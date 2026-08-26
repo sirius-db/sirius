@@ -168,7 +168,7 @@ class dense_count_state {
   };
   using bins_variant = std::variant<histograms<uint32_t>, histograms<uint64_t>>;
 
-  /// Defined in the .cu so no CUDA runtime header enters this header.
+  /// Defined in the .cu, where the CUDA error-checking macros it needs are already in scope.
   template <typename CountT>
   [[nodiscard]] static histograms<CountT> make_bins(std::size_t slots,
                                                     rmm::cuda_stream_view stream,

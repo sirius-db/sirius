@@ -171,6 +171,13 @@ __device__ __forceinline__ void bin_add(T* slot, T delta)
   cuda::atomic_ref<T, Scope>{*slot}.fetch_add(delta, cuda::memory_order_relaxed);
 }
 
+// Both strategies emit the same product and so share its overflow test; a zero right operand
+// cannot overflow and must not divide.
+__device__ __forceinline__ bool product_exceeds_bigint(uint64_t lhs, uint64_t rhs)
+{
+  return rhs != 0 && lhs > k_bigint_max / rhs;
+}
+
 // Per-row validity filter and domain offset, shared by both accumulate kernels.
 template <typename KeyT>
 __device__ __forceinline__ bool key_bin_offset(KeyT const* __restrict__ keys,
@@ -311,7 +318,7 @@ __global__ void emit_kernel(int64_t const* __restrict__ selected,
     out_keys[i] = static_cast<KeyT>(min_key + k);
     // An overflowing product wraps in uint64_t, which is defined and discarded: the host throws.
     out_values[i] = static_cast<int64_t>(p * matched);
-    if (overflow_flag != nullptr && matched != 0 && p > k_bigint_max / matched) {
+    if (overflow_flag != nullptr && product_exceeds_bigint(p, matched)) {
       cuda::atomic_ref<int32_t, cuda::thread_scope_device>{*overflow_flag}.store(
         1, cuda::memory_order_relaxed);
     }
@@ -330,7 +337,7 @@ __global__ void validate_product_kernel(int64_t const* __restrict__ lhs,
     // value and trip the check anyway.
     auto const left_u  = static_cast<uint64_t>(lhs[i]);
     auto const right_u = static_cast<uint64_t>(rhs[i]);
-    if (right_u != 0 && left_u > k_bigint_max / right_u) {
+    if (product_exceeds_bigint(left_u, right_u)) {
       cuda::atomic_ref<int32_t, cuda::thread_scope_device>{*status}.store(
         1, cuda::memory_order_relaxed);
     }

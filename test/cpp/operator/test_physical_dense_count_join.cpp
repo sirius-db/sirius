@@ -461,37 +461,13 @@ TEST_CASE("dense_count_join: wide (u64) histogram slots match the u32 result", "
 {
   auto* space = get_default_gpu_space();
   REQUIRE(space);
-  auto mr     = get_resource_ref(*space);
-  auto stream = default_stream();
 
-  auto preserved = make_numeric_batch<int32_t>(*space, {5, 6, 6, 8}, cudf::type_id::INT32);
-  auto counted   = make_numeric_batch<int32_t>(*space, {6, 6, 6, 9, 4}, cudf::type_id::INT32);
-  auto const preserved_keys = sirius::get_cudf_table_view(*preserved).column(0);
-  auto const counted_keys   = sirius::get_cudf_table_view(*counted).column(0);
+  const std::vector<int32_t> preserved{5, 6, 6, 8};
+  const std::vector<int32_t> counted{6, 6, 6, 9, 4};
+  const std::vector<std::pair<int32_t, int64_t>> expected{{5, 0}, {6, 6}, {8, 0}};
 
-  // A layout may be wider than the data needs, so an inflated preserved-row count is what forces
-  // the wide slots without changing the keys under test.
-  for (auto [preserved_bound, expected_slot_bytes] :
-       {std::pair{int64_t{4}, sizeof(uint32_t)}, std::pair{int64_t{1} << 32, sizeof(uint64_t)}}) {
-    auto const layout = dense_count_layout::plan(/*min_key=*/5,
-                                                 /*max_key=*/8,
-                                                 preserved_bound,
-                                                 /*counted_rows=*/5);
-    REQUIRE(layout);
-    REQUIRE(layout->slot_bytes() == expected_slot_bytes);
-    dense_count_state state(*layout, stream, mr);
-    state.accumulate_preserved(preserved_keys, stream);
-    state.accumulate_counted(counted_keys, std::nullopt, stream);
-    auto table        = state.emit(cudf::data_type{cudf::type_id::INT32},
-                            dense_count_semantics::for_count_star(false),
-                            /*null_group_rows=*/0,
-                            dense_count_bounds{4, 5},
-                            stream,
-                            mr);
-    auto const keys   = copy_column_to_host<int32_t>(table->view().column(0));
-    auto const counts = copy_column_to_host<int64_t>(table->view().column(1));
-    REQUIRE(keys == std::vector<int32_t>{5, 6, 8});
-    REQUIRE(counts == std::vector<int64_t>{0, 6, 0});
+  for (auto slot_bytes : {sizeof(uint32_t), sizeof(uint64_t)}) {
+    CHECK(run_dense_count_state(*space, preserved, counted, 5, 8, slot_bytes) == expected);
   }
 }
 
@@ -555,6 +531,20 @@ TEST_CASE("dense_count_join accumulation agrees across the shared-memory gate",
   SECTION("exactly at the gate") { check_domain(gate_slots, int64_t{8} * gate_slots); }
   SECTION("just above the gate") { check_domain(gate_slots + 1, int64_t{8} * (gate_slots + 1)); }
   SECTION("too few rows per slot to privatize") { check_domain(1024, 8 * 1024 - 1); }
+
+  // Out-of-domain counted keys must be rejected by the privatized kernel too. Its bounds check
+  // guards a shared-memory write, so a miss corrupts a live block rather than faulting.
+  SECTION("out-of-domain counted keys while privatizing")
+  {
+    constexpr int32_t slots = 25;
+    auto const preserved    = keys_covering(slots, 4096);
+    auto counted            = keys_covering(slots, 4096);
+    for (int32_t stray : {-1, -1000, slots, slots + 1000}) {
+      counted.push_back(stray);
+    }
+    CHECK(run_dense_count_state(*space, preserved, counted, 0, slots - 1) ==
+          expected_dense_groups(preserved, counted, 0, static_cast<std::size_t>(slots)));
+  }
 }
 
 TEST_CASE("dense_count_join admits a histogram at exactly the configured byte budget",
@@ -806,6 +796,8 @@ TEST_CASE("dense_count_join rejects an unrepresentable histogram layout",
                 std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), 1, 1)
                 .has_value());
   CHECK_FALSE(dense_count_layout::plan(5, 4, 0, 0).has_value());
+  // Representable as an int64_t range, so only the 2 * range * slot_bytes guard rejects this one.
+  CHECK_FALSE(dense_count_layout::plan(0, int64_t{1} << 62, 1, 1).has_value());
 }
 
 TEST_CASE("dense_count_layout sizes slots from the domain and slot width from the row counts",
@@ -824,6 +816,14 @@ TEST_CASE("dense_count_layout sizes slots from the domain and slot width from th
   REQUIRE(wide);
   CHECK(wide->slot_bytes() == sizeof(uint64_t));
   CHECK(wide->total_bytes() == 2 * wide->slots() * wide->slot_bytes());
+
+  // Either row count widens the slots: the counted side is what a count slot can wrap on.
+  auto const narrow_counted = dense_count_layout::plan(-4, 5, 0, int64_t{uint32_max} - 1);
+  REQUIRE(narrow_counted);
+  CHECK(narrow_counted->slot_bytes() == sizeof(uint32_t));
+  auto const wide_counted = dense_count_layout::plan(-4, 5, 0, int64_t{uint32_max});
+  REQUIRE(wide_counted);
+  CHECK(wide_counted->slot_bytes() == sizeof(uint64_t));
 }
 
 TEST_CASE("dense_count_bounds gates BIGINT overflow detection", "[dense_count_join][validation]")

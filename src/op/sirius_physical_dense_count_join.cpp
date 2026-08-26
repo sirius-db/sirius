@@ -394,14 +394,6 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   using sirius::memory::saturating_mul;
 
   constexpr std::size_t allocation_floor = 1024 * 1024;
-  constexpr auto allocation_alignment    = rmm::CUDA_ALLOCATION_ALIGNMENT;
-
-  auto const aligned_charge = [](std::size_t bytes) {
-    if (bytes == 0) { return bytes; }
-    auto const padded = saturating_add(bytes, static_cast<std::size_t>(allocation_alignment - 1));
-    if (padded == std::numeric_limits<std::size_t>::max()) { return padded; }
-    return (padded / allocation_alignment) * allocation_alignment;
-  };
 
   auto const histogram_bytes = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
 
@@ -423,9 +415,9 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   dense_peak      = saturating_add(dense_peak, mask_bytes);
   dense_peak      = saturating_add(dense_peak, histogram_bytes);  // selection/CUB workspace
 
-  // Min/max calculation
-  auto const scalar_bytes = saturating_add(aligned_charge(key_width), aligned_charge(sizeof(bool)));
-  auto const extrema_per_batch = saturating_mul(2, scalar_bytes);
+  // Min/max calculation: two scalars per batch, each a value and a validity allocation, and every
+  // one of those rounds up to a single allocation alignment unit.
+  constexpr std::size_t extrema_per_batch = 4 * rmm::CUDA_ALLOCATION_ALIGNMENT;
   auto const minmax_peak =
     saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
 
