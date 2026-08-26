@@ -74,9 +74,7 @@ hoping schemas differ: `install_rider` (`late_mat_plan_pass.cpp`) requires the m
 `expected_schema` to match the existing one at every position except the new rider's own, and
 `port_materialize_directive::valid()` re-checks self-consistency and position collisions before
 the merge is accepted. Two scans converging at one port get ONE directive with each side's rowid
-at its own fixed position — disambiguated structurally, not by a runtime schema coincidence. No
-code change identified as necessary; recorded here because the reasoning isn't obvious from the
-"schema equality is the entire identity check" statement alone.
+at its own fixed position — disambiguated structurally, not by a runtime schema coincidence.
 
 ## Which columns, and how far
 
@@ -159,15 +157,16 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 
 - A column an outer join could null is withheld: a null rowid must materialize a null, which the
   materializer does not do yet.
-- A nullable PINNED SOURCE column is admitted for any uncompressed origin (single-batch,
-  multi-batch fixed-width, or multi-batch variable-width — every such gather path propagates
-  validity). A compressed origin is refused UNCONDITIONALLY, whether or not it actually has any
-  nulls: per-column nullability inside a Simpatico-compressed blob is opaque (see
-  [Compressed Materialization](compressed-materialization.md)), so nothing upstream of the
-  install-time gate can tell "no nulls" apart from "unknown," and the gate treats both as unsafe.
-  `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
-  output validity buffer — but that is a secondary reason and moot in practice, since a compressed
-  origin never reaches them today.
+- A nullable PINNED SOURCE column is admitted for any origin whose gather path propagates
+  validity, which is now every one of them. The uncompressed shapes (single-batch, multi-batch
+  fixed-width, multi-batch variable-width) do it natively. A COMPRESSED origin does it through
+  the validity sidecar compression stores beside each column's plan tree: the count is readable
+  from the `.hpln` header without decoding (`simpatico::column_null_count`), so the install gate
+  can tell "no nulls" apart from "unknown", and the decode routes reattach the mask
+  (`materialize.cpp`'s `attach_selected_validity`). The two COMPACTING routes gather the stored
+  bitmask by the same rows they selected the values by — the mask describes the whole chunk while
+  a compacted output holds only the selection, so copying it verbatim would pair each value with
+  another row's validity. A chunk carrying no blob still answers nothing and is refused.
 - A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
   deferred column from a compressed pin is decompressed and then discarded.
 - Filtered scans of compressed pins are refused (above).
