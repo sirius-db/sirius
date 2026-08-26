@@ -621,6 +621,22 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
            : late_mat::kRowidType;
 }
 
+/// Nulls one compressed chunk records for a column, or nullopt when the chunk
+/// cannot say.
+///
+/// Compression strips a column's validity into a sidecar the .hpln header
+/// carries, so the count is a header read and no decode happens here. A chunk
+/// carrying no blob at all is a legitimate shape (serving paths that need only
+/// a row count never load one), and it answers nothing.
+[[nodiscard]] std::optional<std::size_t> compressed_chunk_null_count(
+  sirius::compressed_device_representation const& compressed, std::size_t column_position)
+{
+  if (!compressed.has_table()) { return std::nullopt; }
+  auto const count = simpatico::column_null_count(compressed.table(), column_position);
+  if (!count.has_value()) { return std::nullopt; }
+  return static_cast<std::size_t>(*count);
+}
+
 /// Nulls in one pinned column across every chunk, or nullopt when the storage
 /// cannot say without decompressing — which reads as "assume the worst".
 [[nodiscard]] std::optional<std::size_t> pinned_column_null_count(pinned_entry const& entry,
@@ -630,8 +646,14 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   std::size_t nulls = 0;
   if (!entry.device_chunks.empty()) {
     for (auto const& chunk : entry.device_chunks) {
-      if (chunk.compressed || column_position >= chunk.columns.size() ||
-          !chunk.columns[column_position]) {
+      if (chunk.compressed) {
+        auto const compressed_nulls =
+          compressed_chunk_null_count(*chunk.compressed, column_position);
+        if (!compressed_nulls.has_value()) { return std::nullopt; }
+        nulls += *compressed_nulls;
+        continue;
+      }
+      if (column_position >= chunk.columns.size() || !chunk.columns[column_position]) {
         return std::nullopt;
       }
       nulls += static_cast<std::size_t>(chunk.columns[column_position]->null_count());
@@ -648,9 +670,16 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return nulls;
 }
 
-/// Whether this column's pin is uncompressed — every such gather shape (single-batch,
-/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
-/// resolve_pinned_column's own check.
+/// Whether materialization can carry this column's validity through.
+///
+/// Every uncompressed gather shape (single-batch, multi-batch fixed-width,
+/// multi-batch variable-width) propagates validity. A compressed chunk does too,
+/// provided its blob is loaded and records the column's validity sidecar: a full
+/// decode reattaches the mask, and the two compacting routes gather it by the
+/// same rows they selected the values by (materialize.cpp's
+/// attach_selected_validity). A chunk carrying no blob answers nothing and is
+/// unsafe, which is also where resolve_pinned_column refuses — the two checks
+/// must agree.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
@@ -658,8 +687,10 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   if (!entry.device_chunks.empty()) {
     return std::all_of(
       entry.device_chunks.begin(), entry.device_chunks.end(), [&](auto const& chunk) {
-        return !chunk.compressed && column_position < chunk.columns.size() &&
-               chunk.columns[column_position] != nullptr;
+        if (chunk.compressed) {
+          return compressed_chunk_null_count(*chunk.compressed, column_position).has_value();
+        }
+        return column_position < chunk.columns.size() && chunk.columns[column_position] != nullptr;
       });
   }
   if (column_position >= entry.cache_info.names.size()) { return false; }
