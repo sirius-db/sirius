@@ -257,6 +257,12 @@ struct pinned_entry {
 void validate_pinned_entry_for_serving(pinned_entry const& entry,
                                        std::span<std::size_t const> selected_columns);
 
+/// Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
+/// chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
+/// DECIMAL(p,0) column has cuDF scale 0 and must still take the two-argument fixed-point
+/// constructor.
+[[nodiscard]] cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& meta);
+
 /// Validate the shape of @p matrix alone: it must hold @p expected_chunks rows of
 /// @p expected_columns cells each. @p allow_empty admits the empty matrix, which reads as
 /// all-native — @ref validate_pinned_entry_for_serving passes true because a zero-chunk or

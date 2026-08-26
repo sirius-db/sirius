@@ -54,4 +54,42 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                std::uint32_t* out_mask,
                                rmm::cuda_stream_view stream);
 
+/// The same gather, for batches whose buffers live in HOST-tier pinned blocks.
+///
+/// A host chunk's storage is a list of equally sized blocks that are not
+/// contiguous with one another, so a column has no base pointer to index off.
+/// Each batch instead contributes its blocks to one flattened device array and
+/// gives a byte offset into their logical concatenation; element `local` of
+/// batch `b` is then found by dividing `data_off_dev[b] + local * elem_size` by
+/// the block size. Under unified virtual addressing the block pointers are
+/// device-usable as they are, so the rows are read where they lie rather than
+/// staged to the device first.
+///
+/// `blocks_dev` is a DEVICE array holding every batch's block pointers back to
+/// back; `block_base_dev[b]` is where batch b's run starts in it. `data_off_dev`
+/// and `mask_off_dev` are DEVICE arrays of B byte offsets each; a negative mask
+/// offset means that batch has no null mask (every row valid). Pass
+/// `out_mask == nullptr` to skip validity entirely.
+///
+/// The caller guarantees the translations land on element and word boundaries:
+/// `block_size` and `data_off_dev[b]` must both be multiples of `elem_size`, and
+/// `mask_off_dev[b]` a multiple of 4. A pin that does not satisfy this has no
+/// element-aligned reading and is refused at resolve time rather than read
+/// crookedly here.
+///
+/// Asynchronous on `stream`.
+void multi_source_gather_fixed_host(void const* const* blocks_dev,
+                                    std::int64_t const* block_base_dev,
+                                    std::int64_t const* data_off_dev,
+                                    std::int64_t const* mask_off_dev,
+                                    std::int64_t const* row_start_dev,
+                                    int num_batches,
+                                    std::size_t block_size,
+                                    std::size_t elem_size,
+                                    std::uint64_t const* ids,
+                                    std::int64_t count,
+                                    void* out,
+                                    std::uint32_t* out_mask,
+                                    rmm::cuda_stream_view stream);
+
 }  // namespace sirius::late_mat

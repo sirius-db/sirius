@@ -103,6 +103,56 @@ __global__ void gather_fixed_kernel(void const* const* __restrict__ bases,
   }
 }
 
+/// The block holding logical byte @p byte of a host chunk's allocation, and the
+/// offset within it. The blocks are equally sized, so this is a divide.
+__device__ inline void const* host_byte(void const* const* __restrict__ blocks,
+                                        std::int64_t block_base,
+                                        std::size_t block_size,
+                                        std::int64_t byte)
+{
+  auto const block = block_base + byte / static_cast<std::int64_t>(block_size);
+  auto const off   = byte % static_cast<std::int64_t>(block_size);
+  return static_cast<char const*>(blocks[block]) + off;
+}
+
+template <typename T>
+__global__ void gather_fixed_host_kernel(void const* const* __restrict__ blocks,
+                                         std::int64_t const* __restrict__ block_base,
+                                         std::int64_t const* __restrict__ data_off,
+                                         std::int64_t const* __restrict__ mask_off,
+                                         std::int64_t const* __restrict__ row_start,
+                                         int num_batches,
+                                         std::size_t block_size,
+                                         std::uint64_t const* __restrict__ ids,
+                                         std::int64_t count,
+                                         T* __restrict__ out,
+                                         cudf::bitmask_type* __restrict__ out_mask)
+{
+  auto const stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+       i += stride) {
+    auto const id    = static_cast<std::int64_t>(ids[i]);
+    int const b      = find_batch(row_start, num_batches, id);
+    auto const local = id - row_start[b];
+    auto const byte  = data_off[b] + local * static_cast<std::int64_t>(sizeof(T));
+    out[i]           = *static_cast<T const*>(host_byte(blocks, block_base[b], block_size, byte));
+    if (out_mask != nullptr) {
+      bool valid = true;
+      if (mask_off[b] >= 0) {
+        auto const word_byte = mask_off[b] + (local / 32) * 4;
+        auto const word      = *static_cast<cudf::bitmask_type const*>(
+          host_byte(blocks, block_base[b], block_size, word_byte));
+        valid = ((word >> (local % 32)) & 1U) != 0U;
+      }
+      if (valid) {
+        cudf::set_bit(out_mask, static_cast<cudf::size_type>(i));
+      } else {
+        cudf::clear_bit(out_mask, static_cast<cudf::size_type>(i));
+      }
+    }
+  }
+}
+
 }  // namespace
 
 void multi_source_gather_fixed(void const* const* bases_dev,
@@ -191,6 +241,67 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                " is not one of 1, 2, 4, 8, 16");
   }
   throw_on_cuda(cudaPeekAtLastError(), "gather_fixed launch");
+}
+
+void multi_source_gather_fixed_host(void const* const* blocks_dev,
+                                    std::int64_t const* block_base_dev,
+                                    std::int64_t const* data_off_dev,
+                                    std::int64_t const* mask_off_dev,
+                                    std::int64_t const* row_start_dev,
+                                    int num_batches,
+                                    std::size_t block_size,
+                                    std::size_t elem_size,
+                                    std::uint64_t const* ids,
+                                    std::int64_t count,
+                                    void* out,
+                                    std::uint32_t* out_mask,
+                                    rmm::cuda_stream_view stream)
+{
+  if (count == 0) { return; }
+  if (blocks_dev == nullptr || block_base_dev == nullptr || data_off_dev == nullptr ||
+      mask_off_dev == nullptr || row_start_dev == nullptr || ids == nullptr || out == nullptr ||
+      num_batches <= 0 || block_size == 0) {
+    throw std::runtime_error("multi_source_gather: host gather over unbound buffers");
+  }
+  if (elem_size == 0 || block_size % elem_size != 0) {
+    throw std::runtime_error("multi_source_gather: host block size " + std::to_string(block_size) +
+                             " is not a multiple of the element width " +
+                             std::to_string(elem_size));
+  }
+
+  std::int64_t launch_blocks = (count + kBlock - 1) / kBlock;
+  if (launch_blocks > 4096) { launch_blocks = 4096; }  // grid-stride covers the rest
+  auto const grid = static_cast<unsigned>(launch_blocks);
+
+  auto* out_bits = reinterpret_cast<cudf::bitmask_type*>(out_mask);
+
+  auto const launch = [&](auto tag) {
+    using element_t = decltype(tag);
+    gather_fixed_host_kernel<element_t>
+      <<<grid, kBlock, 0, stream.value()>>>(blocks_dev,
+                                            block_base_dev,
+                                            data_off_dev,
+                                            mask_off_dev,
+                                            row_start_dev,
+                                            num_batches,
+                                            block_size,
+                                            ids,
+                                            count,
+                                            static_cast<element_t*>(out),
+                                            out_bits);
+  };
+
+  switch (elem_size) {
+    case 1: launch(std::uint8_t{}); break;
+    case 2: launch(std::uint16_t{}); break;
+    case 4: launch(std::uint32_t{}); break;
+    case 8: launch(std::uint64_t{}); break;
+    case 16: launch(uint4{}); break;
+    default:
+      throw std::runtime_error("multi_source_gather: element width " + std::to_string(elem_size) +
+                               " is not one of 1, 2, 4, 8, 16");
+  }
+  throw_on_cuda(cudaPeekAtLastError(), "gather_fixed_host launch");
 }
 
 }  // namespace sirius::late_mat

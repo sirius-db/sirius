@@ -186,13 +186,17 @@ TEST_CASE("a column position the entry does not have resolves to nothing", "[lat
   REQUIRE_FALSE(resolve_pinned_column(pin.origin(7)).has_value());
 }
 
-TEST_CASE("a host-tier entry is not served", "[late_mat][resolver]")
+TEST_CASE("a host-tier entry with no host chunks is not served", "[late_mat][resolver]")
 {
   auto const stream = rmm::cuda_stream_view{};
   fake_entry pin({16}, "c_name", stream);
+  // The tier says HOST while the storage is the GPU per-column map — the shape a
+  // half-built entry has. Not an error, a reason not to defer: the host path
+  // reads host_chunks and there are none, and reading the GPU columns instead,
+  // on the strength of their being there, would gather device memory for an
+  // entry that says it holds none. A host-tier entry that really does hold host
+  // chunks is covered in test_late_mat_host_pin.cpp.
   pin.entry.tier = cucascade::memory::Tier::HOST;
-  // Not an error — a reason not to defer. A host chunk would have to be staged
-  // before any of this applies.
   REQUIRE_FALSE(resolve_pinned_layout(pin.origin()).has_value());
   REQUIRE_FALSE(resolve_pinned_column(pin.origin()).has_value());
 }

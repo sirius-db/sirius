@@ -7,8 +7,10 @@ what is IN them.
 
 Late materialization replaces those columns at the scan with a pin-order **rowid**, carries that
 instead, and puts the values back at the far end by gathering them out of the pinned table. It
-works only for a **GPU-tier pinned** table — the values have to still exist somewhere
-addressable when the far end asks for them, and that is what the pin guarantees.
+works only for a **pinned** table — the values have to still exist somewhere addressable when the
+far end asks for them, and that is what the pin guarantees. A GPU-tier pin is gathered out of
+device memory; a HOST-tier pin is gathered out of pinned host memory in place, over unified
+virtual addressing, with nothing staged back to the device (see [Host-tier pins](#host-tier-pins)).
 
 ## Turning it on (experimental)
 
@@ -41,6 +43,7 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | = the ordinary floor | Separate floor for compressed origins. Inert until the decode-skip exists to measure. |
+| `SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER` | 12 | What the value x crossings floor is multiplied by for a HOST-tier pin. |
 
 ## What a deferral is
 
@@ -177,10 +180,7 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   handful of short strings can clear the floor on the estimate while saving fewer bytes/row than
   the measured value would show). The real fix is measuring the width — the scan already has the
   offsets for it.
-- **Host-tier pins are refused**, not just unpinned scans: `install_late_materialization`
-  declines on tier, and `resolve_pinned_layout`/`resolve_pinned_column` refuse independently at
-  the far end. Supporting them would mean staging a chunk back to the device per gather, so the
-  ride would have to repay a host round trip rather than a device read.
+- **A host-tier pin rides only FIXED-WIDTH, uncompressed columns** (see below).
 - **A non-pinned scan cannot defer at all.** A fresh parquet or DuckDB-native read consumes its
   decoded batch, so there is nothing for the port to gather from. Deferring against a file would
   mean a rowid addressing a file offset and a re-read per gather — the shape classic disk-based
@@ -204,6 +204,62 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   whenever more than one GPU memory space is active, matching the memory prefetcher's own
   single-GPU prototype scope.
 
+## Host-tier pins
+
+A host-tier pin stores its data the other way round from a GPU one: `entry.host_chunks` holds one
+representation PER EMITTED BATCH, each carrying every pinned column, where a GPU pin holds a chunk
+vector per column. The resolver is what bridges the two orientations, and there is no per-column
+merge path on the host side because of it.
+
+**The gather reads the rows where they lie.** The alternative — staging the needed chunk back to
+the device per materialization — was rejected on two counts, one measured and one structural:
+
+- *Measured.* On GB300 (Grace-Blackwell, C2C rather than PCIe), a 150M x 8 B pinned column stages
+  H2D at 163 GB/s, so a full stage costs 7.4 ms whatever the selection. A blocked zero-copy gather
+  of the same column costs 0.012 ms at 0.01% selectivity, 0.42 ms at 1%, and 5.1 ms even when the
+  selection covers every row — cheaper than staging at EVERY selectivity, and by two to three
+  orders of magnitude for the sparse ones a ride actually produces.
+- *Structural.* Staging puts the whole column in device memory, which is exactly what pinning on
+  the host was avoiding. The in-place gather allocates only its output.
+
+Against a device gather the same column costs 2.0x, 8.1x, 10.6x, 12.2x, 11.0x and 6.6x at those
+selectivities. That worst case is `SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER`: the value x crossings
+floor is calibrated against a device gather, and both the floor and the gather scale with the same
+row count, so a host-tier bundle is weighed against `128 x 12` instead of `128`. It bounds one
+operation rather than calibrating a query, which is why it is a knob.
+
+**How a chunk-major host chunk becomes a column-major view.** A host chunk's storage is a list of
+equally sized pinned blocks that are NOT contiguous with one another, so a column's buffer has no
+single base pointer and cannot be described by a `cudf::column_view` at all. What it does have is a
+byte offset into the logical concatenation of those blocks (`cucascade::memory::column_metadata`),
+and `batch_source::host` carries exactly that: the block pointers, the block size, and the data and
+null-mask offsets. `multi_source_gather_fixed_host` turns a global rowid into a batch, a row, a byte
+offset, a block index and an offset within it — one divide on top of the batch search the GPU-tier
+gather already does. Validity comes along one mask word at a time, in the same coordinates.
+
+The block pointers are used as device addresses directly. That is legitimate only where the device
+reports both `cudaDevAttrUnifiedAddressing` and `cudaDevAttrCanUseHostPointerForRegisteredMem`; the
+resolver asks once and refuses host-tier deferral outright when either is false, rather than
+translating or staging.
+
+**What a host-tier pin refuses**, beyond every refusal the GPU tier makes:
+
+- **A variable-width or nested column.** There is no element width to multiply a row by, and its
+  offsets would have to be rebuilt against buffers that are not contiguous. Refused per COLUMN, not
+  per pin: the fixed-width columns of the same chunks stay eligible.
+- **A compressed host chunk** (`compressed_host_representation`). A Simpatico blob has no
+  addressable per-row layout to read in place, and its per-column nullability is opaque besides —
+  the same reason a compressed GPU chunk is refused.
+- **A translation that does not land on a boundary.** The block size must divide by the element
+  width, the data offset must start on an element, and the mask offset must be word-aligned. A pin
+  that fails any of these is refused rather than read crookedly.
+- **A filtered scan**, which was already refused for host pins and stays refused.
+
+`install_late_materialization` and the rider pass check exactly what `resolve_pinned_column` checks,
+for the same reason the nullability gate does: by the time a port resolves an origin the scan has
+already emitted rowids in place of the values, so a refusal there is a thrown query rather than a
+slower one.
+
 ## Results
 
 GB300, TPC-H SF1000, unpatched libcudf, GPU-pinned, `SIRIUS_EXP_FUSED_SCAN_FILTER=1` held on in
@@ -226,3 +282,4 @@ q10; no other query moves outside noise.
 | Pin-time distinctness proof | `src/late_mat/pin_uniqueness.cpp` |
 | Putting the values back | `src/late_mat/port_materialize.cpp`, `materialize.cpp` |
 | Reading a pinned entry the way the materializer needs it | `src/scan_manager/late_mat_resolver.cpp` |
+| Gathering by global rowid, device and host tiers | `src/late_mat/multi_source_gather.cu` |

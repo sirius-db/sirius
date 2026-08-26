@@ -43,6 +43,7 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan_manager/late_mat_resolver.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -87,15 +88,6 @@
 
 namespace sirius::scan_manager {
 
-namespace {
-
-using sirius::pinned_column_storage_matrix;
-using sirius::pinned_column_storage_meta;
-
-// Actual cuDF carrier of one column of an uncompressed pinned host chunk, rebuilt from the
-// chunk's host column metadata. Keyed on the DECIMAL type ids, not on a nonzero scale: a
-// DECIMAL(p,0) column has cuDF scale 0 and must still take the two-argument fixed-point
-// constructor.
 cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& meta)
 {
   auto const id         = static_cast<cudf::type_id>(meta.type_id);
@@ -106,9 +98,15 @@ cudf::data_type host_column_carrier(cucascade::memory::column_metadata const& me
 
 namespace {
 
-/// Chunks a GPU-tier entry holds, whichever storage form it uses.
+using sirius::pinned_column_storage_matrix;
+using sirius::pinned_column_storage_meta;
+
+namespace {
+
+/// Chunks an entry holds, whichever storage form it uses.
 std::size_t pinned_chunk_count(pinned_entry const& entry)
 {
+  if (entry.tier == cucascade::memory::Tier::HOST) { return entry.host_chunks.size(); }
   if (!entry.device_chunks.empty()) { return entry.device_chunks.size(); }
   auto const& names = entry.cache_info.column_names();
   if (names.empty()) { return 0; }
@@ -116,10 +114,23 @@ std::size_t pinned_chunk_count(pinned_entry const& entry)
   return it == entry.data_batches_by_column.end() ? 0 : it->second.size();
 }
 
-/// Rows in one chunk of a GPU-tier entry. Every column of a chunk shares its
-/// row count, so any present one answers.
+/// Rows in one chunk of an entry. Every column of a chunk shares its row count,
+/// so any present one answers.
 std::int64_t pinned_chunk_rows(pinned_entry const& entry, std::size_t index)
 {
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    if (index >= entry.host_chunks.size() || !entry.host_chunks[index]) { return 0; }
+    if (auto const* compressed = dynamic_cast<sirius::compressed_host_representation const*>(
+          entry.host_chunks[index].get())) {
+      return compressed->num_rows();
+    }
+    auto const* host =
+      dynamic_cast<cucascade::host_data_representation const*>(entry.host_chunks[index].get());
+    if (host == nullptr || !host->get_host_table() || host->get_host_table()->columns.empty()) {
+      return 0;
+    }
+    return static_cast<std::int64_t>(host->get_host_table()->columns.front().num_rows);
+  }
   if (!entry.device_chunks.empty()) {
     if (index >= entry.device_chunks.size()) { return 0; }
     auto const& chunk = entry.device_chunks[index];
@@ -189,8 +200,9 @@ struct cached_databatch_provider : public databatch_provider {
     if (!_entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
     if (has_any_mask(_mvcc_masks)) { return decline("the scan carries MVCC keep-masks"); }
     if (!_delta_splits.empty()) { return decline("the scan carries insert-delta splits"); }
-    if (_entry.tier != cucascade::memory::Tier::GPU) {
-      return decline("the pinned entry is not device-resident");
+    if (_entry.tier != cucascade::memory::Tier::GPU &&
+        _entry.tier != cucascade::memory::Tier::HOST) {
+      return decline("the pinned entry is neither device- nor host-resident");
     }
 
     auto columns = std::make_shared<std::vector<late_mat::column_origin>>();
@@ -626,6 +638,21 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
 [[nodiscard]] std::optional<std::size_t> pinned_column_null_count(pinned_entry const& entry,
                                                                   std::size_t column_position)
 {
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    // A host chunk records its per-column null count at pin time; a compressed
+    // one has no per-column layout to record it against.
+    std::size_t host_nulls = 0;
+    for (auto const& chunk : entry.host_chunks) {
+      auto const* host = dynamic_cast<cucascade::host_data_representation const*>(chunk.get());
+      if (host == nullptr || !host->get_host_table()) { return std::nullopt; }
+      auto const& columns = host->get_host_table()->columns;
+      if (column_position >= columns.size()) { return std::nullopt; }
+      auto const recorded = columns[column_position].null_count;
+      if (recorded < 0) { return std::nullopt; }
+      host_nulls += static_cast<std::size_t>(recorded);
+    }
+    return host_nulls;
+  }
   if (entry.tier != cucascade::memory::Tier::GPU) { return std::nullopt; }
   std::size_t nulls = 0;
   if (!entry.device_chunks.empty()) {
@@ -649,11 +676,14 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
 }
 
 /// Whether this column's pin is uncompressed — every such gather shape (single-batch,
-/// multi-batch fixed-width, multi-batch variable-width) propagates validity. Must agree with
-/// resolve_pinned_column's own check.
+/// multi-batch fixed-width, multi-batch variable-width, and the host-tier blocked gather)
+/// propagates validity. Must agree with resolve_pinned_column's own check.
 [[nodiscard]] bool pinned_column_nulls_are_safe(pinned_entry const& entry,
                                                 std::size_t column_position)
 {
+  if (entry.tier == cucascade::memory::Tier::HOST) {
+    return host_pinned_column_is_addressable(entry, column_position);
+  }
   if (entry.tier != cucascade::memory::Tier::GPU) { return false; }
   if (!entry.device_chunks.empty()) {
     return std::all_of(
@@ -813,13 +843,17 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   };
 
   if (!entry.late_mat_handle) { return decline("the pinned entry has no late-mat handle"); }
-  if (entry.tier != cucascade::memory::Tier::GPU) {
-    return decline("the pinned entry is not device-resident");
+  bool const host_tier = entry.tier == cucascade::memory::Tier::HOST;
+  if (entry.tier != cucascade::memory::Tier::GPU && !host_tier) {
+    return decline("the pinned entry is neither device- nor host-resident");
   }
   if (!single_gpu_pin) {
+    // A device chunk could be dereferenced from the wrong GPU; a host chunk's
+    // blocks are mapped for the context that registered them and need not be
+    // readable from another. Neither is checked at materialize time.
     return decline(
       "more than one GPU space is active; materialization is not yet device-aware and cannot "
-      "safely gather a chunk pinned on a different GPU than the consumer");
+      "safely gather a chunk pinned outside the consumer's GPU");
   }
   if (!serves_whole_chunks) {
     return decline("a served batch is not one pinned chunk's whole row span");
@@ -866,6 +900,11 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   late_mat::defer_policy policy;
   if (compressed_origin) {
     policy.min_value_bytes = late_mat::min_value_bytes_compressed(policy.min_value_bytes);
+  }
+  if (host_tier) {
+    // Materializing costs more from the host than from the device, so the ride
+    // has to save proportionally more to repay it.
+    policy.min_value_x_boundaries *= late_mat::host_tier_cost_multiplier();
   }
   auto const planned = sirius::planner::plan_deferral(scan_op, policy);
   for (auto const& outcome : planned.census) {
@@ -975,6 +1014,21 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
     return decline(
       "a join on the ride multiplied the rows and nothing collapsed them again, so materializing "
       "at the port would gather the fan-out rather than the scan's rows");
+  }
+
+  // A host-tier column is gathered where it lies, which only some of them can
+  // be. Refusing here rather than at the port matters: by the time the port
+  // resolves the origin the scan has already emitted rowids in place of the
+  // values, so a refusal there is a thrown query, not a slower one.
+  if (host_tier) {
+    for (auto const position : planned.positions) {
+      if (position >= selected_columns.size()) { continue; }  // caught again, and reported, below
+      if (!host_pinned_column_is_addressable(entry, selected_columns[position])) {
+        return decline(
+          "a deferred column's host pin cannot be gathered where it lies — it is compressed, not "
+          "fixed width, or its blocks do not divide on element boundaries");
+      }
+    }
   }
 
   // The pinned SOURCE being nullable is only the pin's to answer, so it's checked here,
@@ -1173,6 +1227,24 @@ void install_rider_deferrals(std::vector<rider_candidate> const& candidates,
       if (!proof.has_value()) {
         decline(
           "neither its own columns nor a join with the ride's scan determines its row in a group");
+        continue;
+      }
+    }
+
+    // Same host-tier gather restriction as the primary bundle's install, above.
+    if (entry.tier == cucascade::memory::Tier::HOST) {
+      bool addressable = true;
+      for (auto const position : planned.positions) {
+        if (position >= candidate.columns.size()) { continue; }  // caught again below
+        if (!host_pinned_column_is_addressable(entry, candidate.columns[position])) {
+          addressable = false;
+          break;
+        }
+      }
+      if (!addressable) {
+        decline(
+          "a deferred column's host pin cannot be gathered where it lies — it is compressed, not "
+          "fixed width, or its blocks do not divide on element boundaries");
         continue;
       }
     }

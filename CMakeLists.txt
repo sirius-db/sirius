@@ -750,10 +750,12 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/integration/test_late_mat_host_query.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
     test/cpp/late_mat/test_late_mat_plan_pass.cpp
     test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_late_mat_host_pin.cpp
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/io/s3/test_sigv4.cpp

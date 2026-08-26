@@ -52,16 +52,42 @@ class compressed_device_representation;
 
 namespace sirius::late_mat {
 
+/// One column's buffers inside one HOST-tier pinned chunk, as a gather has to
+/// address them.
+///
+/// Host-tier storage is a list of equally sized pinned blocks that are NOT
+/// contiguous with one another, so a column's buffer has no single base pointer
+/// and cannot be described by a cudf::column_view at all. What it does have is a
+/// byte offset into the logical concatenation of those blocks, which the gather
+/// translates to (block, offset) per element.
+///
+/// The block pointers are the host addresses. Under unified virtual addressing a
+/// registered pinned host pointer is also a valid device pointer, which is what
+/// lets the gather read the rows it wants where they lie instead of staging the
+/// whole column back to the device; the resolver refuses the pin outright when
+/// the device does not offer that.
+struct host_blocked_buffers {
+  std::vector<void*> blocks;  ///< block bases in allocation order, device-addressable
+  std::size_t block_size       = 0;
+  std::size_t data_offset      = 0;  ///< first data byte, logical offset over `blocks`
+  std::size_t null_mask_offset = 0;  ///< first mask byte, same coordinates; ignored unless
+                                     ///< `has_null_mask`
+  bool has_null_mask = false;
+};
+
 /// One pinned batch of one origin column. Exactly one form is populated, which
 /// mirrors device_pin_chunk: compression is decided per chunk, so a single pin
-/// may interleave the two.
+/// may interleave the two. A host-tier pin populates `host` instead, for every
+/// batch or none — a pinned entry lives in one tier.
 struct batch_source {
   sirius::compressed_device_representation const* compressed = nullptr;
   std::size_t column_index                                   = 0;  ///< within the compressed chunk
-  cudf::column_view uncompressed{};  ///< valid iff compressed == nullptr
+  cudf::column_view uncompressed{};  ///< valid iff compressed == nullptr and host == nullptr
+  std::shared_ptr<host_blocked_buffers const> host;  ///< set iff the pin is host-tier
   std::int64_t num_rows = 0;
 
   [[nodiscard]] bool is_compressed() const noexcept { return compressed != nullptr; }
+  [[nodiscard]] bool is_host() const noexcept { return host != nullptr; }
 };
 
 /// One origin column across the pinned table's batches, positionally consistent
@@ -89,6 +115,13 @@ struct pinned_column_view {
 /// resort. None of these routes writes an output validity buffer, so a decoded
 /// column that turns out to contain nulls is rejected rather than returned
 /// half-formed (require_non_null).
+///
+/// A HOST-tier origin is gathered where it lies, out of the pinned blocks
+/// described by batch_source::host, with no staging pass: fixed-width columns
+/// only, because a variable-width one has no element width to translate and its
+/// offsets would have to be rebuilt against buffers that are not contiguous.
+/// Validity is carried through, one mask word at a time, in the same
+/// coordinates.
 ///
 /// What this materializer can serve and what the INSTALLER admits are two
 /// different questions. Today no compressed origin reaches here: the install
