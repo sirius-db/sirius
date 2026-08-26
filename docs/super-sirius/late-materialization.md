@@ -182,6 +182,14 @@ selection mask it already balloted into an ascending INT32 index list
 (`pushdown_outcome::survivor_rows`). Off a deferring scan the decode does neither, so the cost is
 one index-list expansion plus 4 bytes per surviving row, paid only where a ride uses it.
 
+Admitting the shape is not the same as it paying. On TPC-H SF1000 (`bench/sf1000-repro`) it
+turns 84 structural refusals into ordinary policy decisions, and most of the newly reachable
+candidates are still withheld because a partition hashes them or refused on the
+value-times-crossings floor. The one that pays is q10's `customer` scan: it now defers five
+columns to the result collector on the group-by-rowid ride keyed by `c_custkey`, and q10 drops
+from 0.382 s to 0.215 s. Every other query is within noise, and suite time goes from 3.938 s /
+3.924 s to 3.771 s / 3.759 s (−4.3%, same build and machine, alternating runs).
+
 Both directions fail closed. A decode that compacted without accounting for its survivors throws
 rather than emit a rowid, at `prepare_for_processing` and again at substitution; a survivor list
 whose length does not match the rows handed on throws too. A scan whose INGESTIBLE cannot report
