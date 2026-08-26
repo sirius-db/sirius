@@ -22,6 +22,7 @@
 #include <helper/numeric_narrowing.hpp>
 #include <log/logging.hpp>
 #include <memory/size_arithmetic.hpp>
+#include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
@@ -348,13 +349,16 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
-  // Resolve the scan's dynamic-filter channel once (null for non-parquet
-  // ingestibles): every split gets it stamped so prepare_for_processing can
-  // snapshot membership filters at decode time.
+  // Resolve the scan's dynamic-filter channel once (null for formats that carry
+  // none): every split gets it stamped so prepare_for_processing can snapshot
+  // membership filters at decode time.
   if (_ingestible != nullptr) {
-    if (auto const* pq =
-          dynamic_cast<parquet_ingestible_table_info const*>(&_ingestible->table_info())) {
+    auto const& info = _ingestible->table_info();
+    if (auto const* pq = dynamic_cast<parquet_ingestible_table_info const*>(&info)) {
       _dynamic_filters_channel = pq->sirius_dynamic_filters;
+    } else if (auto const* native =
+                 dynamic_cast<duckdb_native_ingestible_table_info const*>(&info)) {
+      _dynamic_filters_channel = native->sirius_dynamic_filters;
     }
   }
   _native_physical_types.reserve(this->types.size());

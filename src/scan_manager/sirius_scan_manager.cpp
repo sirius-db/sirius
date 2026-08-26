@@ -304,15 +304,15 @@ struct cached_databatch_provider : public databatch_provider {
         // Attach the scan's decode request to this projection only — never to
         // the shared pinned chunk, which other queries filter differently.
         // for_chunk narrows it to what this chunk's compression plans make
-        // worth asking; row dropping is additionally skipped when this operator
-        // carries mvcc keep-masks, since a decode-compacted batch no longer
+        // worth asking; row dropping is additionally skipped for chunks that
+        // carry an mvcc keep-mask, since a decode-compacted batch no longer
         // lines up with a positional deleted-row mask.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
         if (!_pushdown_req.empty()) {
           auto scan = std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           // Row dropping cannot compose with a positional deleted-row mask: a
           // compacted batch no longer lines up with it.
-          if (!_mvcc_masks.empty()) { scan = scan->without_row_selection(); }
+          if (chunk_has_mvcc_mask(index)) { scan = scan->without_row_selection(); }
           if (scan) { pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
         }
         // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
@@ -331,14 +331,15 @@ struct cached_databatch_provider : public databatch_provider {
         // exactly filters_for_column(i); trailing pure-filter slots query keys
         // the set can never hold (push_filter rejects non-output columns) and
         // come back empty by construction — no output-arity knowledge is needed
-        // here. Same mvcc guard as the row selection above.
+        // here. Same per-chunk mvcc guard as the row selection above.
         //
         // This drain runs on the metadata thread at query PREPARE, before any
         // join build has published, so this snapshot is almost always EMPTY. It
         // is kept as a free early base; the authoritative snapshot is taken at
         // decode time by scan_operator_input::prepare_for_processing (same
         // builder, same mapping invariant), which replaces this one.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
+            !chunk_has_mvcc_mask(index)) {
           if (_dynamic_filters->has_filters()) {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
@@ -411,6 +412,16 @@ struct cached_databatch_provider : public databatch_provider {
       batch_id,
       std::move(gpu_repr),
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+  }
+
+  // True when chunk @p index carries a real (non-default) mvcc keep-mask.
+  //
+  // Set emptiness must never stand in for slot presence: the set is slot-sized
+  // whenever the entry has MVCC state at all, so one committed refresh would
+  // otherwise strip the decode-side pushdown from every chunk of the table.
+  [[nodiscard]] bool chunk_has_mvcc_mask(std::size_t index) const
+  {
+    return index < _mvcc_masks.size() && _mvcc_masks[index].has_mask();
   }
 
   // True when scan normalization will cast the recorded stored @p carrier to @p target: the same
@@ -1571,9 +1582,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // serve time.
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
     if (sirius::decompression_pushdown_enabled()) {
-      auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
-        &assignment.op->get_ingestible().table_info());
-      if (pq != nullptr) { dynamic_filters = pq->sirius_dynamic_filters; }
+      auto const& info = assignment.op->get_ingestible().table_info();
+      if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+        dynamic_filters = pq->sirius_dynamic_filters;
+      } else if (auto const* native =
+                   dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+        dynamic_filters = native->sirius_dynamic_filters;
+      }
       // Channel identity: this pointer must match the one the hash join
       // publishes into (both resolve through the generator's channel map, keyed
       // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
