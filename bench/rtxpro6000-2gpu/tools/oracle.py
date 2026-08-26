@@ -45,8 +45,13 @@ if only:
     names = [n for n in names if n in only]
 
 con = duckdb.connect()
-con.execute("PRAGMA threads=48")
+con.execute("PRAGMA threads=%d" % int(os.environ.get("ORACLE_THREADS", "48")))
 con.execute("SET preserve_insertion_order=false")
+# At SF500 several queries spill. The root volume has no room, so temp must go on the nvme.
+con.execute("SET memory_limit='%s'" % os.environ.get("ORACLE_MEM", "380GB"))
+_tmp = os.environ.get("ORACLE_TMP", "/opt/dlami/nvme/duckdb-tmp")
+os.makedirs(_tmp, exist_ok=True)
+con.execute("SET temp_directory='%s'" % _tmp)
 
 for n in names:
     sql = open(os.path.join(qdir, f"{n}.sql")).read().replace("__TPCH_DATA__", data)
