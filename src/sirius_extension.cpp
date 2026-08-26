@@ -1884,13 +1884,8 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       "index for this column, if any, was left in place.");
   }
 
-  // Reserve the index footprint: ~2x the stored vectors + 2x centroids + 1 MiB slack
-  // NOTE: this is very conservative and can be tightened
-  std::size_t const vec_bytes =
-    static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
-  std::size_t const centroid_bytes =
-    static_cast<std::size_t>(n_lists) * static_cast<std::size_t>(dim) * sizeof(float);
-  std::size_t const footprint = vec_bytes * 2 + centroid_bytes * 2 + (std::size_t{1} << 20);
+  // Index building footprint reservation
+  std::size_t const footprint = sirius::vss::ivf_flat_reservation_bytes(n_rows, dim, n_lists);
 
   [[maybe_unused]] auto* pool = target_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   SIRIUS_LOG_DEBUG(

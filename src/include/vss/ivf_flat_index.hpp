@@ -26,12 +26,27 @@
 
 #include <cuvs/distance/distance.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
 #include <vector>
 
 namespace sirius::vss {
+
+/// GPU bytes to reserve for building an IVF-Flat index.
+[[nodiscard]] inline std::size_t ivf_flat_reservation_bytes(std::int64_t n_rows,
+                                                            std::int64_t dim,
+                                                            std::uint32_t n_lists)
+{
+  std::size_t const row_bytes =
+    static_cast<std::size_t>(dim) * sizeof(float) + sizeof(std::int64_t);
+  std::size_t const vec_bytes      = static_cast<std::size_t>(n_rows) * row_bytes;
+  std::size_t const rounding_bytes = static_cast<std::size_t>(n_lists) * 32 * row_bytes;
+  std::size_t const centroid_bytes =
+    static_cast<std::size_t>(n_lists) * static_cast<std::size_t>(dim) * sizeof(float);
+  return vec_bytes * 2 + rounding_bytes + centroid_bytes * 2 + (std::size_t{1} << 20);
+}
 
 /// Build an IVF-Flat index from the dataset held as many separate FLOAT32 LIST
 /// @p batches (each unsliced, gap-free, fixed width @p dim), without concatenating

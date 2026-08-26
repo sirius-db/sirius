@@ -363,6 +363,124 @@ TEST_CASE("cuvs_index_cache create binds the build to its reservation and leaks 
   REQUIRE(adaptor->get_total_allocated_bytes() == alloc_before);
 }
 
+// Exercises the list-growth path the current tests miss: one list, two batches of
+// 32 then 1 row. IVF-Flat sizes each list in 32-row units, so the 33rd row forces
+// the single list to grow past its initial 32-row capacity. resize_list allocates
+// the larger buffer and copies while the old one is still owned, which is the
+// transient the footprint estimate has to cover. This prints footprint vs the
+// measured resident/peak so the estimate can be checked against reality.
+TEST_CASE("cuvs_index_cache build peak when a list outgrows its 32-row capacity", "[vss]")
+{
+  namespace mem = cucascade::memory;
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  auto* gpu_space = const_cast<mem::memory_space*>(manager->get_memory_space(mem::Tier::GPU, 0));
+  REQUIRE(gpu_space != nullptr);
+  auto* adaptor = gpu_space->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(adaptor != nullptr);
+
+  constexpr cudf::size_type dim   = 3;
+  constexpr std::uint32_t n_lists = 1;
+
+  std::vector<float> a(32 * dim);
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    a[i] = static_cast<float>(i);
+  }
+  std::vector<float> const b(1 * dim, 1.0f);
+  auto batch_a = make_float_list(a, 32, dim);  // fills the list to its 32-row capacity
+  auto batch_b = make_float_list(b, 1, dim);   // the 33rd row forces resize_list to grow it
+
+  std::int64_t const n_rows   = 33;
+  std::size_t const footprint = sirius::vss::ivf_flat_reservation_bytes(n_rows, dim, n_lists);
+
+  auto reservation = cache.reserve_index_memory(footprint, /*preferred_gpu=*/0);
+  REQUIRE(reservation != nullptr);
+  rmm::cuda_stream build_stream;
+  auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+
+  auto handle = sirius::vss::build_ivf_flat_index_from_batches({batch_a->view(), batch_b->view()},
+                                                               dim,
+                                                               n_lists,
+                                                               Metric::L2SqrtExpanded,
+                                                               gpu_space->get_default_allocator(),
+                                                               build_stream.view());
+
+  std::size_t const resident = adaptor->get_allocated_bytes(build_stream.view());
+  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream.view());
+  adaptor->reset_stream_reservation(build_stream.view());
+
+  REQUIRE(handle != nullptr);
+  WARN("footprint=" << footprint << " resident=" << resident << " peak=" << peak);
+  CHECK(peak >= resident);
+  // The growth path is exercised (a list reallocated past its 32-row capacity) and
+  // the reservation covers the build peak.
+  CHECK(footprint >= peak);
+}
+
+// The low-dim / many-rows-per-list case that a naive 2x-vectors estimate misses:
+// one list, 1,000,000 rows at dim 3, fed as ten equal 100k batches. The final extend
+// keeps the 900k-row old list buffer while allocating the 1M-row replacement, so the
+// list buffers alone peak near (900k + 1M) * (4*dim + 8) = 38,000,000 bytes. The
+// row-id and clone-and-replace terms in ivf_flat_reservation_bytes are what keep the
+// reservation above that peak here; a formula that only doubled the vector floats
+// would fall below it.
+TEST_CASE("cuvs_index_cache reservation covers the build peak for a large low-dim list", "[vss]")
+{
+  namespace mem = cucascade::memory;
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  auto* gpu_space = const_cast<mem::memory_space*>(manager->get_memory_space(mem::Tier::GPU, 0));
+  REQUIRE(gpu_space != nullptr);
+  auto* adaptor = gpu_space->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(adaptor != nullptr);
+
+  constexpr cudf::size_type dim = 3;
+  constexpr std::uint32_t n_lists = 1;
+  constexpr cudf::size_type per   = 100000;
+  constexpr int n_batches         = 10;
+
+  // Build the ten source batches; keep the columns alive for the whole build.
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  std::vector<cudf::column_view> batches;
+  cols.reserve(n_batches);
+  batches.reserve(n_batches);
+  for (int c = 0; c < n_batches; ++c) {
+    std::vector<float> vals(static_cast<std::size_t>(per) * dim);
+    for (std::size_t i = 0; i < vals.size(); ++i) {
+      vals[i] = static_cast<float>(static_cast<std::size_t>(c) * per + i / dim);
+    }
+    cols.push_back(make_float_list(vals, per, dim));
+    batches.push_back(cols.back()->view());
+  }
+
+  std::int64_t const n_rows   = static_cast<std::int64_t>(per) * n_batches;  // 1,000,000
+  std::size_t const footprint = sirius::vss::ivf_flat_reservation_bytes(n_rows, dim, n_lists);
+
+  auto reservation = cache.reserve_index_memory(footprint, /*preferred_gpu=*/0);
+  REQUIRE(reservation != nullptr);
+  rmm::cuda_stream build_stream;
+  auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+
+  auto handle = sirius::vss::build_ivf_flat_index_from_batches(batches,
+                                                               dim,
+                                                               n_lists,
+                                                               Metric::L2SqrtExpanded,
+                                                               gpu_space->get_default_allocator(),
+                                                               build_stream.view());
+
+  std::size_t const resident = adaptor->get_allocated_bytes(build_stream.view());
+  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream.view());
+  adaptor->reset_stream_reservation(build_stream.view());
+
+  REQUIRE(handle != nullptr);
+  WARN("footprint=" << footprint << " resident=" << resident << " peak=" << peak);
+  CHECK(footprint >= peak);
+}
+
 TEST_CASE("cuvs_index_cache erase_by_column drops the matching index before a rebuild", "[vss]")
 {
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
