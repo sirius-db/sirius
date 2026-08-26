@@ -857,20 +857,14 @@ late_mat_outcome install_late_materialization(op::scan::sirius_gpu_scan_operator
   }
   if (scan_op.get_ingestible().has_row_filter()) {
     // A filtered batch is no longer the chunk's rows in order, so the rowid has
-    // to come from the survivor positions the filter produced. That only works
-    // where the filter runs where we can see it — post-serve, over a whole
-    // served chunk. A COMPRESSED chunk is filtered inside the fused decode
-    // instead, and those survivors never reach the scan's output path, so a
-    // pin with any compressed chunk is refused rather than guessed at.
-    bool const compressed_chunks =
-      std::any_of(entry.device_chunks.begin(), entry.device_chunks.end(), [](auto const& chunk) {
-        return chunk.compressed != nullptr;
-      });
-    if (compressed_chunks) {
-      return decline(
-        "the scan restricts rows and its pin is compressed, so the surviving rows are decided "
-        "inside the decode");
-    }
+    // to come from the survivor positions the filter produced. A COMPRESSED
+    // chunk may be restricted twice — inside the fused decode and again by
+    // whatever conjuncts the decode could not carry — and both stages report
+    // their survivors: the decode through pushdown_outcome::survivor_rows,
+    // requested per split by late_mat_wants_survivors, and the residual through
+    // post_filter_and_project. The scan composes them
+    // (sirius_gpu_scan_operator's compose_survivors) and throws rather than
+    // guess if a compaction arrives unaccounted for.
     if (!entry.host_chunks.empty()) {
       return decline("the scan restricts rows and its pin is host-tier");
     }
