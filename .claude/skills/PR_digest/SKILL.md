@@ -144,10 +144,17 @@ For every key change, in this order:
 **What it does.** Plain description of the new feature/fix/modified class — write for someone
 unfamiliar with this part of the codebase, not for the PR author.
 
-**Why.** Pull from the PR description or code comments wherever they state it. If it's genuinely
-not stated, say so explicitly ("not stated in the PR description; best guess: ...") — never
-present a guess as a confirmed fact.
+**Why.** Pull from the PR description or code comments wherever they state it, and label every
+causal claim and failure mode by its evidence:
 
+- **Author-stated** — quoted from the PR body, a commit message, or a review comment. Keep it
+  quoted and attributed; never paraphrase it into the digest's own voice as established fact.
+- **Traced** — you read the code (in-diff or related) that shows it.
+- **Unverified** — neither stated by the author nor traced. List it under "Not covered in this
+  pass", phrased as "I did not check X". It must not appear in the opening summary.
+
+If the why is genuinely not stated, say so explicitly ("not stated in the PR description; best
+guess: ...") — never present a guess as a confirmed fact.
 **Where it's invoked.** The call chain from a recognizable entry point down to this
 function/class. Write this as a nested markdown bullet list with `→` for the tree structure —
 **never inside a triple-backtick fence**, because fenced code blocks don't render markdown links,
