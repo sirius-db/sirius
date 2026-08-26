@@ -177,14 +177,54 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
 /// microbench.
 constexpr double kMaskRouteMaxDensity = 0.35;
 
-std::unique_ptr<cudf::column> require_non_null(std::unique_ptr<cudf::column> col)
+/// Reattach a compressed chunk's stripped validity to a decoded column that
+/// holds only the rows @p selection selected.
+///
+/// The sidecar's bitmask spans every row of the chunk while the decode returned
+/// the selected ones alone, so bit i of the result is bit `local_indices[i]` of
+/// the stored mask. Copying it verbatim would pair each value with some other
+/// row's validity. The all-valid and all-null shapes carry no bitmask and need
+/// no gather.
+void attach_selected_validity(cudf::column& col,
+                              simpatico::validity_sidecar const& validity,
+                              batch_selection const& selection,
+                              std::int64_t source_rows,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr)
 {
-  // None of these routes gathers a validity mask alongside the values, so a
-  // nullable column would come back with someone else's nulls.
-  if (col && col->null_count() != 0) {
-    throw std::runtime_error("late_mat::materialize: nullable origin columns are not supported");
+  if (validity.kind == simpatico::validity_kind::all_valid) { return; }
+
+  auto const count = col.size();
+  if (static_cast<std::int64_t>(count) != selection.survivors) {
+    throw std::runtime_error(
+      "late_mat::materialize: a compacted decode returned a row count the selection did not ask "
+      "for, so its validity cannot be aligned");
   }
-  return col;
+  if (validity.kind == simpatico::validity_kind::all_null) {
+    col.set_null_mask(cudf::create_null_mask(count, cudf::mask_state::ALL_NULL, stream, mr), count);
+    return;
+  }
+
+  auto const needed =
+    cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(source_rows));
+  if (validity.mask.size() < needed) {
+    throw std::runtime_error(
+      "late_mat::materialize: the stored validity mask is too small for the chunk's rows");
+  }
+  if (selection.local_indices.size() < static_cast<std::size_t>(count) * sizeof(std::int32_t)) {
+    throw std::runtime_error(
+      "late_mat::materialize: the selection carries no row list to gather validity by");
+  }
+
+  auto out = cudf::create_null_mask(count, cudf::mask_state::UNINITIALIZED, stream, mr);
+  gather_validity_bits(static_cast<std::uint32_t const*>(validity.mask.data()),
+                       static_cast<std::int32_t const*>(selection.local_indices.data()),
+                       static_cast<std::int64_t>(count),
+                       static_cast<std::uint32_t*>(out.data()),
+                       stream);
+  auto const nulls =
+    cudf::null_count(static_cast<cudf::bitmask_type const*>(out.data()), 0, count, stream);
+  col.set_null_mask(std::move(out), nulls);
 }
 
 /// One compressed batch, by the cheapest route its plan can take.
@@ -201,12 +241,13 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
   auto const& table = source.compressed->table();
   auto const idx    = source.column_index;
 
-  // Whole batch live: no selection to express, so this is an ordinary decode.
+  // Whole batch live: no selection to express, so this is an ordinary decode,
+  // which reattaches the column's validity itself.
   if (selection.dense) {
     std::string err;
     auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
     if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
-    return require_non_null(std::move(full));
+    return full;
   }
 
   auto const rows = selection.rows.view();
@@ -216,8 +257,12 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
   // measured — it is the capability fallback below, not the faster one.
   {
     std::string err;
-    auto sparse = simpatico::decompress_column_rows(table, idx, rows, stream, mr, &err);
-    if (sparse) { return require_non_null(std::move(sparse)); }
+    simpatico::validity_sidecar const* validity = nullptr;
+    auto sparse = simpatico::decompress_column_rows(table, idx, rows, stream, mr, &err, &validity);
+    if (sparse) {
+      attach_selected_validity(*sparse, *validity, selection, source.num_rows, stream, mr);
+      return sparse;
+    }
   }
 
   // (b) Mask route: the shipped kernels, for the shapes with no random access
@@ -243,17 +288,22 @@ std::unique_ptr<cudf::column> materialize_compressed(batch_source const& source,
                                          rows.num_survivors,
                                          static_cast<std::uint32_t*>(chunk_offsets.data())};
     std::string err;
-    auto compacted = simpatico::decompress_column_compacted(table, idx, mask, stream, mr, &err);
-    if (compacted) { return require_non_null(std::move(compacted)); }
+    simpatico::validity_sidecar const* validity = nullptr;
+    auto compacted =
+      simpatico::decompress_column_compacted(table, idx, mask, stream, mr, &err, &validity);
+    if (compacted) {
+      attach_selected_validity(*compacted, *validity, selection, source.num_rows, stream, mr);
+      return compacted;
+    }
   }
 
-  // (c) The route that always works: decode everything, gather once.
+  // (c) The route that always works: decode everything, gather once. The full
+  // decode carries the column's validity and the gather propagates it.
   std::string err;
   auto full = simpatico::decompress_column_full(table, idx, stream, mr, &err);
   if (!full) { throw std::runtime_error("late_mat::materialize: full decode failed: " + err); }
-  auto checked = require_non_null(std::move(full));
   return gather_one(
-    checked->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
+    full->view(), int32_map(selection.local_indices, selection.survivors), stream, mr);
 }
 
 /// A batch's surviving rows, as a column of its own.
