@@ -293,15 +293,21 @@ partition_strategy sirius_physical_dense_count_join::get_partition_strategy(
   }
   uint64_t const total_bytes = in.combined_total_bytes;
 
+  auto const wanted = std::max(uint64_t{1},
+                               total_bytes / bytes_per_partition +
+                                 static_cast<uint64_t>(total_bytes % bytes_per_partition != 0));
   auto num_partitions =
-    static_cast<int>(std::max(uint64_t{1},
-                              total_bytes / bytes_per_partition +
-                                static_cast<uint64_t>(total_bytes % bytes_per_partition != 0)));
+    static_cast<int>(std::min(wanted, static_cast<uint64_t>(std::numeric_limits<int>::max())));
 
   int const min_parts = partition_min_num_partitions(_num_gpus);
   // For multi-gpu execution, there is a balance between doing any partitioning (added compute) vs
   // distributing the load across more GPUs. This is a rough heuristic threshold to determine if we
   // would rather share the load or avoid partitioning which adds compute.
+  //
+  // Deliberately the unscaled hash_partition_bytes, not bytes_per_partition: the target above sizes
+  // partitions when their count is ours to choose, which is the single-GPU case. Once there is more
+  // than one GPU, spreading the load wins over larger partitions, so the floor engages six times
+  // earlier than the target alone would.
   if (min_parts > 1 && total_bytes >= _hash_partition_bytes) {
     num_partitions = std::max(num_partitions, min_parts);
   }
@@ -333,10 +339,23 @@ std::optional<task_creation_hint> sirius_physical_dense_count_join::get_next_tas
       return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
     }
   }
-  if (_current_partition_index < partition_count()) {
-    return task_creation_hint{TaskCreationHint::READY, this};
-  }
+  if (has_pending_partition()) { return task_creation_hint{TaskCreationHint::READY, this}; }
   return std::nullopt;
+}
+
+bool sirius_physical_dense_count_join::has_pending_partition()
+{
+  auto const* preserved_port = get_port(PRESERVED_PORT);
+  auto const* counted_port   = get_port(COUNTED_PORT);
+  auto const num_partitions  = partition_count();
+  for (auto idx = _current_partition_index; idx < num_partitions; ++idx) {
+    for (auto const* input_port : {preserved_port, counted_port}) {
+      if (input_port != nullptr && input_port->repo != nullptr && !input_port->repo->empty(idx)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::get_next_task_input_data()

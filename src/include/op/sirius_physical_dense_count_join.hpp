@@ -108,7 +108,8 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    * @param max_bins_bytes Budget for one partition task's direct-address histograms; the runtime
    *        density and input-size gates may still select sparse aggregation below it
    * @param hash_partition_bytes Configured per-partition byte target; get_partition_strategy
-   *        doubles it because one task of this operator holds a partition of both inputs
+   *        scales it up, because one task of this operator holds a partition of both inputs and
+   *        this operator only ever sees narrow tables
    */
   sirius_physical_dense_count_join(
     duckdb::vector<sirius::logical_type> types,
@@ -195,9 +196,11 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   /**
    * @brief Decide how many partitions the upstream PARTITIONs should produce
    *
-   * Sizes from both inputs combined, since one task holds a partition of each side, and uses twice
-   * the configured `hash_partition_bytes` as both the per-partition target and the small-table
-   * threshold. Never broadcasts and never drives BUILD_PROBE.
+   * Sizes from both inputs combined, since one task holds a partition of each side. The
+   * per-partition target is a multiple of the configured `hash_partition_bytes`, because this
+   * operator sees only narrow tables and aggregates as it goes; the multi-GPU floor engages at the
+   * unscaled `hash_partition_bytes`, so spreading across GPUs wins over larger partitions once
+   * there is that much input. Never broadcasts and never drives BUILD_PROBE.
    *
    * @param in What the sizing partition measured, including both siblings' byte totals
    * @return The partition count to apply to both input PARTITIONs
@@ -246,6 +249,11 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   /// Number of partitions decided by get_partition_strategy, mirrored from the input repositories.
   /// One until sizing runs.
   [[nodiscard]] std::size_t partition_count() const;
+
+  /// Whether any partition at or after the cursor still holds input, so a READY hint always
+  /// precedes a real task. The cursor alone cannot say: it only advances when a task is created,
+  /// and task creation stops as soon as the repositories drain.
+  [[nodiscard]] bool has_pending_partition();
 
   std::size_t _preserved_key_idx;
   std::size_t _counted_key_idx;
