@@ -435,6 +435,51 @@ fn merge_exchange_overrides(
     Ok(overrides)
 }
 
+/// The wire types a partial aggregation's state columns leave the fragment with.
+pub(crate) struct PartialStateColumns {
+    /// Output-row index of the first state column (= the grouping-key count).
+    pub first: usize,
+    /// Modeled wire type per measure, in measure order.
+    pub types: Vec<substrait::proto::Type>,
+}
+
+/// Computes the partial-state wire types for a fragment whose root is a partial aggregation.
+///
+/// The sender-side mirror of [`merge_exchange_overrides`]: a partial fragment's state columns
+/// intentionally leave in the modeled wire types (see `partial_state`), not the FE's
+/// intermediate slot types, and the receiving exchange overrides its declared stream the same
+/// way. Both ends consult the same pure function of the same FE thrift (function name +
+/// `ret_type`), so the sink conformance targets and the receiver's stream schema agree by
+/// construction.
+///
+/// Preorder puts the fragment root at `nodes[0]`; the width-preserving wrappers a root node can
+/// grow (conjunct filters, limit fetches) change neither which node is the root nor where its
+/// columns sit.
+pub(crate) fn partial_root_state_columns(plan: &TPlan) -> Result<Option<PartialStateColumns>> {
+    let Some(root) = plan.nodes.first() else {
+        return Ok(None);
+    };
+    if root.node_type != TPlanNodeType::AGGREGATION_NODE {
+        return Ok(None);
+    }
+    // A node without agg_node fails in translate_aggregation with its own error.
+    let Some(agg) = root.agg_node.as_ref() else {
+        return Ok(None);
+    };
+    if agg_phase::classify(root.node_id, root.node_type, agg)? != AggPhase::Partial {
+        return Ok(None);
+    }
+    let types = agg
+        .aggregate_functions
+        .iter()
+        .map(|measure| partial_state::wire_type(measure_function(measure)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(PartialStateColumns {
+        first: agg.grouping_exprs.as_deref().unwrap_or_default().len(),
+        types,
+    }))
+}
+
 /// Replaces a receiver exchange boundary with a read of the sender's output **stream**.
 ///
 /// The sender's rows are already on the GPU, parked in the engine as native batches. So the read
@@ -820,6 +865,31 @@ fn merge_projection(
             measure_type.clone(),
         ));
     }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples)
+}
+
+/// Wraps a data-stream-sink fragment's root in the sink conformance projection: one throwing
+/// cast per output column, positionally, to `declared` — the FE-declared wire type of that
+/// column (the caller overrides a partial aggregation's state columns to their modeled wire
+/// types first). Width, column order, and `row_tuples` all pass through, so partition-column
+/// indices resolved against the pre-conformance row stay valid.
+///
+/// The casts are emitted UNCONDITIONALLY. The translator's own type model is not
+/// engine-accurate for function results — the emitted plan claims `year(date)` has the FE's
+/// SMALLINT type while the consumer's binder resolves `year` from its own catalog and produces
+/// BIGINT — so a pass keyed on "translated type != declared type" would skip exactly the
+/// columns that need fixing. The consumer's binder folds a cast to a column's own type at
+/// bind, so already-conformant columns cost nothing.
+pub(crate) fn sink_conformance_projection(
+    input: TranslatedRel,
+    declared: &[substrait::proto::Type],
+) -> TranslatedRel {
+    let expressions = declared
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| expr_translator::cast_to(field_selection(index as i32), ty.clone()))
+        .collect();
     let row_tuples = input.row_tuples.clone();
     project_rel(input, expressions, row_tuples)
 }

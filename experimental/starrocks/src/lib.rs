@@ -57,6 +57,8 @@ mod prpc;
 mod prpc_client;
 mod result_encoder;
 mod result_store;
+#[cfg(all(test, feature = "sirius-engine"))]
+mod wire_type_parity;
 
 pub use brpc::BrpcServer;
 pub use compute_node_service::ExchangeIdentity;

@@ -377,6 +377,24 @@ impl PlanTranslator {
             _ => None,
         };
 
+        // Every data-stream-sink fragment leaves through a conformance projection to the wire
+        // row the receiver declares: the FE slot types of the sink row, with a partial
+        // aggregation's state columns overridden to their modeled wire types. The receiving
+        // hop's schema guard compares exactly these declared types against what the sink
+        // produces, and the translator cannot prove its own view of an expression's type is
+        // what the engine binds (a `year()` the FE declared SMALLINT binds BIGINT), so the
+        // projection is applied unconditionally; equal-type casts fold at bind. Result
+        // fragments render values as text by actual type and are left untouched.
+        if fragment
+            .output_sink
+            .as_ref()
+            .and_then(|sink| sink.stream_sink.as_ref())
+            .is_some()
+        {
+            let declared = declared_wire_types(fragment, &desc, &translated, plan)?;
+            translated = node_translator::sink_conformance_projection(translated, &declared);
+        }
+
         let (extension_urns, extensions) = registry.into_extensions();
         let substrait_plan = Plan {
             // Source the spec version from the `substrait` crate so it tracks the
@@ -487,6 +505,65 @@ impl ExtensionRegistry {
 /// Translates a StarRocks execution fragment using the default reusable translator.
 pub fn translate_fragment(params: &TExecPlanFragmentParams) -> Result<TranslatedPlan> {
     PlanTranslator::new().translate_fragment(params)
+}
+
+/// The wire types a data-stream-sink fragment must ship, one per output column: the FE-declared
+/// slot types of the sink row (or, for a fragment with explicit output expressions, the
+/// expressions' declared types), with a partial aggregation's state columns overridden to the
+/// modeled partial-state wire types the receiver also declares.
+fn declared_wire_types(
+    fragment: &starrocks_thrift::planner::TPlanFragment,
+    desc: &DescriptorTable,
+    translated: &node_translator::TranslatedRel,
+    plan: &starrocks_thrift::plan_nodes::TPlan,
+) -> Result<Vec<substrait::proto::Type>> {
+    let declared = if let Some(output_exprs) = fragment
+        .output_exprs
+        .as_ref()
+        .filter(|output_exprs| !output_exprs.is_empty())
+    {
+        // The sink row is the reprojected output-expression row, so its declared types are the
+        // expression roots'. No partial-state override here: the FE never reprojects a partial
+        // state through output expressions.
+        output_exprs
+            .iter()
+            .map(|expr| {
+                let root = expr.nodes.first().ok_or(TranslateError::MissingField {
+                    context: "fragment output expression",
+                    field: "nodes",
+                })?;
+                type_mapper::map_type_desc(&root.type_, root.is_nullable.unwrap_or(true))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let mut types = desc
+            .named_struct_for_tuples(&translated.row_tuples, None)?
+            .r#struct
+            .ok_or_else(|| TranslateError::malformed("sink row schema has no struct"))?
+            .types;
+        if let Some(states) = node_translator::partial_root_state_columns(plan)? {
+            let width = types.len();
+            for (index, ty) in states.types.iter().enumerate() {
+                let slot = types.get_mut(states.first + index).ok_or_else(|| {
+                    TranslateError::malformed(format!(
+                        "partial aggregation state column {} is outside the sink row \
+                         ({width} columns)",
+                        states.first + index
+                    ))
+                })?;
+                *slot = ty.clone();
+            }
+        }
+        types
+    };
+    if declared.len() != translated.output_width {
+        return Err(TranslateError::malformed(format!(
+            "fragment root emits {} columns but the sink declares {} wire types",
+            translated.output_width,
+            declared.len()
+        )));
+    }
+    Ok(declared)
 }
 
 /// Uses a simple slot-reference output expression as its root output name.

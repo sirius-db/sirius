@@ -2827,8 +2827,8 @@ fn two_phase_wire_types_agree_end_to_end() {
         ],
     );
     let partial = translate_fragment(&params(
-        Some(TPlan::new(vec![node, scan_node(0, 0)])),
-        Some(desc),
+        Some(TPlan::new(vec![node.clone(), scan_node(0, 0)])),
+        Some(desc.clone()),
         None,
     ))
     .unwrap();
@@ -2859,6 +2859,23 @@ fn two_phase_wire_types_agree_end_to_end() {
         .collect();
 
     assert_eq!(partial_kinds, merge_types);
+
+    // With a stream sink, the partial fragment's conformance cast targets are the sender-side
+    // rendering of the same wire types the merge fragment declares its stream with — the two
+    // ends of the hop, pinned to one another at translator level.
+    let mut sender_params = params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    );
+    attach_stream_sink(&mut sender_params, unpartitioned());
+    let sender = translate_fragment(&sender_params).unwrap();
+    let conformance_targets: Vec<_> = root_project(&sender.plan)
+        .expressions
+        .iter()
+        .map(|expr| kind_duckdb_name(cast_parts(expr).0))
+        .collect();
+    assert_eq!(conformance_targets, merge_types);
 }
 
 /// Verifies a partial-phase ("update serialize") aggregation translates to a plain aggregate
@@ -4562,14 +4579,8 @@ fn group_by_keys_that_do_not_pair_with_output_slots_are_rejected() {
     );
 }
 
-/// Attaches a data-stream sink with the given output partition to the fragment params.
-fn params_with_stream_sink(
-    plan: Option<TPlan>,
-    desc_tbl: Option<TDescriptorTable>,
-    output_exprs: Option<Vec<TExpr>>,
-    partition: TDataPartition,
-) -> TExecPlanFragmentParams {
-    let mut params = params(plan, desc_tbl, output_exprs);
+/// Attaches a data-stream sink with the given output partition to already-built params.
+fn attach_stream_sink(params: &mut TExecPlanFragmentParams, partition: TDataPartition) {
     params.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
         TDataSinkType::DATA_STREAM_SINK,
         TDataStreamSink::new(14, partition, None, None, None, None, None),
@@ -4588,7 +4599,23 @@ fn params_with_stream_sink(
         None,
         None,
     ));
+}
+
+/// Attaches a data-stream sink with the given output partition to the fragment params.
+fn params_with_stream_sink(
+    plan: Option<TPlan>,
+    desc_tbl: Option<TDescriptorTable>,
+    output_exprs: Option<Vec<TExpr>>,
+    partition: TDataPartition,
+) -> TExecPlanFragmentParams {
+    let mut params = params(plan, desc_tbl, output_exprs);
+    attach_stream_sink(&mut params, partition);
     params
+}
+
+/// The unpartitioned (gather) output partition most stream-sink tests use.
+fn unpartitioned() -> TDataPartition {
+    TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None)
 }
 
 /// The partial half of a grouped two-phase sum, the sender side of a hash-partitioned hop.
@@ -4697,6 +4724,406 @@ fn hash_partitioned_sink_with_output_exprs_is_rejected() {
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)), "{err:?}");
     assert!(err.to_string().contains("output_exprs"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Sink conformance: every data-stream-sink fragment leaves through a projection
+// of throwing casts to the FE-declared wire types (partial states excepted).
+// ---------------------------------------------------------------------------
+
+/// Builds a `year(<child>)` FUNCTION_CALL whose FE-declared type is `declared`.
+fn year_call(child: TExpr, declared: TTypeDesc) -> TExpr {
+    let mut node = base_expr_node(TExprNodeType::FUNCTION_CALL, declared.clone(), 1);
+    node.fn_ = Some(builtin_function("year", declared));
+    let mut nodes = vec![node];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Extracts the project relation a plan roots at, panicking on any other shape.
+fn root_project(plan: &substrait::proto::Plan) -> &substrait::proto::ProjectRel {
+    let rel::RelType::Project(project) = root(plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the fragment root to be a projection");
+    };
+    project
+}
+
+/// Renders a cast-target kind the way the engine declares a stream column, so cast targets can
+/// be compared against `StreamInputColumn::ty` strings.
+fn kind_duckdb_name(kind: &substrait::proto::r#type::Kind) -> String {
+    use substrait::proto::r#type::Kind;
+    match kind {
+        Kind::Varchar(_) => "VARCHAR".to_string(),
+        Kind::I16(_) => "SMALLINT".to_string(),
+        Kind::I32(_) => "INTEGER".to_string(),
+        Kind::I64(_) => "BIGINT".to_string(),
+        Kind::Fp64(_) => "DOUBLE".to_string(),
+        Kind::Date(_) => "DATE".to_string(),
+        Kind::Decimal(decimal) => format!("DECIMAL({},{})", decimal.precision, decimal.scale),
+        other => panic!("unmapped cast target kind {other:?}"),
+    }
+}
+
+/// A stream-sink fragment's root must be the conformance projection: one throwing cast per
+/// output column to the declared wire type — the FE key slot's VARCHAR and the sum's modeled
+/// I64 partial state — emitted after the input row, in input order.
+#[test]
+fn stream_sink_fragment_root_is_a_conformance_projection_of_throwing_casts() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(partial_grouped_sum_plan()),
+        Some(agg_desc()),
+        None,
+        unpartitioned(),
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["name", "total"]);
+    let project = root_project(&translated.plan);
+    assert_eq!(project.expressions.len(), 2);
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![2, 3]);
+    let (key_kind, key_input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(key_kind, substrait::proto::r#type::Kind::Varchar(_)),
+        "{key_kind:?}"
+    );
+    assert_eq!(field_index(key_input), 0);
+    let (state_kind, state_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(state_kind, substrait::proto::r#type::Kind::I64(_)),
+        "{state_kind:?}"
+    );
+    assert_eq!(field_index(state_input), 1);
+    let rel::RelType::Aggregate(_) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the partial aggregate under the conformance projection");
+    };
+}
+
+/// The q08/q09 leaf shape: a partial aggregation grouped by a projected `year()` column the FE
+/// declared SMALLINT. The translator's own type model already claims SMALLINT for the call while
+/// the engine binds BIGINT, so only an unconditional cast to the FE slot type fixes the hop —
+/// this pins that the conformance target for the expression key is I16.
+#[test]
+fn conformance_casts_an_expression_key_to_its_fe_slot_type() {
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None)],
+        vec![
+            slot(1, 0, "nation", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(3, 0, "amount", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(10, 1, "nation", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 1, "o_year", scalar_type(TPrimitiveType::SMALLINT)),
+            slot(12, 1, "amount", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(10, 2, "nation", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 2, "o_year", scalar_type(TPrimitiveType::SMALLINT)),
+            slot(22, 2, "sum_amount", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(10, slot_ref(1, 0, scalar_type(TPrimitiveType::VARCHAR)));
+    slot_map.insert(
+        11,
+        year_call(
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DATE)),
+            scalar_type(TPrimitiveType::SMALLINT),
+        ),
+    );
+    slot_map.insert(12, slot_ref(3, 0, scalar_type(TPrimitiveType::DOUBLE)));
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), None));
+
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(12, 1, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut aggregate = aggregation_node(
+        2,
+        2,
+        vec![
+            slot_ref(10, 1, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(11, 1, scalar_type(TPrimitiveType::SMALLINT)),
+        ],
+        vec![sum],
+    );
+    aggregate.agg_node.as_mut().unwrap().need_finalize = false;
+
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(TPlan::new(vec![aggregate, project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+        unpartitioned(),
+    ))
+    .unwrap();
+
+    let project = root_project(&translated.plan);
+    let targets: Vec<_> = project
+        .expressions
+        .iter()
+        .map(|expr| kind_duckdb_name(cast_parts(expr).0))
+        .collect();
+    assert_eq!(targets, vec!["VARCHAR", "SMALLINT", "DOUBLE"]);
+}
+
+/// A partial fragment's state columns are exempt from FE slot conformance: with the
+/// intermediate sum slot declared DECIMAL64(15,2), the cast target must still be the modeled
+/// FP64 wire type — the type the receiver declares its stream with — not the slot's decimal.
+#[test]
+fn conformance_exempts_partial_state_columns_from_fe_slot_types() {
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        Some(slot_ref(
+            1,
+            0,
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+        )),
+    );
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut aggregate = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![sum],
+    );
+    aggregate.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(
+                1,
+                0,
+                "price",
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            ),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(
+                30,
+                1,
+                "s",
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            ),
+        ],
+    );
+
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(TPlan::new(vec![aggregate, scan_node(0, 0)])),
+        Some(desc),
+        None,
+        unpartitioned(),
+    ))
+    .unwrap();
+
+    let project = root_project(&translated.plan);
+    assert_eq!(project.expressions.len(), 2);
+    let (key_kind, _) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(key_kind, substrait::proto::r#type::Kind::Varchar(_)),
+        "{key_kind:?}"
+    );
+    let (state_kind, _) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(state_kind, substrait::proto::r#type::Kind::Fp64(_)),
+        "the state column must conform to the modeled FP64 wire type, not the FE's \
+         DECIMAL64(15,2) slot: {state_kind:?}"
+    );
+}
+
+/// A merge fragment with a stream sink stacks the conformance projection over the finalizing
+/// merge projection, both casting the measures to the same FE output slot types in the same
+/// order — so the outer casts fold at bind and nothing is double-converted or reordered.
+#[test]
+fn merge_fragment_conformance_folds_over_merge_projection() {
+    let mut params = merge_fragment_params();
+    attach_stream_sink(&mut params, unpartitioned());
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params,
+            &[ExchangeInput {
+                node_id: 7,
+                stream_view: "sirius_stream_7".to_string(),
+                names: vec!["s".to_string(), "c".to_string()],
+            }],
+        )
+        .unwrap();
+
+    let conformance = root_project(&translated.plan);
+    let rel::RelType::Project(finalizing) = conformance
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the finalizing merge projection under the conformance projection");
+    };
+    for project in [conformance, finalizing] {
+        assert_eq!(project.expressions.len(), 2);
+        let (sum_kind, sum_input) = cast_parts(&project.expressions[0]);
+        assert!(
+            matches!(sum_kind, substrait::proto::r#type::Kind::Fp64(_)),
+            "{sum_kind:?}"
+        );
+        assert_eq!(field_index(sum_input), 0);
+        let (count_kind, count_input) = cast_parts(&project.expressions[1]);
+        assert!(
+            matches!(count_kind, substrait::proto::r#type::Kind::I64(_)),
+            "{count_kind:?}"
+        );
+        assert_eq!(field_index(count_input), 1);
+    }
+    let rel::RelType::Aggregate(_) = finalizing
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the merge aggregate under the finalizing projection");
+    };
+}
+
+/// Fragments without a data-stream sink are not conformed: a sink-less fragment and a
+/// RESULT_SINK fragment both keep their bare aggregate root (the result encoder renders values
+/// as text by actual type, so conformance there would buy nothing and change rendering).
+#[test]
+fn result_fragments_are_not_conformed() {
+    let assert_bare_aggregate_root = |params: &TExecPlanFragmentParams| {
+        let translated = translate_fragment(params).unwrap();
+        let root = root(&translated.plan);
+        let rel::RelType::Aggregate(_) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected a bare aggregate root, got {:?}", root.input);
+        };
+    };
+
+    let sink_less = params(Some(partial_grouped_sum_plan()), Some(agg_desc()), None);
+    assert_bare_aggregate_root(&sink_less);
+
+    let mut result_sink = params(Some(partial_grouped_sum_plan()), Some(agg_desc()), None);
+    result_sink.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
+        TDataSinkType::RESULT_SINK,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    assert_bare_aggregate_root(&result_sink);
+}
+
+/// A top-N sender's wire row is the sort tuple: the conformance projection sits above the
+/// FetchRel (so the limit selects rows before the casts) and targets the sort tuple's FE slot
+/// types.
+#[test]
+fn topn_sender_conforms_the_sort_tuple() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(TPlan::new(vec![sort_node_with(3, None), scan_node(0, 0)])),
+        Some(sort_fetch_desc()),
+        None,
+        unpartitioned(),
+    ))
+    .unwrap();
+
+    let project = root_project(&translated.plan);
+    assert_eq!(project.expressions.len(), 1);
+    let (kind, input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(kind, substrait::proto::r#type::Kind::I64(_)),
+        "{kind:?}"
+    );
+    assert_eq!(field_index(input), 0);
+    let rel::RelType::Fetch(fetch) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the top-N fetch under the conformance projection");
+    };
+    let rel::RelType::Sort(_) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the sort under the fetch");
+    };
+}
+
+/// A stream-sink fragment with explicit output expressions conforms to the expressions'
+/// declared types, not the underlying row's slot types.
+#[test]
+fn output_exprs_fragment_conforms_to_expr_declared_types() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(partial_grouped_sum_plan()),
+        Some(agg_desc()),
+        Some(vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))]),
+        unpartitioned(),
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_names, vec!["name"]);
+    let conformance = root_project(&translated.plan);
+    assert_eq!(conformance.expressions.len(), 1);
+    let (kind, input) = cast_parts(&conformance.expressions[0]);
+    assert!(
+        matches!(kind, substrait::proto::r#type::Kind::Varchar(_)),
+        "{kind:?}"
+    );
+    assert_eq!(field_index(input), 0);
+    let rel::RelType::Project(output_exprs) = conformance
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the output-expression projection under the conformance projection");
+    };
+    assert_eq!(output_exprs.expressions.len(), 1);
+}
+
+/// Hash-partition indices are resolved against the row layout the conformance projection
+/// preserves (position i maps to position i), so a hash-partitioned sender both conforms and
+/// keeps its partition columns.
+#[test]
+fn hash_partitioned_sink_keeps_partition_indices_under_conformance() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        Some(partial_grouped_sum_plan()),
+        Some(agg_desc()),
+        None,
+        TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))]),
+            None,
+            None,
+        ),
+    ))
+    .unwrap();
+
+    assert_eq!(translated.output_partition_columns, Some(vec![0]));
+    let project = root_project(&translated.plan);
+    assert_eq!(project.expressions.len(), 2);
+    let (key_kind, key_input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(key_kind, substrait::proto::r#type::Kind::Varchar(_)),
+        "{key_kind:?}"
+    );
+    assert_eq!(field_index(key_input), 0);
 }
 
 /// Builds a SORT_NODE over sort tuple 1 carrying `limit` and `offset`, sorting on the single
