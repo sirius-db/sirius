@@ -191,6 +191,30 @@ This can also be done in the Web UI by clicking on the stack icon (next to the P
 in the top left of the PR page). There you can see the full stack of PRs, and an option to add
 to the stack.
 
+**Collaborating with existing stacks**
+
+Any Maintainer can use `gh stack checkout <PR-number>` to check out an existing stack to contribute
+code or to manage the stack during the "bottom-up" merge process.
+
+**Managing conflicts**
+
+During active development of the stack, always use `gh stack rebase` to manage conflicts with `dev`
+or between your stacked layers. If you have submitted your stack, run `gh stack submit` to push
+these changes to the repo and open PRs.
+
+Conflicts can also occur while merging "bottom-up" as described below. The two-step process above
+can be shortened to `gh stack sync --prune` during merging to handle the merge conflicts between
+the stack layers as they are merged.
+
+**Rebase stack notifications**
+
+GitHub's support for stacked PRs includes a "Rebase stack" option in the Web UI when the target base
+(usually `dev`) has moved forward; it is not recommended to use this method.
+
+**NOTE:** CI and the merge queue both test the combined merge commit of the PR and the latest
+`dev` before merging. Rebasing is not necessary unless there is a conflict. If you have a conflict,
+follow the instructions in **Managing conflicts**.
+
 **Unstacking PRs**
 
 Sometimes it may be necessary to unstack PRs. This can be done in the CLI with
@@ -212,26 +236,28 @@ bottom-up merging method in this repo.
 
 **Merging bottom-up**
 
-Steps 1-4 and 7 only need GitHub, so any maintainer with merge permission can do them, not just
-the stack's author. Steps 5-6 need the stack's actual local checkout (where `gh-stack` tracks the
-stack), so only whoever has that clone, normally the author, can do them. If you're merging
-someone else's stack, do steps 1-4, then ping the author to run steps 5-6 before you continue.
+Steps 1-4 and 7 only need GitHub Web UI, so any maintainer with merge permission can do them,
+not just the stack's author. Steps 5-6 need a local checkout with the stack tracked to manage
+(see **Managing a stack** above).
 
-1. Open the bottom-most unmerged PR of the stack (the stack
-   panel on any PR in it, click the `N/M` badge next to the PR title, shows the whole stack in
-   order).
-2. Confirm it's approved and its required checks have passed.
-3. Click **"Enqueue pull request"** on that PR's own page to
+1. ***Web UI*** - Open the bottom-most unmerged PR of the stack (the stack panel on any PR in it,
+   click the `N/M` badge next to the PR title, shows the whole stack in order).
+2. ***Web UI*** - Confirm it's approved and its required checks have passed.
+3. ***Web UI*** - Click **"Enqueue pull request"** on that PR's own page to
    merge just that one PR. Do not click "Enqueue stack" (this is only on the top-most layer of
    the stack) and don't use `gh stack merge`.
-4. Wait for it to clear the merge queue and merge to `dev`.
-5. **(Stack author)** Run `gh stack sync --prune` to rebase the
-   remaining branches onto the updated `dev` and clean up local branches for the merged PR.
-6. **(Stack author)** Confirm it worked via `gh stack view`: the
-   merged layer should show a ✓ under a `╌╌╌ merged ╌╌╌` marker, and the remaining branches
-   shouldn't show a `⚠` warning icon. If they still do, repeat step 5.
-7. Back in the web UI, open the new bottom-most unmerged PR
-   and repeat from step 2, until the whole stack is merged.
+4. ***Web UI*** - Wait for it to clear the merge queue and merge to `dev`. GitHub automatically
+   retargets the next layer's base to `dev` once the branch it was targeting is deleted; no
+   manual action is needed for the retargeting.
+5. ***GH CLI*** - If the next layer's PR now shows "This branch has conflicts that must be
+   resolved" / "Unable to merge", run `gh stack sync --prune` to rebase the remaining branches
+   onto the updated `dev` and clean up local branches for the merged PR. Always resolve stack
+   conflicts via the CLI.
+6. ***GH CLI*** - Confirm it worked via `gh stack view`: the merged layer should show a `✓` under
+   a `╌╌╌ merged ╌╌╌` marker, and the remaining branches shouldn't show a `⚠` warning icon. If
+   they still do, repeat **step 5**.
+7. ***Web UI*** - Open the new bottom-most unmerged PR and repeat from **step 2**, until the whole
+   stack is merged.
 
 Our goal is to automate this process in the future; however, this is the current merge method
 that works with our repo's merge queue settings.
