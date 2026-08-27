@@ -1,0 +1,94 @@
+# Sirius config for RTX PRO 6000 Blackwell (96 GB) on a g-class EC2 instance
+# (8 vCPU, 62 GB RAM, nvme1n1 local store at /mnt/datasets).
+#
+# Derived from bench/sf1000-repro/sirius-sf1000.yaml (GB300 / 256 GB HBM baseline).
+#
+# Key deltas vs GB300:
+#   GPU VRAM       256 GB  -> 96 GB   (~3/8)
+#   Host RAM       471 GB  -> 62 GB   (~1/8)
+#   CPU cores       72     -> 8
+#   scan_task_batch_size  8 GB -> 4 GB
+#   hash_partition/build  32 GB -> 12 GB (~12% of VRAM)
+#   concat_batch          5 GB -> 4 GB
+#   scan_manager.num_threads 18 -> 4
+#   pipeline.num_threads  8  -> 6
+#
+# Disk spill goes to the fast local NVMe (/mnt/datasets on nvme1n1, 1.7 TB)
+# instead of root EBS. Measured 2026-08-24.
+sirius:
+    topology:
+        num_gpus: 1
+    memory:
+        gpu:
+            # The fraction is applied to cudaMemGetInfo *total* (101.98 GB here)
+            # and RMM reserves the whole pool eagerly at startup, so this is a
+            # hard up-front allocation rather than a ceiling. Measured on this
+            # card: a bare CUDA probe tops out at 101.18 GB (0.992), 0.95 comes
+            # up with a peak of 93033 MiB resident, 0.908 with 88917 MiB.
+            #
+            # 0.908 rather than 0.95 because the paired spill-compression config
+            # (sirius-rtx6000-spill.yaml) has to give 4 GiB back to the
+            # compression arena, and that arena is a partition of the device, not
+            # extra memory. Both arms run at 0.908 so the query pool is the same
+            # size in each and the A/B measures compression, not pool size. For a
+            # standalone (non-A/B) run on this box, 0.95 is fine.
+            #
+            # If you see `bad_alloc ... failed to allocate <~half the card>` at
+            # startup, the cause is almost certainly a redundant `LOAD` of the
+            # extension: build/release/duckdb has Sirius statically linked and
+            # initialises it at startup, so an explicit LOAD builds a SECOND pool
+            # of the same size and the pair cannot fit. Do not lower this fraction
+            # to work around that -- just drop the LOAD. (The Python harness uses
+            # a duckdb module, where the LOAD is correct and creates one pool.)
+            usage_limit_fraction: 0.908
+            reservation_limit_fraction: 0.9
+            downgrade_trigger_fraction: 0.9
+            downgrade_stop_fraction: 0.85
+        host:
+            # The host tier is *pinned* memory (numa_region_pinned_host_memory_resource)
+            # and cannot be reclaimed by the kernel, so this ceiling has to leave real
+            # room for DuckDB, Python and the parquet page cache on a 62 GB box.
+            # 40 GB ceiling; initial_number_pools * pool_size * block_size
+            # = 32 * 8 * 64 MB = 16.4 GB is pinned eagerly at startup, the rest grows
+            # on demand. (52 GB / 50 pools left only ~10 GB of headroom and drew the
+            # OOM killer during startup probing.)
+            capacity_bytes: 40000000000      # 40 GB
+            initial_number_pools: 32         # 16.4 GB pinned up front
+            pool_size: 8
+            block_size: 67108864             # 64 MB
+        disk:
+            disk_id: 0
+            capacity_bytes: 1000000000000    # 1 TB
+            downgrade_root_dirs: "/mnt/datasets/sirius_spill"
+    executor:
+        scan_manager:
+          memory_prefetcher:
+            enable: true
+            num_threads: 3
+          num_threads: 4
+          use_sirius_datasource: true
+          uring_n_reactors: 2
+          enable_prefetch_cache: false
+        pipeline:
+            num_threads: 6
+        downgrade:
+            num_threads: 1
+        task_creator:
+            num_threads: 2
+    operator_params:
+        scan_task_batch_size: 4GB
+        max_sort_partition_bytes: 0          # 0: auto (33% GPU memory, ~16 GB)
+        hash_partition_bytes: 12GB
+        concat_batch_bytes: 4GB
+        max_build_hash_table_bytes: 12GB
+    compression:
+        # Baseline arm: spill compression off. The 4 GiB the compression arena would
+        # take is already deducted from memory.gpu.usage_limit_fraction above so that
+        # both arms run with identical query memory and the A/B isolates compression
+        # rather than pool size. bench/compress-spills-v2/sirius-rtx6000-spill.yaml
+        # is this file with enable_spill_compression/device_pool_bytes turned on.
+        enable_spill_compression: false
+    telemetry:
+        enable_quent: false
+        output_directory: telemetry_data
+        engine_name: siriusDB
