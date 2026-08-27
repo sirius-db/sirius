@@ -15,7 +15,6 @@
  */
 
 #include "late_mat/host_gather_policy.hpp"
-
 #include "late_mat/multi_source_gather.hpp"
 #include "log/logging.hpp"
 
@@ -24,10 +23,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
-#include <atomic>
 #include <optional>
 #include <random>
 #include <system_error>
@@ -130,9 +129,9 @@ host_gather_policy run_probe()
   };
   auto const max_ids = ids_at(1.0);
 
-  auto* device_buffer  = arena.device_alloc(kProbeBytes);
-  auto* device_out     = arena.device_alloc(static_cast<std::size_t>(max_ids) * kProbeElem);
-  auto* device_ids     = arena.device_alloc(static_cast<std::size_t>(max_ids) * sizeof(std::uint64_t));
+  auto* device_buffer = arena.device_alloc(kProbeBytes);
+  auto* device_out    = arena.device_alloc(static_cast<std::size_t>(max_ids) * kProbeElem);
+  auto* device_ids = arena.device_alloc(static_cast<std::size_t>(max_ids) * sizeof(std::uint64_t));
   auto* device_blocks  = arena.device_alloc(kProbeBlocks * sizeof(void*));
   auto* device_scalars = arena.device_alloc(4 * sizeof(std::int64_t));
   auto* device_bases   = arena.device_alloc(sizeof(void*));
@@ -266,7 +265,8 @@ host_gather_policy run_probe()
   }
   if (multiplier_dev > 0.0F && multiplier_host > 0.0F) {
     auto const ratio = static_cast<double>(multiplier_host) / static_cast<double>(multiplier_dev);
-    policy.cost_multiplier = std::clamp<std::int64_t>(static_cast<std::int64_t>(ratio + 0.5), 1, 64);
+    policy.cost_multiplier =
+      std::clamp<std::int64_t>(static_cast<std::int64_t>(ratio + 0.5), 1, 64);
   }
 
   SIRIUS_LOG_INFO(

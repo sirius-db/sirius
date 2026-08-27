@@ -75,8 +75,7 @@ struct host_gather_policy {
 /// SIRIUS_EXP_LATE_MAT_HOST_INPLACE_MAX_DENSITY overrides the measured
 /// crossover; setting it to 1 forces in place and 0 forces staging, which is how
 /// a route can be pinned for a measurement or a test.
-[[nodiscard]] bool prefer_inplace_host_gather(std::int64_t selected_rows,
-                                              std::int64_t total_rows);
+[[nodiscard]] bool prefer_inplace_host_gather(std::int64_t selected_rows, std::int64_t total_rows);
 
 /// How many host-tier materializations have taken each route.
 ///
