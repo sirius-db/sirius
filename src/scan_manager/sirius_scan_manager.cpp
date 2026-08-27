@@ -27,6 +27,7 @@
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "late_mat/host_gather_policy.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"

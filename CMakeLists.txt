@@ -258,6 +258,7 @@ set(EXTENSION_SOURCES
     src/planner/late_mat_plan_pass.cpp
     src/scan_manager/late_mat_resolver.cpp
     src/late_mat/multi_source_gather.cu
+    src/late_mat/host_gather_policy.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp

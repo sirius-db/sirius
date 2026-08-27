@@ -17,6 +17,7 @@
 #include "late_mat/materialize.hpp"
 
 #include "compression/compressed_representation.hpp"
+#include "late_mat/host_gather_policy.hpp"
 #include "late_mat/multi_source_gather.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -99,6 +100,117 @@ rmm::device_buffer to_device(std::vector<T> const& values,
   cudaMemcpyAsync(
     buf.data(), values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice, stream.value());
   return buf;
+}
+
+/// Copy @p bytes of a host chunk, starting at logical offset @p offset over its
+/// blocks, into @p dest on the device. The blocks are not contiguous with one
+/// another, so the copy splits wherever it crosses one.
+void stage_host_range(host_blocked_buffers const& host,
+                      std::size_t offset,
+                      std::size_t bytes,
+                      void* dest,
+                      rmm::cuda_stream_view stream)
+{
+  std::size_t copied = 0;
+  while (copied < bytes) {
+    auto const at        = offset + copied;
+    auto const block     = at / host.block_size;
+    auto const within    = at % host.block_size;
+    auto const available = host.block_size - within;
+    auto const chunk     = std::min(available, bytes - copied);
+    if (block >= host.blocks.size()) {
+      throw std::runtime_error("late_mat::materialize: a host chunk is shorter than its column");
+    }
+    cudaMemcpyAsync(static_cast<char*>(dest) + copied,
+                    static_cast<char const*>(host.blocks[block]) + within,
+                    chunk,
+                    cudaMemcpyHostToDevice,
+                    stream.value());
+    copied += chunk;
+  }
+}
+
+/// The staging route: copy each host chunk's column to the device in bulk, then
+/// gather there.
+///
+/// Wins once the selection is dense enough that scattered reads over the link
+/// cost more than moving the whole column across it once. Where that crossover
+/// sits is a property of the link and is measured rather than assumed; see
+/// host_gather_policy.hpp. The bytes moved here are the ones the query would
+/// have moved anyway had the column never been deferred.
+std::unique_ptr<cudf::column> materialize_host_staged(pinned_column_view const& column,
+                                                      prepared_selection const& selection,
+                                                      rmm::cuda_stream_view stream,
+                                                      rmm::device_async_resource_ref mr)
+{
+  auto const& ids      = selection.ids();
+  auto const elem_size = cudf::size_of(column.dtype);
+
+  std::vector<rmm::device_buffer> staged_data;
+  std::vector<rmm::device_buffer> staged_masks;
+  std::vector<void const*> bases;
+  std::vector<cudf::bitmask_type const*> masks;
+  std::vector<std::int64_t> starts;
+  staged_data.reserve(column.batches.size());
+  staged_masks.reserve(column.batches.size());
+  bool any_nullable = false;
+
+  for (std::size_t batch = 0; batch < column.batches.size(); ++batch) {
+    auto const* host = column.batches[batch].host.get();
+    if (host == nullptr) {
+      throw std::runtime_error("late_mat::materialize: a host-tier column mixes storage forms");
+    }
+    auto const rows  = static_cast<std::size_t>(column.batches[batch].num_rows);
+    auto const bytes = rows * elem_size;
+    rmm::device_buffer data(bytes, stream, mr);
+    if (bytes > 0) { stage_host_range(*host, host->data_offset, bytes, data.data(), stream); }
+    bases.push_back(data.data());
+    staged_data.push_back(std::move(data));
+
+    if (host->has_null_mask) {
+      any_nullable = true;
+      auto const mask_bytes =
+        cudf::bitmask_allocation_size_bytes(static_cast<cudf::size_type>(rows));
+      rmm::device_buffer mask(mask_bytes, stream, mr);
+      stage_host_range(*host, host->null_mask_offset, mask_bytes, mask.data(), stream);
+      masks.push_back(static_cast<cudf::bitmask_type const*>(mask.data()));
+      staged_masks.push_back(std::move(mask));
+    } else {
+      masks.push_back(nullptr);
+    }
+    starts.push_back(selection.layout().batch_row_start[batch]);
+  }
+
+  auto out = cudf::make_fixed_width_column(
+    column.dtype,
+    static_cast<cudf::size_type>(ids.count),
+    any_nullable ? cudf::mask_state::UNINITIALIZED : cudf::mask_state::UNALLOCATED,
+    stream,
+    mr);
+
+  auto const bases_dev  = to_device(bases, stream, mr);
+  auto const starts_dev = to_device(starts, stream, mr);
+  rmm::device_buffer masks_dev;
+  if (any_nullable) { masks_dev = to_device(masks, stream, mr); }
+
+  multi_source_gather_fixed(
+    static_cast<void const* const*>(bases_dev.data()),
+    static_cast<std::int64_t const*>(starts_dev.data()),
+    static_cast<int>(column.batches.size()),
+    elem_size,
+    ids.ids,
+    ids.count,
+    out->mutable_view().head<void>(),
+    any_nullable ? static_cast<std::uint32_t const* const*>(masks_dev.data()) : nullptr,
+    any_nullable ? reinterpret_cast<std::uint32_t*>(out->mutable_view().null_mask()) : nullptr,
+    stream);
+  if (any_nullable) {
+    out->set_null_count(cudf::null_count(
+      out->view().null_mask(), 0, static_cast<cudf::size_type>(ids.count), stream));
+  }
+  // The staged buffers are freed as this returns, stream-ordered on the same
+  // stream the gather was enqueued on.
+  return out;
 }
 
 /// The host-tier path: gather by global id straight out of the pinned blocks.
@@ -191,7 +303,15 @@ std::unique_ptr<cudf::column> materialize_raw(pinned_column_view const& column,
   auto const& ids = selection.ids();
 
   if (column.batches.front().is_host()) {
-    return materialize_host_raw(column, selection, stream, mr);
+    // Both routes produce the same values; which one is cheaper depends on how
+    // much of the pinned table the selection wants and on how the link handles
+    // scattered reads. The ids may repeat, so this density is an upper bound on
+    // the distinct fraction, which biases the choice towards staging — the
+    // route whose cost does not grow with the count.
+    bool const inplace = prefer_inplace_host_gather(ids.count, selection.layout().total_rows());
+    note_host_gather_route(inplace);
+    return inplace ? materialize_host_raw(column, selection, stream, mr)
+                   : materialize_host_staged(column, selection, stream, mr);
   }
 
   // One batch starts at global row 0, so the ids ARE the batch-local map and

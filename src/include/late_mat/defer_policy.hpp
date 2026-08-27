@@ -172,31 +172,6 @@ inline std::int64_t min_value_bytes_compressed(std::int64_t ordinary)
   return value < 0 ? ordinary : value;
 }
 
-/// How much dearer a materialization is when the pin lives on the HOST tier
-/// (SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER, default 12).
-///
-/// A host-tier ride is gathered out of pinned host blocks over the CPU-GPU link
-/// rather than out of device memory, while the value floor below is calibrated
-/// against a device gather. The floor and the gather scale with the same row
-/// count, so the correction is a plain multiplier on the product floor.
-///
-/// 12 is the worst measured ratio of a blocked host gather to the equivalent
-/// device gather on GB300 (a 150M x 8 B pinned column, random ids, selectivities
-/// from 0.01% to 100%: 2.0x, 8.1x, 10.6x, 12.2x, 11.0x, 6.6x). That bounds ONE
-/// operation rather than calibrating a query, which is why it is a knob.
-inline std::int64_t host_tier_cost_multiplier()
-{
-  static std::int64_t const value = [] {
-    char const* v = std::getenv("SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER");
-    if (v == nullptr || v[0] == '\0') { return std::int64_t{12}; }
-    std::int64_t parsed = 0;
-    auto const* end     = v + std::strlen(v);
-    auto const rc       = std::from_chars(v, end, parsed);
-    return (rc.ec == std::errc{} && rc.ptr == end && parsed >= 1) ? parsed : std::int64_t{12};
-  }();
-  return value;
-}
-
 /// The thresholds, in one place so a measurement can move them together.
 struct defer_policy {
   /// A ride must save SOMETHING per row after the rowid; whether it repays is

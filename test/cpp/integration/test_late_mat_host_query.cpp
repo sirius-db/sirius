@@ -57,11 +57,12 @@ constexpr std::int64_t kCustomers = 5'000;
 constexpr std::int64_t kOrders    = 15'000;
 constexpr std::int64_t kLines     = 30'000;
 
-/// Payload width. This shape crosses 6 ports, and the host-tier product floor is
-/// 128 x 12 = 1536, so the bundle has to save at least 256 B/row. 40 BIGINTs save
-/// 40 x 8 - 8 = 312, clearing it with room; 32 would sit just under at 248.
-/// Widening this is the knob if the floor or the shape moves.
-constexpr int kPayloadColumns = 40;
+/// Payload width. The bundle must clear the host-tier product floor, which is
+/// 128 times a multiplier the startup probe measures (13 on a GB300). The ride
+/// carries one rowid plus a placeholder per remaining column, so N BIGINTs save
+/// 8N - (8 + N - 1) per row, and this shape crosses 6 ports. 56 columns save 385
+/// B/row for 2310, clearing a 1664 floor; 40 would sit just under at 1638.
+constexpr int kPayloadColumns = 56;
 
 std::string payload_names(char const* prefix)
 {

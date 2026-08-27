@@ -50,6 +50,7 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <late_mat/host_gather_policy.hpp>
 #include <late_mat/materialize.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <scan_manager/late_mat_resolver.hpp>
@@ -271,6 +272,15 @@ std::vector<bool> read_validity(cudf::column_view const& col)
   return valid;
 }
 
+/// Pins a route for the duration of a scope and hands it back afterwards, so a
+/// failed assertion cannot leak the setting into the rest of the binary.
+struct forced_route {
+  explicit forced_route(bool inplace) { sirius::late_mat::force_host_gather_route(inplace); }
+  forced_route(forced_route const&)            = delete;
+  forced_route& operator=(forced_route const&) = delete;
+  ~forced_route() { sirius::late_mat::force_host_gather_route(std::nullopt); }
+};
+
 }  // namespace
 
 TEST_CASE("late-mat materializes out of a host-tier pin", "[late_mat][host_pin][shared_context]")
@@ -398,6 +408,64 @@ TEST_CASE("late-mat materializes out of a host-tier pin", "[late_mat][host_pin][
     REQUIRE_FALSE(resolve_pinned_column(stale).has_value());
   }
 
+  SECTION("the route is chosen, not incidental, and both routes agree")
+  {
+    using sirius::late_mat::host_gather_routes_taken;
+
+    auto const layout = resolve_pinned_layout(pin.origin(1));
+    REQUIRE(layout.has_value());
+    auto const column = resolve_pinned_column(pin.origin(1));
+    REQUIRE(column.has_value());
+
+    // Spread across all three chunks, and nullable, so each route has to carry
+    // validity as well as values.
+    std::vector<std::uint64_t> ids;
+    for (std::uint64_t id = 0; id < 1'000'000; id += 9973) {
+      ids.push_back(id);
+    }
+    auto const buf = upload_ids(ids, stream);
+    row_id_list list{
+      static_cast<std::uint64_t const*>(buf.data()), static_cast<std::int64_t>(ids.size()), true};
+
+    auto run = [&](bool inplace) {
+      forced_route pinned{inplace};
+      auto const before = host_gather_routes_taken();
+      prepared_selection selection(*layout, list);
+      auto produced = materialize(*column, selection, stream, mr);
+      cudaStreamSynchronize(stream.value());
+      auto const after = host_gather_routes_taken();
+      // The branch that ran, asserted directly: a values-only check passes
+      // whichever route was taken and would not notice the choice being ignored.
+      if (inplace) {
+        REQUIRE(after.inplace == before.inplace + 1);
+        REQUIRE(after.staged == before.staged);
+      } else {
+        REQUIRE(after.staged == before.staged + 1);
+        REQUIRE(after.inplace == before.inplace);
+      }
+      return produced;
+    };
+
+    auto const in_place = run(true);
+    auto const staged   = run(false);
+
+    REQUIRE(in_place->size() == static_cast<cudf::size_type>(ids.size()));
+    REQUIRE(staged->size() == in_place->size());
+    REQUIRE(staged->null_count() == in_place->null_count());
+    REQUIRE(read_values(staged->view()) == read_values(in_place->view()));
+    REQUIRE(read_validity(staged->view()) == read_validity(in_place->view()));
+
+    // And the values are the rows that were asked for, not merely two routes
+    // agreeing on the same wrong answer.
+    auto const values = read_values(in_place->view());
+    auto const valid  = read_validity(in_place->view());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      auto const id = static_cast<std::int64_t>(ids[i]);
+      REQUIRE(valid[i] == row_is_valid(id));
+      if (valid[i]) { REQUIRE(values[i] == id); }
+    }
+  }
+
   SECTION("a host entry with no chunks is refused rather than resolved empty")
   {
     pinned_entry empty;
@@ -414,4 +482,29 @@ TEST_CASE("late-mat materializes out of a host-tier pin", "[late_mat][host_pin][
     REQUIRE_FALSE(resolve_pinned_layout(origin).has_value());
     REQUIRE_FALSE(resolve_pinned_column(origin).has_value());
   }
+}
+
+TEST_CASE("the host gather probe measures this machine's link", "[late_mat][host_pin][probe]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, test_config_path());
+  auto const& policy   = sirius::late_mat::measured_host_gather_policy();
+
+  // Machine-independent invariants only. The crossover is a property of the
+  // link, so pinning a number here would assert this GB300's answer on every
+  // machine that runs the suite; what must hold everywhere is that the probe
+  // either measured something usable or fell back to the conservative policy.
+  REQUIRE(policy.max_inplace_density >= 0.0);
+  REQUIRE(policy.max_inplace_density <= 1.0);
+  REQUIRE(policy.cost_multiplier >= 1);
+  REQUIRE(policy.cost_multiplier <= 64);
+  if (!policy.measured) {
+    REQUIRE(policy.max_inplace_density == 0.0);  // fail closed: stage
+  }
+
+  WARN("host gather probe: measured=" << policy.measured
+                                      << " bulk=" << policy.bulk_bytes_per_second / 1e9
+                                      << " GB/s in-place=" << policy.inplace_bytes_per_second / 1e9
+                                      << " GB/s crossover=" << policy.max_inplace_density
+                                      << " multiplier=" << policy.cost_multiplier);
 }
