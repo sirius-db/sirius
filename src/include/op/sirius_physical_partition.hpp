@@ -114,6 +114,12 @@ class sirius_physical_partition : public sirius_physical_operator {
     return _downstream_consumer_op;
   }
 
+  /// Input positions this partition hashes to place a row — its `key_source`'s keys,
+  /// resolved at construction. Exposed for late materialization, which must never let one
+  /// of these ride as a rowid: a rowid hashes differently from the value it stands for, so
+  /// equal keys would land in different partitions and the consuming join would miss matches.
+  [[nodiscard]] std::vector<int> const& partition_keys() const noexcept { return _partition_keys; }
+
   /// The sorted, deduped device ids of the GPUs the query runs on — identical to the list
   /// task_creator routes partitions across (`_active_gpu_ids[partition_idx % size]`). Used by
   /// broadcast mode to map a probe batch's residence GPU back to its partition slot.

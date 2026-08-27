@@ -24,13 +24,13 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -596,13 +596,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
 
   _sirius_dynamic_filters = bind.sirius_dynamic_filters;
 
-  // Producers reference probe columns in DuckDB's column_ids space; the AST merge and the
-  // post-decode apply both key by output-column position. Install the translation so push_filter
-  // remaps before storing. Wiring-time setup, before the producing build publishes.
-  if (_sirius_dynamic_filters) {
-    _sirius_dynamic_filters->set_consumer_column_remap(_plan->output_position_by_column_id);
-  }
-
   // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
   // not receive post-decode dynamic filters.
   if (_sirius_dynamic_filters && _plan->has_partitions()) {
@@ -1002,7 +995,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
 
@@ -1109,7 +1104,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     owning_table_view view{std::move(table)};
     if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        like_cache);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -1131,10 +1132,32 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 // per-split partition values) and return ROW_FILTERED_AND_PROJECTED, so they
 // never reach here. This path therefore only applies a pending row filter and a
 // non-partition projection; partition injection is unreachable.
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 owning_table_view parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::unique_ptr<cudf::column>* survivors,
+  std::span<std::size_t const> elided)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
@@ -1153,10 +1176,24 @@ owning_table_view parquet_gpu_ingestible::post_filter_and_project(
     // `exec`, which only borrows the AST.
     auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
     if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        std::move(like_cache));
       auto const data_positions = output_data_positions(*_plan);
-      auto filtered             = data_positions.empty() ? exec.select(input.table.view())
-                                                         : exec.select(input.table.view(), data_positions);
+      std::unique_ptr<cudf::table> filtered;
+      if (survivors != nullptr && !data_positions.empty()) {
+        // A deferral rides on this batch: it needs to know WHICH rows survived,
+        // because its rowid addresses the pinned chunk and the batch no longer
+        // holds that chunk's rows in order.
+        filtered = exec.select_with_survivors(input.table.view(), data_positions, *survivors);
+      } else {
+        filtered = data_positions.empty() ? exec.select(input.table.view())
+                                          : exec.select(input.table.view(), data_positions);
+      }
       // The select only enqueued its reads; record before the reassignment drops the read lock.
       input.table.record_reader_event(stream);
       input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
@@ -1182,7 +1219,21 @@ owning_table_view parquet_gpu_ingestible::post_filter_and_project(
     assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(assembled.view().num_columns()), elided);
+      !kept.empty()) {
+    assembled.select_columns(kept);
+  }
   return assembled;
+}
+
+bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
+{
+  // !needs_output_assembly means assemble_scan_output is a pass-through: no
+  // partition columns to synthesize and output_layout reads data columns
+  // 0..N-1 in order. (Its other false case, the empty count(*) layout, can
+  // never reach the transactional steal: such scans have no carrier targets.)
+  return !needs_output_assembly(*_plan);
 }
 
 //===----------------------------------------------------------------------===//

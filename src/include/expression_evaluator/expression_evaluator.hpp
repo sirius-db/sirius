@@ -20,6 +20,7 @@
 #include <config.hpp>
 #include <expression/ast/node.hpp>  // sirius::ast::node + 11 alternative types
 #include <expression_evaluator/expression_evaluator_strategy.hpp>
+#include <expression_evaluator/like_multiliteral.hpp>
 
 // cudf
 #include <cudf/ast/expressions.hpp>
@@ -33,10 +34,14 @@
 
 // standard library
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -67,6 +72,8 @@ class expression_evaluator {
   using expr_ref = std::reference_wrapper<cudf::ast::expression const>;
 
  public:
+  static constexpr std::size_t default_min_ast_size = 2;
+
   /**
    * @brief The result of adding an expression to the executor's AST tree.
    *
@@ -233,13 +240,18 @@ class expression_evaluator {
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
+   * @param like_swar_fastpath Whether eligible multi-literal LIKE expressions use the SWAR kernel.
+   * @param like_cache Query-owned immutable LIKE classifications shared across task-local
+   * evaluators. A null value creates an evaluator-local cache.
    */
   expression_evaluator(
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = default_min_ast_size,
+    bool like_swar_fastpath                     = false,
+    std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
 
   /**
    * @brief Construct a expression_evaluator with the given expression (for FILTER operators).
@@ -254,26 +266,37 @@ class expression_evaluator {
    * with N operators and N < min_ast_size, the expression will be evaluated operator-by-operator
    * (in MATERIALIZE mode). Otherwise, the executor will try to evaluate the expression subtree by
    * adding nodes to the AST tree.
+   * @param like_swar_fastpath Whether eligible multi-literal LIKE expressions use the SWAR kernel.
+   * @param like_cache Query-owned immutable LIKE classifications shared across task-local
+   * evaluators. A null value creates an evaluator-local cache.
    */
   expression_evaluator(
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = default_min_ast_size,
+    bool like_swar_fastpath                     = false,
+    std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
 
   /**
    * @brief Non-owning ctor for call sites that hold a raw sirius::ast::node pointer
    * (e.g., NLJ lambda over cuDF expressions, parquet scan filter pushdown).
    *
    * The caller retains ownership; the executor only reads from the node tree.
+   *
+   * @param like_swar_fastpath Whether eligible multi-literal LIKE expressions use the SWAR kernel.
+   * @param like_cache Query-owned immutable LIKE classifications shared across task-local
+   * evaluators. A null value creates an evaluator-local cache.
    */
   expression_evaluator(
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = default_min_ast_size,
+    bool like_swar_fastpath                     = false,
+    std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
 
   /**
    * @brief Non-owning ctor for a pre-filtered list of expressions (e.g. the projection operator's
@@ -283,13 +306,19 @@ class expression_evaluator {
    * The caller retains ownership of the nodes; the executor only reads from them. The output
    * table produced by evaluate() contains one column per entry in @p expressions, in the same
    * order.
+   *
+   * @param like_swar_fastpath Whether eligible multi-literal LIKE expressions use the SWAR kernel.
+   * @param like_cache Query-owned immutable LIKE classifications shared across task-local
+   * evaluators. A null value creates an evaluator-local cache.
    */
   expression_evaluator(
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
     rmm::cuda_stream_view stream                = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
-    std::size_t min_ast_size                    = 2);
+    std::size_t min_ast_size                    = default_min_ast_size,
+    bool like_swar_fastpath                     = false,
+    std::shared_ptr<like_multiliteral_cache const> like_cache = nullptr);
 
   /**
    * @brief Executes the current set of expressions against the given input batch and emits a new
@@ -316,6 +345,21 @@ class expression_evaluator {
    */
   std::unique_ptr<cudf::table> select(cudf::table_view input,
                                       std::span<cudf::size_type const> output_indices);
+
+  /**
+   * @brief select(), plus the positions of the rows that survived.
+   *
+   * @p survivors comes back as an INT32 column holding the input row index of
+   * each output row, ascending. Its purpose is late materialization: a scan
+   * that filters no longer emits its chunk's rows in order, so a pin-order
+   * rowid can only be reconstructed from where the survivors were. Costs one
+   * extra gather over a row-index sequence, so it is a separate entry point
+   * rather than a widening of select().
+   */
+  std::unique_ptr<cudf::table> select_with_survivors(
+    cudf::table_view input,
+    std::span<cudf::size_type const> output_indices,
+    std::unique_ptr<cudf::column>& survivors);
 
   /**
    * @brief Selects rows from the input batch based on the executor's (singular) expression.
@@ -358,13 +402,26 @@ class expression_evaluator {
     return _narrow_domain_comparison_count;
   }
 
+  /// Number of shared LIKE-cache lookups over the evaluator lifetime.
+  [[nodiscard]] std::size_t like_shared_cache_lookup_count_for_testing() const noexcept
+  {
+    return _like_shared_cache_lookup_count;
+  }
+
  private:
+  using like_classification_memo =
+    std::map<std::string, like_multiliteral_cache::entry_ptr, std::less<>>;
+
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
   expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
   rmm::cuda_stream_view _stream;       ///< The stream in which to evaluate any cuDF operations
   std::size_t _min_ast_size;  ///< The minimum number of nodes in an AST tree before we switch from
                               ///< MATERIALIZE mode to AST mode
+  bool _like_swar_fastpath;   ///< Whether eligible multi-literal LIKE expressions use SWAR
+  std::shared_ptr<like_multiliteral_cache const> _like_cache;
+  like_classification_memo _like_classifications;
+  std::size_t _like_shared_cache_lookup_count{0};
   cudf::table_view _input_table;  ///< The input table for expression evaluation
   std::vector<std::unique_ptr<cudf::column>>
     _output_columns;  ///< The output columns generated by expression evaluation (one per
@@ -391,6 +448,9 @@ class expression_evaluator {
   std::vector<restored_reference_cache_entry> _restored_reference_cache;
   std::size_t _restored_reference_cast_count{0};   ///< For observability/testing
   std::size_t _narrow_domain_comparison_count{0};  ///< For observability/testing
+
+  [[nodiscard]] like_multiliteral_cache::entry_ptr const& get_or_classify_like(
+    std::string_view pattern);
 
   // Evaluate the executor's single boolean predicate over @p input and return the resulting
   // mask column (the sole column of evaluate()'s output). Shared by both select() overloads.

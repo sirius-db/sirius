@@ -19,7 +19,7 @@
 #include "duckdb/common/assert.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/utils.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
@@ -281,18 +281,12 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
         slot->set_physical_types({});
         return;
       }
-      // Translate each planned target column (column_ids space) to its scan output position:
-      // output i reads column_ids position `projection_ids.empty() ? i : projection_ids[i]`, the
-      // same convention scan_physical_schema uses. A planned target with no output position marks
-      // nothing (such a filter is rejected by the consumer remap at publish time).
+      // Channel target ordinals are scan outputs; no column_ids remap applies.
       auto const targets = scan.sirius_dynamic_filters->planned_target_columns();
       auto const native  = native_physical_schema(*slot);
       auto physical      = slot->get_physical_types();
       for (std::size_t output_idx = 0; output_idx < physical.size(); ++output_idx) {
-        if (!scan.projection_ids.empty() && output_idx >= scan.projection_ids.size()) { continue; }
-        auto const ids_position =
-          scan.projection_ids.empty() ? output_idx : scan.projection_ids[output_idx];
-        if (std::ranges::binary_search(targets, ids_position)) {
+        if (std::ranges::binary_search(targets, output_idx)) {
           physical[output_idx] = native[output_idx];
         }
       }
@@ -461,12 +455,15 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       return;
     }
 
+    // Plan-time endpoints require native carriers; scan wrappers are inserted after propagation.
+    case sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER: break;
+
     default: break;
   }
 
   // Pipeline wrapper operators (PARTITION, CONCAT, MERGE_*, SORT_PARTITION, SORT_SAMPLE,
-  // GPU_SCAN, DYNAMIC_FILTER) are inserted by insert_gpu_pipeline_operators after these passes
-  // run; their carrier contracts are established at wrap time from the finished sidecars.
+  // GPU_SCAN) are inserted by insert_gpu_pipeline_operators after these passes run; their
+  // carrier contracts are established at wrap time from the finished sidecars.
   D_ASSERT(slot->type != sirius::op::SiriusPhysicalOperatorType::PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::CONCAT &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT &&
@@ -475,8 +472,7 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
            slot->type != sirius::op::SiriusPhysicalOperatorType::MERGE_AGGREGATE &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_PARTITION &&
            slot->type != sirius::op::SiriusPhysicalOperatorType::SORT_SAMPLE &&
-           slot->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN &&
-           slot->type != sirius::op::SiriusPhysicalOperatorType::DYNAMIC_FILTER);
+           slot->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN);
 
   // Joins, aggregates, ordering, and all other operators retain their existing native-type
   // contracts. Restore any narrowed child immediately before crossing that boundary.

@@ -64,19 +64,35 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
 - `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
 
-**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+**Policy:** Sirius applies eligible merge fusion automatically. See
+[physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape
+details.
 
 ### Task Creator Look-Ahead (PR #1174)
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator keeps a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When the task scheduler finds its task queue empty, it calls `schedule_lookahead(device_hint)`, which — only under `strategy: lookahead` — emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/include/creator/config.hpp` — `request_type`
 
-**Config:** `executor.task_creator.strategy` (`active` default, `lookahead` opt-in) — see [configuration.md](configuration.md).
+**Policy:** internal. The current shipped policy is active and demand-driven;
+look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
+
+### Multi-Literal LIKE SWAR Fast Path (PR #1610)
+
+**Motivation:** cuDF's thread-per-row, byte-at-a-time LIKE matcher is load-instruction-bound on wide text columns. The TPC-H q13 predicate `%special%requests%` measured about 6x faster in the specialized kernel, reducing the query's LIKE work without changing SQL semantics.
+
+**Mechanism:** Constant patterns of the form `%lit1%lit2%...%litN%` are classified and compiled once per query and pattern value, then shared immutably across task-local evaluators. The CUDA kernel scans aligned 64-bit words, uses SWAR digram masks to find candidates, and verifies complete literals in order. Unsupported pattern shapes and ineligible column layouts fall back to `cudf::strings::like`; NOT LIKE is fused into the output write.
+
+**Code path:**
+- `src/expression_evaluator/specializations/function.cpp` — query-cache lookup and dispatch
+- `src/cuda/sirius_like_multiliteral.cu` — classifier, query-cache implementation, compiled descriptors, and SWAR kernel
+- `src/include/expression_evaluator/like_multiliteral.hpp` — launcher and input contracts
+
+**Config:** `like_swar_fastpath` (default: `true`, connection-local). The query snapshots this setting at engine initialization. Supported Sirius ingestion must supply valid UTF-8 for DuckDB VARCHAR/cuDF STRING input; the hot path treats that as a precondition and does not add a redundant validation scan.
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
@@ -278,6 +294,43 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Late Materialization (unreleased, experimental)
+
+**Motivation:** A query that selects wide columns carries them from the scan to whatever finally
+reads them — through joins that copy them beside their keys, partitions that write them to a
+repository and read them back, and aggregates that group on them. Nothing in that stretch reads
+what is IN them. On TPC-H q10 at SF1000 the five wide `customer` columns are 158 B/row and cross
+eleven port boundaries before anything needs their values.
+
+**Mechanism:** For a PINNED table, the scan emits a pin-order rowid (UINT32 where the table's rows
+fit 32 bits, UINT64 otherwise) in place of the deferred columns plus 1-byte placeholders, so arity
+and positions are unchanged and every operator in between is unaffected. A directive on the
+consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
+schema. Both halves install together or not at all. A plan pass reports how far each column travels
+and how many port crossings it survives; a policy with measured floors decides whether the ride
+repays the rowid. Where the deferred columns are GROUP BY keys, the ride can continue past the
+aggregate to materialize one row per group instead of one per join match, subject to a pin-time
+distinctness proof.
+
+**Code path:**
+- `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
+- `src/include/late_mat/defer_directive.hpp` — the pair, the substituted schemas, rowid widths
+- `src/include/late_mat/defer_policy.hpp` — value/boundary floors and their measurements
+- `src/late_mat/pin_uniqueness.cpp` — the pin-time distinctness proof
+- `src/scan_manager/sirius_scan_manager.cpp` — admission, the port hop, riders
+- `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
+
+**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+(default on) — a deferred column riding through a carrier-restore cast is carried past it rather
+than suppressing the deferral.
+
+**Measured:** GB300 SF1000, default `enable_compressed_materialization`. See
+[Late Materialization](late-materialization.md) for the full results table.
+
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
@@ -363,13 +416,11 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
 1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
 2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
-3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
 - `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
-
-**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
 
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 

@@ -28,8 +28,8 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
-#include "op/dynamic_filter_publish_plan.hpp"
-#include "op/dynamic_filter_replica_space.hpp"
+#include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
 #include "utils.hpp"
@@ -42,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -193,6 +194,14 @@ struct cross_schedule_pair {
 [[nodiscard]] std::vector<cross_schedule_discard> collect_cross_schedule_discards(
   std::vector<partition_cross_schedule>& cross, bool probe_finished, bool build_finished);
 
+/// Reference arithmetic for a pairing-weighted probe-byte denominator: sum
+/// `probe bytes * completed pairings / build batches`. Unused — the STANDARD/MIXED estimate is
+/// withheld — but kept with its tests for the eventual fix. See
+/// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
+[[nodiscard]] std::size_t pairing_weighted_probe_bytes(
+  std::vector<partition_cross_schedule> const& cross,
+  std::unordered_map<uint64_t, std::size_t> const& probe_bytes);
+
 /// Find and claim the next unscheduled (probe,build) pair across partitions, marking it scheduled
 /// and bumping the paired counts. If none is schedulable now, reports whether to wait on the build
 /// or probe producer, or that the operator is done. Pure over `cross`.
@@ -248,27 +257,13 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     const duckdb::vector<std::size_t>& right_projection_map,
     duckdb::vector<sirius::logical_type> delim_types,
     std::size_t estimated_cardinality,
-    duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info,
     uint64_t max_build_hash_table_bytes             = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
     dynamic_filter_publish_plan dynamic_filter_plan = {},
     uint64_t hash_partition_bytes                   = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
-
-  sirius_physical_hash_join(
-    duckdb::LogicalOperator& op,
-    duckdb::unique_ptr<sirius_physical_operator> left,
-    duckdb::unique_ptr<sirius_physical_operator> right,
-    duckdb::vector<sirius::join_condition> cond,
-    duckdb::JoinType join_type,
-    std::size_t estimated_cardinality,
-    uint64_t max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES,
-    uint64_t hash_partition_bytes       = config::DEFAULT_HASH_PARTITION_BYTES,
-    uint64_t max_broadcast_join_size    = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE);
+    uint64_t max_broadcast_join_size                = config::DEFAULT_MAX_BROADCAST_JOIN_SIZE,
+    dynamic_filter_stats* dynamic_filter_stats_sink = {});
 
   duckdb::vector<sirius::join_condition> conditions;
-  //! Scans where we should push generated filters into (if any)
-  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> filter_pushdown;
-
   //! The types of the join keys
   duckdb::vector<sirius::logical_type> condition_types;
   //! The type of the join
@@ -303,8 +298,6 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
-  /// \brief Drop dynamic-filter replica targets on GPUs outside @p admitted_gpu_ids. Called
-  /// by sirius_pipeline_converter once the admitted set is known.
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
     _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
@@ -314,13 +307,18 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op);
 
+  //! Whether the execute dispatch has an arm for @p join_type. SINGLE does not;
+  //! are_conditions_supported() folds this in so the planner never builds one.
+  static bool is_join_type_supported(duckdb::JoinType join_type);
+
   /**
-   * @brief Returns true if the given join conditions can be handled by this operator.
+   * @brief Returns true if the given join type and conditions can be handled by this operator.
    *
-   * Requires at least one equality condition. For mixed joins (equality + inequality), also
-   * requires that no column referenced by an equality condition appears in any inequality
-   * condition on the same side — cuDF's mixed_join API requires disjoint equality and
-   * conditional table columns.
+   * Requires an executable join type (is_join_type_supported) and at least one equality
+   * condition. For mixed joins (equality + inequality), also requires that no column referenced
+   * by an equality condition appears in any inequality condition on the same side — cuDF's
+   * mixed_join API requires disjoint equality and conditional table columns. A MARK join mixing
+   * null-safe and plain keys is rejected; see mark_join_mixes_null_safe_keys.
    *
    * @param join_type Used to exclude MARK joins from null-safe routing.
    */
@@ -344,21 +342,14 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// decision so the partition can finish its own wiring (e.g. enabling build-side concat_all).
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
-  /// True when this join publishes dynamic filters (a filter-pushdown plan with wired probe
-  /// targets). The upstream PARTITION folds a single-partition build to one batch for such a join
-  /// so the one-shot publisher sees the whole key set.
   [[nodiscard]] bool publishes_dynamic_filters() const;
 
-  /// The per-GPU hash-table byte budget (also the upstream PARTITION's bound on folding a build
-  /// whole for dynamic-filter publication).
   [[nodiscard]] uint64_t max_build_hash_table_bytes() const noexcept
   {
     return _max_build_hash_table_bytes;
   }
 
-  /// Reported by the upstream PARTITION at sizing time: the build port will deliver one
-  /// concat-folded batch covering the entire build side (single-partition or broadcast build).
-  /// Precondition for claiming a build batch for dynamic-filter publication, in any join mode.
+  // Publication may claim only a delivery known to contain the whole build.
   void set_build_arrives_whole(bool arrives_whole);
 
   /// @brief True when this join runs in build-then-probe mode (see `get_partition_strategy`).
@@ -389,7 +380,33 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
+  /// Nominates the streaming probe port for INNER/LEFT/SEMI/ANTI/MARK joins. Returns nullopt for
+  /// RIGHT-family and OUTER joins, which would require build-byte accounting. See
+  /// sirius_physical_operator::primary_input_port.
+  [[nodiscard]] std::optional<std::string_view> primary_input_port() const override
+  {
+    if (is_right_family() || join_type == duckdb::JoinType::OUTER) { return std::nullopt; }
+    return std::string_view{"default"};
+  }
+
+  /// True only in BUILD_PROBE, where each probe batch is popped exactly once and `consumed` is
+  /// a plain running total. A cross schedule would need pairing weights, which read high under
+  /// skew, so the estimate is withheld there. See
+  /// data-size-estimation.md#why-standard-and-mixed_join-are-not-estimated.
+  [[nodiscard]] bool probe_bytes_are_unweighted() const
+  {
+    return _join_mode == HASH_JOIN_MODE::BUILD_PROBE;
+  }
+
+  /// Whole-counted probe bytes, or nullopt until the build side is complete — and always nullopt
+  /// unless @ref probe_bytes_are_unweighted. Out of line because the check needs `sirius_pipeline`.
+  [[nodiscard]] std::optional<std::size_t> consumed_primary_input_bytes() const override;
+
  protected:
+  /// Count @p bytes once for a popped probe batch. Takes @ref _probe_bytes_mutex but no batch
+  /// lock, so callers may hold a batch lock.
+  void note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes);
+
   // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
   // override;
 
@@ -403,7 +420,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   bool is_all_inequality_join = true;
 
-  HASH_JOIN_MODE _join_mode            = HASH_JOIN_MODE::STANDARD;
+  // Atomic: the size estimator polls probe_bytes_are_unweighted() without op_state_mutex.
+  std::atomic<HASH_JOIN_MODE> _join_mode{HASH_JOIN_MODE::STANDARD};
   uint64_t _max_build_hash_table_bytes = config::DEFAULT_MAX_BUILD_HASH_TABLE_BYTES;
   // Maximum build-side bytes eligible for a broadcast join (see get_partition_strategy). Set from
   // operator_params at construction.
@@ -414,11 +432,20 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // the probe side is streamed unpartitioned.
   bool _broadcast = false;
 
-  // Whether the build port delivers one concat-folded batch covering the entire build side
-  // (single-partition or broadcast build with a concat_all'd build-side CONCAT). Set by the
-  // upstream PARTITION at sizing time; the one-shot dynamic-filter publisher only claims a build
-  // batch when this holds. Guarded by op_state_mutex.
   bool _build_arrives_whole = false;
+
+  // Guarded by op_state_mutex.
+  bool _build_not_whole_reported = false;
+
+  // Whole-counted BUILD_PROBE and orphan bytes. Relaxed reads may be slightly stale.
+  std::atomic<std::size_t> _whole_probe_bytes{0};
+
+  // Deduplicates _whole_probe_bytes. Guarded by _probe_bytes_mutex.
+  std::unordered_set<uint64_t> _counted_probe_batch_ids;
+
+  // Lock order: op_state_mutex -> _probe_bytes_mutex. execute() may take this mutex while holding
+  // a batch lock; nothing may wait on a batch lock or op_state_mutex while holding it.
+  std::mutex _probe_bytes_mutex;
 
   // Whether any build-side join key column contains a NULL. Used exclusively for MARK join
   // three-valued logic. Sentinel -1 = unset, 0 = false, 1 = true. Join-wide (not per-partition)
@@ -458,12 +485,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// construction (conditions and join_type are fixed thereafter). cuDF applies one
   /// flag to all key columns, so it is EQUAL (null-safe -- NULL matches NULL) only
   /// when EVERY equi-key is IS NOT DISTINCT FROM; a plain `=` key (including mixed
-  /// joins such as delim joins) forces UNEQUAL. MARK joins are also forced to
-  /// UNEQUAL to match their IN/EXISTS three-valued result logic -- a null-safe MARK
-  /// join (e.g. EXISTS with IS NOT DISTINCT FROM) is a known unsupported case, see
-  /// the constructor.
+  /// joins such as delim joins) forces UNEQUAL. A MARK join follows the same rule:
+  /// all-null-safe keys use EQUAL and emit definite marks (see mark_is_null_safe),
+  /// anything containing a plain key uses UNEQUAL and the IN/EXISTS three-valued
+  /// result logic. A MARK join *mixing* the two is rejected at plan time.
   cudf::null_equality compare_nulls() const { return compare_nulls_; }
   cudf::null_equality compare_nulls_ = cudf::null_equality::UNEQUAL;
+
+  /// A MARK join whose every condition is IS NOT DISTINCT FROM: the predicate is never UNKNOWN,
+  /// so every mark is definite and the result carries no null mask.
+  [[nodiscard]] bool mark_is_null_safe() const { return mark_is_null_safe_; }
+  bool mark_is_null_safe_ = false;
 
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison
@@ -477,55 +509,34 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
-  //===----------------------------------------------------------------------===//
-  // Dynamic Filters
-  //===----------------------------------------------------------------------===//
-  /// @brief Claim and perform this join's one dynamic-filter publication attempt.
-  ///
-  /// The only publishing caller is @ref push_data_batch_partitioned: it publishes as soon as the
-  /// single, concat-folded build batch reaches the build port, before any probe batch is required.
-  ///
-  /// The caller that changes @c OPEN to @c PUBLISHING owns construction, device replication,
-  /// and channel fan-out. GPU work runs without holding @ref op_state_mutex. A successful attempt
-  /// ends in @c FINISHED even when selectivity gates or drained targets cause it to emit no
-  /// filters. @ref on_finalize_operator never publishes; it only changes an unclaimed @c OPEN
-  /// window to @c CLOSED before releasing BUILD_PROBE state.
-  ///
-  /// @param build_view The build side to reduce / build membership over.
-  /// @param stream     Durable build-memory-space stream used for filter construction.
+  // Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
+  // propagate.
   void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
 
   enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,        ///< The publication hook has not claimed the build table.
-    PUBLISHING,  ///< The claiming caller owns construction, replication, and fan-out.
-    FINISHED,    ///< The one publication attempt completed successfully (possibly emitting none).
-    FAILED,      ///< The claimed attempt threw; the uncertain state must not be retried.
-    CLOSED       ///< Finalization closed the window before the hook claimed it.
+    OPEN,
+    PUBLISHING,
+    FINISHED,
+    FAILED,  ///< Terminal: a failed window is never reopened for a sibling retry.
+    CLOSED
   };
 
-  /// Complete plan-time routing, policy, and replica-space description; immutable at runtime.
+  // Narrowed before execution; immutable during execution.
   dynamic_filter_publish_plan _dynamic_filter_plan;
-  /// Exactly-once arbitration between the publication hook and finalization.
+  // Non-owning; SiriusContext outlives the plan.
+  dynamic_filter_stats* _dynamic_filter_stats = nullptr;
   std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
     dynamic_filter_publication_state::OPEN};
-  //===----------------------------------------------------------------------===//
 
  public:
-  /// @brief Route a partitioned batch and publish dynamic filters from an eligible build batch.
-  ///
-  /// For the @c build port of a wired @c BUILD_PROBE join, the single concat-folded batch is the
-  /// publication point. Its read-only accessor is acquired BEFORE the batch is routed: once
-  /// deposited into a repository the batch becomes a downgrade candidate, and holding the shared
-  /// lock across the deposit pins its GPU representation until publication completes. A stream
-  /// borrowed from the build memory space then waits on the batch writer event and builds and
-  /// replicates filters from the build keys without requiring a probe batch or a built hash table.
-  ///
-  /// Other ports and join modes only route. This synchronous hook completes before this join's
-  /// immediate probe producer is scheduled. A scan target reached through an intervening join is
-  /// not gated by that edge.
   void push_data_batch_partitioned(std::string_view port_id,
                                    std::shared_ptr<::cucascade::data_batch> batch,
                                    std::size_t partition_idx) override;
+
+  [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
+  {
+    return _dynamic_filter_plan;
+  }
 
  public:
   //! True when this HJ is the internal `delim.join` of a RIGHT_DELIM_JOIN (set in its

@@ -21,6 +21,7 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -545,6 +546,16 @@ class SiriusContext : public ClientContextState {
   /// \brief Snapshot counters for transparent execution observability.
   [[nodiscard]] transparent_execution_stats get_transparent_execution_stats() const noexcept;
 
+  [[nodiscard]] sirius::op::dynamic_filter_stats& get_dynamic_filter_stats() noexcept
+  {
+    return dynamic_filter_stats_;
+  }
+  [[nodiscard]] sirius::op::dynamic_filter_stats_snapshot get_dynamic_filter_stats_snapshot()
+    const noexcept
+  {
+    return dynamic_filter_stats_.snapshot();
+  }
+
   /// \brief Record a successful transparent rebind to Sirius.
   void record_transparent_rebind_success() noexcept;
 
@@ -677,12 +688,15 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
+  // before reset; reverse member destruction also preserves that order if initialize() throws.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
   duckdb::shared_ptr<sirius::planner::query> query_;
 
+  sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
@@ -748,6 +762,9 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Read the per-session `like_swar_fastpath` setting (default true).
+bool like_swar_fastpath_enabled(ClientContext& context);
 
 /// \brief Read the per-session `enable_compressed_materialization` setting.
 ///

@@ -34,6 +34,7 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -43,6 +44,10 @@
 namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
+
+namespace sirius {
+class like_multiliteral_cache;
+}  // namespace sirius
 
 namespace sirius::scan_manager {
 class sirius_scan_manager;
@@ -84,8 +89,22 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   gpu_ingestible(gpu_ingestible&&)                 = delete;
   gpu_ingestible& operator=(gpu_ingestible&&)      = delete;
 
-  filtered_table materialize_table(const op::scan::scan_operator_input& split,
-                                   rmm::cuda_stream_view stream);
+  /**
+   * @brief Materialize one scan split using query-local expression policy
+   *
+   * @param split Scan split to materialize
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @return Materialized table and filtering state
+   */
+  filtered_table materialize_table(
+    const op::scan::scan_operator_input& split,
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr);
 
   virtual std::unique_ptr<batch_coalescer> create_batch_coalescer() const = 0;
 
@@ -114,7 +133,13 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * @brief Materialize the cudf table for one split. Called by
    *        @c sirius_gpu_scan_operator::execute on the task-local stream.
    *
+   * @param info Metadata for the split
    * @param mem_space Destination memory space for decoded columns.
+   * @param stream Task-local CUDA stream
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
    *
    * Implementations allocate through this space's allocator. The caller must
    * make its device current before calling this method. I/O uses the datasource
@@ -123,7 +148,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   virtual filtered_table materialize_metadata_to_table(
     const scan_info& info,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream) = 0;
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
 
   /**
    * @brief Apply pending post-decode filtering and projection
@@ -133,15 +160,42 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    * naturally produced by their filtering and projection steps; the scan operator decides whether
    * to forward a returned view or materialize it.
    *
+   * Takes the input by owning unique_ptr so implementations that call
+   * @c assemble_scan_output (which consumes its input by rvalue) can
+   * move-forward without an extra view→owning copy on the dominant
+   * fresh-read + assembly path.
+   *
    * @param input Materialized table and filter state to consume
    * @param mem_space Memory space whose allocator is used for any new columns
    * @param stream Stream used for filtering, projection, and allocation
+   * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
+   *        fail closed for non-query callers.
+   * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
+   *        evaluator a private cache.
+   * @param survivors When non-null AND this call applies a row filter here,
+   *        receives an INT32 column of the input row positions that survived,
+   *        ascending. Late materialization needs it: a filtered batch is no
+   *        longer the chunk's rows in order, so the pin-order rowid can only be
+   *        rebuilt from where the survivors were. Left untouched when the rows
+   *        were filtered somewhere this call cannot see (the decoder), which is
+   *        exactly the case a deferral must refuse rather than guess at. An
+   *        implementation that ignores it must leave @ref can_report_survivors
+   *        false.
+   * @param elided Output positions the caller is going to overwrite regardless
+   *        (a deferral's rowid and placeholders). Dropped from the selection
+   *        before it is realized, so the copy never reads them; the caller puts
+   *        columns back at those positions and restores the arity. Ignored when
+   *        it would leave nothing to size the batch by.
    * @return Filtered and projected table with the ownership needed to keep its view valid
    */
   virtual owning_table_view post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream) = 0;
+    rmm::cuda_stream_view stream,
+    bool like_swar_fastpath                                           = false,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    std::unique_ptr<cudf::column>* survivors                          = nullptr,
+    std::span<std::size_t const> elided                               = {}) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that
@@ -150,6 +204,39 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        (pinned-cache) splits, which always reach post-filter unfiltered.
    */
   [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
+
+  /**
+   * @brief Whether @ref post_filter_and_project actually POPULATES its
+   *        @c survivors out-parameter when one is passed.
+   *
+   * Accepting the parameter is not the same as answering it: an implementation
+   * that filters with a plain select ignores it and hands back a compacted
+   * table with no record of which rows survived. A late-materialization rowid
+   * over a filtered scan is built from exactly those positions, so a scan whose
+   * ingestible cannot report them must be refused at install rather than
+   * discovered at runtime, when the only signal left is a row count that no
+   * longer matches the pinned chunk.
+   *
+   * Defaults to FALSE so a new ingestible is refused until it opts in.
+   */
+  [[nodiscard]] virtual bool can_report_survivors() const noexcept { return false; }
+
+  /// Whether @ref post_filter_and_project's assembly is a leading-identity
+  /// projection: output column k is materialized column k, and no partition or
+  /// other synthesized column joins the output. When true, a decode-row-filtered
+  /// batch whose width already matches the output arity needs no assembly at
+  /// all, so the scan's transactional carrier-cast steal may bypass
+  /// post_filter_and_project for it. A width match alone cannot prove this:
+  /// trailing pure-filter columns can offset missing synthesized columns.
+  /// Conservative default: false (the steal then falls back to the generic
+  /// materialize/project path, which is always correct).
+  /// Implementations must derive this from their assembly configuration
+  /// (parquet: `!needs_output_assembly`) or return a structural constant only
+  /// while the invariant is type-level (duckdb-native synthesizes no
+  /// partition/virtual output columns and projects via `std::iota` — see its
+  /// `post_filter_and_project`). An override returning a stale `true` silently
+  /// corrupts decode-row-filtered steals.
+  [[nodiscard]] virtual bool output_assembly_is_leading_identity() const noexcept { return false; }
 
   [[nodiscard]] virtual const ingestible_table_info& table_info() const noexcept = 0;
 

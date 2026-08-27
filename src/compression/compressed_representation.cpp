@@ -289,6 +289,8 @@ compressed_device_representation::compressed_device_representation(
 {
 }
 
+bool compressed_device_representation::has_table() const noexcept { return _blob != nullptr; }
+
 const simpatico::compressed_table& compressed_device_representation::table() const noexcept
 {
   return _blob->table;

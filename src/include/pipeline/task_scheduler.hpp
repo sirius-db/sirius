@@ -193,25 +193,6 @@ class task_scheduler {
    */
   void wait_for_completion();
 
-  // for testing/stress only — see Doxygen below.
-  /**
-   * @brief Inject an initial value into the round-robin counter.
-   *
-   * For testing/stress only. Intended to verify that the round-robin
-   * distribution path (and the per-task-device contract documented in
-   * `docs/super-sirius/pipeline-execution.md`) is correct under arbitrary
-   * counter starting offsets — catches hash-bucket-order dependent bugs and
-   * off-by-one drift that a counter starting at 0 each query might mask.
-   *
-   * Must be called AFTER `prepare_for_query` (which resets the counter
-   * to 0) but BEFORE the first task is dispatched into
-   * `management_eventloop`. Concurrent calls are safe (atomic store).
-   */
-  void set_no_pref_rr_counter_for_testing(size_t value) noexcept
-  {
-    _no_pref_rr_counter.store(value, std::memory_order_relaxed);
-  }
-
  private:
   void management_eventloop();
 
@@ -234,17 +215,12 @@ class task_scheduler {
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
   std::vector<int> _ready_devices;
 
-  /// device_id -> GPU executor. std::map (not unordered_map) so iteration
-  /// order is deterministic (ascending by device_id) — keeps preference-less
-  /// task dispatch reproducible across runs.
+  /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
-  /// Deprecated as of pull-signal restoration: no-preference distribution now
-  /// arises from which executor sends a device_ready signal first, not from a
-  /// counter. Field retained for source compat with set_no_pref_rr_counter_for_testing.
-  std::atomic<size_t> _no_pref_rr_counter{0};
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  std::unique_ptr<completion_handler> _completion_handler;
+  /// Strong owner for the weak completion references held by terminal pipelines.
+  std::shared_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

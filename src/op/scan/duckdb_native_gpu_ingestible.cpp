@@ -23,12 +23,12 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/duckdb_native_decoder.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 
 // duckdb
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -209,9 +209,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
   _block_manager = sf_bm;
 
-  // Emission order: the k-th decoded column is column_ids[source_ids[k]]. Computed outside the
-  // static-filter guard — the dynamic-filter remap below needs it even when the scan carries no
-  // static filters.
   duckdb::vector<duckdb::idx_t> source_ids_fallback;
   if (bind.projection_ids.empty()) {
     source_ids_fallback.reserve(bind.column_ids.size());
@@ -233,21 +230,6 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     if (filter_expr_duckdb) {
       _filter_expression = std::shared_ptr<duckdb::Expression>(filter_expr_duckdb.release());
     }
-  }
-
-  // Producers push dynamic filters keyed in DuckDB's column_ids space; the post-decode operator
-  // applies them by output position. Install the translation now — the ctor runs at plan time,
-  // before any producing join can publish. Decode positions at or past the output arity are
-  // pure-filter columns that post_filter_and_project drops; they map to the sentinel so
-  // push_filter rejects filters nothing downstream could apply.
-  if (bind.sirius_dynamic_filters) {
-    std::vector<std::size_t> output_position_by_column_id(bind.column_ids.size(),
-                                                          scan_plan::no_output_position);
-    auto const output_arity = bind.output_types.size();
-    for (std::size_t k = 0; k < source_ids.size() && k < output_arity; ++k) {
-      output_position_by_column_id[source_ids[k]] = k;
-    }
-    bind.sirius_dynamic_filters->set_consumer_column_remap(std::move(output_position_by_column_id));
   }
 
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
@@ -302,7 +284,9 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool /*like_swar_fastpath*/,
+  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (!split.datasource && !split.host_backed_only) {
@@ -340,10 +324,32 @@ std::unique_ptr<batch_coalescer> duckdb_native_gpu_ingestible::create_batch_coal
 //===----------------------------------------------------------------------===//
 // post_filter_and_project — filter eval + projection to output arity
 //===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::unique_ptr<cudf::column>* /*survivors*/,
+  std::span<std::size_t const> elided)
 {
   auto const output_arity = _info->output_types.size();
   auto const decoded_cols =
@@ -356,7 +362,13 @@ owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
   owning_table_view final_table;
   if (_filter_expression) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
-    sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+    sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                      mr_ref,
+                                      stream,
+                                      strategy_from_config(),
+                                      sirius::expression_evaluator::default_min_ast_size,
+                                      like_swar_fastpath,
+                                      std::move(like_cache));
     if (projection_required) {
       // Fold the projection into the filter gather so pure-filter columns are never materialized.
       std::vector<cudf::size_type> output_indices(output_arity);
@@ -383,6 +395,11 @@ owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
     final_table.select_columns(selected_cols);
   }
 
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(final_table.view().num_columns()), elided);
+      !kept.empty()) {
+    final_table.select_columns(kept);
+  }
   return final_table;
 }
 

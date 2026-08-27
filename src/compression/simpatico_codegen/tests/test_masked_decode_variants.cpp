@@ -248,7 +248,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                                                                  dtype.c_str(),
                                                                  n,
                                                                  sm,
-                                                                 nullptr,
+                                                                 simpatico::row_enumeration{},
                                                                  reinterpret_cast<void*>(d_plain),
                                                                  stream),
                   "[%s] mask_consume without chunk_offsets should fail",
@@ -292,12 +292,17 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                0xAB,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
 
-    REQUIRE_MSG(
-      simpatico::launch_decode_fused_tree_compacted(
-        *tree, enc.buffers, dtype.c_str(), n, sm, nullptr, reinterpret_cast<void*>(d_out), stream),
-      "[%s/%s] compacted (mask walk) launch failed",
-      dtype.c_str(),
-      pred_names[p]);
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                              enc.buffers,
+                                                              dtype.c_str(),
+                                                              n,
+                                                              sm,
+                                                              simpatico::row_enumeration{},
+                                                              reinterpret_cast<void*>(d_out),
+                                                              stream),
+                "[%s/%s] compacted (mask walk) launch failed",
+                dtype.c_str(),
+                pred_names[p]);
 
     // Reference: plain decode + host filter (row order preserved).
     std::vector<Element> expect;
@@ -339,18 +344,18 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     cudaMemset(reinterpret_cast<void*>(d_out4),
                0xCD,
                static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-    REQUIRE_MSG(
-      simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                    enc.buffers,
-                                                    dtype.c_str(),
-                                                    n,
-                                                    sm,
-                                                    reinterpret_cast<const std::int32_t*>(d_idx),
-                                                    reinterpret_cast<void*>(d_out4),
-                                                    stream),
-      "[%s/%s] compacted (index walk) launch failed",
-      dtype.c_str(),
-      pred_names[p]);
+    REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(
+                  *tree,
+                  enc.buffers,
+                  dtype.c_str(),
+                  n,
+                  sm,
+                  simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx), nullptr},
+                  reinterpret_cast<void*>(d_out4),
+                  stream),
+                "[%s/%s] compacted (index walk) launch failed",
+                dtype.c_str(),
+                pred_names[p]);
     std::vector<Element> got4(static_cast<std::size_t>(survivors));
     if (survivors > 0) {
       cudaMemcpy(got4.data(),
@@ -363,6 +368,76 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
                 dtype.c_str(),
                 pred_names[p],
                 expect.size());
+
+    // The sparse walk must produce the same compacted output from a chunk-CSR
+    // row set — same survivors, expressed as touched chunks + uint16 positions,
+    // and launched over only those chunks.
+    {
+      std::vector<std::uint32_t> csr_chunks, csr_blocks;
+      std::vector<std::uint16_t> csr_rows;
+      csr_blocks.push_back(0);
+      for (std::int64_t c = 0; c < nc; ++c) {
+        std::vector<std::uint16_t> in_chunk;
+        for (std::int64_t r = c * kChunk; r < std::min<std::int64_t>((c + 1) * kChunk, n); ++r) {
+          if ((mask_ref[static_cast<std::size_t>(r) / 32] >> (r % 32)) & 1u) {
+            in_chunk.push_back(static_cast<std::uint16_t>(r - c * kChunk));
+          }
+        }
+        if (in_chunk.empty()) continue;  // untouched chunks are absent, not empty
+        csr_chunks.push_back(static_cast<std::uint32_t>(c));
+        csr_rows.insert(csr_rows.end(), in_chunk.begin(), in_chunk.end());
+        csr_blocks.push_back(static_cast<std::uint32_t>(csr_rows.size()));
+      }
+      REQUIRE_MSG(static_cast<std::int64_t>(csr_rows.size()) == survivors,
+                  "[%s/%s] CSR row count %zu != %lld survivors",
+                  dtype.c_str(),
+                  pred_names[p],
+                  csr_rows.size(),
+                  static_cast<long long>(survivors));
+      if (survivors > 0) {
+        sirius::codegen::chunk_row_set rs;
+        rs.chunk_ids = reinterpret_cast<const std::uint32_t*>(
+          enc.upload_bytes(csr_chunks.data(), csr_chunks.size() * 4));
+        rs.block_offsets = reinterpret_cast<const std::uint32_t*>(
+          enc.upload_bytes(csr_blocks.data(), csr_blocks.size() * 4));
+        rs.in_chunk_rows = reinterpret_cast<const std::uint16_t*>(
+          enc.upload_bytes(csr_rows.data(), csr_rows.size() * 2));
+        rs.num_touched   = static_cast<std::int64_t>(csr_chunks.size());
+        rs.num_survivors = survivors;
+        rs.num_rows      = n;
+        REQUIRE_MSG(rs.valid(), "[%s/%s] built an invalid row set", dtype.c_str(), pred_names[p]);
+
+        CUdeviceptr d_sparse = enc.alloc(static_cast<std::size_t>(survivors) * sizeof(Element));
+        cudaMemset(reinterpret_cast<void*>(d_sparse),
+                   0xEF,
+                   static_cast<std::size_t>(survivors) * sizeof(Element));
+        REQUIRE_MSG(
+          simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                        enc.buffers,
+                                                        dtype.c_str(),
+                                                        n,
+                                                        sm,
+                                                        simpatico::row_enumeration{nullptr, &rs},
+                                                        reinterpret_cast<void*>(d_sparse),
+                                                        stream),
+          "[%s/%s] sparse (chunk_csr) launch failed",
+          dtype.c_str(),
+          pred_names[p]);
+        std::vector<Element> got_sparse(static_cast<std::size_t>(survivors));
+        cudaMemcpy(got_sparse.data(),
+                   reinterpret_cast<const void*>(d_sparse),
+                   got_sparse.size() * sizeof(Element),
+                   cudaMemcpyDeviceToHost);
+        REQUIRE_MSG(got_sparse == expect,
+                    "[%s/%s] sparse output != the mask-walk/host reference (%zu touched chunks of "
+                    "%lld, %lld survivors)",
+                    dtype.c_str(),
+                    pred_names[p],
+                    csr_chunks.size(),
+                    static_cast<long long>(nc),
+                    static_cast<long long>(survivors));
+      }
+    }
 
     std::printf("PASS: %s/%s k3+k4 (survivors=%lld of %lld)\n",
                 dtype.c_str(),
@@ -390,14 +465,15 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
     CUdeviceptr d_idx1 = enc.upload_bytes(&idx_host, sizeof(idx_host));
     CUdeviceptr d_out1 = enc.alloc(sizeof(Element));
     REQUIRE_MSG(
-      simpatico::launch_decode_fused_tree_compacted(*tree,
-                                                    enc.buffers,
-                                                    dtype.c_str(),
-                                                    n,
-                                                    sm1,
-                                                    reinterpret_cast<const std::int32_t*>(d_idx1),
-                                                    reinterpret_cast<void*>(d_out1),
-                                                    stream),
+      simpatico::launch_decode_fused_tree_compacted(
+        *tree,
+        enc.buffers,
+        dtype.c_str(),
+        n,
+        sm1,
+        simpatico::row_enumeration{reinterpret_cast<const std::int32_t*>(d_idx1), nullptr},
+        reinterpret_cast<void*>(d_out1),
+        stream),
       "[%s] index-walk singleton launch failed",
       dtype.c_str());
     Element got1{};
@@ -463,11 +539,16 @@ bool run_delta_masked(const std::string& dtype, int arch)
 
   CUdeviceptr d_out =
     enc.alloc(static_cast<std::size_t>(survivors > 0 ? survivors : 1) * sizeof(Element));
-  REQUIRE_MSG(
-    simpatico::launch_decode_fused_tree_compacted(
-      *tree, enc.buffers, dtype.c_str(), n, sm, nullptr, reinterpret_cast<void*>(d_out), stream),
-    "[delta/%s] mask-walk decode launch failed",
-    dtype.c_str());
+  REQUIRE_MSG(simpatico::launch_decode_fused_tree_compacted(*tree,
+                                                            enc.buffers,
+                                                            dtype.c_str(),
+                                                            n,
+                                                            sm,
+                                                            simpatico::row_enumeration{},
+                                                            reinterpret_cast<void*>(d_out),
+                                                            stream),
+              "[delta/%s] mask-walk decode launch failed",
+              dtype.c_str());
 
   std::vector<Element> expect;
   expect.reserve(static_cast<std::size_t>(survivors));
@@ -585,6 +666,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
                                                               "int32_t",
                                                               n,
                                                               sm,
+                                                              simpatico::row_enumeration{},
                                                               reinterpret_cast<const void*>(d_keys),
                                                               key_width,
                                                               reinterpret_cast<void*>(d_out),
@@ -701,6 +783,7 @@ bool run_str_split_masked(bool deep, int arch)
                                                        "int32_t",
                                                        n,
                                                        sm,
+                                                       simpatico::row_enumeration{},
                                                        reinterpret_cast<std::int64_t*>(d_src),
                                                        reinterpret_cast<std::int32_t*>(d_len),
                                                        stream),
