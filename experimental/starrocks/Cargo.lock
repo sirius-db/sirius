@@ -738,6 +738,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,6 +923,26 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "glob",
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]
@@ -1651,6 +1677,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "regress"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "158a764437582235e3501f683b93a0a6f8d825d04a789dbe5ed30b8799b8908a"
+dependencies = [
+ "hashbrown 0.16.1",
+ "memchr",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1811,6 +1847,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
 name = "serde_tokenstream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1918,7 +1963,7 @@ dependencies = [
  "sirius",
  "starrocks-plan-translator",
  "starrocks-thrift",
- "substrait",
+ "substrait 0.64.1",
  "syn 3.0.4",
  "tempfile",
  "thiserror",
@@ -1973,7 +2018,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "starrocks-thrift",
- "substrait",
+ "substrait 0.64.1",
  "substrait-explain",
  "thiserror",
 ]
@@ -2006,15 +2051,31 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "regress",
+ "regress 0.10.5",
  "schemars",
  "semver",
  "serde",
  "serde_json",
  "serde_yaml",
  "syn 2.0.119",
- "typify",
+ "typify 0.5.0",
  "walkdir",
+]
+
+[[package]]
+name = "substrait"
+version = "0.64.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "618502e453a8c8c24a48ec1b28b081b6ecf33e0f4b207cbf2f4a2c4bff40f85c"
+dependencies = [
+ "indexmap",
+ "prost",
+ "semver",
+ "serde",
+ "serde_json",
+ "substrait-extensions",
+ "substrait-prost",
+ "toml",
 ]
 
 [[package]]
@@ -2037,8 +2098,40 @@ dependencies = [
  "protox",
  "serde_json",
  "serde_yaml",
- "substrait",
+ "substrait 0.63.0",
  "thiserror",
+]
+
+[[package]]
+name = "substrait-extensions"
+version = "0.87.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73dfa39674c1af4b7951dc7a5c353c8be24593b395faac61ca82594a27b0cc44"
+dependencies = [
+ "heck",
+ "include_dir",
+ "indexmap",
+ "prettyplease 0.3.0",
+ "regress 0.11.1",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "syn 3.0.4",
+ "typify 0.7.0",
+ "walkdir",
+]
+
+[[package]]
+name = "substrait-prost"
+version = "0.87.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aba90370eb71dc6e439c92f0e82c86afe44a42842b4d113a92693775a856f76"
+dependencies = [
+ "prost",
+ "prost-build",
+ "prost-types",
+ "walkdir",
 ]
 
 [[package]]
@@ -2216,6 +2309,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.1.4+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "1.1.1+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "toml_parser"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+dependencies = [
+ "winnow",
+]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2320,8 +2452,18 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6d5bcc6f62eb1fa8aa4098f39b29f93dcb914e17158b76c50360911257aa629"
 dependencies = [
- "typify-impl",
- "typify-macro",
+ "typify-impl 0.5.0",
+ "typify-macro 0.5.0",
+]
+
+[[package]]
+name = "typify"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cdc2e612ea322c6e232d46a0b34607c8eb28978fd6060ecfb139f2a50db8d5f"
+dependencies = [
+ "typify-impl 0.7.0",
+ "typify-macro 0.7.0",
 ]
 
 [[package]]
@@ -2334,7 +2476,27 @@ dependencies = [
  "log",
  "proc-macro2",
  "quote",
- "regress",
+ "regress 0.10.5",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "thiserror",
+ "unicode-ident",
+]
+
+[[package]]
+name = "typify-impl"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "691591f49550c0d371bc441d019c30ce241d4116aee7d68df7a9840d6c70bf8f"
+dependencies = [
+ "heck",
+ "log",
+ "proc-macro2",
+ "quote",
+ "regress 0.11.1",
  "schemars",
  "semver",
  "serde",
@@ -2358,7 +2520,24 @@ dependencies = [
  "serde_json",
  "serde_tokenstream",
  "syn 2.0.119",
- "typify-impl",
+ "typify-impl 0.5.0",
+]
+
+[[package]]
+name = "typify-macro"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d41aea893c49cf95661389207b8af0c6254ff48b2c3ae1e4f3704777dbdfcf03"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_tokenstream",
+ "syn 2.0.119",
+ "typify-impl 0.7.0",
 ]
 
 [[package]]
@@ -2577,6 +2756,12 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wit-bindgen"

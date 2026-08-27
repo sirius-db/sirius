@@ -30,7 +30,7 @@ prettyplease = "0.3.0"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full", "parsing"] }
-substrait = "0.63.0"
+substrait = "0.64.1"
 substrait-explain = "0.9.0"
 thiserror = "2"
 thrift = "0.24"
