@@ -92,7 +92,10 @@ struct port {
 | `PARTIAL` | Downstream can consume data **incrementally** as it arrives, but respects pipeline boundaries | CONCAT after PARTITION in streaming joins (INNER); HASH_GROUP_BY into its fanout PARTITION, when that partition has runtime size estimation enabled |
 | `PIPELINE` | No synchronization — data flows **immediately** | Within a single pipeline |
 
-Barriers are assigned by `resolve_barrier()` in `src/pipeline/sirius_pipeline_converter.cpp`.
+Barriers are assigned per edge by the consuming operator's `input_barrier_for()` virtual
+(`src/op/sirius_physical_operator.cpp` for the FULL-except-ORDER_BY default, with per-operator
+overrides), consulted by `compute_repository_wiring()` in
+`src/pipeline/sirius_pipeline_converter.cpp`.
 
 ### Runtime data size estimation
 
@@ -103,8 +106,9 @@ knows its own total).
 
 This is what lets a grouped aggregation's `PARTITION` take a `PARTIAL` ingress instead of a `FULL`
 one: it fixes its partition count from the first batches rather than waiting for its whole input.
-`resolve_barrier` relaxes that edge only for a partition with estimation enabled, so with the
-setting off the barrier is `FULL` exactly as it was before the feature existed.
+`sirius_physical_partition::input_barrier_for` relaxes that edge only for a partition with
+estimation enabled, so with the setting off the barrier is `FULL` exactly as it was before the
+feature existed.
 `PARTITION → MERGE_GROUP_BY` remains `FULL` either way — the merge still needs every per-thread
 bucket.
 

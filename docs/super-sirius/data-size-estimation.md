@@ -322,6 +322,10 @@ which is why `STREAMING_LIMIT` has to opt out by hand — see [capped pipelines]
 `NESTED_LOOP_JOIN` uses the same port names and could take the identical fan-in treatment; leaving
 it unnominated preserves fall-back-to-waiting behaviour.
 
+The estimator itself is exercised by `test/cpp/pipeline/test_data_size_estimator.cpp` against a
+synthetic pipeline DAG, which covers each terminating case, the sample floors, overflow, and the
+fan-in rules above. Everything below documents its first in-tree consumer.
+
 ---
 
 ## The problem
@@ -372,7 +376,7 @@ partitioning, *then* all merging — three sequential phases where the first two
 
 Three coordinated changes.
 
-**Barrier.** `sirius_pipeline_converter::resolve_barrier` returns `PARTIAL` for an aggregate-fanout
+**Barrier.** `sirius_physical_partition::input_barrier_for` returns `PARTIAL` for an aggregate-fanout
 partition's ingress — a `PARTITION` whose tree parent is `MERGE_GROUP_BY` **and** which has
 estimation enabled (`is_size_estimation_enabled()`). Only that edge changes;
 `PARTITION → MERGE_GROUP_BY` remains `FULL`, since the merge needs every bucket. Branch formation
@@ -432,8 +436,8 @@ Interpreting them:
 | `measured` | no estimate; sized from the drained port, i.e. pre-feature behaviour |
 | `error +0.0%` | suspicious — a genuine projection is essentially never exact. Indicates the total was read after the fact |
 
-`hops` counts the pipelines traversed; ratio error compounds per hop, so a long chain is less
-trustworthy than a short one.
+`hops` counts the learned ratios applied between the anchor and the answer; error compounds per
+hop, so a long chain is less trustworthy than a short one.
 
 The same three bases are also published as counters on `SiriusContext`, so the question can be
 answered programmatically rather than by grepping a log at the right level:
@@ -497,11 +501,13 @@ direct observation of the mechanism:
 Per-query GPU allocation has two layers, and this estimator serves only one of them.
 
 **Layer 1, admission ("how many GPUs does this query warrant?") — no.** Not a gap to fill: every
-number here is measurement-derived, and at admission no task has run, so no pipeline has a ratio
-and every case returns `nullopt`. `assume_unit_ratio` does not rescue it, since the leaf anchor
-`total_source_input_bytes()` is itself `nullopt` until split discovery closes — which happens
-after the GPU set is chosen. Admission needs a **plan-time** cost model over
-`estimated_cardinality` and plan shape. The two are complementary, not substitutes.
+anchor here needs at least one measured batch (even the planner-derived one multiplies
+`estimated_cardinality` by a *measured* average row width), and at admission no task has run, so
+no pipeline has a ratio and every case returns `nullopt`. `assume_unit_ratio` does not rescue it,
+since the leaf anchor `total_source_input_bytes()` is itself `nullopt` until split discovery
+closes — which happens after the GPU set is chosen. Admission is served by the separate
+plan-time scan-output estimate behind `admission_bytes_per_gpu` (see
+[Configuration](configuration.md)). The two are complementary, not substitutes.
 
 **Layer 2, dynamic tapering ("can we release a GPU after this stage?") — yes.** That question is
 `estimate_port_total_input_bytes` at a pipeline boundary, and by then upstream ratios exist. Gate

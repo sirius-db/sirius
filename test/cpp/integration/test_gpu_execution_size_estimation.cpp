@@ -98,7 +98,7 @@ constexpr const char* kGroupByOverJoinQuery =
 // A DISTINCT aggregate, which the planner lowers through a delim join whose distinct root is a
 // PARTITION of its own. That partition's tree parent is a grouped_aggregate_merge — typed
 // MERGE_GROUP_BY, exactly like the one above — but it is never constructed with estimation
-// enabled, so resolve_barrier must leave its ingress FULL under both settings. Covered here
+// enabled, so input_barrier_for must leave its ingress FULL under both settings. Covered here
 // because the type test alone cannot tell the two shapes apart.
 constexpr const char* kDistinctAggregateQuery =
   "SELECT g, COUNT(DISTINCT k) AS ks, SUM(v) AS total FROM facts GROUP BY g";
