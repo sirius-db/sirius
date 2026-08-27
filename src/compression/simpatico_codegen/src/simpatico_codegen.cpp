@@ -631,8 +631,28 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
             throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
           auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
           auto flags      = directive.probe(keys_typed->view(), stream, mr);
-          if (!flags || flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-            throw plan_error("filtered decode: membership probe result shape mismatch");
+          // A null probe is NOT a shape mismatch, and reporting it as one sends
+          // you looking at row counts that are in fact correct. Every
+          // compute_mask implementation (in_list / small_in_list / Bloom)
+          // returns null for exactly two reasons: the probe key dtype does not
+          // equal the filter's build-side key type, or this device has no
+          // replica of the filter. Name the dtype so the first is visible --
+          // pin-table compressed materialization narrows key columns (e.g.
+          // int64 -> int32), which silently disqualifies the probe.
+          if (!flags)
+            throw plan_error(
+              "filtered decode: membership probe declined (col " +
+              std::to_string(directive.column) + ", probe key dtype id " +
+              std::to_string(static_cast<int>(keys_typed->type().id())) +
+              ", stored dtype id " + std::to_string(static_cast<int>(col.dtype.id())) +
+              ", " + std::to_string(num_rows) +
+              " rows) -- build-side key type mismatch or no device replica");
+          if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
+            throw plan_error(
+              "filtered decode: membership probe result shape mismatch (col " +
+              std::to_string(directive.column) + ": probe=" + std::to_string(flags->size()) +
+              " rows type " + std::to_string(static_cast<int>(flags->type().id())) +
+              ", expected " + std::to_string(num_rows) + " rows type BOOL8)");
           if (flags->null_count() != 0)
             throw plan_error("filtered decode: null-masked membership probe result");
           sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
