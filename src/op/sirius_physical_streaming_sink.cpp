@@ -190,8 +190,10 @@ std::size_t sirius_physical_streaming_sink::no_history_peak_memory_estimate(
   // Broadcast holds the original plus one clone per extra destination, and each one stays
   // resident until its own repository drains — so the whole fan-out is live at once, not 2×.
   if (_spec.mode == partition_mode::broadcast) { return stats.bytes * _outputs.size(); }
-  // Hash holds hash_partition's reorder buffer alongside the slices it produces.
-  return stats.bytes * 2;
+  // Hash holds hash_partition's reorder buffer, and the slices are views into it rather
+  // than copies, so the reorder is the whole cost. It stays resident until the last slice
+  // referencing it is released.
+  return stats.bytes;
 }
 
 void sirius_physical_streaming_sink::build_pipelines(pipeline::sirius_pipeline& current,
