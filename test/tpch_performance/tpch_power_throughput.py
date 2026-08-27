@@ -34,6 +34,13 @@ validation and the clean/post-RF1/post-RF2 comparison meaningful.
 --query-dir (see generate_tpch_queries.sh), as an official run requires;
 validation is not supported there.
 
+In both mode the throughput streams are validated too: the deferred pure-DuckDB
+worker replays the N throughput RF1/RF2 pairs and snapshots the 22 CPU results at
+the post-power baseline and after each refresh commit (2N+1 snapshots). Each
+stream's GPU rows must match one of them — a concurrent stream observes some
+committed refresh state, but which one is a scheduling accident. Throughput-only
+mode has no validated power baseline, so it skips this.
+
 Metrics:
     Power@Size      = 3600 * SF / geomean(22 stream-0 query times + T_RF1 + T_RF2)
     Throughput@Size = (N * 22 * 3600 / measurement_interval) * SF
@@ -257,19 +264,54 @@ def compare_rows(cpu_rows, gpu_rows):
     return None
 
 
-def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
-    """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
-    failures = {}
+def cpu_pass(cpu, plan, timeout_s):
+    """Run the refresh-sensitive queries on a plain-DuckDB cursor; {qnum: rows}."""
+    rows_by_q = {}
     for q, statements in plan:
         if q in REFRESH_INVARIANT_QUERIES:
             continue
-        _, cpu_rows = timed_query(cpu, statements, timeout_s)
+        _, rows_by_q[q] = timed_query(cpu, statements, timeout_s)
+    return rows_by_q
+
+
+def validate_pass(cpu, gpu_rows_by_q, plan, label, timeout_s):
+    """Diff stored GPU rows against fresh DuckDB CPU runs on the current state."""
+    failures = {}
+    for q, cpu_rows in cpu_pass(cpu, plan, timeout_s).items():
         msg = compare_rows(cpu_rows, gpu_rows_by_q[q])
         if msg is None:
             log(f"  [{label}] q{q}: OK")
         else:
             failures[f"q{q}"] = msg
             log(f"  [{label}] q{q}: MISMATCH — {msg}")
+    return failures
+
+
+def validate_throughput(stream_rows, snapshots):
+    """Match each stream's stored GPU rows against the knowledge-base snapshots.
+
+    A throughput query stream runs concurrently with the refresh stream, so a
+    query result is only pinned down to *some* committed refresh state: the
+    pre-throughput baseline or the state after any RF1/RF2 commit. A result is
+    valid iff it matches at least one snapshot; on failure the mismatch against
+    every snapshot is kept for the report.
+    """
+    failures = {}
+    for i, rows_by_q in sorted(stream_rows.items()):
+        for q, gpu_rows in sorted(rows_by_q.items()):
+            tried = {}
+            for label, cpu_rows_by_q in snapshots.items():
+                msg = compare_rows(cpu_rows_by_q[q], gpu_rows)
+                if msg is None:
+                    log(f"  [throughput] stream {i} q{q}: OK ({label})")
+                    break
+                tried[label] = msg
+            else:
+                failures[f"stream{i}_q{q}"] = tried
+                log(
+                    f"  [throughput] stream {i} q{q}: MISMATCH — matches none "
+                    f"of {len(snapshots)} snapshots"
+                )
     return failures
 
 
@@ -283,8 +325,13 @@ def stash_gpu_rows(run_dir, label, rows_by_q):
         pickle.dump(rows_by_q, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def deferred_validation(args, run_dir):
+def deferred_validation(args, run_dir, throughput_streams):
     """Diff the stored GPU rows against pure DuckDB, in a fresh process.
+
+    With throughput_streams > 0 the worker also builds the throughput knowledge
+    base: after the power replay it re-runs the N throughput RF1/RF2 pairs,
+    snapshotting the CPU results after the baseline and each commit, and matches
+    every stream's stashed GPU rows against those 2N+1 snapshots.
 
     Validation cannot share a process with the pinned run. Sirius's host pool
     is a growing pool allocator, so unpinning returns blocks to the pool rather
@@ -312,6 +359,7 @@ def deferred_validation(args, run_dir):
         "query_dir": args.query_dir,
         "query_timeout": args.query_timeout,
         "keep_scratch_db": args.keep_scratch_db,
+        "throughput_streams": throughput_streams,
     }
     spec_path = os.path.join(run_dir, "_validate_spec.json")
     with open(spec_path, "w") as f:
@@ -375,6 +423,29 @@ def validation_worker(spec_path):
             verdict[label] = validate_pass(
                 cur, gpu_rows, plan, label.replace("_", " "), spec["query_timeout"]
             )
+        tp_streams = spec["throughput_streams"]
+        tp_rows_path = _gpu_rows_path(run_dir, "throughput")
+        if tp_streams and os.path.exists(tp_rows_path):
+            # Knowledge base: the CPU results at every state a concurrent
+            # stream could have observed — the post-power baseline (the state
+            # this connection is in right now, RF1/RF2 of set 1 applied) plus
+            # each RF1/RF2 commit of the throughput refresh stream.
+            log(
+                f"=== Throughput knowledge base: baseline + {2 * tp_streams} "
+                "refresh states ==="
+            )
+            snapshots = {"baseline": cpu_pass(cur, plan, spec["query_timeout"])}
+            for pair in range(1, tp_streams + 1):
+                n = pair + 1  # set 1 belongs to the power run
+                for rf_label, statements in (
+                    (f"after_rf1_set{n}", rf1_statements(spec["refresh_dir"], n)),
+                    (f"after_rf2_set{n}", rf2_statements(spec["refresh_dir"], n)),
+                ):
+                    run_refresh(cur, statements, rf_label)
+                    snapshots[rf_label] = cpu_pass(cur, plan, spec["query_timeout"])
+            with open(tp_rows_path, "rb") as f:
+                stream_rows = pickle.load(f)
+            verdict["throughput"] = validate_throughput(stream_rows, snapshots)
     finally:
         con.close()
         if not spec["keep_scratch_db"]:
@@ -692,6 +763,7 @@ def throughput_run(con, args, run_dir, writer, streams):
     barrier = threading.Barrier(streams + 2)  # N query + 1 refresh + main
     errors = []
     stream_times = {i: {} for i in range(1, streams + 1)}
+    stream_rows = {i: {} for i in range(1, streams + 1)}
     stream_elapsed = {}
     refresh_times = []
 
@@ -716,8 +788,10 @@ def throughput_run(con, args, run_dir, writer, streams):
             barrier.wait()
             start = time.perf_counter()
             for q, statements in plan:
-                elapsed, _ = timed_query(cur, statements, args.query_timeout)
+                elapsed, rows = timed_query(cur, statements, args.query_timeout)
                 stream_times[i][f"q{q}"] = elapsed
+                if args.throughput_validation and q not in REFRESH_INVARIANT_QUERIES:
+                    stream_rows[i][q] = rows
                 with _write_lock:
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
                 log(f"  [stream {i}] q{q}: {elapsed:.4f}s")
@@ -779,6 +853,12 @@ def throughput_run(con, args, run_dir, writer, streams):
 
     if errors:
         raise RuntimeError("throughput run failed:\n  " + "\n  ".join(errors))
+
+    if args.throughput_validation:
+        # Written while the pinned benchmark process is still alive, so the
+        # deferred extension-free worker can read it after this process has
+        # released the Sirius pools.
+        stash_gpu_rows(run_dir, "throughput", stream_rows)
 
     throughput_at_size = streams * 22 * 3600.0 / interval * args.sf
     log(
@@ -863,6 +943,15 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
             )
         out(f"Power@Size       = {power['power_at_size']:.2f}")
     if throughput:
+        tp_val = throughput.get("validation")
+        if tp_val is not None:
+            status = (
+                "PASS" if not tp_val else f"FAIL ({len(tp_val)} stream-query results)"
+            )
+            out(
+                f"Validation throughput: {status} "
+                f"(each stream vs {2 * streams + 1} snapshots)"
+            )
         out(
             f"Throughput@Size  = {throughput['throughput_at_size']:.2f}   "
             f"({streams} streams, interval "
@@ -896,6 +985,7 @@ def write_run_info(run_dir, args, streams):
         f"vary_predicates: {args.vary_predicates}",
         f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
         f"validation: {args.validation}",
+        f"throughput_validation: {args.throughput_validation}",
         f"baseline_pass: {args.baseline_pass}",
         f"warmup_pass: {args.warmup_pass}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
@@ -997,8 +1087,10 @@ def parse_args():
         "--validation",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run; "
-        "default: on unless --vary-predicates)",
+        help="Diff GPU vs DuckDB CPU results after RF1 and RF2 (power run), and "
+        "in --mode both also match every throughput stream's results against "
+        "the 2N+1 possible refresh states (default: on unless "
+        "--vary-predicates)",
     )
     p.add_argument(
         "--baseline-pass",
@@ -1051,6 +1143,15 @@ def main():
         raise SystemExit("--vary-predicates does not support --validation")
     if args.validation is None:
         args.validation = not args.vary_predicates
+
+    # Throughput validation needs the power run's validated post-RF2 state as
+    # its baseline snapshot, so it only runs in --mode both.
+    args.throughput_validation = args.validation and args.mode == "both"
+    if args.validation and args.mode == "throughput":
+        log(
+            "Throughput validation skipped: it needs the power run as its "
+            "baseline (--mode both)"
+        )
 
     # Simpatico compression happens at pin time, so it needs a pinned tier, and
     # it is a no-op without at least one plan file naming a TPC-H table.
@@ -1159,7 +1260,14 @@ def main():
     # unpinned, the connection is closed and the pinned scratch copy is gone,
     # so the child process gets the machine to itself.
     if power and args.validation:
-        power["validation"].update(deferred_validation(args, run_dir))
+        tp_streams = (
+            streams if (throughput is not None and args.throughput_validation) else 0
+        )
+        verdict = deferred_validation(args, run_dir, tp_streams)
+        tp_verdict = verdict.pop("throughput", None)
+        power["validation"].update(verdict)
+        if throughput is not None and tp_verdict is not None:
+            throughput["validation"] = tp_verdict
 
     qphh = None
     if power and throughput:
@@ -1205,6 +1313,8 @@ def main():
         for label in ("after_rf1", "after_rf2"):
             if val.get(label):
                 failures.append(f"validation {label}: {sorted(val[label])}")
+    if throughput and throughput.get("validation"):
+        failures.append(f"validation throughput: {sorted(throughput['validation'])}")
     if failures:
         raise SystemExit("FAILED: " + "; ".join(failures))
 
