@@ -22,6 +22,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
@@ -2461,15 +2462,61 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
-pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
-  std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const
+bool pinned_native_types_match_columns(pinned_entry const& entry,
+                                       duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+                                       duckdb::vector<duckdb::LogicalType> const& returned_types)
 {
-  for (auto const& [name, entry] : _pinned_entries) {
-    if (entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
-      return &entry;
+  if (entry.column_storage.empty()) { return true; }
+
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  for (auto const& col_idx : column_ids) {
+    if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() || col_idx.IsVirtualColumn() ||
+        col_idx.IsEmptyColumn()) {
+      continue;
+    }
+    auto const primary = col_idx.GetPrimaryIndex();
+    auto const it      = entry_pos_by_primary.find(primary);
+    if (it == entry_pos_by_primary.end()) { continue; }
+    std::optional<cudf::data_type> native;
+    if (primary < returned_types.size()) {
+      native = sirius::try_get_cudf_type(sirius::from_duckdb(returned_types[primary]));
+    }
+    if (!native) { return false; }
+    for (auto const& row : entry.column_storage) {
+      if (it->second >= row.size() || row[it->second].native != *native) { return false; }
     }
   }
-  return nullptr;
+  return true;
+}
+
+pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
+  std::string_view catalog_name,
+  std::string_view schema_name,
+  std::string_view table_name,
+  duckdb::vector<duckdb::ColumnIndex> const* requested_ids,
+  duckdb::vector<duckdb::LogicalType> const* returned_types) const
+{
+  bool const match_columns              = requested_ids != nullptr && !requested_ids->empty();
+  pinned_entry const* identity_match    = nullptr;
+  pinned_entry const* covering_mismatch = nullptr;
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (!entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) { continue; }
+    if (identity_match == nullptr) { identity_match = &entry; }
+    if (!match_columns) { return &entry; }
+    if (entry.cache_info.column_projection_for(*requested_ids).empty()) { continue; }
+    // The guard reads a type-mismatched entry as unpinned, so preferring one loses a hit.
+    if (returned_types == nullptr ||
+        pinned_native_types_match_columns(entry, *requested_ids, *returned_types)) {
+      return &entry;
+    }
+    if (covering_mismatch == nullptr) { covering_mismatch = &entry; }
+  }
+  return covering_mismatch != nullptr ? covering_mismatch : identity_match;
 }
 
 pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
@@ -2780,8 +2827,8 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-    // Check native types before strict MVCC handling so type drift is a clean cache miss rather
-    // than an MVCC error or a cache hit under the wrong type.
+    // Check native types before strict MVCC handling so a type-mismatched pin is a clean cache
+    // miss rather than an MVCC error or a hit under the wrong type.
     if (auto const* native_info =
           dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
         native_info != nullptr && !pinned_native_types_match_scan(entry, *native_info)) {
