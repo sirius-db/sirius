@@ -85,7 +85,9 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "[integration][gpu_execution][union_all]")
 {
   // An empty arm's pipeline finishes without pushing a batch, so the operator must fall through
-  // to the other arm rather than reporting exhausted.
+  // to the other arm rather than reporting exhausted. The base's all-ports readiness test can
+  // never hold here, which makes these the only cases in the file that would fail if UNION's
+  // ANY-readiness override were reverted.
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM uempty");
   compare_gpu_vs_cpu("SELECT k, v FROM uempty UNION ALL SELECT k, v FROM ua");
   compare_gpu_vs_cpu("SELECT k FROM uempty UNION ALL SELECT k FROM uempty");
@@ -112,8 +114,9 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL arms of unequal length",
                  "[integration][gpu_execution][union_all]")
 {
-  // A short arm drains first. The base task-driver contract would strand the longer arm's
-  // remaining rows once the short one finished; the row counts here are what catches that.
+  // A row-count check on asymmetric inputs, and no more than that. Arm stranding needs an arm
+  // with a second batch to strand, which the shared 100 MB scan_task_batch_size cannot produce:
+  // at one batch per arm the base task-driver contract answers these correctly too.
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k FROM uc UNION ALL SELECT k FROM ua) t");
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT k FROM ua UNION ALL SELECT k FROM uc) t");
   compare_gpu_vs_cpu("SELECT k FROM uc UNION ALL SELECT k FROM ua");

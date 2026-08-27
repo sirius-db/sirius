@@ -139,7 +139,6 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   // -----------------------------
   PARTITION,
   CONCAT,
-  //! Non-partitioning arm terminator for UNION: forwards batches unchanged and unpartitioned.
   PASSTHROUGH_SINK,
   MERGE_SORT,
   MERGE_GROUP_BY,

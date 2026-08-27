@@ -60,11 +60,17 @@ void sirius_physical_union::build_pipelines(pipeline::sirius_pipeline& current,
 
   // Every arm reaches UNION through a plan-gen PASSTHROUGH_SINK wrap. Create a child meta per arm
   // terminating in that sink, then recurse *past* it so it does not redundantly create its own.
-  D_ASSERT(children.size() >= 2);
+  // A throw rather than a D_ASSERT, because a release build would otherwise index an empty
+  // `children` and read past the end silently. The other two preconditions already fail loudly
+  // elsewhere: arity in the plan builder (`sirius_plan_set_operation.cpp`), and a non-sink
+  // pipeline sink in `sirius_pipeline::reset_sink`.
   for (auto& child_slot : children) {
     auto& child = *child_slot;
-    D_ASSERT(child.is_sink());
-    D_ASSERT(!child.children.empty());
+    if (child.children.empty()) {
+      throw internal_exception(
+        "sirius_physical_union::build_pipelines: arm reached pipeline building without its "
+        "PASSTHROUGH_SINK wrap");
+    }
     auto& child_meta = host_meta->create_child_meta_pipeline(*host_current, child);
     child_meta.build(*child.children[0]);
   }
@@ -158,8 +164,10 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
   }
 
   // `task_creator::get_operator_for_next_task` selects the next operator to run *only* by walking
-  // `hint.producer`, so a null producer here means the still-producing arm never runs — a hang,
-  // not a wrong answer. Advance the cursor so successive waits do not keep naming the same arm.
+  // `hint.producer`, so a null producer here would leave the still-producing arm with nothing to
+  // run it. The walk is also all-or-nothing: when it yields no operator, `task_creator` abandons
+  // the whole task-creation request, so repeatedly nominating one stalled arm concentrates that
+  // loss on it. Advancing past the arm just nominated spreads it across the arms instead.
   if (live_producer != nullptr) {
     _wait_cursor = (live_arm + 1) % num_arms;
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, live_producer};

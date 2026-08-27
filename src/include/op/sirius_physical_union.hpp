@@ -31,9 +31,11 @@ namespace op {
 //!
 //! `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, and each sink feeds a *distinct* input
 //! port, `port_label(i)` for `children[i]`. The distinct names are a correctness requirement:
-//! `add_port` is last-writer-wins and the repository manager keys by `(operator_id, port_id)`, so a
-//! shared name would orphan an arm's repository and let the pipeline finish while that arm still
-//! had rows.
+//! `add_port` is last-writer-wins on the name, the repository manager keys by
+//! `(operator_id, port_id)`, and the pipeline-finish gate reads `is_source_pipeline_finished()` /
+//! `all_ports_empty()` across the same `ports` map. A shared name would therefore orphan an arm's
+//! repository, and because the orphan is no longer in that map, let the pipeline finish while that
+//! arm still had rows.
 class sirius_physical_union : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::UNION;
@@ -83,8 +85,13 @@ class sirius_physical_union : public sirius_physical_operator {
     sirius_physical_operator const& producer) const override;
 
   //! A UNION arm streams: bag union keeps no cross-batch state and makes no ordering guarantee, so
-  //! it never needs a complete side. The base's default is FULL, which would hold every arm's
-  //! output in repositories until all arms finished.
+  //! it never needs a complete side. Same answer as the join's inbound edges, so a fan-in consumer
+  //! absorbed into its producers' branches is the established shape rather than a novelty. UNION
+  //! overrides its own hint and never reads `port::type`, but the value still matters:
+  //! `query_index` cuts a branch only on a FULL edge, so PARTIAL lets each arm's branch walk absorb
+  //! the UNION's pipeline rather than give it one of its own, which feeds scheduling priorities. It
+  //! is also what would keep the base hint from buffering every arm to completion, the day someone
+  //! simplifies UNION back onto it.
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 

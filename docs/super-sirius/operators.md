@@ -328,6 +328,9 @@ over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the 
   also keeps each batch on the GPU that produced it.
 - **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
   operator, so this answer decides the whole plan's.
+- **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
+  the operator, and resolving a `"union_{i}"` name costs two `std::string` allocations, so the
+  names are resolved to `port*` once on first use.
 - **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
   arms presenting different physical carriers for the same logical column.
 
