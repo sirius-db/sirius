@@ -31,7 +31,6 @@ sirius_physical_union::sirius_physical_union(duckdb::vector<sirius::logical_type
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::UNION, std::move(types), estimated_cardinality)
 {
-  // Nothing to configure: no keys, no join type, no dedup.
 }
 
 std::string sirius_physical_union::get_name() const { return "UNION"; }
@@ -92,10 +91,8 @@ std::unique_ptr<operator_data> sirius_physical_union::execute(const operator_dat
                                                               rmm::cuda_stream_view /*stream*/)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_union::execute"};
-  // Identity: no device work, no concat. get_next_task_input_data already popped the batch from
-  // one arm's repository; re-wrap the same batches. Forwarding the read-only accessors keeps the
-  // shared read lock held across the handoff, matching the other pass-through forwarders (CTE,
-  // DELIM_JOIN, COLUMN_DATA_SCAN).
+  // get_next_task_input_data already popped the batch; re-wrap it. Forwarding the read-only
+  // accessors keeps the shared read lock held across the handoff.
   const auto* pipelineable = dynamic_cast<const pipelineable_operator_data*>(&input_data);
   if (pipelineable == nullptr) {
     throw internal_exception("sirius_physical_union::execute: expected pipelineable_operator_data");
@@ -109,9 +106,8 @@ const std::vector<sirius_physical_operator::port*>& sirius_physical_union::arm_p
   _arm_ports.clear();
   _arm_ports.reserve(children.size());
   for (std::size_t i = 0; i < children.size(); i++) {
-    // get_port throws (listing the ports that do exist) when an arm has no port, which means the
-    // wiring dropped that arm. Failing loudly is the point: the alternative is silently returning
-    // a short row count.
+    // get_port throws when an arm has no port, meaning the wiring dropped that arm. Failing
+    // loudly is the point: the alternative is silently returning a short row count.
     _arm_ports.push_back(get_port(port_label(i)));
   }
   return _arm_ports;
@@ -138,9 +134,8 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(lock);
 
-  // One pass over the arms doing two jobs. The base splits this into three scans because it must
-  // distinguish FULL from PARTIAL ports; a UNION arm carries no cross-batch state, so the inbound
-  // edge is declared PARTIAL (`input_barrier_for`) and `port::type` is deliberately not consulted.
+  // `port::type` is deliberately not consulted: a UNION arm carries no cross-batch state, so its
+  // inbound edge is declared PARTIAL by this operator's `input_barrier_for`.
   const auto& ports_by_arm = arm_ports();
   const auto num_arms      = ports_by_arm.size();
   if (num_arms == 0) { return std::nullopt; }
@@ -150,34 +145,26 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
   for (std::size_t offset = 0; offset < num_arms; offset++) {
     const auto arm = (_wait_cursor + offset) % num_arms;
     auto* p        = ports_by_arm[arm];
-    // Readiness is ANY, not ALL: one arm with a queued batch is enough to fire a task. The scan
-    // order does not affect this answer, only which arm is nominated below.
+    // Readiness is ANY, not ALL: one arm with a queued batch is enough to fire a task.
     if (p->repo && p->repo->total_size() > 0) {
       return task_creation_hint{TaskCreationHint::READY, this};
     }
-    // Otherwise remember one arm that is still producing. Unlike the base we cannot return here —
-    // a later arm may have data, and READY outranks WAITING — so the candidate is carried.
+    // Carry a still-producing arm rather than returning here: a later arm may have data, and
+    // READY outranks WAITING.
     if (live_producer == nullptr && p->src_pipeline && !p->src_pipeline->is_pipeline_finished()) {
       live_producer = &(p->src_pipeline->get_operators()[0].get());
       live_arm      = arm;
     }
   }
 
-  // No arm has data, but one is still producing: wait, and name that arm's producer.
   // `task_creator::get_operator_for_next_task` selects the next operator to run *only* by walking
   // `hint.producer`, so a null producer here means the still-producing arm never runs — a hang,
-  // not a wrong answer. Drained and finished arms are skipped: waiting on one would be pointless.
-  //
-  // Nominating strictly by arm index would keep naming the same producer, and a producer that
-  // cannot progress costs the whole task-creation request (task_creator drops the walk when it
-  // yields no operator). Advancing past the arm just nominated spreads that cost over the arms
-  // instead of concentrating it on the lowest-numbered stalled one.
+  // not a wrong answer. Advance the cursor so successive waits do not keep naming the same arm.
   if (live_producer != nullptr) {
     _wait_cursor = (live_arm + 1) % num_arms;
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, live_producer};
   }
 
-  // Every arm empty and every producer finished: exhausted.
   return std::nullopt;
 }
 
@@ -185,12 +172,9 @@ std::unique_ptr<operator_data> sirius_physical_union::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> lg(lock);
 
-  // One batch from one arm, rather than the base's one-from-every-port bundle. Beyond the
-  // unequal-arm problem the bundle would also mix batches produced on different GPUs into a single
-  // task, which runs on one device — reintroducing the migration the passthrough sink removes.
-  //
-  // task_creator loops `while (!node->all_ports_empty())` around this call, so one batch per call
-  // still drains every arm within a scheduling round; the cursor only decides the order within it.
+  // One batch from one arm, not the base's one-from-every-port bundle, which would mix batches
+  // produced on different GPUs into a task that runs on one device. task_creator loops
+  // `while (!node->all_ports_empty())` around this call, so every arm still drains in a round.
   const auto& ports_by_arm = arm_ports();
   const auto num_arms      = ports_by_arm.size();
   if (num_arms == 0) { return nullptr; }
@@ -203,8 +187,8 @@ std::unique_ptr<operator_data> sirius_physical_union::get_next_task_input_data()
     _arm_cursor = (arm + 1) % num_arms;
     std::vector<std::shared_ptr<::cucascade::data_batch>> popped;
     popped.push_back(std::move(batch));
-    // pipelineable, not partitioned: no partition_idx, so the task creator routes this task by
-    // data locality and the batch is processed on the GPU that produced it.
+    // pipelineable, not partitioned: with no partition_idx the task creator routes by data
+    // locality, so the batch is processed on the GPU that produced it.
     return std::make_unique<pipelineable_operator_data>(std::move(popped));
   }
   return nullptr;

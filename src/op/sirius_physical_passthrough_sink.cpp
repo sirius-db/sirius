@@ -43,11 +43,10 @@ std::unique_ptr<operator_data> sirius_physical_passthrough_sink::execute(
   const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_passthrough_sink::execute"};
-  // Re-wrap the same batches, deliberately as the base `pipelineable_operator_data` rather than a
-  // `partitioned_operator_data`: the absence of a partition index is what lets the task creator
-  // route the downstream UNION task by data locality. Forwarding the read-only accessors keeps the
-  // shared read lock held across the handoff, matching the other pass-through forwarders (CTE,
-  // DELIM_JOIN, COLUMN_DATA_SCAN).
+  // Re-wrap as the base `pipelineable_operator_data`, not a `partitioned_operator_data`: the
+  // absence of a partition index is what lets the task creator route the downstream UNION task by
+  // data locality. Forwarding the read-only accessors keeps the shared read lock held across the
+  // handoff.
   const auto* pipelineable = dynamic_cast<const pipelineable_operator_data*>(&input_data);
   if (pipelineable == nullptr) {
     throw internal_exception(
