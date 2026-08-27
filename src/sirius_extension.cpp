@@ -680,8 +680,10 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (gstate.finished) { return; }
 
   if (!gstate.res) {
-    auto start      = std::chrono::high_resolution_clock::now();
-    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto conn_state    = get_sirius_connection_state(context);
+    auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
+    auto start         = std::chrono::high_resolution_clock::now();
+    auto sirius_ctx    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
@@ -711,8 +713,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
           std::move(prepared), std::move(sirius_physical_plan));
 
-        gstate.sirius_iface = make_uniq<::sirius::sirius_interface>(context, data.query_label);
-        gstate.res          = gstate.sirius_iface->sirius_execute_query(
+        gstate.sirius_iface =
+          make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
+        gstate.res = gstate.sirius_iface->sirius_execute_query(
           context, data.query, gpu_prepared, {}, window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
@@ -1888,6 +1891,39 @@ static void SiriusVectorSearchFunction(ClientContext& context,
   state.reader->get_next_chunk(output);
 }
 
+// sirius_set_session_label('<label>'): sticky per-connection telemetry query
+// group; '' reverts to the default session group.
+static unique_ptr<FunctionData> SiriusSetSessionLabelBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_session_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetSessionLabelFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto conn_state = get_sirius_connection_state(context)) {
+    conn_state->set_session_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
@@ -1942,6 +1978,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                 SiriusSetQueryLabelBind);
   CreateTableFunctionInfo set_query_label_info(set_query_label);
   catalog.CreateTableFunction(transaction, set_query_label_info);
+
+  TableFunction set_session_label("sirius_set_session_label",
+                                  {LogicalType::VARCHAR},
+                                  SiriusSetSessionLabelFunction,
+                                  SiriusSetSessionLabelBind);
+  CreateTableFunctionInfo set_session_label_info(set_session_label);
+  catalog.CreateTableFunction(transaction, set_session_label_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

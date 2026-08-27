@@ -71,6 +71,10 @@ class telemetry_context {
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
   /// The single, session-scoped query group that every query in this context is reported under.
   [[nodiscard]] const uuid::UUID& query_group_id() const { return query_group_uuid_; }
+  /// The `{engine}-{session_label}` query group, declared on first use; empty or
+  /// nullopt falls back to the default session-scoped group. Thread-safe.
+  [[nodiscard]] uuid::UUID query_group_id_for(
+    const std::optional<std::string>& session_label) const;
   /// The `gpu-N` device group for `device_id`; falls back to the engine group
   /// (with a warning) when the device was not declared at creation time.
   [[nodiscard]] const uuid::UUID& gpu_device_group_id(int device_id) const;
@@ -103,6 +107,9 @@ class telemetry_context {
   uuid::UUID worker_uuid_;
   uuid::UUID query_group_uuid_;
   uuid::UUID shared_group_uuid_;
+  std::string engine_name_;
+  mutable std::mutex labeled_groups_mutex_;
+  mutable std::map<std::string, uuid::UUID> labeled_group_ids_;
   std::map<int, gpu_device_group_ids> gpu_group_ids_;
   rust::Box<quent::Context> context_;
   rust::Box<quent::engine::EngineObserver> engine_observer_;
