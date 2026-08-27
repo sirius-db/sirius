@@ -374,6 +374,7 @@ mod tests {
             metadata: vec![fill; 4],
             offset: u64::from(fill) * 1024,
             len: 512,
+            rows: Some(u64::from(fill)),
         }
     }
 

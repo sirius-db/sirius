@@ -62,6 +62,7 @@
 #include <algorithm>  // std::find
 #include <cstdlib>    // std::getenv
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -366,6 +367,7 @@ struct Fragment::Impl {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
     std::set<sirius::exec::sender_id_t> expected_senders;
+    std::optional<std::uint64_t> estimated_rows;
   };
 
   std::map<sirius::exec::stream_id_t, declared_input> inputs;
@@ -424,6 +426,7 @@ struct Fragment::Impl {
       }
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
+      spec.estimated_rows = declared.estimated_rows;
       resolved.emplace(id, std::move(spec));
     }
     return resolved;
@@ -443,9 +446,10 @@ struct Fragment::Impl {
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();
       if (is_result()) { result_input_repos[id] = repository; }
-      catalog.declare(id,
-                      sirius::exec::stream_input_binding{
-                        spec.names, spec.types, repository, spec.expected_senders, nullptr});
+      catalog.declare(
+        id,
+        sirius::exec::stream_input_binding{
+          spec.names, spec.types, repository, spec.expected_senders, spec.estimated_rows, nullptr});
     }
   }
 
@@ -503,6 +507,12 @@ void Fragment::declare_input_sender(std::uint64_t stream_id, std::uint32_t sende
 {
   impl_->require_not_built("declare_input_sender");
   impl_->inputs[stream_id].expected_senders.insert(sender_id);
+}
+
+void Fragment::declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows)
+{
+  impl_->require_not_built("declare_input_cardinality");
+  impl_->inputs[stream_id].estimated_rows = rows;
 }
 
 void Fragment::declare_output(std::uint64_t stream_id)
@@ -697,7 +707,8 @@ constexpr std::size_t kPackChunkBytes = 8u << 20;
 
 std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t stream_id,
                                                                    std::uint64_t& offset,
-                                                                   std::uint64_t& length)
+                                                                   std::uint64_t& length,
+                                                                   std::uint64_t& rows)
 {
   if (!impl_->built) {
     throw sirius::invalid_input_exception("Fragment: build() must run before export_packed()");
@@ -706,6 +717,7 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
 
   offset     = 0;
   length     = 0;
+  rows       = 0;
   auto batch = impl_->session().pull(stream_id);
   if (!batch) { return nullptr; }
 
@@ -723,6 +735,7 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
     throw sirius::invalid_input_exception("Fragment: batch on output stream " +
                                           std::to_string(stream_id) + " has no memory space");
   }
+  rows = static_cast<std::uint64_t>(view.num_rows());
 
   auto stream = cudf::get_default_stream();
   // STREAM-LINEAGE: order the pack's gather after the batch's writer.
@@ -915,6 +928,29 @@ std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
 {
   if (!impl_->fragment) { return 0; }
   return impl_->fragment->output_repository(stream_id)->total_size();
+}
+
+std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
+{
+  if (!impl_->fragment) { return 0; }
+  const auto& repository = impl_->fragment->output_repository(stream_id);
+
+  // Non-destructive walk: by-id lookups leave the parked queue intact, unlike session().pull.
+  std::uint64_t rows = 0;
+  for (std::size_t partition = 0; partition < repository->num_partitions(); ++partition) {
+    for (auto batch_id : repository->get_batch_ids(partition)) {
+      auto batch = repository->get_data_batch_by_id(batch_id, partition);
+      if (!batch) { continue; }  // popped concurrently; parked outputs are quiescent in practice
+      auto read_only = batch->to_read_only();
+      if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+        throw sirius::invalid_input_exception(
+          "Fragment: batch on output stream " + std::to_string(stream_id) +
+          " is not GPU-resident; counting a spilled batch's rows is not supported yet");
+      }
+      rows += static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
+    }
+  }
+  return rows;
 }
 
 std::unique_ptr<std::vector<std::string>> Fragment::output_types() const

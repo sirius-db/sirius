@@ -354,6 +354,7 @@ fn export_next(
         metadata: batch.metadata,
         offset: batch.offset,
         len: batch.len,
+        rows: Some(batch.rows),
     }))
 }
 
@@ -479,6 +480,44 @@ fn run_fragment_inner<'ctx>(
                 .declare_input_sender(stream_id, sender_id)
                 .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
         }
+
+        // The CN already holds every input of this fragment — parked local sender outputs and
+        // staged remote batches — so it can declare the stream's EXACT row count and let
+        // DuckDB's optimizer size join order / build-side selection (a stream source binds with
+        // no rows behind it, so undeclared streams all estimate cardinality 1: the q07 2-CN
+        // regression built its hash join on a multi-GB stream while a 2-row stream probed).
+        // Best-effort by design: when any contributor's count is unknown (a spilled parked
+        // batch, a remote frame that predates the wire's `rows` field), skip the declaration
+        // and keep the legacy blind planning for this stream rather than failing the fragment.
+        let local_rows: Option<u64> = senders
+            .iter()
+            .map(|slot| {
+                let (park_id, sender_stream) = parked_slots.get(slot).copied()?;
+                let entry = parked.get(&park_id)?;
+                entry.fragment.output_row_count(sender_stream).ok()
+            })
+            .sum();
+        let remote_rows: Option<u64> = request
+            .remote_inputs
+            .iter()
+            .filter(|(node_id, _, _)| *node_id == schema.node_id)
+            .flat_map(|(_, _, batches)| batches.iter().map(|batch| batch.rows))
+            .sum();
+        match (local_rows, remote_rows) {
+            (Some(local), Some(remote)) => {
+                let rows = local + remote;
+                fragment
+                    .declare_input_cardinality(stream_id, rows)
+                    .map_err(|err| {
+                        format!("failed to declare cardinality of stream {stream_id}: {err}")
+                    })?;
+                info!(stream_id, rows, "declared input stream cardinality");
+            }
+            _ => warn!(
+                stream_id,
+                "input stream row count unknown; planning without a declared cardinality"
+            ),
+        }
     }
 
     // An intermediate fragment sinks into one output stream per destination (stream i belongs
@@ -552,6 +591,9 @@ fn run_fragment_inner<'ctx>(
                 metadata: batch.metadata.clone(),
                 offset: batch.offset,
                 len: batch.len,
+                // push_packed never reads the count; the receiver consumed it before build()
+                // through declare_input_cardinality.
+                rows: batch.rows.unwrap_or(0),
             };
             fragment.push_packed(stream_id, &staged).map_err(|err| {
                 format!(

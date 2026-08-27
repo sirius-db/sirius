@@ -733,6 +733,9 @@ mod agent_tier {
                             length: Some(length),
                             column_names: spec.names.clone(),
                             canary: None,
+                            // Exact per-batch count from export_packed; the receiver sums the
+                            // frames into declare_input_cardinality before it builds its plan.
+                            rows: batch.rows,
                         },
                         metadata,
                     )
@@ -771,6 +774,7 @@ mod agent_tier {
                     length: None,
                     column_names: spec.names.clone(),
                     canary: None,
+                    rows: None,
                 },
                 Vec::new(),
             )?;

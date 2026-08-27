@@ -1,8 +1,8 @@
 diff --git a/gensrc/proto/internal_service.proto b/gensrc/proto/internal_service.proto
-index 1e392043e89..b42695269d0 100644
+index 1e392043e89..6679b2d8d72 100644
 --- a/gensrc/proto/internal_service.proto
 +++ b/gensrc/proto/internal_service.proto
-@@ -786,6 +786,44 @@ message PLookUpResponse {
+@@ -786,6 +786,49 @@ message PLookUpResponse {
      repeated PColumn columns = 2;
  }
  
@@ -39,6 +39,11 @@ index 1e392043e89..b42695269d0 100644
 +    optional uint64 length = 7;
 +    repeated string column_names = 8;
 +    optional bool canary = 9;
++    // Exact row count of this batch frame (from export_packed). The receiver sums the counts
++    // per stream into declare_input_cardinality so the optimizer can size the stream; absent
++    // on EOS/canary frames and from senders that predate the field (receiver then declares
++    // nothing and keeps the legacy blind planning).
++    optional uint64 rows = 10;
 +}
 +
 +message PTransmitPackedResult {
@@ -47,7 +52,7 @@ index 1e392043e89..b42695269d0 100644
  
  service PInternalService {
      rpc transmit_data(PTransmitDataParams) returns (PTransmitDataResult);
-@@ -838,4 +876,9 @@ service PInternalService {
+@@ -838,4 +881,9 @@ service PInternalService {
  
      rpc update_transaction_state(PUpdateTransactionStateRequest) returns (PUpdateTransactionStateResponse);
      rpc lookup(PLookUpRequest) returns (PLookUpResponse);
