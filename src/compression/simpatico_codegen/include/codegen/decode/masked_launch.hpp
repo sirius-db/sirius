@@ -23,6 +23,7 @@
 #pragma once
 
 #include "codegen/jit/fused_tree.hpp"
+#include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/selection.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
@@ -30,6 +31,21 @@
 #include <cstdint>
 
 namespace simpatico {
+
+/// How a compacting launcher enumerates survivors. At most one form is set;
+/// none means walk the mask bits. It changes which rows a block visits and how
+/// many blocks launch — never the output, never the signature.
+///
+/// The mask and index forms describe a selection the decode itself made, so they
+/// are dense over the batch's chunks; a row set is for one that arrives
+/// afterwards and launches only the chunks it touches.
+struct row_enumeration {
+  std::int32_t const* row_indices              = nullptr;
+  ::sirius::codegen::chunk_row_set const* rows = nullptr;
+
+  [[nodiscard]] bool by_index() const noexcept { return row_indices != nullptr; }
+  [[nodiscard]] bool by_row_set() const noexcept { return rows != nullptr; }
+};
 
 /// Range ballot: decode fused with the inclusive range ``pred`` (decoded
 /// integer domain), balloting into ``mask.words``; no column output.  Any
@@ -64,7 +80,7 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         char const* dtype,
                                         std::int64_t num_rows,
                                         ::sirius::codegen::selection_mask const& mask,
-                                        std::int32_t const* row_indices,
+                                        row_enumeration rows,
                                         void* out,
                                         rmm::cuda_stream_view stream);
 
@@ -80,6 +96,7 @@ bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           char const* dtype,
                                           std::int64_t num_rows,
                                           ::sirius::codegen::selection_mask const& mask,
+                                          row_enumeration rows,
                                           void const* keys_chars,
                                           std::int32_t key_width,
                                           void* out_chars,
@@ -98,6 +115,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              char const* dtype,
                                              std::int64_t num_string_rows,
                                              ::sirius::codegen::selection_mask const& mask,
+                                             row_enumeration rows,
                                              std::int64_t* src_offsets_out,
                                              std::int32_t* lengths_out,
                                              rmm::cuda_stream_view stream);

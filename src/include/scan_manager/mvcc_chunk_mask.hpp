@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -59,5 +60,17 @@ struct mvcc_chunk_mask {
 /// request fills it, then each cached provider takes its own copy (words are
 /// shared through the masks' owning pointers, never duplicated).
 using mvcc_chunk_mask_set = std::vector<mvcc_chunk_mask>;
+
+/// Whether any slot actually masks a row. A duckdb pin's set is sized to the chunk count at
+/// request creation and never resized (see mvcc_mask_job.hpp), so `masks.empty()` is false for
+/// every duckdb pin even when the table has no deletions — checking size alone would refuse late
+/// materialization for every duckdb-native scan unconditionally. This checks the slots
+/// themselves instead: an unmodified table's slots are all default-constructed (has_mask()
+/// false), so this reports false and the caller may treat the set as if it carried no mask.
+[[nodiscard]] inline bool has_any_mask(mvcc_chunk_mask_set const& masks)
+{
+  return std::any_of(
+    masks.begin(), masks.end(), [](mvcc_chunk_mask const& mask) { return mask.has_mask(); });
+}
 
 }  // namespace sirius::scan_manager

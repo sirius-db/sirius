@@ -14,7 +14,11 @@
  * limitations under the License.
  */
 
+// libcudf's AST header uses std::variant without including <variant>.
+// clang-format off
+#include <variant>
 #include <cudf/ast/expressions.hpp>
+// clang-format on
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/search.hpp>
 #include <cudf/utilities/traits.hpp>

@@ -63,10 +63,12 @@
 #include <duckdb/common/types/value.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -304,6 +306,19 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
     // Better than crashing — the column will be STRING instead of native type.
     default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
+}
+
+/** @brief Assemble an owned table from column pointers; `cudf::table` has no variadic constructor.
+ */
+template <typename... Columns>
+  requires(sizeof...(Columns) > 0 &&
+           (std::convertible_to<Columns &&, std::unique_ptr<cudf::column>> && ...))
+[[nodiscard]] inline std::unique_ptr<cudf::table> make_table(Columns&&... columns)
+{
+  std::vector<std::unique_ptr<cudf::column>> owned;
+  owned.reserve(sizeof...(Columns));
+  (owned.push_back(std::forward<Columns>(columns)), ...);
+  return std::make_unique<cudf::table>(std::move(owned));
 }
 
 /**

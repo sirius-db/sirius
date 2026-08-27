@@ -257,6 +257,15 @@ set(EXTENSION_SOURCES
     src/compression/simpatico_bridge.cpp
     src/compression/spill_context.cpp
     src/planner/column_origin.cpp
+    src/late_mat/prepared_selection.cpp
+    src/late_mat/materialize.cpp
+    src/late_mat/defer_policy.cpp
+    src/late_mat/defer_directive.cpp
+    src/late_mat/port_materialize.cpp
+    src/late_mat/pin_uniqueness.cpp
+    src/planner/late_mat_plan_pass.cpp
+    src/scan_manager/late_mat_resolver.cpp
+    src/late_mat/multi_source_gather.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -291,6 +300,9 @@ set(EXTENSION_SOURCES
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
     src/exec/stream_session.cpp
+    src/exec/stream_bind_catalog.cpp
+    src/exec/stream_plan_bindings.cpp
+    src/exec/streaming_fragment.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -318,6 +330,7 @@ set(EXTENSION_SOURCES
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
+    src/op/aggregate/group_key_labels.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
@@ -350,6 +363,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
+    src/op/sirius_physical_dense_count_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
@@ -380,6 +394,7 @@ set(EXTENSION_SOURCES
     src/pipeline/sirius_meta_pipeline.cpp
     src/pipeline/sirius_pipeline.cpp
     src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/data_size_estimator.cpp
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
@@ -446,10 +461,12 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
+    src/cuda/dense_count_join_impl.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/sirius_like_multiliteral.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -684,7 +701,10 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp
+    test/cpp/exec/test_sirius_ffi_fragment.cpp
+    test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_stream_session.cpp
+    test/cpp/exec/test_streaming_fragment.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -697,6 +717,7 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_expression_evaluator.cpp
     test/cpp/expression_evaluator/test_expression_evaluator_ast_equivalence.cpp
     test/cpp/expression_evaluator/test_gpu_expression_translator.cpp
+    test/cpp/expression_evaluator/test_like_multiliteral.cpp
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
@@ -707,6 +728,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
+    test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
@@ -722,6 +744,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
@@ -734,6 +757,18 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
+    test/cpp/late_mat/test_column_origin.cpp
+    test/cpp/late_mat/test_prepared_selection.cpp
+    test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_port_materialize.cpp
+    test/cpp/integration/test_late_mat_deferred_query.cpp
+    test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/late_mat/test_defer_policy.cpp
+    test/cpp/late_mat/test_defer_directive.cpp
+    test/cpp/late_mat/test_late_mat_plan_pass.cpp
+    test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_pin_handle_lifecycle.cpp
+    test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -754,13 +789,14 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
-    test/cpp/operator/test_mgpu_stress.cpp
+    test/cpp/operator/test_task_scheduler_routing.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
@@ -768,6 +804,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
+    test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp
@@ -791,6 +828,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
@@ -807,9 +845,11 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
+    test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
+    test/cpp/pipeline/test_data_size_estimator.cpp
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
@@ -899,6 +939,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    # Late-materialization headers include codegen/selection/chunk_row_set.hpp
+    # and row_id_space.hpp, so a test that includes
+    # late_mat/prepared_selection.hpp needs the simpatico include root. It was
+    # dropped as dead in #1474 (8a3de03c), which was true until this feature
+    # landed.
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 

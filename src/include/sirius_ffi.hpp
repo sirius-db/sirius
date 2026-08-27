@@ -32,12 +32,15 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifndef SIRIUS_FFI_EXPORT
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
 namespace sirius::ffi {
+
+class Fragment;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -66,27 +69,119 @@ class SIRIUS_FFI_EXPORT Context {
   /// of record batches). `out_stream_addr` is the address of a caller-owned
   /// `ArrowArrayStream` that the caller releases per the Arrow ABI. Throws on
   /// translation or execution failure.
-  ///
-  /// `plan` is the protobuf-encoded `substrait::Plan` as a byte buffer; its reads
-  /// must be resolvable by DuckDB (e.g. `local_files` parquet reads). The stream
-  /// is passed as an integer address so this public header stays free of
-  /// Arrow/DuckDB types; the Rust bindings pass the address of an
-  /// `FFI_ArrowArrayStream` they own.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
  private:
-  // PIMPL: the engine handle + embedded DuckDB live in the .cpp so this public
-  // header pulls in no DuckDB/cudf/rmm types (DuckDB uses its own smart pointers).
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class Fragment;
+  friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
 };
 
-/// Create an initialized [`Context`] configured from built-in defaults, owned by
-/// the returned `unique_ptr`.
+/// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
+///
+/// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
+/// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
+/// streams fed by other fragments without copying.
+///
+/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
+/// drain via relay_from or result_to_arrow.
+///
+/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
+/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
+/// build() but before run() closes the lifecycle itself.
+class SIRIUS_FFI_EXPORT Fragment {
+ public:
+  ~Fragment();
+
+  Fragment(const Fragment&)            = delete;
+  Fragment& operator=(const Fragment&) = delete;
+
+  /// Declare one column of input stream `stream_id` (in plan order). `type` is a DuckDB type
+  /// name (`BIGINT`, `DECIMAL(15,2)`, `DATE`, …).
+  /// @throws after build().
+  void declare_input_column(std::uint64_t stream_id,
+                            const std::string& name,
+                            const std::string& type);
+
+  /// Declare a sender that must close input stream `stream_id` before it ends. With none
+  /// declared the stream expects single sender 0.
+  /// @throws after build().
+  void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Declare an output stream. A fragment with no output stream is a result fragment.
+  /// @throws after build() or on duplicate id.
+  void declare_output(std::uint64_t stream_id);
+
+  /// Every output receives the full fragment output (broadcast sink). Requires at least two
+  /// declared outputs: build() rejects a partition mode declared on 0 or 1 outputs rather than
+  /// silently ignoring it. Mutually exclusive with declare_output_hash_key.
+  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
+  void declare_output_broadcast();
+
+  /// Declare one hash-partition key column for a multi-output sink. Call once per key in
+  /// partition-expression order. Requires at least two declared outputs, same as
+  /// declare_output_broadcast(). Mutually exclusive with declare_output_broadcast.
+  /// @throws after build(), or from build() itself when fewer than two outputs are declared.
+  void declare_output_hash_key(std::uint32_t column_index);
+
+  /// Lower and plan `substrait_plan` against the declared streams; open the query lifecycle.
+  /// Creates a view `sirius_stream_<id>` for each declared input stream.
+  /// @throws on translation/planning failure or if already built.
+  void build(const std::string& substrait_plan);
+
+  /// Move every batch on `source`'s output stream `source_stream_id` into this fragment's
+  /// input stream `input_stream_id`, then close `sender_id` on it. Schema is validated before
+  /// any data moves. Must be called after source.run() and before this->run().
+  /// @return number of batches moved.
+  /// @throws on unknown stream id, schema mismatch, or before build().
+  std::size_t relay_from(Fragment& source,
+                         std::uint64_t source_stream_id,
+                         std::uint64_t input_stream_id,
+                         std::uint32_t sender_id);
+
+  /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
+  /// (relay_from closes its own sender). Idempotent per sender.
+  /// @throws before build() or on unknown stream/sender.
+  void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
+  /// @throws before build() or on execution failure.
+  void run();
+
+  /// Write this result fragment's rows into the caller-owned ArrowArrayStream at
+  /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.
+  /// @throws on an intermediate fragment or before run().
+  void result_to_arrow(std::uintptr_t out_stream_addr);
+
+  /// Batches currently parked on output stream `stream_id`. For diagnostics.
+  [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+  /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
+  /// @throws before build() or on a result fragment.
+  [[nodiscard]] std::unique_ptr<std::vector<std::string>> output_types() const;
+
+ private:
+  struct Impl;
+  explicit Fragment(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Create a [`Context`] configured from built-in defaults.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context();
 
-/// Create an initialized [`Context`] configured from the YAML file at
-/// `config_path`, owned by the returned `unique_ptr`.
+/// Create a [`Context`] configured from the YAML file at `config_path`.
 SIRIUS_FFI_EXPORT std::unique_ptr<Context> make_context_from_config(const std::string& config_path);
+
+/// Create a [`Fragment`] on `context`. The context must outlive it.
+SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+
+/// DuckDB view name a plan must read to consume input stream `stream_id`.
+/// Fragment::build() creates this view; the plan emits a read of this name where a file scan
+/// would otherwise appear.
+SIRIUS_FFI_EXPORT std::unique_ptr<std::string> stream_view_name(std::uint64_t stream_id);
 
 }  // namespace sirius::ffi

@@ -382,12 +382,16 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (probe.type() != _key_type) { return nullptr; }
+  // A pinned chunk may store this key narrowed while the filter was published at
+  // the native carrier; restore rather than decline (see restore_probe_to).
+  auto const restored = detail::restore_probe_to(probe, _key_type, stream, mr);
+  auto const keys     = restored ? restored->view() : probe;
+  if (keys.type() != _key_type) { return nullptr; }
   auto const* replica =
     _set ? _set->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica) { return nullptr; }
 
-  auto const n = probe.size();
+  auto const n = keys.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   auto* const outp = out->mutable_view().data<bool>();
@@ -396,7 +400,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
     [&](auto const& set) {
       using owner_type = std::decay_t<decltype(set)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
+      auto const* d    = keys.data<key_type>();
       auto ref         = set->ref(cuco::contains);
       cub::DeviceFor::Bulk(
         n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.value());

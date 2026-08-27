@@ -995,7 +995,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
 
@@ -1102,7 +1104,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     owning_table_view view{std::move(table)};
     if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        like_cache);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -1124,10 +1132,32 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 // per-split partition values) and return ROW_FILTERED_AND_PROJECTED, so they
 // never reach here. This path therefore only applies a pending row filter and a
 // non-partition projection; partition injection is unreachable.
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::unique_ptr<cudf::column>* survivors,
+  std::span<std::size_t const> elided)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
@@ -1146,10 +1176,24 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     // `exec`, which only borrows the AST.
     auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
     if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        std::move(like_cache));
       auto const data_positions = output_data_positions(*_plan);
-      auto filtered             = data_positions.empty() ? exec.select(input.table.view())
-                                                         : exec.select(input.table.view(), data_positions);
+      std::unique_ptr<cudf::table> filtered;
+      if (survivors != nullptr && !data_positions.empty()) {
+        // A deferral rides on this batch: it needs to know WHICH rows survived,
+        // because its rowid addresses the pinned chunk and the batch no longer
+        // holds that chunk's rows in order.
+        filtered = exec.select_with_survivors(input.table.view(), data_positions, *survivors);
+      } else {
+        filtered = data_positions.empty() ? exec.select(input.table.view())
+                                          : exec.select(input.table.view(), data_positions);
+      }
       // The select only enqueued its reads; record before the reassignment drops the read lock.
       input.table.record_reader_event(stream);
       input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
@@ -1175,6 +1219,11 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(assembled.view().num_columns()), elided);
+      !kept.empty()) {
+    assembled.select_columns(kept);
+  }
   return assembled.release(stream, mr_ref);
 }
 

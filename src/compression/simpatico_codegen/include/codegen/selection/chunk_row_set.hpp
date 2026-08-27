@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// A row selection that arrives AFTER the scan — post-join survivor ids — in the
+// form the decode can consume.
+//
+// The selection types in selection.hpp describe rows the DECODE itself chose: a
+// bitmap it balloted, or the ascending index list built from that bitmap. Both
+// are dense over the batch's chunks, because every chunk was a candidate. A
+// selection handed back later is not: a join may leave a few thousand rows
+// spread over a handful of chunks out of tens of thousands, and the difference
+// between "every chunk, most of them empty" and "only the chunks that survive"
+// is the whole cost at that density.
+//
+// So this is CSR (compressed sparse row) over chunks — "rows" being 1024-row
+// chunks, "entries" being surviving rows:
+//
+//   chunk_ids[b]        which chunk block b serves        (ascending, T entries)
+//   block_offsets[b]    where block b's output starts     (T + 1 entries)
+//   in_chunk_rows[]     positions 0..1023 within a chunk  (S entries, uint16)
+//
+// Block b reads in_chunk_rows[block_offsets[b] .. block_offsets[b+1]) and writes
+// from block_offsets[b]. Empty chunks are absent rather than launched-and-
+// skipped, and the output is in ascending row order by construction.
+//
+// Why uint16 positions: a stray offset cannot reach far past its own chunk. The
+// index list's global ids are turned into in-chunk positions by subtracting
+// chunk_start, which is correct only while every id in a block's slice really
+// belongs to that block's chunk — an invariant the mask->indices wave supplies
+// but a post-join caller would have to be trusted for. The 16-bit width bounds
+// the blast radius of a wrong id (kChunkSize = 1024, so it can address up to 64
+// chunks of reach, not an arbitrary one) — it does not enforce the invariant by
+// itself. What actually enforces it is build_chunk_row_set validating ids as
+// in-range and strictly increasing, so id - chunk_start < kChunkSize by
+// construction; that guarantee lives in the builder, not the type. This is a
+// public struct with public members, so a view assembled by hand elsewhere
+// gets none of the builder's protection.
+//
+// Size, for S survivors over T touched chunks: 2S + 8T bytes, against 4S + 4(C+1)
+// for the index list over C chunks. The crossover is DENSITY, not clustering:
+// survivors falling at random still leave most chunks empty once density is low
+// (a chunk is touched with probability 1-(1-d)^1024), so T/C collapses on its
+// own. On TPC-H sf1000 q17 and q19 sit exactly on that random baseline — no
+// clustering at all — and still skip 5.4M of 5.86M empty blocks; q18 is the one
+// genuinely clustered case, at T/C 0.011 against a 0.073 baseline.
+//
+// So this form never launches more blocks than the index list and never occupies more
+// memory THAN A SELECTION AT RANDOM DENSITY WOULD — that is what the size comparison above
+// models. It is not an absolute bound: CSR costs 4S + 4(T+1) + 2S against the index list's
+// 4S + 4(C+1), so CSR loses once nearly every chunk is touched with very few survivors each
+// (roughly T = C with fewer than ~2 survivors/chunk). A random selection cannot reach that —
+// T collapses below C well before S gets that sparse per chunk — so the crossover only bites
+// a STRUCTURED selection (one row per chunk), which the density argument above deliberately
+// sets aside. What this form costs instead is construction: the index list falls out of the
+// mask->indices wave, while the CSR has to be bucketed.
+
+#pragma once
+
+#include "codegen/jit/fused_tree.hpp"
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <cstdint>
+
+namespace sirius::codegen {
+
+/// Non-owning device view. The buffers belong to whoever built the selection;
+/// the decode only reads them.
+struct chunk_row_set {
+  /// Batch-local chunk ids, ascending, one per launched block.
+  std::uint32_t const* chunk_ids = nullptr;
+  /// Exclusive prefix of per-block survivor counts; num_touched + 1 entries,
+  /// last == num_survivors. Indexed by BLOCK, not by chunk id — that is what
+  /// lets the grid skip untouched chunks.
+  std::uint32_t const* block_offsets = nullptr;
+  /// In-chunk positions, grouped by block and ascending within each.
+  std::uint16_t const* in_chunk_rows = nullptr;
+
+  std::int64_t num_touched   = 0;  ///< T: blocks to launch
+  std::int64_t num_survivors = 0;  ///< S: rows the decode will write
+  std::int64_t num_rows      = 0;  ///< the batch's row count, for bounds checks
+
+  [[nodiscard]] bool valid() const noexcept
+  {
+    // An empty selection needs no arrays, but a non-zero block count with no survivors is
+    // still invalid: a launcher trusting this view would dispatch blocks against null pointers.
+    if (num_survivors == 0) { return num_touched == 0; }
+    return chunk_ids != nullptr && block_offsets != nullptr && in_chunk_rows != nullptr &&
+           num_touched > 0 && num_touched <= num_survivors &&
+           num_touched <= (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
+  }
+};
+
+/// Owning storage behind a chunk_row_set. The view is non-owning by design —
+/// the decode only reads — so this is what a builder returns and what the
+/// caller must keep alive for as long as any launch is still reading it.
+struct chunk_row_set_owner {
+  rmm::device_buffer chunk_ids;      // uint32 x num_touched
+  rmm::device_buffer block_offsets;  // uint32 x (num_touched + 1)
+  rmm::device_buffer in_chunk_rows;  // uint16 x num_survivors
+
+  std::int64_t num_touched   = 0;
+  std::int64_t num_survivors = 0;
+  std::int64_t num_rows      = 0;
+
+  [[nodiscard]] chunk_row_set view() const noexcept
+  {
+    return chunk_row_set{static_cast<std::uint32_t const*>(chunk_ids.data()),
+                         static_cast<std::uint32_t const*>(block_offsets.data()),
+                         static_cast<std::uint16_t const*>(in_chunk_rows.data()),
+                         num_touched,
+                         num_survivors,
+                         num_rows};
+  }
+};
+
+/// Bucket a selection that arrived after the scan into the CSR above.
+///
+/// ``row_ids`` are batch-local row ids on device, STRICTLY INCREASING and each
+/// in [0, num_rows). A join may well hand the same row back many times, but a
+/// repeat here would decode that row once per reference; deduplication belongs
+/// upstream, where sort_unique_global_ids drops the repeats and keeps the ranks
+/// that replay them from the compact output (row_id_space.hpp). So a duplicate
+/// reaching this point is an upstream bug, and is rejected as one.
+///
+/// Cost is O(num_ids) — no pass over the batch's chunks. That is the point: a
+/// selection touching 1% of chunks must not pay for the 99% it skips, which is
+/// exactly what a per-chunk counter array would charge. One host sync, for the
+/// touched-chunk count, because that count is the grid the launcher needs.
+///
+/// Throws if the ids are out of order or out of range, rather than building a
+/// row set that would decode the wrong rows.
+chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
+                                        std::int64_t num_ids,
+                                        std::int64_t num_rows,
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr);
+
+// ── Deriving the mask form ──────────────────────────────────────────────────
+//
+// Only this form can be built from a selection that arrives without a mask, so
+// it is what gets built, and the mask is derived when a consumer needs one —
+// cheaper than a second construction path for the selections that do come with
+// one, and how a plan with no random-access decode is still served.
+
+/// Expand into the fused wave-1 shape: selection-mask words plus per-chunk
+/// exclusive survivor offsets over ALL chunks, so the shipped mask route runs
+/// without re-deriving either.
+///
+/// Both outputs are written in full, including the chunks this selection never
+/// touches — a mask consumer reads the whole strip, so a partially written one
+/// would invent survivors out of whatever was there before. ``mask_words``
+/// holds selection_mask::WordsFor(num_rows) words and ``all_chunk_offsets``
+/// holds ChunksFor(num_rows) + 1.
+///
+/// Note the asymmetry: this is the one direction that costs O(chunks) rather
+/// than O(survivors), because the mask form is O(chunks) by definition.
+void row_set_to_mask(chunk_row_set const& rows,
+                     std::uint32_t* mask_words,
+                     std::uint32_t* all_chunk_offsets,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr);
+
+}  // namespace sirius::codegen

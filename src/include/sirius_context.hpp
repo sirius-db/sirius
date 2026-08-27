@@ -150,6 +150,20 @@ class SiriusConnectionState : public ClientContextState {
     return label;
   }
 
+  /// Sets the telemetry query-group label for subsequent queries on this connection.
+  ///
+  /// The label remains active until replaced.
+  /// An empty label restores the default session group.
+  void set_session_label(std::string label)
+  {
+    if (label.empty()) {
+      session_label_.reset();
+    } else {
+      session_label_ = std::move(label);
+    }
+  }
+  [[nodiscard]] const std::optional<std::string>& session_label() const { return session_label_; }
+
   void enter_internal_query() noexcept
   {
     internal_query_depth_.fetch_add(1, std::memory_order_relaxed);
@@ -185,6 +199,8 @@ class SiriusConnectionState : public ClientContextState {
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
+  /// Sticky label set by `sirius_set_session_label`; never consumed.
+  std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
@@ -688,6 +704,8 @@ class SiriusContext : public ClientContextState {
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
+  // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads
+  // before reset; reverse member destruction also preserves that order if initialize() throws.
   std::unique_ptr<sirius::pipeline::task_scheduler> task_scheduler_;
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
@@ -760,6 +778,9 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 /// Gates both plan-time and runtime fallback from GPU to DuckDB CPU. Set per
 /// connection via `SET enable_duckdb_fallback = ...`.
 bool duckdb_fallback_enabled(ClientContext& context);
+
+/// \brief Read the per-session `like_swar_fastpath` setting (default true).
+bool like_swar_fastpath_enabled(ClientContext& context);
 
 /// \brief Read the per-session `enable_compressed_materialization` setting.
 ///

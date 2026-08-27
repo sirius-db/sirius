@@ -142,15 +142,15 @@ When a query selects from a pinned table, `cached_databatch_provider` walks `pin
 
 GPU-tier chunks run on their owning GPU without a peer copy. HOST-tier chunks are copied to a NUMA-local GPU when the task starts. `task_creator` applies this rule last, after upstream-split, partition-pin, and byte-locality preferences.
 
-## Task Scheduling: SCHED-RR and Locality
+## Task Scheduling: Ready Devices and Locality
 
-For tasks that aren't bound to a specific chunk (e.g., downstream operators consuming many input batches), the scheduler computes a **locality score**:
+For tasks that aren't bound to a specific chunk (e.g., downstream operators consuming many input batches), the task creator computes a **locality score**:
 
 ```
 locality(task, gpu_id) = bytes of task input data already on gpu_id
 ```
 
-The task goes to the GPU with the highest score, falling back to the task's NUMA-paired GPU if locality is tied or all data is on HOST. This is the **SCHED-RR** (round-robin with locality) distribution policy. Source-pipeline tasks (those at the start of a pipeline) are distributed using strict round-robin; downstream tasks use locality.
+The task creator records the selected device as `preferred_device_id`, falling back to the task's NUMA-paired GPU if locality is tied or all data is on HOST. The scheduler then matches tasks to GPU executors that have signaled readiness: it first looks for a task preferring that exact GPU, then for a task with no preference. A preference is binding; a preference-less task may be claimed by any ready GPU. There is no round-robin ordering guarantee in the scheduler matcher.
 
 The task creator resolves a task's `preferred_device_id` in priority order:
 
@@ -172,7 +172,7 @@ See [`pipeline-execution.md`](pipeline-execution.md) "Per-task-device contract u
 
 Partitioned operators — BUILD_PROBE hash join, `grouped_aggregate_merge`, and the other partition-keyed operators — build a per-partition cuco hash table that is **only valid on the GPU it was built on**. A stream bound to GPU A that touches a cuco counter built under GPU B trips `cudaErrorInvalidValue` in cuco's `counter_storage`. The device a partition runs on is therefore a **correctness constraint, not just a locality preference**: every task of a given partition (its build and all its probes) must land on the same GPU.
 
-The task creator enforces this by pinning any task whose input is a `partitioned_operator_data` to `partition_idx % num_active_gpus`. The index is taken over the **admitted GPU set** — `task_creator::_active_gpu_ids`, which starts as the device ids that actually have a GPU executor (from the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on) and is narrowed per query by `sirius_engine::initialize_internal` via `set_active_gpu_ids()`. Indexing this set, rather than the physical hardware topology, is essential: when the configured GPU count is smaller than the physical GPU count (e.g. `num_gpus=2` on a 4-GPU box), a physical-topology modulo can resolve to a device id with no executor; the scheduler treats a pin to a non-existent executor as "no preference" and round-robins the task, which scatters a partition's build and probe across GPUs and lets a probe touch a build table cross-device. The same reasoning applies to a query admitted onto a subset of the executors (`topology.gpus_per_query`).
+The task creator enforces this by pinning any task whose input is a `partitioned_operator_data` to `partition_idx % num_active_gpus`. The index is taken over the **admitted GPU set** — `task_creator::_active_gpu_ids`, which starts as the device ids that actually have a GPU executor (from the memory manager's `Tier::GPU` memory spaces, the same set `task_scheduler` keys executors on) and is narrowed per query by `sirius_engine::initialize_internal` via `set_active_gpu_ids()`. Indexing this set, rather than the physical hardware topology, covers both a configured GPU count smaller than the physical count and a query admitted onto only a subset of executors (`topology.gpus_per_query`). A task that reached the scheduler pinned to a device without an executor would remain queued indefinitely because preferences are binding; deriving and clamping preferences against the admitted set prevents such phantom or excluded-device pins.
 
 The pin also survives OOM reschedule. When a partitioned task OOMs and is rebuilt with a fresh `local_state`, the per-task `preferred_device_id` is carried forward; without it the rescheduled task would demote to "no preference" and scatter. (A pin held on the pipeline-level global state already survives reconstruction, so only the local-state pin needs to be copied.)
 
@@ -267,7 +267,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/op/scan/sirius_gpu_scan_operator.cpp` | Unified `GPU_SCAN` source operator (multi-GPU-aware) |
 | `src/creator/task_creator.cpp` | Per-task `preferred_device_id` resolution, partition device pin |
 | `src/include/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
-| `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | SCHED-RR distribution, locality scoring, OOM-reschedule pin carry-forward |
+| `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | Ready-device matching, reservation-device execution, OOM-reschedule pin carry-forward |
 | `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, K.6-gated `cudaSetDevice` |
 | `cucascade/src/data/representation_converter.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |
 | `cucascade/src/memory/common.cpp` | `probe_peer_dma_works`, `run_p2p_probe_locked` |

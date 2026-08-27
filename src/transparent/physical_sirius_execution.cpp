@@ -131,7 +131,9 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> PhysicalSiriusExecution::GetGlobal
   auto conn_state = duckdb::get_sirius_connection_state(context);
   auto query_label =
     conn_state ? conn_state->take_pending_query_label() : std::optional<std::string>{};
-  state->iface = duckdb::make_uniq<sirius::sirius_interface>(context, std::move(query_label));
+  auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
+  state->iface       = duckdb::make_uniq<sirius::sirius_interface>(
+    context, std::move(query_label), std::move(session_label));
   state->sirius_context = sirius_ctx.get();
   return std::move(state);
 }

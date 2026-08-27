@@ -61,7 +61,8 @@ spill-encode-to-device	src/compression/compression_converters.cpp	register_conve
 spill-compression-gate	src/include/data/convertible_data_batch.hpp	try_convert_compressed
 spill-compression-arena	src/compression/compression_device_pool.hpp	init_compression_device_pool
 spill-arena-install	src/sirius_context.cpp	init_compression_device_pool
-pushdown-decline-diag	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	membership probe declined
+spill-encode-plan-entrypoints	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	compressed_table compress_columns(
+pushdown-graceful-decline	src/compression/simpatico_codegen/src/simpatico_codegen.cpp	declined_members
 ANCHORS
 }
 
@@ -115,14 +116,14 @@ case "${1:-}" in
     if [ -n "$ref" ]; then
       collect "$ref" > "$SNAP.ref"
       base="$SNAP.ref"
-      echo "merge-guard: comparing working tree against $ref"
+      label="comparing working tree against $ref"
     else
       [ -s "$SNAP" ] || { echo "merge-guard: no snapshot at $SNAP -- run 'snapshot' before the merge"; exit 2; }
       base="$SNAP"
-      echo "merge-guard: comparing working tree against pre-merge snapshot"
+      label="comparing working tree against pre-merge snapshot"
     fi
     collect "" > "$SNAP.now"
-    compare_files "$base" "$SNAP.now" "${ref:+comparing working tree against $ref}${ref:-comparing working tree against pre-merge snapshot}" || exit 1
+    compare_files "$base" "$SNAP.now" "$label" || exit 1
     ;;
   *)
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'

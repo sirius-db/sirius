@@ -106,6 +106,8 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   //! identical field on `sirius_physical_hash_join`.
   [[nodiscard]] bool is_delim_join_inner() const noexcept { return _is_delim_join_inner; }
   void set_delim_join_inner(bool value) noexcept { _is_delim_join_inner = value; }
+  [[nodiscard]] std::string_view input_port_for(
+    sirius_physical_operator const& producer) const override;
 
   // Sink Interface
   //! The inner join of a RIGHT_DELIM_JOIN is never a sink; otherwise the base rule

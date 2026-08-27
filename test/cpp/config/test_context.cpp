@@ -125,6 +125,31 @@ struct finally {
 };
 
 namespace {
+class scoped_env_assignment {
+ public:
+  scoped_env_assignment(const char* name, const char* value) : _name(name)
+  {
+    if (auto const* previous = std::getenv(name)) { _previous = previous; }
+    setenv(_name.c_str(), value, 1);
+  }
+
+  ~scoped_env_assignment()
+  {
+    if (_previous) {
+      setenv(_name.c_str(), _previous->c_str(), 1);
+    } else {
+      unsetenv(_name.c_str());
+    }
+  }
+
+  scoped_env_assignment(scoped_env_assignment const&)            = delete;
+  scoped_env_assignment& operator=(scoped_env_assignment const&) = delete;
+
+ private:
+  std::string _name;
+  std::optional<std::string> _previous;
+};
+
 struct setting_assignment {
   const char* name;
   const char* value;
@@ -143,10 +168,11 @@ constexpr std::array<setting_assignment, 10> legacy_only_settings{{
   {"modified_pipeline", "true"},
 }};
 
-constexpr std::array<const char*, 3> super_sirius_settings{{
+constexpr std::array<const char*, 4> super_sirius_settings{{
   "expression_evaluator_strategy",
   "enable_regex_jit_impl",
   "enable_duckdb_fallback",
+  "like_swar_fastpath",
 }};
 }  // namespace
 
@@ -194,6 +220,30 @@ TEST_CASE("Legacy-only settings follow the build surface",
   }
 }
 
+TEST_CASE("like_swar_fastpath is isolated between connections",
+          "[sirius][config][like-swar][isolated_context]")
+{
+  scoped_env_assignment disable_sirius{"SIRIUS_DISABLE", "1"};
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con_a(db);
+  duckdb::Connection con_b(db);
+
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
+
+  auto set_result = con_a.Query("SET like_swar_fastpath = false");
+  REQUIRE(set_result != nullptr);
+  REQUIRE_FALSE(set_result->HasError());
+  REQUIRE_FALSE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_b.context));
+
+  auto reset_result = con_a.Query("RESET like_swar_fastpath");
+  REQUIRE(reset_result != nullptr);
+  REQUIRE_FALSE(reset_result->HasError());
+  REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+}
+
 TEST_CASE("Test-only settings require explicit process opt-in",
           "[sirius][config][test-settings][isolated_context]")
 {
@@ -229,6 +279,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -251,6 +303,12 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET enable_runtime_distinct_build_probe = true");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET enable_dense_count_join = false");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -267,6 +325,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 0);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 0);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
 
@@ -281,6 +341,8 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "scan_task_batch_size") == 1);
     REQUIRE(setting_count(con, "fuse_merge_pipelines") == 1);
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
+    REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
+    REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -319,6 +381,22 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET enable_runtime_distinct_build_probe");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET enable_dense_count_join = false");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("RESET enable_dense_count_join");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 1024");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_max_bytes = 0");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Contains("must be greater than zero"));
+    result = con.Query("RESET dense_count_join_max_bytes");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
@@ -1420,7 +1498,7 @@ TEST_CASE("reservation_manager_configurator builds N GPU spaces", "[multi_gpu_fo
   auto const& topology = discovery.get_topology();
 
   cucascade::memory::reservation_manager_configurator builder;
-  builder.set_number_of_gpus(topology.num_gpus).use_host_per_numa();
+  builder.set_number_of_gpus(topology.num_gpus).use_numa_id_as_host_id();
   auto configs = builder.build(topology);
 
   // Count GPU and HOST tier configs (memory_space_config is a variant post-bump f47de0b)
@@ -1451,9 +1529,9 @@ TEST_CASE("memory_manager creates independent spaces per GPU", "[multi_gpu_found
   builder.set_number_of_gpus(static_cast<size_t>(device_count))
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -1536,9 +1614,9 @@ TEST_CASE("multi_gpu_config_two_gpus", "[.][multi_gpu_foundation]")
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_gpu()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -1585,9 +1663,9 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   builder.set_number_of_gpus(2)
     .set_gpu_usage_limit(gpu_capacity)
     .set_reservation_fraction_per_gpu(limit_ratio)
-    .set_per_host_capacity(host_capacity)
-    .use_host_per_numa()
-    .set_reservation_fraction_per_host(limit_ratio);
+    .set_per_numa_region_capacity(host_capacity)
+    .use_numa_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(limit_ratio);
 
   auto space_configs = builder.build();
   auto manager =
@@ -1785,4 +1863,33 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
 
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
+}
+
+TEST_CASE("Sirius configuration enables dense count join by default and accepts a YAML override",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+
+  sirius::sirius_config defaults;
+  REQUIRE(defaults.get_operator_params().enable_dense_count_join);
+  REQUIRE(sirius::config::DEFAULT_ENABLE_DENSE_COUNT_JOIN);
+
+  sirius::sirius_config disabled;
+  REQUIRE_NOTHROW(disabled.load_from_file(data_dir / "valid_dense_count_join_disable.yaml"));
+  REQUIRE_FALSE(disabled.get_operator_params().enable_dense_count_join);
+  REQUIRE(disabled.get_operator_params().dense_count_join_max_bytes ==
+          sirius::config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES);
+
+  sirius::sirius_config invalid_type;
+  REQUIRE_THROWS_WITH(
+    invalid_type.load_from_file(data_dir / "invalid_dense_count_join_enable_type.yaml"),
+    Catch::Contains("operator_params.enable_dense_count_join") &&
+      Catch::Contains("bad conversion"));
+
+  sirius::sirius_config invalid_budget;
+  REQUIRE_THROWS_WITH(
+    invalid_budget.load_from_file(data_dir / "invalid_dense_count_join_engine_policy.yaml"),
+    Catch::Contains("sirius.operator_params.dense_count_join_max_bytes") &&
+      Catch::Contains("internal engine policy") && Catch::Contains("remove this key"));
 }

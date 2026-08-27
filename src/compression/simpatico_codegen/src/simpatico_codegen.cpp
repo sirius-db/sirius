@@ -99,6 +99,17 @@ void validate_plan_count(size_t plan_count, int table_columns)
   }
 }
 
+void reject_sliced_columns(cudf::table_view table)
+{
+  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
+    if (table.column(i).offset() != 0) {
+      throw plan_error("compress_with_plan: input column " + std::to_string(i) +
+                       " has a non-zero offset (" + std::to_string(table.column(i).offset()) +
+                       "); sliced/offset column views are not supported, compact the column first");
+    }
+  }
+}
+
 void validate_column_names(std::vector<std::string> const& column_names, size_t num_columns)
 {
   if (!column_names.empty() && column_names.size() != num_columns) {
@@ -538,6 +549,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   std::vector<std::unique_ptr<cudf::column>> bool8_full(request.bool8_filters.size());
   event_set join_events;
   bool unselective = false;  // distinguishes giving compaction up from a real failure
+  // Probes that declined this chunk and were stood down to the AND identity.
+  size_t declined_members = 0;
 
   try {
     int64_t const nc          = sc::selection_mask::ChunksFor(num_rows);
@@ -631,34 +644,57 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
             throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
           auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
           auto flags      = directive.probe(keys_typed->view(), stream, mr);
-          // A null probe is NOT a shape mismatch, and reporting it as one sends
-          // you looking at row counts that are in fact correct. Every
-          // compute_mask implementation (in_list / small_in_list / Bloom)
-          // returns null for exactly two reasons: the probe key dtype does not
-          // equal the filter's build-side key type, or this device has no
-          // replica of the filter. Name the dtype so the first is visible --
-          // pin-table compressed materialization narrows key columns (e.g.
-          // int64 -> int32), which silently disqualifies the probe.
-          if (!flags)
-            throw plan_error(
-              "filtered decode: membership probe declined (col " +
-              std::to_string(directive.column) + ", probe key dtype id " +
-              std::to_string(static_cast<int>(keys_typed->type().id())) +
-              ", stored dtype id " + std::to_string(static_cast<int>(col.dtype.id())) +
-              ", " + std::to_string(num_rows) +
-              " rows) -- build-side key type mismatch or no device replica");
+          // A null result is the probe DECLINING this column (the documented
+          // "caller skips it" answer — e.g. the chunk's stored carrier is
+          // narrower than the type the filter was published with). A join
+          // filter is never the whole filter, so dropping one only
+          // under-filters and the authoritative join still runs. Stand the
+          // source down to all-ones, the identity for the AND-combine, rather
+          // than abandoning the batch's whole filtered decode.
+          if (!flags) {
+            if (cudaMemsetAsync(dst,
+                                0xFF,
+                                static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t),
+                                stream.value()) != cudaSuccess) {
+              throw plan_error("filtered decode: declined-probe mask fill failed");
+            }
+            ++declined_members;
+            return;
+          }
+          // A wrong type or width is NOT a decline — it breaks the probe
+          // contract, so it stays fatal and names which side broke.
           if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
-            throw plan_error(
-              "filtered decode: membership probe result shape mismatch (col " +
-              std::to_string(directive.column) + ": probe=" + std::to_string(flags->size()) +
-              " rows type " + std::to_string(static_cast<int>(flags->type().id())) +
-              ", expected " + std::to_string(num_rows) + " rows type BOOL8)");
+            throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
+                             std::to_string(selected[directive.column]) + " got=type_id=" +
+                             std::to_string(static_cast<int>(flags->type().id())) +
+                             " size=" + std::to_string(flags->size()) + " want=type_id=" +
+                             std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
+                             " size=" + std::to_string(num_rows) + ")");
           if (flags->null_count() != 0)
             throw plan_error("filtered decode: null-masked membership probe result");
           sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
           // keys/flags die here: stream-ordered frees behind the adapter
           // kernel on the same stream.
         });
+    }
+
+    // An all-ones source is the AND identity only while a real source still
+    // zeroes the tail bits past num_rows, which CNT and the gather require. If
+    // every source declined there is nothing left to filter by anyway, so take
+    // the plain decode instead of counting a mask that is all ones.
+    if (declined_members == k_total) {
+      throw plan_error("filtered decode: every membership probe declined (" +
+                       std::to_string(declined_members) + " of " + std::to_string(k_total) +
+                       " source(s)); nothing left to select by");
+    }
+
+    if (declined_members > 0 && sc::decompression_pushdown_diag_enabled()) {
+      std::fprintf(stderr,
+                   "simpatico: %zu of %zu membership probe(s) declined this chunk (rows=%lld); the "
+                   "decode carries the rest and the join filters the remainder\n",
+                   declined_members,
+                   k_member,
+                   static_cast<long long>(num_rows));
     }
 
     // ── Combine + CNT on stream 0. run_selection_cnt host-syncs s0 once (the
@@ -864,22 +900,6 @@ std::vector<std::string> split_plan_dsl(std::string_view plan_dsl)
 // ── compress_with_plan ────────────────────────────────────────────────────────
 
 namespace {
-// Leaf operators read input data through column_view::head(), which is
-// offset-unaware (it returns the allocation base, not data() == head() + offset).
-// A sliced/offset input column would therefore be compressed from the wrong
-// elements. Sliced inputs are not supported: reject them loudly rather than emit
-// corrupt output — the caller must compact (deep-copy) the column first.
-void reject_sliced_columns(cudf::table_view table)
-{
-  for (cudf::size_type i = 0; i < table.num_columns(); ++i) {
-    if (table.column(i).offset() != 0) {
-      throw plan_error("compress_with_plan: input column " + std::to_string(i) +
-                       " has a non-zero offset (" + std::to_string(table.column(i).offset()) +
-                       "); sliced/offset column views are not supported, compact the column first");
-    }
-  }
-}
-
 // Split the per-column plan DSL and validate it against the table + names.
 // Shared preamble of all three compress_with_plan overloads.
 std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
@@ -895,33 +915,6 @@ std::vector<std::string> split_and_validate_plans(std::string_view plan_dsl,
   return plans;
 }
 }  // namespace
-
-compressed_table compress_columns(cudf::table_view table,
-                                  std::vector<std::string> const& column_plans,
-                                  int column_threads,
-                                  rmm::device_async_resource_ref mr,
-                                  std::vector<std::string> column_names)
-{
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[threads]"};
-  validate_plan_count(column_plans.size(), table.num_columns());
-  validate_column_names(column_names, column_plans.size());
-  reject_sliced_columns(table);
-  leased_pool lp(std::min(std::max(1, column_threads), std::max(1, table.num_columns())));
-  return compress_columns_parallel(table, column_plans, lp.pool, mr, column_names);
-}
-
-compressed_table compress_columns(cudf::table_view table,
-                                  std::vector<std::string> const& column_plans,
-                                  simpatico::stream_pool& pool,
-                                  rmm::device_async_resource_ref mr,
-                                  std::vector<std::string> column_names)
-{
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[pool]"};
-  validate_plan_count(column_plans.size(), table.num_columns());
-  validate_column_names(column_names, column_plans.size());
-  reject_sliced_columns(table);
-  return compress_columns_parallel(table, column_plans, pool, mr, column_names);
-}
 
 compressed_table compress_with_plan(cudf::table_view table,
                                     std::string_view plan_dsl,
@@ -947,6 +940,36 @@ compressed_table compress_with_plan(cudf::table_view table,
     out.columns.push_back(std::move(col));
   }
   return out;
+}
+
+// Per-column plan entry points. compress_with_plan below takes ONE DSL string and
+// splits it; these take an already-split plan per column, which is what the spill
+// encoder has after resolve_or_explore_spill_plan.
+compressed_table compress_columns(cudf::table_view table,
+                                  std::vector<std::string> const& column_plans,
+                                  int column_threads,
+                                  rmm::device_async_resource_ref mr,
+                                  std::vector<std::string> column_names)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[threads]"};
+  validate_plan_count(column_plans.size(), table.num_columns());
+  validate_column_names(column_names, column_plans.size());
+  reject_sliced_columns(table);
+  leased_pool lp(std::min(std::max(1, column_threads), std::max(1, table.num_columns())));
+  return compress_columns_parallel(table, column_plans, lp.pool, mr, column_names);
+}
+
+compressed_table compress_columns(cudf::table_view table,
+                                  std::vector<std::string> const& column_plans,
+                                  simpatico::stream_pool& pool,
+                                  rmm::device_async_resource_ref mr,
+                                  std::vector<std::string> column_names)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::compress_columns[pool]"};
+  validate_plan_count(column_plans.size(), table.num_columns());
+  validate_column_names(column_names, column_plans.size());
+  reject_sliced_columns(table);
+  return compress_columns_parallel(table, column_plans, pool, mr, column_names);
 }
 
 compressed_table compress_with_plan(cudf::table_view table,
@@ -1026,6 +1049,105 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
     cols.push_back(apply_stored_dtype(std::move(c), col.dtype));
   }
   return std::make_unique<cudf::table>(std::move(cols));
+}
+
+namespace {
+
+// The plan tree of one column, or nullptr with `error_out` set.
+PlanTree const* column_plan(const compressed_table& table,
+                            std::size_t column_index,
+                            std::string* error_out,
+                            char const* what)
+{
+  if (column_index >= table.columns.size()) {
+    if (error_out) { *error_out = std::string(what) + ": column index out of range"; }
+    return nullptr;
+  }
+  auto const& col = table.columns[column_index];
+  if (!col.plan_tree) {
+    if (error_out) { *error_out = std::string(what) + ": column has no plan tree"; }
+    return nullptr;
+  }
+  return col.plan_tree.get();
+}
+
+}  // namespace
+
+std::unique_ptr<cudf::column> decompress_column_rows(const compressed_table& table,
+                                                     std::size_t column_index,
+                                                     sirius::codegen::chunk_row_set const& rows,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_rows");
+  if (tree == nullptr) { return nullptr; }
+  if (!rows.valid()) {
+    if (error_out) { *error_out = "decompress_column_rows: the row set is not valid"; }
+    return nullptr;
+  }
+  // Only the bitpack compacted decode reads a row set, and discovering that
+  // costs no device work.
+  if (probe_column(*tree).compact_route != sirius::codegen::decode_route::bitpack_mask) {
+    if (error_out) {
+      *error_out = "decompress_column_rows: this plan has no random-access decode for a row set";
+    }
+    return nullptr;
+  }
+
+  decode_selection sel;
+  sel.rows           = &rows;
+  sel.survivor_count = rows.num_survivors;
+  sel.route          = sirius::codegen::decode_route::bitpack_mask;
+
+  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+}
+
+std::unique_ptr<cudf::column> decompress_column_compacted(
+  const compressed_table& table,
+  std::size_t column_index,
+  sirius::codegen::selection_mask const& mask,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_compacted");
+  if (tree == nullptr) { return nullptr; }
+  if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.survivor_count < 0) {
+    if (error_out) {
+      *error_out = "decompress_column_compacted: the mask has not been counted (no chunk_offsets)";
+    }
+    return nullptr;
+  }
+  auto const route = probe_column(*tree).compact_route;
+  if (route == sirius::codegen::decode_route::full) {
+    if (error_out) { *error_out = "decompress_column_compacted: this plan has no compacted route"; }
+    return nullptr;
+  }
+
+  decode_selection sel;
+  sel.mask           = &mask;
+  sel.survivor_count = mask.survivor_count;
+  sel.route          = route;
+
+  auto col = decompress_column(*tree, stream, mr, error_out, nullptr, &sel);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
+}
+
+std::unique_ptr<cudf::column> decompress_column_full(const compressed_table& table,
+                                                     std::size_t column_index,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr,
+                                                     std::string* error_out)
+{
+  auto const* tree = column_plan(table, column_index, error_out, "decompress_column_full");
+  if (tree == nullptr) { return nullptr; }
+  auto col = decompress_column(*tree, stream, mr, error_out);
+  if (!col) { return nullptr; }
+  return apply_stored_dtype(std::move(col), table.columns[column_index].dtype);
 }
 
 std::unique_ptr<cudf::table> decompress(const compressed_table& table,

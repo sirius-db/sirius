@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+// clang-format off
+#include <variant>
 #include "expression_evaluator/regex/regex_playground.hpp"
+// clang-format on
 
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>

@@ -2019,9 +2019,9 @@ dependencies = [
 
 [[package]]
 name = "substrait-explain"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9508a9e0ce7acd78a06614956120da46fcd2fa9a36e2431b909c095dd6ee7215"
+checksum = "0c75caca513fcb44a75450f9f3439338e57ded28caf952c82c1e7ce14205ef16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2411,9 +2411,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.1"
+version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
+checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

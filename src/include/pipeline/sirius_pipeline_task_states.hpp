@@ -46,8 +46,9 @@ struct reservation_size_info {
     0;  ///< Cost to materialize input into the task's target space (host/disk upgrades plus
         ///< cross-GPU clones); 0 for scans
   std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
-  std::size_t reservation_size     = 0;  ///< peak_memory_estimate + bytes_to_materialize_input
-  bool had_history                 = false;  ///< True if estimate came from pipeline_memory_history
+  std::size_t retry_reservation_floor = 0;      ///< OOM-derived lower bound
+  std::size_t reservation_size        = 0;      ///< max(normal estimate, retry floor)
+  bool had_history                    = false;  ///< Estimate used pipeline history
 };
 
 /**
@@ -97,9 +98,16 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    *
    * Used to record and query historical memory consumption patterns so that
    * future tasks can make better reservation estimates.
+   * Delegates to the pipeline-owned history; uses detached history when tests provide no pipeline.
    */
-  pipeline_memory_history& get_memory_history() { return _memory_history; }
-  const pipeline_memory_history& get_memory_history() const { return _memory_history; }
+  pipeline_memory_history& get_memory_history()
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
+  const pipeline_memory_history& get_memory_history() const
+  {
+    return _pipeline ? _pipeline->get_memory_history() : _detached_memory_history;
+  }
 
   /**
    * @brief Set the preferred GPU device ID for this pipeline's tasks.
@@ -133,9 +141,10 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
  private:
   duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-  pipeline_memory_history _memory_history;        ///< Historical memory metrics for estimation
-  std::optional<int> _preferred_device_id;        ///< Pipeline-level preferred GPU device
-  exec::queue_priority _priority{0};              ///< Pipeline-level scheduling priority
+  /// Test fallback when @c _pipeline is null.
+  pipeline_memory_history _detached_memory_history;
+  std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device
+  exec::queue_priority _priority{0};        ///< Pipeline-level scheduling priority
   std::shared_ptr<const telemetry::telemetry_context>
     _telemetry_context;  ///< SiriusContext telemetry
 };

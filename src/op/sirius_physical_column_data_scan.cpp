@@ -105,7 +105,7 @@ void sirius_physical_column_data_scan::build_pipelines(
     default: break;
   }
   D_ASSERT(children.empty());
-  // A leaf sink (parent is PARTITION/RIGHT_DELIM_JOIN) gets its own single-op pipeline,
+  // A leaf sink (its parent is a sink parent) gets its own single-op pipeline,
   // mirroring the base leaf-sink branch — replicated here because this override would
   // otherwise unconditionally append to `current`.
   if (is_sink()) {

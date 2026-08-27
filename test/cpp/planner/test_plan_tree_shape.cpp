@@ -31,6 +31,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_delim_join.hpp"
@@ -1117,7 +1118,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
-                 "plan tree shape - set_parent_ops stamps every operator",
+                 "plan tree shape - set_parent_ops links every operator",
                  "[plan_tree_shape][isolated_context]")
 {
   const std::string queries[] = {
@@ -1149,6 +1150,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       }
     }
   }
+}
+
+TEST_CASE("set_parent_ops accepts a GPU scan without an ingestible",
+          "[plan_tree_shape][set_parent_ops]")
+{
+  duckdb::vector<sirius::logical_type> types;
+  sirius::op::scan::sirius_gpu_scan_operator scan(
+    std::move(types), /*estimated_cardinality=*/0, /*ingestible=*/nullptr);
+
+  CHECK_NOTHROW(
+    sirius::planner::sirius_physical_plan_generator::set_parent_ops(scan, /*parent=*/nullptr));
+  CHECK(scan.get_parent_op() == nullptr);
 }
 
 //===----------------------------------------------------------------------===//

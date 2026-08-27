@@ -65,11 +65,14 @@ struct sirius_active_query_context {
 class sirius_interface {
  public:
   sirius_interface(duckdb::ClientContext& client_context,
-                   std::optional<std::string> query_label = std::nullopt);
+                   std::optional<std::string> query_label   = std::nullopt,
+                   std::optional<std::string> session_label = std::nullopt);
   //! The client context
   duckdb::ClientContext& client_context;
   //! Optional label for this query's telemetry instance name
   std::optional<std::string> query_label;
+  //! Optional sticky per-connection label selecting the telemetry query group
+  std::optional<std::string> session_label;
   //! The currently active query context
   duckdb::unique_ptr<sirius_active_query_context> sirius_active_query;
   //! The current query progress

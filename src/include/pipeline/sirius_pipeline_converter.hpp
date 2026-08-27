@@ -27,8 +27,6 @@
 
 namespace sirius {
 
-struct operator_params;
-
 namespace pipeline {
 
 //! Result of converting meta-pipelines into execution-ready pipelines
@@ -80,8 +78,7 @@ void reorder_pipelines_topologically(
 //! 5. Reorder into the canonical strictly-topological schedule
 class sirius_pipeline_converter {
  public:
-  sirius_pipeline_converter(const pipeline_build_context& ctx,
-                            const sirius::operator_params& op_params);
+  explicit sirius_pipeline_converter(const pipeline_build_context& ctx);
 
   //! Convert meta-pipelines into execution-ready pipelines.
   //! No runtime state required: wiring is emitted as descriptors in the result;
@@ -98,10 +95,6 @@ class sirius_pipeline_converter {
   //! Runtime materialization is done by `materialize_repository_wiring()` from
   //! `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring(sirius_pipeline_build_state& state);
-  static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
-                                          const op::sirius_physical_operator& parent);
-  static op::MemoryBarrierType resolve_barrier(const op::sirius_physical_operator& sink,
-                                               const sirius_pipeline& dest);
 
   //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();
@@ -123,7 +116,6 @@ class sirius_pipeline_converter {
   void restrict_dynamic_filter_replicas();
 
   const pipeline_build_context build_ctx_;
-  const sirius::operator_params& op_params_;
 
   // Internal state built during convert(), moved into result
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;

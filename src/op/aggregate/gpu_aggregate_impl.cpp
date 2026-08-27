@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/group_key_labels.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -28,6 +29,8 @@
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
+
+#include <rmm/error.hpp>
 
 #include <algorithm>
 #include <new>
@@ -139,41 +142,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto input_table = get_cudf_table_view(input);
   auto mr          = memory_space.get_default_allocator();
 
-  // ---------------------------------------------------------------------------------------
-  // Single-label group keys for the sorted-groupby path.
-  //
-  // COLLECT_SET (our COUNT(DISTINCT ...) lowering) is not a hash aggregation in cudf, so
-  // `cudf::groupby::aggregate` routes the whole request through the *sorted* groupby helper.
-  // That helper's first step is `key_sort_order()`, which calls
-  // `cudf::detail::stable_sorted_order(keys)` over the full input. For a multi-column key
-  // table that is a `cub::DeviceMergeSort` driven by a lexicographic row comparator:
-  // O(N log N) passes of random access over every key column.
-  //
-  // `cudf::detail::stable_sorted_order` has a fast path though: a *single*, non-nested,
-  // fixed-width, null-free column is dispatched to `sorted_order_radix`
-  // (`cub::DeviceRadixSort`), which is a handful of fully coalesced passes.
-  //
-  // So we collapse the whole key table into one dense INT32 label with `cudf::encode` and
-  // group by that instead. `cudf::encode` returns the distinct key rows in sorted order plus
-  // the per-row index into them, so the label ordering is exactly the lexicographic ordering
-  // of the original key tuples -- group identity and group ordering are both preserved. The
-  // original key columns are recovered after the aggregate with a gather at group cardinality.
-  //
-  // NULL semantics are preserved: `cudf::encode` builds the distinct set with
-  // `null_equality::EQUAL` / `nan_equality::ALL_EQUAL` and searches it with
-  // `null_order::AFTER`, which is precisely what the sorted groupby helper does for
-  // `null_policy::INCLUDE`. A key tuple containing NULL therefore gets its own label and
-  // becomes its own group, exactly as before.
-  //
-  // Only worth it when the sort actually dominates, so gate on a large input; and pointless
-  // when the key table is already a single radix-sortable column.
-  //
-  // The gate on group cardinality matters most: `cudf::encode` is distinct + a sort of the
-  // *distinct* rows + a binary search per input row. That is a large win when the groups are
-  // few, but for a high-cardinality key (say COUNT(DISTINCT ...) grouped by an order key) the
-  // distinct-key sort is as big as the sort we are trying to avoid, and we would come out
-  // behind. An HLL estimate over the key rows is ~O(1) memory and one cheap pass, so use it to
-  // decline the rewrite rather than guessing.
+  // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
+  // single-column radix path while preserving the original keys' lexicographic order. A
+  // single null-free fixed-width key is already radix-sortable; single nullable or
+  // variable-width keys and non-nested multi-column keys may benefit from labels.
   constexpr cudf::size_type label_encode_min_rows = 1 << 20;
   constexpr double label_encode_max_group_ratio   = 0.01;
 
@@ -215,9 +187,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           input_table.num_rows(),
           ratio);
       } else {
-        auto encoded     = cudf::encode(keys_view, stream, mr);
-        label_key_values = std::move(encoded.first);
-        label_col        = std::move(encoded.second);
+        auto key_labels  = detail::make_group_key_labels(keys_view, stream, mr);
+        label_key_values = std::move(key_labels.sorted_unique_keys);
+        label_col        = std::move(key_labels.labels);
         SIRIUS_LOG_DEBUG(
           "local_grouped_agg: label-encoded {} group key column(s) into a single radix-sortable "
           "key for the COLLECT_SET sort path (rows={}, ndv={}, groups={})",
@@ -227,15 +199,15 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
           label_key_values->num_rows());
       }
     } catch (const std::bad_alloc&) {
-      // Out-of-memory (incl. rmm::out_of_memory) must reach the task retry /
-      // downgrade machinery.
+      // Preserve the task's reservation retry and downgrade path.
       throw;
     } catch (const cudf::cuda_error&) {
-      // CUDA errors are sticky; falling back would compute on a broken context.
+      // Do not continue on a potentially invalid CUDA context.
+      throw;
+    } catch (const rmm::cuda_error&) {
+      // RMM CUDA errors carry the same invalid-context risk as cuDF CUDA errors.
       throw;
     } catch (const std::exception& e) {
-      // Non-fatal (e.g. an unsupported key shape): fall back to grouping on
-      // the original key columns.
       label_key_values.reset();
       label_col.reset();
       SIRIUS_LOG_DEBUG(

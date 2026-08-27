@@ -46,6 +46,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -69,6 +70,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace sirius {
@@ -197,6 +199,23 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
                                            rmm::cuda_stream_view stream)
 {
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
+}
+
+std::string_view sirius_physical_hash_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
+}
+
+MemoryBarrierType sirius_physical_hash_join::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::CONCAT
+           ? MemoryBarrierType::PARTIAL
+           : sirius_physical_operator::input_barrier_for(producer);
 }
 
 bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_type)
@@ -560,8 +579,8 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // is_sink() is true iff the tree parent is a PARTITION (nested-join case); otherwise HJ
-  // contributes to the downstream chain's pipeline as its source.
+  // is_sink() is true iff the tree parent is a sink parent (PARTITION or DENSE_COUNT_JOIN);
+  // otherwise HJ contributes to the downstream chain's pipeline as its source.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {
@@ -664,6 +683,26 @@ std::vector<cross_schedule_discard> collect_cross_schedule_discards(
     }
   }
   return discards;
+}
+
+std::size_t pairing_weighted_probe_bytes(
+  std::vector<partition_cross_schedule> const& cross,
+  std::unordered_map<uint64_t, std::size_t> const& probe_bytes)
+{
+  std::size_t weighted = 0;
+  for (auto const& c : cross) {
+    auto const builds = c.build_ids.size();
+    if (builds == 0) { continue; }
+    auto const n = std::min(c.probe_ids.size(), c.probe_paired_count.size());
+    for (std::size_t i = 0; i < n; ++i) {
+      auto const it = probe_bytes.find(c.probe_ids[i]);
+      // A failed non-blocking size read is retried on a later pairing.
+      if (it == probe_bytes.end()) { continue; }
+      // Multiply first to minimize truncation.
+      weighted += it->second * c.probe_paired_count[i] / builds;
+    }
+  }
+  return weighted;
 }
 
 cross_schedule_pair next_cross_schedule_pair(std::vector<partition_cross_schedule>& cross,
@@ -830,6 +869,25 @@ partition_strategy compute_hash_join_partition_strategy(uint64_t total_bytes,
                              : (is_mark && num_gpus <= 1) ? 1
                                                           : natural;
   return {num_partitions, broadcast, build_probe};
+}
+
+std::optional<std::size_t> sirius_physical_hash_join::consumed_primary_input_bytes() const
+{
+  // Only the unweighted BUILD_PROBE count is published; see probe_bytes_are_unweighted().
+  if (!probe_bytes_are_unweighted()) { return std::nullopt; }
+  // Read live completion state so drain-phase polls cannot observe a stale latch.
+  auto const* build = try_get_port("build");
+  if (build == nullptr || !build->src_pipeline || !build->src_pipeline->is_pipeline_finished()) {
+    return std::nullopt;
+  }
+  return _whole_probe_bytes.load(std::memory_order_relaxed);
+}
+
+void sirius_physical_hash_join::note_probe_bytes_counted(uint64_t batch_id, std::size_t bytes)
+{
+  std::lock_guard<std::mutex> lg(_probe_bytes_mutex);
+  if (!_counted_probe_batch_ids.insert(batch_id).second) { return; }
+  _whole_probe_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 partition_strategy sirius_physical_hash_join::get_partition_strategy(
@@ -1093,6 +1151,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
     input_batch.push_back(probe_port->repo->pop_next_data_batch(p));
     input_batch.push_back(build_port->repo->pop_next_data_batch(p));
+    // Count in execute() with a blocking accessor because this batch is not observed after pop.
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::SCHEDULED,
                                                  std::memory_order_release);
     // Every task of partition p (this build+first-probe and all later probe-only tasks) shares the
@@ -1212,6 +1271,7 @@ std::pair<bool, bool> sirius_physical_hash_join::refresh_cross_schedule()
       port->repo->pop_data_batch_by_id(d.batch_id, d.partition);
     }
   }
+
   return {probe_finished, build_finished};
 }
 
@@ -1285,6 +1345,13 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
     {
       auto present_ro = present_batch->to_read_only();
       ms              = present_ro.get_memory_space();
+      // An orphaned probe has no later retry, so count it through this blocking accessor.
+      if (!orphan.present_is_build) {
+        if (auto const* data = present_ro.get_data(); data != nullptr) {
+          note_probe_bytes_counted(present_batch->get_batch_id(),
+                                   data->get_uncompressed_data_size_in_bytes());
+        }
+      }
     }
     if (!ms) {
       throw std::runtime_error(
@@ -1704,8 +1771,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // With a single partition the task is tagged with operator_id (for cross-join GPU spread), so
     // map any tag back to the lone slot 0; with multiple partitions the tag is the real partition
     // index and selects its slot directly.
-    std::size_t const partition =
-      _partition_build_states.size() == 1 ? std::size_t{0} : partitioned->get_partition_idx();
+    std::size_t partition = 0;
+    if (_partition_build_states.size() != 1) {
+      auto const partition_idx = partitioned->get_partition_idx();
+      if (!partition_idx.has_value()) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join::execute: BUILD_PROBE input carries no partition index "
+          "but the join has " +
+          std::to_string(_partition_build_states.size()) + " build partitions");
+      }
+      partition = *partition_idx;
+    }
     if (partition >= _partition_build_states.size()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join::execute: BUILD_PROBE partition index " +
@@ -1714,6 +1790,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         std::to_string(this->get_operator_id()));
     }
     auto& slot = _partition_build_states[partition];
+
+    // BUILD_PROBE sees each popped probe once, so count it through this blocking accessor. Dedup
+    // handles OOM rescheduling. Take only _probe_bytes_mutex to avoid inverting the batch-lock /
+    // op_state_mutex order used by broadcast cleanup.
+    if (!input_batches.empty()) {
+      if (auto const* probe_data = input_batches[0].get_data(); probe_data != nullptr) {
+        note_probe_bytes_counted(input_batches[0].get_batch_id(),
+                                 probe_data->get_uncompressed_data_size_in_bytes());
+      }
+    }
 
     if (slot.build_state.load(std::memory_order_acquire) == BUILD_HASH_TABLE_STATE::SCHEDULED) {
       if (input_batches.size() != 2) {

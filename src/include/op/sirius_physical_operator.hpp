@@ -20,6 +20,8 @@
 #include "duckdb/common/common.hpp"
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
+#include "late_mat/defer_directive.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/column_origin.hpp"
 #include "sirius/exception.hpp"
@@ -42,6 +44,8 @@
 
 namespace sirius {
 
+class like_multiliteral_cache;
+
 namespace telemetry {
 struct batch_telemetry_info;
 }  // namespace telemetry
@@ -58,6 +62,17 @@ class sirius_meta_pipeline;
 }  // namespace pipeline
 namespace planner {
 class sirius_physical_plan_generator;
+//! The only writer of the two late-materialization halves; see `deferred_output()`.
+bool install_count_deferral(op::sirius_physical_operator& scan,
+                            late_mat::deferred_scan_output output);
+
+bool install_rider(op::sirius_physical_operator& scan,
+                   op::sirius_physical_operator& port,
+                   late_mat::defer_pair pair);
+
+bool install_deferral(op::sirius_physical_operator& scan,
+                      op::sirius_physical_operator& port,
+                      late_mat::defer_pair pair);
 }  // namespace planner
 namespace op {
 
@@ -330,7 +345,8 @@ class pipelineable_operator_data : public operator_data {
     std::size_t total = 0;
     auto ro_batches   = get_read_only_batches(false);
     for (auto const& ro : ro_batches) {
-      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+      if (!ro.get_data()) { continue; }
+      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
     }
     return total;
   }
@@ -375,6 +391,17 @@ class partitioned_operator_data : public pipelineable_operator_data {
   {
   }
 
+  /// Partitioned data with no index. The scheduler pins a task to
+  /// `_active_gpu_ids[partition_idx % size]` only when an index is present; without one it falls
+  /// through to its byte-affinity heuristic and places the task on the GPU already holding the
+  /// data. Used when a consumer produced a single partition, where no cross-task device agreement
+  /// is required.
+  explicit partitioned_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    : pipelineable_operator_data(std::move(data_batches))
+  {
+  }
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PARTITIONED;
@@ -382,12 +409,13 @@ class partitioned_operator_data : public pipelineable_operator_data {
 
   /**
    * @brief Get the partition index.
-   * @return Partition index
+   * @return The partition index, or std::nullopt when this data carries none — which means
+   *         "place by data affinity", not "partition 0".
    */
-  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+  [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
 
  private:
-  std::size_t _partition_idx = 0;
+  std::optional<std::size_t> _partition_idx;
 };
 
 /**
@@ -493,6 +521,10 @@ class sirius_physical_operator {
 
   [[nodiscard]] bool has_physical_overrides() const noexcept { return !_physical_types.empty(); }
 
+  [[nodiscard]] bool like_swar_fastpath_enabled() const noexcept;
+
+  [[nodiscard]] std::shared_ptr<like_multiliteral_cache const> like_cache() const noexcept;
+
   //! Install a complete physical output schema. Callers must supply one entry per logical column;
   //! keeping this invariant local prevents a partial sidecar from silently shifting columns.
   void set_physical_types(std::vector<cudf::data_type> schema)
@@ -528,6 +560,23 @@ class sirius_physical_operator {
   //! operator has no pipeline set.
   [[nodiscard]] telemetry::batch_telemetry_info batch_telemetry() const;
 
+  //! The late-materialization half this operator carries, if any. Both are empty on every
+  //! operator unless `SIRIUS_EXP_LATE_MAT` is on AND the pair installed; they are written once,
+  //! at query prepare, before any task runs, and only read from then on.
+  //!
+  //! A scan carries the producing half (stop emitting these positions' values) and its port
+  //! carries the consuming half (put them back). Stamped only by
+  //! `planner::install_deferral`, which writes both or neither — an operator holding one half
+  //! alone either loses the data or corrupts a batch that was already correct.
+  [[nodiscard]] late_mat::deferred_scan_output const& deferred_output() const noexcept
+  {
+    return _deferred_output;
+  }
+  [[nodiscard]] late_mat::port_materialize_directive const& port_directive() const noexcept
+  {
+    return _port_directive;
+  }
+
   //! This operator's parent in the physical plan tree, or nullptr at the root. Stamped by
   //! `sirius_physical_plan_generator::set_parent_ops` after plan generation completes.
   [[nodiscard]] sirius_physical_operator* get_parent_op() const noexcept { return _parent_op; }
@@ -548,6 +597,13 @@ class sirius_physical_operator {
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
   virtual void verify();
+  /** @brief Return the receiving port for @p producer; the default is `"default"`. */
+  [[nodiscard]] virtual std::string_view input_port_for(
+    sirius_physical_operator const& producer) const;
+
+  /** @brief Return the input barrier; the default is FULL except for ORDER_BY producers. */
+  [[nodiscard]] virtual MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const;
 
  public:
   // Operator interface
@@ -570,7 +626,7 @@ class sirius_physical_operator {
    */
   [[nodiscard]] virtual std::size_t no_history_peak_memory_estimate(const input_stats& stats) const
   {
-    return stats.bytes * 2;
+    return memory::saturating_mul(stats.bytes, 2);
   }
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
@@ -592,19 +648,50 @@ class sirius_physical_operator {
     return sirius::OrderPreservationType::INSERTION_ORDER;
   }
 
+  // Data-size estimator hooks. nullopt means unavailable; see
+  // docs/super-sirius/data-size-estimation.md.
+
+  /// Whole-query leaf input in `pipeline_memory_history::input_basis` units.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// Whole-query leaf output, used unscaled only when @ref total_source_input_bytes is nullopt.
+  /// Planner-based overrides must floor totals at emitted bytes; results are `planner_derived`.
+  [[nodiscard]] virtual std::optional<std::size_t> total_source_output_bytes() const
+  {
+    return std::nullopt;
+  }
+
+  /// Fan-in port that drives output volume. Must pair with @ref consumed_primary_input_bytes.
+  [[nodiscard]] virtual std::optional<std::string_view> primary_input_port() const
+  {
+    return std::nullopt;
+  }
+
+  /// Bytes processed from @ref primary_input_port, counted at task entry once per distinct batch.
+  [[nodiscard]] virtual std::optional<std::size_t> consumed_primary_input_bytes() const
+  {
+    return std::nullopt;
+  }
+
  public:
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  //! An operator is a pipeline sink iff its tree parent is a PARTITION or
-  //! RIGHT_DELIM_JOIN — computed from `_parent_op` so it always reflects the final tree.
-  //! Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
-  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`.
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION, RIGHT_DELIM_JOIN, or
+  //! DENSE_COUNT_JOIN — computed from `_parent_op` so it always reflects the final tree. Those
+  //! parents consume a child's output through a repository, so the child terminates its own
+  //! pipeline. Unconditional sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION,
+  //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE and the `delim.join` of a RIGHT_DELIM_JOIN
+  //! override to `false`.
   virtual bool is_sink() const
   {
     return _parent_op != nullptr &&
            (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
-            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
+            _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
 
   //! Whether or not the sink operator depends on the order of the input chunks
@@ -694,10 +781,16 @@ class sirius_physical_operator {
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
-  //! Get a port from the operator
+  //! Look up a port, or nullptr if absent. Use @ref get_port when absence is an error.
+  [[nodiscard]] port* try_get_port(std::string_view port_id);
+  [[nodiscard]] const port* try_get_port(std::string_view port_id) const;
+  //! Look up a port; throws if absent.
   port* get_port(std::string_view port_id);
   //! Get all ports from the operator
   std::vector<std::string_view> get_port_ids();
+  //! Ports in ownership order. Allocation-free, and reaches each port without the per-name
+  //! map lookup get_port_ids() implies.
+  [[nodiscard]] const std::list<std::unique_ptr<port>>& get_ports() const { return _ports_list; }
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Returns true if any FULL-barrier port has src_pipeline == src
@@ -722,6 +815,10 @@ class sirius_physical_operator {
 
   /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
   virtual bool is_limit_exhausted() const { return false; }
+
+  /// \brief Whether this operator caps pipeline output regardless of input volume.
+  /// True before the cap binds; the data-size estimator will not extrapolate through it.
+  [[nodiscard]] virtual bool caps_pipeline_output() const { return false; }
 
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
@@ -778,10 +875,27 @@ class sirius_physical_operator {
   //! set_physical_types() cannot be bypassed by direct assignment.
   std::vector<cudf::data_type> _physical_types;
 
+  //! See `deferred_output()` / `port_directive()`. Private and written through one friend, so
+  //! the two halves cannot be installed apart.
+  late_mat::deferred_scan_output _deferred_output;
+  late_mat::port_materialize_directive _port_directive;
+
   //! Restricted to the plan generator so parent pointers stay immutable post-plan-gen.
   void set_parent_op(sirius_physical_operator* parent_op) noexcept { _parent_op = parent_op; }
 
   friend class ::sirius::planner::sirius_physical_plan_generator;
+  friend bool ::sirius::planner::install_deferral(sirius_physical_operator&,
+                                                  sirius_physical_operator&,
+                                                  late_mat::defer_pair);
+  //! The same complete-or-absent contract for a rider joining an installed
+  //! ride: it writes the rider's scan half and the port's merged directive, or
+  //! neither.
+  friend bool ::sirius::planner::install_rider(sirius_physical_operator&,
+                                               sirius_physical_operator&,
+                                               late_mat::defer_pair);
+  //! The one deferral with no second half: see planner::install_count_deferral.
+  friend bool ::sirius::planner::install_count_deferral(sirius_physical_operator&,
+                                                        late_mat::deferred_scan_output);
 };
 
 }  // namespace op

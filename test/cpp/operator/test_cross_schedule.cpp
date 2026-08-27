@@ -32,7 +32,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 using sirius::op::collect_cross_schedule_discards;
@@ -42,6 +44,7 @@ using sirius::op::cross_schedule_orphan;
 using sirius::op::has_pending_cross_orphan;
 using sirius::op::next_cross_schedule_orphan;
 using sirius::op::next_cross_schedule_pair;
+using sirius::op::pairing_weighted_probe_bytes;
 using sirius::op::partition_cross_schedule;
 using sirius::op::peek_cross_schedule_kind;
 
@@ -277,4 +280,95 @@ TEST_CASE("orphan path does nothing when both sides are empty", "[cross_schedule
   REQUIRE_FALSE(has_pending_cross_orphan(cross, true, true));
   REQUIRE_FALSE(next_cross_schedule_orphan(cross, true, true).found);
   REQUIRE(peek_cross_schedule_kind(cross, true, true) == cross_schedule_kind::done);
+}
+
+//===----------------------------------------------------------------------===//
+// pairing_weighted_probe_bytes — the size estimator's denominator
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("pairing-weighted probe bytes track how far through its pairings a batch is",
+          "[cross_schedule][size_estimation]")
+{
+  // Weighting by completed pairings prevents early ratios from reading artificially low.
+  std::vector<partition_cross_schedule> cross{make_partition({7}, {10, 11, 12, 13})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{7, 1000}};
+
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 0);
+  cross[0].probe_paired_count[0] = 1;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 250);
+  cross[0].probe_paired_count[0] = 2;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 500);
+  cross[0].probe_paired_count[0] = 4;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1000);
+}
+
+TEST_CASE("pairing-weighted probe bytes sum across batches and partitions",
+          "[cross_schedule][size_estimation]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({1, 2}, {10, 11}),
+                                              make_partition({3}, {20, 21, 22, 23})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 800}, {2, 400}, {3, 1000}};
+  cross[0].probe_paired_count[0] = 2;
+  cross[0].probe_paired_count[1] = 1;
+  cross[1].probe_paired_count[0] = 3;
+
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1750);
+}
+
+TEST_CASE("pairing-weighted probe bytes ignore a partition with no build batch yet",
+          "[cross_schedule][size_estimation]")
+{
+  std::vector<partition_cross_schedule> cross{make_partition({1}, {})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 500}};
+
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 0);
+}
+
+TEST_CASE("pairing-weighted probe bytes read far below the probe volume mid-sweep",
+          "[cross_schedule][size_estimation]")
+{
+  // Why STANDARD / MIXED_JOIN withhold the fan-in estimate: next_cross_schedule_pair sweeps one
+  // probe batch across every build batch before starting the next, so at the 16-pairing sample
+  // gate the denominator holds 16% of one batch's bytes while the numerator may already be near
+  // its final value — the ratio overstates by the same factor.
+  std::vector<uint64_t> builds;
+  builds.reserve(100);
+  for (uint64_t i = 0; i < 100; ++i) {
+    builds.push_back(10 + i);
+  }
+  std::vector<partition_cross_schedule> cross{make_partition({1}, builds)};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 1000}};
+
+  cross[0].probe_paired_count[0] = 16;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 160);
+  // The gap closes only when the sweep completes, which is the end of the join.
+  cross[0].probe_paired_count[0] = 100;
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1000);
+}
+
+TEST_CASE("pairing-weighted probe bytes lag the probe side while later batches wait",
+          "[cross_schedule][size_estimation]")
+{
+  // The same sweep order leaves later probe batches at zero weight, so the denominator describes
+  // the opening batches rather than the probe side as a whole.
+  std::vector<partition_cross_schedule> cross{make_partition({1, 2, 3}, {10, 11})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 900}, {2, 900}, {3, 900}};
+  cross[0].probe_paired_count[0] = 2;  // swept
+  cross[0].probe_paired_count[1] = 1;  // mid-sweep
+  cross[0].probe_paired_count[2] = 0;  // untouched
+
+  // 900 + 450 + 0 against 2700 bytes actually queued.
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 1350);
+}
+
+TEST_CASE("pairing-weighted probe bytes skip a batch whose size was never recorded",
+          "[cross_schedule][size_estimation]")
+{
+  // Simulate a non-blocking size read that could not acquire the batch lock.
+  std::vector<partition_cross_schedule> cross{make_partition({1, 2}, {10})};
+  std::unordered_map<uint64_t, std::size_t> bytes{{1, 600}};
+  cross[0].probe_paired_count[0] = 1;
+  cross[0].probe_paired_count[1] = 1;
+
+  CHECK(pairing_weighted_probe_bytes(cross, bytes) == 600);
 }

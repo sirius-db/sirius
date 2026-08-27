@@ -295,6 +295,12 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
+  r.optional("enable_dense_count_join", opt.enable_dense_count_join);
+  if (r.has("dense_count_join_max_bytes")) {
+    throw std::runtime_error(
+      "'sirius.operator_params.dense_count_join_max_bytes': removed; dense count-join histogram "
+      "sizing is an internal engine policy; remove this key");
+  }
   // 0 is meaningful here: it turns the estimate off and leaves sizing to gpus_per_query.
   r.optional("admission_bytes_per_gpu", yaml::bytes(opt.admission_bytes_per_gpu));
   r.optional("avg_variable_column_bytes", yaml::bytes(opt.avg_variable_column_bytes));
@@ -528,15 +534,18 @@ struct host_mem_config {
     // SiriusContext::initialize() which asserts host_spaces.size() ==
     // topology.num_numa_nodes on the default path. YAML configs may override
     // by explicitly setting per-space numa_id.
-    builder.use_host_per_numa();
+    builder.use_numa_id_as_host_id();
     if (std::holds_alternative<double>(reservation_limit)) {
-      builder.set_reservation_fraction_per_host(std::get<double>(reservation_limit));
+      builder.set_reservation_fraction_per_numa_region(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_host(std::get<std::uint64_t>(reservation_limit));
+      builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
     }
-    builder.set_downgrade_fractions_per_host(downgrade_trigger_fraction, downgrade_stop_fraction);
-    if (std::holds_alternative<std::uint64_t>(capacity)) {
-      builder.set_per_host_capacity(std::get<std::uint64_t>(capacity));
+    builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
+                                                    downgrade_stop_fraction);
+    if (std::holds_alternative<double>(capacity)) {
+      builder.set_usage_limit_ratio_per_numa_region(std::get<double>(capacity));
+    } else {
+      builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
     }
     // NOTE on argument order: cucascade's set_host_pool_features has confusingly-named
     // parameters (chunk_size, block_size, initial_block_count) that it internally remaps onto

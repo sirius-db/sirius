@@ -26,7 +26,9 @@
 
 // standard library
 #include <atomic>
+#include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -133,6 +135,15 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   [[nodiscard]] static std::size_t resident_carrier_conversion_peak_memory_estimate(
     const op::input_stats& stats) noexcept;
 
+  /// Whole-query sum of `scan_info::estimated_bytes()` for all pushed splits, in scan-task
+  /// `input_basis` units.
+  /// Returns nullopt until discovery closes or if any split lacks an a-priori estimate.
+  [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override;
+
+  /// @ref pipeline::project_source_output_bytes: planner cardinality times measured post-filter
+  /// bytes/row, floored at emitted bytes. Returns nullopt before measurement; used unscaled.
+  [[nodiscard]] std::optional<std::size_t> total_source_output_bytes() const override;
+
   /**
    * @brief Returns the complete carrier schema used to normalize scan output
    *
@@ -179,6 +190,10 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   duckdb::SiriusContext* _compressed_materialization_observer;
   /// Native cuDF carrier for each logical output column, in output order.
   std::vector<cudf::data_type> _native_physical_types;
+  /// Post-filter totals, locked together to provide a consistent bytes/row sample.
+  mutable std::mutex _emitted_mutex;
+  std::size_t _emitted_bytes{0};
+  std::size_t _emitted_rows{0};
 };
 
 }  // namespace sirius::op::scan

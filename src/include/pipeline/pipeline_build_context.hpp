@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "expression_evaluator/like_multiliteral.hpp"
+#include "sirius_config.hpp"
+
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -45,25 +48,50 @@ class pipeline_build_context {
   //!        Enables sirius_pipeline_converter::configure_partition_min_partitions
   //!        to ensure big partition-consuming operators (hash_join,
   //!        merge_group_by) get at least num_gpus partitions to spread work.
+  //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
+  //!        fail-closed default snapshot.
+  //! @param like_cache Query-owned cache shared by all copied contexts, pipelines, and task-local
+  //!        evaluators. A null value creates a new cache.
   explicit pipeline_build_context(
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-    bool preserve_insertion_order = true,
-    int num_gpus                  = 1)
+    bool preserve_insertion_order                                     = true,
+    int num_gpus                                                      = 1,
+    std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
-      _num_gpus(num_gpus)
+      _num_gpus(num_gpus),
+      _operator_params(operator_params ? std::move(operator_params)
+                                       : std::make_shared<const sirius::operator_params>()),
+      _like_cache(like_cache ? std::move(like_cache)
+                             : std::make_shared<sirius::like_multiliteral_cache>())
   {
   }
 
   //! Construct an engine-backed context from the configured GPU set. The GPU count is derived
   //! from the same ids used for execution routing, so planning cannot accidentally use the raw
   //! hardware count when the Sirius config selected a subset of visible GPUs.
-  pipeline_build_context(std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
-                         bool preserve_insertion_order,
-                         std::vector<int> active_gpu_ids)
+  //!
+  //! @param telemetry_context SiriusContext-wide telemetry context
+  //! @param preserve_insertion_order Whether query results preserve insertion order
+  //! @param active_gpu_ids GPU device ids used for execution routing
+  //! @param operator_params Immutable per-query operator-policy snapshot. A null value installs a
+  //!        fail-closed default snapshot.
+  //! @param like_cache Query-owned cache shared by all copied contexts, pipelines, and task-local
+  //!        evaluators. A null value creates a new cache.
+  pipeline_build_context(
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+    bool preserve_insertion_order,
+    std::vector<int> active_gpu_ids,
+    std::shared_ptr<const sirius::operator_params> operator_params    = nullptr,
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr)
     : _telemetry_context(std::move(telemetry_context)),
       _preserve_insertion_order(preserve_insertion_order),
-      _active_gpu_ids(std::move(active_gpu_ids))
+      _active_gpu_ids(std::move(active_gpu_ids)),
+      _operator_params(operator_params ? std::move(operator_params)
+                                       : std::make_shared<const sirius::operator_params>()),
+      _like_cache(like_cache ? std::move(like_cache)
+                             : std::make_shared<sirius::like_multiliteral_cache>())
   {
     if (_active_gpu_ids.empty()) {
       throw std::invalid_argument(
@@ -86,11 +114,24 @@ class pipeline_build_context {
     return _telemetry_context;
   }
 
+  [[nodiscard]] const sirius::operator_params& get_operator_params() const noexcept
+  {
+    return *_operator_params;
+  }
+
+  [[nodiscard]] const std::shared_ptr<const sirius::like_multiliteral_cache>&
+  get_like_multiliteral_cache() const noexcept
+  {
+    return _like_cache;
+  }
+
  private:
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   bool _preserve_insertion_order = true;
   int _num_gpus                  = 1;
   std::vector<int> _active_gpu_ids;
+  std::shared_ptr<const sirius::operator_params> _operator_params;
+  std::shared_ptr<const sirius::like_multiliteral_cache> _like_cache;
 };
 
 }  // namespace pipeline

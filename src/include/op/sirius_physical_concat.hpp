@@ -56,6 +56,8 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   bool is_sink() const override;
 
   bool is_build_concat() const;
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
 
   //! The downstream HJ/NLJ this CONCAT feeds; distinct from `get_parent_op()` (tree parent).
   [[nodiscard]] sirius_physical_operator* get_downstream_join() const noexcept

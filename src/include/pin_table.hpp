@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "late_mat/pin_uniqueness.hpp"
+
 #include <cudf/types.hpp>
 
 #include <duckdb/common/types.hpp>
@@ -128,6 +130,11 @@ struct materialized_pin {
   /// capture was skipped (no pinned column types). Fed together with the
   /// pin-time column types into @c sirius_scan_manager::insert_pinned_entry.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Late-mat uniqueness verdicts, positional with the pinned columns (see
+  /// @c late_mat::unique_verdict). Empty when the probe did not run. Anything
+  /// short of @c proven means UNKNOWN, never "known duplicated"; @c undecided
+  /// additionally means the exact check is worth running.
+  std::vector<late_mat::unique_verdict> unique_verdicts;
 };
 
 /// Pin-time validation of the coalescer invariant the MVCC delta merge relies on
@@ -161,6 +168,11 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 struct pin_materialization_options {
   bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
+  /// Positional with the pinned columns: observe this column for whole-table
+  /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
+  /// leaves the probe off, which is the default; the caller derives it from
+  /// @c late_mat::pin_unique_probe_selection.
+  std::vector<bool> probe_unique_columns;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
@@ -208,6 +220,9 @@ struct host_pin_result {
   /// (no pinned column types). Fed with the pin-time column types into
   /// @c sirius_scan_manager::insert_pinned_entry_host to drive zone-map pruning.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Late-mat uniqueness verdicts, positional with the pinned columns; see
+  /// @ref materialized_pin::unique_verdicts.
+  std::vector<late_mat::unique_verdict> unique_verdicts;
 };
 
 /// Optional compression settings for @ref materialize_pin_to_host
@@ -249,6 +264,9 @@ struct device_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Late-mat uniqueness verdicts, positional with the pinned columns; see
+  /// @ref materialized_pin::unique_verdicts.
+  std::vector<late_mat::unique_verdict> unique_verdicts;
 };
 
 /// Drive @p ingestible to completion, streaming each emitted batch to pinned host memory

@@ -259,6 +259,14 @@ int64_t run_selection_cnt(selection_mask& mask,
 // Expand the mask to ascending int32 survivor row ids (TierB gather map).
 // Requires run_selection_cnt to have filled chunk_offsets/survivor_count.
 // out_indices must hold >= mask.survivor_count entries.
+/// How many chunks hold at least one survivor, from the per-chunk offsets the
+/// CNT wave produced. DIAGNOSTIC ONLY: it synchronizes, and it exists because
+/// the mask and index walks launch a block per chunk whether or not that chunk
+/// holds anything — so their own geometry cannot report how many blocks did
+/// work, which is the number that decides whether a sparse grid would pay.
+/// Returns -1 if it cannot be computed.
+[[nodiscard]] int64_t count_touched_chunks(uint32_t const* chunk_offsets, int64_t num_chunks);
+
 void mask_to_row_indices(selection_mask const& mask,
                          int32_t* out_indices,
                          rmm::cuda_stream_view stream);

@@ -152,10 +152,16 @@ const std::vector<TrailingParamDecl>& enumerator_params(Enumerator e)
     {TrailingParam::row_indices, "const int32_t* __restrict__ row_indices"},
     {TrailingParam::chunk_offsets, "const uint32_t* __restrict__ chunk_offsets"},
   };
+  static const std::vector<TrailingParamDecl> kChunkCsr{
+    {TrailingParam::chunk_ids, "const uint32_t* __restrict__ chunk_ids"},
+    {TrailingParam::block_offsets, "const uint32_t* __restrict__ block_offsets"},
+    {TrailingParam::in_chunk_rows, "const uint16_t* __restrict__ in_chunk_rows"},
+  };
   switch (e) {
     case Enumerator::all_rows: return kNone;
     case Enumerator::mask_bits: return kMaskBits;
     case Enumerator::index_list: return kIndexList;
+    case Enumerator::chunk_csr: return kChunkCsr;
   }
   return kNone;
 }
@@ -195,6 +201,9 @@ std::string shape_symbol_suffix(DecodeShape shape)
   if (shape == kShapeDictGather) return "_mask_dict";
   if (shape == kShapeIndexConsume) return "_index_consume";
   if (shape == kShapeStrSplitMeta) return "_str_meta";
+  if (shape == kShapeSparseConsume) return "_sparse_consume";
+  if (shape == kShapeSparseDictGather) return "_sparse_dict";
+  if (shape == kShapeSparseStrSplitMeta) return "_sparse_str_meta";
   return "";  // kShapePlain
 }
 
@@ -252,6 +261,9 @@ class Walker {
             }
             break;
           case Enumerator::index_list: emit_bitpack_index_consume(tree); break;
+          // Any value_source root: a staged one still reconstructs its chunk,
+          // but only for the chunks the selection touches.
+          case Enumerator::chunk_csr: emit_generic_mask_consume(tree); break;
         }
         break;
       case Consumer::ballot_range:
@@ -323,7 +335,15 @@ class Walker {
   // variants stage the chunk's mask via a warp scan of per-word popcounts
   // (emit_selection_stage) and write compacted output.
   void emit_selection_stage();
+  // The compacting walk in two halves, so a consumer states its per-row sink
+  // ONCE and runs under every compacting enumerator: the prologue binds
+  // `out_base` (and early-returns an empty chunk), the loop binds `i` (the
+  // in-chunk row) and `rank` (its slot within the chunk) and emits `sink`.
+  void emit_survivor_prologue();
+  void emit_survivor_loop(const std::string& sink);
   void emit_mask_survivor_loop(const std::string& sink);
+  void emit_index_survivor_loop(const std::string& sink);
+  void emit_chunk_csr_survivor_loop(const std::string& sink);
 
   // How a Delta producer writes its reconstructed chunk.
   //   plain        — every row to dst[row], as the full-column decode does.
@@ -405,7 +425,9 @@ class Walker {
     }
     src << "{\n"
         << "    constexpr int32_t CHUNK = " << ::codegen::kChunkSize << ";\n"
-        << "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n"
+        << (shape_.enumerator == Enumerator::chunk_csr
+              ? "    const int32_t chunk_id = static_cast<int32_t>(chunk_ids[blockIdx.x]);\n"
+              : "    const int32_t chunk_id = static_cast<int32_t>(blockIdx.x);\n")
         << "    const int32_t tid      = static_cast<int32_t>(threadIdx.x);\n"
         << "    const int64_t chunk_start = static_cast<int64_t>(chunk_id) *\n"
         << "                                static_cast<int64_t>(CHUNK);\n"
@@ -613,8 +635,7 @@ static std::string rank_expr(const std::string& pos)
 // (the chunk's base in the compacted output), `w` (the row's mask word).
 void Walker::emit_mask_survivor_loop(const std::string& sink)
 {
-  body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "    #pragma unroll\n"
+  body_ << "    #pragma unroll\n"
         << "    for (int32_t j = 0; j < CHUNK / " << tbs_ << "; ++j) {\n"
         << "        const int32_t i = j * " << tbs_ << " + tid;\n"
         << "        const uint32_t w = sel_words[i >> 5];\n"
@@ -622,6 +643,73 @@ void Walker::emit_mask_survivor_loop(const std::string& sink)
         << "            const int32_t rank = " << rank_expr("i") << ";\n"
         << sink << "        }\n"
         << "    }\n";
+}
+
+// The index walk's counterpart: the chunk's survivors are READ from the
+// row-index list rather than searched for, so the loop runs `cnt` iterations
+// instead of a full pass over the chunk, and the slot IS the list position.
+// Binds the same names as the mask loop, so a consumer's sink is
+// enumerator-agnostic — except `w`, which has no meaning here.
+void Walker::emit_index_survivor_loop(const std::string& sink)
+{
+  body_ << "    for (int32_t slot = tid; slot < cnt; slot += " << tbs_ << ") {\n"
+        << "        const int32_t rank = slot;\n"
+        << "        const int32_t i = static_cast<int32_t>(idxs[slot] - chunk_start);\n"
+        << sink << "    }\n";
+}
+
+// The chunk_csr walk: this block's slice of the CSR, positions read straight
+// from the row set — no subtraction, because a uint16 cannot address another
+// chunk.
+void Walker::emit_chunk_csr_survivor_loop(const std::string& sink)
+{
+  body_ << "    for (int32_t slot = tid; slot < cnt; slot += " << tbs_ << ") {\n"
+        << "        const int32_t rank = slot;\n"
+        << "        const int32_t i = static_cast<int32_t>(rows_in_chunk[slot]);\n"
+        << sink << "    }\n";
+}
+
+// Prologue for whichever compacting enumerator is in play: bind `out_base` and
+// early-return a chunk with no survivors. The mask walk stages the chunk's mask
+// words; the list walks slice their own arrays, which is where their
+// survivor-count-proportional cost comes from.
+void Walker::emit_survivor_prologue()
+{
+  switch (shape_.enumerator) {
+    case Enumerator::mask_bits:
+      emit_selection_stage();
+      body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n";
+      return;
+    case Enumerator::index_list:
+      body_ << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
+            << "    const int32_t cnt = static_cast<int32_t>(\n"
+            << "        static_cast<int64_t>(chunk_offsets[chunk_id + 1]) - out_base);\n"
+            << "    if (cnt == 0) return;  // zero-survivor chunk: nothing to decode\n"
+            << "    const int32_t* idxs = row_indices + out_base;\n";
+      return;
+    case Enumerator::chunk_csr:
+      // Indexed by BLOCK: the grid covers touched chunks, so blockIdx.x is a
+      // position in the row set rather than a chunk id.
+      body_ << "    const int64_t out_base = static_cast<int64_t>(block_offsets[blockIdx.x]);\n"
+            << "    const int32_t cnt = static_cast<int32_t>(\n"
+            << "        static_cast<int64_t>(block_offsets[blockIdx.x + 1]) - out_base);\n"
+            << "    if (cnt == 0) return;  // a listed chunk with no survivors\n"
+            << "    const uint16_t* rows_in_chunk = in_chunk_rows + out_base;\n";
+      return;
+    case Enumerator::all_rows: break;
+  }
+  throw RenderError("decode render: all_rows has no survivor prologue");
+}
+
+void Walker::emit_survivor_loop(const std::string& sink)
+{
+  switch (shape_.enumerator) {
+    case Enumerator::mask_bits: emit_mask_survivor_loop(sink); return;
+    case Enumerator::index_list: emit_index_survivor_loop(sink); return;
+    case Enumerator::chunk_csr: emit_chunk_csr_survivor_loop(sink); return;
+    case Enumerator::all_rows: break;
+  }
+  throw RenderError("decode render: all_rows has no survivor loop");
 }
 
 // =====================================================================
@@ -666,15 +754,15 @@ void Walker::emit_bitpack_mask_dict_gather(const ::codegen::jit::FusedTree& node
   }
   body_ << "    // --- node " << id_of(node) << ": Bitpack code masked dictionary gather ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
-  emit_selection_stage();
+  emit_survivor_prologue();
 
   ValueSource vs = bitpack_value_source(node, dtype_);
-  emit_mask_survivor_loop("            const int64_t code = static_cast<int64_t>(" +
-                          at_pos(vs.read_expr, "i") +
-                          ");\n"
-                          "            const char* k = keys_chars + code * key_width;\n"
-                          "            char* o = out + (out_base + rank) * key_width;\n"
-                          "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n");
+  emit_survivor_loop("            const int64_t code = static_cast<int64_t>(" +
+                     at_pos(vs.read_expr, "i") +
+                     ");\n"
+                     "            const char* k = keys_chars + code * key_width;\n"
+                     "            char* o = out + (out_base + rank) * key_width;\n"
+                     "            for (int32_t b = 0; b < key_width; ++b) o[b] = k[b];\n");
 }
 
 // =====================================================================
@@ -700,20 +788,12 @@ void Walker::emit_bitpack_index_consume(const ::codegen::jit::FusedTree& node)
   }
   body_ << "    // --- node " << id_of(node)
         << ": Bitpack index-list decode -> compacted output ---\n"
-        << "    (void)len;  // listed rows are < n by construction (mask tail bits were zero)\n"
-        << "    const int64_t out_base = static_cast<int64_t>(chunk_offsets[chunk_id]);\n"
-        << "    const int32_t cnt = static_cast<int32_t>(\n"
-        << "        static_cast<int64_t>(chunk_offsets[chunk_id + 1]) - out_base);\n"
-        << "    if (cnt == 0) return;  // zero-survivor chunk: nothing to decode\n";
+        << "    (void)len;  // listed rows are < n by construction (mask tail bits were zero)\n";
+  emit_survivor_prologue();
 
   // Per-chunk scalar prelude after the early return, then the survivor loop.
   ValueSource vs = bitpack_value_source(node, dtype_);
-  body_ << "    const int32_t* idxs = row_indices + out_base;\n"
-        << "    for (int32_t k = tid; k < cnt; k += " << tbs_ << ") {\n"
-        << "        const int32_t i = static_cast<int32_t>(idxs[k] - chunk_start);  // in-chunk "
-           "pos\n"
-        << "        (out + out_base)[k] = " << at_pos(vs.read_expr, "i") << ";\n"
-        << "    }\n";
+  emit_survivor_loop("            (out + out_base)[rank] = " + at_pos(vs.read_expr, "i") + ";\n");
 }
 
 // =====================================================================
@@ -730,12 +810,11 @@ void Walker::emit_generic_mask_consume(const ::codegen::jit::FusedTree& node)
   body_ << "    // --- node " << id_of(node) << ": " << ::codegen::jit::op_kind_name(node.op)
         << " masked decode -> compacted output (generic) ---\n"
         << "    (void)len;  // mask tail bits are zero, so selected rows are always < len\n";
-  emit_selection_stage();
+  emit_survivor_prologue();
 
   const auto mark = sm_.mark();
   ValueSource vs  = value_source(node, dtype_, "len");
-  emit_mask_survivor_loop("            (out + out_base)[rank] = " + at_pos(vs.read_expr, "i") +
-                          ";\n");
+  emit_survivor_loop("            (out + out_base)[rank] = " + at_pos(vs.read_expr, "i") + ";\n");
   sm_.release_to(mark);
 }
 
@@ -768,7 +847,7 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
   body_ << "    // --- node " << id_of(node) << ": str_split offsets masked survivor meta ---\n"
         << "    const int64_t n_rows = n - 1;  // offsets count = string rows + 1\n"
         << "    if (chunk_start >= n_rows) return;  // offsets-tail chunk: no rows\n";
-  emit_selection_stage();
+  emit_survivor_prologue();
 
   const auto mark = sm_.mark();
   ValueSource vs  = value_source(node, dtype_, "len");
@@ -789,7 +868,7 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
   }
   body_ << "    }\n";
 
-  emit_mask_survivor_loop(
+  emit_survivor_loop(
     "            const int64_t off_r = static_cast<int64_t>(" + at_pos(vs.read_expr, "i") +
     ");\n"
     "            const int64_t off_r1 = (i + 1 < len)\n"
@@ -1521,12 +1600,13 @@ void Walker::emit_raw_producer(const ::codegen::jit::FusedTree& node,
 
 bool shape_is_supported(DecodeShape shape)
 {
-  // Shipped points of the product. The meaningful-but-unbuilt combinations —
-  // index_list x dict_gather and index_list x offsets_meta, which would give
-  // index-walk-speed dictionary and string decode below the crossover — belong here
-  // the moment their emitters land; see DECODE_PUSHDOWN_PLAN.md section 7.
+  // Shipped points of the product. index_list x {dict_gather, offsets_meta}
+  // remain unbuilt: chunk_csr covers the same two consumers for the selection
+  // shape that needed them, so building them would add a second way to say it.
   return shape == kShapePlain || shape == kShapeMaskOut || shape == kShapeMaskConsume ||
-         shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta;
+         shape == kShapeIndexConsume || shape == kShapeDictGather || shape == kShapeStrSplitMeta ||
+         shape == kShapeSparseConsume || shape == kShapeSparseDictGather ||
+         shape == kShapeSparseStrSplitMeta;
 }
 
 DecodeKernelSpec render_masked_char_copy()

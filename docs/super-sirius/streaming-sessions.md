@@ -361,3 +361,28 @@ from the **downgrade executor** instead: queued batches sit in repositories wher
 sweep can see and spill them (GPU → host → disk). Cross-fragment and cross-query pressure is a
 scheduling concern (per-fragment priority), and a future sink↔source slowness signal would be
 additive — nothing in this design forecloses it.
+
+## Fragments: `exec::streaming_fragment` and the FFI
+
+The layer above these primitives — building a plan around them, bridging DuckDB bind time to
+physical-plan time via `stream_bind_catalog`, and the cross-language `sirius::ffi::Fragment`
+lifecycle — has its own document: [Streaming Fragments](streaming-fragments.md).
+
+## Tests
+
+| File | Catch2 tags |
+|---|---|
+| `test/cpp/exec/test_batch_stream.cpp` | `[batch_stream]` |
+| `test/cpp/operator/test_physical_streaming_source.cpp` | `[streaming_source]`, `[streaming_source][pipeline_completion]` |
+| `test/cpp/operator/test_physical_streaming_sink.cpp` | `[streaming_sink]` |
+| `test/cpp/exec/test_stream_session.cpp` | `[stream_session]` |
+| `test/cpp/pipeline/test_streaming_sink_root.cpp` | `[integration][pipeline][streaming_sink_root]`, `[integration][pipeline][streaming_sink_root_exec]` |
+
+Fragment-layer tests (`test_stream_bind_catalog.cpp`, `test_streaming_fragment.cpp`,
+`test_sirius_ffi_fragment.cpp`) are listed in [Streaming Fragments](streaming-fragments.md#tests).
+
+A `recording_task_creator` stands in for the scheduler, so the live re-arm and the `on_data`
+hook path are proven without a live executor. The `[pipeline_completion]` cases drive the real
+`sirius_pipeline` completion predicate rather than the operator in isolation, because the bugs
+they cover live in what *calls* `update_pipeline_status()`. Everything tagged `[integration]`
+needs a GPU and the real DuckDB integration database.
