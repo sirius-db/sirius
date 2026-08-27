@@ -647,6 +647,9 @@ impl SiriusComputeNodeService {
                 metadata: attachment,
                 offset,
                 len: length,
+                // None from a sender that predates the wire field: the receiver then skips the
+                // stream's cardinality declaration instead of failing the frame.
+                rows: params.rows,
             })
         };
         tracing::debug!(
@@ -2565,6 +2568,9 @@ mod tests {
             length: Some(length),
             column_names: names.iter().map(|name| name.to_string()).collect(),
             canary: None,
+            // A fixed per-batch row count on batch frames, so the receiver-side test can assert
+            // the count rode the wire into the staged batch; EOS frames carry none.
+            rows: if eos { None } else { Some(3) },
         }
         .encode_to_vec()
     }
@@ -2628,9 +2634,10 @@ mod tests {
                     metadata,
                     offset: 4096,
                     len: 256,
+                    rows: Some(3),
                 }],
             )],
-            "the dispatched receiver consumed exactly the staged batch"
+            "the dispatched receiver consumed exactly the staged batch, row count included"
         );
     }
 

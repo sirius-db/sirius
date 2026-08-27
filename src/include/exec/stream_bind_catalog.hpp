@@ -21,9 +21,11 @@
 #include "exec/stream_session.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -36,6 +38,12 @@ struct stream_input_binding {
   duckdb::vector<sirius::logical_type> types;
   std::shared_ptr<cucascade::shared_data_repository> repository;
   std::set<sender_id_t> expected_senders;
+
+  /// Caller-declared row count for this stream (exact when the sender already parked/staged its
+  /// batches, an estimate otherwise). Reported to DuckDB's optimizer through the stream-source
+  /// TableFunction's cardinality callback so join order / build-side selection can see stream
+  /// sizes. nullopt = undeclared: the optimizer falls back to its default (cardinality 1).
+  std::optional<std::uint64_t> estimated_rows;
 
   /// Back-pointer into the engine-owned plan; filled during planning for session registration.
   op::sirius_physical_streaming_source* built = nullptr;
@@ -65,6 +73,12 @@ class stream_bind_catalog : public duckdb::ClientContextState {
 
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
+
+  /// The declared row count of `id`, or nullopt when the stream is undeclared or was declared
+  /// without one. Non-throwing on purpose: this feeds the TableFunction cardinality callback,
+  /// which DuckDB may invoke at any point in a plan's lifetime — a missing declaration there
+  /// must mean "no estimate", never a bind error.
+  [[nodiscard]] std::optional<std::uint64_t> estimated_rows(stream_id_t id) const;
 
   /// @throws sirius::invalid_input_exception when `id` was never declared, or when it already
   ///         has a built operator (the same declared stream read by more than one plan leaf —

@@ -223,6 +223,23 @@ impl Fragment<'_> {
             .declare_input_sender(stream_id, sender_id)
     }
 
+    /// Declare the row count of input stream `stream_id`, summed over all its senders — exact
+    /// when the caller already holds the stream's batches (parked locally or staged remotely),
+    /// an estimate otherwise.
+    ///
+    /// Optional but load-bearing for plan quality: a stream source binds with no rows behind
+    /// it, so without this DuckDB's optimizer sees cardinality 1 on every stream and picks hash
+    /// join build sides blind. Undeclared streams keep that legacy behavior. Last call wins.
+    pub fn declare_input_cardinality(
+        &mut self,
+        stream_id: u64,
+        rows: u64,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .declare_input_cardinality(stream_id, rows)
+    }
+
     /// Declare an output stream. A fragment with no output stream is a result fragment.
     pub fn declare_output(&mut self, stream_id: u64) -> Result<(), Exception> {
         self.inner.pin_mut().declare_output(stream_id)
@@ -291,6 +308,14 @@ impl Fragment<'_> {
         self.inner.output_batch_count(stream_id)
     }
 
+    /// Total rows parked on output stream `stream_id`, without draining it — what a local
+    /// relay's receiver feeds [`declare_input_cardinality`](Fragment::declare_input_cardinality)
+    /// before its own [`build`](Fragment::build). Errs on an unknown stream or a spilled
+    /// (non-GPU) parked batch; skip the declaration then rather than failing the fragment.
+    pub fn output_row_count(&self, stream_id: u64) -> Result<u64, Exception> {
+        self.inner.output_row_count(stream_id)
+    }
+
     /// DuckDB type names of this built fragment's output (sink) columns — the types every batch
     /// leaving the fragment actually carries, exactly what the receiving hop's schema guard
     /// compares against the receiver's declared input columns. Errs before
@@ -318,10 +343,11 @@ impl Fragment<'_> {
     pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
         let mut offset = 0u64;
         let mut len = 0u64;
+        let mut rows = 0u64;
         let metadata = self
             .inner
             .pin_mut()
-            .export_packed(stream_id, &mut offset, &mut len)?;
+            .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
         if metadata.is_null() {
             return Ok(None);
         }
@@ -329,6 +355,7 @@ impl Fragment<'_> {
             metadata: metadata.as_slice().to_vec(),
             offset,
             len,
+            rows,
         }))
     }
 
@@ -377,6 +404,11 @@ pub struct PackedBatch {
     pub offset: u64,
     /// Length of the packed payload in bytes.
     pub len: u64,
+    /// Exact row count of the packed table, filled by
+    /// [`export_packed`](Fragment::export_packed) so a transport can carry it to the receiver's
+    /// [`declare_input_cardinality`](Fragment::declare_input_cardinality). Ignored by
+    /// [`push_packed`](Fragment::push_packed).
+    pub rows: u64,
 }
 
 /// Thread-safe handle to a context's exchange staging arena, from
@@ -1062,11 +1094,15 @@ mod tests {
         assert_eq!(ctx.staging_capacity().unwrap(), 64 << 20);
         assert_ne!(ctx.staging_base().unwrap(), 0);
 
-        // Declares `(id, name)` on input stream 0 and builds the stream-view read.
+        // Declares `(id, name)` on input stream 0 and builds the stream-view read. The declared
+        // cardinality is what a CN feeds from parked/staged row counts; on this single-stream
+        // plan it must be harmless, and it proves the declare -> bind -> optimize path end to
+        // end on a real build.
         let make_receiver = || {
             let mut receiver = ctx.fragment().unwrap();
             receiver.declare_input_column(0, "id", "BIGINT").unwrap();
             receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.declare_input_cardinality(0, 3).unwrap();
             receiver.build(&receiver_plan).unwrap();
             receiver
         };
@@ -1077,6 +1113,11 @@ mod tests {
             sender.declare_output(0).unwrap();
             sender.build(&sender_plan).unwrap();
             sender.run().unwrap();
+
+            // The receiver-side cardinality source for a LOCAL hop: exact parked rows, counted
+            // without draining the stream.
+            assert_eq!(sender.output_row_count(0).unwrap(), 3);
+            assert!(sender.output_batch_count(0).unwrap() > 0);
 
             let mut receiver = make_receiver();
             let moved = receiver.relay_from(&mut sender, 0, 0, 0).unwrap();
@@ -1096,9 +1137,13 @@ mod tests {
             while let Some(batch) = sender.export_packed(0).unwrap() {
                 assert!(batch.len > 0, "a packed batch carries payload bytes");
                 assert!(!batch.metadata.is_empty(), "pack metadata is never empty");
+                assert!(batch.rows > 0, "a non-empty packed batch reports its rows");
                 staged.push(batch);
             }
             assert!(!staged.is_empty(), "the sender parked batches to export");
+            // The receiver-side cardinality source for a REMOTE hop: per-batch exact row counts
+            // that ride the transmit frames and sum to the stream's total.
+            assert_eq!(staged.iter().map(|batch| batch.rows).sum::<u64>(), 3);
             // A drained stream is `None`, not an error.
             assert!(sender.export_packed(0).unwrap().is_none());
 
@@ -1189,6 +1234,7 @@ mod tests {
         for batch in &staged {
             if batch.len == 0 {
                 assert_eq!(batch.offset, 0, "a metadata-only frame names no lease");
+                assert_eq!(batch.rows, 0, "a metadata-only frame carries zero rows");
             } else {
                 ctx.staging_release(batch.offset).unwrap();
             }

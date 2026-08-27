@@ -22,7 +22,9 @@
 #include <helper/type_conversions.hpp>
 #include <sirius/exception.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -37,8 +39,12 @@ duckdb::vector<sirius::logical_type> int_schema()
 
 stream_input_binding make_binding()
 {
-  return stream_input_binding{
-    {"a"}, int_schema(), std::make_shared<cucascade::shared_data_repository>(), {0}, nullptr};
+  return stream_input_binding{{"a"},
+                              int_schema(),
+                              std::make_shared<cucascade::shared_data_repository>(),
+                              {0},
+                              std::nullopt,
+                              nullptr};
 }
 
 }  // namespace
@@ -201,6 +207,7 @@ TEST_CASE("stream_bind_catalog CAT-7: sirius_stream_source binds a declared stre
                            duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR}),
                          std::make_shared<cucascade::shared_data_repository>(),
                          {0},
+                         std::nullopt,
                          nullptr});
 
   // Binding is the whole point: DuckDB must resolve names and types for a relation that has no
@@ -250,4 +257,39 @@ TEST_CASE("stream_bind_catalog CAT-9: no catalog on the connection is an error",
 
   auto prepared = con.Prepare("SELECT * FROM sirius_stream_source(0)");
   REQUIRE(prepared->HasError());
+}
+
+// ============================================================================
+// CAT-10: the optional declared row count round-trips through the catalog
+// ============================================================================
+
+TEST_CASE("stream_bind_catalog CAT-10: estimated_rows is optional and non-throwing",
+          "[stream_bind_catalog]")
+{
+  stream_bind_catalog catalog;
+
+  // Undeclared id: nullopt, not a throw — this feeds the TableFunction cardinality callback,
+  // which DuckDB may invoke after a fragment erased its declarations.
+  REQUIRE_FALSE(catalog.estimated_rows(7).has_value());
+
+  // Declared without a count: still nullopt (today's behavior for callers that never declare).
+  catalog.declare(7, make_binding());
+  REQUIRE_FALSE(catalog.estimated_rows(7).has_value());
+
+  // Declared with a count: the value comes back verbatim.
+  auto binding           = make_binding();
+  binding.estimated_rows = 123456;
+  catalog.declare(7, std::move(binding));
+  REQUIRE(catalog.estimated_rows(7) == std::optional<std::uint64_t>{123456});
+
+  // Redeclaration replaces the whole binding, count included.
+  catalog.declare(7, make_binding());
+  REQUIRE_FALSE(catalog.estimated_rows(7).has_value());
+
+  // erase() drops it with the declaration.
+  binding                = make_binding();
+  binding.estimated_rows = 2;
+  catalog.declare(8, std::move(binding));
+  catalog.erase(8);
+  REQUIRE_FALSE(catalog.estimated_rows(8).has_value());
 }

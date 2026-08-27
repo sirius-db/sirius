@@ -189,6 +189,13 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build().
   void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
 
+  /// Declare the row count of input stream `stream_id` (summed over all its senders; exact when
+  /// the caller already holds the stream's batches, an estimate otherwise). Optional: DuckDB's
+  /// optimizer uses it to size the stream for join order / build-side selection; undeclared
+  /// streams keep today's behavior (the optimizer assumes cardinality 1). Last call wins.
+  /// @throws after build().
+  void declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows);
+
   /// Declare an output stream. A fragment with no output stream is a result fragment.
   /// @throws after build() or on duplicate id.
   void declare_output(std::uint64_t stream_id);
@@ -234,11 +241,15 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
   /// `length == 0` and holds NO lease — the caller must not release anything for it. This is
   /// the same `length == 0` frame the transports already pass end-to-end.
+  ///
+  /// On success also writes the batch's exact row count to `rows`, so a transport can carry it
+  /// to the receiver, which sums the counts into declare_input_cardinality before building.
   /// @throws before `build()`, on an unknown output stream, when no arena is configured, on
   /// lease exhaustion, or on a parked batch that is not GPU-resident.
   std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
                                                            std::uint64_t& offset,
-                                                           std::uint64_t& length);
+                                                           std::uint64_t& length,
+                                                           std::uint64_t& rows);
 
   /// The receive-side mirror of `export_packed`: unpack the `length` packed bytes at staging
   /// offset `offset` using the pack metadata at `metadata_addr` (`metadata_len` bytes, host
@@ -273,6 +284,13 @@ class SIRIUS_FFI_EXPORT Fragment {
 
   /// Batches currently parked on output stream `stream_id`. For diagnostics.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+  /// Total rows parked on output stream `stream_id`, without draining it. What a local relay's
+  /// receiver feeds into declare_input_cardinality before its own build(). 0 on a fragment with
+  /// no streaming sink (mirroring output_batch_count).
+  /// @throws on an unknown output stream, or on a parked batch that is not GPU-resident (the
+  /// same contract as export_packed; the caller should skip the cardinality declaration then).
+  [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
   /// @throws before build() or on a result fragment.

@@ -139,10 +139,13 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 
   // Declare before planning: bind resolves schema; create_plan reads repo + senders.
   for (const auto& [id, input] : _spec.inputs) {
-    catalog->declare(
-      id,
-      stream_input_binding{
-        input.names, input.types, _input_repos.at(id), input.expected_senders, nullptr});
+    catalog->declare(id,
+                     stream_input_binding{input.names,
+                                          input.types,
+                                          _input_repos.at(id),
+                                          input.expected_senders,
+                                          input.estimated_rows,
+                                          nullptr});
   }
 
   auto logical_plan = _spec.plan_source(_context);

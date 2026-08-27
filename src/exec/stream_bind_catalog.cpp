@@ -81,6 +81,14 @@ const stream_input_binding& stream_bind_catalog::get(stream_id_t id) const
   return it->second;
 }
 
+std::optional<std::uint64_t> stream_bind_catalog::estimated_rows(stream_id_t id) const
+{
+  std::lock_guard<std::mutex> guard(_mutex);
+  auto it = _entries.find(id);
+  if (it == _entries.end()) { return std::nullopt; }
+  return it->second.estimated_rows;
+}
+
 void stream_bind_catalog::set_built(stream_id_t id, op::sirius_physical_streaming_source* built)
 {
   std::lock_guard<std::mutex> guard(_mutex);

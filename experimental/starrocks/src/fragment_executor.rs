@@ -62,6 +62,11 @@ pub struct StagedBatch {
     pub offset: u64,
     /// Length of the packed payload in bytes.
     pub len: u64,
+    /// Exact row count of the packed table (from `export_packed`, carried on the transmit
+    /// frame). The receiver sums the counts per stream into `declare_input_cardinality` so the
+    /// optimizer can size the stream. `None` when the frame predates the wire field: the
+    /// receiver then declares nothing for the stream and keeps the legacy blind planning.
+    pub rows: Option<u64>,
 }
 
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
