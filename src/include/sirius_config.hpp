@@ -98,11 +98,15 @@ struct valid_domain_coverage_threshold {
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
+
+constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+
 }  // namespace config
 
-/// Operator parameters shared between planning and execution.
-/// User-tunable members can be set under sirius.operator_params in YAML or overridden with
-/// DuckDB SET commands; engine-owned query policy is noted below.
+/// Parameters controlling operator-level resource sizing.
+/// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
+/// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 struct operator_params {
   /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
   /// execution context stays fail-closed until the engine snapshots the connection value.
@@ -181,6 +185,12 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
+  bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
+  uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's

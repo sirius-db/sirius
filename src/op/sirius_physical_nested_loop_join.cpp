@@ -29,6 +29,7 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -197,6 +198,14 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
       if (idx < rhs_types.size()) { right_output_col_idxs.push_back(idx); }
     }
   }
+}
+std::string_view sirius_physical_nested_loop_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
 }
 
 bool sirius_physical_nested_loop_join::is_supported(

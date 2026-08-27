@@ -150,6 +150,20 @@ class SiriusConnectionState : public ClientContextState {
     return label;
   }
 
+  /// Sets the telemetry query-group label for subsequent queries on this connection.
+  ///
+  /// The label remains active until replaced.
+  /// An empty label restores the default session group.
+  void set_session_label(std::string label)
+  {
+    if (label.empty()) {
+      session_label_.reset();
+    } else {
+      session_label_ = std::move(label);
+    }
+  }
+  [[nodiscard]] const std::optional<std::string>& session_label() const { return session_label_; }
+
   void enter_internal_query() noexcept
   {
     internal_query_depth_.fetch_add(1, std::memory_order_relaxed);
@@ -185,6 +199,8 @@ class SiriusConnectionState : public ClientContextState {
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
+  /// Sticky label set by `sirius_set_session_label`; never consumed.
+  std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;

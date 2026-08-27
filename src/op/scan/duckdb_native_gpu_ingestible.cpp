@@ -359,8 +359,10 @@ owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
   //===----------Filter Evaluation----------===//
+  // A ROW_FILTERED state means the decode already applied the whole conjunction
+  // and compacted to the survivors, so only the projection below is left.
   owning_table_view final_table;
-  if (_filter_expression) {
+  if (_filter_expression && input.state != filter_state::ROW_FILTERED) {
     auto sirius_filter_ast = sirius::ast::from_duckdb(*_filter_expression);
     sirius::expression_evaluator exec(sirius_filter_ast.get(),
                                       mr_ref,
