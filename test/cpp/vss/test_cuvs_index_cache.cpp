@@ -268,6 +268,41 @@ TEST_CASE("cuvs_index_cache keeps same-named tables in different schemas distinc
   REQUIRE(e1 != e2);  // each schema routes to its own index
 }
 
+// Regression for the key-collision bug: the old key glued the identity parts with
+// underscores, so table "orders_data" column "vec" and table "orders" column
+// "data_vec" both flattened to the same "..._orders_data_vec_l2..." string, and the
+// second build silently replaced the first table's index. build_ann_index_cache_key
+// length-prefixes each part so their contents can never run together.
+TEST_CASE("cuvs_index_cache keeps colliding-name identities distinct", "[vss]")
+{
+  using sirius::vss::build_ann_index_cache_key;
+
+  // The two identities the old glued key could not tell apart.
+  auto const k1 = build_ann_index_cache_key("mem", "main", "orders_data", "vec", "l2");
+  auto const k2 = build_ann_index_cache_key("mem", "main", "orders", "data_vec", "l2");
+
+  SECTION("the key itself is distinct for the two identities") { REQUIRE(k1 != k2); }
+
+  SECTION("both survive in the cache instead of one overwriting the other")
+  {
+    auto manager = sirius::test::operator_utils::initialize_memory_manager();
+    cuvs_index_cache cache(*manager);
+
+    insert_dummy(cache, k1, make_meta("orders_data", "vec", Metric::L2SqrtExpanded));
+    insert_dummy(cache, k2, make_meta("orders", "data_vec", Metric::L2SqrtExpanded));
+
+    REQUIRE(cache.size() == 2);  // distinct keys, not a silent overwrite
+
+    auto e1 = cache.find_by_column("mem", "main", "orders_data", "vec", Metric::L2SqrtExpanded);
+    auto e2 = cache.find_by_column("mem", "main", "orders", "data_vec", Metric::L2SqrtExpanded);
+    REQUIRE(e1 != nullptr);
+    REQUIRE(e2 != nullptr);
+    REQUIRE(e1->meta.table_name == "orders_data");
+    REQUIRE(e2->meta.table_name == "orders");
+    REQUIRE(e1 != e2);  // each identity routes to its own index
+  }
+}
+
 TEST_CASE("cuvs_index_cache reserve_index_memory is non-blocking", "[vss]")
 {
   auto manager = sirius::test::operator_utils::initialize_memory_manager();
@@ -517,6 +552,124 @@ TEST_CASE("cuvs_index_cache erase_by_column drops the matching index before a re
     REQUIRE(cache.erase_by_column("mem", "main", "docs", "other", Metric::L2SqrtExpanded) == 0);
     REQUIRE(cache.size() == 1);
   }
+  SECTION("no metric drops every index on the column, leaving other columns")
+  {
+    // sirius_drop_ann_index without a metric: both l2 and cosine on docs.vec go,
+    // docs.title_vec stays.
+    insert_dummy(cache, "vec_l2", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    insert_dummy(cache, "vec_cos", make_meta("docs", "vec", Metric::CosineExpanded));
+    insert_dummy(cache, "title", make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
+
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "vec") == 2);  // no metric = all metrics
+    REQUIRE(cache.find("vec_l2") == nullptr);
+    REQUIRE(cache.find("vec_cos") == nullptr);
+    REQUIRE(cache.find("title") != nullptr);  // different column untouched
+  }
+  SECTION("a metric drops only that index, leaving the other metric on the column")
+  {
+    insert_dummy(cache, "vec_l2", make_meta("docs", "vec", Metric::L2SqrtExpanded));
+    insert_dummy(cache, "vec_cos", make_meta("docs", "vec", Metric::CosineExpanded));
+
+    REQUIRE(cache.erase_by_column("mem", "main", "docs", "vec", Metric::CosineExpanded) == 1);
+    REQUIRE(cache.find("vec_cos") == nullptr);
+    REQUIRE(cache.find("vec_l2") != nullptr);  // the l2 index survives
+  }
+}
+
+// indexes_on_column feeds the "not enough GPU memory" error so it can name the
+// other-metric indexes that are still holding memory on the same column.
+TEST_CASE("cuvs_index_cache indexes_on_column lists all metrics on a column", "[vss]")
+{
+  using sirius::vss::build_ann_index_cache_key;
+  auto manager = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  // Two indexes on docs.vec (l2 and cosine) plus one on a different column.
+  auto l2           = make_meta("docs", "vec", Metric::L2SqrtExpanded);
+  l2.resident_bytes = 4ull << 20;  // 4 MiB
+  insert_dummy(cache, build_ann_index_cache_key("mem", "main", "docs", "vec", "l2"), l2);
+
+  auto cos           = make_meta("docs", "vec", Metric::CosineExpanded);
+  cos.resident_bytes = 6ull << 20;  // 6 MiB
+  insert_dummy(cache, build_ann_index_cache_key("mem", "main", "docs", "vec", "cosine"), cos);
+
+  insert_dummy(cache,
+               build_ann_index_cache_key("mem", "main", "docs", "title_vec", "l2"),
+               make_meta("docs", "title_vec", Metric::L2SqrtExpanded));
+
+  auto const on_vec = cache.indexes_on_column("mem", "main", "docs", "vec");
+  REQUIRE(on_vec.size() == 2);  // both metrics on this column, not the other column
+
+  std::size_t total = 0;
+  bool saw_l2 = false, saw_cos = false;
+  for (auto const& e : on_vec) {
+    total += e.resident_bytes;
+    if (e.metric == Metric::L2SqrtExpanded) { saw_l2 = true; }
+    if (e.metric == Metric::CosineExpanded) { saw_cos = true; }
+  }
+  REQUIRE(saw_l2);
+  REQUIRE(saw_cos);
+  REQUIRE(total == (10ull << 20));
+
+  // A column with no index reports nothing.
+  REQUIRE(cache.indexes_on_column("mem", "main", "docs", "missing").empty());
+}
+
+// Creating a second index (a different metric) on a column
+// that already has one, when the GPU cannot hold both. The second build's
+// reservation must be refused cleanly, the existing index must survive untouched,
+// and it must remain discoverable as the memory holder the error names. The exact
+// fits-one-but-not-two capacity is verified manually (GPU size varies); here the
+// oversized request stands in for "the second build cannot be admitted".
+TEST_CASE("cuvs_index_cache refused second build leaves the first index holding memory", "[vss]")
+{
+  namespace mem = cucascade::memory;
+  auto manager  = sirius::test::operator_utils::initialize_memory_manager();
+  cuvs_index_cache cache(*manager);
+
+  auto* gpu_space = const_cast<mem::memory_space*>(manager->get_memory_space(mem::Tier::GPU, 0));
+  REQUIRE(gpu_space != nullptr);
+  auto* adaptor = gpu_space->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(adaptor != nullptr);
+
+  // Build and pin a small l2 index on docs.vec (the first index).
+  constexpr cudf::size_type dim = 2;
+  auto col                      = make_float_list(
+    {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f}, 6, dim);
+
+  auto reservation = cache.reserve_index_memory(2ull << 20, /*preferred_gpu=*/0);
+  REQUIRE(reservation != nullptr);
+  rmm::cuda_stream build_stream;
+  auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+  auto handle         = sirius::vss::build_ivf_flat_index_from_batches({col->view()},
+                                                               dim,
+                                                               /*n_lists=*/2,
+                                                               Metric::L2SqrtExpanded,
+                                                               gpu_space->get_default_allocator(),
+                                                               build_stream.view());
+  auto const l2_bytes = adaptor->get_allocated_bytes(build_stream.view());
+  adaptor->reset_stream_reservation(build_stream.view());
+
+  index_metadata l2 = make_meta("docs", "vec", Metric::L2SqrtExpanded);
+  l2.resident_bytes = l2_bytes;
+  cache.insert(sirius::vss::build_ann_index_cache_key("mem", "main", "docs", "vec", "l2"),
+               std::move(l2),
+               std::move(handle),
+               std::move(build_stream));
+
+  // The second build (cosine on the same column) needs more than the GPU can hold.
+  // reserve_index_memory returns null instead of blocking, so the create path can
+  // fail cleanly before it touches the l2 index.
+  REQUIRE(cache.reserve_index_memory(8ull << 30, /*preferred_gpu=*/0) == nullptr);
+
+  // The l2 index survives untouched and is discoverable as the holder the error names.
+  REQUIRE(cache.find_by_column("mem", "main", "docs", "vec", Metric::L2SqrtExpanded) != nullptr);
+  auto const others = cache.indexes_on_column("mem", "main", "docs", "vec");
+  REQUIRE(others.size() == 1);
+  REQUIRE(others[0].metric == Metric::L2SqrtExpanded);
+  REQUIRE(others[0].resident_bytes == l2_bytes);
+  REQUIRE(l2_bytes > 0);
 }
 
 TEST_CASE("cuvs_index_cache lookup handle outlives an erase", "[vss]")

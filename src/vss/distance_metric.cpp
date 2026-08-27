@@ -37,4 +37,13 @@ cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metr
                               std::string(metric) + "'");
 }
 
+std::string_view ann_metric_name(cuvs::distance::DistanceType metric)
+{
+  switch (metric) {
+    case cuvs::distance::DistanceType::L2SqrtExpanded: return "l2";
+    case cuvs::distance::DistanceType::CosineExpanded: return "cosine";
+    default: return "unknown";
+  }
+}
+
 }  // namespace sirius::vss

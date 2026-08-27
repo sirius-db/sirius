@@ -1697,7 +1697,6 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
 struct CreateAnnIndexData : public TableFunctionData {
   std::string table_name;
   std::string column_name;
-  std::string index_name;                ///< management name (for a future drop_ann_index)
   std::string index_type  = "ivf_flat";  ///< lowercased; only "ivf_flat" supported today
   std::string metric      = "l2";        ///< lowercased; one of l2 / cosine
   std::string schema_name = "main";
@@ -1735,9 +1734,7 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
       throw BinderException("sirius_create_ann_index: named parameter '" + kv.first +
                             "' cannot be NULL");
     }
-    if (key == "name") {
-      result->index_name = kv.second.ToString();
-    } else if (key == "metric") {
+    if (key == "metric") {
       result->metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "index_type") {
       result->index_type = StringUtil::Lower(kv.second.ToString());
@@ -1900,24 +1897,22 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     dim,
     n_lists);
 
-  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
-
-  // The index's management name contains the index identity and then a suffix (index's name)
-  std::string index_name = entry_catalog + "_" + entry_schema + "_" + entry.name + "_" +
-                           data.column_name + "_" + data.metric + "_ann_" +
-                           (data.index_name.empty() ? "default" : data.index_name);
+  auto& index_cache      = sirius_ctx->get_cuvs_index_cache();
+  std::string index_name = sirius::vss::build_ann_index_cache_key(
+    entry_catalog, entry_schema, entry.name, data.column_name, data.metric);
 
   // Check if there's enough memory to build the index before releasing the current one
   auto reservation      = index_cache.reserve_index_memory(footprint, target_gpu);
   bool released_first   = false;
   bool removed_existing = false;
-  // Destructive path: not enough memory to hold both indexes at once so release the current one
+  // Destructive path: not enough memory to hold all indexes so release the current one first
   if (!reservation) {
     removed_existing = index_cache.erase_by_column(
                          entry_catalog, entry_schema, entry.name, data.column_name, metric) > 0;
     released_first = true;
     reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
     if (!reservation) {
+      // Still not enough memory
       auto const avail = target_space->get_available_memory();
       std::string msg =
         "sirius_create_ann_index: not enough free GPU memory to build the index for '" +
@@ -1926,6 +1921,23 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
         std::to_string(target_gpu) + ".";
       if (removed_existing) {
         msg += " The previous index for this column and metric was removed to make room.";
+      }
+      // Look for indexes on this same column under other metrics to inform users
+      auto const others =
+        index_cache.indexes_on_column(entry_catalog, entry_schema, entry.name, data.column_name);
+      if (!others.empty()) {
+        std::size_t held_bytes = 0;
+        std::string listed;
+        for (auto const& o : others) {
+          held_bytes += o.resident_bytes;
+          if (!listed.empty()) { listed += ", "; }
+          listed += std::string(sirius::vss::ann_metric_name(o.metric)) + " (~" +
+                    std::to_string(o.resident_bytes >> 20) + " MiB)";
+        }
+        msg += " Other indexes on this column are still holding ~" +
+               std::to_string(held_bytes >> 20) + " MiB of GPU memory [" + listed +
+               "]; drop one with sirius_drop_ann_index('" + data.table_name + "', '" +
+               data.column_name + "', metric => ...) to free it.";
       }
       throw InvalidInputException(msg);
     }
@@ -2003,6 +2015,102 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BOOLEAN(true));
+  gstate.finished = true;
+}
+
+struct DropAnnIndexData : public TableFunctionData {
+  std::string table_name;
+  std::string column_name;
+  std::string schema_name = "main";
+  std::string metric;       ///< lowercased l2 / cosine; only read when has_metric
+  bool has_metric = false;  ///< true if a metric was given (drop just that one)
+};
+
+// Per-execution state
+struct DropAnnIndexGlobalState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusDropAnnIndexInit(ClientContext& context,
+                                                                   TableFunctionInitInput& input)
+{
+  return make_uniq<DropAnnIndexGlobalState>();
+}
+
+static unique_ptr<FunctionData> SiriusDropAnnIndexBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto result = make_uniq<DropAnnIndexData>();
+
+  if (input.inputs.size() < 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+    throw BinderException(
+      "sirius_drop_ann_index requires two non-NULL positional arguments: table and column");
+  }
+  result->table_name  = input.inputs[0].ToString();
+  result->column_name = input.inputs[1].ToString();
+
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_drop_ann_index: named parameter '" + kv.first +
+                            "' cannot be NULL");
+    }
+    if (key == "metric") {
+      result->has_metric = true;
+      result->metric     = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "schema_name") {
+      result->schema_name = kv.second.ToString();
+    }
+  }
+
+  // A given metric drops just that index; omitting it drops every metric on the column.
+  if (result->has_metric && result->metric != "l2" && result->metric != "cosine") {
+    throw BinderException("sirius_drop_ann_index: metric must be one of 'l2', 'cosine', got '" +
+                          result->metric + "'");
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Dropped");
+  return std::move(result);
+}
+
+static void SiriusDropAnnIndexFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& data   = data_p.bind_data->CastNoConst<DropAnnIndexData>();
+  auto& gstate = data_p.global_state->Cast<DropAnnIndexGlobalState>();
+  if (gstate.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_drop_ann_index requires the Sirius context to be initialized");
+  }
+
+  // Hold the query-lifecycle slot while the registry is read and mutated
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
+  auto const qname          = QualifiedName::Parse(data.table_name);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
+  std::string const& table  = qname.name;
+  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry      = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog = entry.ParentCatalog().GetName();
+  auto& entry_schema  = entry.ParentSchema().name;
+
+  std::optional<cuvs::distance::DistanceType> metric;
+  if (data.has_metric) { metric = sirius::vss::ann_distance_type_from_metric(data.metric); }
+
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  std::size_t const removed =
+    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(removed > 0));
   gstate.finished = true;
 }
 
@@ -2302,20 +2410,29 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
 
-  // sirius_create_ann_index(table, column, name=>, metric=>, index_type=>, n_lists=>,
-  // schema_name=>)
+  // sirius_create_ann_index(table, column, metric=>, index_type=>, n_lists=>, schema_name=>)
   TableFunction create_ann_index("sirius_create_ann_index",
                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                  SiriusCreateAnnIndexFunction,
                                  SiriusCreateAnnIndexBind,
                                  SiriusCreateAnnIndexInit);
-  create_ann_index.named_parameters["name"]        = LogicalType::VARCHAR;
   create_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
   create_ann_index.named_parameters["index_type"]  = LogicalType::VARCHAR;
   create_ann_index.named_parameters["n_lists"]     = LogicalType::BIGINT;
   create_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
   CreateTableFunctionInfo create_ann_index_info(create_ann_index);
   catalog.CreateTableFunction(transaction, create_ann_index_info);
+
+  // sirius_drop_ann_index(table, column, metric =>, schema_name =>)
+  TableFunction drop_ann_index("sirius_drop_ann_index",
+                               {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                               SiriusDropAnnIndexFunction,
+                               SiriusDropAnnIndexBind,
+                               SiriusDropAnnIndexInit);
+  drop_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
+  drop_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  CreateTableFunctionInfo drop_ann_index_info(drop_ann_index);
+  catalog.CreateTableFunction(transaction, drop_ann_index_info);
 
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
   // schema_name =>)

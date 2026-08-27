@@ -23,11 +23,13 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace cucascade::memory {
 class memory_reservation_manager;
@@ -64,6 +66,22 @@ struct index_metadata {
   std::size_t resident_bytes{
     0};  ///< Resident GPU bytes the finished index occupies (capacity-accounted)
 };
+
+/// Build the cache key for an index from its routing identity.
+[[nodiscard]] inline std::string build_ann_index_cache_key(std::string_view catalog,
+                                                           std::string_view schema,
+                                                           std::string_view table,
+                                                           std::string_view column,
+                                                           std::string_view metric)
+{
+  std::string key;
+  for (auto part : {catalog, schema, table, column, metric}) {
+    key += std::to_string(part.size());
+    key += ':';
+    key += part;
+  }
+  return key;
+}
 
 /// Type-erased owner of a cuVS index. The cache stores indexes through
 /// this base so it never has to template over the concrete cuVS index type
@@ -159,7 +177,7 @@ class cuvs_index_cache {
   /// this reservation to the build stream so cuVS's allocations are charged and
   /// bounded by it, then releases it once the index is built.
   ///
-  /// Non-blocking, and pinned to @p preferred_gpu: the index must be reserved on
+  /// Non-blocking and pinned to @p preferred_gpu: the index must be reserved on
   /// the same GPU that holds the table's pinned data. Returns null instead of
   /// waiting, so the caller can fail cleanly rather than blocking indefinitely
   /// when the device cannot fit the index.
@@ -187,12 +205,8 @@ class cuvs_index_cache {
 
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
   /// metadata matches (@p catalog, @p schema, @p table, @p column, @p metric).
-  /// This is the lookup a search recognizer uses to decide whether a query can use
-  /// ANN. Returns nullptr if no pinned index covers that column under that metric.
-  /// Metrics are compared up to canonicalization: L2SqrtExpanded/L2SqrtUnexpanded fold together,
-  /// so a query's unexpanded metric still matches an index built expanded.
-  ///
-  /// Like @ref find, the returned handle keeps the entry alive while held.
+  /// Returns nullptr if no pinned index covers that column under that metric.
+  /// Metrics are compared up to canonicalization.
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
     std::string_view catalog,
     std::string_view schema,
@@ -200,14 +214,11 @@ class cuvs_index_cache {
     std::string_view column,
     cuvs::distance::DistanceType metric) const;
 
-  /// Remove every entry whose auto-routing identity matches
-  /// (@p catalog, @p schema, @p table, @p column, @p metric). Metrics are compared
-  /// up to canonicalization. Returns the number of entries removed.
-  std::size_t erase_by_column(std::string_view catalog,
-                              std::string_view schema,
-                              std::string_view table,
-                              std::string_view column,
-                              cuvs::distance::DistanceType metric);
+  /// List all pinned indexes (across metrics) on this column.
+  [[nodiscard]] std::vector<index_metadata> indexes_on_column(std::string_view catalog,
+                                                              std::string_view schema,
+                                                              std::string_view table,
+                                                              std::string_view column) const;
 
   [[nodiscard]] bool contains(std::string_view name) const;
 
@@ -215,6 +226,16 @@ class cuvs_index_cache {
   /// outstanding lookup handle still refers to it. Returns true iff an entry was
   /// removed.
   bool erase(std::string_view name);
+
+  /// Remove entries on (@p catalog, @p schema, @p table, @p column). With a
+  /// @p metric, only the entry for that metric is removed (compared up to
+  /// canonicalization); with no metric, every index on the column is removed
+  /// regardless of metric. Returns the number of entries removed.
+  std::size_t erase_by_column(std::string_view catalog,
+                              std::string_view schema,
+                              std::string_view table,
+                              std::string_view column,
+                              std::optional<cuvs::distance::DistanceType> metric = std::nullopt);
 
   /// Drop all pinned indexes.
   void clear();

@@ -314,13 +314,12 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("SET scan_task_batch_size = 1048576;");
 }
 
-// A created index must resolve two ways: by its management name (the key always
-// embeds the routing identity, then the user's name or "default"), and by its
-// routing identity via find_by_column. Rebuilding under a different name moves
-// the management key but keeps exactly one entry for the identity, so identity
-// lookup still resolves.
+// A created index resolves two ways to the same entry: by its cache key (the
+// routing identity, built by build_ann_index_cache_key) and by find_by_column.
+// Rebuilding the same identity replaces the one entry on that key rather than
+// appending a second.
 TEST_CASE_METHOD(VectorSearchFixture,
-                 "sirius_create_ann_index - findable by identity and management name",
+                 "sirius_create_ann_index - findable by identity key",
                  "[integration][gpu_execution][array][vss][vector_search]")
 {
   run_ok(
@@ -338,44 +337,135 @@ TEST_CASE_METHOD(VectorSearchFixture,
   REQUIRE(sirius_ctx);
   auto& index_cache = sirius_ctx->get_cuvs_index_cache();
 
-  auto const identity_prefix = catalog + "_main_vs_lookup_vec_l2_ann_";
+  // The cache key is the routing identity.
+  auto const key =
+    sirius::vss::build_ann_index_cache_key(catalog, "main", "vs_lookup", "vec", "l2");
 
   // The cache is shared across test cases in this process, so assert on the net
   // change this test makes rather than an absolute count.
   auto const baseline = index_cache.size();
 
-  // Explicit name => the management key ends with that name; identity lookup
-  // resolves to the same entry.
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', name => 'my_idx', "
-    "metric => 'l2', n_lists => 16);");
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', metric => 'l2', n_lists => 16);");
   {
-    auto by_name = index_cache.find(identity_prefix + "my_idx");
+    auto by_key = index_cache.find(key);
     auto by_identity =
       index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
-    REQUIRE(by_name != nullptr);
+    REQUIRE(by_key != nullptr);
     REQUIRE(by_identity != nullptr);
-    REQUIRE(by_name == by_identity);              // same entry, reached two ways
+    REQUIRE(by_key == by_identity);               // same entry, reached two ways
     REQUIRE(index_cache.size() == baseline + 1);  // one entry added
   }
 
-  // No name => the suffix defaults to "default". Rebuilding the same identity
-  // replaces the old entry, so the old "my_idx" key is gone but identity lookup
-  // still resolves (to the new "default" entry).
+  // Rebuilding the same identity replaces the entry on the same key (not appended).
   run_ok(
-    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', "
-    "metric => 'l2', n_lists => 16);");
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', metric => 'l2', n_lists => 16);");
   {
-    // The old name is gone (replaced, not appended) and identity still resolves.
-    REQUIRE(index_cache.find(identity_prefix + "my_idx") == nullptr);
-    auto by_name = index_cache.find(identity_prefix + "default");
+    auto by_key = index_cache.find(key);
     auto by_identity =
       index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
-    REQUIRE(by_name != nullptr);
+    REQUIRE(by_key != nullptr);
     REQUIRE(by_identity != nullptr);
-    REQUIRE(by_name == by_identity);
+    REQUIRE(by_key == by_identity);
     REQUIRE(index_cache.size() == baseline + 1);  // replaced, not appended
   }
 
   run_ok("SELECT * FROM unpin_table('vs_lookup');");
+}
+
+// sirius_drop_ann_index removes a built index by its (table, column, metric)
+// identity: after the drop, routing can no longer find it, and a second drop is a
+// no-op that reports nothing was dropped.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_drop_ann_index - drops a built index by metric",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_drop AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_drop', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_drop', 'vec', metric => 'l2', n_lists => 16);");
+  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) !=
+          nullptr);
+
+  // Drop reports it removed one, and routing can no longer find it.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop', 'vec', metric => 'l2');");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("drop error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+  }
+  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) ==
+          nullptr);
+
+  // Dropping again is a no-op: nothing matched, so Dropped is false.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop', 'vec', metric => 'l2');");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE_FALSE(r->GetValue(0, 0).GetValue<bool>());
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_drop');");
+}
+
+// sirius_drop_ann_index with no metric removes every index on the column. Build an
+// l2 and a cosine index on the same column, then a single metric-less drop clears
+// both.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_drop_ann_index - no metric drops every index on the column",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_drop_all AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) "
+    "t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_drop_all', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'l2', n_lists => 16);");
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'cosine', "
+    "n_lists => 16);");
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) != nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) != nullptr);
+
+  // One metric-less drop clears both indexes on the column.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop_all', 'vec');");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("drop-all error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+  }
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) == nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) == nullptr);
+
+  run_ok("SELECT * FROM unpin_table('vs_drop_all');");
 }

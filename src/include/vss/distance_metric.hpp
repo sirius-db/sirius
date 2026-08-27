@@ -33,4 +33,9 @@ cuvs::distance::DistanceType enn_distance_type_from_metric(std::string_view metr
  */
 cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metric);
 
+/**
+ * @brief Name the metric family of a cuVS DistanceType for user-facing messages.
+ */
+std::string_view ann_metric_name(cuvs::distance::DistanceType metric);
+
 }  // namespace sirius::vss
