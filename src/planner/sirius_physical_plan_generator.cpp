@@ -235,10 +235,11 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  info->column_ids     = scan_op.column_ids;
-  info->projection_ids = scan_op.projection_ids;
-  info->returned_types = scan_op.returned_types;
-  info->output_types   = scan_op.types;
+  info->column_ids          = scan_op.column_ids;
+  info->projection_ids      = scan_op.projection_ids;
+  info->returned_types      = scan_op.returned_types;
+  info->output_types        = scan_op.types;
+  info->defer_metadata_walk = scan_op.mvcc_pin_serves_scan;
   return info;
 }
 

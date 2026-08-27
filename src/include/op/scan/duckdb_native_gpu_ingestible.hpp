@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -69,6 +70,10 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   /// dynamic path).
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+
+  /// Skip the constructor's metadata walk: a pin-served scan takes its splits from the pinned
+  /// entry. ensure_metadata_prepared() runs the walk if the scan falls to disk after all.
+  bool defer_metadata_walk = false;
 
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
@@ -161,6 +166,19 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
+  void ensure_metadata_prepared() override;
+
+  [[nodiscard]] bool metadata_walk_pending() const noexcept
+  {
+    return _walk_deferred && !_walk_ready.load(std::memory_order_acquire);
+  }
+
+  /// Call only when !metadata_walk_pending().
+  [[nodiscard]] duckdb_native_walk_plan const& walk_plan_for_testing() const noexcept
+  {
+    return _plan;
+  }
+
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
@@ -198,15 +216,23 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   }
 
  private:
+  void run_metadata_walk();
+
   std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> _info;
   duckdb_native_walk_plan _plan;
   std::shared_ptr<duckdb::Expression> _filter_expression;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 
+  //===----------Deferred metadata walk----------===//
+  bool _walk_deferred = false;
+  std::atomic<bool> _walk_ready{false};
+  std::once_flag _walk_once;  ///< Serializes the deferred walk; re-arms after a throw.
+
   //===----------RG Range Slicing----------===//
   std::size_t _chunk_row_groups =
     1;  ///< The number of row groups to chunk together for each metadata scan task.
-  std::size_t _num_ranges = 0;
+  /// Atomic: a deferred walk may rewrite the constructor's estimate while claims are in flight.
+  std::atomic<std::size_t> _num_ranges{0};
   std::atomic<std::size_t> _next_range_idx{0};
 };
 

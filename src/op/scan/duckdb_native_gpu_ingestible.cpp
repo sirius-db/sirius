@@ -181,23 +181,10 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
 
-  // Phase 1 (serial): PartitionStatistics,
-  //                   projected-type gate, and
-  //                   filter-stat row-group pruning.
-  // Unsupported types / invalid partitions refuse -> CPU fallback before any per-segment IO.
-  // PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so it must stay
-  // serial.
-  _plan = prepare_duckdb_native_walk(*bind.storage,
-                                     *bind.context,
-                                     bind.projected_cols,
-                                     bind.projected_types,
-                                     bind.table_filters.get(),
-                                     &bind.column_ids);
-  if (!_plan.viable) {
-    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
-                     _plan.viability_failure_reason);
-    throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _plan.viability_failure_reason);
+  // Eager even when the walk is deferred, so an undecodable type still refuses at plan time.
+  if (auto reason = unsupported_projected_type_reason(bind.projected_cols, bind.projected_types)) {
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}", *reason);
+    throw std::runtime_error("duckdb-native scan rejected query: " + *reason);
   }
 
   auto& sm          = bind.storage->GetAttached().GetStorageManager();
@@ -232,12 +219,57 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     }
   }
 
+  _chunk_row_groups = metadata_parse_chunk();
+  if (bind.defer_metadata_walk) {
+    // Seed _num_ranges in case the split provider is consulted first; the walk rewrites it.
+    _walk_deferred = true;
+    _num_ranges.store(std::max<std::size_t>(
+                        1,
+                        utils::ceil_div(bind.storage->GetRowGroupCollection()->GetRowGroupCount(),
+                                        _chunk_row_groups)),
+                      std::memory_order_relaxed);
+    SIRIUS_LOG_DEBUG(
+      "[duckdb_native_gpu_ingestible] deferring metadata walk for pin-served scan of '{}'",
+      bind.table_name);
+  } else {
+    run_metadata_walk();
+  }
+}
+
+//! PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so this must stay
+//! serial; the deferred path runs it from prepare_for_query on the query thread.
+void duckdb_native_gpu_ingestible::run_metadata_walk()
+{
+  auto const& bind = *_info;
+  _plan            = prepare_duckdb_native_walk(*bind.storage,
+                                     *bind.context,
+                                     bind.projected_cols,
+                                     bind.projected_types,
+                                     bind.table_filters.get(),
+                                     &bind.column_ids);
+  if (!_plan.viable) {
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
+                     _plan.viability_failure_reason);
+    throw std::runtime_error("duckdb-native scan rejected query: " +
+                             _plan.viability_failure_reason);
+  }
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
   // Always at least one range: a zero-row-group table must still push one (empty)
   // scan_info so the coalescer seeds its template and emits the empty split —
   // zero splits would mean zero tasks and the query never completes.
-  _chunk_row_groups = metadata_parse_chunk();
-  _num_ranges = std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups));
+  _num_ranges.store(
+    std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups)),
+    std::memory_order_relaxed);
+}
+
+void duckdb_native_gpu_ingestible::ensure_metadata_prepared()
+{
+  if (!_walk_deferred || _walk_ready.load(std::memory_order_acquire)) { return; }
+  // call_once re-arms after an exception, so a failed walk is retried rather than latched.
+  std::call_once(_walk_once, [this] {
+    run_metadata_walk();
+    _walk_ready.store(true, std::memory_order_release);
+  });
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
@@ -247,14 +279,26 @@ duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_range_idx.load(std::memory_order_relaxed) >= _num_ranges;
+  return _next_range_idx.load(std::memory_order_relaxed) >=
+         _num_ranges.load(std::memory_order_relaxed);
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
+  // Backstop: the scan manager already ran the walk on the query thread, so this is a no-op.
+  if (metadata_walk_pending()) {
+    SIRIUS_LOG_WARN(
+      "[duckdb_native_gpu_ingestible] deferred metadata walk still pending at "
+      "next_split_provider for '{}'; running it now (off the query thread)",
+      _info->table_name);
+    ensure_metadata_prepared();
+  }
+
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
+  if (idx >= _num_ranges.load(std::memory_order_relaxed)) {
+    return nullptr;  // lost the race for the final range
+  }
 
   auto const rg_begin = idx * _chunk_row_groups;
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);
