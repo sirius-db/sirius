@@ -1,0 +1,249 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 392.79999999999995
+  Memory: 122.4
+
+PLAN FRAGMENT 0(F14)
+  Fragment Cost: 96.0
+  Output Exprs:18: s_name | 87: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  28:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 1
+
+PLAN FRAGMENT 1(F13)
+  Fragment Cost: 160.79999999999995
+
+  Input Partition: HASH_PARTITIONED: 18: s_name
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 28
+
+  27:TOP-N
+  |  order by: [87, BIGINT, false] DESC, [18, VARCHAR(1048576), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 1
+  |  
+  26:AGGREGATE (merge finalize)
+  |  aggregate: count[([87: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [18: s_name, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  25:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [18: s_name, VARCHAR(1048576), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 364.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 18: s_name
+  OutPut Exchange Id: 25
+
+  24:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  group by: [18: s_name, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  23:Project
+  |  output columns:
+  |  18 <-> [18: s_name, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  22:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [20: s_nationkey, INT, true] = [49: n_nationkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 4, build_expr = (49: n_nationkey), remote = false
+  |  output columns: 18
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----21:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  18:Project
+  |  output columns:
+  |  18 <-> [18: s_name, VARCHAR(1048576), true]
+  |  20 <-> [20: s_nationkey, INT, true]
+  |  cardinality: 1
+  |  
+  17:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [17: s_suppkey, INT, true] = [26: l_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (26: l_suppkey), remote = false
+  |  output columns: 18, 20
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----16:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 3, probe_expr = (17: s_suppkey)
+     - filter_id = 4, probe_expr = (20: s_nationkey)
+
+PLAN FRAGMENT 3(F11)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 21
+
+  20:Project
+  |  output columns:
+  |  49 <-> [49: n_nationkey, INT, true]
+  |  cardinality: 1
+  |  
+  19:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 4(F07)
+  Fragment Cost: 246.0
+
+  Input Partition: HASH_PARTITIONED: 24: l_orderkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 16
+
+  15:Project
+  |  output columns:
+  |  26 <-> [26: l_suppkey, INT, true]
+  |  cardinality: 1
+  |  
+  14:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [24: l_orderkey, BIGINT, true] = [53: l_orderkey, BIGINT, true]
+  |  other join predicates: [55: l_suppkey, INT, true] != [26: l_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (53: l_orderkey), remote = true
+  |  output columns: 26
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----13:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [53: l_orderkey, BIGINT, true]
+  |       cardinality: 1
+  |    
+  11:Project
+  |  output columns:
+  |  24 <-> [24: l_orderkey, BIGINT, true]
+  |  26 <-> [26: l_suppkey, INT, true]
+  |  cardinality: 1
+  |  
+  10:HASH JOIN
+  |  join op: RIGHT ANTI JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [70: l_orderkey, BIGINT, true] = [24: l_orderkey, BIGINT, true]
+  |  other join predicates: [72: l_suppkey, INT, true] != [26: l_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (24: l_orderkey), remote = true
+  |  output columns: 24, 26
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----9:Project
+  |    |  output columns:
+  |    |  24 <-> [24: l_orderkey, BIGINT, true]
+  |    |  26 <-> [26: l_suppkey, INT, true]
+  |    |  cardinality: 1
+  |    |  
+  |    8:HASH JOIN
+  |    |  join op: INNER JOIN (PARTITIONED)
+  |    |  equal join conjunct: [24: l_orderkey, BIGINT, true] = [40: o_orderkey, BIGINT, true]
+  |    |  build runtime filters:
+  |    |  - filter_id = 0, build_expr = (40: o_orderkey), remote = true
+  |    |  output columns: 24, 26
+  |    |  can local shuffle: false
+  |    |  cardinality: 1
+  |    |  
+  |    |----7:EXCHANGE
+  |    |       distribution type: SHUFFLE
+  |    |       partition exprs: [40: o_orderkey, BIGINT, true]
+  |    |       cardinality: 1
+  |    |       probe runtime filters:
+  |    |       - filter_id = 2, probe_expr = (40: o_orderkey)
+  |    |    
+  |    4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [24: l_orderkey, BIGINT, true]
+  |       cardinality: 1
+  |       probe runtime filters:
+  |       - filter_id = 2, probe_expr = (24: l_orderkey)
+  |    
+  2:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [70: l_orderkey, BIGINT, true]
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (70: l_orderkey)
+     - filter_id = 2, probe_expr = (70: l_orderkey)
+
+PLAN FRAGMENT 5(F08)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 53: l_orderkey
+  OutPut Exchange Id: 13
+
+  12:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 6(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 40: o_orderkey
+  OutPut Exchange Id: 07
+
+  6:Project
+  |  output columns:
+  |  40 <-> [40: o_orderkey, BIGINT, true]
+  |  cardinality: 1
+  |  
+  5:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (40: o_orderkey)
+
+PLAN FRAGMENT 7(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 24: l_orderkey
+  OutPut Exchange Id: 04
+
+  3:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (24: l_orderkey)
+     - filter_id = 2, probe_expr = (24: l_orderkey)
+
+PLAN FRAGMENT 8(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 70: l_orderkey
+  OutPut Exchange Id: 02
+
+  1:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (70: l_orderkey)
+     - filter_id = 2, probe_expr = (70: l_orderkey)

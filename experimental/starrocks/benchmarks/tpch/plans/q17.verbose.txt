@@ -1,0 +1,139 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 189.2
+  Memory: 79.6
+
+PLAN FRAGMENT 0(F07)
+  Fragment Cost: 103.99999999999997
+  Output Exprs:62: expr
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  16:Project
+  |  output columns:
+  |  62 <-> [61: sum, DECIMAL128(38,2), true] / 7.0
+  |  cardinality: 1
+  |  
+  15:AGGREGATE (merge finalize)
+  |  aggregate: sum[([61: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  14:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F04)
+  Fragment Cost: 197.7
+
+  Input Partition: HASH_PARTITIONED: 18: l_partkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 14
+
+  13:AGGREGATE (update serialize)
+  |  aggregate: sum[([22: l_extendedprice, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  12:Project
+  |  output columns:
+  |  22 <-> [22: l_extendedprice, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  11:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [33: p_partkey, INT, true] = [43: l_partkey, INT, true]
+  |  other join predicates: cast([21: l_quantity, DECIMAL64(15,2), true] as DECIMAL128(38,9)) < 0.2 * [58: avg, DECIMAL128(38,8), true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (43: l_partkey), remote = true
+  |  output columns: 22
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----10:AGGREGATE (merge finalize)
+  |    |  aggregate: avg[([58: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true]
+  |    |  group by: [43: l_partkey, INT, true]
+  |    |  cardinality: 1
+  |    |  
+  |    9:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [43: l_partkey, INT, true]
+  |       cardinality: 1
+  |    
+  6:Project
+  |  output columns:
+  |  21 <-> [21: l_quantity, DECIMAL64(15,2), true]
+  |  22 <-> [22: l_extendedprice, DECIMAL64(15,2), true]
+  |  33 <-> [33: p_partkey, INT, true]
+  |  cardinality: 1
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [18: l_partkey, INT, true] = [33: p_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (33: p_partkey), remote = true
+  |  output columns: 21, 22, 33
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [33: p_partkey, INT, true]
+  |       cardinality: 1
+  |       probe runtime filters:
+  |       - filter_id = 1, probe_expr = (33: p_partkey)
+  |    
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [18: l_partkey, INT, true]
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (18: l_partkey)
+
+PLAN FRAGMENT 2(F05)
+  Fragment Cost: 4.6
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 43: l_partkey
+  OutPut Exchange Id: 09
+
+  8:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: avg[([46: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true]
+  |  group by: [43: l_partkey, INT, true]
+  |  cardinality: 1
+  |  
+  7:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 3(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 33: p_partkey
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  33 <-> [33: p_partkey, INT, true]
+  |  cardinality: 1
+  |  
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (33: p_partkey)
+
+PLAN FRAGMENT 4(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 18: l_partkey
+  OutPut Exchange Id: 01
+
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (18: l_partkey)
+     - filter_id = 1, probe_expr = (18: l_partkey)

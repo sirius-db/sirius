@@ -291,6 +291,7 @@ set(EXTENSION_SOURCES
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
+    src/exec/exchange_staging_arena.cpp
     src/exec/stream_session.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
@@ -336,6 +337,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
+    src/op/scan/parquet_byte_range.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_filter_analysis.cpp
@@ -397,6 +399,7 @@ set(EXTENSION_SOURCES
     src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
+    src/planner/substrait_scan_ranges.cpp
     src/planner/sirius_plan_column_data_get.cpp
     src/planner/sirius_plan_comparison_join.cpp
     src/planner/sirius_plan_compressed_schema.cpp
@@ -685,6 +688,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_staging_arena.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
@@ -863,6 +867,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
+    test/cpp/scan/test_parquet_byte_range.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp

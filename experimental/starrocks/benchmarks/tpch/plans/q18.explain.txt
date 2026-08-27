@@ -1,0 +1,136 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:18: c_name | 17: c_custkey | 25: o_orderkey | 29: o_orderdate | 28: o_totalprice | 68: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  20:MERGING-EXCHANGE
+     limit: 100
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 26: o_custkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    UNPARTITIONED
+
+  19:TOP-N
+  |  order by: <slot 28> 28: o_totalprice DESC, <slot 29> 29: o_orderdate ASC
+  |  offset: 0
+  |  limit: 100
+  |  
+  18:AGGREGATE (update finalize)
+  |  output: sum(38: l_quantity)
+  |  group by: 18: c_name, 17: c_custkey, 25: o_orderkey, 29: o_orderdate, 28: o_totalprice
+  |  
+  17:Project
+  |  <slot 17> : 17: c_custkey
+  |  <slot 18> : 18: c_name
+  |  <slot 25> : 25: o_orderkey
+  |  <slot 28> : 28: o_totalprice
+  |  <slot 29> : 29: o_orderdate
+  |  <slot 38> : 38: l_quantity
+  |  
+  16:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 26: o_custkey = 17: c_custkey
+  |  
+  |----15:EXCHANGE
+  |    
+  13:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    HASH_PARTITIONED: 17: c_custkey
+
+  14:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 50: l_orderkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    HASH_PARTITIONED: 26: o_custkey
+
+  12:Project
+  |  <slot 25> : 25: o_orderkey
+  |  <slot 26> : 26: o_custkey
+  |  <slot 28> : 28: o_totalprice
+  |  <slot 29> : 29: o_orderdate
+  |  <slot 38> : 38: l_quantity
+  |  
+  11:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  colocate: false, reason: 
+  |  equal join conjunct: 25: o_orderkey = 34: l_orderkey
+  |  
+  |----10:EXCHANGE
+  |    
+  8:Project
+  |  <slot 25> : 25: o_orderkey
+  |  <slot 26> : 26: o_custkey
+  |  <slot 28> : 28: o_totalprice
+  |  <slot 29> : 29: o_orderdate
+  |  
+  7:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BUCKET_SHUFFLE(S))
+  |  colocate: false, reason: 
+  |  equal join conjunct: 25: o_orderkey = 50: l_orderkey
+  |  
+  |----6:Project
+  |    |  <slot 50> : 50: l_orderkey
+  |    |  
+  |    5:AGGREGATE (merge finalize)
+  |    |  output: sum(66: sum)
+  |    |  group by: 50: l_orderkey
+  |    |  having: 66: sum > 300
+  |    |  
+  |    4:EXCHANGE
+  |    
+  1:EXCHANGE
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    HASH_PARTITIONED: 34: l_orderkey
+
+  9:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 50: l_orderkey
+
+  3:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(54: l_quantity)
+  |  group by: 50: l_orderkey
+  |  
+  2:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 6
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: 25: o_orderkey
+
+  0:FileScanNode
+     BROKER: 

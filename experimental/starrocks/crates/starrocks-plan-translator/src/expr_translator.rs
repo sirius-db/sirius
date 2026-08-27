@@ -13,6 +13,22 @@ use crate::{
     ExtensionRegistry, URN_ARITHMETIC, URN_BOOLEAN, URN_COMPARISON, URN_DATETIME, URN_STRING,
 };
 
+/// A common-expr slot a project physically emits past its descriptor row because an ancestor
+/// node consumes it (see `node_translator::translate_project_node`).
+///
+/// StarRocks' BE outputs a project's common slots when a node above references them even
+/// though no output tuple materializes them; carrying the `(tuple, slot) -> column` binding
+/// upward is how this translator reproduces that.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CarriedSlot {
+    /// Output tuple of the project that carries the slot.
+    pub tuple_id: i32,
+    /// StarRocks slot id (query-global in new-optimizer plans).
+    pub slot_id: i32,
+    /// Physical column of the carried value in the project's output row.
+    pub column: usize,
+}
+
 /// Mutable state needed while translating one StarRocks expression tree.
 pub(crate) struct ExprContext<'a> {
     /// Descriptor lookups for slot references and row layouts.
@@ -21,6 +37,10 @@ pub(crate) struct ExprContext<'a> {
     registry: &'a mut ExtensionRegistry,
     /// Tuple ids that describe the input row visible to this expression.
     row_tuples: &'a [i32],
+    /// Synthetic StarRocks slots appended while evaluating common project expressions.
+    slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
+    /// Common-expr columns the input row carries past its descriptor width.
+    carried: Option<&'a [CarriedSlot]>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -34,7 +54,34 @@ impl<'a> ExprContext<'a> {
             desc,
             registry,
             row_tuples,
+            slot_overrides: None,
+            carried: None,
         }
+    }
+
+    /// Creates an expression context that can resolve synthetic slots not present
+    /// in the descriptor table.
+    pub(crate) fn with_slot_overrides(
+        desc: &'a DescriptorTable,
+        registry: &'a mut ExtensionRegistry,
+        row_tuples: &'a [i32],
+        slot_overrides: &'a std::collections::HashMap<(i32, i32), usize>,
+    ) -> Self {
+        Self {
+            desc,
+            registry,
+            row_tuples,
+            slot_overrides: Some(slot_overrides),
+            carried: None,
+        }
+    }
+
+    /// Makes the input row's carried common-expr columns visible to slot resolution.
+    pub(crate) fn with_carried(mut self, carried: &'a [CarriedSlot]) -> Self {
+        if !carried.is_empty() {
+            self.carried = Some(carried);
+        }
+        self
     }
 }
 
@@ -128,6 +175,7 @@ fn translate_expr_node(
         TExprNodeType::ARITHMETIC_EXPR => translate_arithmetic(node, children, ctx),
         TExprNodeType::IN_PRED => translate_in_pred(node, children, ctx),
         TExprNodeType::CASE_EXPR => translate_case(node, children),
+        TExprNodeType::CLONE_EXPR => translate_clone(node, children),
         TExprNodeType::FUNCTION_CALL => translate_function_call(node, children, ctx),
         _ => Err(TranslateError::UnsupportedExpression {
             node_type: node.node_type,
@@ -137,6 +185,11 @@ fn translate_expr_node(
 }
 
 /// Converts a StarRocks `SLOT_REF` into a Substrait field selection.
+///
+/// Resolution order: exact `(tuple, slot)` synthetic override, exact `(tuple, slot)` carried
+/// column, descriptor row (`slot_global_index`), and — only when the descriptor fails — a
+/// carried column matched by slot id alone (BE semantics: the tuple id of a ref can be stale,
+/// see `DescriptorTable::slot_global_index`). Every ambiguity is refused, never guessed.
 fn translate_slot_ref(
     node: &TExprNode,
     children: Vec<Expression>,
@@ -147,9 +200,59 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field =
-        ctx.desc
-            .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)? as i32;
+    let key = (slot_ref.tuple_id, slot_ref.slot_id);
+    let exact_override = ctx
+        .slot_overrides
+        .and_then(|overrides| overrides.get(&key).copied());
+    let exact_carried = ctx.carried.and_then(|carried| {
+        carried
+            .iter()
+            .find(|slot| (slot.tuple_id, slot.slot_id) == key)
+            .map(|slot| slot.column)
+    });
+    if exact_override.is_some() && exact_carried.is_some() {
+        return Err(TranslateError::descriptor(format!(
+            "slot {} (tuple {}) resolves through both a synthetic slot override and a carried \
+             common column; refusing to guess between the two",
+            key.1, key.0
+        )));
+    }
+    let field = match exact_override.or(exact_carried) {
+        Some(column) => column,
+        None => {
+            match ctx
+                .desc
+                .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
+            {
+                Ok(index) => index,
+                Err(descriptor_error) => {
+                    let candidates = ctx
+                        .carried
+                        .map(|carried| {
+                            carried
+                                .iter()
+                                .filter(|slot| slot.slot_id == key.1)
+                                .map(|slot| slot.column)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    match candidates.as_slice() {
+                        [column] => *column,
+                        [] => return Err(descriptor_error),
+                        _ => {
+                            return Err(TranslateError::descriptor(format!(
+                                "slot {} (tuple {}) matches {} carried common columns by slot id \
+                             alone; an ambiguous fallback is a guess, not a resolution",
+                                key.1,
+                                key.0,
+                                candidates.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    } as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
@@ -255,19 +358,27 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             field: "decimal_literal",
         })?;
     let decimal_type = type_mapper::map_type_desc(&node.type_, true)?;
-    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = decimal_type.kind else {
-        return Err(TranslateError::malformed(
-            "DECIMAL_LITERAL has non-decimal type",
-        ));
-    };
-    let value = encode_decimal(&lit.value, decimal.scale)?;
-    Ok(literal(expression::literal::LiteralType::Decimal(
-        expression::literal::Decimal {
-            value: value.to_vec(),
-            precision: decimal.precision,
-            scale: decimal.scale,
-        },
-    )))
+    match decimal_type.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => {
+            let value = encode_decimal(&lit.value, decimal.scale)?;
+            Ok(literal(expression::literal::LiteralType::Decimal(
+                expression::literal::Decimal {
+                    value: value.to_vec(),
+                    precision: decimal.precision,
+                    scale: decimal.scale,
+                },
+            )))
+        }
+        Some(substrait::proto::r#type::Kind::Fp64(_)) => {
+            let value = lit.value.parse::<f64>().map_err(|_| {
+                TranslateError::malformed(format!("invalid decimal literal {:?}", lit.value))
+            })?;
+            Ok(literal(expression::literal::LiteralType::Fp64(value)))
+        }
+        _ => Err(TranslateError::malformed(
+            "DECIMAL_LITERAL has non-numeric type",
+        )),
+    }
 }
 
 /// Converts a StarRocks `DATE_LITERAL` into a Substrait date literal.
@@ -346,22 +457,32 @@ fn translate_arithmetic(
         }
     };
     expect_child_count(node, &children, 2)?;
-    // Decimal-typed arithmetic is rejected for now: the StarRocks-shaped cast/width combination
-    // reliably segfaults the engine's GPU projection (see the starrocks tpch crash repro);
-    // fail with a structured error instead of taking down the compute node.
-    if is_decimal(&node.type_)? {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: node.node_type,
-            reason: "decimal arithmetic is not supported yet (crashes the engine projection)",
-        });
-    }
-    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
+    let decimal = is_decimal(&node.type_)?;
+    let children = if decimal {
+        children
+            .into_iter()
+            .map(|input| Expression {
+                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+                    r#type: Some(type_mapper::fp64_type(true)),
+                    input: Some(Box::new(input)),
+                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+                }))),
+            })
+            .collect()
+    } else {
+        children
+    };
+    let output_type = if decimal {
+        type_mapper::fp64_type(node.is_nullable.unwrap_or(true))
+    } else {
+        type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?
+    };
     let anchor = ctx.registry.register_function(URN_ARITHMETIC, name);
     Ok(scalar_function(anchor, children, output_type))
 }
 
 /// Returns whether a StarRocks type descriptor is any decimal flavour.
-fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
+pub(crate) fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
     Ok(matches!(
         type_mapper::scalar_primitive(type_desc)?,
         TPrimitiveType::DECIMAL
@@ -470,6 +591,20 @@ fn translate_case(node: &TExprNode, children: Vec<Expression>) -> Result<Express
     })
 }
 
+/// Unwraps a StarRocks `CLONE_EXPR`, which carries no value semantics.
+///
+/// The frontend's `CloneDuplicateColRefRule` inserts it when a projection maps two output
+/// slots to the same input column, because the backend has no copy-on-write and would
+/// otherwise write the shared column twice; the backend's `CloneExpr` evaluates its child and
+/// hands back a uniquely-owned copy of the same values. The node's type and nullability are
+/// its child's by construction, so the child is returned as-is — restating the declared type
+/// with a cast would re-narrow a child the arithmetic path deliberately lowered to FP64, and
+/// make a cloned column differ from the uncloned one the frontend says it equals.
+fn translate_clone(node: &TExprNode, children: Vec<Expression>) -> Result<Expression> {
+    expect_child_count(node, &children, 1)?;
+    Ok(children.into_iter().next().unwrap())
+}
+
 /// Converts a StarRocks `FUNCTION_CALL` into a Substrait expression.
 ///
 /// Functions are allowlisted so an unknown StarRocks builtin fails loudly instead of silently
@@ -561,6 +696,18 @@ fn translate_function_call(
         }
     };
     let anchor = ctx.registry.register_function(urn, mapped);
+    // The engine binds these names through DuckDB's catalog, where year/month/day and
+    // octet_length/char_length all return BIGINT, while the FE declares narrower slots
+    // (year SMALLINT, month/day TINYINT, length/char_length INT). A downstream fragment
+    // derives its stream schema from the FE slots, so without a cast back to the declared
+    // type the produced BIGINT column is refused at the next hop's schema guard.
+    if matches!(name, "year" | "month" | "day" | "length" | "char_length") {
+        let produced = type_mapper::i64_type(node.is_nullable.unwrap_or(true));
+        return Ok(cast_to(
+            scalar_function(anchor, children, produced),
+            output_type,
+        ));
+    }
     Ok(scalar_function(anchor, children, output_type))
 }
 
@@ -597,13 +744,26 @@ pub(crate) struct AggregateCall {
     pub name: String,
     /// Translated argument expressions over the aggregation input row.
     pub arguments: Vec<Expression>,
+    /// The same arguments before the decimal-to-FP64 lowering.
+    ///
+    /// A caller that expands one StarRocks measure into several Sirius measures needs the
+    /// argument without a cast that only fits one of them: a two-phase avg counts the raw
+    /// values and sums the cast ones.
+    pub raw_arguments: Vec<Expression>,
     /// Whether the aggregate applies to distinct inputs.
     pub distinct: bool,
 }
 
 /// Decomposes a StarRocks aggregate-function expression (the root of a
 /// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
-pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+///
+/// `merge` marks a measure of a merge-phase aggregation, whose arguments are references to
+/// partial-state columns rather than raw rows.
+pub(crate) fn aggregate_call(
+    expr: &TExpr,
+    ctx: &mut ExprContext<'_>,
+    merge: bool,
+) -> Result<AggregateCall> {
     let root = expr
         .nodes
         .first()
@@ -618,18 +778,9 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "aggregate function root is not an aggregate expression",
         });
     }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
-        });
-    }
+    // No merge check here: the phase decision belongs to the node-level classifier
+    // (`agg_phase::classify`), which sees every measure at once. Rejecting merges in one
+    // place and classifying them in another is how the two guards would drift apart.
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
         context: "aggregate expression",
         field: "fn",
@@ -652,28 +803,39 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "distinct aggregates over multiple columns are not supported",
         });
     }
-    // Only double-returning `avg` translates faithfully. StarRocks `avg` over decimals returns
-    // a decimal (DuckDB computes a double and the consumer ignores the declared output type),
-    // and temporal `avg` has StarRocks-specific day-rounding semantics.
-    if name == "avg" && type_mapper::scalar_primitive(&function.ret_type)? != TPrimitiveType::DOUBLE
-    {
+    let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
+    let decimal_result = is_decimal(&function.ret_type)?;
+    // Decimal SUM/AVG are lowered to FP64 below because the Sirius GPU expression/aggregate
+    // path cannot consume decimal arithmetic; every other avg return type (temporal avg's
+    // StarRocks-specific rounding, in particular) has no GPU lowering.
+    if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
-            reason: "only avg with a DOUBLE result is supported (decimal/temporal avg differ)",
+            reason: "avg is only supported where it lowers to the GPU's FP64 avg \
+                     (DOUBLE and DECIMAL inputs)",
         });
     }
 
     let mut cursor = ExprNodeCursor::new(&expr.nodes);
     // Consume the root marker; its children are the aggregate arguments.
     cursor.idx = 1;
-    let arguments = (0..root.num_children)
+    let raw_arguments = (0..root.num_children)
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
+    // Not on the merge side: a merge measure's argument is already the FP64 partial-state
+    // column; the decimal `ret_type` that drives this condition describes the original input,
+    // not the child the measure actually reads.
+    let arguments = if decimal_result && matches!(name, "sum" | "avg") && !merge {
+        raw_arguments.iter().cloned().map(cast_to_fp64).collect()
+    } else {
+        raw_arguments.clone()
+    };
 
     Ok(AggregateCall {
         name: name.to_string(),
         arguments,
+        raw_arguments,
         distinct,
     })
 }
@@ -834,6 +996,26 @@ fn integer_literal_type(
     }
 }
 
+/// Wraps an expression in the throwing FP64 cast that lowers values Sirius cannot aggregate
+/// or divide in their declared type (decimals, and the inputs of a two-phase avg).
+pub(crate) fn cast_to_fp64(input: Expression) -> Expression {
+    cast_to(input, type_mapper::fp64_type(true))
+}
+
+/// Wraps an expression in a throwing cast to `ty`.
+///
+/// A cast to the type the expression already has is a no-op the consumer's binder elides, so
+/// this is safe to emit wherever the type has to be stated rather than inferred.
+pub(crate) fn cast_to(input: Expression, ty: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
+    }
+}
+
 /// Builds a Substrait scalar-function expression from already translated children.
 pub(crate) fn scalar_function(
     anchor: u32,
@@ -910,4 +1092,187 @@ fn encode_decimal(value: &str, scale: i32) -> Result<[u8; 16]> {
         unscaled = -unscaled;
     }
     Ok(unscaled.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use starrocks_thrift::descriptors::{TDescriptorTable, TSlotDescriptor, TTupleDescriptor};
+    use starrocks_thrift::exprs::TSlotRef;
+    use starrocks_thrift::types::{TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+
+    use super::*;
+
+    /// Builds a descriptor with one tuple 0 carrying one BIGINT slot 1.
+    fn one_slot_desc() -> DescriptorTable {
+        let ty = TTypeDesc::new(Some(vec![TTypeNode::new(
+            TTypeNodeType::SCALAR,
+            Some(TScalarType::new(TPrimitiveType::BIGINT, None, None, None)),
+            None,
+            None,
+        )]));
+        let desc_tbl = TDescriptorTable::new(
+            Some(vec![TSlotDescriptor::new(
+                Some(1),
+                Some(0),
+                Some(ty),
+                Some(0),
+                None,
+                None,
+                None,
+                Some("a".to_string()),
+                None,
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+                None,
+            )]),
+            vec![TTupleDescriptor::new(Some(0), None, None, None, None)],
+            None,
+            None,
+        );
+        DescriptorTable::try_from(&desc_tbl).unwrap()
+    }
+
+    /// Builds a bare slot-reference expression node.
+    fn slot_ref_node(tuple_id: i32, slot_id: i32) -> TExprNode {
+        let ty = TTypeDesc::new(Some(vec![TTypeNode::new(
+            TTypeNodeType::SCALAR,
+            Some(TScalarType::new(TPrimitiveType::BIGINT, None, None, None)),
+            None,
+            None,
+        )]));
+        TExprNode {
+            node_type: TExprNodeType::SLOT_REF,
+            type_: ty,
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: Some(TSlotRef::new(slot_id, tuple_id)),
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: -1,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+            cast_struct_by_name: None,
+        }
+    }
+
+    /// Returns the field index of a direct struct-field selection.
+    fn field_of(expr: &Expression) -> i32 {
+        let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+            panic!("expected field selection");
+        };
+        let field_reference::ReferenceType::DirectReference(segment) =
+            selection.reference_type.as_ref().unwrap()
+        else {
+            panic!("expected direct reference");
+        };
+        let reference_segment::ReferenceType::StructField(field) =
+            segment.reference_type.as_ref().unwrap()
+        else {
+            panic!("expected struct field");
+        };
+        field.field
+    }
+
+    /// A stale-tuple ref that misses the descriptor resolves through the single carried column
+    /// matching its slot id — the BE's by-slot-id semantics extended to carried commons.
+    #[test]
+    fn carried_by_slot_id_fallback_resolves_a_single_candidate() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let carried = [CarriedSlot {
+            tuple_id: 7,
+            slot_id: 99,
+            column: 4,
+        }];
+        let mut ctx = ExprContext::new(&desc, &mut registry, &row).with_carried(&carried);
+        let node = slot_ref_node(3, 99);
+        let translated = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap();
+        assert_eq!(field_of(&translated), 4);
+    }
+
+    /// Two carried columns sharing a slot id make the by-slot-id fallback a guess; refuse it.
+    #[test]
+    fn ambiguous_carried_by_slot_id_fallback_is_refused() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let carried = [
+            CarriedSlot {
+                tuple_id: 7,
+                slot_id: 99,
+                column: 4,
+            },
+            CarriedSlot {
+                tuple_id: 8,
+                slot_id: 99,
+                column: 5,
+            },
+        ];
+        let mut ctx = ExprContext::new(&desc, &mut registry, &row).with_carried(&carried);
+        let node = slot_ref_node(3, 99);
+        let err = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap_err();
+        assert!(
+            matches!(&err, TranslateError::Descriptor(message) if message.contains("carried")),
+            "{err:?}"
+        );
+    }
+
+    /// A `(tuple, slot)` key present in both the synthetic overrides and the carried columns
+    /// has two competing sources; never guess between them.
+    #[test]
+    fn duplicate_override_and_carried_key_is_refused() {
+        let desc = one_slot_desc();
+        let mut registry = ExtensionRegistry::new();
+        let row = [0];
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert((7, 99), 1usize);
+        let carried = [CarriedSlot {
+            tuple_id: 7,
+            slot_id: 99,
+            column: 4,
+        }];
+        let mut ctx = ExprContext::with_slot_overrides(&desc, &mut registry, &row, &overrides)
+            .with_carried(&carried);
+        let node = slot_ref_node(7, 99);
+        let err = translate_slot_ref(&node, Vec::new(), &mut ctx).unwrap_err();
+        assert!(
+            matches!(&err, TranslateError::Descriptor(message) if message.contains("both")),
+            "{err:?}"
+        );
+    }
 }

@@ -1,0 +1,170 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:17: ps_partkey | 34: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  29:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 17: ps_partkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 29
+    UNPARTITIONED
+
+  28:SORT
+  |  order by: <slot 34> 34: sum DESC
+  |  offset: 0
+  |  
+  27:Project
+  |  <slot 17> : 17: ps_partkey
+  |  <slot 34> : 34: sum
+  |  
+  26:NESTLOOP JOIN
+  |  join op: INNER JOIN
+  |  colocate: false, reason: 
+  |  other join predicates: CAST(34: sum AS DOUBLE) > CAST(53: expr AS DOUBLE)
+  |  
+  |----25:EXCHANGE
+  |    
+  11:AGGREGATE (merge finalize)
+  |  output: sum(34: sum)
+  |  group by: 17: ps_partkey
+  |  
+  10:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: UNPARTITIONED
+
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    UNPARTITIONED
+
+  24:Project
+  |  <slot 53> : 52: sum * 0.0001000000
+  |  
+  23:AGGREGATE (merge finalize)
+  |  output: sum(52: sum)
+  |  group by: 
+  |  
+  22:EXCHANGE
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    UNPARTITIONED
+
+  21:AGGREGATE (update serialize)
+  |  output: sum(CAST(38: ps_supplycost AS DECIMAL128(15,2)) * CAST(37: ps_availqty AS DECIMAL128(9,0)))
+  |  group by: 
+  |  
+  20:Project
+  |  <slot 37> : 37: ps_availqty
+  |  <slot 38> : 38: ps_supplycost
+  |  
+  19:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 36: ps_suppkey = 40: s_suppkey
+  |  
+  |----18:EXCHANGE
+  |    
+  12:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    UNPARTITIONED
+
+  17:Project
+  |  <slot 40> : 40: s_suppkey
+  |  
+  16:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 47: n_nationkey = 43: s_nationkey
+  |  
+  |----15:EXCHANGE
+  |    
+  13:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    UNPARTITIONED
+
+  14:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 6
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    HASH_PARTITIONED: 17: ps_partkey
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(33: expr)
+  |  group by: 17: ps_partkey
+  |  
+  8:Project
+  |  <slot 17> : 17: ps_partkey
+  |  <slot 33> : CAST(20: ps_supplycost AS DECIMAL128(15,2)) * CAST(19: ps_availqty AS DECIMAL128(9,0))
+  |  
+  7:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 18: ps_suppkey = 22: s_suppkey
+  |  
+  |----6:EXCHANGE
+  |    
+  0:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 7
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:Project
+  |  <slot 22> : 22: s_suppkey
+  |  
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 29: n_nationkey = 25: s_nationkey
+  |  
+  |----3:EXCHANGE
+  |    
+  1:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 8
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    UNPARTITIONED
+
+  2:FileScanNode
+     BROKER: 

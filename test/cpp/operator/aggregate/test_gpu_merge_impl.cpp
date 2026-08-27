@@ -23,9 +23,19 @@
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/utilities/bit.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
+#include <map>
+#include <numeric>
+#include <random>
 
 using namespace sirius;
 using namespace cucascade;
@@ -952,6 +962,278 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
                                                      *mem_space);
   ro_batches.clear();
   validate_order_by(input.batches, *output_batch, order_key_idx, column_order);
+}
+
+namespace {
+
+std::unique_ptr<cudf::column> make_int32_column(const std::vector<int32_t>& h_data,
+                                                memory_space& mem_space)
+{
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                       h_data.size(),
+                                       cudf::mask_state::UNALLOCATED,
+                                       cudf::get_default_stream(),
+                                       mem_space.get_default_allocator());
+  cudaMemcpy(col->mutable_view().data<int32_t>(),
+             h_data.data(),
+             sizeof(int32_t) * h_data.size(),
+             cudaMemcpyHostToDevice);
+  return col;
+}
+
+std::unique_ptr<cudf::column> make_float64_column(const std::vector<double>& h_data,
+                                                  memory_space& mem_space)
+{
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT64},
+                                       h_data.size(),
+                                       cudf::mask_state::UNALLOCATED,
+                                       cudf::get_default_stream(),
+                                       mem_space.get_default_allocator());
+  cudaMemcpy(col->mutable_view().data<double>(),
+             h_data.data(),
+             sizeof(double) * h_data.size(),
+             cudaMemcpyHostToDevice);
+  return col;
+}
+
+std::shared_ptr<data_batch> make_key_value_batch(const std::vector<int32_t>& keys,
+                                                 const std::vector<double>& values,
+                                                 memory_space& mem_space)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(make_int32_column(keys, mem_space));
+  cols.push_back(make_float64_column(values, mem_space));
+  return sirius::make_data_batch(std::make_unique<cudf::table>(std::move(cols)),
+                                 mem_space,
+                                 cudf::get_default_stream(),
+                                 sirius::telemetry::batch_telemetry_info{});
+}
+
+/// Float64 addends spanning ~19 orders of magnitude: sequential addition drops different low
+/// bits under different orders, so grouped sums over these rows are order-sensitive in FP64.
+constexpr std::array<double, 8> kOrderSensitiveDoubles = {
+  2.5e8, -1.25e8, 3.141592653589793, 1.0e-3, -1.0 / 3.0, 7.7e-11, 123456.789, 42.0};
+
+void make_order_sensitive_rows(int num_rows,
+                               int num_keys,
+                               uint64_t seed,
+                               std::vector<int32_t>& keys,
+                               std::vector<double>& values)
+{
+  std::mt19937_64 gen(seed);
+  keys.resize(num_rows);
+  values.resize(num_rows);
+  for (int r = 0; r < num_rows; ++r) {
+    keys[r]   = static_cast<int32_t>(gen() % num_keys);
+    values[r] = kOrderSensitiveDoubles[gen() % kOrderSensitiveDoubles.size()];
+  }
+}
+
+/// Copy a [INT32 key, FLOAT64 sum] grouped-aggregate output to host as key -> sum bits.
+std::map<int32_t, uint64_t> grouped_sum_bits(data_batch& output)
+{
+  auto view = sirius::get_cudf_table_view(output);
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.column(0).type().id() == cudf::type_id::INT32);
+  REQUIRE(view.column(1).type().id() == cudf::type_id::FLOAT64);
+  auto const num_rows = view.num_rows();
+  std::vector<int32_t> h_keys(num_rows);
+  std::vector<double> h_sums(num_rows);
+  cudaMemcpy(h_keys.data(),
+             view.column(0).data<int32_t>(),
+             sizeof(int32_t) * num_rows,
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_sums.data(),
+             view.column(1).data<double>(),
+             sizeof(double) * num_rows,
+             cudaMemcpyDeviceToHost);
+  std::map<int32_t, uint64_t> bits;
+  for (cudf::size_type r = 0; r < num_rows; ++r) {
+    REQUIRE(!bits.contains(h_keys[r]));
+    bits[h_keys[r]] = std::bit_cast<uint64_t>(h_sums[r]);
+  }
+  return bits;
+}
+
+}  // namespace
+
+TEST_CASE("Grouped local aggregate float64 sum is bit-identical across row orders",
+          "[operator][deterministic_agg]")
+{
+  auto* mem_space        = get_shared_mem_space();
+  constexpr int num_rows = 20000;
+  constexpr int num_keys = 37;
+
+  std::vector<int32_t> keys;
+  std::vector<double> values;
+  make_order_sensitive_rows(num_rows, num_keys, /*seed=*/42, keys, values);
+
+  // The same rows in a different order.
+  std::vector<size_t> perm(num_rows);
+  std::iota(perm.begin(), perm.end(), size_t{0});
+  std::shuffle(perm.begin(), perm.end(), std::mt19937_64(7));
+  std::vector<int32_t> keys_shuffled(num_rows);
+  std::vector<double> values_shuffled(num_rows);
+  for (int r = 0; r < num_rows; ++r) {
+    keys_shuffled[r]   = keys[perm[r]];
+    values_shuffled[r] = values[perm[r]];
+  }
+
+  // Vacuous-test guard: sequential host addition over the two orders must disagree in bits for
+  // at least one group, i.e. this dataset really exposes order sensitivity.
+  std::map<int32_t, double> seq_original, seq_shuffled;
+  for (int r = 0; r < num_rows; ++r) {
+    seq_original[keys[r]] += values[r];
+    seq_shuffled[keys_shuffled[r]] += values_shuffled[r];
+  }
+  bool any_group_order_sensitive = false;
+  for (auto const& [key, sum] : seq_original) {
+    any_group_order_sensitive |=
+      std::bit_cast<uint64_t>(sum) != std::bit_cast<uint64_t>(seq_shuffled[key]);
+  }
+  REQUIRE(any_group_order_sensitive);
+
+  auto batch          = make_key_value_batch(keys, values, *mem_space);
+  auto batch_shuffled = make_key_value_batch(keys_shuffled, values_shuffled, *mem_space);
+
+  std::vector<int> group_idx                      = {0};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+  std::vector<int> aggregate_idx                  = {1};
+
+  auto run_local = [&](std::shared_ptr<data_batch>& b) {
+    auto ro = b->to_read_only();
+    return gpu_aggregate_impl::local_grouped_aggregate(
+      ro, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), *mem_space);
+  };
+
+  auto bits_run1     = grouped_sum_bits(*run_local(batch));
+  auto bits_run2     = grouped_sum_bits(*run_local(batch));
+  auto bits_shuffled = grouped_sum_bits(*run_local(batch_shuffled));
+
+  REQUIRE(bits_run1.size() == static_cast<size_t>(num_keys));
+  // Same batch twice: no atomicAdd nondeterminism.
+  REQUIRE(bits_run1 == bits_run2);
+  // Same row multiset in a different order: canonicalized before reduction.
+  REQUIRE(bits_run1 == bits_shuffled);
+
+  // The sums themselves stay correct (long double host reference).
+  std::map<int32_t, long double> reference;
+  for (int r = 0; r < num_rows; ++r) {
+    reference[keys[r]] += static_cast<long double>(values[r]);
+  }
+  for (auto const& [key, bits] : bits_run1) {
+    auto const expected = static_cast<double>(reference[key]);
+    REQUIRE(std::bit_cast<double>(bits) == Approx(expected).epsilon(1e-9));
+  }
+}
+
+TEST_CASE("Grouped merge aggregate float64 sum is bit-identical across arrival orders",
+          "[operator][deterministic_agg]")
+{
+  auto* mem_space           = get_shared_mem_space();
+  constexpr int num_batches = 8;
+  constexpr int num_rows    = 5000;
+  constexpr int num_keys    = 37;
+
+  std::vector<int> group_idx                      = {0};
+  std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
+  std::vector<int> aggregate_idx                  = {1};
+
+  // Multi-sender shape: every partial batch covers every key, so the merge combines float
+  // partials across all batches for each group.
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (int b = 0; b < num_batches; ++b) {
+    std::vector<int32_t> keys;
+    std::vector<double> values;
+    make_order_sensitive_rows(num_rows, num_keys, /*seed=*/100 + b, keys, values);
+    auto base = make_key_value_batch(keys, values, *mem_space);
+    auto ro   = base->to_read_only();
+    partials.push_back(gpu_aggregate_impl::local_grouped_aggregate(
+      ro, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), *mem_space));
+  }
+
+  auto merge_in_order = [&](const std::vector<int>& order) {
+    std::vector<read_only_data_batch> ro_batches;
+    for (int idx : order) {
+      ro_batches.push_back(partials[idx]->to_read_only());
+    }
+    auto merged = gpu_merge_impl::merge_grouped_aggregate(
+      ro_batches, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space);
+    ro_batches.clear();
+    return grouped_sum_bits(*merged);
+  };
+
+  std::vector<int> in_order(num_batches);
+  std::iota(in_order.begin(), in_order.end(), 0);
+  std::vector<int> reversed(in_order.rbegin(), in_order.rend());
+  std::vector<int> rotated(in_order);
+  std::rotate(rotated.begin(), rotated.begin() + 3, rotated.end());
+
+  auto bits_in_order = merge_in_order(in_order);
+  auto bits_repeat   = merge_in_order(in_order);
+  auto bits_reversed = merge_in_order(reversed);
+  auto bits_rotated  = merge_in_order(rotated);
+
+  REQUIRE(bits_in_order.size() == static_cast<size_t>(num_keys));
+  // Same arrival order twice: no atomicAdd nondeterminism.
+  REQUIRE(bits_in_order == bits_repeat);
+  // Same partials in different arrival orders: canonicalized before reduction.
+  REQUIRE(bits_in_order == bits_reversed);
+  REQUIRE(bits_in_order == bits_rotated);
+}
+
+TEST_CASE("Ungrouped merge aggregate float64 sum is bit-identical across arrival orders",
+          "[operator][deterministic_agg]")
+{
+  auto* mem_space                        = get_shared_mem_space();
+  const std::vector<double> partial_sums = {
+    1.0e16, 3.0, -1.0e16, 1.0, 2.0, -3.0, 0.5, 1.0e-3, 7.0, -0.5, 1.0e8, -1.0e8};
+
+  // Vacuous-test guard: forward vs reversed sequential addition must disagree in bits.
+  double forward = 0.0, backward = 0.0;
+  for (auto it = partial_sums.begin(); it != partial_sums.end(); ++it) {
+    forward += *it;
+  }
+  for (auto it = partial_sums.rbegin(); it != partial_sums.rend(); ++it) {
+    backward += *it;
+  }
+  REQUIRE(std::bit_cast<uint64_t>(forward) != std::bit_cast<uint64_t>(backward));
+
+  std::vector<std::shared_ptr<data_batch>> partials;
+  for (double v : partial_sums) {
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(make_float64_column({v}, *mem_space));
+    partials.push_back(sirius::make_data_batch(std::make_unique<cudf::table>(std::move(cols)),
+                                               *mem_space,
+                                               cudf::get_default_stream(),
+                                               sirius::telemetry::batch_telemetry_info{}));
+  }
+
+  std::vector<cudf::aggregation::Kind> aggregates             = {cudf::aggregation::Kind::SUM};
+  std::vector<std::optional<cudf::size_type>> merge_nth_index = {std::nullopt};
+
+  auto merge_bits = [&](bool reverse_order) {
+    std::vector<read_only_data_batch> ro_batches;
+    for (size_t i = 0; i < partials.size(); ++i) {
+      auto idx = reverse_order ? partials.size() - 1 - i : i;
+      ro_batches.push_back(partials[idx]->to_read_only());
+    }
+    auto merged = gpu_merge_impl::merge_ungrouped_aggregate(
+      ro_batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
+    ro_batches.clear();
+    auto view = sirius::get_cudf_table_view(*merged);
+    REQUIRE(view.num_rows() == 1);
+    REQUIRE(view.column(0).type().id() == cudf::type_id::FLOAT64);
+    double h_sum = 0.0;
+    cudaMemcpy(&h_sum, view.column(0).data<double>(), sizeof(double), cudaMemcpyDeviceToHost);
+    return std::bit_cast<uint64_t>(h_sum);
+  };
+
+  auto bits_forward  = merge_bits(false);
+  auto bits_repeat   = merge_bits(false);
+  auto bits_backward = merge_bits(true);
+  REQUIRE(bits_forward == bits_repeat);
+  REQUIRE(bits_forward == bits_backward);
 }
 
 TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")

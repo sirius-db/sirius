@@ -46,6 +46,9 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 
@@ -105,6 +108,67 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
   }
 
   return sirius_ctx->get_telemetry_context();
+}
+
+/// Sum of every pipeline's scheduling counters (+1 per finished pipeline): changes whenever any
+/// task is created or completes or a pipeline finishes, so a stalled query — zero tasks anywhere
+/// and nothing finishing — has a constant fingerprint. Counters are atomics; no lock needed.
+std::uint64_t query_progress_fingerprint(duckdb::SiriusContext& sirius_ctx)
+{
+  std::uint64_t fingerprint = 0;
+  if (auto query = sirius_ctx.get_query()) {
+    for (const auto& pipeline : query->get_pipelines()) {
+      if (!pipeline) { continue; }
+      fingerprint += pipeline->get_tasks_created() + pipeline->get_tasks_completed();
+      fingerprint += pipeline->is_pipeline_finished() ? 1 : 0;
+    }
+  }
+  return fingerprint;
+}
+
+/// Wait for the query future. With SIRIUS_QUERY_WATCHDOG_SECS set (> 0) this polls instead of
+/// blocking: when no pipeline makes scheduling progress for that many seconds, the query is
+/// failed loudly through the scheduler's completion handler (first-call-wins; no stop or drain
+/// here — draining belongs to execute()'s catch) and the failed future is rethrown to the
+/// caller. Off by default: an in-flight long-running kernel makes no counter progress, so only
+/// opt in where per-operator runtimes are known to sit far below the threshold (the CN cluster
+/// env sets 60s).
+void wait_for_query_future(std::future<void>& future, duckdb::SiriusContext& sirius_ctx)
+{
+  std::uint64_t watchdog_secs = 0;
+  if (const char* env = std::getenv("SIRIUS_QUERY_WATCHDOG_SECS"); env != nullptr && *env != '\0') {
+    char* end         = nullptr;
+    auto const parsed = std::strtoull(env, &end, 10);
+    if (end == env || *end != '\0') {
+      throw invalid_input_exception(
+        "SIRIUS_QUERY_WATCHDOG_SECS must be a non-negative integer, "
+        "got: '" +
+        std::string(env) + "'");
+    }
+    watchdog_secs = parsed;
+  }
+  if (watchdog_secs == 0) {
+    future.get();
+    return;
+  }
+
+  auto last_fingerprint = query_progress_fingerprint(sirius_ctx);
+  auto last_progress    = std::chrono::steady_clock::now();
+  while (future.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+    auto const fingerprint = query_progress_fingerprint(sirius_ctx);
+    auto const now         = std::chrono::steady_clock::now();
+    if (fingerprint != last_fingerprint) {
+      last_fingerprint = fingerprint;
+      last_progress    = now;
+      continue;
+    }
+    if (now - last_progress >= std::chrono::seconds(watchdog_secs)) {
+      // Resolves the future with an error unless the query completed concurrently
+      // (first-call-wins); the next wait_for observes it and the loop exits into get().
+      sirius_ctx.get_task_scheduler().fail_stalled_query(watchdog_secs);
+    }
+  }
+  future.get();
 }
 
 }  // namespace
@@ -200,7 +264,7 @@ void sirius_engine::execute()
                            });
   auto future = sirius_ctx->get_task_scheduler().start_query();
   try {
-    future.get();
+    wait_for_query_future(future, *sirius_ctx);
     sirius_ctx->get_task_scheduler().wait_for_completion();
   } catch (const std::exception& e) {
     SIRIUS_LOG_ERROR("Error executing query: {}", e.what());

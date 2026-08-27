@@ -1,0 +1,93 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:18: l_orderkey | 35: sum | 13: o_orderdate | 16: o_shippriority
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  14:MERGING-EXCHANGE
+     limit: 10
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 18: l_orderkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    UNPARTITIONED
+
+  13:TOP-N
+  |  order by: <slot 35> 35: sum DESC, <slot 13> 13: o_orderdate ASC
+  |  offset: 0
+  |  limit: 10
+  |  
+  12:AGGREGATE (update finalize)
+  |  output: sum(34: expr)
+  |  group by: 18: l_orderkey, 13: o_orderdate, 16: o_shippriority
+  |  
+  11:Project
+  |  <slot 13> : 13: o_orderdate
+  |  <slot 16> : 16: o_shippriority
+  |  <slot 18> : 18: l_orderkey
+  |  <slot 34> : CAST(23: l_extendedprice AS DECIMAL128(15,2)) * CAST(1 - CAST(24: l_discount AS DECIMAL64(16,2)) AS DECIMAL128(16,2))
+  |  
+  10:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 18: l_orderkey = 9: o_orderkey
+  |  
+  |----9:EXCHANGE
+  |    
+  2:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    HASH_PARTITIONED: 9: o_orderkey
+
+  8:Project
+  |  <slot 9> : 9: o_orderkey
+  |  <slot 13> : 13: o_orderdate
+  |  <slot 16> : 16: o_shippriority
+  |  
+  7:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 10: o_custkey = 1: c_custkey
+  |  
+  |----6:EXCHANGE
+  |    
+  3:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:Project
+  |  <slot 1> : 1: c_custkey
+  |  
+  4:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 18: l_orderkey
+
+  1:Project
+  |  <slot 18> : 18: l_orderkey
+  |  <slot 23> : 23: l_extendedprice
+  |  <slot 24> : 24: l_discount
+  |  
+  0:FileScanNode
+     BROKER: 

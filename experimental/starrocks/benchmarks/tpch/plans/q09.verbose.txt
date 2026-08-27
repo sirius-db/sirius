@@ -1,0 +1,250 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 6.4000655199999996E7
+  Memory: 1833.4
+
+PLAN FRAGMENT 0(F14)
+  Fragment Cost: 136.0
+  Output Exprs:48: n_name | 51: year | 53: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  26:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F13)
+  Fragment Cost: 227.80000000074506
+
+  Input Partition: HASH_PARTITIONED: 48: n_name, 51: year
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 26
+
+  25:SORT
+  |  order by: [48, VARCHAR(1048576), true] ASC, [51, SMALLINT, true] DESC
+  |  offset: 0
+  |  cardinality: 1
+  |  
+  24:AGGREGATE (merge finalize)
+  |  aggregate: sum[([53: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [48: n_name, VARCHAR(1048576), true], [51: year, SMALLINT, true]
+  |  cardinality: 1
+  |  
+  23:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [48: n_name, VARCHAR(1048576), true], [51: year, SMALLINT, true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F06)
+  Fragment Cost: 711.1999999992549
+
+  Input Partition: HASH_PARTITIONED: 10: s_suppkey, 1: p_partkey
+  OutPut Partition: HASH_PARTITIONED: 48: n_name, 51: year
+  OutPut Exchange Id: 23
+
+  22:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([52: expr, DECIMAL128(32,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [48: n_name, VARCHAR(1048576), true], [51: year, SMALLINT, true]
+  |  cardinality: 1
+  |  
+  21:Project
+  |  output columns:
+  |  48 <-> [48: n_name, VARCHAR(1048576), true]
+  |  51 <-> year[([42: o_orderdate, DATE, true]); args: DATE; result: SMALLINT; args nullable: true; result nullable: true]
+  |  52 <-> cast([22: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast(1 - [23: l_discount, DECIMAL64(15,2), true] as DECIMAL128(16,2)) - cast([36: ps_supplycost, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast([21: l_quantity, DECIMAL64(15,2), true] as DECIMAL128(15,2))
+  |  cardinality: 1
+  |  
+  20:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [13: s_nationkey, INT, true] = [47: n_nationkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 5, build_expr = (47: n_nationkey), remote = true
+  |  output columns: 21, 22, 23, 36, 42, 48
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----19:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  17:Project
+  |  output columns:
+  |  13 <-> [13: s_nationkey, INT, true]
+  |  21 <-> [21: l_quantity, DECIMAL64(15,2), true]
+  |  22 <-> [22: l_extendedprice, DECIMAL64(15,2), true]
+  |  23 <-> [23: l_discount, DECIMAL64(15,2), true]
+  |  36 <-> [36: ps_supplycost, DECIMAL64(15,2), true]
+  |  42 <-> [42: o_orderdate, DATE, true]
+  |  cardinality: 1
+  |  
+  16:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [17: l_orderkey, BIGINT, true] = [38: o_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 4, build_expr = (38: o_orderkey), remote = true
+  |  output columns: 13, 21, 22, 23, 36, 42
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----15:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  13:Project
+  |  output columns:
+  |  13 <-> [13: s_nationkey, INT, true]
+  |  17 <-> [17: l_orderkey, BIGINT, true]
+  |  21 <-> [21: l_quantity, DECIMAL64(15,2), true]
+  |  22 <-> [22: l_extendedprice, DECIMAL64(15,2), true]
+  |  23 <-> [23: l_discount, DECIMAL64(15,2), true]
+  |  36 <-> [36: ps_supplycost, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  12:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [19: l_suppkey, INT, true] = [34: ps_suppkey, INT, true]
+  |  equal join conjunct: [18: l_partkey, INT, true] = [33: ps_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (34: ps_suppkey), remote = true
+  |  - filter_id = 3, build_expr = (33: ps_partkey), remote = true
+  |  output columns: 13, 17, 21, 22, 23, 36
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----11:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [34: ps_suppkey, INT, true], [33: ps_partkey, INT, true]
+  |       cardinality: 1
+  |    
+  9:Project
+  |  output columns:
+  |  13 <-> [13: s_nationkey, INT, true]
+  |  17 <-> [17: l_orderkey, BIGINT, true]
+  |  18 <-> [18: l_partkey, INT, true]
+  |  19 <-> [19: l_suppkey, INT, true]
+  |  21 <-> [21: l_quantity, DECIMAL64(15,2), true]
+  |  22 <-> [22: l_extendedprice, DECIMAL64(15,2), true]
+  |  23 <-> [23: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  8:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [10: s_suppkey, INT, true] = [19: l_suppkey, INT, true]
+  |  equal join conjunct: [1: p_partkey, INT, true] = [18: l_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (19: l_suppkey), remote = true
+  |  - filter_id = 1, build_expr = (18: l_partkey), remote = true
+  |  output columns: 13, 17, 18, 19, 21, 22, 23
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----7:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [19: l_suppkey, INT, true], [18: l_partkey, INT, true]
+  |       cardinality: 1
+  |       probe runtime filters:
+  |       - filter_id = 2, probe_expr = (19: l_suppkey)
+  |       - filter_id = 3, probe_expr = (18: l_partkey)
+  |       - filter_id = 4, probe_expr = (17: l_orderkey)
+  |    
+  5:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [10: s_suppkey, INT, true], [1: p_partkey, INT, true]
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (10: s_suppkey)
+     - filter_id = 3, probe_expr = (1: p_partkey)
+     - filter_id = 5, probe_expr = (13: s_nationkey)
+
+PLAN FRAGMENT 3(F11)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 19
+
+  18:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 4(F09)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 15
+
+  14:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 5(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 34: ps_suppkey, 33: ps_partkey
+  OutPut Exchange Id: 11
+
+  10:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 6(F04)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 19: l_suppkey, 18: l_partkey
+  OutPut Exchange Id: 07
+
+  6:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (19: l_suppkey), partition_exprs = (19: l_suppkey,18: l_partkey)
+     - filter_id = 3, probe_expr = (18: l_partkey), partition_exprs = (19: l_suppkey,18: l_partkey)
+     - filter_id = 4, probe_expr = (17: l_orderkey)
+
+PLAN FRAGMENT 7(F00)
+  Fragment Cost: 3.2003228E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 10: s_suppkey, 1: p_partkey
+  OutPut Exchange Id: 05
+
+  4:NESTLOOP JOIN
+  |  join op: CROSS JOIN
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  probe runtime filters:
+  |  - filter_id = 0, probe_expr = (10: s_suppkey), partition_exprs = (10: s_suppkey,1: p_partkey)
+  |  - filter_id = 1, probe_expr = (1: p_partkey), partition_exprs = (10: s_suppkey,1: p_partkey)
+  |  - filter_id = 2, probe_expr = (10: s_suppkey), partition_exprs = (10: s_suppkey,1: p_partkey)
+  |  - filter_id = 3, probe_expr = (1: p_partkey), partition_exprs = (10: s_suppkey,1: p_partkey)
+  |  
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  1:Project
+  |  output columns:
+  |  1 <-> [1: p_partkey, INT, true]
+  |  cardinality: 1
+  |  
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 8(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 5, probe_expr = (13: s_nationkey)

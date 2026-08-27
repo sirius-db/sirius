@@ -1,0 +1,192 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 532.0
+  Memory: 238.4
+
+PLAN FRAGMENT 0(F10)
+  Fragment Cost: 224.0000000000001
+  Output Exprs:18: c_name | 17: c_custkey | 25: o_orderkey | 29: o_orderdate | 28: o_totalprice | 68: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  20:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 1
+
+PLAN FRAGMENT 1(F09)
+  Fragment Cost: 549.25
+
+  Input Partition: HASH_PARTITIONED: 26: o_custkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 20
+
+  19:TOP-N
+  |  order by: [28, DECIMAL64(15,2), true] DESC, [29, DATE, true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 1
+  |  
+  18:AGGREGATE (update finalize)
+  |  aggregate: sum[([38: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [18: c_name, VARCHAR(1048576), true], [17: c_custkey, INT, true], [25: o_orderkey, BIGINT, true], [29: o_orderdate, DATE, true], [28: o_totalprice, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  17:Project
+  |  output columns:
+  |  17 <-> [17: c_custkey, INT, true]
+  |  18 <-> [18: c_name, VARCHAR(1048576), true]
+  |  25 <-> [25: o_orderkey, BIGINT, true]
+  |  28 <-> [28: o_totalprice, DECIMAL64(15,2), true]
+  |  29 <-> [29: o_orderdate, DATE, true]
+  |  38 <-> [38: l_quantity, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  16:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [26: o_custkey, INT, true] = [17: c_custkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (17: c_custkey), remote = true
+  |  output columns: 17, 18, 25, 28, 29, 38
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----15:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [17: c_custkey, INT, true]
+  |       cardinality: 1
+  |    
+  13:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [26: o_custkey, INT, true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 17: c_custkey
+  OutPut Exchange Id: 15
+
+  14:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 3(F03)
+  Fragment Cost: 254.29999999999998
+
+  Input Partition: HASH_PARTITIONED: 50: l_orderkey
+  OutPut Partition: HASH_PARTITIONED: 26: o_custkey
+  OutPut Exchange Id: 13
+
+  12:Project
+  |  output columns:
+  |  25 <-> [25: o_orderkey, BIGINT, true]
+  |  26 <-> [26: o_custkey, INT, true]
+  |  28 <-> [28: o_totalprice, DECIMAL64(15,2), true]
+  |  29 <-> [29: o_orderdate, DATE, true]
+  |  38 <-> [38: l_quantity, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  11:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [25: o_orderkey, BIGINT, true] = [34: l_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (34: l_orderkey), remote = true
+  |  output columns: 25, 26, 28, 29, 38
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----10:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [34: l_orderkey, BIGINT, true]
+  |       cardinality: 1
+  |    
+  8:Project
+  |  output columns:
+  |  25 <-> [25: o_orderkey, BIGINT, true]
+  |  26 <-> [26: o_custkey, INT, true]
+  |  28 <-> [28: o_totalprice, DECIMAL64(15,2), true]
+  |  29 <-> [29: o_orderdate, DATE, true]
+  |  cardinality: 1
+  |  
+  7:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [25: o_orderkey, BIGINT, true] = [50: l_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (50: l_orderkey), remote = true
+  |  output columns: 25, 26, 28, 29
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----6:Project
+  |    |  output columns:
+  |    |  50 <-> [50: l_orderkey, BIGINT, true]
+  |    |  cardinality: 1
+  |    |  
+  |    5:AGGREGATE (merge finalize)
+  |    |  aggregate: sum[([66: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |    |  group by: [50: l_orderkey, BIGINT, true]
+  |    |  having: [66: sum, DECIMAL128(38,2), true] > 300
+  |    |  cardinality: 1
+  |    |  
+  |    4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [50: l_orderkey, BIGINT, true]
+  |       cardinality: 1
+  |       probe runtime filters:
+  |       - filter_id = 1, probe_expr = (50: l_orderkey)
+  |    
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [25: o_orderkey, BIGINT, true]
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (25: o_orderkey)
+     - filter_id = 1, probe_expr = (25: o_orderkey)
+
+PLAN FRAGMENT 4(F04)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 34: l_orderkey
+  OutPut Exchange Id: 10
+
+  9:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 5(F02)
+  Fragment Cost: 5.6000000000000005
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 50: l_orderkey
+  OutPut Exchange Id: 04
+
+  3:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([54: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [50: l_orderkey, BIGINT, true]
+  |  cardinality: 1
+  |  
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (50: l_orderkey)
+
+PLAN FRAGMENT 6(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 25: o_orderkey
+  OutPut Exchange Id: 01
+
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (25: o_orderkey)
+     - filter_id = 1, probe_expr = (25: o_orderkey)
+     - filter_id = 2, probe_expr = (26: o_custkey)

@@ -1,0 +1,134 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1139.1999999999998
+  Memory: 3365.6
+
+PLAN FRAGMENT 0(F07)
+  Fragment Cost: 160.0
+  Output Exprs:37: substring | 38: count | 39: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  17:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F06)
+  Fragment Cost: 268.0
+
+  Input Partition: HASH_PARTITIONED: 37: substring
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:SORT
+  |  order by: [37, VARCHAR, true] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |  
+  15:AGGREGATE (merge finalize)
+  |  aggregate: count[([38: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false], sum[([39: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [37: substring, VARCHAR, true]
+  |  cardinality: 1
+  |  
+  14:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [37: substring, VARCHAR, true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 7060.799999999999
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 37: substring
+  OutPut Exchange Id: 14
+
+  13:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false], sum[([14: c_acctbal, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [37: substring, VARCHAR, true]
+  |  cardinality: 1
+  |  
+  12:Project
+  |  output columns:
+  |  14 <-> [14: c_acctbal, DECIMAL64(15,2), true]
+  |  37 <-> substring[([13: c_phone, VARCHAR(1048576), true], 1, 2); args: VARCHAR,INT,INT; result: VARCHAR; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  11:HASH JOIN
+  |  join op: LEFT ANTI JOIN (BROADCAST)
+  |  equal join conjunct: [9: c_custkey, INT, true] = [28: o_custkey, INT, true]
+  |  output columns: 13, 14
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----10:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  8:Project
+  |  output columns:
+  |  9 <-> [9: c_custkey, INT, true]
+  |  13 <-> [13: c_phone, VARCHAR(1048576), true]
+  |  14 <-> [14: c_acctbal, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  7:NESTLOOP JOIN
+  |  join op: INNER JOIN
+  |  other join predicates: cast([14: c_acctbal, DECIMAL64(15,2), true] as DECIMAL128(38,8)) > [25: avg, DECIMAL128(38,8), true]
+  |  can local shuffle: false
+  |  cardinality: 1
+  |  
+  |----6:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 3(F04)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 10
+
+  9:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 4(F02)
+  Fragment Cost: 72.0
+
+  Input Partition: UNPARTITIONED
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 06
+
+  5:AGGREGATE (merge finalize)
+  |  aggregate: avg[([25: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  4:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 5(F01)
+  Fragment Cost: 4.4
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 04
+
+  3:AGGREGATE (update serialize)
+  |  aggregate: avg[([22: c_acctbal, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  2:Project
+  |  output columns:
+  |  22 <-> [22: c_acctbal, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  1:FileScanNode
+     BROKER: 
+     cardinality: 1

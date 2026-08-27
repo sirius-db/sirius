@@ -222,6 +222,22 @@ std::future<void> task_scheduler::start_query()
   return _completion_handler->get_awaitable();
 }
 
+void task_scheduler::complete_query_if_finished()
+{
+  std::scoped_lock lock(_query_mutex);
+  if (!_completion_handler || !_query) { return; }
+  for (const auto& pipeline : _query->get_pipelines()) {
+    if (!pipeline || !pipeline->is_query_terminal()) { continue; }
+    if (!pipeline->is_pipeline_finished()) { return; }
+    // No drain here, unlike the task-completion path: this path exists precisely because no
+    // task ran, so there is nothing in flight to wait for — and the caller is the task
+    // creator's own manager thread, which a drain would deadlock against.
+    // wait_for_completion() still validates that every queue is empty afterwards.
+    _completion_handler->mark_completed();
+    return;
+  }
+}
+
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
   std::shared_ptr<completion_handler> completion;
@@ -231,6 +247,19 @@ void task_scheduler::terminate_query(std::exception_ptr error)
   }
   if (completion) { completion->report_error(std::move(error)); }
   stop();
+}
+
+void task_scheduler::fail_stalled_query(uint64_t stalled_secs)
+{
+  std::scoped_lock lock(_query_mutex);
+  if (!_completion_handler) { return; }
+  SIRIUS_LOG_ERROR(
+    "task_scheduler: no scheduling progress for {}s (no task created or completed, no pipeline "
+    "finished); failing the query as stalled",
+    stalled_secs);
+  _completion_handler->report_error("sirius query watchdog: no scheduling progress for " +
+                                    std::to_string(stalled_secs) +
+                                    "s — failing the stalled query instead of wedging the engine");
 }
 
 void task_scheduler::drain_after_error()

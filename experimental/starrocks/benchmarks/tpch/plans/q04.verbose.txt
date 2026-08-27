@@ -1,0 +1,96 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 141.60000000000002
+  Memory: 90.4
+
+PLAN FRAGMENT 0(F04)
+  Fragment Cost: 96.0
+  Output Exprs:6: o_orderpriority | 27: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  11:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F03)
+  Fragment Cost: 160.79999999999998
+
+  Input Partition: HASH_PARTITIONED: 6: o_orderpriority
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 11
+
+  10:SORT
+  |  order by: [6, VARCHAR(1048576), true] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |  
+  9:AGGREGATE (merge finalize)
+  |  aggregate: count[([27: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [6: o_orderpriority, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  8:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [6: o_orderpriority, VARCHAR(1048576), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 98.4
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 6: o_orderpriority
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  group by: [6: o_orderpriority, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  6:Project
+  |  output columns:
+  |  6 <-> [6: o_orderpriority, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  5:HASH JOIN
+  |  join op: LEFT SEMI JOIN (BROADCAST)
+  |  equal join conjunct: [1: o_orderkey, BIGINT, true] = [10: l_orderkey, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (10: l_orderkey), remote = false
+  |  output columns: 6
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----4:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |    
+  1:Project
+  |  output columns:
+  |  1 <-> [1: o_orderkey, BIGINT, true]
+  |  6 <-> [6: o_orderpriority, VARCHAR(1048576), true]
+  |  cardinality: 1
+  |  
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: o_orderkey)
+
+PLAN FRAGMENT 3(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  10 <-> [10: l_orderkey, BIGINT, true]
+  |  cardinality: 1
+  |  
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1

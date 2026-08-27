@@ -1,0 +1,462 @@
+//! One registry for the CN's data-transport tunables.
+//!
+//! Every knob the exchange path has is declared here with its environment name, its default,
+//! and its valid range, and the whole set is resolved ONCE at bring-up ([`Tunables::resolve`])
+//! so a bad value fails the CN before it accepts a query rather than mid-sweep.
+//!
+//! Three rules, each of which the previous ad-hoc parsing broke somewhere:
+//!
+//! 1. **Out-of-range and unparsable values are REJECTED, never clamped and never ignored.**
+//!    `warmup.rs` used to do `.and_then(|v| v.parse().ok())`, which turns
+//!    `SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS=6O` (letter O) into the 180 s default with no
+//!    diagnostic — the operator sees the knob having no effect and cannot tell why.
+//! 2. **The resolved values are logged at bring-up.** The launcher's echo is what you asked
+//!    for; this line is what the CN got. Same discipline as `derived-sirius-config.yaml`
+//!    (`bench/a100x8/TUNING.md` §1), and for the same reason.
+//! 3. **Unset means the documented default**, so an operator who sets nothing gets exactly the
+//!    behaviour these constants had when they were hardcoded.
+//!
+//! The defaults are the values that were compiled in before this module existed, so resolving
+//! an empty environment is a no-op change.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Filled by [`Tunables::resolve`] at bring-up. Reads that happen before that (unit tests, and
+/// builds without the transport feature) see [`Tunables::DEFAULTS`].
+static RESOLVED: OnceLock<Tunables> = OnceLock::new();
+
+/// Bound on a PRPC connect and on waiting for a reply.
+///
+/// Generous because a peer's `request_staging_lease` queues behind whatever fragment its engine
+/// thread is currently running; a peer that exceeds this is treated as wedged and the query
+/// fails loudly. Worth raising at large scale factors: a CN whose engine thread is inside a
+/// multi-minute stage cannot answer a lease request, and the sender then fails a query that
+/// would have completed — the SF100 q08 refusal at 60758 ms is exactly this timeout firing
+/// (`OPEN-ISSUES.md`, audit 2026-08-08).
+const RPC_TIMEOUT_SECS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_RPC_TIMEOUT_SECS",
+    default: 60,
+    min: 1,
+    max: 3600,
+};
+
+/// Bound on waiting for one posted nixl WRITE to reach DONE.
+///
+/// This covers the RDMA/NVLink transfer alone, not any queueing behind a peer's engine thread,
+/// so it is much tighter than [`RPC_TIMEOUT_SECS`] and should stay that way: it is the one
+/// signal that distinguishes a wedged fabric from a busy peer.
+const XFER_TIMEOUT_SECS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS",
+    default: 30,
+    min: 1,
+    max: 3600,
+};
+
+/// Bytes of the mandatory first-contact bandwidth canary (finding F1).
+///
+/// Pool memory over `cuda_ipc` silently degrades ~220x while still transferring correct bytes,
+/// so a slow link must be refused, not tolerated. Large enough that the measurement is
+/// bandwidth and not latency; the lower bound keeps it that way.
+const CANARY_BYTES: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_CANARY_BYTES",
+    default: 16 << 20,
+    min: 1 << 20,
+    max: 1 << 30,
+};
+
+/// Floor under which the link is declared degraded and the transport tier is refused.
+///
+/// Measured reference points: same-host `cuda_ipc` ~85-90 GB/s on A100 and 322-399 GB/s on the
+/// GB200 NV18 mesh; the degraded staged-copy path ~0.4 GB/s; a cross-host `cudaMalloc` IPC
+/// handle bounced through the host at 0.32-0.43 GB/s. The default sits an order of magnitude
+/// above the degraded paths and two below the healthy ones, so it separates them cleanly on
+/// every fabric measured so far.
+///
+/// `0` disables the check. That is an escape hatch for bringing up a fabric whose healthy
+/// bandwidth is genuinely below the floor, not a way to make a failing cluster start — it is
+/// logged as a warning at bring-up, because with it set the ~220x silent-degradation trap this
+/// canary exists to catch is once again silent.
+const CANARY_FLOOR_GBPS: Knob<f64> = Knob {
+    name: "SIRIUS_CN_NIXL_CANARY_FLOOR_GBPS",
+    default: 2.0,
+    min: 0.0,
+    max: 10_000.0,
+};
+
+/// Wall-clock budget for the whole bring-up session-warmup loop.
+///
+/// The warmup is best-effort — exhausting the budget is loud but never fails bring-up, because
+/// a cold peer still works (slowly) through the lazy `ensure_session` path.
+const WARMUP_TIMEOUT_SECS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS",
+    default: 180,
+    min: 1,
+    max: 3600,
+};
+
+/// Peer count that ends the warmup loop early once established. Unset means "keep trying every
+/// peer the FE reports until the budget runs out".
+const WARMUP_EXPECT_PEERS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_WARMUP_EXPECT_PEERS",
+    default: 0, // sentinel: no early exit
+    min: 0,
+    max: 4096,
+};
+
+/// One environment-backed knob: where it is read from, what it is when unset, and the range
+/// outside which a value is an error rather than a clamp.
+struct Knob<T> {
+    name: &'static str,
+    default: T,
+    min: T,
+    max: T,
+}
+
+impl Knob<u64> {
+    /// The configured value, or the default when unset.
+    ///
+    /// # Errors
+    /// When the value does not parse as an unsigned integer, or falls outside `[min, max]`.
+    fn read(&self) -> Result<u64, String> {
+        let Some(raw) = env_value(self.name) else {
+            return Ok(self.default);
+        };
+        let value: u64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| self.rejected(&raw, "expected a non-negative integer"))?;
+        self.in_range(value, &raw)
+    }
+
+    /// Rejects an out-of-range value, naming the range and the default.
+    fn in_range(&self, value: u64, raw: &str) -> Result<u64, String> {
+        if value < self.min || value > self.max {
+            return Err(self.rejected(
+                raw,
+                &format!("must be between {} and {}", self.min, self.max),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn rejected(&self, raw: &str, why: &str) -> String {
+        format!(
+            "{}: {why}, got \"{raw}\" (unset means the default, {})",
+            self.name, self.default
+        )
+    }
+}
+
+impl Knob<f64> {
+    /// The configured value, or the default when unset.
+    ///
+    /// # Errors
+    /// When the value does not parse as a finite float, or falls outside `[min, max]`.
+    fn read(&self) -> Result<f64, String> {
+        let Some(raw) = env_value(self.name) else {
+            return Ok(self.default);
+        };
+        let value: f64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| self.rejected(&raw, "expected a number"))?;
+        // NaN fails every comparison, so the range check below would ADMIT it; reject first.
+        if !value.is_finite() {
+            return Err(self.rejected(&raw, "expected a finite number"));
+        }
+        if value < self.min || value > self.max {
+            return Err(self.rejected(
+                &raw,
+                &format!("must be between {} and {}", self.min, self.max),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn rejected(&self, raw: &str, why: &str) -> String {
+        format!(
+            "{}: {why}, got \"{raw}\" (unset means the default, {})",
+            self.name, self.default
+        )
+    }
+}
+
+/// The variable's value, or `None` when it is unset OR set to the empty string.
+///
+/// Empty counts as unset on purpose: `export FOO=${FOO:-}` and an unset variable are the same
+/// operator intent, and rejecting `""` would fail bring-up on a launcher typo that means
+/// "leave it alone".
+fn env_value(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// The resolved transport tunables. Copy so call sites can hold one cheaply.
+///
+/// Public only so `main` can call [`resolve`](Self::resolve) at bring-up; the fields are
+/// crate-internal because every consumer of them lives in this crate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tunables {
+    /// See [`RPC_TIMEOUT_SECS`].
+    pub(crate) rpc_timeout: Duration,
+    /// See [`XFER_TIMEOUT_SECS`].
+    pub(crate) xfer_timeout: Duration,
+    /// See [`CANARY_BYTES`].
+    pub(crate) canary_bytes: u64,
+    /// See [`CANARY_FLOOR_GBPS`]; `0.0` means the check is disabled.
+    pub(crate) canary_floor_gbps: f64,
+    /// See [`WARMUP_TIMEOUT_SECS`].
+    pub(crate) warmup_timeout: Duration,
+    /// See [`WARMUP_EXPECT_PEERS`]; `None` when the sentinel `0` leaves early exit off.
+    pub(crate) warmup_expect_peers: Option<usize>,
+}
+
+impl Tunables {
+    /// Exactly the values these knobs had as hardcoded constants.
+    const DEFAULTS: Self = Self {
+        rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.default),
+        xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.default),
+        canary_bytes: CANARY_BYTES.default,
+        canary_floor_gbps: CANARY_FLOOR_GBPS.default,
+        warmup_timeout: Duration::from_secs(WARMUP_TIMEOUT_SECS.default),
+        warmup_expect_peers: None,
+    };
+
+    /// Reads and validates every knob without touching the global.
+    ///
+    /// # Errors
+    /// The first knob that rejects its value, naming the variable, the value, and the range.
+    /// One knob per error rather than a collected list: the message is a startup failure an
+    /// operator fixes one line at a time.
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.read()?),
+            xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.read()?),
+            canary_bytes: CANARY_BYTES.read()?,
+            canary_floor_gbps: CANARY_FLOOR_GBPS.read()?,
+            warmup_timeout: Duration::from_secs(WARMUP_TIMEOUT_SECS.read()?),
+            // The sentinel keeps the "engine decides" path and the explicit override in one
+            // knob, so both are reachable from the same variable.
+            warmup_expect_peers: match WARMUP_EXPECT_PEERS.read()? {
+                0 => None,
+                peers => Some(peers as usize),
+            },
+        })
+    }
+
+    /// Resolves every knob, publishes the result for [`get`](Self::get), and logs what the CN
+    /// actually got. Call once, at bring-up, before the transport starts.
+    ///
+    /// A second call is a no-op that returns the already-published values — the first caller
+    /// wins, so a test that resolves early cannot be overwritten by a later one.
+    ///
+    /// # Errors
+    /// Propagates the first rejected knob, so a typo'd tunable fails CN startup instead of
+    /// silently reverting to a default mid-sweep.
+    pub fn resolve() -> Result<Self, String> {
+        if let Some(already) = RESOLVED.get() {
+            return Ok(*already);
+        }
+        let tunables = Self::from_env()?;
+        // A racing resolve may have won; either way the published value is the one in force.
+        let published = *RESOLVED.get_or_init(|| tunables);
+        if published.canary_floor_gbps == 0.0 {
+            tracing::warn!(
+                knob = CANARY_FLOOR_GBPS.name,
+                "the nixl bandwidth canary floor is disabled: a link that has silently fallen \
+                 back to staged host copies (~220x slower, still correct bytes) will now be \
+                 ACCEPTED instead of refused"
+            );
+        }
+        tracing::info!(
+            rpc_timeout_secs = published.rpc_timeout.as_secs(),
+            xfer_timeout_secs = published.xfer_timeout.as_secs(),
+            canary_bytes = published.canary_bytes,
+            canary_floor_gbps = published.canary_floor_gbps,
+            warmup_timeout_secs = published.warmup_timeout.as_secs(),
+            warmup_expect_peers = published.warmup_expect_peers,
+            "resolved CN transport tunables"
+        );
+        Ok(published)
+    }
+
+    /// The tunables in force. Before [`resolve`](Self::resolve) runs this is
+    /// [`DEFAULTS`](Self::DEFAULTS) — which is correct for unit tests and for builds without
+    /// the transport feature, and unreachable in production because `main` resolves before it
+    /// builds the transport.
+    pub(crate) fn get() -> Self {
+        RESOLVED.get().copied().unwrap_or(Self::DEFAULTS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes the tests that mutate the process environment. `cargo test` runs a module's
+    /// tests on multiple threads, and `set_var` is process-wide.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets `name` to `value`, or removes it for `None`.
+    ///
+    /// # Safety
+    /// The caller must hold [`ENV_LOCK`]: `set_var`/`remove_var` are process-wide.
+    unsafe fn assign(name: &str, value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// Runs `body` with every `(name, value)` applied — `None` meaning "unset" — and restores
+    /// the previous environment after.
+    ///
+    /// Takes the whole set at once rather than one variable per call: [`ENV_LOCK`] is a plain
+    /// non-reentrant `Mutex`, so a nested `with_env` would deadlock against itself.
+    fn with_env<T>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let restore: Vec<_> = vars
+            .iter()
+            .map(|(name, value)| {
+                let previous = std::env::var(name).ok();
+                // SAFETY: ENV_LOCK is held, so no other test thread touches the environment.
+                unsafe { assign(name, *value) };
+                (*name, previous)
+            })
+            .collect();
+        let outcome = body();
+        for (name, previous) in restore {
+            // SAFETY: still under ENV_LOCK.
+            unsafe { assign(name, previous.as_deref()) };
+        }
+        outcome
+    }
+
+    #[test]
+    fn an_empty_environment_reproduces_the_previously_hardcoded_constants() {
+        let resolved = with_env(
+            &[
+                (RPC_TIMEOUT_SECS.name, None),
+                (XFER_TIMEOUT_SECS.name, None),
+                (CANARY_BYTES.name, None),
+                (CANARY_FLOOR_GBPS.name, None),
+                (WARMUP_TIMEOUT_SECS.name, None),
+                (WARMUP_EXPECT_PEERS.name, None),
+            ],
+            Tunables::from_env,
+        )
+        .expect("an empty environment resolves");
+        assert_eq!(resolved, Tunables::DEFAULTS);
+        // The constants these replaced, spelled out so a default change has to touch this test.
+        assert_eq!(resolved.rpc_timeout, Duration::from_secs(60));
+        assert_eq!(resolved.xfer_timeout, Duration::from_secs(30));
+        assert_eq!(resolved.canary_bytes, 16 << 20);
+        assert_eq!(resolved.canary_floor_gbps, 2.0);
+        assert_eq!(resolved.warmup_timeout, Duration::from_secs(180));
+        assert_eq!(resolved.warmup_expect_peers, None);
+    }
+
+    #[test]
+    fn a_configured_value_is_taken() {
+        let value = with_env(&[(XFER_TIMEOUT_SECS.name, Some("90"))], || {
+            XFER_TIMEOUT_SECS.read()
+        });
+        assert_eq!(value, Ok(90));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        let value = with_env(&[(XFER_TIMEOUT_SECS.name, Some(" 90 "))], || {
+            XFER_TIMEOUT_SECS.read()
+        });
+        assert_eq!(value, Ok(90));
+    }
+
+    #[test]
+    fn an_empty_value_reads_as_unset() {
+        let value = with_env(&[(XFER_TIMEOUT_SECS.name, Some(""))], || {
+            XFER_TIMEOUT_SECS.read()
+        });
+        assert_eq!(value, Ok(XFER_TIMEOUT_SECS.default));
+    }
+
+    /// The defect this module exists to fix: the old `.parse().ok()` turned a typo into the
+    /// default with no diagnostic, so the knob appeared to have no effect.
+    #[test]
+    fn an_unparsable_value_is_rejected_rather_than_silently_defaulted() {
+        let error = with_env(&[(WARMUP_TIMEOUT_SECS.name, Some("6O"))], || {
+            WARMUP_TIMEOUT_SECS.read()
+        })
+        .expect_err("a letter O is not a digit");
+        assert!(error.contains(WARMUP_TIMEOUT_SECS.name), "{error}");
+        assert!(error.contains("6O"), "{error}");
+    }
+
+    #[test]
+    fn an_out_of_range_value_is_rejected_rather_than_clamped() {
+        let error = with_env(&[(XFER_TIMEOUT_SECS.name, Some("0"))], || {
+            XFER_TIMEOUT_SECS.read()
+        })
+        .expect_err("zero is below the minimum");
+        assert!(error.contains("between 1 and 3600"), "{error}");
+
+        let error = with_env(&[(CANARY_BYTES.name, Some("1024"))], || CANARY_BYTES.read())
+            .expect_err("1 KiB is below the 1 MiB minimum");
+        assert!(error.contains(CANARY_BYTES.name), "{error}");
+    }
+
+    #[test]
+    fn a_float_knob_takes_a_value_and_rejects_a_non_finite_one() {
+        let value = with_env(&[(CANARY_FLOOR_GBPS.name, Some("50.5"))], || {
+            CANARY_FLOOR_GBPS.read()
+        });
+        assert_eq!(value, Ok(50.5));
+
+        // NaN compares false against both bounds, so a naive range check would admit it.
+        let error = with_env(&[(CANARY_FLOOR_GBPS.name, Some("NaN"))], || {
+            CANARY_FLOOR_GBPS.read()
+        })
+        .expect_err("NaN is not a usable floor");
+        assert!(error.contains("finite"), "{error}");
+
+        let error = with_env(&[(CANARY_FLOOR_GBPS.name, Some("-1"))], || {
+            CANARY_FLOOR_GBPS.read()
+        })
+        .expect_err("a negative floor is meaningless");
+        assert!(error.contains("between 0 and 10000"), "{error}");
+    }
+
+    /// `0` is the documented escape hatch, not an out-of-range value.
+    #[test]
+    fn a_zero_canary_floor_is_accepted_as_the_disable_sentinel() {
+        let value = with_env(&[(CANARY_FLOOR_GBPS.name, Some("0"))], || {
+            CANARY_FLOOR_GBPS.read()
+        });
+        assert_eq!(value, Ok(0.0));
+    }
+
+    /// The expect-peers sentinel: `0` means "no early exit", not "exit after zero peers".
+    #[test]
+    fn the_expect_peers_sentinel_maps_to_none() {
+        let zero = with_env(&[(WARMUP_EXPECT_PEERS.name, Some("0"))], Tunables::from_env)
+            .expect("zero resolves");
+        assert_eq!(zero.warmup_expect_peers, None);
+
+        let three = with_env(&[(WARMUP_EXPECT_PEERS.name, Some("3"))], Tunables::from_env)
+            .expect("3 resolves");
+        assert_eq!(three.warmup_expect_peers, Some(3));
+    }
+
+    /// A bad knob has to fail the whole resolution, not just its own field.
+    #[test]
+    fn one_rejected_knob_fails_the_whole_resolution() {
+        let error = with_env(&[(RPC_TIMEOUT_SECS.name, Some("-5"))], Tunables::from_env)
+            .expect_err("a negative timeout is not an unsigned integer");
+        assert!(error.contains(RPC_TIMEOUT_SECS.name), "{error}");
+    }
+}

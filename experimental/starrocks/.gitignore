@@ -1,2 +1,9 @@
 target/
 .pixi/
+.cn1/
+.cn2/
+/target
+.pixi
+.cn*/
+.cn*-x.yaml
+sirius-cn-*/

@@ -1,0 +1,73 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:30: expr
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  10:Project
+  |  <slot 30> : 100.00 * 28: sum / 29: sum
+  |  
+  9:AGGREGATE (merge finalize)
+  |  output: sum(28: sum), sum(29: sum)
+  |  group by: 
+  |  
+  8:EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 2: l_partkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    UNPARTITIONED
+
+  7:AGGREGATE (update serialize)
+  |  output: sum(if(21: p_type LIKE 'PROMO%', 35: multiply, 0)), sum(27: expr)
+  |  group by: 
+  |  
+  6:Project
+  |  <slot 21> : 21: p_type
+  |  <slot 27> : clone(35: multiply)
+  |  <slot 35> : 35: multiply
+  |  common expressions:
+  |  <slot 32> : CAST(7: l_discount AS DECIMAL64(16,2))
+  |  <slot 33> : 1 - 32: cast
+  |  <slot 34> : CAST(33: subtract AS DECIMAL128(16,2))
+  |  <slot 35> : 31: cast * 34: cast
+  |  <slot 31> : CAST(6: l_extendedprice AS DECIMAL128(15,2))
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 2: l_partkey = 17: p_partkey
+  |  
+  |----4:EXCHANGE
+  |    
+  2:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 17: p_partkey
+
+  3:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 2: l_partkey
+
+  1:Project
+  |  <slot 2> : 2: l_partkey
+  |  <slot 6> : 6: l_extendedprice
+  |  <slot 7> : 7: l_discount
+  |  
+  0:FileScanNode
+     BROKER: 

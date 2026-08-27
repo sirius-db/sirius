@@ -24,6 +24,7 @@
 #include "expression/ast/reference.hpp"
 #include "expression/ast/utils.hpp"
 #include "helper/type_conversions.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
@@ -396,6 +397,10 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
               col        = casted_col->view();
             }
             out_type = col.type();
+          }
+          if (spec.kind == aggregate_kind::SUM) {
+            // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
+            throw_if_int64_sum_could_overflow(col, stream, cudf::get_current_device_resource_ref());
           }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
