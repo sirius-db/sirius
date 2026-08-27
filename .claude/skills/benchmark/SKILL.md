@@ -248,7 +248,11 @@ varied runs per-stream qgen parameters and rejects `--validation`), `--query-dir
 `--validation/--no-validation` (fixed predicates only, default on; the power run's post-RF1 and
 post-RF2 GPU rows are diffed against pure DuckDB in a child process after every pinned phase
 completes, with the refresh functions replayed on a fresh copy — it cannot share the benchmark
-process, since the host pool does not return memory to the OS on unpin),
+process, since the host pool does not return memory to the OS on unpin. In `--mode both` the
+throughput streams are validated too: the child re-runs the N throughput RF1/RF2 pairs and
+snapshots the CPU results after the baseline and each commit, and every stream's GPU rows must
+match one of those 2N+1 snapshots — which committed refresh state a concurrent query observed is
+a scheduling accident, but it must be one of them),
 `--baseline-pass/--no-baseline-pass`
 (default on; adds the clean pre-refresh timing pass so delta/mask overhead is attributable),
 `--query-timeout`, `--output`, `--keep-scratch-db`.
@@ -337,9 +341,14 @@ option) and ask for the rest. Mark sensible defaults "(Recommended)".
    SF). Ensure the refresh dir has `streams + 1` sets.
 6. **Validation** (`--validation`): only ask with fixed predicates (default on there): the
    post-RF1/post-RF2 GPU rows are diffed against pure DuckDB in a child process once the pinned
-   phases finish, with the refreshes replayed on a fresh copy. It adds one base-DB copy and an
-   untimed CPU pass, but does not compete with the pin for memory. With varied predicates skip
-   the question — the runner rejects `--validation` — and tell the user the run is timing-only.
+   phases finish, with the refreshes replayed on a fresh copy. In `--mode both` it also covers
+   the throughput streams: the child builds a knowledge base of the 2N+1 refresh states a
+   concurrent query could have observed (baseline + each throughput RF1/RF2 commit) and each
+   stream's GPU rows must match one of them; `--mode throughput` alone skips this (no power
+   baseline). It adds one base-DB copy and an untimed CPU pass (2N+1 passes when the throughput
+   streams are covered), but does not compete with the pin for memory. With varied predicates
+   skip the question — the runner rejects `--validation` — and tell the user the run is
+   timing-only.
 
 `--baseline-pass` (clean pre-refresh pass, default on) and `--query-timeout` can take defaults
 unless the user asks otherwise.

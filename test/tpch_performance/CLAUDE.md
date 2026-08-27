@@ -357,7 +357,7 @@ sqrt(Power · Throughput)`.
 - The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
   (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
   post-RF1 stream.
-- Validation (default on with fixed predicates, power run only): the post-RF1 and post-RF2 GPU
+- Validation (default on with fixed predicates): the post-RF1 and post-RF2 GPU
   rows are stashed during the timed passes, then diffed against pure DuckDB **after every pinned
   phase has finished** — in a child process that never loads the extension. It cannot share the
   benchmark process: the host pool is a growing pool allocator, so unpinning returns blocks to the
@@ -370,6 +370,16 @@ sqrt(Power · Throughput)`.
   the cost is one extra copy of the base DB and an untimed CPU pass. q2/q11/q16 touch neither
   table and are skipped. Row-count movement across RF1/RF2 is also checked. Any mismatch exits
   non-zero.
+- Throughput validation (`--mode both` only): each throughput stream's GPU rows are stashed
+  during the run, and the same extension-free child process then builds a **knowledge base** —
+  after replaying the power run's RF1/RF2 it snapshots the Q1-Q22 CPU results at the post-power
+  baseline and after each of the N throughput RF1/RF2 commits (2N+1 in-memory snapshots, update
+  sets 2..N+1). A stream's result for a query is validated iff it matches at least one snapshot:
+  the query streams run concurrently with the refresh stream, so which committed refresh state a
+  given query observed is a scheduling accident, but it must be one of them. q2/q11/q16 are
+  skipped as refresh-invariant. `--mode throughput` alone skips this with a warning (no validated
+  power baseline to anchor snapshot 0); mismatches list the per-snapshot diffs in `metrics.json`
+  under `throughput.validation` and exit non-zero like power validation.
 - Concurrency caveat: the engine serializes queries across all connections on one query-lifecycle
   lock, so the throughput run measures throughput of concurrent submission on one GPU, not
   overlapped execution. Every result is fetched fully before the next query; an open cursor would
@@ -443,7 +453,8 @@ to start without an explicit config; there is no default path), `--mode power|th
 tables — debug only), `--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
 a pinned tier), `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates`
 (per-stream qgen parameters; rejects `--validation`), `--query-dir <dir>`,
-`--validation/--no-validation` (fixed predicates only), `--baseline-pass/--no-baseline-pass`,
+`--validation/--no-validation` (fixed predicates only; covers the throughput streams too in
+`--mode both`), `--baseline-pass/--no-baseline-pass`,
 `--query-timeout <s>`, `--keep-scratch-db`, `--output`.
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
