@@ -441,6 +441,7 @@ set(EXTENSION_SOURCES
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp
+    src/vss/cuvs_index_cache.cpp
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
     src/vss/pinned_column.cpp
@@ -469,7 +470,8 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu
     src/cuda/vss/cudf_raft_interop.cu
-    src/cuda/vss/brute_force_search.cu)
+    src/cuda/vss/brute_force_search.cu
+    src/cuda/vss/ivf_flat_index.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -883,8 +885,10 @@ set(TEST_SOURCES
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
+    test/cpp/vss/test_cuvs_index_cache.cpp
     test/cpp/vss/test_distance_metric.cpp
     test/cpp/vss/test_enn_top_k.cpp
+    test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_pinned_column.cpp
     test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
