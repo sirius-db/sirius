@@ -20,7 +20,9 @@
 // -- and again on DuckDB CPU, then compares. The zero-fallback assertion is what makes these tests
 // meaningful: a silent CPU fallback would still produce the right answer, so a plain result check
 // would pass whether or not the operator existed. The rest of the set-operation family is asserted
-// the other way round, with expect_gpu_fallback.
+// the other way round, with expect_plan_fallback_matches_cpu -- those shapes are refused during
+// plan generation, which moves `fallbacks` and leaves `executions` flat, so expect_gpu_fallback
+// (which requires the *runtime* counter to move) would never hold for them.
 //
 // NOT covered here (needs a fixture with a small scan_task_batch_size; the shared integration
 // config uses 100 MB, so these fixtures are one batch per arm): multi-batch streaming,
@@ -201,15 +203,11 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "[integration][gpu_execution][union_all]")
 {
   // Distinct UNION, EXCEPT and INTERSECT must leave the GPU path cleanly via a fallback -- not
-  // error, and not silently produce a bag union.
-  expect_gpu_fallback("SELECT k FROM ua UNION SELECT k FROM ub");
-  expect_gpu_fallback("SELECT k FROM ua EXCEPT SELECT k FROM ub");
-  expect_gpu_fallback("SELECT k FROM ua INTERSECT SELECT k FROM ub");
-
-  // And the results are still right on the CPU.
-  auto distinct_result = con->Query(
-    "SELECT count(*) FROM (SELECT k FROM ua UNION SELECT k FROM ub) t WHERE k IS NOT NULL");
-  REQUIRE(distinct_result);
-  REQUIRE_FALSE(distinct_result->HasError());
-  REQUIRE(distinct_result->GetValue(0, 0).ToString() == "4");
+  // error, and not silently produce a bag union. All three are refused during plan generation
+  // (sirius_plan_set_operation.cpp for distinct UNION, the generator switch for the other two),
+  // so this asserts a plan-time fallback. The helper also compares against the CPU result, which
+  // is what pins "still the right answer" without a hand-rolled second check.
+  expect_plan_fallback_matches_cpu("SELECT k FROM ua UNION SELECT k FROM ub");
+  expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
+  expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
