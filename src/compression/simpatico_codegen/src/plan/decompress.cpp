@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/plan/validity.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -1299,6 +1300,16 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
 
   bool const selecting    = sel != nullptr && sel->active();
   bool const substituting = pred != nullptr && pred->active();
+  // A selection compacts the value rows, while the stored bitmask describes
+  // every row of the chunk. Returning it verbatim would misalign validity with
+  // values, so a nullable column is refused here; a caller that wants both
+  // reattaches the mask itself against the same selection it passed in.
+  if (selecting && !tree.validity.empty() && !sel->caller_reattaches_validity) {
+    if (error_out) {
+      *error_out = "decompress: selection on a null-masked column is not supported";
+    }
+    return nullptr;
+  }
   // The requested route must be the one this plan actually supports: a
   // mismatch would silently decode full width where the caller sized the
   // output from the survivor count.
@@ -1432,6 +1443,11 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
     // soon as we return, so the gather must have completed.
     cudaStreamSynchronize(stream.value());
   }
+  // Reattach the validity the compress side detached. The walk decodes a
+  // null-free column, so this is the only place the mask re-enters the picture.
+  // A selecting decode is either all-valid or served an opting-in caller, which
+  // compacts the sidecar itself against the selection it supplied.
+  if (col && !selecting) { attach_validity(*col, tree.validity, stream, mr); }
   return col;
 }
 

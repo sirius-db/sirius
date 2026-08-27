@@ -440,7 +440,7 @@ const char* dtype_to_cxx(const char* dtype)
   // the original float type_id so cudf reinterprets the bits correctly.
   if (s == "float32") return "int32_t";
   if (s == "float64") return "int64_t";
-  // Byte types (string sub-channels: chars, null_mask, keys_chars) map to the
+  // Byte types (string sub-channels: chars, keys_chars) map to the
   // SIGNED int8_t: zigzag's shift = elem_size*8-1 relies on sign-extension.
   // The output column retains the original UINT8 type_id.
   if (s == "uint8" || s == "uint8_t" || s == "int8" || s == "int8_t") return "int8_t";

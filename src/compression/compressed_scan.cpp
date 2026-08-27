@@ -19,7 +19,9 @@
 #include "decompression_pushdown_policy.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
@@ -328,6 +330,39 @@ struct selection_source {
 /// is structurally impossible and the round-trip is skipped.
 constexpr std::size_t kMaxSelectionSources = 8;
 
+/// The rows a filtered decode kept, as ascending chunk-local INT32 positions.
+///
+/// The selection wave already holds the answer: the tier-B route materialized
+/// the index list to gather by, and every other route left the counted mask it
+/// balloted. So this either wraps a buffer that exists or expands one, never
+/// re-derives the selection.
+///
+/// Returns null when the result cannot account for its survivors exactly — an
+/// uncounted mask, or a count the buffers do not cover. A caller that asked for
+/// the positions must treat that as a refusal rather than as "no rows dropped".
+[[nodiscard]] std::unique_ptr<cudf::column> survivor_positions(
+  sirius::codegen::scan_filter_result& result,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (result.survivor_count < 0) { return nullptr; }
+  auto const count = static_cast<cudf::size_type>(result.survivor_count);
+  auto column      = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, count, cudf::mask_state::UNALLOCATED, stream, mr);
+  if (count == 0) { return column; }
+  auto* out       = column->mutable_view().data<std::int32_t>();
+  auto const need = static_cast<std::size_t>(count) * sizeof(std::int32_t);
+  if (result.row_indices.size() >= need) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      out, result.row_indices.data(), need, cudaMemcpyDeviceToDevice, stream.value()));
+    return column;
+  }
+  if (result.mask_words.size() == 0 || result.chunk_offsets.size() == 0) { return nullptr; }
+  auto mask = result.view();
+  sirius::codegen::mask_to_row_indices(mask, out, stream);
+  return column;
+}
+
 /// Decompress @p selected columns of @p chunk with @p request applied during
 /// the decode. Returns a null table when the attempt is declined here
 /// (nothing to configure, shape checks) or when the assembly refuses — the
@@ -437,6 +472,15 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   } else if (result.applied && config.covers_whole_filter) {
     outcome.row_filtered = true;
   }
+  // Rows were dropped whenever the filtered decode applied, whether or not it
+  // carried the whole filter. A consumer that addresses the chunk by position
+  // needs that fact separately from row_filtered, and it must be reported even
+  // when the positions themselves were not asked for — otherwise "not asked"
+  // and "nothing dropped" look the same.
+  outcome.compacted = result.applied;
+  if (result.applied && request.report_survivors) {
+    outcome.survivor_rows = survivor_positions(result, stream, mr);
+  }
   // Every equality the request carried was ANDed into the batch mask before
   // wave 2 ran, so on an applied decode the surviving rows already satisfy
   // them. On any other outcome the equality answers come from the plain
@@ -477,7 +521,16 @@ decompression_pushdown_scan::without_row_selection() const
   }
   if (narrowed.empty()) { return nullptr; }
   narrowed.row_selection_disabled = true;
+  narrowed.report_survivors       = _request.report_survivors;
   return std::make_shared<const decompression_pushdown_scan>(std::move(narrowed));
+}
+
+std::shared_ptr<const decompression_pushdown_scan>
+decompression_pushdown_scan::with_survivor_reporting() const
+{
+  auto refreshed             = _request;
+  refreshed.report_survivors = true;
+  return std::make_shared<const decompression_pushdown_scan>(std::move(refreshed));
 }
 
 std::shared_ptr<const decompression_pushdown_scan>

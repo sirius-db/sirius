@@ -639,6 +639,49 @@ void test_str_split_plan_shapes_roundtrip()
   memory_roundtrip("str_split_bare_terminal_mem", addr_tbl->view(), bare_dsl);
 }
 
+// Validity survives both serialization paths. The sidecar is not a leaf, so it
+// travels in its own per-column header record rather than through describe() --
+// this covers the file path, the pinned in-memory path, and the two fast paths
+// that write no payload bytes at all.
+void test_validity_sidecar_roundtrip()
+{
+  auto stream = cudf::get_default_stream();
+  auto mr     = rmm::mr::get_current_device_resource_ref();
+
+  // Mixed validity: a real bitmask is written to the payload region.
+  auto mixed = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 128, cudf::mask_state::ALL_VALID, stream, mr);
+  std::vector<std::int32_t> host(128);
+  for (int r = 0; r < 128; ++r)
+    host[static_cast<std::size_t>(r)] = static_cast<std::int32_t>((r * 31 + 7) % 5000);
+  if (cudaMemcpy(mixed->mutable_view().head<std::int32_t>(),
+                 host.data(),
+                 host.size() * sizeof(std::int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    throw std::runtime_error("validity_sidecar: cudaMemcpy failed");
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 3, 4, /*valid=*/false, stream);
+  cudf::set_null_mask(mixed->mutable_view().null_mask(), 70, 96, /*valid=*/false, stream);
+  mixed->set_null_count(27);
+  cudf::table_view mixed_tbl({mixed->view()});
+  io_roundtrip("validity_mixed", mixed_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_mixed_mem", mixed_tbl, "input -> delta -> differences\n");
+
+  // All null: nothing is written to the payload, so this also checks that the
+  // reader rebuilds the mask from the kind alone.
+  auto all_null = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 64, cudf::mask_state::ALL_NULL, stream, mr);
+  all_null->set_null_count(64);
+  cudf::table_view an_tbl({all_null->view()});
+  io_roundtrip("validity_all_null", an_tbl, "input -> delta -> differences\n");
+  memory_roundtrip("validity_all_null_mem", an_tbl, "input -> delta -> differences\n");
+
+  // Nullable STRING through str_split, where validity used to be a routed channel.
+  std::vector<bool> valid = {true, false, true, true, false, true};
+  auto strs = make_strings_table({"alpha", "", "gamma", "delta", "x", "zeta"}, valid, stream);
+  io_roundtrip("validity_strings", strs->view(), "input -> str_split\n");
+  memory_roundtrip("validity_strings_mem", strs->view(), "input -> str_split\n");
+}
+
 }  // namespace
 
 int main()
@@ -674,6 +717,7 @@ int main()
     {"error_bad_version", test_error_bad_version},
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
+    {"validity_sidecar", test_validity_sidecar_roundtrip},
   };
 
   int failures = 0;

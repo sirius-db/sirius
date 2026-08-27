@@ -74,9 +74,7 @@ hoping schemas differ: `install_rider` (`late_mat_plan_pass.cpp`) requires the m
 `expected_schema` to match the existing one at every position except the new rider's own, and
 `port_materialize_directive::valid()` re-checks self-consistency and position collisions before
 the merge is accepted. Two scans converging at one port get ONE directive with each side's rowid
-at its own fixed position — disambiguated structurally, not by a runtime schema coincidence. No
-code change identified as necessary; recorded here because the reasoning isn't obvious from the
-"schema equality is the entire identity check" statement alone.
+at its own fixed position — disambiguated structurally, not by a runtime schema coincidence.
 
 ## Which columns, and how far
 
@@ -148,9 +146,35 @@ NAME, since a re-pin that merges columns would make a positional attach mark the
 ## Filtered scans, and count-on-deferred
 
 A filtered batch is no longer the chunk's rows in order, so the rowid comes from the surviving
-row positions, taken from the same mask the scan filters with. It is refused where the survivors
-are decided somewhere this path cannot see them — a compressed pin filters inside the fused
-decode (see [Compressed Pinning](compressed-pinning.md)).
+row positions, taken from the same mask the scan filters with.
+
+**A batch off a compressed pin can be restricted twice.** The fused decode drops rows while
+decoding (see [Compressed Pinning](compressed-pinning.md)), and whatever conjuncts it could not
+carry are evaluated again on what it kept. Each stage reports positions in ITS OWN input, so the
+second stage's positions index the first stage's output rather than the chunk, and the pin-order
+rowid is only right once the two are composed — `compose_survivors`
+(`sirius_gpu_scan_operator.cpp`) gathers the decode's list by the residual's.
+
+The decode reports its half because it is asked to: a split carrying a deferral sets
+`late_mat_wants_survivors`, which `prepare_for_processing` turns into
+`decompression_pushdown_scan::with_survivor_reporting()`, and the decode then expands the
+selection mask it already balloted into an ascending INT32 index list
+(`pushdown_outcome::survivor_rows`). Off a deferring scan the decode does neither, so the cost is
+one index-list expansion plus 4 bytes per surviving row, paid only where a ride uses it.
+
+Admitting the shape is not the same as it paying. On TPC-H SF1000 with
+`PIN_UNIQUE_COLS=all` it turns 39 structural refusals into ordinary policy decisions and installs
+no additional deferral: the newly reachable candidates are `lineitem` and `orders` filtered scans,
+and they are withheld because a partition hashes them or refused on the value-times-crossings
+floor. Suite time is unchanged (6.312 s before, 6.304 s / 6.326 s after, same build and machine),
+which is what a change that only removes a refusal should look like where the refusal was not the
+binding constraint on value.
+
+Both directions fail closed. A decode that compacted without accounting for its survivors throws
+rather than emit a rowid, at `prepare_for_processing` and again at substitution; a survivor list
+whose length does not match the rows handed on throws too. A scan whose INGESTIBLE cannot report
+survivors (the duckdb-native one filters with a plain select) is still refused at install, since
+the residual half would have nothing to say.
 
 A column every reader only COUNTs needs no far end at all: `install_count_deferral` is the one
 deferral with a single half, admitted only over pinned columns with no nulls. Off by default.
@@ -159,18 +183,18 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
 
 - A column an outer join could null is withheld: a null rowid must materialize a null, which the
   materializer does not do yet.
-- A nullable PINNED SOURCE column is admitted for any uncompressed origin (single-batch,
-  multi-batch fixed-width, or multi-batch variable-width — every such gather path propagates
-  validity). A compressed origin is refused UNCONDITIONALLY, whether or not it actually has any
-  nulls: per-column nullability inside a Simpatico-compressed blob is opaque (see
-  [Compressed Materialization](compressed-materialization.md)), so nothing upstream of the
-  install-time gate can tell "no nulls" apart from "unknown," and the gate treats both as unsafe.
-  `materialize_compressed`'s decode routes in `materialize.cpp` do write values only, with no
-  output validity buffer — but that is a secondary reason and moot in practice, since a compressed
-  origin never reaches them today.
+- A nullable PINNED SOURCE column is admitted for any origin whose gather path propagates
+  validity, which is now every one of them. The uncompressed shapes (single-batch, multi-batch
+  fixed-width, multi-batch variable-width) do it natively. A COMPRESSED origin does it through
+  the validity sidecar compression stores beside each column's plan tree: the count is readable
+  from the `.hpln` header without decoding (`simpatico::column_null_count`), so the install gate
+  can tell "no nulls" apart from "unknown", and the decode routes reattach the mask
+  (`materialize.cpp`'s `attach_selected_validity`). The two COMPACTING routes gather the stored
+  bitmask by the same rows they selected the values by — the mask describes the whole chunk while
+  a compacted output holds only the selection, so copying it verbatim would pair each value with
+  another row's validity. A chunk carrying no blob still answers nothing and is refused.
 - A compressed origin cannot skip its decode — the scan substitutes on the FINISHED output, so a
   deferred column from a compressed pin is decompressed and then discarded.
-- Filtered scans of compressed pins are refused (above).
 - Deferred-value widths are ESTIMATED for variable-width columns, not measured, and the error runs
   both ways: underestimating a wide column can refuse a bundle that would have qualified, but
   overestimating a short one can just as easily admit a bundle that does not actually repay (a

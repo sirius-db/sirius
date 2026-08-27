@@ -54,4 +54,23 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                std::uint32_t* out_mask,
                                rmm::cuda_stream_view stream);
 
+/// Gather validity bits: bit `i` of `out_mask` is bit `map[i]` of `source_mask`.
+///
+/// A compacted decode returns only the selected rows of a chunk while the
+/// chunk's stored bitmask still describes all of them, so the mask has to be
+/// gathered by the same row list the values were selected by. `map` is the
+/// batch-local, ascending index list the selection already carries; `count` is
+/// its length, which must equal the decoded column's row count.
+///
+/// `out_mask` must be sized for `count` bits and may be uninitialized — every
+/// bit below `count` is written. Indices are not bounds-checked, matching the
+/// gather above.
+///
+/// Asynchronous on `stream`.
+void gather_validity_bits(std::uint32_t const* source_mask,
+                          std::int32_t const* map,
+                          std::int64_t count,
+                          std::uint32_t* out_mask,
+                          rmm::cuda_stream_view stream);
+
 }  // namespace sirius::late_mat
