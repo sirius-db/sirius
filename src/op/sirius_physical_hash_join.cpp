@@ -998,15 +998,15 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
-                                                    bool probe_finished)
+std::vector<std::size_t> build_only_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
+                                                     bool probe_finished)
 {
   std::vector<std::size_t> to_discard;
   if (!probe_finished) { return to_discard; }
   for (std::size_t p = 0; p < slots.size(); ++p) {
     auto const& s = slots[p];
-    // NOT_BUILT means the slot was never scheduled (so its replicated build batch is still in the
-    // repo); no probe batch with the probe side finished means none is coming. A BUILT slot already
+    // NOT_BUILT means the slot was never scheduled (so its build batch is still in the repo); no
+    // probe batch with the probe side finished means none is coming. A BUILT slot already
     // consumed its build batch, and a slot with probe data will still be built — leave those.
     if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && s.has_build_batch && !s.has_probe_batch) {
       to_discard.push_back(p);
@@ -1015,38 +1015,122 @@ std::vector<std::size_t> broadcast_slots_to_discard(std::vector<build_probe_slot
   return to_discard;
 }
 
+std::vector<std::size_t> never_buildable_slots(std::vector<build_probe_slot_view> const& slots,
+                                               bool build_finished)
+{
+  std::vector<std::size_t> result;
+  if (!build_finished) { return result; }
+  for (std::size_t p = 0; p < slots.size(); ++p) {
+    auto const& s = slots[p];
+    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && !s.has_build_batch) { result.push_back(p); }
+  }
+  return result;
+}
+
+namespace {
+
+/// Pop and free every batch parked in `repo`'s partition `p`, freeing each on the GPU it lives on
+/// (rmm requires the owning device to be current).
+void drain_and_free_partition(cucascade::shared_data_repository& repo, std::size_t p)
+{
+  while (auto batch = repo.pop_next_data_batch(p)) {
+    int device_id = -1;
+    {
+      auto ro = batch->to_read_only();
+      if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
+    }
+    std::optional<rmm::cuda_set_device_raii> device_guard;
+    if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
+    batch.reset();
+  }
+}
+
+}  // namespace
+
 void sirius_physical_hash_join::discard_build_only_slots_if_probe_complete()
 {
-  if (!_broadcast) { return; }
   auto* build_port = get_port("build");
   auto* probe_port = get_port("default");
   if (!build_port || !probe_port) { return; }
+  // Build batches can land in an already-discarded partition (build tasks race the discard pass,
+  // and a DESTROYED slot no longer shows up as discardable below), so re-drain every recorded
+  // slot each pass — otherwise a late batch keeps all_ports_empty() false forever and the
+  // pipeline never finishes. Mirrors _never_buildable_destroyed_slots on the probe side.
+  for (std::size_t p : _build_only_discarded_slots) {
+    drain_and_free_partition(*build_port->repo, p);
+  }
   // Only once the probe upstream is finished do we know no further probe data can arrive for any
-  // slot. Broadcast replicates the build table to every slot, but the probe side is unpartitioned,
-  // so slots on GPUs that saw no probe rows get build data that will never be probed.
+  // slot. Broadcast replicates the build table to every slot while the probe side is
+  // unpartitioned, so replicas on GPUs that saw no probe rows go unprobed; and in any mode the
+  // probe stream itself can finish without ever delivering a batch (a hash-partitioned exchange
+  // whose probe rows all hashed to another instance). Either way the slot's build data will never
+  // be probed, and every BUILD_PROBE-eligible join type emits only probe-derived rows, so
+  // discarding it changes no output.
   bool const probe_finished =
     probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
 
-  for (std::size_t p : broadcast_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
-    // Build-only slot with no probe and none coming: drop its replicated build batch(es), freeing
-    // each on the GPU it was folded onto (rmm requires the owning device to be current).
-    while (auto batch = build_port->repo->pop_next_data_batch(p)) {
-      int device_id = -1;
-      {
-        auto ro = batch->to_read_only();
-        if (auto* ms = ro.get_memory_space(); ms != nullptr) { device_id = ms->get_device_id(); }
-      }
-      std::optional<rmm::cuda_set_device_raii> device_guard;
-      if (device_id >= 0) { device_guard.emplace(rmm::cuda_device_id{device_id}); }
-      batch.reset();
+  for (std::size_t p : build_only_slots_to_discard(snapshot_build_probe_slots(), probe_finished)) {
+    // Build-only slot with no probe and none coming: drop its build batch(es).
+    drain_and_free_partition(*build_port->repo, p);
+    _build_only_discarded_slots.push_back(p);
+    _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
+                                                 std::memory_order_release);
+    SIRIUS_LOG_DEBUG(
+      "sirius_physical_hash_join id {}: discarding build-only slot {} (probe side complete and "
+      "empty for this partition)",
+      this->get_operator_id(),
+      p);
+  }
+}
+
+std::optional<std::size_t> sirius_physical_hash_join::resolve_never_buildable_slots()
+{
+  auto* build_port = get_port("build");
+  auto* probe_port = get_port("default");
+  if (!build_port || !probe_port) { return std::nullopt; }
+  // Probe batches can land in an already-destroyed never-buildable partition (probe tasks race
+  // the destroy pass, and a DESTROYED slot no longer shows up as never-buildable below), so
+  // re-drain every recorded slot each pass — otherwise a late batch keeps all_ports_empty()
+  // false forever and the pipeline never finishes.
+  for (std::size_t p : _never_buildable_destroyed_slots) {
+    drain_and_free_partition(*probe_port->repo, p);
+  }
+  bool const build_finished =
+    build_port->src_pipeline && build_port->src_pipeline->is_pipeline_finished();
+  auto const unbuildable = never_buildable_slots(snapshot_build_probe_slots(), build_finished);
+  if (unbuildable.empty()) { return std::nullopt; }
+
+  bool const probe_finished =
+    probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+  // INNER/SEMI emit only probe rows that match a build row: with no build rows the partition's
+  // output is empty and parked probe batches can be dropped. Every other BUILD_PROBE-eligible
+  // type (LEFT/ANTI/MARK) emits probe rows even against an empty build, which discarding cannot
+  // express.
+  bool const empty_build_discards_probe =
+    join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::SEMI;
+
+  for (std::size_t p : unbuildable) {
+    if (!empty_build_discards_probe) {
+      // Parked probe rows would have to be emitted against the never-coming build: loud failure.
+      if (probe_port->repo->size(p) > 0) { return p; }
+      // No probe rows yet and more may come — leave the slot; a later pass decides.
+      if (!probe_finished) { continue; }
+      // Both sides finished empty: zero output rows for every join type; fall through to destroy.
+    } else {
+      drain_and_free_partition(*probe_port->repo, p);
+      // More probe batches may still arrive for this partition; record it for re-draining.
+      _never_buildable_destroyed_slots.push_back(p);
     }
     _partition_build_states[p].build_state.store(BUILD_HASH_TABLE_STATE::DESTROYED,
                                                  std::memory_order_release);
     SIRIUS_LOG_DEBUG(
-      "sirius_physical_hash_join id {}: broadcast discard of build-only slot {} (probe complete)",
+      "sirius_physical_hash_join id {}: build side finished with no build batch for partition {} "
+      "({} join): discarding its probe input and tearing the slot down",
       this->get_operator_id(),
-      p);
+      p,
+      duckdb::JoinTypeToString(join_type));
   }
+  return std::nullopt;
 }
 
 std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint()
@@ -1064,9 +1148,20 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // sequences interleave (a built partition probes on its GPU while another still builds on a
     // different GPU). Pick the next action from a per-partition snapshot.
 
-    // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
-    // the operator can reach completion instead of waiting forever on their absent probe data.
+    // Reclaim slots that will never be probed (probe upstream finished with no probe batch for
+    // them — a broadcast replica on a probe-less GPU, or a probe exchange stream that closed
+    // empty) before deciding the next action, so the operator reaches completion instead of
+    // answering wait_for_probe forever against a finished producer.
     discard_build_only_slots_if_probe_complete();
+    // The inverse: resolve slots whose build batch can never arrive (build upstream finished
+    // empty), so the operator completes instead of answering wait_for_build forever — the silent
+    // wedge a hash-partitioned exchange causes when every build row hashed to another instance.
+    if (resolve_never_buildable_slots().has_value()) {
+      // A never-buildable slot must emit its parked probe rows (LEFT/ANTI/MARK), which this path
+      // cannot do. Throwing here would kill the task creator's unguarded manager thread, so
+      // return READY and let the guarded task-creation path raise the error.
+      return task_creation_hint{TaskCreationHint::READY, this};
+    }
     auto const decision = select_build_probe_action(snapshot_build_probe_slots());
     switch (decision.action) {
       case build_probe_action::schedule_build:
@@ -1121,6 +1216,20 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       "In sirius_physical_hash_join:get_next_task_input_data_for_build_probe: missing expected "
       "ports in operator " +
       std::to_string(this->get_operator_id()));
+  }
+
+  // A never-buildable slot whose join type must emit probe rows against the empty build cannot be
+  // served by this path. The hint side detected it and routed READY here precisely because this
+  // call runs under the task creator's try/catch, where a throw fails the query loudly instead of
+  // wedging it (or killing the manager thread).
+  if (auto const failing = resolve_never_buildable_slots(); failing.has_value()) {
+    throw std::runtime_error(std::format(
+      "sirius_physical_hash_join {} ({} join): the build side finished without ever delivering a "
+      "build batch for partition {}, but this join type must emit probe rows against an empty "
+      "build — refusing to drop them silently",
+      this->get_operator_id(),
+      duckdb::JoinTypeToString(join_type),
+      failing.value()));
   }
 
   // How a partition's tasks are tagged for GPU routing (task_creator uses tag % num_gpus):

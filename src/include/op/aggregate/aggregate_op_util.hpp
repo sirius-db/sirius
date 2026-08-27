@@ -21,6 +21,12 @@
 #include "expression/ast/node.hpp"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <memory>
 #include <optional>
@@ -92,6 +98,49 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Throw if a SUM over `input` could overflow its 64-bit accumulator.
+ *
+ * DuckDB models integer sums as HUGEINT, but cuDF has no INT128, so the plan generator
+ * downcasts them to BIGINT (`downcast_hugeint_types`) and the reduction runs in a 64-bit
+ * accumulator that wraps silently on overflow. This is the loud guard on that downcast path:
+ * a cheap min/max pre-check that refuses any 64-bit integer sum whose
+ * `valid_rows * max(|min|, |max|)` bound exceeds the accumulator range. Conservative — it can
+ * refuse a sum that would have fit — but it never lets one wrap.
+ *
+ * No-op for other input types: narrower integers cannot overflow an int64 accumulator within
+ * one column (2^31 rows * 2^31 max < 2^63), and float/decimal sums do not take this path.
+ */
+void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr);
+
+/**
+ * @brief True when a SUM over `values_type` is order-sensitive: a FLOAT32/FLOAT64 sum.
+ *
+ * Floating-point addition is not associative, so the result bits of a float sum depend on the
+ * order in which values are combined. Integer and decimal sums accumulate exactly and are
+ * order-independent; MIN/MAX/COUNT are order-independent for every type.
+ */
+bool is_order_sensitive_sum(cudf::aggregation::Kind kind, cudf::data_type values_type);
+
+/**
+ * @brief Gather `input` into a canonical row order so floating-point sums are bit-stable.
+ *
+ * Sorts rows by `sort_col_indices` (all ascending, nulls last), which must cover the group key
+ * columns plus every float SUM value column. The resulting per-group value sequence — and
+ * therefore the bits an atomics-free reduction produces — is then a pure function of the row
+ * multiset, independent of upstream batch order and exchange arrival order. Distributed plans
+ * that evaluate the same aggregation twice and compare the sums for exact equality (TPC-H q15:
+ * `sum = max(sum)`) rely on this: without it, cuDF's hash groupby accumulates float sums via
+ * atomicAdd and the two evaluations diverge by ULPs, silently emptying the join.
+ */
+std::unique_ptr<cudf::table> canonicalize_row_order(
+  const cudf::table_view& input,
+  const std::vector<cudf::size_type>& sort_col_indices,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace op
 }  // namespace sirius

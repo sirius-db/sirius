@@ -1,0 +1,30 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:18: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  4:AGGREGATE (merge finalize)
+  |  output: sum(18: sum)
+  |  group by: 
+  |  
+  3:EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    UNPARTITIONED
+
+  2:AGGREGATE (update serialize)
+  |  output: sum(CAST(6: l_extendedprice AS DECIMAL128(15,2)) * CAST(7: l_discount AS DECIMAL128(15,2)))
+  |  group by: 
+  |  
+  1:Project
+  |  <slot 6> : 6: l_extendedprice
+  |  <slot 7> : 7: l_discount
+  |  
+  0:FileScanNode
+     BROKER: 

@@ -1,0 +1,15 @@
+query,run,phase,status,ms,rows
+q05,0,cold,pass,22482,5
+q05,1,warm,refused,300104,0
+q07,0,cold,pass,83251,4
+q07,1,warm,refused,319030,0
+q08,0,cold,refused,10944,0
+q08,1,warm,refused,10256,0
+q09,0,cold,refused,10207,0
+q09,1,warm,refused,9166,0
+q17,0,cold,pass,14984,1
+q17,1,warm,pass,13244,1
+q18,0,cold,pass,9382,100
+q18,1,warm,pass,9256,100
+q21,0,cold,pass,17734,100
+q21,1,warm,pass,17387,100

@@ -1,0 +1,65 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:27: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  9:AGGREGATE (merge finalize)
+  |  output: sum(27: sum)
+  |  group by: 
+  |  
+  8:EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 17: p_partkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 08
+    UNPARTITIONED
+
+  7:AGGREGATE (update serialize)
+  |  output: sum(CAST(6: l_extendedprice AS DECIMAL128(15,2)) * CAST(1 - CAST(7: l_discount AS DECIMAL64(16,2)) AS DECIMAL128(16,2)))
+  |  group by: 
+  |  
+  6:Project
+  |  <slot 6> : 6: l_extendedprice
+  |  <slot 7> : 7: l_discount
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 17: p_partkey = 2: l_partkey
+  |  other join predicates: (((((20: p_brand = 'Brand#12') AND (23: p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))) AND ((5: l_quantity >= 1) AND (5: l_quantity <= 11))) AND (22: p_size <= 5)) OR ((((20: p_brand = 'Brand#23') AND (23: p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))) AND ((5: l_quantity >= 10) AND (5: l_quantity <= 20))) AND (22: p_size <= 10))) OR ((((20: p_brand = 'Brand#34') AND (23: p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))) AND ((5: l_quantity >= 20) AND (5: l_quantity <= 30))) AND (22: p_size <= 15))
+  |  
+  |----4:EXCHANGE
+  |    
+  1:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 2: l_partkey
+
+  3:Project
+  |  <slot 2> : 2: l_partkey
+  |  <slot 5> : 5: l_quantity
+  |  <slot 6> : 6: l_extendedprice
+  |  <slot 7> : 7: l_discount
+  |  
+  2:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: 17: p_partkey
+
+  0:FileScanNode
+     BROKER: 

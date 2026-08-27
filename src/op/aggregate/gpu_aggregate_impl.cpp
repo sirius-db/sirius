@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "log/logging.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/group_key_labels.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -142,6 +143,32 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto input_table = get_cudf_table_view(input);
   auto mr          = memory_space.get_default_allocator();
 
+  // Bit-stable float sums: cuDF's hash groupby accumulates SUM via atomicAdd, whose combine
+  // order varies run to run, and FP addition is not associative — the same rows can yield
+  // per-group sums differing by ULPs across evaluations. Distributed plans compare such sums
+  // for exact equality (TPC-H q15 probes `sum = max(sum)` across two evaluations of the same
+  // CTE), so gather rows into a canonical (group keys, float values) order and declare the
+  // keys presorted, which routes cuDF onto its sort-based, atomics-free aggregation. The
+  // partial then depends only on the batch's row multiset.
+  std::vector<cudf::size_type> float_sum_value_cols;
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    int col_idx = aggregate_idx[i];
+    // COLLECT_SET slots may carry the -1 struct-column sentinel; they are never SUM.
+    if (col_idx < 0) { continue; }
+    if (is_order_sensitive_sum(aggregates[i], input_table.column(col_idx).type()) &&
+        std::find(float_sum_value_cols.begin(), float_sum_value_cols.end(), col_idx) ==
+          float_sum_value_cols.end()) {
+      float_sum_value_cols.push_back(col_idx);
+    }
+  }
+  const bool use_canonical_sorted_groupby = !float_sum_value_cols.empty();
+  std::unique_ptr<cudf::table> canonical_input;
+  if (use_canonical_sorted_groupby) {
+    std::vector<cudf::size_type> sort_cols(group_idx.begin(), group_idx.end());
+    sort_cols.insert(sort_cols.end(), float_sum_value_cols.begin(), float_sum_value_cols.end());
+    canonical_input = canonicalize_row_order(input_table, sort_cols, stream, mr);
+    input_table     = canonical_input->view();
+  }
   // COLLECT_SET uses cuDF's sorted groupby. Dense INT32 labels let that sort take its
   // single-column radix path while preserving the original keys' lexicographic order. A
   // single null-free fixed-width key is already radix-sortable; single nullable or
@@ -233,7 +260,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   for (int idx : group_idx) {
     if (use_label_keys) { break; }
     auto col = input_table.column(idx);
-    if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
+    // Dict-encoding is a hash-groupby optimization; the canonical path must hand the
+    // presorted raw keys to the sort-based groupby unchanged.
+    if (!use_canonical_sorted_groupby && col.type().id() == cudf::type_id::STRING &&
+        col.size() > 0) {
       cudf::strings_column_view scv(col);
       auto avg_len = static_cast<double>(scv.chars_size(stream)) / col.size();
       if (avg_len >= dict_encode_min_avg_len) {
@@ -278,7 +308,16 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     }
   }
   if (use_label_keys) { group_cols.push_back(label_col->view()); }
-  cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+  // Presorted keys force cuDF's deterministic sort-based aggregation (hash groupby would
+  // reintroduce atomicAdd). The declared order must match canonicalize_row_order's.
+  cudf::groupby::groupby grpby_obj(
+    cudf::table_view(group_cols),
+    cudf::null_policy::INCLUDE,
+    use_canonical_sorted_groupby ? cudf::sorted::YES : cudf::sorted::NO,
+    std::vector<cudf::order>(use_canonical_sorted_groupby ? group_cols.size() : 0,
+                             cudf::order::ASCENDING),
+    std::vector<cudf::null_order>(use_canonical_sorted_groupby ? group_cols.size() : 0,
+                                  cudf::null_order::AFTER));
 
   // Make aggregation requests, group aggregations on the same column in the single request.
   // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
@@ -288,6 +327,10 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   std::vector<int> input_col_order;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& aggregate_kind = aggregates[i];
+    if (aggregate_kind == cudf::aggregation::Kind::SUM) {
+      // The HUGEINT->BIGINT downcast guard: refuse a 64-bit integer sum that could wrap.
+      throw_if_int64_sum_could_overflow(input_table.column(aggregate_idx[i]), stream, mr);
+    }
     int aggregate_col_id;
     if (has_struct_col_indices && !aggregate_struct_col_indices[i].empty()) {
       // Multi-column COLLECT_SET: use a unique synthetic negative key for this slot.

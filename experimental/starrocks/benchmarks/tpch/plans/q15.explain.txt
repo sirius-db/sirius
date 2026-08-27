@@ -1,0 +1,138 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:19: s_suppkey | 20: s_name | 21: s_address | 23: s_phone | 43: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  22:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 28: l_suppkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    UNPARTITIONED
+
+  21:SORT
+  |  order by: <slot 19> 19: s_suppkey ASC
+  |  offset: 0
+  |  
+  20:Project
+  |  <slot 19> : 19: s_suppkey
+  |  <slot 20> : 20: s_name
+  |  <slot 21> : 21: s_address
+  |  <slot 23> : 23: s_phone
+  |  <slot 43> : 43: sum
+  |  
+  19:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  colocate: false, reason: 
+  |  equal join conjunct: 19: s_suppkey = 28: l_suppkey
+  |  
+  |----18:Project
+  |    |  <slot 28> : 28: l_suppkey
+  |    |  <slot 43> : 43: sum
+  |    |  
+  |    17:HASH JOIN
+  |    |  join op: INNER JOIN (BROADCAST)
+  |    |  colocate: false, reason: 
+  |    |  equal join conjunct: 43: sum = 62: max
+  |    |  
+  |    |----16:EXCHANGE
+  |    |    
+  |    6:AGGREGATE (merge finalize)
+  |    |  output: sum(43: sum)
+  |    |  group by: 28: l_suppkey
+  |    |  having: 43: sum IS NOT NULL
+  |    |  
+  |    5:EXCHANGE
+  |    
+  1:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: UNPARTITIONED
+
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    UNPARTITIONED
+
+  15:AGGREGATE (merge finalize)
+  |  output: max(62: max)
+  |  group by: 
+  |  having: 62: max IS NOT NULL
+  |  
+  14:EXCHANGE
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 46: l_suppkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    UNPARTITIONED
+
+  13:AGGREGATE (update serialize)
+  |  output: max(61: sum)
+  |  group by: 
+  |  
+  12:Project
+  |  <slot 61> : 61: sum
+  |  
+  11:AGGREGATE (merge finalize)
+  |  output: sum(61: sum)
+  |  group by: 46: l_suppkey
+  |  
+  10:EXCHANGE
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    HASH_PARTITIONED: 46: l_suppkey
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(60: expr)
+  |  group by: 46: l_suppkey
+  |  
+  8:Project
+  |  <slot 46> : 46: l_suppkey
+  |  <slot 60> : CAST(49: l_extendedprice AS DECIMAL128(15,2)) * CAST(1 - CAST(50: l_discount AS DECIMAL64(16,2)) AS DECIMAL128(16,2))
+  |  
+  7:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    HASH_PARTITIONED: 28: l_suppkey
+
+  4:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(42: expr)
+  |  group by: 28: l_suppkey
+  |  
+  3:Project
+  |  <slot 28> : 28: l_suppkey
+  |  <slot 42> : CAST(31: l_extendedprice AS DECIMAL128(15,2)) * CAST(1 - CAST(32: l_discount AS DECIMAL64(16,2)) AS DECIMAL128(16,2))
+  |  
+  2:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 6
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: 19: s_suppkey
+
+  0:FileScanNode
+     BROKER: 

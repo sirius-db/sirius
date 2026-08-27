@@ -238,23 +238,31 @@ impl DescriptorTable {
 
     /// Builds the Substrait schema for a StarRocks tuple.
     pub fn named_struct(&self, tuple_id: i32) -> Result<NamedStruct> {
-        let (names, types): (Vec<_>, Vec<_>) = self
-            .materialized_slot_ids(tuple_id)?
-            .into_iter()
-            .map(|slot_id| {
+        self.named_struct_for_tuples(&[tuple_id])
+    }
+
+    /// Builds the Substrait schema for a row layout spanning one or more tuples.
+    ///
+    /// Names and types both come from the descriptor table. An exchange read rewrites both
+    /// afterwards — its columns are the sender's, which a partial-state expansion can make
+    /// wider than the receiver's tuple (see `node_translator::translate_exchange`).
+    pub(crate) fn named_struct_for_tuples(&self, tuple_ids: &[i32]) -> Result<NamedStruct> {
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        for &tuple_id in tuple_ids {
+            for slot_id in self.materialized_slot_ids(tuple_id)? {
                 let slot = self.slot(tuple_id, slot_id)?;
-                let substrait_type =
+                names.push(slot.output_name());
+                types.push(
                     slot.substrait_type
                         .clone()
                         .ok_or(TranslateError::MissingField {
                             context: "materialized TSlotDescriptor",
                             field: "slotType",
-                        })?;
-                Ok((slot.output_name(), substrait_type))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .unzip();
+                        })?,
+                );
+            }
+        }
 
         Ok(NamedStruct {
             names,
@@ -269,7 +277,18 @@ impl DescriptorTable {
     /// Resolves a StarRocks `(tuple id, slot id)` to its zero-based field index in `row_tuples`.
     ///
     /// The tuple id comes from the `TSlotRef` and disambiguates slots: ids are unique only within
-    /// a tuple, so the same slot id can name different columns in different tuples.
+    /// a tuple, so the same slot id can name different columns in different tuples. It is NOT
+    /// authoritative, though — StarRocks' BE resolves slot refs by slot id alone (the tuple id is
+    /// only consulted by `is_bound`), and the FE relies on that: `buildAggregateTuple` never
+    /// rebinds `colRefToExpr` for grouping columns, so nodes above a multi-stage aggregation keep
+    /// naming them by the tuple they had below it (the TPC-H q16 shape). New-optimizer slot ids
+    /// are query-wide `ColumnRefOperator` ids, so the same id in another of the row's tuples is
+    /// the same column.
+    ///
+    /// Resolution rule: an exact `(tuple, slot)` match wins; otherwise, if exactly one tuple in
+    /// `row_tuples` carries the slot id, resolve to it (reproducing BE semantics). Zero
+    /// candidates is a descriptor error; more than one is too — a fallback two tuples could
+    /// satisfy is a guess, not a resolution.
     pub fn slot_global_index(
         &self,
         tuple_id: i32,
@@ -277,21 +296,32 @@ impl DescriptorTable {
         row_tuples: &[i32],
     ) -> Result<usize> {
         let mut offset = 0;
+        let mut by_slot_id = Vec::new();
         for &candidate_tuple in row_tuples {
             let materialized = self.materialized_slot_ids(candidate_tuple)?;
-            if candidate_tuple == tuple_id
-                && let Some(index) = materialized
-                    .iter()
-                    .position(|candidate| *candidate == slot_id)
+            if let Some(index) = materialized
+                .iter()
+                .position(|candidate| *candidate == slot_id)
             {
-                return Ok(offset + index);
+                if candidate_tuple == tuple_id {
+                    return Ok(offset + index);
+                }
+                by_slot_id.push(offset + index);
             }
             offset += materialized.len();
         }
 
-        Err(TranslateError::descriptor(format!(
-            "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
-        )))
+        match by_slot_id.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
+            ))),
+            _ => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}, and {} \
+                 of those tuples carry a slot {slot_id} to fall back on",
+                by_slot_id.len()
+            ))),
+        }
     }
 
     /// Returns the Substrait named-table path for a tuple's backing table.
@@ -398,6 +428,36 @@ mod tests {
         let desc = two_tuple_desc();
         // Slot 3 lives in tuple 1, which is absent from this row layout.
         let err = desc.slot_global_index(1, 3, &[0]).unwrap_err();
+        assert!(matches!(err, TranslateError::Descriptor(_)));
+    }
+
+    /// A slot ref naming a tuple absent from the row still resolves when exactly one row tuple
+    /// carries its slot id — the TPC-H q16 shape, where `buildAggregateTuple` leaves grouping
+    /// columns bound to the tuple below the aggregation.
+    #[test]
+    fn slot_global_index_falls_back_to_the_slot_id_across_tuples() {
+        let desc = two_tuple_desc();
+        // Refs stale-bound to tuple 0 resolve against a row of [1] by slot id alone.
+        assert_eq!(desc.slot_global_index(0, 3, &[1]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(0, 4, &[1]).unwrap(), 1);
+    }
+
+    /// A fallback two tuples could satisfy is a guess, not a resolution — it must fail loudly.
+    #[test]
+    fn slot_global_index_refuses_an_ambiguous_slot_id_fallback() {
+        // Tuples 0 and 1 both carry a slot 1.
+        let desc_tbl = TDescriptorTable::new(
+            Some(vec![slot(1, 0, 0, "a"), slot(1, 1, 0, "x")]),
+            vec![
+                TTupleDescriptor::new(Some(0), None, None, None, None),
+                TTupleDescriptor::new(Some(1), None, None, None, None),
+            ],
+            None,
+            None,
+        );
+        let desc = DescriptorTable::try_from(&desc_tbl).unwrap();
+
+        let err = desc.slot_global_index(2, 1, &[0, 1]).unwrap_err();
         assert!(matches!(err, TranslateError::Descriptor(_)));
     }
 

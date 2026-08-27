@@ -40,7 +40,8 @@ constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
 //
 // Rules:
 //   TINYINT / SMALLINT / INTEGER → INT64   (all sub-64-bit integers → canonical 64-bit)
-//   BIGINT / BOOLEAN / VARCHAR   → EMPTY   (already canonical; hash as-is)
+//   BIGINT / BOOLEAN / VARCHAR / DOUBLE → EMPTY (already canonical; hash as-is)
+//   FLOAT                        → FLOAT64 (sub-64-bit float → canonical 64-bit)
 //   DECIMAL (any precision/scale) → FLOAT64 (normalized floating representation)
 //   anything else                → throw
 cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
@@ -51,12 +52,14 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
     case sirius::type_id::INTEGER: return cudf::data_type{cudf::type_id::INT64};
     case sirius::type_id::BIGINT:
     case sirius::type_id::BOOLEAN:
-    case sirius::type_id::VARCHAR: return cudf::data_type{cudf::type_id::EMPTY};
+    case sirius::type_id::VARCHAR:
+    case sirius::type_id::DOUBLE: return cudf::data_type{cudf::type_id::EMPTY};
+    case sirius::type_id::FLOAT:
     case sirius::type_id::DECIMAL: return cudf::data_type{cudf::type_id::FLOAT64};
     default:
       throw sirius::invalid_input_exception(
-        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, and "
-        "decimal columns may be used as hash partition keys");
+        "streaming_fragment: unsupported partition key type — only integer, boolean, varchar, "
+        "float, and decimal columns may be used as hash partition keys");
   }
 }
 

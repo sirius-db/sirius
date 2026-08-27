@@ -1,0 +1,84 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:18: count | 19: count
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  13:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 18: count
+
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    UNPARTITIONED
+
+  12:SORT
+  |  order by: <slot 19> 19: count DESC, <slot 18> 18: count DESC
+  |  offset: 0
+  |  
+  11:AGGREGATE (merge finalize)
+  |  output: count(19: count)
+  |  group by: 18: count
+  |  
+  10:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 10: o_custkey
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    HASH_PARTITIONED: 18: count
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: count(*)
+  |  group by: 18: count
+  |  
+  8:Project
+  |  <slot 18> : 18: count
+  |  
+  7:AGGREGATE (update finalize)
+  |  output: count(9: o_orderkey)
+  |  group by: 1: c_custkey
+  |  
+  6:Project
+  |  <slot 1> : 1: c_custkey
+  |  <slot 9> : 9: o_orderkey
+  |  
+  5:HASH JOIN
+  |  join op: RIGHT OUTER JOIN (PARTITIONED)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 10: o_custkey = 1: c_custkey
+  |  
+  |----4:EXCHANGE
+  |    
+  2:EXCHANGE
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    HASH_PARTITIONED: 1: c_custkey
+
+  3:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 10: o_custkey
+
+  1:Project
+  |  <slot 9> : 9: o_orderkey
+  |  <slot 10> : 10: o_custkey
+  |  
+  0:FileScanNode
+     BROKER: 

@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <vector>
 
@@ -501,6 +502,456 @@ TEST_CASE_METHOD(fragment_fixture,
                             << " tasks_completed=" << completed);
 
     REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-6: a join fragment where one input stream closes empty before run().
+// The CN flow delivers and closes ALL exchange input before run(); a stream
+// whose rows all hashed to the other CN closes with zero batches. The join
+// must still run to completion with an empty result — not wedge waiting on
+// the side that will never produce (TPC-H q07 hang shape: one empty input
+// among several live ones).
+// ============================================================================
+
+namespace {
+
+//! Turns a wedged run() into a loud failure: the engine-side scheduling watchdog
+//! (SIRIUS_QUERY_WATCHDOG_SECS) fails a query with no scheduling progress, and
+//! streaming_fragment::run() rethrows it — so a hang fails in seconds instead of
+//! blocking the suite forever.
+struct watchdog_guard {
+  explicit watchdog_guard(const char* secs) { setenv("SIRIUS_QUERY_WATCHDOG_SECS", secs, 1); }
+  ~watchdog_guard() { unsetenv("SIRIUS_QUERY_WATCHDOG_SECS"); }
+  watchdog_guard(const watchdog_guard&)            = delete;
+  watchdog_guard& operator=(const watchdog_guard&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-6: a join whose input stream closes empty before run() completes",
+                 "[integration][streaming_fragment][empty_input_join]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  constexpr const char* kJoinQuery =
+    "SELECT l.a, r.b FROM sirius_stream_source(0) l JOIN sirius_stream_source(1) r ON l.a = r.b";
+
+  // Which input closes empty. Both directions are covered because the Sirius planner may swap
+  // the join's build/probe sides (both stream sources estimate cardinality 1), and nothing
+  // guarantees which side of the exchange starves first in a cluster.
+  stream_id_t empty_stream = 1;
+  SECTION("build side closes empty") { empty_stream = 1; }
+  SECTION("probe side closes empty") { empty_stream = 0; }
+  stream_id_t const live_stream = empty_stream == 1 ? 0 : 1;
+
+  watchdog_guard watchdog("20");
+
+  con->BeginTransaction();
+  try {
+    // Sender: real batches for the live side.
+    fragment_spec sender_spec;
+    sender_spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+    sender_spec.outputs     = {0};
+    streaming_fragment sender(*con->context, std::move(sender_spec));
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(kJoinQuery);
+    receiver_spec.inputs[0]   = stream_input_spec{
+        {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+        {0}};
+    receiver_spec.inputs[1] = stream_input_spec{
+      {"b"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      {0}};
+    receiver_spec.outputs = {2};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    {
+      query_window sender_window(*sirius_ctx, *con->context, "frag6_sender");
+      sender.build(sender_window.query_id());
+      sender.run();
+      sender_window.finish();
+    }
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag6_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // The CN arrival order: every batch lands and every input closes before run().
+    std::size_t relayed_batches = 0;
+    while (auto batch = sender.session().pull(0)) {
+      REQUIRE(receiver.session().push(live_stream, *batch));
+      ++relayed_batches;
+    }
+    REQUIRE(relayed_batches > 0);
+    receiver.session().close_input(live_stream, 0);
+    // The empty side: closed without ever carrying a batch.
+    receiver.session().close_input(empty_stream, 0);
+
+    receiver.run();
+    receiver_window.finish();
+
+    // An inner join against an empty side yields no rows — but it must yield.
+    REQUIRE(drain_row_count(receiver, 2) == 0);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-7: the q07 hang shape — a join CASCADE where the empty stream feeds the
+// build side of an upper join whose probe side is another join's output, not a
+// stream source. All input arrives and closes pre-run; only one stream is
+// empty. FRAG-6 covers the empty stream feeding a join directly; here the
+// probe rows only materialize while the query is running, after the empty
+// build side already finished.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-7: a join cascade completes when an upper build stream closes empty",
+                 "[integration][streaming_fragment][empty_input_join]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  // Optimizer disabled, so the join tree stays left-deep as written: ((a JOIN b) JOIN c) with
+  // c — the empty stream — as the build side of the upper join.
+  constexpr const char* kCascadeQuery =
+    "SELECT a.x, c.z FROM sirius_stream_source(0) a "
+    "JOIN sirius_stream_source(1) b ON a.x = b.y "
+    "JOIN sirius_stream_source(2) c ON a.x = c.z";
+
+  watchdog_guard watchdog("20");
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&]() {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto int_types = [] {
+      return sirius::from_duckdb_vec(
+        duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER});
+    };
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(kCascadeQuery);
+    receiver_spec.inputs[0]   = stream_input_spec{{"x"}, int_types(), {0}};
+    receiver_spec.inputs[1]   = stream_input_spec{{"y"}, int_types(), {0}};
+    receiver_spec.inputs[2]   = stream_input_spec{{"z"}, int_types(), {0}};
+    receiver_spec.outputs     = {3};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    // Senders run first, each in its own window; their output repositories survive the
+    // window cleanup, so the batches are still parked for the relay below.
+    auto first  = make_sender();
+    auto second = make_sender();
+    for (auto* sender : {first.get(), second.get()}) {
+      query_window sender_window(*sirius_ctx, *con->context, "frag7_sender");
+      sender->build(sender_window.query_id());
+      sender->run();
+      sender_window.finish();
+    }
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag7_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // Live streams 0 and 1 get real batches; stream 2 closes without ever carrying one.
+    for (auto [sender, live] : {std::pair{first.get(), stream_id_t{0}},
+                                std::pair{second.get(), stream_id_t{1}}}) {
+      std::size_t relayed = 0;
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(live, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed > 0);
+      receiver.session().close_input(live, 0);
+    }
+    receiver.session().close_input(2, 0);
+
+    receiver.run();
+    receiver_window.finish();
+
+    // The empty build side annihilates the cascade — zero rows, but delivered.
+    REQUIRE(drain_row_count(receiver, 3) == 0);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-8: the full q07-cn1 fragment shape. Lower join: probe stream carries
+// real fan-in batches, build stream closes EMPTY. Upper join: build stream
+// carries one real batch, probe side is the (empty) lower join result. A
+// grouped aggregate sits on top and the sink hash-partitions to two
+// destinations. All input arrives and closes before run(), exactly the CN
+// arrival order. Every piece passed alone (FRAG-6/7); q07 hangs with them
+// composed.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-8: the q07 fragment shape completes when the lower build stream is empty",
+                 "[integration][streaming_fragment][empty_input_join]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  // Mirrors the hung fragment on cn1 (streams 14/16/20 -> 24):
+  //   Aggregate[group, sum]
+  //     Join2[Inner f.k2 = n2.b]        <- build (n2) has ONE batch
+  //       Join1[Inner f.k1 = n1.a]      <- build (n1) closed EMPTY
+  //         f  (probe: fan-in, 2 senders x multiple batches)
+  //         n1
+  //       n2
+  constexpr const char* kQ07Shape =
+    "SELECT n1.a AS g1, n2.b AS g2, sum(f.v) AS s "
+    "FROM sirius_stream_source(0) f "
+    "JOIN sirius_stream_source(1) n1 ON f.k1 = n1.a "
+    "JOIN sirius_stream_source(2) n2 ON f.k2 = n2.b "
+    "GROUP BY n1.a, n2.b";
+
+  constexpr const char* kProbeQuery =
+    "SELECT a AS v, a AS k1, a AS k2 FROM (VALUES (1), (2), (3), (4), (5)) t(a)";
+
+  watchdog_guard watchdog("20");
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const char* query) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(query);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto int_types = [](std::size_t n) {
+      duckdb::vector<duckdb::LogicalType> t(n, duckdb::LogicalType::INTEGER);
+      return sirius::from_duckdb_vec(t);
+    };
+
+    // Senders first: their windows may not nest inside the receiver's.
+    auto probe_a = make_sender(kProbeQuery);  // fan-in sender 0 of stream 0
+    auto probe_b = make_sender(kProbeQuery);  // fan-in sender 1 of stream 0
+    auto n2      = make_sender(kLeafQuery);   // the one real batch for stream 2
+    for (auto* sender : {probe_a.get(), probe_b.get(), n2.get()}) {
+      query_window sender_window(*sirius_ctx, *con->context, "frag8_sender");
+      sender->build(sender_window.query_id());
+      sender->run();
+      sender_window.finish();
+    }
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(kQ07Shape);
+    receiver_spec.inputs[0]   = stream_input_spec{{"v", "k1", "k2"}, int_types(3), {0, 1}};
+    receiver_spec.inputs[1]   = stream_input_spec{{"a"}, int_types(1), {0}};
+    receiver_spec.inputs[2]   = stream_input_spec{{"b"}, int_types(1), {0}};
+    receiver_spec.outputs     = {3, 4};
+    receiver_spec.partitioning = sirius::op::partition_spec{{0, 1}};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag8_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // CN arrival order: all pushes, then all closes, then run().
+    for (auto [sender, sender_id] :
+         {std::pair{probe_a.get(), sender_id_t{0}}, std::pair{probe_b.get(), sender_id_t{1}}}) {
+      std::size_t relayed = 0;
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(0, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed > 0);
+      receiver.session().close_input(0, sender_id);
+    }
+    receiver.session().close_input(1, 0);  // n1: closed without ever carrying a batch
+    {
+      std::size_t relayed = 0;
+      while (auto batch = n2->session().pull(0)) {
+        REQUIRE(receiver.session().push(2, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed == 1);
+      receiver.session().close_input(2, 0);
+    }
+
+    receiver.run();
+    receiver_window.finish();
+
+    // The empty n1 build annihilates everything above it: both partitions deliver zero rows.
+    REQUIRE(drain_row_count(receiver, 3) + drain_row_count(receiver, 4) == 0);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-9: FRAG-8 with full q07 fidelity — real types (fp64 / DATE / VARCHAR),
+// the OR residual on the upper join, year() in the projection, a 3-key
+// grouped sum, and a real-volume parquet probe. The volume is what matters:
+// the planner sizes the folded ~33 MB lineitem side as the lower join's BUILD
+// (too big for the small-table broadcast threshold, so BUILD_PROBE runs
+// non-broadcast) and the EMPTY nation stream becomes its PROBE. Before the
+// build-only-slot discard was extended past broadcast mode, that slot held
+// its build batch forever, select_build_probe_action answered wait_for_probe
+// against the finished-empty probe producer, and the fragment hung — the
+// TPC-H q07 2-CN wedge this test reproduces (~33 s hang, 3/3 deterministic).
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-9: the faithful q07 fragment completes when a probe stream closes empty",
+                 "[integration][streaming_fragment][empty_input_join]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  auto const parquet = lineitem_parquet_path();
+  REQUIRE(fs::exists(parquet));
+
+  // The exact hung plan on cn1 (streams 14/16/20 -> 24), keys synthesized from lineitem:
+  //   Aggregate[n1name, n2name, year => sum(price * (1 - discount))]
+  //     Join2[Inner c_nationkey = n2key AND (FRANCE/GERMANY OR GERMANY/FRANCE)]
+  //       Join1[Inner s_nationkey = n1key]   <- n1 stream EMPTY; the planner sizes the folded
+  //                                             lineitem side as this join's build, so the empty
+  //                                             stream is its PROBE
+  constexpr const char* kQ07 =
+    "SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation, year(f.l_shipdate) AS l_year, "
+    "sum(f.l_extendedprice * (1 - f.l_discount)) AS revenue "
+    "FROM sirius_stream_source(0) f "
+    "JOIN sirius_stream_source(1) n1 ON f.s_nationkey = n1.n_nationkey "
+    "JOIN sirius_stream_source(2) n2 ON f.c_nationkey = n2.n_nationkey AND "
+    "((n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') OR "
+    " (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')) "
+    "GROUP BY n1.n_name, n2.n_name, year(f.l_shipdate)";
+
+  auto const probe_query =
+    "SELECT CAST(l_extendedprice AS DOUBLE) AS l_extendedprice, "
+    "CAST(l_discount AS DOUBLE) AS l_discount, l_shipdate, "
+    "CAST(l_suppkey % 25 AS INTEGER) AS s_nationkey, "
+    "CAST(l_orderkey % 25 AS INTEGER) AS c_nationkey "
+    "FROM read_parquet('" +
+    parquet.string() + "')";
+
+  constexpr const char* kNationQuery =
+    "SELECT * FROM (VALUES (2, 'GERMANY'), (7, 'FRANCE')) t(n_nationkey, n_name)";
+
+  watchdog_guard watchdog("30");
+
+  con->BeginTransaction();
+  try {
+    auto make_sender = [&](const std::string& query) {
+      fragment_spec spec;
+      spec.plan_source = sirius::test::sql_plan_source(query);
+      spec.outputs     = {0};
+      return std::make_unique<streaming_fragment>(*con->context, std::move(spec));
+    };
+
+    auto probe_a = make_sender(probe_query);
+    auto probe_b = make_sender(probe_query);
+    auto n2      = make_sender(kNationQuery);
+    for (auto* sender : {probe_a.get(), probe_b.get(), n2.get()}) {
+      query_window sender_window(*sirius_ctx, *con->context, "frag9_sender");
+      sender->build(sender_window.query_id());
+      sender->run();
+      sender_window.finish();
+    }
+
+    auto probe_types = sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{
+      duckdb::LogicalType::DOUBLE,
+      duckdb::LogicalType::DOUBLE,
+      duckdb::LogicalType::DATE,
+      duckdb::LogicalType::INTEGER,
+      duckdb::LogicalType::INTEGER});
+    auto nation_types = sirius::from_duckdb_vec(
+      duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER,
+                                          duckdb::LogicalType::VARCHAR});
+
+    fragment_spec receiver_spec;
+    receiver_spec.plan_source = sirius::test::sql_plan_source(kQ07);
+    receiver_spec.inputs[0]   = stream_input_spec{
+        {"l_extendedprice", "l_discount", "l_shipdate", "s_nationkey", "c_nationkey"},
+      probe_types,
+        {0, 1}};
+    receiver_spec.inputs[1] = stream_input_spec{{"n_nationkey", "n_name"}, nation_types, {0}};
+    receiver_spec.inputs[2] = stream_input_spec{{"n_nationkey", "n_name"}, nation_types, {0}};
+    receiver_spec.outputs   = {3, 4};
+    receiver_spec.partitioning = sirius::op::partition_spec{{0, 1, 2}};
+    streaming_fragment receiver(*con->context, std::move(receiver_spec));
+
+    query_window receiver_window(*sirius_ctx, *con->context, "frag9_receiver");
+    receiver.build(receiver_window.query_id());
+
+    // CN arrival order: all pushes, then all closes, then run().
+    for (auto [sender, sender_id] :
+         {std::pair{probe_a.get(), sender_id_t{0}}, std::pair{probe_b.get(), sender_id_t{1}}}) {
+      std::size_t relayed = 0;
+      while (auto batch = sender->session().pull(0)) {
+        REQUIRE(receiver.session().push(0, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed > 0);
+      receiver.session().close_input(0, sender_id);
+    }
+    receiver.session().close_input(1, 0);  // n1: closed without ever carrying a batch
+    {
+      std::size_t relayed = 0;
+      while (auto batch = n2->session().pull(0)) {
+        REQUIRE(receiver.session().push(2, *batch));
+        ++relayed;
+      }
+      REQUIRE(relayed > 0);
+      receiver.session().close_input(2, 0);
+    }
+
+    try {
+      receiver.run();
+    } catch (...) {
+      // Stall diagnostics: dump every pipeline's scheduling state before rethrowing.
+      std::cerr << "==== FRAG-9 stall pipeline dump ====\n";
+      for (const auto& pl : receiver.engine().sirius_pipelines) {
+        if (!pl) { continue; }
+        std::cerr << "pipeline " << pl->get_pipeline_id()
+                  << " finished=" << pl->is_pipeline_finished()
+                  << " created=" << pl->get_tasks_created()
+                  << " completed=" << pl->get_tasks_completed();
+        if (auto src = pl->get_source()) {
+          std::cerr << " source=" << src->get_name()
+                    << " src_ports_empty=" << src->all_ports_empty()
+                    << " src_pipeline_finished=" << src->is_source_pipeline_finished();
+        }
+        std::cerr << " ops=[";
+        for (auto& op_ref : pl->get_operators()) {
+          std::cerr << op_ref.get().get_name() << " ";
+        }
+        std::cerr << "]";
+        if (auto sink = pl->get_sink()) { std::cerr << " sink=" << sink->get_name(); }
+        std::cerr << "\n";
+      }
+      std::cerr.flush();
+      throw;
+    }
+    receiver_window.finish();
+
+    REQUIRE(drain_row_count(receiver, 3) + drain_row_count(receiver, 4) == 0);
 
     con->Rollback();
   } catch (...) {

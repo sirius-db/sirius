@@ -1,0 +1,107 @@
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:37: substring | 38: count | 39: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  17:MERGING-EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 37: substring
+
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    UNPARTITIONED
+
+  16:SORT
+  |  order by: <slot 37> 37: substring ASC
+  |  offset: 0
+  |  
+  15:AGGREGATE (merge finalize)
+  |  output: count(38: count), sum(39: sum)
+  |  group by: 37: substring
+  |  
+  14:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    HASH_PARTITIONED: 37: substring
+
+  13:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: count(*), sum(14: c_acctbal)
+  |  group by: 37: substring
+  |  
+  12:Project
+  |  <slot 14> : 14: c_acctbal
+  |  <slot 37> : substring(13: c_phone, 1, 2)
+  |  
+  11:HASH JOIN
+  |  join op: LEFT ANTI JOIN (BROADCAST)
+  |  colocate: false, reason: 
+  |  equal join conjunct: 9: c_custkey = 28: o_custkey
+  |  
+  |----10:EXCHANGE
+  |    
+  8:Project
+  |  <slot 9> : 9: c_custkey
+  |  <slot 13> : 13: c_phone
+  |  <slot 14> : 14: c_acctbal
+  |  
+  7:NESTLOOP JOIN
+  |  join op: INNER JOIN
+  |  colocate: false, reason: 
+  |  other join predicates: CAST(14: c_acctbal AS DECIMAL128(38,8)) > 25: avg
+  |  
+  |----6:EXCHANGE
+  |    
+  0:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 3
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    UNPARTITIONED
+
+  9:FileScanNode
+     BROKER: 
+
+PLAN FRAGMENT 4
+ OUTPUT EXPRS:
+  PARTITION: UNPARTITIONED
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:AGGREGATE (merge finalize)
+  |  output: avg(25: avg)
+  |  group by: 
+  |  
+  4:EXCHANGE
+
+PLAN FRAGMENT 5
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:AGGREGATE (update serialize)
+  |  output: avg(22: c_acctbal)
+  |  group by: 
+  |  
+  2:Project
+  |  <slot 22> : 22: c_acctbal
+  |  
+  1:FileScanNode
+     BROKER: 

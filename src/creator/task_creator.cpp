@@ -365,7 +365,8 @@ void task_creator::manager_loop()
       continue;
     }
 
-    auto node         = request->node;
+    auto* scheduled   = request->node;
+    auto node         = scheduled;
     auto request_kind = request->type;
     if (node == nullptr) { continue; }
 
@@ -384,6 +385,30 @@ void task_creator::manager_loop()
                               visited_pipelines.end());
       for (auto& visited : visited_pipelines) {
         visited->update_pipeline_status(false);
+      }
+
+      // A scheduled head yielded no task. Usually it is starved and a producer will wake it,
+      // but it may also be exhausted, and an exhausted head that never created a task leaves
+      // nobody to carry its pipeline's completion: every other completion signal rides on a
+      // task finishing. An input stream that ends without ever carrying a batch is exactly
+      // that -- and its end-of-stream hook fired at close time, between build() and run(),
+      // against a query and a completion handler that did not exist yet.
+      //
+      // So for a head that can never produce again -- all_ports_empty(), the same exhaustion
+      // predicate the finish condition uses -- re-run the status check here, where the query
+      // is live: it notifies a pipeline that just became finished, and re-notifies the
+      // downstream of one that was already finished before the query started. A merely
+      // starved head is left alone, so a live query pays nothing for this.
+      if (auto pipeline = scheduled->get_pipeline(); pipeline && scheduled->all_ports_empty()) {
+        pipeline->update_pipeline_status(false);
+        // A finished pipeline cascades up to the terminal one, so ask about the query rather
+        // than about this pipeline. Give the pool slot back before signalling, so a waiter on
+        // pool capacity cannot block on this thread; and nothing after the signal may touch
+        // the pipeline or its operators, because it releases execute(), which destroys them.
+        if (pipeline->is_pipeline_finished() && _task_scheduler != nullptr) {
+          { auto released = std::move(slot); }
+          _task_scheduler->complete_query_if_finished();
+        }
       }
       continue;
     }

@@ -1,0 +1,98 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 223.2
+  Memory: 71.2
+
+PLAN FRAGMENT 0(F05)
+  Fragment Cost: 176.0
+  Output Exprs:30: expr
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  10:Project
+  |  output columns:
+  |  30 <-> 100.00 * [28: sum, DECIMAL128(38,4), true] / [29: sum, DECIMAL128(38,4), true]
+  |  cardinality: 1
+  |  
+  9:AGGREGATE (merge finalize)
+  |  aggregate: sum[([28: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([29: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  8:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F04)
+  Fragment Cost: 177.25
+
+  Input Partition: HASH_PARTITIONED: 2: l_partkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  aggregate: sum[(if[([21: p_type, VARCHAR(1048576), true] LIKE 'PROMO%', [35: multiply, DECIMAL128(31,4), true], 0); args: BOOLEAN,DECIMAL128,DECIMAL128; result: DECIMAL128(31,4); args nullable: true; result nullable: true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([27: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  6:Project
+  |  output columns:
+  |  21 <-> [21: p_type, VARCHAR(1048576), true]
+  |  27 <-> clone([35: multiply, DECIMAL128(31,4), true])
+  |  35 <-> [35: multiply, DECIMAL128(31,4), true]
+  |  common expressions:
+  |  32 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  33 <-> 1 - [32: cast, DECIMAL64(16,2), true]
+  |  34 <-> cast([33: subtract, DECIMAL64(16,2), true] as DECIMAL128(16,2))
+  |  35 <-> [31: cast, DECIMAL128(15,2), true] * [34: cast, DECIMAL128(16,2), true]
+  |  31 <-> cast([6: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2))
+  |  cardinality: 1
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [2: l_partkey, INT, true] = [17: p_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (17: p_partkey), remote = true
+  |  output columns: 6, 7, 21
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [17: p_partkey, INT, true]
+  |       cardinality: 1
+  |    
+  2:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [2: l_partkey, INT, true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 17: p_partkey
+  OutPut Exchange Id: 04
+
+  3:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 3(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 2: l_partkey
+  OutPut Exchange Id: 02
+
+  1:Project
+  |  output columns:
+  |  2 <-> [2: l_partkey, INT, true]
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (2: l_partkey)

@@ -131,14 +131,26 @@ struct build_probe_decision {
   HASH_JOIN_MODE join_mode,
   double estimated_probe_to_build_ratio);
 
-/// Which broadcast slots to discard. In a broadcast join the build table is replicated to every
-/// slot but the probe side is unpartitioned, so a slot may hold build data yet never receive probe
-/// data. Once the probe upstream is finished (`probe_finished`), any slot that is still NOT_BUILT
-/// with a build batch but no probe batch will never be probed and is returned for discard. Returns
-/// empty while the probe side may still deliver data. Pure/unit-testable counterpart of
-/// discard_build_only_slots_if_probe_complete.
-[[nodiscard]] std::vector<std::size_t> broadcast_slots_to_discard(
+/// Which build-only slots to discard. A slot may hold build data yet never receive probe data:
+/// in a broadcast join the build table is replicated to every slot while the probe side is
+/// unpartitioned, and in any BUILD_PROBE join the probe upstream can finish without delivering a
+/// batch for a slot at all — the wedge a hash-partitioned exchange causes when every probe row
+/// hashed to another instance. Once the probe upstream is finished (`probe_finished`), any slot
+/// that is still NOT_BUILT with a build batch but no probe batch will never be probed and is
+/// returned for discard. Returns empty while the probe side may still deliver data.
+/// Pure/unit-testable counterpart of discard_build_only_slots_if_probe_complete.
+[[nodiscard]] std::vector<std::size_t> build_only_slots_to_discard(
   std::vector<build_probe_slot_view> const& slots, bool probe_finished);
+
+/// Which slots can never be built. Once the build upstream is finished (`build_finished`), a slot
+/// that is still NOT_BUILT with no build batch in its repo will never receive one — nothing can
+/// build it, so waiting on the (exhausted) build producer would wait forever. This is the state a
+/// hash-partitioned exchange leaves behind when every build row hashed to another instance: the
+/// build pipeline finishes with zero batches and the join must resolve the slot instead of
+/// wedging. Returns empty while the build side may still deliver data. Pure/unit-testable
+/// counterpart of resolve_never_buildable_slots.
+[[nodiscard]] std::vector<std::size_t> never_buildable_slots(
+  std::vector<build_probe_slot_view> const& slots, bool build_finished);
 
 //===----------------------------------------------------------------------===//
 // STANDARD / MIXED_JOIN partial-barrier scheduling helpers.
@@ -373,11 +385,26 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   /// scheduler (`select_build_probe_action`). Must be called with `op_state_mutex` held.
   std::vector<build_probe_slot_view> snapshot_build_probe_slots();
 
-  /// Broadcast-mode cleanup: once the probe upstream is finished, any NOT_BUILT slot that holds a
-  /// (replicated) build batch but never received probe data is discarded — its build batch is freed
-  /// on its own GPU and the slot is marked DESTROYED so the operator can complete. No-op unless
-  /// `_broadcast`. Must be called with `op_state_mutex` held.
+  /// Once the probe upstream is finished, any NOT_BUILT slot that holds a build batch but never
+  /// received probe data is discarded — its build batch is freed on its own GPU and the slot is
+  /// marked DESTROYED so the operator can complete. Applies to every BUILD_PROBE join, broadcast
+  /// or not: BUILD_PROBE-eligible join types (INNER/SEMI/LEFT/ANTI/MARK) only emit probe-derived
+  /// rows, so a slot with no probe rows and none coming produces nothing. Without this a probe
+  /// stream that closes empty leaves the build batch parked forever: no probe batch ever pairs
+  /// with it, select_build_probe_action answers wait_for_probe against a finished producer, and
+  /// the query silently wedges. Must be called with `op_state_mutex` held.
   void discard_build_only_slots_if_probe_complete();
+
+  /// The inverse cleanup: once the build upstream is finished, a NOT_BUILT slot with no build
+  /// batch can never be built (see `never_buildable_slots`). For INNER/SEMI joins an empty build
+  /// side means the partition emits nothing, so its parked probe batches are freed and the slot is
+  /// marked DESTROYED, letting the operator finish instead of waiting forever on the exhausted
+  /// build producer. Every other BUILD_PROBE-eligible type (LEFT/ANTI/MARK) must still EMIT probe
+  /// rows against an empty build — discarding would silently drop rows — so when such a slot holds
+  /// probe data its index is returned and the caller must fail the query loudly (the hint path
+  /// cannot throw: it runs on the task creator's unguarded manager thread). Returns nullopt when
+  /// no loud failure is required. Must be called with `op_state_mutex` held.
+  std::optional<std::size_t> resolve_never_buildable_slots();
 
   std::optional<task_creation_hint> get_next_task_hint() override;
 
@@ -478,6 +505,17 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   // non-movable (atomic member), so the vector is default-constructed at the target size and only
   // ever whole-move-assigned — never resized or push_back'd — so element moves are never required.
   std::vector<per_partition_build_state> _partition_build_states;
+  // Slots destroyed because their build batch can never arrive (see
+  // resolve_never_buildable_slots). Probe batches may still land in these partitions after the
+  // destroy pass (probe tasks race the hint pass), so every resolve pass re-drains them; without
+  // this a late batch would keep all_ports_empty() false forever and the pipeline could never
+  // finish. Guarded by op_state_mutex.
+  std::vector<std::size_t> _never_buildable_destroyed_slots;
+  // The mirror for the build side: slots discarded because no probe data will ever arrive for
+  // them (see discard_build_only_slots_if_probe_complete). Build batches may still land in these
+  // partitions after the discard pass (build tasks race the hint pass), so every pass re-drains
+  // them for the same all_ports_empty() reason. Guarded by op_state_mutex.
+  std::vector<std::size_t> _build_only_discarded_slots;
   //
   // Number of equality conditions after reordering; inequality conditions follow at higher indices.
   std::size_t num_equality_conditions = 0;

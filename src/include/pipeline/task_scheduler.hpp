@@ -174,6 +174,30 @@ class task_scheduler {
   void terminate_query(std::exception_ptr error);
 
   /**
+   * @brief Signal query completion if the query's terminal pipeline has finished.
+   *
+   * Completion is normally signalled by the task that finishes the terminal pipeline. A query
+   * can finish with no task ever having run — an input stream that ends without carrying a
+   * batch is the case — and then there is no task completion to carry the signal. Whoever
+   * finished a pipeline outside a task calls this; it looks at the terminal pipeline rather
+   * than the caller's, because finishing one pipeline cascades up to the terminal one.
+   */
+  void complete_query_if_finished();
+
+  /**
+   * @brief Fail the running query as stalled.
+   *
+   * Reports an error through the completion handler (first-call-wins: a query that completes
+   * concurrently keeps its real outcome) WITHOUT stopping the scheduler or draining executors —
+   * draining after an error belongs to the engine's execute() catch path, which observes the
+   * failed future. Called from the engine thread by the opt-in query watchdog (see
+   * sirius_engine::execute); never from the task creator's manager thread.
+   *
+   * @param stalled_secs How long the watchdog observed no scheduling progress, for the message.
+   */
+  void fail_stalled_query(uint64_t stalled_secs);
+
+  /**
    * @brief Drain all in-flight tasks after a query error.
    *
    * Drains the top-level task queue and waits for each GPU executor to finish

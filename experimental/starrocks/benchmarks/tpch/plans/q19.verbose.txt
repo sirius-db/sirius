@@ -1,0 +1,88 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 260.4
+  Memory: 45.6
+
+PLAN FRAGMENT 0(F05)
+  Fragment Cost: 72.0
+  Output Exprs:27: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  9:AGGREGATE (merge finalize)
+  |  aggregate: sum[([27: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  8:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F04)
+  Fragment Cost: 263.15
+
+  Input Partition: HASH_PARTITIONED: 17: p_partkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  aggregate: sum[(cast([6: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast(1 - [7: l_discount, DECIMAL64(15,2), true] as DECIMAL128(16,2))); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |  
+  6:Project
+  |  output columns:
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [17: p_partkey, INT, true] = [2: l_partkey, INT, true]
+  |  other join predicates: ((((([20: p_brand, VARCHAR(1048576), true] = 'Brand#12') AND ([23: p_container, VARCHAR(1048576), true] IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG'))) AND (([5: l_quantity, DECIMAL64(15,2), true] >= 1) AND ([5: l_quantity, DECIMAL64(15,2), true] <= 11))) AND ([22: p_size, INT, true] <= 5)) OR (((([20: p_brand, VARCHAR(1048576), true] = 'Brand#23') AND ([23: p_container, VARCHAR(1048576), true] IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK'))) AND (([5: l_quantity, DECIMAL64(15,2), true] >= 10) AND ([5: l_quantity, DECIMAL64(15,2), true] <= 20))) AND ([22: p_size, INT, true] <= 10))) OR (((([20: p_brand, VARCHAR(1048576), true] = 'Brand#34') AND ([23: p_container, VARCHAR(1048576), true] IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'))) AND (([5: l_quantity, DECIMAL64(15,2), true] >= 20) AND ([5: l_quantity, DECIMAL64(15,2), true] <= 30))) AND ([22: p_size, INT, true] <= 15))
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (2: l_partkey), remote = true
+  |  output columns: 6, 7
+  |  can local shuffle: true
+  |  cardinality: 1
+  |  
+  |----4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [2: l_partkey, INT, true]
+  |       cardinality: 1
+  |    
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [17: p_partkey, INT, true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 2: l_partkey
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  2 <-> [2: l_partkey, INT, true]
+  |  5 <-> [5: l_quantity, DECIMAL64(15,2), true]
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 1
+  |  
+  2:FileScanNode
+     BROKER: 
+     cardinality: 1
+
+PLAN FRAGMENT 3(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 17: p_partkey
+  OutPut Exchange Id: 01
+
+  0:FileScanNode
+     BROKER: 
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (17: p_partkey)

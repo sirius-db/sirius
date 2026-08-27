@@ -21,7 +21,17 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
+
+#include <sirius/exception.hpp>
+
+#include <algorithm>
+#include <cstdint>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -158,6 +168,85 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   }
 
   return result;
+}
+
+namespace {
+
+/// Magnitude of an int64 as uint64, defined for INT64_MIN too (modular negation).
+uint64_t magnitude(int64_t v)
+{
+  return v < 0 ? -static_cast<uint64_t>(v) : static_cast<uint64_t>(v);
+}
+
+}  // namespace
+
+void throw_if_int64_sum_could_overflow(const cudf::column_view& input,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
+{
+  auto const type_id = input.type().id();
+  if (type_id != cudf::type_id::INT64 && type_id != cudf::type_id::UINT64) { return; }
+  auto const valid_rows =
+    static_cast<uint64_t>(input.size()) - static_cast<uint64_t>(input.null_count());
+  // A lone 64-bit value is its own sum; nothing can wrap.
+  if (valid_rows < 2) { return; }
+  auto const [min_scalar, max_scalar] = cudf::minmax(input, stream, mr);
+  if (type_id == cudf::type_id::INT64) {
+    auto const lo = static_cast<const cudf::numeric_scalar<int64_t>&>(*min_scalar).value(stream);
+    auto const hi = static_cast<const cudf::numeric_scalar<int64_t>&>(*max_scalar).value(stream);
+    // `mag > INT64_MAX / rows` (floor division) is exactly `rows * mag > INT64_MAX`.
+    auto const mag = std::max(magnitude(lo), magnitude(hi));
+    if (mag > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / valid_rows) {
+      throw sirius::invalid_input_exception(
+        "sum over {} BIGINT values in [{}, {}] could overflow int64: DuckDB computes this sum "
+        "as HUGEINT, but cuDF has no INT128, so Sirius runs it as BIGINT and an overflow would "
+        "wrap silently. Refusing to run instead of risking a wrong result (conservative "
+        "rows * max(|min|,|max|) bound); cast the summed column to DOUBLE to accept lossy "
+        "accumulation.",
+        valid_rows,
+        lo,
+        hi);
+    }
+  } else {
+    auto const hi = static_cast<const cudf::numeric_scalar<uint64_t>&>(*max_scalar).value(stream);
+    if (hi > std::numeric_limits<uint64_t>::max() / valid_rows) {
+      throw sirius::invalid_input_exception(
+        "sum over {} UBIGINT values with max {} could overflow uint64: DuckDB computes this "
+        "sum as UHUGEINT, but cuDF has no UINT128, so Sirius runs it as UBIGINT and an "
+        "overflow would wrap silently. Refusing to run instead of risking a wrong result "
+        "(conservative rows * max bound); cast the summed column to DOUBLE to accept lossy "
+        "accumulation.",
+        valid_rows,
+        hi);
+    }
+  }
+}
+
+bool is_order_sensitive_sum(cudf::aggregation::Kind kind, cudf::data_type values_type)
+{
+  return kind == cudf::aggregation::Kind::SUM &&
+         (values_type.id() == cudf::type_id::FLOAT32 || values_type.id() == cudf::type_id::FLOAT64);
+}
+
+std::unique_ptr<cudf::table> canonicalize_row_order(
+  const cudf::table_view& input,
+  const std::vector<cudf::size_type>& sort_col_indices,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  std::vector<cudf::column_view> sort_cols;
+  sort_cols.reserve(sort_col_indices.size());
+  for (auto col_idx : sort_col_indices) {
+    sort_cols.push_back(input.column(col_idx));
+  }
+  auto sort_order =
+    cudf::sorted_order(cudf::table_view(sort_cols),
+                       std::vector<cudf::order>(sort_cols.size(), cudf::order::ASCENDING),
+                       std::vector<cudf::null_order>(sort_cols.size(), cudf::null_order::AFTER),
+                       stream,
+                       mr);
+  return cudf::gather(
+    input, sort_order->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 }
 
 }  // namespace op
