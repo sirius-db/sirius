@@ -547,7 +547,7 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     }
   }
 
-  // Aggregate-fanout partition with estimation enabled — the one case resolve_barrier wires
+  // Aggregate-fanout partition with estimation enabled — the one case input_barrier_for wires
   // PARTIAL. Tasks may start before the producer drains, but only once the count is pinned:
   // it is fixed for the operator's life, since re-sizing would route later batches to slots
   // computed under a different modulus. Until a projection exists, reproduce the FULL wait.

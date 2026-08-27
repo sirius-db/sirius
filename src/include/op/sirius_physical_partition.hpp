@@ -81,7 +81,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool is_build_partition() const;
 
   /// operator_params::enable_runtime_size_estimation, threaded in at plan generation. Read by
-  /// resolve_barrier, which relaxes this partition's ingress only when it is set.
+  /// input_barrier_for, which relaxes this partition's ingress only when it is set.
   [[nodiscard]] bool is_size_estimation_enabled() const { return _enable_size_estimation; }
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }

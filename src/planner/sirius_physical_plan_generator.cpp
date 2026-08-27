@@ -420,7 +420,8 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 
     // The aggregate-fanout partition is the one consumer of runtime size estimation today: with
     // a projected total it fixes its partition count from the first batch, which is what lets
-    // its ingress run as a PARTIAL rather than a FULL barrier (see resolve_barrier).
+    // its ingress run as a PARTIAL rather than a FULL barrier (see
+    // sirius_physical_partition::input_barrier_for).
     auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
       hgb_ptr->types,
       hgb_ptr->estimated_cardinality,
