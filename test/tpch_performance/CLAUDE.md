@@ -350,6 +350,48 @@ sqrt(Power · Throughput)`.
   insert-delta/delete-mask path that serves the refreshed rows on the GPU; the refreshed rows land
   in the delta/mask over these same columns. Parquet inputs are read-only views with no MVCC
   metadata, so they cannot be used.
+- `--pin-layout <json>` replaces the uniform `--pin` tier with a mixed-tier layout: a JSON list
+  of pin entries `{"name", "tier", "cols"?/"exclude"?}` (`cols` defaults to the table's query
+  union minus `exclude`). Scan matching is by table identity + column superset — the pin *name*
+  is just the registry key — so a schema-qualified name (`"main.orders"`) creates a second entry
+  over the same table, which is how one table's columns are tiered differently. The loader
+  validates that every queried column is pinned in some entry (a gap would silently fall through
+  to disk). The SF1000 reference layout is `bench/sf1000-repro/pin-layout-sf1000.json`:
+  lineitem + orders (minus `o_comment`) compressed GPU-tier, `main.orders` carrying
+  `{o_orderkey,o_custkey,o_comment}` host-tier for q13, the other six tables host-tier — the full
+  22-query union does **not** fit GPU-resident at SF1000 (pinned memory is not evictable;
+  q9/q13/q18 then OOM-downgrade). A qualified-name entry matches no compression-plan stem, so it
+  pins uncompressed — deliberate for `o_comment`. Split entries require the column-aware
+  plan-time entry lookup (`find_pinned_entry_for_duckdb_table` with `requested_ids` — an engine
+  change that ships separately from this harness): without it, the MVCC guard checks the first
+  identity match in name-map order, and every query whose columns live in the *other* entry
+  silently falls back to DuckDB CPU. After any layout change, grep the run's `log_dir` for
+  `Transparent execution fallback` — a scored run must have zero.
+- `SIRIUS_PRE_SQL` (same contract as `performance_test.py`) is executed after `LOAD` and before
+  any pin — e.g. `SET expression_evaluator_strategy = 'ast_jit'`. Compression settings should ride
+  the runner's own `--pin-compression`/`--compression-plan-dir` flags instead.
+- **Quent telemetry structure**: the runner labels every query (`CALL sirius_set_query_label`,
+  zero-padded `q01`..`q22`) and buckets each phase into its own telemetry query group
+  (`CALL sirius_set_session_label` — sticky per connection; engine support ships separately from
+  this harness): groups `warmup`,
+  `power_clean`, `power`, `power_postrf2`, and `tput_s1`..`tput_sN` appear per engine in the
+  Quent UI, 22 queries each. Both calls are made outside the timed window and cost the metrics
+  nothing; the runner degrades silently on an engine without the functions. Within-group
+  dropdown ordering is decided by the upstream quent UI/model (hash order today) — the
+  zero-padded names make any name-sort correct.
+- **Post-run analysis prep** (`prep_analysis_bundles.py <run_dir> <nsys_dir> <quent_dir>`):
+  after an `NSYS=1 QUENT=1` run, builds per-query bundle JSONs under `<run_dir>/bundles/`
+  (one power + one throughput bundle per query: nsys report paths, timings, quent query UUIDs)
+  and pre-exports every `.nsys-rep` to `.sqlite` in parallel so downstream analysis agents skip
+  the 10–30 s first-call export. Reports `missing_report_indices` (nsys can stop generating
+  ranges before the manifest ends — observed after 72 of 89) and the quent group list.
+- `bench/sf1000-repro/run-power.sh` wraps all of the above into the repro-parity official run:
+  patched libcudf via `LD_PRELOAD`, `ast_jit`, fused scan-filter + late-mat gates, tuned config,
+  repro compression plans, and the SF1000 mixed-tier layout. The `SIRIUS_EXP_*` gates are no-ops
+  on an engine that does not implement them (the corresponding engine PRs ship separately). Where
+  implemented: late-mat is inert on duckdb pins (the defer policy refuses non-parquet sources);
+  fused scan-filter engages on compressed GPU pins and automatically backs off on chunks carrying
+  MVCC keep-masks.
 - RF1/RF2 run as plain DuckDB CPU DML; the GPU does not execute INSERT/DELETE. The GPU serves the
   following queries from `pinned base + insert delta − delete mask`, with no CHECKPOINT between a
   refresh and the queries that observe it. The delta is re-decoded and the mask re-applied per
@@ -440,11 +482,29 @@ pixi run python test/tpch_performance/tpch_power_throughput.py \
 Key flags: `--config <yaml>` (**required** unless `SIRIUS_CONFIG_FILE` is set — the runner refuses
 to start without an explicit config; there is no default path), `--mode power|throughput|both`,
 `--streams N`, `--pin gpu|host|none` (`none` disables pinning and thereby GPU serving of refreshed
-tables — debug only), `--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
+tables — debug only), `--pin-layout <json>` (mixed-tier pin entries; see above),
+`--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
 a pinned tier), `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates`
 (per-stream qgen parameters; rejects `--validation`), `--query-dir <dir>`,
 `--validation/--no-validation` (fixed predicates only), `--baseline-pass/--no-baseline-pass`,
+`--warmup-pass/--no-warmup-pass` (burn one discarded pass so JIT/first-touch cost lands nowhere;
+recommended with `ast_jit`), `--duckdb-memory-limit <size>` (default `32GB` for the benchmark
+connection — DuckDB's default is ~80% of system RAM, which the Sirius pools already own; at
+SF1000 the unlimited default gets the process OOM-killed during pin materialization),
+`--scratch-db <path>` (reuse an existing pristine copy of `--input` after a failed attempt —
+skips the ~15 min copy at SF1000; the file is mutated and deleted unless `--keep-scratch-db`),
 `--query-timeout <s>`, `--keep-scratch-db`, `--output`.
+
+For the full repro-parity stack in one command (recommended for SF1000 scoring):
+
+```bash
+# Power + throughput + QphH with the bench/sf1000-repro performance stack
+DB=~/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
+# Power run only
+MODE=power DB=~/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
+# With Quent telemetry capture (derived config; view with `pixi run quent $QUENT_DIR`)
+QUENT=1 DB=~/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
+```
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`

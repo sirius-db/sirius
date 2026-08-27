@@ -82,6 +82,23 @@ from tpch_stream_permutations import default_streams, stream_order
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+def perf_stack_env():
+    """The environment knobs that change what a scored run measures.
+
+    Captured into run_info.txt and metrics.json so a score is attributable to
+    its exact performance stack (experimental gates, pre-SQL settings, a
+    preloaded custom libcudf).
+    """
+    keys = ["LD_PRELOAD", "SIRIUS_PRE_SQL"]
+    keys += sorted(
+        k
+        for k in os.environ
+        if k.startswith(("SIRIUS_EXP_", "SIRIUS_LATE_MAT", "SIRIUS_PIN_TIER"))
+    )
+    return {k: os.environ[k] for k in keys if os.environ.get(k)}
+
+
 # Queries that touch neither lineitem nor orders are unchanged by RF1/RF2, so
 # refresh validation skips them.
 REFRESH_INVARIANT_QUERIES = frozenset(
@@ -193,7 +210,7 @@ def _is_select(stmt):
     return stmt.lstrip().lower().startswith("select")
 
 
-def timed_query(cur, statements, timeout_s):
+def timed_query(cur, statements, timeout_s, label=None, nsys_tag=None):
     """Run one query as a single transaction; return (elapsed_s, rows).
 
     A query is timed end to end including its transaction, matching the
@@ -201,7 +218,22 @@ def timed_query(cur, statements, timeout_s):
     template sets write q15 as a view create/select/drop trio, which needs a
     writable one. Results are fetched in full because an open result holds
     Sirius's engine-wide query lock and would stall every other stream.
+
+    `label` names the query in Quent telemetry (otherwise every query shows as
+    "unnamed_query"): `sirius_set_query_label` sets a pending label on the
+    connection, consumed by the next Sirius-intercepted query — the SELECT
+    below. Set before the timer starts, so it costs the metric nothing.
+
+    `nsys_tag` (phase, qnum) brackets the query in its own nsys capture range;
+    only passed by the sequential power passes (cudaProfilerStart is
+    process-global, so concurrent streams must not use it). Start/stop sit
+    outside the timer, but an nsys-wrapped run is an analysis run — do not
+    quote its metrics as scores.
     """
+    if label:
+        cur.execute(f"CALL sirius_set_query_label('{label}')").fetchall()
+    if nsys_tag is not None:
+        _nsys_range_start(cur, *nsys_tag)
     begin = (
         "BEGIN TRANSACTION READ ONLY"
         if all(_is_select(s) for s in statements)
@@ -230,7 +262,12 @@ def timed_query(cur, statements, timeout_s):
     finally:
         if timer is not None:
             timer.cancel()
-    return time.perf_counter() - start, rows
+    elapsed = time.perf_counter() - start
+    # Range closes after the clock stops, so the stop call costs the timing
+    # nothing. On exception the range stays open — the run is aborting anyway.
+    if nsys_tag is not None:
+        _nsys_range_stop(cur)
+    return elapsed, rows
 
 
 def stream_queries(stream, args):
@@ -243,6 +280,59 @@ def stream_queries(stream, args):
     if args.vary_predicates:
         return load_stream(args.query_dir, stream, args.sf)
     return [(q, [QUERIES[f"q{q}"]]) for q in stream_order(stream)]
+
+
+# Ordered record of nsys capture ranges opened by this run (--nsys-per-query).
+# nsys `--capture-range=cudaProfilerApi --capture-range-end=repeat` numbers
+# its reports in this same order, but MERGES adjacent ranges when stop/start
+# pairs arrive faster than it can finalize a range (and can drop the last one
+# at exit), then renumbers the survivors compactly — so report index N does
+# NOT reliably equal manifest range N. Each entry therefore records the
+# wall-clock start/stop of its capture range; prep_analysis_bundles.py joins
+# surviving reports to manifest entries by these timestamps, never by index.
+# Appended only from sequential code (power passes + the main thread's
+# throughput interval), so no lock is needed.
+_NSYS_MANIFEST = []
+
+
+def _nsys_range_start(cur, phase, qnum):
+    """Open a per-query nsys capture range (cudaProfilerStart is process-global,
+    so this is only safe where exactly one query runs at a time)."""
+    cur.execute("CALL profiler_start()").fetchall()
+    # Stamped after start / before stop, so the recorded window is contained
+    # in the report's actual capture window — required by the timestamp join.
+    _NSYS_MANIFEST.append(
+        {
+            "range": len(_NSYS_MANIFEST) + 1,
+            "phase": phase,
+            "query": qnum,
+            "start_epoch_ns": time.time_ns(),
+        }
+    )
+
+
+def _nsys_range_stop(cur):
+    _NSYS_MANIFEST[-1]["stop_epoch_ns"] = time.time_ns()
+    cur.execute("CALL profiler_stop()").fetchall()
+
+
+def write_nsys_manifest(run_dir):
+    if not _NSYS_MANIFEST:
+        return
+    with open(os.path.join(run_dir, "nsys_manifest.json"), "w") as f:
+        json.dump(_NSYS_MANIFEST, f, indent=2)
+    log(f"nsys manifest: {len(_NSYS_MANIFEST)} capture ranges recorded")
+
+
+def set_session_label(cur, label):
+    """Bucket this connection's subsequent queries into their own telemetry
+    query group (`{engine}-{label}`), so each benchmark phase / throughput
+    stream shows up as its own group in the Quent UI. Sticky per connection.
+    Tolerates an engine without `sirius_set_session_label` (pre-2026-08-11)."""
+    try:
+        cur.execute(f"CALL sirius_set_session_label('{label}')").fetchall()
+    except duckdb.CatalogException:
+        pass
 
 
 def compare_rows(cpu_rows, gpu_rows):
@@ -441,9 +531,82 @@ def _evict_page_cache(path, dirty):
         log(f"  page-cache eviction skipped for {path}: {e}")
 
 
-def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
-    """Connect writable, LOAD Sirius, CHECKPOINT, pin the TPC-H tables."""
+def load_pin_layout(path):
+    """Parse and validate a --pin-layout JSON file.
+
+    The file is a list of pin entries: {"name": <pin name>, "tier": "gpu"|"host",
+    "cols": [...]} with optional "exclude": [...] subtracted from the table's
+    union columns when "cols" is omitted. The pin name doubles as the duckdb
+    table reference, so a second entry over the same table uses a qualified name
+    ("main.orders") — scan matching is by table identity + column superset, not
+    by name. This is how one table's columns are tiered differently (the SF1000
+    layout keeps orders GPU-compressed but banishes o_comment to a host entry).
+
+    Every column the 22 queries read must be pinned in some entry, otherwise
+    that table's scans silently fall through to disk — validated here.
+    """
+    with open(path) as f:
+        entries = json.load(f)
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(f"--pin-layout {path}: expected a non-empty JSON list")
+    union = union_columns_by_table()
+    covered = {t: set() for t in union}
+    resolved = []
+    for e in entries:
+        name = e["name"]
+        tier = e["tier"]
+        if tier not in ("gpu", "host"):
+            raise SystemExit(f"--pin-layout entry '{name}': tier must be gpu|host")
+        table = name.split(".")[-1]
+        if table not in union:
+            raise SystemExit(f"--pin-layout entry '{name}': unknown TPC-H table")
+        cols = e.get("cols")
+        if cols is None:
+            cols = [c for c in union[table] if c not in set(e.get("exclude", ()))]
+        unknown = set(cols) - set(union[table])
+        if unknown:
+            raise SystemExit(
+                f"--pin-layout entry '{name}': column(s) {sorted(unknown)} are "
+                "not referenced by any TPC-H query (not in the pinnable union)"
+            )
+        covered[table].update(cols)
+        resolved.append({"name": name, "tier": tier, "cols": cols})
+    missing = {
+        t: sorted(set(union[t]) - covered[t])
+        for t in union
+        if set(union[t]) - covered[t]
+    }
+    if missing:
+        raise SystemExit(
+            f"--pin-layout {path} does not cover every queried column; scans "
+            f"would fall through to disk. Missing: {missing}"
+        )
+    return resolved
+
+
+def open_benchmark_db(
+    scratch_db,
+    pin_tier,
+    compression_plan_dir=None,
+    pin_layout=None,
+    duckdb_memory_limit="32GB",
+):
+    """Connect writable, LOAD Sirius, CHECKPOINT, pin the TPC-H tables.
+
+    DuckDB sizes its default memory_limit from total system RAM with no
+    knowledge of what Sirius holds; in this process the Sirius host pool
+    (hundreds of GB at SF1000) and the GPU pool already own most of the
+    machine. Pin materialization streams the whole working set through
+    DuckDB's buffer manager, which caches up to that oversized limit — at
+    SF1000 the kernel OOM-kills the process mid-run. The benchmark connection
+    therefore gets an explicit small limit; refresh DML and count(*) checks
+    stream fine within it. (The validation child is separate by design: it
+    runs with no pinned pools and sizes itself for CPU-side queries.)
+    """
     con = duckdb.connect(scratch_db, config={"allow_unsigned_extensions": "true"})
+    if duckdb_memory_limit:
+        sql(con, f"SET memory_limit = '{duckdb_memory_limit}'")
+        log(f"DuckDB memory_limit set to {duckdb_memory_limit}")
     log(f"Loading Sirius extension from {EXTENSION_PATH}")
     sql(con, f"LOAD '{EXTENSION_PATH}'")
     sql(con, "CHECKPOINT")
@@ -454,7 +617,28 @@ def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
             con,
             f"SET pin_table_input_compression_plan_dir = '{compression_plan_dir}'",
         )
-    if pin_tier != "none":
+    pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+    if pre_sql:
+        # Same contract as performance_test.py: engine settings applied after
+        # LOAD, before any pin — e.g. expression_evaluator_strategy = 'ast_jit'.
+        log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+        for stmt in pre_sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                sql(con, stmt)
+    if pin_layout is not None:
+        # Mixed-tier layout: each entry names its own tier and column set (see
+        # load_pin_layout). Refreshed rows still land in the insert delta /
+        # delete mask over these entries, so RF1/RF2 stay visible on the GPU.
+        for e in pin_layout:
+            col_literals = ",".join(f"'{c}'" for c in e["cols"])
+            log(f"  Pinning {e['name']} ({len(e['cols'])} cols, tier={e['tier']})")
+            sql(
+                con,
+                f"CALL pin_table(format='duckdb', name='{e['name']}', "
+                f"tier='{e['tier']}', cols=[{col_literals}])",
+            )
+    elif pin_tier != "none":
         # Pin once up front, with only the columns the 22 queries actually read
         # (their union). Pinning whole tables also loads columns no TPC-H query
         # ever references — ps_comment, l_comment, o_clerk, p_comment — and at
@@ -472,13 +656,17 @@ def open_benchmark_db(scratch_db, pin_tier, compression_plan_dir=None):
     return con
 
 
-def close_benchmark_db(con, pin_tier):
+def close_benchmark_db(con, pin_tier, pin_layout=None, close=True):
     try:
-        if pin_tier != "none":
+        if pin_layout is not None:
+            for e in pin_layout:
+                sql(con, f"CALL unpin_table('{e['name']}')")
+        elif pin_tier != "none":
             for t in TPCH_TABLES:
                 sql(con, f"CALL unpin_table('{t}')")
     finally:
-        con.close()
+        if close:
+            con.close()
 
 
 def compressed_pin_count(log_dir, timeout_s=10.0):
@@ -505,17 +693,90 @@ def compressed_pin_count(log_dir, timeout_s=10.0):
     return count
 
 
+# Connections deliberately kept open by --rollback-scratch (see benchmark_db);
+# _rollback_exit's os._exit prevents their destructors from checkpointing.
+_ROLLBACK_KEEPALIVE = []
+
+
+def _rollback_exit(args, code):
+    """End a --rollback-scratch run without a clean DuckDB shutdown.
+
+    A clean close (or interpreter teardown of the kept-alive connection)
+    force-checkpoints the WAL into the base file, consuming the scratch.
+    os._exit skips both; the caller then deletes <scratch>.wal and the scratch
+    is content-pristine for the next offset-0 run.
+    """
+    if not args.rollback_scratch:
+        return
+    scratch = os.path.abspath(args.scratch_db)
+    log(
+        f"rollback-scratch: exiting without close; delete {scratch}.wal "
+        "to finish the restore (run-power.sh ROLLBACK=1 does this)"
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 @contextlib.contextmanager
 def benchmark_db(args, run_dir, filename):
     """Copy the base DB into run_dir, open it with the TPC-H tables pinned, and
     unpin/close/delete the copy on exit."""
-    scratch = os.path.join(run_dir, filename)
-    copy_database(args.input, scratch)
+    if args.scratch_db:
+        # Reuse a pristine copy from a previous attempt instead of re-copying
+        # ~SF GB (the copy takes ~15 min at SF1000, a long window for another
+        # workload to grab the GPU before our pool reservation). The file is
+        # consumed exactly like the internal copy: mutated by RF1/RF2 and
+        # deleted at the end unless --keep-scratch-db.
+        scratch = os.path.abspath(args.scratch_db)
+        if os.path.getsize(scratch) != os.path.getsize(args.input):
+            if args.update_set_offset == 0 and not args.rollback_scratch:
+                raise SystemExit(
+                    f"--scratch-db {scratch} differs in size from --input; it is "
+                    "not a pristine copy (was it mutated by an earlier run?). "
+                    "An evolved database (clause 2.8) needs --update-set-offset, "
+                    "or use --rollback-scratch runs which keep it content-pristine."
+                )
+            drift = os.path.getsize(scratch) - os.path.getsize(args.input)
+            if args.rollback_scratch and args.update_set_offset == 0:
+                # Rolled-back runs leave the file content-pristine but a little
+                # larger each time: DuckDB's optimistic writer puts bulk row
+                # groups straight into base blocks, and discarding the WAL
+                # orphans them (never reclaimed, never read). Re-copy when the
+                # drift gets large.
+                log(f"Rollback scratch: {drift:+d} bytes of orphaned-block drift")
+            else:
+                log(
+                    f"Evolved scratch (clause 2.8): size differs from pristine input "
+                    f"by {drift:+d} bytes"
+                )
+        log(f"Reusing scratch copy {scratch} (skipping copy; it will be mutated)")
+        _evict_page_cache(scratch, dirty=False)
+    else:
+        scratch = os.path.join(run_dir, filename)
+        copy_database(args.input, scratch)
     con = open_benchmark_db(
         scratch,
         args.pin,
         args.compression_plan_dir if args.pin_compression else None,
+        args.pin_layout_entries,
+        args.duckdb_memory_limit,
     )
+    if args.rollback_scratch:
+        # Keep every refresh mutation out of the base file so deleting the .wal
+        # restores the scratch: no auto-checkpoint mid-run, and no WAL-bypass
+        # for large writes (below the skip threshold DuckDB checkpoints big
+        # transactions straight into the base on commit). Database-scoped, so
+        # the refresh stream's connections inherit them. The matching "no clean
+        # close" half lives in _rollback_exit — DuckDB force-checkpoints the
+        # WAL on shutdown and has no opt-out.
+        for stmt in (
+            "SET checkpoint_threshold='1TB'",
+            "SET wal_autocheckpoint='1TB'",
+            f"SET auto_checkpoint_skip_wal_threshold={1 << 40}",
+        ):
+            sql(con, stmt)
+        log("Rollback scratch armed: WAL-only mutations, restore = delete .wal")
     try:
         if args.pin_compression:
             compressed = compressed_pin_count(os.environ["SIRIUS_LOG_DIR"])
@@ -528,7 +789,21 @@ def benchmark_db(args, run_dir, filename):
             log(f"Simpatico engaged: {compressed} pinned table(s) compressed")
         yield con
     finally:
-        close_benchmark_db(con, args.pin)
+        # Cleanup must not destroy results already earned: if the database died
+        # mid-run (e.g. fatal IO error), unpin/close raises here — and an
+        # exception escaping this finally would discard the power metrics and
+        # skip validation. Log and continue instead.
+        try:
+            close_benchmark_db(
+                con, args.pin, args.pin_layout_entries, close=not args.rollback_scratch
+            )
+        except Exception as e:  # noqa: BLE001 - reported, run results still written
+            log(f"WARNING: unpin/close failed (continuing to metrics/validation): {e}")
+        if args.rollback_scratch:
+            # The connection must never be closed (close force-checkpoints the
+            # WAL into the base); keep it alive until _rollback_exit's os._exit
+            # skips interpreter teardown and destructors.
+            _ROLLBACK_KEEPALIVE.append(con)
         if not args.keep_scratch_db:
             for f in (scratch, scratch + ".wal"):
                 if os.path.exists(f):
@@ -571,8 +846,15 @@ def power_run(con, args, run_dir, writer):
 
         def timed_pass(phase, result_name):
             times, rows_by_q = {}, {}
+            set_session_label(gpu, phase)
             for q, statements in plan:
-                elapsed, rows = timed_query(gpu, statements, args.query_timeout)
+                elapsed, rows = timed_query(
+                    gpu,
+                    statements,
+                    args.query_timeout,
+                    label=f"q{q:02d}",
+                    nsys_tag=(phase, q) if args.nsys_per_query else None,
+                )
                 times[q], rows_by_q[q] = elapsed, rows
                 with _write_lock:
                     writer.writerow([phase, 0, f"q{q}", f"{elapsed:.6f}"])
@@ -580,7 +862,8 @@ def power_run(con, args, run_dir, writer):
                 log(f"  q{q}: {elapsed:.4f}s ({len(rows)} rows)")
             return times, rows_by_q
 
-        check_refresh_matches_base(cpu, args.refresh_dir, 1)
+        power_set = args.update_set_offset + 1
+        check_refresh_matches_base(cpu, args.refresh_dir, power_set)
         counts_base = table_counts(cpu)
         log(f"Base counts: {counts_base}")
 
@@ -591,8 +874,15 @@ def power_run(con, args, run_dir, writer):
             # show up as bogus negative delta overhead. Burn one discarded pass
             # so `clean` is a warm baseline and postRF1 - clean is really RF1.
             log("=== Power: warm-up pass (discarded; not timed, not in any metric) ===")
+            set_session_label(gpu, "warmup")
             for _q, statements in plan:
-                timed_query(gpu, statements, args.query_timeout)
+                timed_query(
+                    gpu,
+                    statements,
+                    args.query_timeout,
+                    label=f"q{_q:02d}",
+                    nsys_tag=("warmup", _q) if args.nsys_per_query else None,
+                )
 
         t_clean = {}
         if args.baseline_pass:
@@ -600,14 +890,16 @@ def power_run(con, args, run_dir, writer):
             t_clean, _ = timed_pass("power_clean", "result_clean.txt")
 
         log("=== Power: RF1 (insert update set 1) ===")
-        t_rf1 = run_refresh(rf, rf1_statements(args.refresh_dir, 1), "RF1")
+        t_rf1 = run_refresh(rf, rf1_statements(args.refresh_dir, power_set), "RF1")
         with _write_lock:
             writer.writerow(["power", 0, "rf1", f"{t_rf1:.6f}"])
 
         counts_rf1 = table_counts(cpu)
-        expected_orders = count_lines(refresh_file(args.refresh_dir, "orders.tbl.u1"))
+        expected_orders = count_lines(
+            refresh_file(args.refresh_dir, f"orders.tbl.u{power_set}")
+        )
         expected_lineitem = count_lines(
-            refresh_file(args.refresh_dir, "lineitem.tbl.u1")
+            refresh_file(args.refresh_dir, f"lineitem.tbl.u{power_set}")
         )
         counts_ok = (
             counts_rf1["orders"] == counts_base["orders"] + expected_orders
@@ -623,12 +915,14 @@ def power_run(con, args, run_dir, writer):
             stash_gpu_rows(run_dir, "after_rf1", rows_p0)
 
         log("=== Power: RF2 (delete update set 1) ===")
-        t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, 1), "RF2")
+        t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, power_set), "RF2")
         with _write_lock:
             writer.writerow(["power", 0, "rf2", f"{t_rf2:.6f}"])
 
         counts_rf2 = table_counts(cpu)
-        expected_deletes = count_lines(refresh_file(args.refresh_dir, "delete.1"))
+        expected_deletes = count_lines(
+            refresh_file(args.refresh_dir, f"delete.{power_set}")
+        )
         counts_ok = (
             counts_rf2["orders"] == counts_rf1["orders"] - expected_deletes
             and counts_rf2["lineitem"] < counts_rf1["lineitem"]
@@ -685,7 +979,9 @@ def throughput_run(con, args, run_dir, writer, streams):
     check_cur = con.cursor()
     sql(check_cur, "SET gpu_execution = false")
     try:
-        check_refresh_matches_base(check_cur, args.refresh_dir, 2)
+        check_refresh_matches_base(
+            check_cur, args.refresh_dir, args.update_set_offset + 2
+        )
     finally:
         check_cur.close()
 
@@ -712,11 +1008,14 @@ def throughput_run(con, args, run_dir, writer, streams):
         try:
             cur = con.cursor()
             sql(cur, "SET gpu_execution = true")
+            set_session_label(cur, f"tput_s{i}")
             plan = stream_queries(i, args)
             barrier.wait()
             start = time.perf_counter()
             for q, statements in plan:
-                elapsed, _ = timed_query(cur, statements, args.query_timeout)
+                elapsed, _ = timed_query(
+                    cur, statements, args.query_timeout, label=f"q{q:02d}"
+                )
                 stream_times[i][f"q{q}"] = elapsed
                 with _write_lock:
                     writer.writerow(["throughput", i, f"q{q}", f"{elapsed:.6f}"])
@@ -737,7 +1036,8 @@ def throughput_run(con, args, run_dir, writer, streams):
             sql(cur, "SET gpu_execution = false")
             barrier.wait()
             for pair in range(1, streams + 1):
-                n = pair + 1  # set 1 belongs to the power run
+                # set offset+1 belongs to the power run
+                n = args.update_set_offset + pair + 1
                 t1 = run_refresh(
                     cur, rf1_statements(args.refresh_dir, n), f"RF1(set {n})"
                 )
@@ -766,6 +1066,13 @@ def throughput_run(con, args, run_dir, writer, streams):
     ]
     threads.append(threading.Thread(target=refresh_stream, name="refresh"))
     log(f"=== Throughput: {streams} query streams + 1 refresh stream ===")
+    # Per-query nsys ranges cannot interleave across concurrent streams
+    # (cudaProfilerStart/Stop is process-global), so the throughput phase gets
+    # ONE range spanning the whole measurement interval instead.
+    nsys_cur = None
+    if args.nsys_per_query:
+        nsys_cur = con.cursor()
+        _nsys_range_start(nsys_cur, "throughput_interval", 0)
     for t in threads:
         t.start()
     try:
@@ -776,6 +1083,9 @@ def throughput_run(con, args, run_dir, writer, streams):
     for t in threads:
         t.join()
     interval = time.perf_counter() - start
+    if nsys_cur is not None:
+        _nsys_range_stop(nsys_cur)
+        nsys_cur.close()
 
     if errors:
         raise RuntimeError("throughput run failed:\n  " + "\n  ".join(errors))
@@ -805,7 +1115,9 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
     out = lines.append
     out("=" * 72)
     predicates = "qgen" if args.vary_predicates else "fixed"
-    pin_label = args.pin + ("+simpatico" if args.pin_compression else "")
+    pin_label = ("layout" if args.pin_layout_entries else args.pin) + (
+        "+simpatico" if args.pin_compression else ""
+    )
     out(
         f"  TPC-H Power / Throughput — Sirius   "
         f"(SF{args.sf:g}, pin={pin_label}, predicates={predicates})"
@@ -889,6 +1201,8 @@ def write_run_info(run_dir, args, streams):
         f"sf: {args.sf:g}",
         f"streams: {streams}",
         f"pin: {args.pin}",
+        f"update_set_offset: {args.update_set_offset}",
+        f"pin_layout: {args.pin_layout or '(uniform)'}",
         f"pin_compression: {args.pin_compression}",
         f"compression_plan_dir: "
         f"{args.compression_plan_dir if args.pin_compression else '(off)'}",
@@ -900,6 +1214,7 @@ def write_run_info(run_dir, args, streams):
         f"warmup_pass: {args.warmup_pass}",
         f"config: {os.environ.get('SIRIUS_CONFIG_FILE', '(default)')}",
     ]
+    info += [f"env {k}: {v}" for k, v in perf_stack_env().items()]
     with open(os.path.join(run_dir, "run_info.txt"), "w") as f:
         f.write("\n".join(info) + "\n")
 
@@ -947,6 +1262,15 @@ def parse_args():
         default="gpu",
         help="Cache tier for the 8 TPC-H tables. 'none' disables pinning, which "
         "also disables GPU serving of refreshed tables (debug only).",
+    )
+    p.add_argument(
+        "--pin-layout",
+        type=str,
+        default=None,
+        help="JSON file of pin entries [{name, tier, cols?/exclude?}] for "
+        "mixed-tier pinning (overrides --pin for pin placement; a qualified "
+        "name like 'main.orders' makes a second entry over the same table). "
+        "Must cover every column the 22 queries read.",
     )
     p.add_argument(
         "--pin-compression",
@@ -1018,6 +1342,59 @@ def parse_args():
         action="store_true",
         help="Keep the per-phase database copies instead of deleting them",
     )
+    p.add_argument(
+        "--update-set-offset",
+        type=int,
+        default=0,
+        help="Skip the first N dbgen update sets (spec clause 2.8 database "
+        "evolution): the power run uses set N+1 and the throughput streams "
+        "N+2..N+streams+1. Lets one evolving database be reused across runs "
+        "(pass --scratch-db <shared> --keep-scratch-db) instead of copying a "
+        "pristine image per run. Requires --no-validation when non-zero (the "
+        "validation child replays set 1 on the pristine input).",
+    )
+    p.add_argument(
+        "--nsys-per-query",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Bracket every sequential power-pass query in its own nsys "
+        "capture range (run the process under `nsys profile "
+        "--capture-range=cudaProfilerApi --capture-range-end=repeat`); the "
+        "throughput phase gets one whole-interval range. Writes "
+        "nsys_manifest.json (report index -> phase/query) into the run dir. "
+        "Analysis runs only — do not quote nsys-wrapped metrics as scores.",
+    )
+    p.add_argument(
+        "--duckdb-memory-limit",
+        type=str,
+        default="32GB",
+        help="DuckDB memory_limit for the benchmark connection (default 32GB; "
+        "'' disables). DuckDB's default is ~80%% of system RAM, which the "
+        "Sirius pools already own — at SF1000 that gets the process "
+        "OOM-killed during pin materialization.",
+    )
+    p.add_argument(
+        "--scratch-db",
+        type=str,
+        default=None,
+        help="Reuse an existing PRISTINE copy of --input as the benchmark "
+        "scratch (skips the copy phase after a failed attempt). The file is "
+        "mutated by the refresh functions and deleted at the end unless "
+        "--keep-scratch-db.",
+    )
+    p.add_argument(
+        "--rollback-scratch",
+        action="store_true",
+        help="Roll the scratch back instead of consuming it: refresh mutations "
+        "are confined to the WAL (checkpoints suppressed), the process ends "
+        "without a clean close (DuckDB force-checkpoints on shutdown, no "
+        "opt-out), and deleting <scratch>.wal afterwards restores it — every "
+        "run reuses offset 0 with no 15-minute re-copy. Requires --scratch-db; "
+        "implies --keep-scratch-db. The base file keeps a little orphaned-"
+        "block drift per run (optimistic bulk writes); re-copy when it grows "
+        "large. Not for --nsys-per-query runs (os._exit can truncate the last "
+        "capture).",
+    )
     return p.parse_args()
 
 
@@ -1046,11 +1423,31 @@ def main():
 
     streams = args.streams if args.streams is not None else default_streams(args.sf)
 
+    if args.rollback_scratch:
+        if not args.scratch_db:
+            raise SystemExit("--rollback-scratch requires --scratch-db")
+        # The rollback IS the cleanup: never delete the scratch we restore.
+        args.keep_scratch_db = True
+
     # Validation diffs GPU vs CPU rows, so it needs the fixed default predicates.
     if args.vary_predicates and args.validation:
         raise SystemExit("--vary-predicates does not support --validation")
+    # The validation child replays update set 1 on a copy of the pristine
+    # --input; an evolved database (non-zero offset) makes that comparison
+    # meaningless.
+    if args.update_set_offset and args.validation:
+        raise SystemExit("--update-set-offset requires --no-validation")
     if args.validation is None:
-        args.validation = not args.vary_predicates
+        args.validation = not args.vary_predicates and not args.update_set_offset
+
+    # A mixed-tier layout replaces the uniform-tier pin placement; the layout
+    # names its own tiers, so it only conflicts with an explicit --pin none.
+    args.pin_layout_entries = None
+    if args.pin_layout:
+        if args.pin == "none":
+            raise SystemExit("--pin-layout and --pin none are contradictory")
+        args.pin_layout = os.path.abspath(args.pin_layout)
+        args.pin_layout_entries = load_pin_layout(args.pin_layout)
 
     # Simpatico compression happens at pin time, so it needs a pinned tier, and
     # it is a no-op without at least one plan file naming a TPC-H table.
@@ -1080,9 +1477,11 @@ def main():
     # Fail fast if any needed refresh set or query stream is missing.
     needed = []
     if args.mode in ("power", "both"):
-        needed.append(1)
+        needed.append(args.update_set_offset + 1)
     if args.mode in ("throughput", "both"):
-        needed.extend(range(2, streams + 2))
+        needed.extend(
+            range(args.update_set_offset + 2, args.update_set_offset + streams + 2)
+        )
     for n in needed:
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
@@ -1155,6 +1554,8 @@ def main():
             with benchmark_db(args, run_dir, "bench_throughput.duckdb") as con:
                 throughput = throughput_run(con, args, run_dir, writer, streams)
 
+    write_nsys_manifest(run_dir)
+
     # Deliberately outside the benchmark_db blocks above: the tables are
     # unpinned, the connection is closed and the pinned scratch copy is gone,
     # so the child process gets the machine to itself.
@@ -1171,6 +1572,9 @@ def main():
         "sf": args.sf,
         "streams": streams,
         "pin": args.pin,
+        "update_set_offset": args.update_set_offset,
+        "pin_layout": args.pin_layout,
+        "pin_layout_entries": args.pin_layout_entries,
         "pin_compression": args.pin_compression,
         "compression_plan_dir": (
             args.compression_plan_dir if args.pin_compression else None
@@ -1182,6 +1586,7 @@ def main():
         "commit": commit,
         "branch": branch,
         "date": datetime.now().isoformat(timespec="seconds"),
+        "perf_stack_env": perf_stack_env(),
         "power": power,
         "throughput": throughput,
         "throughput_error": throughput_error,
@@ -1206,7 +1611,10 @@ def main():
             if val.get(label):
                 failures.append(f"validation {label}: {sorted(val[label])}")
     if failures:
+        log("FAILED: " + "; ".join(failures))
+        _rollback_exit(args, 1)
         raise SystemExit("FAILED: " + "; ".join(failures))
+    _rollback_exit(args, 0)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,56 @@ pixi run bash bench/sf1000-repro/build-libcudf.sh
 DATA=/path/to/tpch_parquet_sf1000 pixi run bash bench/sf1000-repro/run.sh
 ```
 
+For the TPC-H **official power/throughput run** (RF1/RF2 refresh functions, Power@Size /
+Throughput@Size / QphH@Size) with this same performance stack, use `run-power.sh` — it runs on a
+native `.duckdb` dataset (the MVCC refresh path needs it) with the mixed-tier pin layout in
+`pin-layout-sf1000.json`. Measured 2026-08-11 (SF1000, 7 streams, GPU-vs-CPU validation PASS
+after both refresh functions): **Power@Size 7,165,616 · Throughput@Size 4,951,261 ·
+QphH@Size 5,956,411**.
+
+```bash
+pixi run bash test/tpch_performance/generate_tpch_refresh.sh 1000 9   # one-time refresh sets
+DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
+```
+
+### run-power.sh knobs
+
+All knobs are environment variables with working defaults; extra arguments after the script name
+are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--update-set-offset`).
+
+| knob | default | effect |
+|---|---|---|
+| `MODE` | `both` | `power` \| `throughput` \| `both` — which phases to run and score. |
+| `QUENT` | `0` | `1`: capture Quent telemetry via a derived config (`enable_quent`, per-run `QUENT_DIR`). Adds a small per-query overhead — leave off for record attempts. The GPU-pool probe stays on the original config so the capture never sees a second same-named engine. |
+| `NSYS` | `0` | `1`: run under nsys with per-query cudaProfilerApi repeat ranges (`--nsys-per-query`), reports + `nsys_manifest.json` under `NSYS_DIR`. Analysis runs only — never quote nsys-wrapped scores. Incompatible with `ROLLBACK=1`. |
+| `SANITIZER` | unset | `memcheck` \| `initcheck` \| `racecheck` \| `synccheck`: wrap the workload in `compute-sanitizer` (report in `SANITIZER_LOG`, exit code 99 on findings). Diagnostic runs only — 10–40× kernel overhead; never quote scores. Incompatible with `NSYS=1`. |
+| `ROLLBACK` | `0` | `1`: append `--rollback-scratch` and delete `<scratch>.wal` after the run — refresh mutations stay in the WAL, so discarding it restores the scratch DB to content-pristine without a 440 GB re-copy. Requires passing `--scratch-db <path>` in the forwarded args. |
+| `PROBE_TRIES` | `20` | Attempts (60 s apart) of the GPU-pool probe before giving up. On a shared box the pool reservation fails for minutes after another workload exits (lazy driver reclaim) — the failing LOAD itself is the only reliable gate; nvidia-smi lies. |
+| `SF`, `DB`, `REFRESH` | SF1000 paths | Scale factor, native `.duckdb` input, refresh-set directory. |
+| `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Patched libcudf to `LD_PRELOAD`, compression-plan dir, pin-layout JSON, Sirius config YAML. |
+| `SIRIUS_PRE_SQL` | `ast_jit` SET | SQL run after `LOAD`, before any pin; override for diagnosis runs (e.g. append a log-level SET). |
+
+### Diagnostics: sanitizer sweeps and concurrency gates
+
+Two ready-made verification gates drive `run-power.sh` in diagnostic configurations. Both
+refuse to start while foreign GPU work is running (`nvidia-smi` check), serialize against each
+other via `flock` on a lease file, and append one PASS/FAIL line per run to `VERIFY-LEDGER.txt`.
+
+- **`verify-memcheck-sf1.sh [tool] [streams]`** — compute-sanitizer sweep on a small-scale
+  *concurrent* repro: SF1 data, `MODE=both`, 3 streams, and `sirius-sf1-memcheck.yaml`, whose
+  tiny GPU cap (`usage_limit_fraction: 0.010`) makes the SF1000 downgrade/eviction churn regime
+  fire at SF1 sizes. The sanitizer's 10–40× overhead is irrelevant at seconds scale, and every
+  invalid device access self-identifies with a device PC + host allocation/free backtraces —
+  this exact gate caught an out-of-bounds shared-memory read inside a vendored CCCL 3.4.0
+  `DeviceScan` kernel in a single pass.
+- **`verify-poison-concurrent.sh [tag] [streams]`** — full-scale SF1000 concurrent gate
+  (`sirius-sf1000-gate.yaml`: 0.80 usage cap, heavier downgrade churn than production) with
+  CUDA exception coredumps enabled (`CUDA_ENABLE_COREDUMP_ON_EXCEPTION` + friends), so the
+  first kernel to touch bad memory is captured red-handed rather than a downstream victim.
+  It exports `SIRIUS_POISON_FREES=1`, an env-gated engine debug mode that ships separately
+  (memory-hardening PR); without it the script degrades gracefully to a concurrent stress
+  gate with coredump capture.
+
 ---
 
 ## What produces the number
