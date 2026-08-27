@@ -54,6 +54,8 @@
 
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
+#include <compression/compressed_scan.hpp>
+#include <compression/device_compressed_blob.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -72,6 +74,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -360,7 +363,9 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space& /*mem_space*/,
     rmm::cuda_stream_view /*stream*/,
     bool /*like_swar_fastpath*/,
-    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::unique_ptr<cudf::column>* /*survivors*/,
+    std::span<std::size_t const> /*elided*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }
@@ -554,6 +559,92 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
     }
     REQUIRE_FALSE(provider->get_next_batch().data);
   }
+}
+
+// Gating the attach on mask-set EMPTINESS stripped the pushdown from every
+// chunk of the table once a single refresh committed, since the set is
+// slot-sized even when every slot is default. The guard must read the slot.
+TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc mask slot",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{64};
+
+  // Two compressed GPU chunks. Unlike the fixtures above, the blob is empty but
+  // PRESENT: for_chunk reads the compressed_table (a range-only request survives
+  // that walk untouched).
+  pinned_entry entry;
+  set_cached_columns(entry, {"k", "v"});
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = e.gpu_space;
+  for (std::size_t c = 0; c < 2; ++c) {
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      std::make_shared<sirius::compressed_device_blob>(),
+      std::vector<std::string>{"k", "v"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows));
+    entry.device_chunks.push_back(std::move(chunk));
+  }
+  entry.num_rows = 2 * rows;
+
+  // The post-refresh shape: only the chunk holding deleted rows is masked.
+  sirius::scan_manager::mvcc_chunk_mask_set masks;
+  masks.push_back(make_test_mask(rows));
+  masks.push_back({});
+
+  // Range-only, so without_row_selection() leaves nothing to ask: a masked
+  // chunk attaches no scan at all, which is what makes the two cases distinct.
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].range          = sirius::decode_range{.lo = 5, .hi = 90};
+  request.ranges_cover_whole_filter = true;
+
+  std::vector<std::size_t> cols{0, 1};
+  sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
+  auto provider =
+    sirius::scan_manager::make_provider_for_pinned_entry(entry,
+                                                         cols,
+                                                         std::move(plan),
+                                                         sirius::telemetry::batch_telemetry_info{},
+                                                         masks,
+                                                         /*delta_splits=*/{},
+                                                         /*normalization_targets=*/{},
+                                                         /*has_physical_overrides=*/false,
+                                                         request);
+
+  auto const served_scan = [](databatch_provider::batch const& b) {
+    auto ro         = b.data->to_read_only();
+    auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
+    REQUIRE(rep != nullptr);
+    return rep->pushdown_scan();
+  };
+
+  // Masked: the classic decode + positional-mask path.
+  auto masked = provider->get_next_batch();
+  REQUIRE(masked.data);
+  REQUIRE(masked.mvcc_keep_mask.has_mask());
+  REQUIRE(served_scan(masked) == nullptr);
+
+  // Default slot: row dropping attached as in a mask-free pass.
+  auto clean = provider->get_next_batch();
+  REQUIRE(clean.data);
+  REQUIRE_FALSE(clean.mvcc_keep_mask.has_mask());
+  auto const scan = served_scan(clean);
+  REQUIRE(scan != nullptr);
+  REQUIRE_FALSE(scan->request().row_selection_disabled);
+  REQUIRE(scan->request().selects_rows());
+  REQUIRE(scan->request().ranges_cover_whole_filter);
+  REQUIRE(scan->request().columns.size() == 2);
+  REQUIRE(scan->request().columns[0].range.has_value());
+  REQUIRE(scan->request().columns[0].range->lo == 5);
+  REQUIRE(scan->request().columns[0].range->hi == 90);
+  REQUIRE_FALSE(scan->request().columns[1].range.has_value());
+
+  REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
 }
 
 TEST_CASE("cached provider marks only selected converting columns",

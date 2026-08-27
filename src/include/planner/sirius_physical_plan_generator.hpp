@@ -197,6 +197,9 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_delim_join(
     duckdb::LogicalComparisonJoin& op);
 
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
+    duckdb::LogicalAggregate& op);
+
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
   // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.

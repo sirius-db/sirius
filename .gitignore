@@ -36,6 +36,7 @@ cufile.log
 envs/
 compile_commands.json
 .cache
+/sirius-perf-sf1000.yaml
 .rumdl_cache/
 
 # Zed editor settings
@@ -71,5 +72,5 @@ test/tpch_performance/__pycache__/
 test/tpch_performance/output/
 test/tpch_performance/log/
 
-# Local review artifacts (not committed)
 PR_digests/
+plans/

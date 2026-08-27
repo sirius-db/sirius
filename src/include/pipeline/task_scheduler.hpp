@@ -219,7 +219,8 @@ class task_scheduler {
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  std::unique_ptr<completion_handler> _completion_handler;
+  /// Strong owner for the weak completion references held by terminal pipelines.
+  std::shared_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

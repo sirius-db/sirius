@@ -45,6 +45,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |
+| [Late Materialization](late-materialization.md) | Carrying a pin-order rowid instead of wide column values — the scan/port pair, group-by-rowid rides, riders, the pin-time uniqueness proof, and the `SIRIUS_EXP_LATE_MAT_*` gates |
 | [Dynamic Filters](dynamic-filters.md) | Ordered hash-build publication, zone-map/IN-list/Bloom consumers, multi-GPU replicas, join-edge (SIP) endpoint placement, and the refinement design that remains future work |
 | [Debugging](debugging.md) | Practical guide to debugging crashes and races — building/running with ASan & TSan, the `tsan.supp` file, and capturing/inspecting core dumps with gdb |
 

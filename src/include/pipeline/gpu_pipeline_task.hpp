@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
@@ -28,8 +29,10 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -90,6 +93,31 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
 
+  /// Request-size fallback used when an OOM does not expose the failed allocation size.
+  static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
+
+  void update_retry_reservation_floor_after_oom(std::size_t current_reservation_bytes,
+                                                std::size_t live_allocated_bytes,
+                                                std::optional<std::size_t> requested_bytes) noexcept
+  {
+    auto const request_bytes = requested_bytes.value_or(kDefaultRetryRequestBytes);
+    auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
+    next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
+    next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
+    _retry_reservation_floor = std::max(_retry_reservation_floor, next_floor);
+  }
+
+  void inherit_retry_reservation_floor(const gpu_pipeline_task_local_state& previous) noexcept
+  {
+    _retry_reservation_floor =
+      std::max(_retry_reservation_floor, previous._retry_reservation_floor);
+  }
+
+  [[nodiscard]] std::size_t get_retry_reservation_floor() const noexcept
+  {
+    return _retry_reservation_floor;
+  }
+
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
     if (_reservation_size_info) { return _reservation_size_info->input_basis; }
@@ -112,6 +140,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
 
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
+  std::size_t _retry_reservation_floor = 0;
 };
 
 /**
@@ -209,6 +238,19 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @param output_batches The data batches to publish
    */
   void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
+
+  /// Restore the sink's deferred input, if it carries a port directive.
+  ///
+  /// Split out from @ref publish_output so the caller can bound the OOM-reschedule window to the
+  /// restoration alone: a sink publishes incrementally, so an OOM inside sink() has already
+  /// committed batches and replaying its input would duplicate them.
+  std::unique_ptr<op::operator_data> materialize_sink_input(op::operator_data& output_data,
+                                                            rmm::cuda_stream_view stream);
+
+  /// Publish @p materialized (or @p output_batches when there was nothing to restore) to the sink.
+  void publish_output(op::operator_data& output_batches,
+                      op::operator_data* materialized,
+                      rmm::cuda_stream_view stream);
 
   /**
    * @brief Get the input size for this task

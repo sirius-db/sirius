@@ -34,6 +34,7 @@
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -169,6 +170,20 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        fail closed for non-query callers.
    * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
    *        evaluator a private cache.
+   * @param survivors When non-null AND this call applies a row filter here,
+   *        receives an INT32 column of the input row positions that survived,
+   *        ascending. Late materialization needs it: a filtered batch is no
+   *        longer the chunk's rows in order, so the pin-order rowid can only be
+   *        rebuilt from where the survivors were. Left untouched when the rows
+   *        were filtered somewhere this call cannot see (the decoder), which is
+   *        exactly the case a deferral must refuse rather than guess at. An
+   *        implementation that ignores it must leave @ref can_report_survivors
+   *        false.
+   * @param elided Output positions the caller is going to overwrite regardless
+   *        (a deferral's rowid and placeholders). Dropped from the selection
+   *        before it is realized, so the copy never reads them; the caller puts
+   *        columns back at those positions and restores the arity. Ignored when
+   *        it would leave nothing to size the batch by.
    * @return Filtered and projected table
    */
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
@@ -176,7 +191,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
     bool like_swar_fastpath                                           = false,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
+    std::unique_ptr<cudf::column>* survivors                          = nullptr,
+    std::span<std::size_t const> elided                               = {}) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that
@@ -185,6 +202,22 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        (pinned-cache) splits, which always reach post-filter unfiltered.
    */
   [[nodiscard]] virtual bool has_row_filter() const noexcept { return false; }
+
+  /**
+   * @brief Whether @ref post_filter_and_project actually POPULATES its
+   *        @c survivors out-parameter when one is passed.
+   *
+   * Accepting the parameter is not the same as answering it: an implementation
+   * that filters with a plain select ignores it and hands back a compacted
+   * table with no record of which rows survived. A late-materialization rowid
+   * over a filtered scan is built from exactly those positions, so a scan whose
+   * ingestible cannot report them must be refused at install rather than
+   * discovered at runtime, when the only signal left is a row count that no
+   * longer matches the pinned chunk.
+   *
+   * Defaults to FALSE so a new ingestible is refused until it opts in.
+   */
+  [[nodiscard]] virtual bool can_report_survivors() const noexcept { return false; }
 
   /// Whether @ref post_filter_and_project's assembly is a leading-identity
   /// projection: output column k is materialized column k, and no partition or

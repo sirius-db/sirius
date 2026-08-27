@@ -338,7 +338,7 @@ Concurrency is managed via `exec::bounded_thread_pool`, which uses a two-phase `
 | `_memory_space` | `memory_space*` | GPU memory for making reservations |
 | `_task_request_publisher` | `publisher<task_request>` | Channel to signal pipeline executor |
 | `_task_creator` | `task_creator*` | For scheduling downstream consumer tasks |
-| `_completion_handler` | `completion_handler*` | For signaling query completion |
+| `_completion_handler` | `completion_handler*` | For signaling query completion (the epilogue's copy; query-terminal pipelines hold one too) |
 
 ### Manager Loop
 
@@ -371,6 +371,24 @@ After a task completes:
 
 The completion check happens **before** scheduling downstream tasks to prevent scheduling tasks that reference already-destroyed operators.
 
+This epilogue is the usual signaller, but not the only one — see the completion contract below.
+
+### Completion Contract
+
+`sirius_pipeline::update_pipeline_status()` owns the transition to `pipeline_finished`. A
+query-terminal pipeline signals completion there because task-creator, streaming-source, and
+parent-cascade paths can finish a pipeline without returning through the GPU epilogue.
+
+`task_scheduler::prepare_for_query()` installs the handler on terminal pipelines as a
+`std::weak_ptr`, preventing retired pipelines from retaining or signaling a later query's handler.
+The pipeline obtains a strong reference under `_status_mutex` and calls `mark_completed()` only
+after releasing the lock and finishing all pipeline access.
+
+The GPU epilogue also keeps its completion signal. Duplicate signals are safe because
+`completion_handler` accepts only the first one. After the future resolves,
+`task_scheduler::wait_for_completion()` joins the task creator and in-flight GPU work before
+operators are destroyed.
+
 ### Task Request Flow
 
 GPU executors communicate with the pipeline executor via `exec::channel<task_request>`:
@@ -393,7 +411,8 @@ Thread-safe signaling for query completion using promise/future:
 | `get_awaitable()` | Returns the future for blocking |
 | `is_completed()` / `has_error()` | Atomic status checks |
 
-All methods are idempotent — subsequent calls after the first are no-ops.
+All methods are idempotent: the GPU epilogue and terminal pipeline may signal the same completion,
+and only the first call takes effect.
 
 ## Reschedule Handling (OOM and CUDA launch failures)
 

@@ -96,6 +96,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
@@ -136,6 +137,7 @@ extern "C" int cudaProfilerStop();
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -678,8 +680,10 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (gstate.finished) { return; }
 
   if (!gstate.res) {
-    auto start      = std::chrono::high_resolution_clock::now();
-    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto conn_state    = get_sirius_connection_state(context);
+    auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
+    auto start         = std::chrono::high_resolution_clock::now();
+    auto sirius_ctx    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
@@ -709,8 +713,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
           std::move(prepared), std::move(sirius_physical_plan));
 
-        gstate.sirius_iface = make_uniq<::sirius::sirius_interface>(context, data.query_label);
-        gstate.res          = gstate.sirius_iface->sirius_execute_query(
+        gstate.sirius_iface =
+          make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
+        gstate.res = gstate.sirius_iface->sirius_execute_query(
           context, data.query, gpu_prepared, {}, window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
@@ -1424,6 +1429,52 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     }
   }
 
+  // Late-mat uniqueness probe: which pinned columns to observe for whole-table
+  // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
+  // names outlive cache_info, which every insert path moves from.
+  auto const pinned_column_names = cache_info.column_names();
+  auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+
+  // Record what the probe proved, by name (see attach_proven_unique_columns on
+  // why not by position). A no-op when the probe was off.
+  //
+  // @p stored_columns is what the insert actually cached. A verdict describes the
+  // values this materialization read, so it may only be attached to a column those
+  // values were stored as: the GPU merge path keeps an already-cached column's
+  // previous chunks and drops the incoming ones, and marking THOSE bytes unique on
+  // the strength of bytes that were discarded is how a non-unique column becomes a
+  // group key.
+  auto attach_proven_unique = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
+                                  std::span<std::string const> stored_columns) {
+    if (verdicts.size() != pinned_column_names.size()) { return; }
+    auto const was_stored = [&](std::string const& column) {
+      return std::find(stored_columns.begin(), stored_columns.end(), column) !=
+             stored_columns.end();
+    };
+    std::vector<std::string> proven_names;
+    for (std::size_t i = 0; i < verdicts.size(); ++i) {
+      switch (verdicts[i]) {
+        case sirius::late_mat::unique_verdict::proven:
+          if (was_stored(pinned_column_names[i])) {
+            proven_names.push_back(pinned_column_names[i]);
+          }
+          break;
+        // undecided/refused/not observed: materialize_pin_batches already ran the
+        // exact stage while the values were still uncompressed, so nothing here
+        // can add to what it concluded.
+        default: break;
+      }
+    }
+    if (!proven_names.empty()) {
+      scan_mgr.attach_proven_unique_columns(data.args.name, proven_names);
+    }
+    for (auto const& n : proven_names) {
+      SIRIUS_LOG_INFO("[late-mat] pin '{}': column '{}' proven distinct table-wide (per-chunk)",
+                      data.args.name,
+                      n);
+    }
+  };
+
   auto attach_duckdb_mvcc_metadata = [&](std::vector<std::size_t> base_row_count_per_chunk) {
     if (data.args.format != "duckdb") { return; }
     sirius::scan_manager::duckdb_mvcc_metadata mvcc;
@@ -1448,7 +1499,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       pinned_column_types,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin});
+                                       .enable_compressed_materialization = compressed_pin,
+                                       .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
@@ -1463,6 +1515,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
                                       std::move(host_result.column_storage));
+    // The host path always REPLACES, so every pinned column holds this
+    // materialization's values.
+    attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
   } else if (pin_comp.enabled) {
     // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
@@ -1475,7 +1530,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       *scan_mgr.io_ctx(),
       pinned_column_types,
       pin_comp,
-      {.capture_chunk_stats = false, .enable_compressed_materialization = compressed_pin});
+      {.capture_chunk_stats               = false,
+       .enable_compressed_materialization = compressed_pin,
+       .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(dev_result.column_storage));
 
@@ -1484,27 +1541,30 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
                                         std::move(dev_result.column_storage));
+    // The compressed device path always REPLACES, as above.
+    attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat =
-      sirius::materialize_all_batches(*ingestible,
-                                      gpu_spaces_mut,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin});
+    auto mat = sirius::materialize_all_batches(*ingestible,
+                                               gpu_spaces_mut,
+                                               *scan_mgr.io_ctx(),
+                                               pinned_column_types,
+                                               {.capture_chunk_stats = capture_chunk_stats,
+                                                .enable_compressed_materialization = compressed_pin,
+                                                .probe_unique_columns = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
-    scan_mgr.insert_pinned_entry(data.args.name,
-                                 std::move(cache_info),
-                                 std::move(mat.tables),
-                                 std::move(mat.chunk_memory_spaces),
-                                 std::move(pinned_column_types),
-                                 std::move(mat.chunk_stats),
-                                 std::move(mat.column_storage));
+    auto const stored             = scan_mgr.insert_pinned_entry(data.args.name,
+                                                     std::move(cache_info),
+                                                     std::move(mat.tables),
+                                                     std::move(mat.chunk_memory_spaces),
+                                                     std::move(pinned_column_types),
+                                                     std::move(mat.chunk_stats),
+                                                     std::move(mat.column_storage));
+    attach_proven_unique(mat.unique_verdicts, stored);
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
 
@@ -1831,6 +1891,39 @@ static void SiriusVectorSearchFunction(ClientContext& context,
   state.reader->get_next_chunk(output);
 }
 
+// sirius_set_session_label('<label>'): sticky per-connection telemetry query
+// group; '' reverts to the default session group.
+static unique_ptr<FunctionData> SiriusSetSessionLabelBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_session_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetSessionLabelFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto conn_state = get_sirius_connection_state(context)) {
+    conn_state->set_session_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
@@ -1885,6 +1978,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                 SiriusSetQueryLabelBind);
   CreateTableFunctionInfo set_query_label_info(set_query_label);
   catalog.CreateTableFunction(transaction, set_query_label_info);
+
+  TableFunction set_session_label("sirius_set_session_label",
+                                  {LogicalType::VARCHAR},
+                                  SiriusSetSessionLabelFunction,
+                                  SiriusSetSessionLabelBind);
+  CreateTableFunctionInfo set_session_label_info(set_session_label);
+  catalog.CreateTableFunction(transaction, set_session_label_info);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
@@ -2328,6 +2428,29 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
                    params->enable_runtime_distinct_build_probe);
 }
 
+static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->enable_dense_count_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
+}
+
+static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->dense_count_join_max_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
+                   params->dense_count_join_max_bytes);
+}
+
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -2591,6 +2714,20 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dense_count_join",
+                    "runtime override for dense count-join planning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dense_count_join),
+                    SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_max_bytes",
+                    "internal test hook for the dense count-join histogram budget",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
+                    SetDenseCountJoinMaxBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",

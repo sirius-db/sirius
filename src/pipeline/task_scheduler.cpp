@@ -189,11 +189,20 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
   std::lock_guard lock(_query_mutex);
   _query = std::move(query);
 
-  _completion_handler = std::make_unique<completion_handler>();
+  _completion_handler = std::make_shared<completion_handler>();
 
-  // Set completion handler on all executors
+  // Executors keep raw references owned by the scheduler.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_completion_handler(_completion_handler.get());
+  }
+
+  // Terminal pipelines keep weak references so replacing the handler retires the previous query.
+  if (_query) {
+    for (auto& pipeline : _query->get_pipelines()) {
+      if (pipeline && pipeline->is_query_terminal()) {
+        pipeline->set_completion_handler(_completion_handler);
+      }
+    }
   }
 }
 
@@ -215,7 +224,12 @@ std::future<void> task_scheduler::start_query()
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
-  _completion_handler->report_error(std::move(error));
+  std::shared_ptr<completion_handler> completion;
+  {
+    std::scoped_lock lock(_query_mutex);
+    completion = _completion_handler;
+  }
+  if (completion) { completion->report_error(std::move(error)); }
   stop();
 }
 

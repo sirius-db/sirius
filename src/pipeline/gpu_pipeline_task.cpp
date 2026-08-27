@@ -17,8 +17,10 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "late_mat/port_materialize.hpp"
 #include "log/logging.hpp"
 #include "memory/defragmenter_oom_policy.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
@@ -133,7 +135,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
       if (batch.get_data()) {
         auto view = get_cudf_table_view(batch);
         batch_rows += std::to_string(view.num_rows()) + "  ";
-        total_bytes += batch.get_data()->get_size_in_bytes();
+        total_bytes = memory::saturating_add(total_bytes, batch.get_data()->get_size_in_bytes());
       }
     }
   } else {
@@ -165,6 +167,55 @@ void log_operator_data(const op::sirius_physical_operator& op,
     extra_info);
 }
 
+/// Put a deferred bundle's values back, just before the operator that reads
+/// them runs (env gate: SIRIUS_EXP_LATE_MAT, via the directive being installed).
+///
+/// Null means "use the input as it is": this operator carries no consuming half,
+/// or the batches are not the ones the directive was installed for. A port can
+/// receive batches from more than one producer, so a decline is ordinary — and
+/// declining is the only safe answer, since materializing against a stranger's
+/// batch reads arbitrary rows of the pinned table.
+std::unique_ptr<op::operator_data> materialize_deferred_input(
+  op::sirius_physical_operator const& op,
+  op::operator_data const& input_data,
+  rmm::cuda_stream_view stream)
+{
+  auto const& directive = op.port_directive();
+  if (directive.empty()) { return nullptr; }
+  auto const* input = dynamic_cast<op::pipelineable_operator_data const*>(&input_data);
+  if (input == nullptr) { return nullptr; }
+  auto const& batches = input->get_read_only_batches();
+  if (batches.empty()) { return nullptr; }
+
+  std::vector<cudf::table_view> views;
+  views.reserve(batches.size());
+  std::size_t matching = 0;
+  for (auto const& batch : batches) {
+    views.push_back(batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    matching += late_mat::port_directive_matches(directive, views.back()) ? 1 : 0;
+  }
+  if (matching == 0) { return nullptr; }
+  if (matching != batches.size()) {
+    // Some batches carry a rowid and some carry values: the operator was already
+    // being handed two different schemas, and materializing part of them would
+    // hide that rather than fix it.
+    throw std::runtime_error(
+      "[gpu_pipeline_task] operator " + std::to_string(op.get_operator_id()) +
+      " received a mix of deferred and materialized batches for one deferral");
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output;
+  output.reserve(batches.size());
+  for (std::size_t i = 0; i < batches.size(); ++i) {
+    auto* space = batches[i].get_memory_space();
+    auto restored =
+      late_mat::materialize_at_port(directive, views[i], stream, space->get_default_allocator());
+    output.push_back(
+      sirius::make_data_batch(std::move(restored), *space, stream, op.batch_telemetry()));
+  }
+  return std::make_unique<op::pipelineable_operator_data>(std::move(output));
+}
+
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
   const op::operator_data& operator_input_data,
@@ -176,13 +227,18 @@ std::unique_ptr<op::operator_data> run_one_operator(
 {
   log_operator_data(op, operator_input_data, pipeline, task_id, "executing on");
 
+  // The far end of a deferral, if this operator is one. Held for the duration of
+  // execute(): the restored columns are what the operator reads.
+  auto const materialized     = materialize_deferred_input(op, operator_input_data, stream);
+  auto const& effective_input = materialized ? *materialized : operator_input_data;
+
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
   nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
   auto start = std::chrono::high_resolution_clock::now();
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
-    operator_output_data = op.execute(operator_input_data, stream);
+    operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
     auto sticky_err = cudaGetLastError();
     if (sticky_err != cudaSuccess) {
@@ -258,7 +314,9 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
                                ro.get_memory_space()->get_id() != target_space->get_id();
-      if (non_gpu || cross_space) { input_size += peak_materialization_bytes(ro.get_data()); }
+      if (non_gpu || cross_space) {
+        input_size = memory::saturating_add(input_size, peak_materialization_bytes(ro.get_data()));
+      }
     }
   }
   return input_size;
@@ -385,13 +443,18 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       }
       size_t requested_bytes = 0;
       size_t global_usage    = 0;
+      std::optional<std::size_t> retry_requested_bytes;
       if (auto const* cc_oom =
             dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
-        requested_bytes = cc_oom->requested_bytes;
-        global_usage    = cc_oom->global_usage;
+        requested_bytes       = cc_oom->requested_bytes;
+        global_usage          = cc_oom->global_usage;
+        retry_requested_bytes = requested_bytes;
       }
       size_t reservation_bytes =
         _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
+      auto const live_allocated_bytes = _allocator ? _allocator->get_allocated_bytes(stream) : 0;
+      local_state.update_retry_reservation_floor_after_oom(
+        reservation_bytes, live_allocated_bytes, retry_requested_bytes);
       SIRIUS_LOG_WARN(
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
@@ -458,7 +521,28 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   return operator_input_output_data;
 }
 
+std::unique_ptr<op::operator_data> gpu_pipeline_task::materialize_sink_input(
+  op::operator_data& output_data, rmm::cuda_stream_view stream)
+{
+  auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto sink_operators = pipeline->get_sink();
+  if (!sink_operators) { throw std::runtime_error("Sink operator not found"); }
+  // A port can be a sink as easily as a mid-pipeline operator — q10's is a
+  // HASH_GROUP_BY — so the far end of a deferral is restored on both paths.
+  return materialize_deferred_input(*sink_operators, output_data, stream);
+}
+
 void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
+{
+  // Interface entry point: restore and publish as one step. gpu_pipeline_task::execute takes the
+  // two-step overload instead, so it can bound the OOM-reschedule window to the restoration.
+  auto materialized = materialize_sink_input(output_data, stream);
+  publish_output(output_data, materialized.get(), stream);
+}
+
+void gpu_pipeline_task::publish_output(op::operator_data& output_data,
+                                       op::operator_data* materialized,
+                                       rmm::cuda_stream_view stream)
 {
   auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto sink_operators = pipeline->get_sink();
@@ -469,7 +553,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
                                   sink_operators->get_operator_id());
     nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
-    sink_operators.get()->sink(output_data, stream);
+    sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
     auto const sink_duration =
       std::chrono::duration_cast<std::chrono::microseconds>(sink_end - sink_start);
@@ -488,7 +572,12 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto operators    = pipeline->get_operators();
-  auto& first_op    = operators[local_state._start_operator_index].get();
+  // A resume index of operators.size() (set when a prior attempt OOM'd restoring a deferral at
+  // the sink, below) means "the operator loop already ran; only the sink is left" -- there is no
+  // operators[start_index] to name in that case, so fall back to the sink for logging.
+  auto* first_op = local_state._start_operator_index < operators.size()
+                     ? &operators[local_state._start_operator_index].get()
+                     : pipeline->get_sink().get();
 
   std::string op_chain;
   auto source_op = pipeline->get_source();
@@ -547,7 +636,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     // is accurate.
     stream.synchronize();
   } catch (const rmm::out_of_memory& oom) {
-    auto peak_bytes           = allocator->get_peak_allocated_bytes(stream);
+    auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
+    std::optional<std::size_t> retry_requested_bytes;
+    if (auto const* cc_oom =
+          dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+      retry_requested_bytes = cc_oom->requested_bytes;
+    }
+    auto const live_allocated_bytes = allocator->get_allocated_bytes(stream);
+    local_state.update_retry_reservation_floor_after_oom(
+      reservation_bytes, live_allocated_bytes, retry_requested_bytes);
     const auto& res_info      = local_state.get_reservation_size_info();
     auto bytes_to_materialize = res_info->bytes_to_materialize_input;
     auto input_basis          = res_info->input_basis;
@@ -575,11 +672,13 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto const prepare_end = std::chrono::high_resolution_clock::now();
   auto const prepare_duration =
     std::chrono::duration_cast<std::chrono::microseconds>(prepare_end - prepare_start);
-  SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
-                   pipeline->get_pipeline_id(),
-                   first_op.get_name(),
-                   first_op.get_operator_id(),
-                   prepare_duration.count() / 1000.0);
+  if (first_op != nullptr) {
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) prepare execution time: {:.2f} ms",
+                     pipeline->get_pipeline_id(),
+                     first_op->get_name(),
+                     first_op->get_operator_id(),
+                     prepare_duration.count() / 1000.0);
+  }
 
   // All input batches are now locked for reading via _read_only_data_batches inside
   // local_state._input_data. The locks are released when the pipelineable_operator_data
@@ -605,7 +704,57 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   auto input_basis = local_state.get_reservation_size_info()->input_basis;
   std::unique_ptr<op::operator_data> output_data = compute_task(stream);
 
-  // Record memory metrics for future reservation estimates
+  // Restoring a deferral at the sink (materialize_deferred_input inside publish_output) can
+  // allocate as much as any mid-pipeline operator -- the restored payload, carrier casts, a copy
+  // of every passthrough column, a full decode of any touched compressed chunk -- so it gets the
+  // same OOM-reschedule coverage compute_task's operator loop already has. Resume index
+  // operators.size() means "the loop already ran; only the sink is left" (compute_task's loop is
+  // a no-op for that index, see the guard on first_op above).
+  if (output_data) {
+    // ONLY the restoration is retryable. A sink publishes incrementally — a partition writes
+    // batches to its repositories as it goes — so an OOM inside sink() has already committed
+    // some of them, and replaying the whole sink input would emit those rows twice. The
+    // reschedule window therefore closes before sink() is entered; an OOM there propagates.
+    std::unique_ptr<op::operator_data> materialized;
+    try {
+      materialized = materialize_sink_input(*output_data, stream);
+    } catch (const rmm::out_of_memory& oom) {
+      auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
+      auto const bytes_to_materialize_input =
+        local_state.get_reservation_size_info()->bytes_to_materialize_input;
+      peak_bytes =
+        peak_bytes > bytes_to_materialize_input ? peak_bytes - bytes_to_materialize_input : 0;
+      size_t requested_bytes = 0;
+      size_t global_usage    = 0;
+      if (auto const* cc_oom =
+            dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom)) {
+        requested_bytes = cc_oom->requested_bytes;
+        global_usage    = cc_oom->global_usage;
+      }
+      SIRIUS_LOG_WARN(
+        "Pipeline {}: OOM restoring a deferral at the sink, requested {} bytes ({:.2f} MB), "
+        "global usage {} bytes ({:.2f} MB), peak allocated {} bytes ({:.2f} MB), rescheduling "
+        "task {}",
+        pipeline->get_pipeline_id(),
+        requested_bytes,
+        static_cast<double>(requested_bytes) / (1024.0 * 1024.0),
+        global_usage,
+        static_cast<double>(global_usage) / (1024.0 * 1024.0),
+        peak_bytes,
+        static_cast<double>(peak_bytes) / (1024.0 * 1024.0),
+        get_task_id());
+      auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
+      global.get_memory_history().record_on_failure(input_basis, peak_bytes);
+      throw oom_reschedule_exception(
+        std::move(output_data), operators.size(), "OOM restoring a deferral at the sink");
+    }
+    publish_output(*output_data, materialized.get(), stream);
+  }
+
+  // Record memory metrics for future reservation estimates. Measured after publish_output, not
+  // before: peak_allocated_bytes is a running high-water mark for the whole stream, so recording
+  // here also captures whatever the sink's own deferral restoration allocated -- otherwise a
+  // reservation sized from this history would systematically undercount a sink port's true peak.
   if (output_data) {
     auto peak_bytes = _allocator ? _allocator->get_peak_allocated_bytes(stream) : 0;
     // Subtract the peak allocated bytes to the input data to get the peak allocated bytes for the
@@ -620,7 +769,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
       for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
-        output_bytes += batch.get_data()->get_size_in_bytes();
+        if (!batch.get_data()) { continue; }
+        output_bytes = memory::saturating_add(output_bytes, batch.get_data()->get_size_in_bytes());
       }
     }
     auto& global = _global_state->cast<gpu_pipeline_task_global_state>();
@@ -641,8 +791,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       local_state.get_reservation_size_info()->bytes_to_materialize_input);
   }
 
-  if (output_data) { publish_output(*output_data, stream); }
-
   // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
   // when compute_task replaced operator_input_output_data, releasing all shared locks.
 }
@@ -656,7 +804,8 @@ std::size_t gpu_pipeline_task::get_input_size() const
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
   for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
-    input_size += batch.get_data()->get_size_in_bytes();
+    if (!batch.get_data()) { continue; }
+    input_size = memory::saturating_add(input_size, batch.get_data()->get_size_in_bytes());
   }
   return input_size;
 }
@@ -703,6 +852,7 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   pipeline::reservation_size_info info;
   info.input_basis                = input_basis;
   info.bytes_to_materialize_input = bytes_to_materialize;
+  info.retry_reservation_floor    = ls.get_retry_reservation_floor();
   info.had_history                = peak_opt.has_value();
 
   if (peak_opt.has_value()) {
@@ -727,10 +877,13 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       }
     }
     // Preserve the task-level 2× fallback when no operator supplies a positive estimate.
-    info.peak_memory_estimate = (max_estimate > 0) ? max_estimate : (input_basis * 2);
+    info.peak_memory_estimate =
+      (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
   }
 
-  info.reservation_size = info.peak_memory_estimate + bytes_to_materialize;
+  auto const normal_reservation =
+    memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize);
+  info.reservation_size = std::max(normal_reservation, info.retry_reservation_floor);
   return info;
 }
 
