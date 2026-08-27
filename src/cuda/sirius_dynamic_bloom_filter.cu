@@ -405,21 +405,26 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (!supports(probe.type())) { return nullptr; }
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  auto const matching_key_type = std::visit(
-    [&](auto const& bloom) {
+  auto const want = std::visit(
+    [](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return probe.type().id() == key_type_id<key_type>();
+      return cudf::data_type{key_type_id<key_type>()};
     },
     replica->bloom);
-  if (!matching_key_type) { return nullptr; }
+  // A pinned chunk may store this key narrowed while the filter was published at
+  // the native carrier; restore rather than decline (see restore_probe_to). The
+  // equality below subsumes the old supports() guard: it admits exactly the two
+  // types the bloom is instantiated for.
+  auto const restored = detail::restore_probe_to(probe, want, stream, mr);
+  auto const keys     = restored ? restored->view() : probe;
+  if (keys.type() != want) { return nullptr; }
 
-  auto const n = probe.size();
+  auto const n = keys.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   cuda::stream_ref const s{stream.value()};
@@ -429,7 +434,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
+      auto const* d    = keys.data<key_type>();
       bloom->contains_async(d, d + n, outp, s);
     },
     replica->bloom);

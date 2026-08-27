@@ -368,6 +368,8 @@ struct cached_scan_plan {
 /// publish into it mid-scan); the provider snapshots it PER BATCH onto the
 /// attached scan, so later batches legitimately see more filters. Null (the
 /// default) disables it.
+/// Both are gated per chunk on @p mvcc_masks: a masked chunk gives up row
+/// dropping, while its default-slot siblings keep the decode-side pushdown.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,

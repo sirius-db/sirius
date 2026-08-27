@@ -166,6 +166,10 @@ class sirius_mask_applicable {
 
   /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
+   *
+   * A probe whose carrier is a narrowed form of the filter's key type is restored first rather
+   * than declined -- a pinned chunk may store the key narrower than the type the filter was
+   * published with (@ref sirius::op::detail::restore_probe_to).
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
