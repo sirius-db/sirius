@@ -69,13 +69,25 @@ class request_manager {
   {
     if (has_error()) {
       promise.set_exception(first_exception);
-    } else {
-      assert(bytes_read >= bytes_requested &&
-             "All chunks completed but fewer bytes were read than requested");
-      assert(chunks_completed == total_chunks &&
-             "All chunks completed but total chunks completed does not match expected");
-      promise.set_value(bytes_requested);
+      return;
     }
+    // A request abandoned mid-flight with no error reported must still fail
+    // loudly: resolving it as a success would silently hand back a buffer
+    // with unread ranges.  This is reachable (a dropped chunk, an intake
+    // path that released its reference early), so it is an error outcome,
+    // not an assert.
+    const bool complete = chunks_completed.load(std::memory_order_acquire) == total_chunks &&
+                          bytes_read.load(std::memory_order_acquire) >= bytes_requested;
+    if (!complete) {
+      promise.set_exception(std::make_exception_ptr(std::runtime_error(
+        "request_manager: internal error: request released with incomplete chunks (" +
+        std::to_string(chunks_completed.load(std::memory_order_relaxed)) + " of " +
+        std::to_string(total_chunks) + " chunks, " +
+        std::to_string(bytes_read.load(std::memory_order_relaxed)) + " of " +
+        std::to_string(bytes_requested) + " bytes)")));
+      return;
+    }
+    promise.set_value(bytes_requested);
   }
 
   void chunk_complete(std::size_t n_bytes)

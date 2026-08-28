@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -40,6 +41,17 @@ struct object_store_config {
   enum class transport { AUTO, HTTP, RDMA };
   transport s3_transport = transport::AUTO;
 
+  /// RDMA reactor sizing (transport::RDMA only). @c s3_rdma_max_inflight is the
+  /// worker count = the global in-flight ceiling (one blocking GET per worker);
+  /// the per-device landing arena is @c max_inflight × @c slot_size bytes.
+  /// Defaults are sized for a 100G link; scale bytes in flight with line rate.
+  size_t s3_rdma_max_inflight    = 8;
+  size_t s3_rdma_arena_slot_size = 4UL << 20;
+
+  /// Envelope-queue bound for the RDMA intake (logical requests). Unset
+  /// derives 4 x max_inflight after sanitizing; an explicit zero is rejected.
+  std::optional<size_t> s3_rdma_queue_cap{};
+
   /// SigV4 signing form for S3 requests. @c presigned puts auth in the URL query
   /// string (default; works everywhere AWS does). @c header puts auth in the
   /// @c Authorization header (sign_request) — for on-prem / S3-compatible stores
@@ -56,6 +68,21 @@ struct object_store_config {
   /// Verify the S3 endpoint's TLS certificate (peer + host). Default true;
   /// false disables verification — INSECURE, dev/test only.
   bool tls_verify = true;
+
+  /// The RDMA DATA-plane endpoint (transport::RDMA only): where the token
+  /// GETs go, distinct from the control endpoint above. Empty credentials
+  /// inherit the control endpoint's at use. Presigned signing is rejected on
+  /// this plane (the data plane signs extra headers into the request).
+  struct s3_data_endpoint {
+    std::string endpoint;  ///< empty = data plane not configured
+    std::string region;
+    std::string access_key;  ///< empty = inherit the control credentials
+    std::string secret_key;
+    signing_mode s3_signing_mode = signing_mode::header;
+    std::string ca_bundle_path;
+    bool tls_verify = true;
+  };
+  s3_data_endpoint s3_rdma_data;
 };
 
 inline bool string_to_enum(std::string_view sv, object_store_config::transport& t)

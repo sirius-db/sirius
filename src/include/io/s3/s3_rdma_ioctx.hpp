@@ -1,0 +1,138 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "io/object_store_config.hpp"
+#include "io/object_store_listing.hpp"
+#include "io/rdma/cuobj_rdma_reactor.hpp"
+#include "io/rdma/rdma_transport_client.hpp"
+#include "io/templated_ioctx.hpp"
+
+namespace sirius::io::s3 {
+
+/// Topology of the host-plane / RDMA-data-plane endpoint pair, judged at
+/// construction and fixed for the ioctx lifetime.  @c same_address means the
+/// two configured addresses name one service, so the cross-endpoint
+/// visibility barrier reduces to that service's read-after-write consistency.
+/// Transfer semantics are the same in both modes; the value only drives the
+/// startup log line and diagnostics.
+enum class endpoint_topology { split, same_address };
+
+/// Same-address judgment over the two endpoints: scheme and host lowercased,
+/// default ports expanded (http:80 / https:443), one trailing slash stripped,
+/// no DNS resolution.  Only a provably equal pair is @c same_address; any
+/// ambiguity, including a CNAME alias of the same service, stays @c split.
+/// The bias is deliberate: a false @c split preserves the stricter
+/// split-address requirements, while a false @c same_address would wrongly
+/// relax the contract.
+[[nodiscard]] endpoint_topology detect_endpoint_topology(std::string_view host_endpoint,
+                                                         std::string_view data_endpoint);
+
+/**
+ * @brief S3-over-RDMA ioctx. Specialisation of
+ *        @c templated_ioctx<rdma::cuobj_rdma_reactor>.
+ *
+ * Registered for the `s3://` scheme instead of the REST backend when
+ * `object_store_config::s3_transport == transport::RDMA`.  One reactor owns the
+ * whole worker pool (`s3_rdma_max_inflight` blocking workers = the global
+ * in-flight ceiling); GPU affinity lives in the per-device landing arenas, not
+ * the reactor count.  The capability profile advertises device reads but
+ * deliberately omits the staged host-to-device and vector host-read paths, so
+ * the prefetch cache is never built for this backend.
+ *
+ * A missing transport capability makes @c start() return an initialization
+ * error rather than falling back to another transport; host chunks ride the
+ * control plane and
+ * device chunks the per-worker data sessions (mocks in tests, the
+ * curl/cuObject-backed clients in production).
+ */
+class s3_rdma_ioctx final : public templated_ioctx<rdma::cuobj_rdma_reactor>,
+                            public object_store_listing {
+ public:
+  /// @p clients is the split transport bundle (control client + data-session
+  /// factory + tag predicate); @p delivery is the CUDA delivery seam.  Both
+  /// bind at construction only.  Construction never validates capabilities —
+  /// @c start() does, so a misconfigured transport is rejected on the
+  /// routing path, not at build time.
+  s3_rdma_ioctx(object_store_config cfg,
+                rdma::rdma_transport_clients clients,
+                rdma::cuda_delivery_ops delivery = {});
+
+  /// Validates the transport capabilities (control client and data-session
+  /// factory present), then starts the reactor pool; a missing capability is
+  /// an RDMA initialization error.
+  void start() override;
+
+  [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::rdma; }
+
+  /// Pool-aggregated transfer counters (single reactor today; summed if the
+  /// pool ever grows).
+  [[nodiscard]] rdma::rdma_perf_snapshot perf_snapshot() const noexcept;
+
+  /// Endpoint-pair topology, judged at construction from the configured
+  /// host-plane and data-plane endpoints; immutable for the ioctx lifetime.
+  [[nodiscard]] endpoint_topology topology() const noexcept { return _topology; }
+
+  /// LIST runs on the host control plane: one ListObjectsV2 page per control
+  /// attempt, one control permit per page.  The data plane stays exact-key.
+  /// Scan caps are the built-in defaults; a REST-side configured cap does not
+  /// apply here yet.
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+                          std::optional<std::size_t> max_scanned = std::nullopt) override;
+
+  [[nodiscard]] std::size_t list_max_matches() const override;
+
+  /// The two staged paths are structurally unsupported for this backend; keep
+  /// the transport-selection error shape ("RDMA ... not implemented") instead
+  /// of the generic unsupported-operation message.
+  exec::semi_future<size_t> host_to_device_read_async_io(
+    const sirius_io_object& obj,
+    std::span<io_object_segment> slices,
+    size_t offset,
+    size_t size,
+    uint8_t* device_dst,
+    rmm::cuda_stream_view stream) noexcept override;
+
+  exec::semi_future<size_t> host_read_ranges_async_io(
+    const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept override;
+
+ protected:
+  /// Parse s3://bucket/key, HEAD it through the control client for the size,
+  /// and build the io_object.  A transport failure or a non-200 status
+  /// (missing object) throws.
+  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+
+  /// Contract §5.2 (context health at any phase): a device-dispatch failure
+  /// is probed for a poisoned context — a sticky code terminates instead of
+  /// softening into an error future.
+  void on_device_dispatch_failure() noexcept override;
+
+ private:
+  /// Retained so the ioctx reaches the admission gate (control permits, the
+  /// terminal error) and the transport bundle through the same context the
+  /// reactor holds.
+  explicit s3_rdma_ioctx(std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> reactor_ctx);
+
+  std::shared_ptr<rdma::cuobj_rdma_reactor::reactor_context> _reactor_ctx;
+  endpoint_topology _topology{endpoint_topology::split};
+  bool _credentials_differ{false};
+};
+
+}  // namespace sirius::io::s3

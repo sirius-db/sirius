@@ -25,8 +25,8 @@
 #include "helper/type_conversions.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
+#include "io/object_store_listing.hpp"
 #include "io/parquet_helpers.hpp"
-#include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
@@ -1735,13 +1735,13 @@ void sirius_scan_manager::list_objects_paged(
   // bucket-root prefix routes via a placeholder key.
   auto const route_probe =
     "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
-  auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
-  if (rest == nullptr) {
+  auto io_ctx  = ioctx_for_path(route_probe);
+  auto* lister = dynamic_cast<sirius::io::object_store_listing*>(io_ctx.get());
+  if (lister == nullptr) {
     throw std::runtime_error("sirius_scan_manager::list_objects_paged: '" + s3_prefix_uri +
                              "' does not route to an object-store backend that supports LIST");
   }
-  rest->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+  lister->list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
 }
 
 std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
@@ -1760,13 +1760,13 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
     bucket_slash == std::string_view::npos ? std::string_view{} : rest_uri.substr(bucket_slash + 1);
   auto const route_probe =
     "s3://" + std::string(bucket) + "/" + (prefix.empty() ? "_" : std::string(prefix));
-  auto io_ctx = ioctx_for_path(route_probe);
-  auto* rest  = dynamic_cast<sirius::io::rest::rest_ioctx*>(io_ctx.get());
-  if (rest == nullptr) {
+  auto io_ctx  = ioctx_for_path(route_probe);
+  auto* lister = dynamic_cast<sirius::io::object_store_listing*>(io_ctx.get());
+  if (lister == nullptr) {
     throw std::runtime_error("sirius_scan_manager::s3_list_max_matches: '" + s3_uri +
                              "' does not route to an object-store backend that supports LIST");
   }
-  return rest->list_max_matches();
+  return lister->list_max_matches();
 }
 
 std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
@@ -1795,7 +1795,16 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
     if (auto it = _routed_io_ctxs.find(*type); it != _routed_io_ctxs.end()) { return it->second; }
   }
   auto io_ctx = _ioctx_registry.make_ioctx(*type);
-  if (!io_ctx) { return nullptr; }
+  if (!io_ctx) {
+    if (*type == sirius::io::io_context_type::rdma) {
+      // Explicit-RDMA routing with nothing built is an error, never a silent
+      // fallback: the caller asked for this transport by configuration.
+      throw std::runtime_error(
+        "sirius_scan_manager: RDMA transport initialization failed for the routed path "
+        "(the backend factory produced no ioctx)");
+    }
+    return nullptr;
+  }
   io_ctx->start();
   if (_config.enable_prefetch_cache && io_ctx->can_use_prefetching_cache()) {
     io_ctx->initialize_cache(_reservation_manager, _config.cache, _topology_index);
