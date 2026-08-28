@@ -16,8 +16,13 @@
 #   3. all tunables live in ./engine-a.env, which documents the arithmetic behind each one.
 #
 # Usage:  ./configs/gb200-4gpu/cluster4-numa.sh
+#         SCALE_FACTOR=1000 ./configs/gb200-4gpu/cluster4-numa.sh
 #         CPU_SPLIT=disjoint ./configs/gb200-4gpu/cluster4-numa.sh
-#         HOST_MEM=120GiB GPU_MEM=128GiB STAGING=32GiB ./configs/gb200-4gpu/cluster4-numa.sh
+#         HOST_MEM=112GiB GPU_MEM=128GiB STAGING=32GiB ./configs/gb200-4gpu/cluster4-numa.sh
+#
+# SCALE_FACTOR picks the memory/timeout preset in engine-a.env (100, 500, 1000, 3000, 10000).
+# Explicit GPU_MEM / STAGING / HOST_MEM still win. Switching scale factor is a relaunch, not a
+# rebuild — the CN binary does not bake in the dataset.
 #
 # Run it in its own terminal or as its own background task -- never chained behind `&` inside
 # another shell command, or the cluster dies with that shell.
@@ -267,9 +272,9 @@ if [ "${#claimed[@]}" -gt 0 ] && [ "${ALLOW_SHARED_GPUS:-0}" != 1 ]; then
 fi
 
 # --- report -----------------------------------------------------------------------------------
-echo "cluster4-numa: $NUM_CNS CNs, CPU_SPLIT=$CPU_SPLIT"
+echo "cluster4-numa: $NUM_CNS CNs, CPU_SPLIT=$CPU_SPLIT  SCALE_FACTOR=${SCALE_FACTOR:-100}"
 echo "  GPU_MEM=$GPU_MEM  STAGING=$SIRIUS_EXCHANGE_STAGING_BYTES  HOST_MEM=$HOST_MEM" \
-     " watchdog=${SIRIUS_QUERY_WATCHDOG_SECS}s"
+     " watchdog=${SIRIUS_QUERY_WATCHDOG_SECS}s  rpc=${SIRIUS_CN_RPC_TIMEOUT_SECS:-60}s"
 echo "  UCX_TLS=$UCX_TLS"
 printf '  %-4s %-4s %-9s %-8s %-10s %-7s %-7s %-7s %s\n' \
        CN gpu cpubind membind heartbeat thrift brpc http starlet

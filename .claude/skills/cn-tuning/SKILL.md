@@ -10,7 +10,8 @@ description: >
 Read, in this order:
 
 1. [`bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md`](../../../bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md) — how the knobs work
-2. [`bench/a100x8/TUNING.md`](../../../bench/a100x8/TUNING.md) — measured method on 8× A100
+2. [`bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md`](../../../bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md) — this 4× GB200 box, SF100–SF10000 presets
+3. [`bench/a100x8/TUNING.md`](../../../bench/a100x8/TUNING.md) — measured method on 8× A100
 3. [`experimental/starrocks/docs/TUNABLES.md`](../../../experimental/starrocks/docs/TUNABLES.md) — env vars (fail-closed registry)
 4. Per-box facts: `bench/<box>/HARDWARE.md`, `CONFIGURATIONS.md`, `STATUS.md`
 

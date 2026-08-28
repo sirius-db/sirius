@@ -8,8 +8,8 @@ bringing up a cluster, or running a benchmark.
 | Current unresolved work | [`OPEN.md`](OPEN.md) |
 | Build the CN stack | `bench/rtxpro6000-2gpu/BUILD-SIRIUS-STARROCKS.md` and the `build-sirius-starrocks` skill |
 | Run a TPC-H sweep | `bench/rtxpro6000-2gpu/TPCH-SWEEP-RUNBOOK.md` and the `tpch-cn-sweep` skill |
-| Size `GPU_MEM` / `STAGING` / operator budgets | `bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md` and the `cn-tuning` skill |
-| Single-host 4× GB200 ops | `.claude/skills/tpch-bench/SKILL.md` and `bench/gb200-4gpu/HARDWARE.md` |
+| Size `GPU_MEM` / `STAGING` / operator budgets | `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` (this 4× GB200 box) or `bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md` (method) and the `cn-tuning` skill |
+| Single-host 4× GB200 ops | `.claude/skills/tpch-bench/SKILL.md`, `bench/gb200-4gpu/HARDWARE.md`, `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` |
 | Two physical GB200 hosts | `experimental/starrocks/benchmarks/2NODE-REPLICATE.md` and the `tpch-2host` skill |
 | Super Sirius architecture | `docs/super-sirius/` |
 
