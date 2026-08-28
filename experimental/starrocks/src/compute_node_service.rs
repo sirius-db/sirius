@@ -569,6 +569,13 @@ impl PInternalService for SiriusComputeNodeService {
     /// `ADMIN EXECUTE ON <node_id> '<script>'` — the FE's execute_script RPC, repurposed as this
     /// CN's admin channel (`pin_table`/`unpin_table`, see [`crate::admin_command`]). Runs on a
     /// blocking worker because a pin occupies the engine thread for the whole materialization.
+    ///
+    /// The FE caps this RPC at a hard 600 s (ExecuteScriptStmt's default AND the brpc stub's
+    /// onceTalkTimeout — neither raisable from SQL). A pin that materializes longer keeps
+    /// running here to completion after the FE reports failure, with no cancel path, and a
+    /// retry queues a second full materialization behind it. Operators must size pins under
+    /// the ceiling (pin only queried columns / one pin per table) and watch the CN log's
+    /// `pin_table finished` line rather than retry on timeout.
     #[instrument(skip_all)]
     async fn execute_command(
         &self,

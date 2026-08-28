@@ -193,6 +193,16 @@ Layout note: whole-file assignment trades load balance for cacheability — keep
 files per table, each well under `totalBytes / (nodes × dop)`, or one CN ends up
 with disproportionate work.
 
+Timeout warning: `ADMIN EXECUTE` has a hard 600 s ceiling on the FE side (statement
+default and brpc stub cap, neither raisable from SQL). A pin that materializes
+longer than that — think host-tier at SF1000 with `cols` omitted, which pins every
+column — makes the FE report `executeCommand RPC failed`, while the CN keeps
+materializing to completion and queries queue behind it; there is no cancel. Do
+NOT retry on timeout (that queues a second full materialization) — watch the CN
+log for `pin_table finished` instead. Keep pins under the ceiling by pinning only
+the queried columns, splitting large tables into one pin per name, or using the
+compression plans.
+
 ## Notes and caveats
 
 - `cols` omitted pins **all** columns — fine at small SF, wasteful at SF1000.
