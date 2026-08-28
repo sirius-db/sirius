@@ -152,3 +152,26 @@ Teardown **both** hosts: `./benchmarks/stop-cn-2host.sh`.
 If the combined arm is still slower than 4-GPU on the overlap, the next arm is
 **`pipeline_dop=18` only** on the old 128/32/112 + kvikio split, so DOP is isolated from
 staging and the scan path.
+
+---
+
+## 7. SF3000: one split does not close all 22
+
+Full log: [`sf3000/TUNING-DISCOVERY.md`](sf3000/TUNING-DISCOVERY.md).
+
+36 GiB and 44 GiB staging both die at q05 with ~44 GiB of outstanding leases.
+56 GiB clears q05–q07; q08 then fills 56–64 GiB **and** pool-OOMs at `pipeline_dop=18`.
+The lever for q08 is **fewer concurrent fragments** (`pipeline_dop=12` for the 18
+easy queries, `9` for q08/q09/q18/q21), not another STAGING bump at 96 % occupancy.
+
+Do not run all 22 in one `bench.sh` process. A q08 refuse poisons q10+.
+Use `queries-common.txt` then `queries-heavy.txt`.
+
+## 8. SF10000: 14/22, two splits, eight empty windows
+
+Full log: [`sf10000/TUNING-DISCOVERY.md`](sf10000/TUNING-DISCOVERY.md).
+
+112/64 dop=9 closes q01, q02, q04, q06, q11–q16, q19, q20, q22. q07 needs 96/80.
+q03/q09/q21 fill any arena (q09/q21 not re-run; SF3000 empty). q05/q08/q17
+pool-OOM even with more GPU_MEM or dop=6. q10 needs both more pool than 112 and
+more staging than 56. q18 fills 64 GiB then pool-OOMs at 96/80.

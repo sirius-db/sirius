@@ -6,7 +6,11 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-export SCALE_FACTOR=${SCALE_FACTOR:-${1:?usage: sweep.sh 1000|3000|10000}}
+if [ -n "${1:-}" ] && [[ "$1" =~ ^(1000|3000|10000)$ ]]; then
+  export SCALE_FACTOR=$1
+  shift
+fi
+export SCALE_FACTOR=${SCALE_FACTOR:?usage: sweep.sh 1000|3000|10000 [q01 q02 ...]}
 KNOBS=$HERE/sf${SCALE_FACTOR}/env.sh
 [ -f "$KNOBS" ] || { echo "sweep: no knobs at $KNOBS" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -40,7 +44,7 @@ sed -i "s/0\\.0001000000/${Q11_FRACTION}/" "$Q11"
 cd "$SR"
 TPCH_DATA=$TPCH_DATA FE_PORT=9030 \
 QUERY_TIMEOUT=$QUERY_TIMEOUT COLD_TIMEOUT=$COLD_TIMEOUT MIN_BACKENDS=$MIN_BACKENDS \
-  ./benchmarks/tpch/bench.sh --cold "$OUT/timings.csv" 3 \
+  ./benchmarks/tpch/bench.sh --cold "$OUT/timings.csv" 3 "$@" \
   | tee "$OUT/bench.log"
 
 restore

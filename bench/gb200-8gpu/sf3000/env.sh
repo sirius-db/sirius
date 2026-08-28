@@ -1,18 +1,15 @@
-# 8-CN SF3000 knobs. Not yet swept on this pair.
+# 8-CN SF3000 knobs.
 #
-# 4-CN SF3000 preset is 120/36/16 (engine-a.env). 8 CNs need less arena per node than 4,
-# but SF1000 8-CN still needed 32 GiB (16 GiB exhausted). Do not drop below 36 GiB
-# until a high-water line says so. Dataset 1.2 T > one box of LPDDR → HOST_MEM=16GiB.
-# Occupancy 120+36+0.76 = 156.8 / 184 = 85 %.
-# pipeline_dop=18 is topology, not scale.
+# 112/64 dop=18: q08 pool-OOMs and fills 64 GiB. Common arm uses dop=12;
+# q08/q09/q18/q21 use PIPELINE_DOP_HEAVY=9. Occupancy 176.8 / 185 = 96 %.
 
 export SCALE_FACTOR=3000
 export NUM_CNS_PER_HOST=${NUM_CNS_PER_HOST:-4}
 export NUM_CNS=${NUM_CNS:-8}
 
-export GPU_MEM=${GPU_MEM:-120GiB}
+export GPU_MEM=${GPU_MEM:-112GiB}
 export HOST_MEM=${HOST_MEM:-16GiB}
-export STAGING=${STAGING:-36GiB}
+export STAGING=${STAGING:-64GiB}
 export SIRIUS_EXCHANGE_STAGING_BYTES=${SIRIUS_EXCHANGE_STAGING_BYTES:-$STAGING}
 
 export SIRIUS_EXCHANGE_STAGING_ARENA=${SIRIUS_EXCHANGE_STAGING_ARENA:-fabric}
@@ -23,7 +20,10 @@ export SIRIUS_QUERY_WATCHDOG_SECS=${SIRIUS_QUERY_WATCHDOG_SECS:-600}
 export SIRIUS_CN_RPC_TIMEOUT_SECS=${SIRIUS_CN_RPC_TIMEOUT_SECS:-900}
 export SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS=${SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS:-600}
 
-export PIPELINE_DOP=${PIPELINE_DOP:-18}
+export PIPELINE_DOP_COMMON=${PIPELINE_DOP_COMMON:-12}
+export PIPELINE_DOP_HEAVY=${PIPELINE_DOP_HEAVY:-9}
+export PIPELINE_DOP_Q09=${PIPELINE_DOP_Q09:-6}
+export PIPELINE_DOP=${PIPELINE_DOP:-$PIPELINE_DOP_COMMON}
 export FE_QUERY_TIMEOUT=${FE_QUERY_TIMEOUT:-18000}
 export QUERY_TIMEOUT=${QUERY_TIMEOUT:-5400}
 export COLD_TIMEOUT=${COLD_TIMEOUT:-18000}
