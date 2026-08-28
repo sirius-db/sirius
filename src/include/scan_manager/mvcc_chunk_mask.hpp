@@ -31,7 +31,9 @@ namespace sirius::scan_manager {
  * One bit per row in cuDF's bitmask convention (bit `row % 32` of uint32 word
  * `row / 32`, 1 = keep), so the packed words upload and expand with
  * @c cudf::mask_to_bools without translation; padding bits past @ref
- * row_count are don't-care. @ref words aliases the mask job's pinned
+ * row_count are ZERO: the job zero-initializes every carve and only writes
+ * [0, row_count), which decode_visibility_mask requires. @ref words aliases
+ * the mask job's pinned
  * {reservation, blocks} bundle or its pageable fallback vector — the pointer
  * IS the owner, so copies are a refcount bump and a mask's words cannot
  * dangle. The mask job installs it at carve time and its fill tasks write

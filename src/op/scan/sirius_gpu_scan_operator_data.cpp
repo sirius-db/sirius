@@ -167,10 +167,12 @@ void scan_operator_input::prepare_for_processing(
       // — by then upstream builds have published — so refresh the projected rep
       // with a fresh per-batch snapshot here, replacing the (typically empty)
       // drain-time one. The mapping invariant lives in
-      // snapshot_membership_probes; same mvcc guard as the row selection.
+      // snapshot_membership_probes. A masked split takes probes only if its rep carries
+      // the visibility mask too, so the two compose into one selection.
       if (sirius::decompression_pushdown_enabled() && dynamic_filters &&
-          dynamic_filters->has_filters() && !mvcc_keep_mask.has_mask()) {
+          dynamic_filters->has_filters()) {
         auto snapshot_onto = [&](auto* rep) {
+          if (mvcc_keep_mask.has_mask() && !rep->visibility_mask().has_mask()) { return; }
           std::size_t const n_slots = rep->selected_indices().has_value()
                                         ? rep->selected_indices()->size()
                                         : rep->column_names().size();
@@ -217,6 +219,7 @@ void scan_operator_input::prepare_for_processing(
       // flag. The transactional steal's filter bypass depends on this — if
       // that gate ever weakens, the steal must stop honoring
       // pushdown_row_filtered.
+      bool visibility_mask_applied = false;
       if (auto const* decoded =
             dynamic_cast<::sirius::decompression_pushdown_batch_representation const*>(
               mut.get_data())) {
@@ -224,18 +227,24 @@ void scan_operator_input::prepare_for_processing(
         pushdown_row_filtered        = outcome.row_filtered;
         pushdown_predicate_columns   = outcome.predicate_columns;
         pushdown_predicates_enforced = outcome.predicates_enforced;
+        visibility_mask_applied      = outcome.visibility_mask_applied;
         if (pushdown_selection_unprofitable && outcome.selection_unprofitable) {
           pushdown_selection_unprofitable->store(true, std::memory_order_relaxed);
         }
       }
+      // The decode consumed the mask: clear it, since re-applying selects wrong rows and
+      // clearing re-enables the zero-copy steal below.
+      if (visibility_mask_applied && mvcc_keep_mask.has_mask()) {
+        mvcc_keep_mask = scan_manager::mvcc_chunk_mask{};
+      }
       if (pushdown_row_filtered && mvcc_keep_mask.has_mask()) {
         // The keep-mask is positional over the chunk's full row range; a
-        // decode-compacted table no longer lines up with it. Row dropping must
-        // never be requested for mvcc-masked chunks — fail loudly rather than
-        // filter the wrong rows.
+        // decode-compacted table no longer aligns with it. A masked chunk may only drop
+        // rows when the decode consumed the mask (cleared above), so throw instead.
         throw std::runtime_error(
           "[scan_operator_input::prepare_for_processing] decode-time row filtering is "
-          "incompatible with an mvcc keep-mask; the attach must exclude masked chunks");
+          "incompatible with an unconsumed mvcc keep-mask; the attach must compose the "
+          "visibility mask on masked chunks");
       }
       // Conversion produces a fresh owned table for this split (raw GPU pins already use a plain
       // gpu_table_representation, so they never reach this branch), so a filter-free scan may

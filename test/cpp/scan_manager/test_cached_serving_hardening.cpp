@@ -561,18 +561,17 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
   }
 }
 
-// Gating the attach on mask-set EMPTINESS stripped the pushdown from every
-// chunk of the table once a single refresh committed, since the set is
-// slot-sized even when every slot is default. The guard must read the slot.
-TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc mask slot",
+// The mask set is slot-sized whenever the entry has any MVCC state, so the attach must
+// read the SLOT, not set emptiness. A masked slot gets the pushdown and its visibility
+// mask; a default slot gets the pushdown alone.
+TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask slot",
           "[cached_serving][scan_manager]")
 {
   auto& e = env();
   constexpr std::size_t rows{64};
 
-  // Two compressed GPU chunks. Unlike the fixtures above, the blob is empty but
-  // PRESENT: for_chunk reads the compressed_table (a range-only request survives
-  // that walk untouched).
+  // Empty cached table: a range-only request narrows through for_chunk without probing
+  // any column plan.
   pinned_entry entry;
   set_cached_columns(entry, {"k", "v"});
   entry.tier         = cucascade::memory::Tier::GPU;
@@ -591,13 +590,13 @@ TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc 
   }
   entry.num_rows = 2 * rows;
 
-  // The post-refresh shape: only the chunk holding deleted rows is masked.
+  // After deletes commit, only chunks holding deleted rows are masked.
   sirius::scan_manager::mvcc_chunk_mask_set masks;
   masks.push_back(make_test_mask(rows));
   masks.push_back({});
 
-  // Range-only, so without_row_selection() leaves nothing to ask: a masked
-  // chunk attaches no scan at all, which is what makes the two cases distinct.
+  // Range-only: both chunks attach the same scan, and only the masked one also
+  // carries a visibility mask.
   sirius::pushdown_request request;
   request.columns.resize(2);
   request.columns[0].range          = sirius::decode_range{.lo = 5, .hi = 90};
@@ -616,33 +615,45 @@ TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc 
                                                          /*has_physical_overrides=*/false,
                                                          request);
 
-  auto const served_scan = [](databatch_provider::batch const& b) {
+  struct served_attachments {
+    std::shared_ptr<const sirius::decompression_pushdown_scan> scan;
+    sirius::decode_visibility_mask visibility;
+  };
+  auto const served_rep = [](databatch_provider::batch const& b) -> served_attachments {
     auto ro         = b.data->to_read_only();
     auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
     REQUIRE(rep != nullptr);
-    return rep->pushdown_scan();
+    return {rep->pushdown_scan(), rep->visibility_mask()};
   };
 
-  // Masked: the classic decode + positional-mask path.
-  auto masked = provider->get_next_batch();
-  REQUIRE(masked.data);
-  REQUIRE(masked.mvcc_keep_mask.has_mask());
-  REQUIRE(served_scan(masked) == nullptr);
+  auto const check_request = [](sirius::pushdown_request const& r) {
+    REQUIRE_FALSE(r.row_selection_disabled);
+    REQUIRE(r.selects_rows());
+    REQUIRE(r.columns.size() == 2);
+    REQUIRE(r.columns[0].range.has_value());
+    REQUIRE(r.columns[0].range->lo == 5);
+    REQUIRE(r.columns[0].range->hi == 90);
+    REQUIRE_FALSE(r.columns[1].range.has_value());
+    REQUIRE(r.ranges_cover_whole_filter);
+  };
 
-  // Default slot: row dropping attached as in a mask-free pass.
-  auto clean = provider->get_next_batch();
-  REQUIRE(clean.data);
-  REQUIRE_FALSE(clean.mvcc_keep_mask.has_mask());
-  auto const scan = served_scan(clean);
-  REQUIRE(scan != nullptr);
-  REQUIRE_FALSE(scan->request().row_selection_disabled);
-  REQUIRE(scan->request().selects_rows());
-  REQUIRE(scan->request().ranges_cover_whole_filter);
-  REQUIRE(scan->request().columns.size() == 2);
-  REQUIRE(scan->request().columns[0].range.has_value());
-  REQUIRE(scan->request().columns[0].range->lo == 5);
-  REQUIRE(scan->request().columns[0].range->hi == 90);
-  REQUIRE_FALSE(scan->request().columns[1].range.has_value());
+  auto a = provider->get_next_batch();
+  REQUIRE(a.data);
+  REQUIRE(a.mvcc_keep_mask.has_mask());
+  auto const a_served = served_rep(a);
+  REQUIRE(a_served.scan != nullptr);
+  check_request(a_served.scan->request());
+  REQUIRE(a_served.visibility.has_mask());
+  REQUIRE(a_served.visibility.row_count == rows);
+  REQUIRE(a_served.visibility.words.get() == masks[0].words.get());
+
+  auto b = provider->get_next_batch();
+  REQUIRE(b.data);
+  REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
+  auto const b_served = served_rep(b);
+  REQUIRE(b_served.scan != nullptr);
+  check_request(b_served.scan->request());
+  REQUIRE_FALSE(b_served.visibility.has_mask());
 
   REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
 }

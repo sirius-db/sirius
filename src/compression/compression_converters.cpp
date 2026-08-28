@@ -86,6 +86,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   simpatico::payload_fetch_fn const& fetch,
   const std::optional<std::vector<std::size_t>>& selected_indices,
   decompression_pushdown_scan const* scan,
+  decode_visibility_mask const& keep_mask,
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
   rmm::cuda_stream_view stream)
@@ -120,7 +121,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   // which is indexed by projected position — lines up with 0..num_columns.
   std::vector<std::size_t> selection(subset.num_columns());
   std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto decoded      = decompress_chunk(subset, selection, scan, stream, mr);
+  auto decoded      = decompress_chunk(subset, selection, scan, keep_mask, stream, mr);
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
@@ -174,6 +175,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
                                            fetch,
                                            rep.selected_indices(),
                                            rep.pushdown_scan().get(),
+                                           rep.visibility_mask(),
                                            source,
                                            target_memory_space,
                                            stream);
@@ -207,7 +209,8 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     selected = identity_selection;
   }
 
-  auto decoded      = decompress_chunk(ct, selected, rep.pushdown_scan().get(), stream, mr);
+  auto decoded =
+    decompress_chunk(ct, selected, rep.pushdown_scan().get(), rep.visibility_mask(), stream, mr);
   auto decompressed = std::move(decoded.table);
 
   auto cols = decompressed->release();
