@@ -1,0 +1,33 @@
+# 8-CN SF10000 knobs. Extrapolated, not yet swept on this pair.
+#
+# 4-CN SF10000 preset is 112/44/16 (engine-a.env). SF1000 8-CN still needed the 4-CN
+# 32 GiB arena (16 GiB died), so do not halve 44 GiB just because N=8. Occupancy
+# 112+44+0.76 = 156.8 / 184 = 85 %. Dataset 3.7 T >> LPDDR → HOST_MEM=16GiB.
+# RPC registry max is 3600; use it. Client cold timeout is 6×SF = 60000 s.
+# pipeline_dop=18 is topology, not scale.
+
+export SCALE_FACTOR=10000
+export NUM_CNS_PER_HOST=${NUM_CNS_PER_HOST:-4}
+export NUM_CNS=${NUM_CNS:-8}
+
+export GPU_MEM=${GPU_MEM:-112GiB}
+export HOST_MEM=${HOST_MEM:-16GiB}
+export STAGING=${STAGING:-44GiB}
+export SIRIUS_EXCHANGE_STAGING_BYTES=${SIRIUS_EXCHANGE_STAGING_BYTES:-$STAGING}
+
+export SIRIUS_EXCHANGE_STAGING_ARENA=${SIRIUS_EXCHANGE_STAGING_ARENA:-fabric}
+export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
+export SIRIUS_CN_USE_SIRIUS_DATASOURCE=${SIRIUS_CN_USE_SIRIUS_DATASOURCE:-true}
+
+export SIRIUS_QUERY_WATCHDOG_SECS=${SIRIUS_QUERY_WATCHDOG_SECS:-1800}
+export SIRIUS_CN_RPC_TIMEOUT_SECS=${SIRIUS_CN_RPC_TIMEOUT_SECS:-3600}
+export SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS=${SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS:-900}
+
+export PIPELINE_DOP=${PIPELINE_DOP:-18}
+export FE_QUERY_TIMEOUT=${FE_QUERY_TIMEOUT:-60000}
+export QUERY_TIMEOUT=${QUERY_TIMEOUT:-18000}
+export COLD_TIMEOUT=${COLD_TIMEOUT:-60000}
+export MIN_BACKENDS=${MIN_BACKENDS:-8}
+
+export TPCH_DATA=${TPCH_DATA:-/scratch/sirius/datasets/tpch_sf10000}
+export Q11_FRACTION=${Q11_FRACTION:-0.000000010000}

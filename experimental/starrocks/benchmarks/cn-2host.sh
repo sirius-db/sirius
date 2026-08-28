@@ -141,6 +141,10 @@ fi
 
 for i in $(seq 0 $((PER_HOST - 1))); do
     base=$((9100 + i * 10))
+    # Pin engine pools to the same 36-core slice as physcpubind. Unset, the CN
+    # discovers the GPU's full socket (72 cores) and the derived YAML disagrees
+    # with the mask the kernel actually allows.
+    SIRIUS_CN_CPU_AFFINITY="${CPUS[$i]}" \
     numactl --physcpubind="${CPUS[$i]}" --membind="${NODES[$i]}" -- \
         "$CN_BIN" \
             --fe-host           "$FE_HOST" \

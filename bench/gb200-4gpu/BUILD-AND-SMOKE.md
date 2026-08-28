@@ -13,12 +13,15 @@ Do **not** `git add` the StarRocks submodule after the proto patch. It is dirty 
 
 ## 0. Paths to set on the new box
 
-`$HOME` is NFS. Compiles and pixi caches go on local NVMe (`/` or `/raid`).
+`$HOME` is NFS. Compiles and pixi caches go on `/scratch`. `/raid` is local NVMe RAID0 but
+root-owned on this box (`presto-gb200-gcn-09`), so it is not writable. On gcn-18, `$BIG` was
+`/raid/$USER/sirius-build`.
 
 ```bash
 export USER=prestouser                          # change
 export REPO=/home/$USER/aocsa/sirius            # clone location
-export BIG=/raid/$USER/sirius-build             # local NVMe
+export BIG=/scratch/$USER/aocsa                 # /raid is not writable here
+export DATASETS=/scratch/sirius/datasets        # TPC-H parquet (all scales, now and later)
 export TOOLS_DIR=/home/$USER/aocsa/tools        # default of cn-env.sh: sibling named tools/
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-arm64
 export CUDA_HOME=/usr/local/cuda-13.0           # on gcn-18, /usr/local/cuda already → 13.0
@@ -31,13 +34,12 @@ export PATH=$CARGO_HOME/bin:$PATH
 `cn-env.sh` derives `TOOLS_DIR` as `<parent-of-repo>/tools`. If you clone to a different parent,
 export `TOOLS_DIR` yourself.
 
-Smoke parquet (SF100 `lineitem` **part.0 only**, ~100M rows, not the full SF100 set):
+TPC-H parquet lives under `$DATASETS` as `tpch_sf<N>/`. Do not copy datasets onto the box.
+Smoke uses SF100 `lineitem` **part.0 only** (~100M rows, not the full SF100 set):
 
 ```text
-/home/prestouser/aocsa/tpch_parquet_sf100_f64v1/lineitem/part.0.parquet
+/scratch/sirius/datasets/tpch_sf100/lineitem/part.0.parquet
 ```
-
-Copy that file onto the new box, or point `PARQ` at an equivalent part file.
 
 ---
 
@@ -148,7 +150,7 @@ source $BIG/env.sh
 unset CUDA_VISIBLE_DEVICES
 export SIRIUS_QUERY_WATCHDOG_SECS=60
 cd $REPO/experimental/starrocks
-PARQ="file:///home/$USER/aocsa/tpch_parquet_sf100_f64v1/lineitem/part.0.parquet"
+PARQ="file://$DATASETS/tpch_sf100/lineitem/part.0.parquet"
 
 # terminal 1 — BLOCKS. Its EXIT trap tears the cluster down.
 pixi run --manifest-path "$PWD/pixi.toml" bash -lc '
@@ -174,16 +176,17 @@ Terminal 2: wait until column 9 of `SHOW COMPUTE NODES` is `true` (`Alive`), the
 
 ```sql
 SELECT sum(l_extendedprice * l_discount) AS revenue
-FROM FILES("path"="file:///…/lineitem/part.0.parquet","format"="parquet")
+FROM FILES("path"="file:///scratch/sirius/datasets/tpch_sf100/lineitem/part.0.parquet","format"="parquet")
 WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
   AND l_discount BETWEEN 0.02 AND 0.04 AND l_quantity < 24;
 
 SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS qty
-FROM FILES("path"="file:///…/lineitem/part.0.parquet","format"="parquet")
+FROM FILES("path"="file:///scratch/sirius/datasets/tpch_sf100/lineitem/part.0.parquet","format"="parquet")
 GROUP BY l_returnflag ORDER BY l_returnflag;
 ```
 
-Expected (gcn-18, same parquet), matching DuckDB:
+Expected (gcn-18, measured on the old `tpch_parquet_sf100_f64v1` part.0). Re-check against the
+oracle on `$DATASETS/tpch_sf100` if the numbers differ.
 
 | Query | Result |
 |---|---|
@@ -214,7 +217,7 @@ Oracle (once):
 mkdir -p $BIG/oracle && cd $BIG/oracle
 pixi init . && pixi add python duckdb
 pixi run python -c "import duckdb; print(duckdb.sql(\"\"\"
-SELECT sum(l_extendedprice*l_discount) FROM read_parquet('/path/to/part.0.parquet')
+SELECT sum(l_extendedprice*l_discount) FROM read_parquet('/scratch/sirius/datasets/tpch_sf100/lineitem/part.0.parquet')
 WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
   AND l_discount BETWEEN 0.02 AND 0.04 AND l_quantity < 24
 \"\"\").fetchall())"
@@ -222,10 +225,13 @@ WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
 
 ---
 
-## 6. Layout on gcn-18 (this session)
+## 6. Layout on gcn-09 (this session)
 
 ```text
-/raid/prestouser/sirius-build/
+/scratch/sirius/datasets/          ← $DATASETS, TPC-H parquet (tpch_sf1 … tpch_sf1000, …)
+  tpch_sf100/lineitem/part.0.parquet
+
+/scratch/prestouser/aocsa/
   env.sh
   build/          ← $REPO/build                    libsirius + duckdb
   root-pixi/      ← $REPO/.pixi
