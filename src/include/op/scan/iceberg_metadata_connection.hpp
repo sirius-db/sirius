@@ -30,10 +30,13 @@ namespace sirius::op::scan {
  * ## Why a connection at all
  *
  * Iceberg metadata lives behind `duckdb-iceberg`'s table functions. Sirius does not link against
- * that extension, and the facts it needs are not on the bound plan: `MultiFileBindData` exposes no
- * snapshot, `OpenFileInfo::extended_info` carries only file_size/etag/last_modified/first_row_id/
- * sequence_number, and duckdb-iceberg overrides no `GetBindInfo`. So the delete files, the
- * manifest entries and the data-file footers are reachable only by asking DuckDB for them.
+ * that extension, and the facts it needs are not readable from the bound plan: `MultiFileBindData`
+ * exposes no snapshot, and `OpenFileInfo::extended_info` carries only file_size/etag/last_modified/
+ * first_row_id/sequence_number. duckdb-iceberg DOES install a `get_bind_info` hook
+ * (`IcebergBindInfo`), and it holds the resolved `IcebergMultiFileList` when it runs, but it
+ * publishes only the catalog entry -- the snapshot identity it has in hand never reaches
+ * `BindInfo::options`. So the delete files, the manifest entries and the data-file footers are
+ * reachable only by asking DuckDB for them.
  *
  * ## Why a SECOND connection cannot see a different table than the bind did
  *
@@ -60,13 +63,18 @@ class iceberg_metadata_connection {
     // Session-scoped settings that change which tables are LEGIBLE. Every site that reads Iceberg
     // metadata must agree on this set: if the delete gate and the delete discovery disagree about
     // which tables they can read, the gate's verdict describes a different table than the scan.
+    //
+    // Mirrored in BOTH directions. Only copying `true` left the inverse ungoverned: a GLOBAL true
+    // overridden to false in the outer session was inherited as true here, so this connection
+    // could read a table the user's own session refuses to read -- the exact asymmetry the class
+    // exists to prevent, just the other way round.
     static constexpr auto kMirroredSettings = {"unsafe_enable_version_guessing"};
     for (auto const* setting : kMirroredSettings) {
       duckdb::Value value;
-      if (context.TryGetCurrentSetting(setting, value) && !value.IsNull() &&
-          value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>()) {
-        _conn.Query(std::string("SET ") + setting + " = true");
-      }
+      if (!context.TryGetCurrentSetting(setting, value) || value.IsNull()) { continue; }
+      bool const outer_effective =
+        value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
+      _conn.Query(std::string("SET ") + setting + " = " + (outer_effective ? "true" : "false"));
     }
   }
 

@@ -92,6 +92,9 @@ find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
+# CRoaring decodes Iceberg Puffin deletion vectors (portable Roaring). Host-side only; the same
+# library duckdb-iceberg uses for the same blob, so the two readers agree by construction.
+find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -598,6 +601,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
+    roaring::roaring
     telemetry_bridge
     core_functions_extension
     parquet_extension

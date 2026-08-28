@@ -36,6 +36,15 @@ namespace sirius::op::scan {
 /// letting file metadata size a plan-time allocation.
 inline constexpr int64_t kMaxDeletionVectorPositions = 32LL * 1024 * 1024;
 
+/// Ceiling on the positions retained across EVERY deletion vector of one statement.
+///
+/// kMaxDeletionVectorPositions is per vector, and every decoded vector is held in
+/// `IcebergDeleteData::positional_deletes` until execution ends, so N individually-admissible
+/// vectors retain 8 * sum(record_count) bytes: 128 vectors at the per-vector ceiling is 32 GiB.
+/// Charged from the manifests' summed `record_count` BEFORE any Puffin is opened, and counted per
+/// live ENTRY rather than per Puffin path, because one Puffin may carry several vectors.
+inline constexpr int64_t kMaxDeletionVectorPositionsPerStatement = 256LL * 1024 * 1024;
+
 /// What a manifest entry claims about the deletion vector it points at. The reader checks every
 /// field against the Puffin footer, so a wrong pointer is caught rather than silently followed.
 struct DeletionVectorRef {

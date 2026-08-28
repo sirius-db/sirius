@@ -40,6 +40,7 @@
 #include <atomic>
 #include <mutex>
 #include <numeric>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -231,17 +232,22 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   // and materialize_positional_deletes opens the Puffin file once per entry.
   std::unordered_set<std::string> expanded_manifests;
 
-  // Every PUFFIN row iceberg_metadata() reported, as (manifest, vector path). The two queries read
-  // the same manifests by different routes; if the second one comes back without a vector the
-  // first one saw, marking the manifest expanded discards that entry's deletes in silence -- a
-  // fail-OPEN, and deleted rows come back. Checked after the loop because one manifest is expanded
-  // once no matter how many of its rows the discovery query returns.
+  // Every PUFFIN row iceberg_metadata() reported, as (manifest, vector path) -> COUNT. The two
+  // queries read the same manifests by different routes; if the second one comes back without a
+  // vector the first one saw, marking the manifest expanded discards that entry's deletes in
+  // silence -- a fail-OPEN, and deleted rows come back. Checked after the loop because one
+  // manifest is expanded once no matter how many of its rows the discovery query returns.
   //
   // Keyed on the MANIFEST too, not the vector path alone: one Puffin file can be referenced from
   // more than one manifest, and a path-only key would let a manifest that expanded correctly cover
   // for one that did not.
-  std::set<std::pair<std::string, std::string>> puffin_rows_from_metadata;
-  std::set<std::pair<std::string, std::string>> expanded_vectors;
+  //
+  // COUNTED, not merely present: one Puffin can hold SEVERAL deletion vectors, distinguished by
+  // content_offset and referenced_data_file but sharing a path. Membership alone lets 2-reported
+  // vs 1-expanded pass -- both sides hold the same single pair -- and the second vector's deleted
+  // rows come back. `iceberg_v3_dv_misbound` has exactly that shape.
+  std::map<std::pair<std::string, std::string>, size_t> puffin_rows_from_metadata;
+  std::map<std::pair<std::string, std::string>, size_t> expanded_vectors;
 
   while (true) {
     auto chunk = meta_result->Fetch();
@@ -257,12 +263,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
         if (file_format == kFormatPuffin) {
           // iceberg_metadata() omits the V3 fields, so re-read the manifest via read_avro.
           auto manifest_path = chunk->GetValue(4, i).ToString();
-          puffin_rows_from_metadata.emplace(manifest_path, sirius::io::strip_file_scheme(filepath));
+          ++puffin_rows_from_metadata[{manifest_path, sirius::io::strip_file_scheme(filepath)}];
           if (expanded_manifests.insert(manifest_path).second) {
             for (auto& dv : read_deletion_vectors_from_manifest(conn, manifest_path)) {
               if (dv.is_deletion_vector()) {
-                expanded_vectors.emplace(manifest_path,
-                                         sirius::io::strip_file_scheme(dv.file_path));
+                ++expanded_vectors[{manifest_path, sirius::io::strip_file_scheme(dv.file_path)}];
                 result.deletion_vector_entries.push_back(std::move(dv));
               }
             }
@@ -293,21 +298,32 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
     }
   }
 
-  // Hold the read_avro pass to what iceberg_metadata() reported. Under-delivery is the dangerous
-  // direction and the only one checked: a vector the discovery query saw but the manifest pass did
-  // not return (it read a different content kind, the entry was not spelled as PUFFIN, or the
-  // manifest came back empty) would otherwise be dropped with no error. Over-delivery is safe --
-  // read_avro returns a whole manifest at once, so it legitimately sees vectors whose discovery
-  // rows are still ahead in the result.
-  for (auto const& [manifest_path, vector_path] : puffin_rows_from_metadata) {
-    if (expanded_vectors.count({manifest_path, vector_path}) == 0) {
-      throw std::runtime_error(
-        "[iceberg] iceberg_metadata() reports a live deletion vector at '" + vector_path +
-        "' in manifest '" + manifest_path + "' for table '" + table_path +
-        "', but re-reading that manifest did not return the vector; the two metadata passes "
-        "disagree about which deletes are live, and proceeding would drop this vector's deleted "
-        "rows back into the result");
-    }
+  // Hold the two passes to EXACT agreement, per (manifest, vector path), now that `meta_result` is
+  // fully consumed. read_avro may run ahead of the discovery query mid-loop -- it returns a whole
+  // manifest at once, so it legitimately sees vectors whose discovery rows are still unread -- but
+  // that is an argument about ordering, not about the totals. At the end both directions are a
+  // reader disagreement: under-delivery drops a live vector's deletes, and over-delivery APPLIES
+  // deletes the discovery pass never reported as live.
+  auto const reconcile = [&](std::pair<std::string, std::string> const& key,
+                             size_t reported,
+                             size_t expanded) {
+    if (reported == expanded) { return; }
+    throw std::runtime_error(
+      "[iceberg] The two metadata passes disagree about the deletion vector(s) at '" + key.second +
+      "' in manifest '" + key.first + "' for table '" + table_path + "': iceberg_metadata() "
+      "reports " + std::to_string(reported) + " live, re-reading the manifest returned " +
+      std::to_string(expanded) +
+      ". A Puffin may hold several vectors at one path, so this is a count and not a presence "
+      "check; proceeding would " +
+      (reported > expanded ? std::string("drop deleted rows back into the result")
+                           : std::string("apply deletes that were never reported as live")));
+  };
+  for (auto const& [key, reported] : puffin_rows_from_metadata) {
+    auto const it = expanded_vectors.find(key);
+    reconcile(key, reported, it == expanded_vectors.end() ? 0 : it->second);
+  }
+  for (auto const& [key, expanded] : expanded_vectors) {
+    if (puffin_rows_from_metadata.count(key) == 0) { reconcile(key, 0, expanded); }
   }
 
   SIRIUS_LOG_INFO(
@@ -430,6 +446,25 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
   if (!files.deletion_vector_entries.empty()) {
     SIRIUS_LOG_INFO("[iceberg] Loading {} deletion vector(s).",
                     files.deletion_vector_entries.size());
+
+    // Charge the WHOLE statement's deletion-vector payload before opening the first Puffin. The
+    // per-vector ceiling admits each of N vectors on its own, but all N are retained together
+    // until execution ends, so N admissible vectors still add up to an inadmissible total. Summed
+    // over live ENTRIES, not Puffin paths -- one Puffin may hold several vectors -- and the
+    // addition is overflow-checked because every term comes from a manifest.
+    int64_t total_positions = 0;
+    for (auto const& dv_entry : files.deletion_vector_entries) {
+      if (dv_entry.record_count < 0 ||
+          dv_entry.record_count > kMaxDeletionVectorPositionsPerStatement - total_positions) {
+        throw std::runtime_error(
+          "[iceberg] The live deletion vectors of this scan declare more than the " +
+          std::to_string(kMaxDeletionVectorPositionsPerStatement) +
+          " deleted positions this reader will retain while planning (reached at '" +
+          dv_entry.file_path + "'); the scan declines rather than sizing a plan-time allocation "
+          "from what the table wrote");
+      }
+      total_positions += dv_entry.record_count;
+    }
     // Which data files a DV has already claimed. Superseding a POSITIONAL entry in out_map is the
     // spec'd behaviour above; a second DV claiming the same data file is not, and assigning it
     // would make the result depend on manifest order, which carries no precedence meaning.

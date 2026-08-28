@@ -22,6 +22,12 @@
 // objects, so reading the Puffin footer costs no new dependency.
 #include "yyjson.hpp"
 
+// CRoaring: the portable-Roaring reader. duckdb-iceberg decodes this same deletion-vector blob with
+// the same two calls (`roaring_bitmap_portable_deserialize_size` + `Roaring::readSafe`), so the GPU
+// path and DuckDB's own reader agree on a bitmap by construction rather than by our re-derivation.
+#include <roaring/roaring.h>
+#include <roaring/roaring.hh>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -47,13 +53,6 @@ uint32_t read_u32_le(const uint8_t* p)
   return v;
 }
 
-uint16_t read_u16_le(const uint8_t* p)
-{
-  uint16_t v;
-  std::memcpy(&v, p, 2);
-  return v;
-}
-
 int64_t read_i64_le(const uint8_t* p)
 {
   int64_t v;
@@ -72,13 +71,6 @@ uint32_t read_u32_be(const uint8_t* p)
 {
   return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-}
-
-uint64_t read_u64_le(const uint8_t* p)
-{
-  uint64_t v;
-  std::memcpy(&v, p, 8);
-  return v;
 }
 
 // CRC-32, same polynomial as DuckDB's iceberg extension.
@@ -106,169 +98,42 @@ uint32_t compute_crc32(const uint8_t* data, size_t length)
   return crc ^ 0xFFFFFFFFu;
 }
 
-// Roaring portable format, 32-bit: https://github.com/RoaringBitmap/RoaringFormatSpec
-// Appends the set values to @p out and returns the bytes consumed.
-constexpr uint32_t SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
-constexpr uint32_t SERIAL_COOKIE                 = 12347;
-
-/// Checks read as `remaining(...) < need` rather than `p + need > p_end` because `need` comes
-/// from the file, and forming a pointer past the end is UB even if only compared.
-size_t remaining(const uint8_t* p, const uint8_t* p_end) { return static_cast<size_t>(p_end - p); }
-
-/// Decoded output is unbounded relative to input size: a 4-byte run entry expands to 65,536
-/// positions and there can be 65,536 containers, so a sub-megabyte blob can demand billions of
-/// them. @p max_out is enforced INSIDE the expansion loops -- checking afterwards is checking
-/// after the allocation that already killed the process. It cannot be derived from @p data_len,
-/// because a legitimate run container really is that dense.
+/// Decodes one 32-bit portable-Roaring bitmap out of @p data and appends its values to @p out,
+/// returning the bytes consumed.
+///
+/// `roaring_bitmap_portable_deserialize_size` reports how many bytes a VALID bitmap occupies within
+/// @p data_len and returns 0 otherwise, so the read is bounded by the buffer rather than by numbers
+/// the file supplied -- there is no decode ceiling to tune here because the library cannot be made
+/// to over-read or over-expand. The cardinality is known before any position is materialized, so
+/// @p max_out is enforced BEFORE the allocation rather than inside an expansion loop.
 size_t deserialize_roaring32(const uint8_t* data,
                              size_t data_len,
                              std::vector<uint32_t>& out,
                              size_t max_out)
 {
-  if (data_len < 4) { throw std::runtime_error("roaring: buffer too small for cookie"); }
-
-  auto const admit = [&out, max_out](size_t n) {
-    if (n > max_out || out.size() > max_out - n) {
-      throw std::runtime_error(
-        "roaring: decoded positions exceed the " + std::to_string(max_out) +
-        " this deletion vector declares; the blob is corrupt or was crafted to expand");
-    }
-  };
-
-  const uint8_t* p     = data;
-  const uint8_t* p_end = data + data_len;
-
-  uint32_t cookie = read_u32_le(p);
-
-  int num_containers        = 0;
-  bool has_run_containers   = false;
-  size_t run_bitmap_bytes   = 0;
-  const uint8_t* run_bitmap = nullptr;
-
-  if ((cookie & 0xFFFF) == SERIAL_COOKIE) {
-    // Run-optimized format: lower 16 bits = cookie, upper 16 bits = (num_containers - 1)
-    num_containers     = static_cast<int>((cookie >> 16) + 1);
-    has_run_containers = true;
-    p += 4;
-
-    // Run bitmap: ceil(num_containers / 8) bytes
-    run_bitmap_bytes = static_cast<size_t>((num_containers + 7) / 8);
-    if (remaining(p, p_end) < run_bitmap_bytes) {
-      throw std::runtime_error("roaring: truncated run bitmap");
-    }
-    run_bitmap = p;
-    p += run_bitmap_bytes;
-  } else if (cookie == SERIAL_COOKIE_NO_RUNCONTAINER) {
-    p += 4;
-    if (remaining(p, p_end) < 4u) {
-      throw std::runtime_error("roaring: truncated container count");
-    }
-    num_containers = static_cast<int>(read_u32_le(p));
-    p += 4;
-  } else {
-    throw std::runtime_error("roaring: unknown cookie " + std::to_string(cookie));
+  size_t const bitmap_size =
+    roaring::api::roaring_bitmap_portable_deserialize_size(reinterpret_cast<const char*>(data),
+                                                           data_len);
+  if (bitmap_size == 0) {
+    throw std::runtime_error(
+      "roaring: no valid portable-Roaring bitmap in the remaining " + std::to_string(data_len) +
+      " bytes; the deletion vector is truncated or corrupt");
   }
 
-  if (num_containers == 0) { return static_cast<size_t>(p - data); }
+  roaring::Roaring bitmap =
+    roaring::Roaring::readSafe(reinterpret_cast<const char*>(data), bitmap_size);
 
-  // Read key-cardinality pairs: [key(u16), cardinality_minus_1(u16)] × num_containers
-  size_t descriptor_bytes = static_cast<size_t>(num_containers) * 4;
-  if (remaining(p, p_end) < descriptor_bytes) {
-    throw std::runtime_error("roaring: truncated descriptors");
+  uint64_t const cardinality = bitmap.cardinality();
+  if (cardinality > max_out || out.size() > max_out - cardinality) {
+    throw std::runtime_error(
+      "roaring: decoded positions exceed the " + std::to_string(max_out) +
+      " this deletion vector declares; the blob is corrupt or was crafted to expand");
   }
 
-  struct ContainerDesc {
-    uint16_t key;
-    uint32_t cardinality;
-    int type;  // 0=array, 1=bitmap, 2=run
-  };
-  std::vector<ContainerDesc> containers(static_cast<size_t>(num_containers));
-
-  for (int i = 0; i < num_containers; ++i) {
-    containers[i].key         = read_u16_le(p);
-    containers[i].cardinality = static_cast<uint32_t>(read_u16_le(p + 2)) + 1;
-    p += 4;
-  }
-
-  // Determine container types
-  for (int i = 0; i < num_containers; ++i) {
-    if (has_run_containers && (run_bitmap[i / 8] & (1u << (i % 8)))) {
-      containers[i].type = 2;  // run
-    } else if (containers[i].cardinality <= 4096) {
-      containers[i].type = 0;  // array
-    } else {
-      containers[i].type = 1;  // bitmap
-    }
-  }
-
-  // Offset header (num_containers × 4 bytes):
-  // - SERIAL_COOKIE_NO_RUNCONTAINER: ALWAYS present (per Roaring spec §2)
-  // - SERIAL_COOKIE (run-optimized): present only when num_containers >= 4
-  // We read containers sequentially so just skip the offset bytes.
-  bool has_offsets =
-    (cookie == SERIAL_COOKIE_NO_RUNCONTAINER) || (has_run_containers && num_containers >= 4);
-  if (has_offsets) {
-    size_t offset_bytes = static_cast<size_t>(num_containers) * 4;
-    if (remaining(p, p_end) < offset_bytes) {
-      throw std::runtime_error("roaring: truncated offset header");
-    }
-    p += offset_bytes;
-  }
-
-  // Read container data
-  for (int i = 0; i < num_containers; ++i) {
-    uint32_t high = static_cast<uint32_t>(containers[i].key) << 16;
-
-    if (containers[i].type == 0) {
-      // Array container: cardinality × uint16 sorted values
-      size_t nbytes = static_cast<size_t>(containers[i].cardinality) * 2;
-      if (remaining(p, p_end) < nbytes) {
-        throw std::runtime_error("roaring: truncated array container");
-      }
-      admit(containers[i].cardinality);
-      for (uint32_t j = 0; j < containers[i].cardinality; ++j) {
-        out.push_back(high | read_u16_le(p));
-        p += 2;
-      }
-    } else if (containers[i].type == 1) {
-      // Bitmap container: 1024 × uint64 = 8192 bytes
-      if (remaining(p, p_end) < 8192u) {
-        throw std::runtime_error("roaring: truncated bitmap container");
-      }
-      for (int w = 0; w < 1024; ++w) {
-        uint64_t word = read_u64_le(p + w * 8);
-        admit(static_cast<size_t>(__builtin_popcountll(word)));
-        while (word != 0) {
-          int bit = __builtin_ctzll(word);
-          out.push_back(high | static_cast<uint32_t>(w * 64 + bit));
-          word &= word - 1;  // clear lowest set bit
-        }
-      }
-      p += 8192;
-    } else {
-      // Run container: num_runs(u16), then num_runs × (start_u16, length_u16)
-      if (remaining(p, p_end) < 2u) {
-        throw std::runtime_error("roaring: truncated run container header");
-      }
-      uint16_t num_runs = read_u16_le(p);
-      p += 2;
-      size_t run_bytes = static_cast<size_t>(num_runs) * 4;
-      if (remaining(p, p_end) < run_bytes) {
-        throw std::runtime_error("roaring: truncated run container");
-      }
-      for (uint16_t r = 0; r < num_runs; ++r) {
-        uint16_t start  = read_u16_le(p);
-        uint16_t length = read_u16_le(p + 2);
-        p += 4;
-        admit(static_cast<size_t>(length) + 1);
-        for (uint32_t v = start; v <= static_cast<uint32_t>(start) + length; ++v) {
-          out.push_back(high | v);
-        }
-      }
-    }
-  }
-
-  return static_cast<size_t>(p - data);
+  size_t const base = out.size();
+  out.resize(base + static_cast<size_t>(cardinality));
+  bitmap.toUint32Array(out.data() + base);
+  return bitmap_size;
 }
 
 using YyjsonDoc =
@@ -291,7 +156,11 @@ std::string property_or_empty(duckdb_yyjson::yyjson_val* properties, char const*
 /// and CRC only prove it is a well-formed vector — a wrong offset landing on a different valid
 /// vector passes both, and passes the cardinality check too whenever the two happen to be the
 /// same size.
-void validate_footer_descriptor(std::ifstream& f,
+///
+/// Returns the offset of the footer's leading magic, i.e. the first byte past the blob region. The
+/// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
+/// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
+std::streamoff validate_footer_descriptor(std::ifstream& f,
                                 std::streamoff file_size,
                                 DeletionVectorRef const& ref,
                                 char const (&puffin_magic)[4])
@@ -320,7 +189,8 @@ void validate_footer_descriptor(std::ifstream& f,
                              " is compressed, so its blob descriptors cannot be checked");
   }
 
-  f.seekg(file_size - kFooterTail - payload_size - 4);
+  auto const footer_start = file_size - kFooterTail - payload_size - 4;
+  f.seekg(footer_start);
   char magic[4];
   f.read(magic, 4);
   if (!f || std::memcmp(magic, puffin_magic, 4) != 0) {
@@ -446,6 +316,8 @@ void validate_footer_descriptor(std::ifstream& f,
                              ", but its manifest entry records " +
                              std::to_string(ref.record_count));
   }
+
+  return footer_start;
 }
 
 }  // anonymous namespace
@@ -505,7 +377,21 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
     throw std::runtime_error("[puffin] Not a Puffin file (bad trailing magic): " + puffin_path);
   }
 
-  validate_footer_descriptor(f, file_size, ref, kPuffinMagic);
+  auto const footer_start = validate_footer_descriptor(f, file_size, ref, kPuffinMagic);
+
+  // The blob must lie entirely between the leading magic and the footer. Both bounds are compared
+  // by SUBTRACTION against a length the file actually has: `content_offset + content_size` is a
+  // sum of two manifest-supplied numbers and can wrap, and a descriptor that merely agrees with
+  // the manifest proves nothing about the file -- a few-KB Puffin whose manifest and footer both
+  // declare a 40 GiB blob would otherwise allocate 40 GiB here and fail on the read afterwards.
+  static constexpr std::streamoff kLeadingMagic = 4;
+  if (content_offset < kLeadingMagic || content_offset > footer_start ||
+      content_size_in_bytes > footer_start - content_offset) {
+    throw std::runtime_error(
+      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " size " +
+      std::to_string(content_size_in_bytes) + " does not fit between the leading magic and the "
+      "footer (which starts at " + std::to_string(footer_start) + ") of " + puffin_path);
+  }
 
   f.seekg(content_offset);
   if (!f) {

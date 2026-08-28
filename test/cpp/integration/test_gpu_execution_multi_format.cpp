@@ -606,6 +606,16 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
                                         << kVerifiedIcebergVersion
                                         << "; reader behaviour differences trace to this");
     }
+
+    // The pyiceberg corpus has no `version-hint.text`, so it is legible only with version
+    // guessing on. Set it in THIS session rather than relying on the extension's default: the
+    // default is not knowable from the version string (see require_session_can_read), and a
+    // suite that depends on an ambient value fails in a way that reads like a Sirius gate bug.
+    // Session-scoped on purpose -- Sirius mirrors the session, so this is also what makes the
+    // mirror the thing under test rather than a global nobody set.
+    auto set_guessing = con->Query("SET unsafe_enable_version_guessing = true;");
+    REQUIRE(set_guessing);
+    REQUIRE_FALSE(set_guessing->HasError());
   }
 
   /// Non-data manifest entries (V2 positional, V2 equality, V3 deletion vectors — the last
@@ -749,22 +759,23 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
    * @brief Assert the user's own session can read this table, which is what Sirius relies on.
    *
    * pyiceberg's SqlCatalog writes no `version-hint.text`, so reading these tables needs
-   * `unsafe_enable_version_guessing`. These cases used to `SET` it, and Sirius's metadata
-   * connection used to force it on -- both because an older extension build defaulted it OFF.
+   * `unsafe_enable_version_guessing`. The fixture now SETs it in this session, so the corpus
+   * precondition is explicit rather than inherited.
    *
-   * It is ON by default in the build this branch targets, and that is a per-build fact that has
-   * already flipped once:
+   * ⚠️ Do NOT restore a claim about what the flag defaults to. Measured 2026-08-27 in fresh
+   * processes, the runtime default differs per build:
    *
-   *     iceberg 75726455 (DuckDB v1.5.4) -> default false
-   *     iceberg 45163a28 (DuckDB v1.5.5) -> default true    <- kVerifiedIcebergVersion
+   *     iceberg 75726455 (DuckDB v1.5.4) -> false
+   *     iceberg 45163a28 (DuckDB v1.5.5) -> true     <- kVerifiedIcebergVersion
    *
-   * So Sirius must not be the thing that makes these tables legible. It mirrors the session's
-   * value rather than forcing one, which means the precondition is exactly this: the OUTER
-   * connection can already read the table. That is what this asserts -- deliberately not the
-   * flag's value, which is the extension's business and is the part that moved.
+   * while duckdb-iceberg's source registers `Value::BOOLEAN(false)` at BOTH `45163a28` and on
+   * `main`. The shipped binary therefore does not match the commit whose version it reports, so
+   * the version string is not evidence of the behaviour and neither is the source. This asserts
+   * the only thing that is checkable in-process: the OUTER connection can read the table, with
+   * the extension version and the effective flag both reported when it cannot.
    *
-   * If a future build defaults it off again, this fails HERE naming the cause, instead of every
-   * conformance case re-routing to plan_fallback and reading like a Sirius gate bug.
+   * Sirius must not be the thing that makes these tables legible -- it mirrors the session's
+   * value rather than forcing one, which is why this checks the session and not Sirius.
    */
   void require_session_can_read(const std::string& table_path)
   {
@@ -772,11 +783,17 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
     REQUIRE(r);
     if (r->HasError()) {
       auto flag = con->Query("SELECT current_setting('unsafe_enable_version_guessing');");
+      auto ver  = con->Query(
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'iceberg';");
       FAIL("this session cannot read conformance table '"
            << table_path << "': " << r->GetError() << "\nunsafe_enable_version_guessing is "
            << (flag && !flag->HasError() ? flag->GetValue(0, 0).ToString() : "unreadable")
-           << "; the corpus has no version-hint, and Sirius deliberately does not force that flag "
-              "on. Check the loaded iceberg build against kVerifiedIcebergVersion.");
+           << ", iceberg extension_version is "
+           << (ver && !ver->HasError() && ver->RowCount() == 1 ? ver->GetValue(0, 0).ToString()
+                                                              : "unreadable")
+           << " (verified: " << kVerifiedIcebergVersion
+           << "). Both are reported together because neither predicts the other: the shipped "
+              "binary's version string does not identify the tree it was built from.");
     }
   }
 

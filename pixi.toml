@@ -38,6 +38,10 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
+# CRoaring: the portable-Roaring reader for Iceberg Puffin deletion vectors. duckdb-iceberg takes
+# the same library (as vcpkg `roaring`) and decodes the same blob with it; we hand-wrote the parser
+# instead and paid for it in five review findings. Host-side only -- no CUDA interaction.
+croaring = "*"
 
 [pypi-dependencies]
 rumdl = "==0.2.44"
