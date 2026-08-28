@@ -22,9 +22,11 @@
 
 #include <rmm/cuda_device.hpp>
 
+#include <cub/device/device_for.cuh>
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
 #include <cuco/hash_functions.cuh>
+#include <cuda/dynamic_filter_probe.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/bit>
 #include <cuda/std/cstddef>
@@ -172,16 +174,33 @@ bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
   return result;
 }
 
-template <class KeyT>
-constexpr cudf::type_id key_type_id() noexcept
-{
-  static_assert(std::is_same_v<KeyT, std::int32_t> || std::is_same_v<KeyT, std::int64_t>);
-  if constexpr (std::is_same_v<KeyT, std::int32_t>) {
-    return cudf::type_id::INT32;
-  } else {
-    return cudf::type_id::INT64;
+/// @brief Per-row Bloom membership probe. Probe values convert into the key domain per element;
+/// an inserted key always fits that domain, so a non-representable value is a definite non-member
+/// and the conversion preserves the no-false-negative contract. Rows the prior keep-mask killed
+/// skip the block fetch.
+template <class ProbeT, class FilterRef>
+struct bloom_contains {
+  using key_type = typename FilterRef::key_type;
+  ProbeT const* __restrict__ probe;
+  bool* __restrict__ out;
+  FilterRef ref;
+  std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
+
+  __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
+  {
+    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx)) {
+      out[idx] = false;
+      return;
+    }
+    key_type key;
+    if (!sirius::op::detail::probe_key_convert(probe[idx], key)) {
+      out[idx] = false;
+      return;
+    }
+    out[idx] = ref.contains(key);
   }
-}
+};
+
 }  // namespace
 
 struct bloom_replica {
@@ -405,39 +424,41 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
+  return compute_mask(probe, /*prior_mask_words=*/nullptr, device_id, stream, mr);
+}
+
+std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
+  cudf::column_view const& probe,
+  std::uint32_t const* prior_mask_words,
+  int device_id,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  auto const want = std::visit(
-    [](auto const& bloom) {
-      using owner_type = std::decay_t<decltype(bloom)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      return cudf::data_type{key_type_id<key_type>()};
-    },
-    replica->bloom);
-  // A pinned chunk may store this key narrowed while the filter was published at
-  // the native carrier; restore rather than decline (see restore_probe_to). The
-  // equality below subsumes the old supports() guard: it admits exactly the two
-  // types the bloom is instantiated for.
-  auto const restored = detail::restore_probe_to(probe, want, stream, mr);
-  auto const keys     = restored ? restored->view() : probe;
-  if (keys.type() != want) { return nullptr; }
-
-  auto const n = keys.size();
-  auto out     = cudf::make_numeric_column(
-    cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cuda::stream_ref const s{stream.value()};
-  auto* const outp = out->mutable_view().data<bool>();
-
-  std::visit(
-    [&](auto const& bloom) {
-      using owner_type = std::decay_t<decltype(bloom)>;
-      using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = keys.data<key_type>();
-      bloom->contains_async(d, d + n, outp, s);
-    },
-    replica->bloom);
+  // A pinned chunk may store this key narrowed while the filter was published at the native
+  // carrier; the kernel converts per element rather than materializing a widened copy.
+  std::unique_ptr<cudf::column> out;
+  auto const n          = probe.size();
+  auto const dispatched = detail::dispatch_signed_integer_probe(probe.type(), [&](auto probe_tag) {
+    using probe_type = decltype(probe_tag);
+    out              = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto* const outp = out->mutable_view().data<bool>();
+    auto const* d    = probe.data<probe_type>();
+    std::visit(
+      [&](auto const& bloom) {
+        auto ref = bloom->ref();
+        cub::DeviceFor::Bulk(
+          n,
+          bloom_contains<probe_type, decltype(ref)>{d, outp, ref, prior_mask_words},
+          stream.value());
+      },
+      replica->bloom);
+  });
+  if (!dispatched) { return nullptr; }
 
   if (probe.nullable() && probe.null_count() > 0) {
     out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
