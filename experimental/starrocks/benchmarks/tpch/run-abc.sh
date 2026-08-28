@@ -168,8 +168,10 @@ and Engine C (cudf-polars/Ray) at any scale factor, one engine at a time with a 
 between them, and writes ONE tidy CSV:  engine,scale,query,run,phase,status,ms,rows
 
 Required:
-  --sf N                  scale factor. Selects the dataset (tpch_parquet_sf<N>), the output
-                          names, and every timeout. REFUSES TO START if the dataset is missing.
+  --sf N                  scale factor. Selects the dataset (tpch_parquet_sf<N> or
+                          tpch_parquet_sf<N>_f64), the Engine A memory preset (SCALE_FACTOR),
+                          the output names, and every timeout. REFUSES TO START if the dataset
+                          is missing.
 
 Selection:
   --engines A,B,C         which engines, in this order (default A,B,C). Case-insensitive.
@@ -546,6 +548,10 @@ fi
 # =================================================================================================
 [ -n "$SF" ] || { usage >&2; die "--sf is required"; }
 [[ $SF =~ ^[0-9]+$ ]] && [ "$SF" -ge 1 ] || die "--sf must be a positive integer, got '$SF'"
+# engine-a.env reads SCALE_FACTOR (SF as alias). Export it so both the provenance subshell
+# and the setsid launcher inherit the preset; otherwise cluster4-numa.sh starts a clean shell
+# and silently uses the SF100 140/16/160 split at --sf 1000.
+export SCALE_FACTOR=$SF
 [[ $RUNS =~ ^[0-9]+$ ]] && [ "$RUNS" -ge 1 ] || die "--runs must be >= 1, got '$RUNS'"
 [[ $WAIT_BOX_MIN =~ ^[0-9]+$ ]] || die "--wait-box must be an integer, got '$WAIT_BOX_MIN'"
 case $Q11_FRACTION_MODE in spec|literal) ;; *) die "--q11-fraction must be spec|literal" ;; esac
@@ -596,10 +602,11 @@ if [ -n "$DATA_OVERRIDE" ]; then
 else
   DATA=""; tried=""
   for root in ${TPCH_DATA_ROOTS//:/ }; do
-    cand="$root/tpch_parquet_sf$SF"
-    tried="$tried
+    for cand in "$root/tpch_parquet_sf$SF" "$root/tpch_parquet_sf${SF}_f64"; do
+      tried="$tried
        $cand"
-    if validate_dataset "$cand" >/dev/null 2>&1; then DATA=$cand; break; fi
+      if validate_dataset "$cand" >/dev/null 2>&1; then DATA=$cand; break 2; fi
+    done
   done
   [ -n "$DATA" ] || die "no TPC-H SF$SF dataset found. Tried:$tried
 
@@ -607,7 +614,8 @@ else
        tpchgen-cli --output-dir=<root>/tpch_parquet_sf$SF --format=parquet -s $SF
      ...then verify the row counts against the spec BEFORE measuring against it. NOTE that
      regeneration produces DIFFERENT BYTES and invalidates every existing number for this SF.
-     Or point at an existing copy with --data / TPCH_DATA_ROOTS."
+     On this box the large-SF trees are named tpch_parquet_sf<N>_f64 (f64 decimals). Point at
+     one with --data, or keep TPCH_DATA_ROOTS pointing at /raid/prestouser/aocsa."
 fi
 DATA_FSTYPE=$(df -PT "$DATA" 2>/dev/null | awk 'NR==2 {print $2}')
 DATA_DEV=$(df -P "$DATA" 2>/dev/null | awk 'NR==2 {print $1}')
@@ -907,6 +915,7 @@ load_engine_a_env() {
     . "$A_ENV" >/dev/null 2>&1
     for v in NUM_CNS PORT_BASE PORT_STRIDE GPU_MEM STAGING HOST_MEM CPU_SPLIT CN_GPU CN_NODE \
              CN_CPUS UCX_TLS SIRIUS_QUERY_WATCHDOG_SECS SIRIUS_EXCHANGE_STAGING_BYTES \
+             SIRIUS_CN_RPC_TIMEOUT_SECS SCALE_FACTOR \
              SIRIUS_CN_USE_SIRIUS_DATASOURCE RUST_LOG JAVA_HOME; do
       printf 'A_%s=%q\n' "$v" "${!v-}"
     done )"
@@ -914,7 +923,7 @@ load_engine_a_env() {
 }
 
 engine_a_up() {
-  say "  launching: $A_LAUNCH  (NUM_CNS=$A_NUM_CNS, GPU_MEM=$A_GPU_MEM, STAGING=$A_STAGING, HOST_MEM=$A_HOST_MEM)"
+  say "  launching: $A_LAUNCH  (SCALE_FACTOR=$A_SCALE_FACTOR NUM_CNS=$A_NUM_CNS, GPU_MEM=$A_GPU_MEM, STAGING=$A_STAGING, HOST_MEM=$A_HOST_MEM)"
   # setsid puts the launcher in its own process group so teardown can signal the FE and every CN
   # with one `kill -- -PGID`, instead of hunting children that numactl exec'd over.
   setsid bash "$A_LAUNCH" >> "$A_OUT/cluster.log" 2>&1 &
@@ -1022,10 +1031,12 @@ engine_a() {
   prov "cn_binary         = $SR_DIR/target/release/sirius-starrocks-cn"
   prov "cn_binary_mtime   = $(date -u -r "$SR_DIR/target/release/sirius-starrocks-cn" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
   prov "cn_binary_bytes   = $(stat -c %s "$SR_DIR/target/release/sirius-starrocks-cn" 2>/dev/null)"
+  prov "SCALE_FACTOR      = $A_SCALE_FACTOR"
   prov "NUM_CNS           = $A_NUM_CNS"
   prov "GPU_MEM           = $A_GPU_MEM"
   prov "STAGING           = $A_STAGING  (bare cudaMalloc, OUTSIDE the RMM pool)"
   prov "HOST_MEM          = $A_HOST_MEM (a lazily-grown ceiling; host spill is NOT implemented)"
+  prov "SIRIUS_CN_RPC_TIMEOUT_SECS = $A_SIRIUS_CN_RPC_TIMEOUT_SECS"
   prov "CPU_SPLIT         = $A_CPU_SPLIT"
   prov "CN_GPU            = $A_CN_GPU"
   prov "CN_NODE           = $A_CN_NODE"

@@ -4,6 +4,10 @@ Configuration for running Sirius as 4 StarRocks compute nodes, one per GB200 GPU
 specific box. Engine A is Sirius; engine B is stock StarRocks (`../gb200-4gpu/engine-b`, if
 present, and `../../benchmarks/tpch/setup-engine-b.sh`).
 
+**Tuning + scale-factor switch (no rebuild):**
+[`../../../bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md`](../../../bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md).
+`SCALE_FACTOR=1000 ./cluster4-numa.sh` (or `run-abc.sh --sf 1000 --engines A`).
+
 | file | what it is |
 |---|---|
 | `engine-a.env` | every tunable, with the arithmetic behind each value. Bash (defines arrays). |
@@ -306,14 +310,15 @@ first-order effect on the headline number.
 
 ### Summary
 
-| knob | SF100 (default) | SF1000 (commented in `engine-a.env`) |
+| knob | SF100 (default) | SF1000 (`SCALE_FACTOR=1000`) |
 |---|---|---|
 | `GPU_MEM` | `140GiB` (`132GiB` rebalance available) | `128GiB` |
 | `STAGING` | `16GiB` (`24GiB` rebalance available) | `32GiB` — **requires eager per-lease arena reclaim (M2 phase 2)** |
-| `HOST_MEM` | `160GiB` | `120GiB` |
+| `HOST_MEM` | `160GiB` | **`112GiB`** (not 120 — 4×112 leaves ~393 GiB cache for the 380 GiB f64 dataset) |
 | `SIRIUS_QUERY_WATCHDOG_SECS` | `0` (recommend `120` for unattended sweeps) | `300` |
-| GPU headroom | 27.24 GiB (14.8%) | 22.0 GiB (12.0%) |
-| page cache left | 244.8 GiB (≈9× dataset) | 372.8 GiB = 400.3 GB ✓ |
+| `SIRIUS_CN_RPC_TIMEOUT_SECS` | `60` | `300` |
+| GPU headroom | 27.24 GiB (14.8%) | 23.24 GiB (12.6%) |
+| page cache left | 244.8 GiB (≈9× dataset) | ~393 GiB vs 380 GiB f64 dataset |
 
 **SF1000 honest caveat:** you cannot buy SF1000 with these knobs. Projected per-CN peaks put q21 at
 100–150 GB and SF1000 arena demand at 105–125 GB/CN under the current bump-reset policy — no fixed
@@ -332,8 +337,7 @@ CPU_SPLIT=disjoint ./configs/gb200-4gpu/cluster4-numa.sh    # truthful core acco
 SIRIUS_QUERY_WATCHDOG_SECS=120 ./configs/gb200-4gpu/cluster4-numa.sh   # unattended sweep
 
 # SF1000
-GPU_MEM=128GiB STAGING=32GiB HOST_MEM=120GiB SIRIUS_QUERY_WATCHDOG_SECS=300 \
-  ./configs/gb200-4gpu/cluster4-numa.sh
+SCALE_FACTOR=1000 ./configs/gb200-4gpu/cluster4-numa.sh
 ```
 
 Run it in its own terminal or as its own background task — **never** chained behind `&` inside
