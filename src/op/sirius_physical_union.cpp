@@ -146,32 +146,36 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
   const auto num_arms      = ports_by_arm.size();
   if (num_arms == 0) { return std::nullopt; }
 
-  sirius_physical_operator* live_producer = nullptr;
-  std::size_t live_arm                    = 0;
+  bool any_ready                             = false;
+  sirius_physical_operator* starved_producer = nullptr;
+  std::size_t starved_arm                    = 0;
   for (std::size_t offset = 0; offset < num_arms; offset++) {
-    const auto arm = (_wait_cursor + offset) % num_arms;
-    auto* p        = ports_by_arm[arm];
-    // Readiness is ANY, not ALL: one arm with a queued batch is enough to fire a task.
-    if (p->repo && p->repo->total_size() > 0) {
-      return task_creation_hint{TaskCreationHint::READY, this};
-    }
-    // Carry a still-producing arm rather than returning here: a later arm may have data, and
-    // READY outranks WAITING.
-    if (live_producer == nullptr && p->src_pipeline && !p->src_pipeline->is_pipeline_finished()) {
-      live_producer = &(p->src_pipeline->get_operators()[0].get());
-      live_arm      = arm;
+    const auto arm      = (_wait_cursor + offset) % num_arms;
+    auto* p             = ports_by_arm[arm];
+    const bool has_data = p->repo && p->repo->total_size() > 0;
+    const bool live     = p->src_pipeline && !p->src_pipeline->is_pipeline_finished();
+    any_ready           = any_ready || has_data;
+    if (!has_data && live && starved_producer == nullptr) {
+      starved_producer = &(p->src_pipeline->get_operators()[0].get());
+      starved_arm      = arm;
     }
   }
 
-  // `task_creator::get_operator_for_next_task` selects the next operator to run *only* by walking
-  // `hint.producer`, so a null producer here would leave the still-producing arm with nothing to
-  // run it. The walk is also all-or-nothing: when it yields no operator, `task_creator` abandons
-  // the whole task-creation request, so repeatedly nominating one stalled arm concentrates that
-  // loss on it. Advancing past the arm just nominated spreads it across the arms instead.
-  if (live_producer != nullptr) {
-    _wait_cursor = (live_arm + 1) % num_arms;
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, live_producer};
+  // A starved arm outranks a ready one, because nothing else will start it.
+  // `task_creator::get_operator_for_next_task` reaches an operator *only* by walking
+  // `hint.producer`, and `task_scheduler::start_query` schedules `scans.front()` alone — so an arm
+  // is named here or never runs, and answering READY first spends that request on draining. The
+  // producer is likewise never null, or the still-producing arm has nothing to run it. The walk is
+  // all-or-nothing too: when it yields no operator `task_creator` abandons the whole request, so
+  // advancing past the arm just nominated spreads that loss instead of concentrating it on one.
+  if (starved_producer != nullptr) {
+    _wait_cursor = (starved_arm + 1) % num_arms;
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, starved_producer};
   }
+
+  // Readiness is ANY, not ALL: one arm with a queued batch is enough to fire a task. An arm that
+  // finished without producing is not starved, which is what lets an empty arm through.
+  if (any_ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
 
   return std::nullopt;
 }
