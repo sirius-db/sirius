@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -153,6 +154,25 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    *
    * @return One carrier target per logical output column, in output order
    */
+  //! Output positions whose values the pinned provider does NOT serve, because a deferral is
+  //! going to replace them with a rowid anyway. Empty unless the scan serves from a pin AND a
+  //! deferral installed AND the narrowing was admissible; see
+  //! `sirius_scan_manager`'s install path, which is the only writer.
+  //!
+  //! The batch therefore arrives narrower than `types.size()`, and two things downstream depend
+  //! on that: output assembly renumbers the layout past the missing columns, and
+  //! `substitute_deferred_columns` INSERTS at these positions rather than overwriting. Setting
+  //! this without narrowing what the provider serves, or the reverse, mismatches the batch
+  //! against the layout that describes it.
+  void set_withheld_output_positions(std::vector<std::size_t> positions)
+  {
+    _withheld_output_positions = std::move(positions);
+  }
+  [[nodiscard]] std::span<std::size_t const> withheld_output_positions() const noexcept
+  {
+    return _withheld_output_positions;
+  }
+
   [[nodiscard]] std::vector<cudf::data_type> const& normalization_targets() const noexcept
   {
     return has_physical_overrides() ? get_physical_types() : _native_physical_types;
@@ -171,6 +191,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   }
 
  private:
+  std::vector<std::size_t> _withheld_output_positions;
+
   std::shared_ptr<gpu_ingestible> _ingestible;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
   /// Latch for "compacting during decode does not pay off", shared with every

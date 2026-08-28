@@ -1157,9 +1157,15 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* survivors,
-  std::span<std::size_t const> elided)
+  std::span<std::size_t const> elided,
+  std::span<std::size_t const> withheld)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
+  if (!withheld.empty() && !elided.empty()) {
+    throw internal_exception(
+      "[parquet_gpu_ingestible::post_filter_and_project] a batch cannot both withhold and elide "
+      "the same output positions");
+  }
 
   // Apply the row filter post-decode when materialization did not — reader-side
   // pushdown was disabled (FLBA-decimal file) or AST translation failed. A
@@ -1215,8 +1221,25 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   // (non-owning select_columns, no GPU copy). No partitions reach this path, so
   // partition_values is unused. The release below moves the surviving column
   // buffers out.
-  auto assembled =
-    assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
+  // D-space positions of the withheld output columns. Every withheld entry must be
+  // DATA-sourced: a PARTITION column is synthesized rather than read, so nothing
+  // could have withheld it, and treating one as withheld would drop a column the
+  // batch never carried in the first place.
+  std::vector<std::size_t> withheld_data;
+  withheld_data.reserve(withheld.size());
+  for (auto const position : withheld) {
+    if (position >= _plan->output_layout.size() ||
+        _plan->output_layout[position].source != scan_plan::output_entry::DATA) {
+      throw internal_exception(
+        "[parquet_gpu_ingestible::post_filter_and_project] withheld output position " +
+        std::to_string(position) + " is not a data column of this scan");
+    }
+    withheld_data.push_back(_plan->output_layout[position].idx);
+  }
+  std::sort(withheld_data.begin(), withheld_data.end());
+
+  auto assembled = assemble_scan_output(
+    *_plan, std::move(input.table), /*partition_values=*/{}, stream, withheld_data);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
   if (auto const kept =

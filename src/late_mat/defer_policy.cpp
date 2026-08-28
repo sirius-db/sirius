@@ -36,11 +36,18 @@ char const* describe(defer_refusal r) noexcept
 
 std::int64_t defer_candidate::net_value_bytes(std::int64_t rowid_bytes) const noexcept
 {
+  if (columns.empty()) { return -rowid_bytes; }
   std::int64_t total = 0;
   for (auto const& c : columns) {
     total += c.value_bytes;
   }
-  return total - rowid_bytes;
+  return total - carrier_bytes(rowid_bytes);
+}
+
+std::int64_t defer_candidate::carrier_bytes(std::int64_t rowid_bytes) const noexcept
+{
+  if (columns.empty()) { return rowid_bytes; }
+  return rowid_bytes + (static_cast<std::int64_t>(columns.size()) - 1) * kPlaceholderBytes;
 }
 
 std::vector<defer_outcome> choose_deferrals(std::vector<defer_candidate> const& candidates,

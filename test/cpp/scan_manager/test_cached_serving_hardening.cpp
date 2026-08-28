@@ -365,7 +365,8 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     bool /*like_swar_fastpath*/,
     std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
     std::unique_ptr<cudf::column>* /*survivors*/,
-    std::span<std::size_t const> /*elided*/) override
+    std::span<std::size_t const> /*elided*/,
+    std::span<std::size_t const> /*withheld*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }

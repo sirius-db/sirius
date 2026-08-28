@@ -7,8 +7,10 @@ what is IN them.
 
 Late materialization replaces those columns at the scan with a pin-order **rowid**, carries that
 instead, and puts the values back at the far end by gathering them out of the pinned table. It
-works only for a **GPU-tier pinned** table — the values have to still exist somewhere
-addressable when the far end asks for them, and that is what the pin guarantees.
+works only for a **pinned** table — the values have to still exist somewhere addressable when the
+far end asks for them, and that is what the pin guarantees. A GPU-tier pin is gathered out of
+device memory; a HOST-tier pin is gathered out of pinned host memory in place, over unified
+virtual addressing, with nothing staged back to the device (see [Host-tier pins](#host-tier-pins)).
 
 ## Turning it on (experimental)
 
@@ -30,7 +32,10 @@ every refusal says which refusal it was — a deferral that silently did not hap
 like one that did nothing.
 
 The uniqueness probe costs pin-time work, so name the columns a ride actually needs rather than
-using `all`; without a proof there is no group-by-rowid ride and no riders.
+using `all`; without a proof there is no group-by-rowid ride and no riders. On TPC-H SF1000 that
+cost is the ONLY difference `all` makes (see Results): it proves eight more columns distinct and
+not one of them changes an admission, so the choice between `all` and the narrow list is a pin-time
+question, not a query-time one.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -41,6 +46,7 @@ using `all`; without a proof there is no group-by-rowid ride and no riders.
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_X_BOUNDARIES` | 128 | Net bytes/row TIMES crossings saved — value and crossings trade off, so this is the floor that matters. |
 | `SIRIUS_EXP_LATE_MAT_COUNT_DEFER` | off | Count-on-deferred (below). |
 | `SIRIUS_EXP_LATE_MAT_MIN_VALUE_COMPRESSED` | = the ordinary floor | Separate floor for compressed origins. Inert until the decode-skip exists to measure. |
+| `SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER` | 12 | What the value x crossings floor is multiplied by for a HOST-tier pin. |
 
 ## What a deferral is
 
@@ -91,7 +97,9 @@ end a ride early.
 Two things then decide whether the ride is taken:
 
 - **It has to repay.** Value per row and crossings saved TRADE OFF — a thin ride over many
-  crossings can pay where a fat one over few does not — so what is weighed is their product.
+  crossings can pay where a fat one over few does not — so what is weighed is their product. What
+  the ride saves is the values less the CARRIER: the rowid plus a 1-byte placeholder for every
+  column past the first, so an n-column bundle costs `rowid + (n - 1)` bytes per row to carry.
 - **It must not sit above a fan-out.** A join emits one scan row once per match, so a port above
   one gathers a row set larger than the scan produced. The walk tracks whether a join below a
   column multiplied the rows and whether a reduction has undone it, and a port that is still
@@ -177,10 +185,8 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   handful of short strings can clear the floor on the estimate while saving fewer bytes/row than
   the measured value would show). The real fix is measuring the width — the scan already has the
   offsets for it.
-- **Host-tier pins are refused**, not just unpinned scans: `install_late_materialization`
-  declines on tier, and `resolve_pinned_layout`/`resolve_pinned_column` refuse independently at
-  the far end. Supporting them would mean staging a chunk back to the device per gather, so the
-  ride would have to repay a host round trip rather than a device read.
+- **A host-tier pin rides only FIXED-WIDTH, uncompressed columns**; see
+  [Host-tier pins](#host-tier-pins).
 - **A non-pinned scan cannot defer at all.** A fresh parquet or DuckDB-native read consumes its
   decoded batch, so there is nothing for the port to gather from. Deferring against a file would
   mean a rowid addressing a file offset and a re-read per gather — the shape classic disk-based
@@ -204,6 +210,89 @@ deferral with a single half, admitted only over pinned columns with no nulls. Of
   whenever more than one GPU memory space is active, matching the memory prefetcher's own
   single-GPU prototype scope.
 
+## Host-tier pins
+
+A host-tier pin stores its data the other way round from a GPU one: `entry.host_chunks` holds one
+representation PER EMITTED BATCH, each carrying every pinned column, where a GPU pin holds a chunk
+vector per column. The resolver is what bridges the two orientations, and there is no per-column
+merge path on the host side because of it.
+
+**The gather reads the rows where they lie**, rather than staging the chunk back to the device per
+materialization. Measured on GB300 (Grace-Blackwell, C2C rather than PCIe), a 150M x 8 B pinned
+column stages H2D at 163 GB/s, so a full stage costs 7.4 ms whatever the selection, while a blocked
+zero-copy gather of the same column costs 0.012 ms at 0.01% selectivity, 0.42 ms at 1%, and 5.1 ms
+even when the selection covers every row. Cheaper at every selectivity, and it allocates only its
+output rather than putting the whole column back in device memory, which is what pinning on the
+host was avoiding.
+
+**The deferred columns are never served.** A pinned scan carrying a deferral withholds them: the
+provider drops their entry positions from what it projects, so a HOST-tier chunk never stages them
+across the link and a GPU-tier chunk never copies them. The batch then arrives NARROWER than the
+scan's arity, which two things downstream absorb — `assemble_scan_output` renumbers the output
+layout past the missing columns (`renumber_output_for_withheld`), and `substitute_deferred_columns`
+INSERTS the rowid and its placeholders at their positions instead of overwriting values that are
+there. Withholding and the older elision are alternatives, never both: elision drops columns the
+batch DID carry, and paid to read them.
+
+Measured, 500k customers x 40 deferred BIGINTs over two joins and two group-by stages, host pin:
+
+| | H2D bytes | of which the pinned scan | GPU kernel time |
+|---|---|---|---|
+| Gate off | 196.231 MB | 55.983 + 22.0 + 4.0 MB | 27.6 ms |
+| Gate on, serving the deferred columns | 196.259 MB | 55.983 + 22.0 + 4.0 MB | 33.0 ms |
+| Gate on, withholding them | **116.259 MB** | **2.0 MB** | 33.5 ms |
+
+The middle row is what the ride cost before withholding existed: per-copy sizes identical to gate
+off, not merely the totals, so the payload crossed in full whether or not it rode. The last row
+lands on the 116.228 MB a control that projects only the key measures, which is what identifies
+the bytes that disappeared as exactly the deferred payload.
+
+**Withholding is refused rather than guessed at.** It requires a parquet plan (the duckdb-native
+reader has no output layout to renumber), no row filter (a post-decode filter evaluates over the
+reader's D-order batch, so a missing column shifts every filter reference past it, and a deferred
+column can itself be a filter column), no partition columns (synthesized rather than read, so
+nothing could have withheld one), and at least one column left over. Where any of those fails the
+scan serves the columns and elides them from the projection, exactly as before.
+
+Against a device gather the same column costs 2.0x, 8.1x, 10.6x, 12.2x, 11.0x and 6.6x at those
+selectivities. That worst case is `SIRIUS_EXP_LATE_MAT_HOST_COST_MULTIPLIER`: the value x crossings
+floor is calibrated against a device gather, and both the floor and the gather scale with the same
+row count, so a host-tier bundle is weighed against `128 x 12` instead of `128`. It bounds one
+operation rather than calibrating a query, which is why it is a knob. It does NOT price the
+scan-time staging above, which no floor currently accounts for.
+
+**How a chunk-major host chunk becomes a column-major view.** A host chunk's storage is a list of
+equally sized pinned blocks that are NOT contiguous with one another, so a column's buffer has no
+single base pointer and cannot be described by a `cudf::column_view` at all. What it does have is a
+byte offset into the logical concatenation of those blocks (`cucascade::memory::column_metadata`),
+and `batch_source::host` carries exactly that: the block pointers, the block size, and the data and
+null-mask offsets. `multi_source_gather_fixed_host` turns a global rowid into a batch, a row, a byte
+offset, a block index and an offset within it — one divide on top of the batch search the GPU-tier
+gather already does. Validity comes along one mask word at a time, in the same coordinates.
+
+The block pointers are used as device addresses directly. That is legitimate only where the device
+reports both `cudaDevAttrUnifiedAddressing` and `cudaDevAttrCanUseHostPointerForRegisteredMem`; the
+resolver asks once and refuses host-tier deferral outright when either is false, rather than
+translating or staging.
+
+**What a host-tier pin refuses**, beyond every refusal the GPU tier makes:
+
+- **A variable-width or nested column.** There is no element width to multiply a row by, and its
+  offsets would have to be rebuilt against buffers that are not contiguous. Refused per COLUMN, not
+  per pin: the fixed-width columns of the same chunks stay eligible.
+- **A compressed host chunk** (`compressed_host_representation`). A Simpatico blob has no
+  addressable per-row layout to read in place, and its per-column nullability is opaque besides —
+  the same reason a compressed GPU chunk is refused.
+- **A translation that does not land on a boundary.** The block size must divide by the element
+  width, the data offset must start on an element, and the mask offset must be word-aligned. A pin
+  that fails any of these is refused rather than read crookedly.
+- **A filtered scan**, which was already refused for host pins and stays refused.
+
+`install_late_materialization` and the rider pass check exactly what `resolve_pinned_column` checks,
+for the same reason the nullability gate does: by the time a port resolves an origin the scan has
+already emitted rowids in place of the values, so a refusal there is a thrown query rather than a
+slower one.
+
 ## Results
 
 GB300, TPC-H SF1000, unpatched libcudf, GPU-pinned, `SIRIUS_EXP_FUSED_SCAN_FILTER=1` held on in
@@ -214,6 +303,28 @@ q10; no other query moves outside noise.
 |---|---|---|---|
 | Gate off | 7.3911 s | 0.8481 s | 0.4991 s |
 | Gate on | **7.0031 s** | **0.7611 s** | **0.2250 s** |
+
+### `PIN_UNIQUE_COLS`: the narrow list versus `all`
+
+Same machine, ONE build (upstream `dev` at `8c88f2f3`), three arms back to back, best-of-3, 22/22
+results byte-identical across all three:
+
+| `PIN_UNIQUE_COLS` | Suite | q9 | q10 | Pin time, 72 `pin_table` calls |
+|---|---|---|---|---|
+| `none` | 6.6852 s | 0.8523 s | 0.4995 s | 77.6 s |
+| `c_custkey,n_name,n_nationkey` | 6.3065 s | 0.7596 s | 0.2264 s | 77.7 s |
+| `all` | **6.2992 s** | 0.7648 s | 0.2257 s | 91.5 s |
+
+`all` does not regress: no query moves by more than 0.7%, and the per-operator census is
+IDENTICAL between the narrow list and `all` — same installs, same refusals, same byte counts. The
+eight extra columns `all` proves distinct (`c_name`, `c_address`, `p_partkey`, `s_suppkey`,
+`s_name`, `s_address`, `r_name`, `r_regionkey`) do not unlock a single admission, because every
+other candidate is stopped by a floor, the fan-out guard, or the compressed-filtered-scan refusal
+— none of which uniqueness affects. The measured 0.7% spread is the run-to-run noise floor: a
+fourth arm executing an identical plan set moved q9 by the same amount.
+
+What `all` does cost is **+13.8 s of pin time (+17.8%)**, which grouped-mode query timings do not
+include. That is the price of not making the user name columns.
 
 ## Where the code is
 
@@ -226,3 +337,4 @@ q10; no other query moves outside noise.
 | Pin-time distinctness proof | `src/late_mat/pin_uniqueness.cpp` |
 | Putting the values back | `src/late_mat/port_materialize.cpp`, `materialize.cpp` |
 | Reading a pinned entry the way the materializer needs it | `src/scan_manager/late_mat_resolver.cpp` |
+| Gathering by global rowid, device and host tiers | `src/late_mat/multi_source_gather.cu` |

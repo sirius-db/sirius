@@ -305,7 +305,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::span<std::size_t const> elided,
+    std::span<std::size_t const> withheld) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 

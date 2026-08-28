@@ -258,6 +258,7 @@ set(EXTENSION_SOURCES
     src/planner/late_mat_plan_pass.cpp
     src/scan_manager/late_mat_resolver.cpp
     src/late_mat/multi_source_gather.cu
+    src/late_mat/host_gather_policy.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -756,10 +757,12 @@ set(TEST_SOURCES
     test/cpp/late_mat/test_port_materialize.cpp
     test/cpp/integration/test_late_mat_deferred_query.cpp
     test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/integration/test_late_mat_host_query.cpp
     test/cpp/late_mat/test_defer_policy.cpp
     test/cpp/late_mat/test_defer_directive.cpp
     test/cpp/late_mat/test_late_mat_plan_pass.cpp
     test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_late_mat_host_pin.cpp
     test/cpp/late_mat/test_pin_handle_lifecycle.cpp
     test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/io/s3/test_sigv4.cpp

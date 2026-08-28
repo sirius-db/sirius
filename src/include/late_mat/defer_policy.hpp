@@ -23,8 +23,10 @@
 // far end. That trade is not always good, and the ways it goes bad are
 // measured rather than guessed:
 //
-//  * A NARROW bundle loses. The ride saves (values - rowid) bytes per row per
-//    boundary, but materializing costs a canonicalization on the port side,
+//  * A NARROW bundle loses. The ride saves (values - carrier) bytes per row per
+//    boundary — the carrier being the rowid plus one placeholder for every
+//    column past the first — but materializing costs a canonicalization on the
+//    port side,
 //    which broke even near 60 B/row on the sort path. Dimension columns of
 //    11-25 B were measured COSTING +61 ms on a 800M-row port, while a 154.6 B
 //    bundle and a 50 B pair both won. Hence a floor on deferred value, not a
@@ -73,6 +75,12 @@ enum class defer_refusal : std::uint8_t {
 
 [[nodiscard]] char const* describe(defer_refusal r) noexcept;
 
+/// Per-row width of one placeholder, matching `kPlaceholderType` (INT8) in
+/// `defer_directive.hpp`. A bundle rides as ONE rowid plus one placeholder per
+/// further column, so an n-column bundle costs `rowid_bytes + (n - 1)` per row,
+/// not `rowid_bytes`.
+inline constexpr std::int64_t kPlaceholderBytes = 1;
+
 /// One column a candidate would defer.
 struct defer_column {
   std::uint32_t column_pos = 0;  ///< position within the origin entry
@@ -90,8 +98,12 @@ struct defer_candidate {
   int boundaries = 0;
 
   /// Bytes per row the ride actually saves: the values it stops carrying, less
-  /// the rowid it carries instead.
+  /// what rides in their place.
   [[nodiscard]] std::int64_t net_value_bytes(std::int64_t rowid_bytes) const noexcept;
+
+  /// Bytes per row the substituted columns cost: the rowid at the first
+  /// deferred position plus a placeholder at each of the others.
+  [[nodiscard]] std::int64_t carrier_bytes(std::int64_t rowid_bytes) const noexcept;
 };
 
 /// Port-crossing floor, env-overridable for measurement (default 4). The

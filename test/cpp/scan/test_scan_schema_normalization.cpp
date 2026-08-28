@@ -160,7 +160,8 @@ class stub_ingestible final : public sirius::op::scan::gpu_ingestible {
     bool,
     std::shared_ptr<const sirius::like_multiliteral_cache>,
     std::unique_ptr<cudf::column>*,
-    std::span<std::size_t const> /*elided*/) override
+    std::span<std::size_t const> /*elided*/,
+    std::span<std::size_t const> /*withheld*/) override
   {
     return _produce();
   }

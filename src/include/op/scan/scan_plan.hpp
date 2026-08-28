@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -172,11 +173,34 @@ struct scan_plan {
 ///                          no partition columns.
 /// @param stream            CUDA stream for any GPU work (scalar-backed column
 ///                          construction on the partition path).
+/// @param withheld_data_positions D-space positions the producer did NOT put in
+///                          @p table, ascending and duplicate-free. Their output
+///                          entries are omitted from the result and every
+///                          surviving DATA index is renumbered to its rank among
+///                          the columns that are present, so a narrowed batch is
+///                          assembled by the same layout that describes a full
+///                          one. Empty for every ordinary scan.
 [[nodiscard]] owning_table_view assemble_scan_output(
   scan_plan const& plan,
   owning_table_view&& table,
   std::vector<std::string> const& partition_values,
-  rmm::cuda_stream_view stream);
+  rmm::cuda_stream_view stream,
+  std::span<std::size_t const> withheld_data_positions = {});
+
+/// Renumber @p plan's output layout for a batch that is missing
+/// @p withheld_data_positions (D-space, ascending).
+///
+/// Returns one entry per surviving output column: the position it occupies in
+/// the narrowed batch. `std::nullopt` for a PARTITION entry, which no batch
+/// position describes. Withheld columns' entries are dropped entirely, so the
+/// result is shorter than @c output_layout by exactly the number of withheld
+/// columns that appear in the output.
+///
+/// Throws std::invalid_argument when a withheld position is out of range or the
+/// positions are not ascending and unique: a silent misordering here would
+/// assemble the right number of columns out of the wrong ones.
+[[nodiscard]] std::vector<std::optional<std::size_t>> renumber_output_for_withheld(
+  scan_plan const& plan, std::span<std::size_t const> withheld_data_positions);
 
 /// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
 /// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in

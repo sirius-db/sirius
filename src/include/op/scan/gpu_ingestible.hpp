@@ -179,6 +179,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        exactly the case a deferral must refuse rather than guess at. An
    *        implementation that ignores it must leave @ref can_report_survivors
    *        false.
+   * @param withheld Output positions the producer never materialized, so the batch arrives
+   *                 without them and the output layout is renumbered past them. Mutually
+   *                 exclusive with @p elided, which drops columns the batch DOES carry.
    * @param elided Output positions the caller is going to overwrite regardless
    *        (a deferral's rowid and placeholders). Dropped from the selection
    *        before it is realized, so the copy never reads them; the caller puts
@@ -193,7 +196,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                          = nullptr,
-    std::span<std::size_t const> elided                               = {}) = 0;
+    std::span<std::size_t const> elided                               = {},
+    std::span<std::size_t const> withheld                             = {}) = 0;
 
   /**
    * @brief Whether this ingestible holds a row-filter expression that
