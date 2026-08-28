@@ -655,6 +655,52 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
     });
 }
 
+//! Wrap each child of a DENSE_COUNT_JOIN with a bare `PARTITION → original_child`, so the fused
+//! operator consumes one partition of each side per task instead of both inputs whole.
+//!
+//! No CONCAT, unlike the join wrap: CONCAT exists to fold a join's build side into one batch for
+//! its hash table, and this operator builds no hash table — it drains whole partitions.
+//!
+//! The preserved side is the build side, which makes it the sizing driver
+//! (`_drives_partition_count = _is_build`). Because sizing reads both sides' bytes, both
+//! partitions are told to wait for their sibling's input before negotiating a count.
+void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
+                           duckdb::SiriusContext* compressed_materialization_observer)
+{
+  D_ASSERT(dense_count_op.type == sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
+  D_ASSERT(dense_count_op.children.size() == 2);
+  auto* dense_count_ptr = &dense_count_op;
+
+  // children[0] is the preserved side, children[1] the counted side (stamped by
+  // try_plan_dense_count_join).
+  for (std::size_t child_idx = 0; child_idx < 2; ++child_idx) {
+    bool const is_build = (child_idx == 0);
+    wrap_child(dense_count_op,
+               child_idx,
+               [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
+                 auto child_types    = child_orig->types;
+                 auto est_card       = child_orig->estimated_cardinality;
+                 auto child_physical = child_orig->has_physical_overrides()
+                                         ? child_orig->get_physical_types()
+                                         : std::vector<cudf::data_type>{};
+
+                 auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+                   std::move(child_types),
+                   est_card,
+                   /*key_source=*/dense_count_ptr,
+                   is_build,
+                   compressed_materialization_observer);
+                 if (!child_physical.empty()) {
+                   partition->set_physical_types(std::move(child_physical));
+                 }
+                 partition->set_downstream_consumer_op(dense_count_ptr);
+                 partition->set_sizing_requires_sibling_input(true);
+                 partition->children.push_back(std::move(child_orig));
+                 return partition;
+               });
+  }
+}
+
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
 //! chain: probe = children[0], build = children[1]. A missing side is skipped.
 void wrap_join(sirius::op::sirius_physical_operator& join_op,
@@ -812,6 +858,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
       wrap_join(*slot, op_params, compressed_materialization_observer);
       break;
+    case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
+      wrap_dense_count_join(*slot, compressed_materialization_observer);
+      break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
       wrap_delim_join(slot, op_params, context, compressed_materialization_observer);
@@ -938,6 +987,7 @@ bool terminal_sink_supports_fusion(const sirius::op::sirius_physical_operator& s
     case T::CTE:
     case T::LEFT_DELIM_JOIN:
     case T::RIGHT_DELIM_JOIN:
+    case T::DENSE_COUNT_JOIN:
     case T::HASH_JOIN:
     case T::NESTED_LOOP_JOIN: return false;
     // Partition sinks require complete upstream input in a single task.

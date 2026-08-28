@@ -5,7 +5,18 @@ operations to the GPU (via cuDF/RMM/cuCascade) and falling back to DuckDB's CPU 
 otherwise. Once the extension is loaded it **transparently intercepts** normal SQL and runs it
 on the GPU — no special syntax needed.
 
+## Contributions & PRs
+
 **The default/main branch is `dev`** (not `main`/`master`) — branch and open PRs against it.
+Before opening a PR, read `CONTRIBUTING.md`'s "PR branching strategy" section to determine which
+of the three approved paths applies — most work is **Self-contained** (push to a personal fork,
+not `origin`); dependent changes use **Stacked PRs**; CI/critical changes that need same-repo
+write permissions are the third, narrower exception.
+
+**Doing a chain of dependent changes (Stacked PRs)?** Read `CONTRIBUTING.md`'s "Stacked PRs" and
+"Merging a stack" sections first. One thing worth knowing without opening that doc: never use
+"Enqueue stack" or `gh stack merge`, they don't reliably work with this repo's merge queue;
+stacks merge bottom-up instead.
 
 ## Build & test
 

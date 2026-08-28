@@ -22,6 +22,7 @@
 #include "data/data_batch_utils.hpp"
 #include "exec/thread_pool.hpp"
 #include "helper/numeric_narrowing.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/io_context.hpp"
 #include "io/parquet_helpers.hpp"
@@ -306,15 +307,15 @@ struct cached_databatch_provider : public databatch_provider {
         // Attach the scan's decode request to this projection only — never to
         // the shared pinned chunk, which other queries filter differently.
         // for_chunk narrows it to what this chunk's compression plans make
-        // worth asking; row dropping is additionally skipped when this operator
-        // carries mvcc keep-masks, since a decode-compacted batch no longer
+        // worth asking; row dropping is additionally skipped for chunks that
+        // carry an mvcc keep-mask, since a decode-compacted batch no longer
         // lines up with a positional deleted-row mask.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
         if (!_pushdown_req.empty()) {
           auto scan = std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
           // Row dropping cannot compose with a positional deleted-row mask: a
           // compacted batch no longer lines up with it.
-          if (!_mvcc_masks.empty()) { scan = scan->without_row_selection(); }
+          if (chunk_has_mvcc_mask(index)) { scan = scan->without_row_selection(); }
           if (scan) { pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
         }
         // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
@@ -333,14 +334,15 @@ struct cached_databatch_provider : public databatch_provider {
         // exactly filters_for_column(i); trailing pure-filter slots query keys
         // the set can never hold (push_filter rejects non-output columns) and
         // come back empty by construction — no output-arity knowledge is needed
-        // here. Same mvcc guard as the row selection above.
+        // here. Same per-chunk mvcc guard as the row selection above.
         //
         // This drain runs on the metadata thread at query PREPARE, before any
         // join build has published, so this snapshot is almost always EMPTY. It
         // is kept as a free early base; the authoritative snapshot is taken at
         // decode time by scan_operator_input::prepare_for_processing (same
         // builder, same mapping invariant), which replaces this one.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters && _mvcc_masks.empty()) {
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
+            !chunk_has_mvcc_mask(index)) {
           if (_dynamic_filters->has_filters()) {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
@@ -413,6 +415,16 @@ struct cached_databatch_provider : public databatch_provider {
       batch_id,
       std::move(gpu_repr),
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+  }
+
+  // True when chunk @p index carries a real (non-default) mvcc keep-mask.
+  //
+  // Set emptiness must never stand in for slot presence: the set is slot-sized
+  // whenever the entry has MVCC state at all, so one committed refresh would
+  // otherwise strip the decode-side pushdown from every chunk of the table.
+  [[nodiscard]] bool chunk_has_mvcc_mask(std::size_t index) const
+  {
+    return index < _mvcc_masks.size() && _mvcc_masks[index].has_mask();
   }
 
   // True when scan normalization will cast the recorded stored @p carrier to @p target: the same
@@ -1561,9 +1573,13 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // serve time.
     std::shared_ptr<sirius::op::sirius_dynamic_filter_set> dynamic_filters;
     if (sirius::decompression_pushdown_enabled()) {
-      auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(
-        &assignment.op->get_ingestible().table_info());
-      if (pq != nullptr) { dynamic_filters = pq->sirius_dynamic_filters; }
+      auto const& info = assignment.op->get_ingestible().table_info();
+      if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+        dynamic_filters = pq->sirius_dynamic_filters;
+      } else if (auto const* native =
+                   dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
+        dynamic_filters = native->sirius_dynamic_filters;
+      }
       // Channel identity: this pointer must match the one the hash join
       // publishes into (both resolve through the generator's channel map, keyed
       // by duckdb's DynamicTableFilterSet pointer) and the one the decode-time
@@ -2444,15 +2460,61 @@ void sirius_scan_manager::visit_pinned_entries(
   }
 }
 
-pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
-  std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const
+bool pinned_native_types_match_columns(pinned_entry const& entry,
+                                       duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+                                       duckdb::vector<duckdb::LogicalType> const& returned_types)
 {
-  for (auto const& [name, entry] : _pinned_entries) {
-    if (entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) {
-      return &entry;
+  if (entry.column_storage.empty()) { return true; }
+
+  std::unordered_map<duckdb::idx_t, std::size_t> entry_pos_by_primary;
+  entry_pos_by_primary.reserve(entry.cache_info.column_ids.size());
+  for (std::size_t i = 0; i < entry.cache_info.column_ids.size(); ++i) {
+    entry_pos_by_primary.emplace(entry.cache_info.column_ids[i].GetPrimaryIndex(), i);
+  }
+
+  for (auto const& col_idx : column_ids) {
+    if (!col_idx.HasPrimaryIndex() || col_idx.IsRowIdColumn() || col_idx.IsVirtualColumn() ||
+        col_idx.IsEmptyColumn()) {
+      continue;
+    }
+    auto const primary = col_idx.GetPrimaryIndex();
+    auto const it      = entry_pos_by_primary.find(primary);
+    if (it == entry_pos_by_primary.end()) { continue; }
+    std::optional<cudf::data_type> native;
+    if (primary < returned_types.size()) {
+      native = sirius::try_get_cudf_type(sirius::from_duckdb(returned_types[primary]));
+    }
+    if (!native) { return false; }
+    for (auto const& row : entry.column_storage) {
+      if (it->second >= row.size() || row[it->second].native != *native) { return false; }
     }
   }
-  return nullptr;
+  return true;
+}
+
+pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
+  std::string_view catalog_name,
+  std::string_view schema_name,
+  std::string_view table_name,
+  duckdb::vector<duckdb::ColumnIndex> const* requested_ids,
+  duckdb::vector<duckdb::LogicalType> const* returned_types) const
+{
+  bool const match_columns              = requested_ids != nullptr && !requested_ids->empty();
+  pinned_entry const* identity_match    = nullptr;
+  pinned_entry const* covering_mismatch = nullptr;
+  for (auto const& [name, entry] : _pinned_entries) {
+    if (!entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name)) { continue; }
+    if (identity_match == nullptr) { identity_match = &entry; }
+    if (!match_columns) { return &entry; }
+    if (entry.cache_info.column_projection_for(*requested_ids).empty()) { continue; }
+    // The guard reads a type-mismatched entry as unpinned, so preferring one loses a hit.
+    if (returned_types == nullptr ||
+        pinned_native_types_match_columns(entry, *requested_ids, *returned_types)) {
+      return &entry;
+    }
+    if (covering_mismatch == nullptr) { covering_mismatch = &entry; }
+  }
+  return covering_mismatch != nullptr ? covering_mismatch : identity_match;
 }
 
 pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
@@ -2763,8 +2825,8 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
-    // Check native types before strict MVCC handling so type drift is a clean cache miss rather
-    // than an MVCC error or a cache hit under the wrong type.
+    // Check native types before strict MVCC handling so a type-mismatched pin is a clean cache
+    // miss rather than an MVCC error or a hit under the wrong type.
     if (auto const* native_info =
           dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&table_info);
         native_info != nullptr && !pinned_native_types_match_scan(entry, *native_info)) {

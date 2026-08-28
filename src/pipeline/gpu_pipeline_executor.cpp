@@ -386,6 +386,7 @@ void gpu_pipeline_executor::manager_loop()
             std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
+          if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
 
           // Preserve the per-task device pin across reschedule. Dropping it lets
           // an OOM'd partition task scatter to the wrong GPU and touch a cuco

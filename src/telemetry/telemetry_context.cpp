@@ -51,6 +51,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     worker_uuid_(uuid::now_v7()),
     query_group_uuid_(uuid::now_v7()),
     shared_group_uuid_(uuid::now_v7()),
+    engine_name_(config.engine_name),
     context_(quent::create_context([&config] {
       if (!config.enable_quent) { return quent::ExporterOptions::none(); }
       if (config.exporter == "ndjson") {
@@ -136,6 +137,25 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
   SIRIUS_LOG_INFO("Telemetry context initialized (engine={}, {} GPU device group(s))",
                   config.engine_name,
                   gpu_group_ids_.size());
+}
+
+uuid::UUID telemetry_context::query_group_id_for(
+  const std::optional<std::string>& session_label) const
+{
+  if (!session_label.has_value() || session_label->empty()) { return query_group_uuid_; }
+  const std::lock_guard lock(labeled_groups_mutex_);
+  auto it = labeled_group_ids_.find(*session_label);
+  if (it == labeled_group_ids_.end()) {
+    auto group_uuid = uuid::now_v7();
+    query_group_observer_->declaration(
+      group_uuid,
+      quent::query_group::Declaration{
+        .instance_name = std::format("{}-{}", engine_name_, *session_label),
+        .engine_id     = engine_uuid_,
+      });
+    it = labeled_group_ids_.emplace(*session_label, std::move(group_uuid)).first;
+  }
+  return it->second;
 }
 
 const uuid::UUID& telemetry_context::gpu_device_group_id(int device_id) const

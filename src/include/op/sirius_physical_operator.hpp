@@ -21,6 +21,7 @@
 #include "helper/logical_type.hpp"
 #include "helper/types.hpp"
 #include "late_mat/defer_directive.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
@@ -307,7 +308,8 @@ class pipelineable_operator_data : public operator_data {
     std::size_t total = 0;
     auto ro_batches   = get_read_only_batches(false);
     for (auto const& ro : ro_batches) {
-      if (ro.get_data()) { total += ro.get_data()->get_uncompressed_data_size_in_bytes(); }
+      if (!ro.get_data()) { continue; }
+      total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
     }
     return total;
   }
@@ -349,6 +351,17 @@ class partitioned_operator_data : public pipelineable_operator_data {
   {
   }
 
+  /// Partitioned data with no index. The scheduler pins a task to
+  /// `_active_gpu_ids[partition_idx % size]` only when an index is present; without one it falls
+  /// through to its byte-affinity heuristic and places the task on the GPU already holding the
+  /// data. Used when a consumer produced a single partition, where no cross-task device agreement
+  /// is required.
+  explicit partitioned_operator_data(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    : pipelineable_operator_data(std::move(data_batches))
+  {
+  }
+
   [[nodiscard]] operator_data_type get_type() const override
   {
     return operator_data_type::PARTITIONED;
@@ -356,12 +369,13 @@ class partitioned_operator_data : public pipelineable_operator_data {
 
   /**
    * @brief Get the partition index.
-   * @return Partition index
+   * @return The partition index, or std::nullopt when this data carries none — which means
+   *         "place by data affinity", not "partition 0".
    */
-  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+  [[nodiscard]] std::optional<std::size_t> get_partition_idx() const { return _partition_idx; }
 
  private:
-  std::size_t _partition_idx = 0;
+  std::optional<std::size_t> _partition_idx;
 };
 
 /**
@@ -537,6 +551,13 @@ class sirius_physical_operator {
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 
   virtual void verify();
+  /** @brief Return the receiving port for @p producer; the default is `"default"`. */
+  [[nodiscard]] virtual std::string_view input_port_for(
+    sirius_physical_operator const& producer) const;
+
+  /** @brief Return the input barrier; the default is FULL except for ORDER_BY producers. */
+  [[nodiscard]] virtual MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const;
 
  public:
   // Operator interface
@@ -559,7 +580,7 @@ class sirius_physical_operator {
    */
   [[nodiscard]] virtual std::size_t no_history_peak_memory_estimate(const input_stats& stats) const
   {
-    return stats.bytes * 2;
+    return memory::saturating_mul(stats.bytes, 2);
   }
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
@@ -613,15 +634,18 @@ class sirius_physical_operator {
   // Sink interface
   virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
-  //! An operator is a pipeline sink iff its tree parent is a PARTITION or
-  //! RIGHT_DELIM_JOIN — computed from `_parent_op` so it always reflects the final tree.
-  //! Unconditional sinks (HGB, ORDER_BY, MERGE ops, scans) override to `true`; the
-  //! `delim.join` of a RIGHT_DELIM_JOIN overrides to `false`.
+  //! An operator is a pipeline sink iff its tree parent is a PARTITION, RIGHT_DELIM_JOIN, or
+  //! DENSE_COUNT_JOIN — computed from `_parent_op` so it always reflects the final tree. Those
+  //! parents consume a child's output through a repository, so the child terminates its own
+  //! pipeline. Unconditional sinks (e.g. HGB, ORDER_BY, MERGE ops, CONCAT, PARTITION,
+  //! DENSE_COUNT_JOIN) override to `true`; SORT_SAMPLE and the `delim.join` of a RIGHT_DELIM_JOIN
+  //! override to `false`.
   virtual bool is_sink() const
   {
     return _parent_op != nullptr &&
            (_parent_op->type == SiriusPhysicalOperatorType::PARTITION ||
-            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
+            _parent_op->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
+            _parent_op->type == SiriusPhysicalOperatorType::DENSE_COUNT_JOIN);
   }
 
   //! Whether or not the sink operator depends on the order of the input chunks

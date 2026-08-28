@@ -131,14 +131,14 @@ class cache_entry_info {
     const op::scan::ingestible_table_info& other) const;
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
-  /// MVCC guards — one matcher, so the probe and prepare can never drift.
+  /// MVCC guards — one matcher, so the probe and prepare can never disagree.
   /// False for parquet entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
                                           std::string_view table) const;
 
   /// Parquet-identity check shared by can_serve_with_columns and the plan-time
-  /// residency gate — one matcher, so the probe and prepare can never drift.
+  /// residency gate — one matcher, so the probe and prepare can never disagree.
   /// Same file set irrespective of order (both sides sorted, byte-exact compare).
   /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
   [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
@@ -335,6 +335,16 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
+/// True when every column of @p column_ids that @p entry carries still maps, in
+/// every chunk, to the pin-time native cuDF type @p returned_types declares. A
+/// column the entry lacks is skipped (coverage is checked separately) and an
+/// empty column-storage matrix passes. Shared by the plan-time MVCC guard and
+/// the lookup below.
+[[nodiscard]] bool pinned_native_types_match_columns(
+  pinned_entry const& entry,
+  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
+  duckdb::vector<duckdb::LogicalType> const& returned_types);
+
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
@@ -368,6 +378,8 @@ struct cached_scan_plan {
 /// publish into it mid-scan); the provider snapshots it PER BATCH onto the
 /// attached scan, so later batches legitimately see more filters. Null (the
 /// default) disables it.
+/// Both are gated per chunk on @p mvcc_masks: a masked chunk gives up row
+/// dropping, while its default-slot siblings keep the decode-side pushdown.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
@@ -637,10 +649,18 @@ class sirius_scan_manager {
 
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or
   /// nullptr. Non-owning; obtain and read it inside one slot-scoped window, and
-  /// never hold it across a pin or unpin. First match wins if one table was
-  /// pinned under two names. Read by the plan-time MVCC guards.
+  /// never hold it across a pin or unpin. When one table is pinned under two
+  /// names with different column sets, @p requested_ids and @p returned_types
+  /// apply the plan-time guard's own two gates: prefer an entry that covers the
+  /// scan and whose pin-time native types still match, then one that only
+  /// covers, then the first identity match. Never null where one identity match
+  /// exists — that would read as an unpinned table.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
-    std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
+    std::string_view catalog_name,
+    std::string_view schema_name,
+    std::string_view table_name,
+    duckdb::vector<duckdb::ColumnIndex> const* requested_ids  = nullptr,
+    duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain

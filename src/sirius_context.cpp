@@ -41,6 +41,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
+#include "vss/cuvs_index_cache.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -673,6 +674,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
 
+  // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
+  // manager so an index build can reserve its GPU footprint through Sirius.
+  cuvs_index_cache_ = std::make_unique<sirius::vss::cuvs_index_cache>(*memory_manager_);
+
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
   // memory manager already reflects the configured topology.num_gpus / topology.gpu_ids
@@ -934,6 +939,11 @@ void SiriusContext::terminate()
 
   scan_manager_.reset();
 
+  // Free pinned cuVS indexes and release their GPU reservations while the
+  // memory manager is still alive. The device was synchronized just above, so
+  // no kernels are still reading the index buffers being freed here.
+  cuvs_index_cache_.reset();
+
   // Drop any remaining per-query repositories while the memory manager is still alive. The
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
   // no borrower can outlive this.
@@ -1055,6 +1065,18 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
 {
   throw_if_not_initialized();
   return *scan_manager_;
+}
+
+sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
+{
+  throw_if_not_initialized();
+  return *cuvs_index_cache_;
+}
+
+const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const
+{
+  throw_if_not_initialized();
+  return *cuvs_index_cache_;
 }
 
 std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()

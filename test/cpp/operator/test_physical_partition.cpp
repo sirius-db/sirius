@@ -18,11 +18,17 @@
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/data_utils.hpp"
 
 #include <catch.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
+#include <op/sirius_physical_concat.hpp>
+#include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 
+#include <array>
 #include <numeric>
 
 using namespace duckdb;
@@ -35,7 +41,106 @@ using namespace cucascade::memory;
 namespace {
 
 using namespace sirius::test::operator_utils;
+
+struct partition_barrier_fixture {
+  duckdb::unique_ptr<duckdb::LogicalComparisonJoin> logical_join;
+  duckdb::unique_ptr<sirius_physical_hash_join> join;
+  sirius_physical_partition* probe_partition = nullptr;
+  sirius_physical_partition* build_partition = nullptr;
+};
+
+partition_barrier_fixture make_partition_barrier_fixture(duckdb::JoinType join_type)
+{
+  partition_barrier_fixture fixture;
+  fixture.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  fixture.logical_join->types = {duckdb::LogicalType::INTEGER, duckdb::LogicalType::INTEGER};
+
+  auto make_child = [] {
+    return duckdb::make_uniq<sirius_physical_operator>(
+      SiriusPhysicalOperatorType::PROJECTION,
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      1);
+  };
+
+  duckdb::JoinCondition condition;
+  condition.left =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  condition.right =
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  condition.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
+  duckdb::vector<duckdb::JoinCondition> conditions;
+  conditions.push_back(std::move(condition));
+
+  fixture.join = duckdb::make_uniq<sirius_physical_hash_join>(
+    *fixture.logical_join,
+    make_child(),
+    make_child(),
+    sirius::wrap_join_conditions(std::move(conditions)),
+    join_type,
+    duckdb::vector<std::size_t>{},
+    duckdb::vector<std::size_t>{},
+    duckdb::vector<sirius::logical_type>{},
+    1);
+
+  auto wrap_side = [&](std::size_t child_idx, bool is_build) {
+    auto child       = std::move(fixture.join->children[child_idx]);
+    auto child_types = child->types;
+    auto partition =
+      duckdb::make_uniq<sirius_physical_partition>(child_types, 1, fixture.join.get(), is_build);
+    auto* partition_ptr = partition.get();
+    partition->children.push_back(std::move(child));
+
+    auto concat =
+      duckdb::make_uniq<sirius_physical_concat>(child_types, 1, fixture.join.get(), is_build);
+    concat->children.push_back(std::move(partition));
+    fixture.join->children[child_idx] = std::move(concat);
+    return partition_ptr;
+  };
+
+  fixture.probe_partition = wrap_side(0, false);
+  fixture.build_partition = wrap_side(1, true);
+  sirius::planner::sirius_physical_plan_generator::set_parent_ops(*fixture.join, nullptr);
+  return fixture;
+}
 }  // namespace
+
+TEST_CASE("sirius_physical_partition barrier hook preserves producer precedence",
+          "[physical_partition][partition_barrier]")
+{
+  auto fixture = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  REQUIRE(fixture.probe_partition->get_parent_op()->type == SiriusPhysicalOperatorType::CONCAT);
+  REQUIRE(fixture.probe_partition->get_parent_op()->get_parent_op() == fixture.join.get());
+
+  sirius_physical_operator order_by{
+    SiriusPhysicalOperatorType::ORDER_BY, duckdb::vector<sirius::logical_type>{}, 0};
+  CHECK(fixture.probe_partition->input_barrier_for(order_by) == MemoryBarrierType::PIPELINE);
+
+  for (auto producer_type : std::array{SiriusPhysicalOperatorType::PARTITION,
+                                       SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE,
+                                       SiriusPhysicalOperatorType::TOP_N,
+                                       SiriusPhysicalOperatorType::SORT_PARTITION}) {
+    CAPTURE(producer_type);
+    sirius_physical_operator producer{producer_type, duckdb::vector<sirius::logical_type>{}, 0};
+    CHECK(fixture.probe_partition->input_barrier_for(producer) == MemoryBarrierType::FULL);
+  }
+
+  sirius_physical_operator projection{
+    SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
+  CHECK(fixture.probe_partition->input_barrier_for(projection) == MemoryBarrierType::PARTIAL);
+}
+
+TEST_CASE("sirius_physical_partition barrier hook preserves build and right-family barriers",
+          "[physical_partition][partition_barrier]")
+{
+  sirius_physical_operator projection{
+    SiriusPhysicalOperatorType::PROJECTION, duckdb::vector<sirius::logical_type>{}, 0};
+
+  auto inner = make_partition_barrier_fixture(duckdb::JoinType::INNER);
+  CHECK(inner.build_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
+
+  auto right = make_partition_barrier_fixture(duckdb::JoinType::RIGHT);
+  CHECK(right.probe_partition->input_barrier_for(projection) == MemoryBarrierType::FULL);
+}
 
 TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single partition key",
                    "[physical_partition]",

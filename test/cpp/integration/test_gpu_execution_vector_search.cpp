@@ -20,10 +20,12 @@
  */
 
 #include <catch.hpp>
+#include <cuvs/distance/distance.hpp>
 #include <duckdb.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <vss/cuvs_index_cache.hpp>
 
 #include <cstdlib>
 #include <numbers>
@@ -211,4 +213,259 @@ TEST_CASE_METHOD(VectorSearchFixture,
   REQUIRE(enn == exact);
 
   run_ok("SELECT * FROM unpin_table('vs_enn_cos');");
+}
+
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - prepared statement rebuilds on every execution",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_reexec AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_reexec', tier => 'gpu', format => 'duckdb');");
+
+  // Prepare once, execute twice. finished now lives in per-execution state, so each
+  // execution rebuilds and returns its one success row. When the flag lived in bind
+  // data (reused across executions of a prepared plan) the second execution returned
+  // zero rows and skipped the rebuild.
+  auto prep = con->Prepare(
+    "SELECT * FROM sirius_create_ann_index('vs_reexec', 'vec', metric => 'l2', n_lists => 16);");
+  REQUIRE(prep);
+  if (prep->HasError()) { UNSCOPED_INFO("prepare error: " << prep->GetError()); }
+  REQUIRE_FALSE(prep->HasError());
+
+  for (int exec = 1; exec <= 2; ++exec) {
+    INFO("execution #" << exec);
+    // allow_stream_result = false so we get a materialized result to count rows.
+    duckdb::vector<duckdb::Value> params;
+    auto res = prep->Execute(params, /*allow_stream_result=*/false);
+    REQUIRE(res);
+    if (res->HasError()) { UNSCOPED_INFO("execute error: " << res->GetError()); }
+    REQUIRE_FALSE(res->HasError());
+    auto& mat = res->Cast<duckdb::MaterializedQueryResult>();
+    REQUIRE(mat.RowCount() == 1);  // rebuilt and returned its success row
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_reexec');");
+}
+
+// A deterministic (non-OOM) failed rebuild must not destroy the existing index.
+// The builder trains centroids on a single batch, so n_lists that exceeds the
+// largest batch can never build even though it is within the total row count.
+// We force a two-batch pin (one batch per storage row group) so the largest
+// batch (122880 rows) sits strictly below a chosen n_lists that is still under
+// the total, then assert the rejected rebuild left the prior index in place.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - failed rebuild leaves the existing index in place",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  // One storage row group is 122880 rows; 200000 rows spans two. A tiny scan
+  // batch target puts each row group in its own batch, so the largest batch is
+  // 122880 < 150000 <= 200000 total. (scan_task_batch_size is a test-only option,
+  // enabled for the C++ test binary.)
+  run_ok("SET scan_task_batch_size = 1;");
+  run_ok(
+    "CREATE TABLE vs_badrebuild AS "
+    "SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(200000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_badrebuild', tier => 'gpu', format => 'duckdb');");
+
+  // Build a valid index. Routing looks it up by identity, so we assert on that.
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_badrebuild', 'vec', "
+    "metric => 'l2', n_lists => 64);");
+
+  // The identity's catalog is the attached database this fixture routed DDL into.
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  {
+    auto entry =
+      index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->meta.n_lists == 64);
+  }
+
+  // Rebuild with n_lists above the largest batch but within the total row count.
+  // This is deterministic: it cannot build regardless of free memory.
+  auto bad = con->Query(
+    "SELECT * FROM sirius_create_ann_index('vs_badrebuild', 'vec', "
+    "metric => 'l2', n_lists => 150000);");
+  REQUIRE(bad);
+  REQUIRE(bad->HasError());
+  INFO("rebuild error: " << bad->GetError());
+  REQUIRE(bad->GetError().find("largest batch size") != std::string::npos);
+  REQUIRE(bad->GetError().find("left in place") != std::string::npos);
+
+  // The failure contract: the rebuild was rejected before any erase, so the
+  // original index is unchanged, not removed.
+  auto entry =
+    index_cache.find_by_column(catalog, "main", "vs_badrebuild", "vec", Metric::L2SqrtExpanded);
+  REQUIRE(entry != nullptr);
+  REQUIRE(entry->meta.n_lists == 64);
+
+  run_ok("SELECT * FROM unpin_table('vs_badrebuild');");
+  run_ok("SET scan_task_batch_size = 1048576;");
+}
+
+// A created index resolves two ways to the same entry: by its cache key (the
+// routing identity, built by build_ann_index_cache_key) and by find_by_column.
+// Rebuilding the same identity replaces the one entry on that key rather than
+// appending a second.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_create_ann_index - findable by identity key",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_lookup AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_lookup', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  // The cache key is the routing identity.
+  auto const key =
+    sirius::vss::build_ann_index_cache_key(catalog, "main", "vs_lookup", "vec", "l2");
+
+  // The cache is shared across test cases in this process, so assert on the net
+  // change this test makes rather than an absolute count.
+  auto const baseline = index_cache.size();
+
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', metric => 'l2', n_lists => 16);");
+  {
+    auto by_key = index_cache.find(key);
+    auto by_identity =
+      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(by_key != nullptr);
+    REQUIRE(by_identity != nullptr);
+    REQUIRE(by_key == by_identity);               // same entry, reached two ways
+    REQUIRE(index_cache.size() == baseline + 1);  // one entry added
+  }
+
+  // Rebuilding the same identity replaces the entry on the same key (not appended).
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_lookup', 'vec', metric => 'l2', n_lists => 16);");
+  {
+    auto by_key = index_cache.find(key);
+    auto by_identity =
+      index_cache.find_by_column(catalog, "main", "vs_lookup", "vec", Metric::L2SqrtExpanded);
+    REQUIRE(by_key != nullptr);
+    REQUIRE(by_identity != nullptr);
+    REQUIRE(by_key == by_identity);
+    REQUIRE(index_cache.size() == baseline + 1);  // replaced, not appended
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_lookup');");
+}
+
+// sirius_drop_ann_index removes a built index by its (table, column, metric)
+// identity: after the drop, routing can no longer find it, and a second drop is a
+// no-op that reports nothing was dropped.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_drop_ann_index - drops a built index by metric",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_drop AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_drop', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_drop', 'vec', metric => 'l2', n_lists => 16);");
+  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) !=
+          nullptr);
+
+  // Drop reports it removed one, and routing can no longer find it.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop', 'vec', metric => 'l2');");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("drop error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+  }
+  REQUIRE(index_cache.find_by_column(catalog, "main", "vs_drop", "vec", Metric::L2SqrtExpanded) ==
+          nullptr);
+
+  // Dropping again is a no-op: nothing matched, so Dropped is false.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop', 'vec', metric => 'l2');");
+    REQUIRE(r);
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE_FALSE(r->GetValue(0, 0).GetValue<bool>());
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_drop');");
+}
+
+// sirius_drop_ann_index with no metric removes every index on the column. Build an
+// l2 and a cosine index on the same column, then a single metric-less drop clears
+// both.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_drop_ann_index - no metric drops every index on the column",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_drop_all AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(1000) "
+    "t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_drop_all', tier => 'gpu', format => 'duckdb');");
+
+  auto catq = con->Query("SELECT current_database();");
+  REQUIRE(catq);
+  REQUIRE_FALSE(catq->HasError());
+  auto const catalog = catq->GetValue(0, 0).ToString();
+  using Metric       = cuvs::distance::DistanceType;
+
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx);
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'l2', n_lists => 16);");
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_drop_all', 'vec', metric => 'cosine', "
+    "n_lists => 16);");
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) != nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) != nullptr);
+
+  // One metric-less drop clears both indexes on the column.
+  {
+    auto r = con->Query("SELECT * FROM sirius_drop_ann_index('vs_drop_all', 'vec');");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("drop-all error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    REQUIRE(r->GetValue(0, 0).GetValue<bool>());
+  }
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::L2SqrtExpanded) == nullptr);
+  REQUIRE(index_cache.find_by_column(
+            catalog, "main", "vs_drop_all", "vec", Metric::CosineExpanded) == nullptr);
+
+  run_ok("SELECT * FROM unpin_table('vs_drop_all');");
 }
