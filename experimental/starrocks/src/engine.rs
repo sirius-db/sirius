@@ -34,7 +34,7 @@ use tracing::{info, warn};
 
 use crate::engine_settings::EngineSettings;
 use crate::fragment_executor::{
-    FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
+    FragmentExecutor, FragmentResult, FragmentRun, PinTableSpec, SenderSlot, StagedBatch,
 };
 
 /// A sender fragment's parked output, shared by its destinations: stream i belongs to
@@ -94,6 +94,20 @@ enum EngineRequest {
     DropParked {
         slot: SenderSlot,
         respond: Sender<Result<(), String>>,
+    },
+    /// Pin a table into the engine's scan cache (driven by `ADMIN EXECUTE ON <id> '<script>'`).
+    /// Deliberately funneled through this channel: pinning mutates the scan registry inside its
+    /// own execution window, so it must serialize with fragment runs — the staging-arena bypass
+    /// precedent does not apply. A pin queued behind a wedged fragment waits; a long pin makes
+    /// queries queue behind it. Pin before running load.
+    PinTable {
+        spec: PinTableSpec,
+        respond: Sender<Result<String, String>>,
+    },
+    /// Remove a pinned entry by name, releasing its memory.
+    UnpinTable {
+        name: String,
+        respond: Sender<Result<String, String>>,
     },
 }
 
@@ -308,6 +322,34 @@ fn engine_thread(
             EngineRequest::DropParked { slot, respond } => {
                 let result =
                     release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
+                let _ = respond.send(result);
+            }
+            EngineRequest::PinTable { spec, respond } => {
+                info!(name = %spec.name, tier = spec.tier.as_str(), "pin_table starting");
+                let started = std::time::Instant::now();
+                let engine_spec = sirius::PinTableSpec {
+                    path: spec.path.clone(),
+                    tier: spec.tier.as_str().to_string(),
+                    name: spec.name.clone(),
+                    cols: spec.cols.clone(),
+                    format: spec.format.clone(),
+                    schema: spec.schema.clone(),
+                };
+                let result = context
+                    .pin_table(&engine_spec)
+                    .map_err(|err| format!("pin_table '{}' failed: {err}", spec.name));
+                info!(
+                    name = %spec.name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    ok = result.is_ok(),
+                    "pin_table finished"
+                );
+                let _ = respond.send(result);
+            }
+            EngineRequest::UnpinTable { name, respond } => {
+                let result = context
+                    .unpin_table(&name)
+                    .map_err(|err| format!("unpin_table '{name}' failed: {err}"));
                 let _ = respond.send(result);
             }
         }
@@ -747,6 +789,16 @@ impl FragmentExecutor for SiriusEngine {
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         self.engine_call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn pin_table(&self, spec: &PinTableSpec) -> Result<String, String> {
+        let spec = spec.clone();
+        self.engine_call(|respond| EngineRequest::PinTable { spec, respond })
+    }
+
+    fn unpin_table(&self, name: &str) -> Result<String, String> {
+        let name = name.to_string();
+        self.engine_call(|respond| EngineRequest::UnpinTable { name, respond })
     }
 }
 

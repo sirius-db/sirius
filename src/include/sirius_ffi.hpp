@@ -105,6 +105,35 @@ class SIRIUS_FFI_EXPORT Context {
   /// lease request) holds this instead of funneling through the `staging_*` methods above.
   std::unique_ptr<StagingArena> staging_arena_handle() const;
 
+  /// Pin a table into the engine's scan cache so later plans that scan the same
+  /// resolved source are served from memory. Runs the same `pin_table` table
+  /// function the DuckDB extension registers, on this context's embedded
+  /// connection, so argument validation and behavior match `CALL pin_table(...)`.
+  ///
+  /// `path` is a parquet file or glob (empty for format 'duckdb', where `name`
+  /// is the catalog table). `tier` is "gpu" or "host". `name` keys the pin
+  /// registry and selects the compression plan file. `cols_joined` is a
+  /// '\n'-separated column list; empty pins every column. `format` is
+  /// "parquet"/"duckdb", or empty to infer from the path suffix (a glob not
+  /// ending in `.parquet` needs the explicit format). `schema_name` applies to
+  /// format 'duckdb' only; empty means "main". Compression engages per the
+  /// context's YAML `sirius.compression.*` config — no SQL involved.
+  ///
+  /// Must run on the context's owning thread, and never between a Fragment's
+  /// build() and run() (pinning opens its own execution window; the engine
+  /// serializes them). Returns a one-line summary. Throws on bad arguments, an
+  /// unmatched glob, or any engine failure.
+  std::unique_ptr<std::string> pin_table(const std::string& path,
+                                         const std::string& tier,
+                                         const std::string& name,
+                                         const std::string& cols_joined,
+                                         const std::string& format,
+                                         const std::string& schema_name);
+
+  /// Remove the pinned entry `name` and release its memory. Same threading
+  /// contract as pin_table(). Returns a one-line summary; throws on failure.
+  std::unique_ptr<std::string> unpin_table(const std::string& name);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

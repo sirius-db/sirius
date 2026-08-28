@@ -2357,6 +2357,32 @@ static void SiriusSetSessionLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+void SiriusExtension::RegisterPinTableFunctions(CatalogTransaction& transaction, Catalog& catalog)
+{
+  // pin_table takes either a positional path (parquet) or no positional (duckdb,
+  // where 'name' is the catalog table reference) — register both arities as a set.
+  TableFunctionSet pin_table_set("pin_table");
+  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
+    TableFunction pin_table(
+      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
+    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
+    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
+    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table_set.AddFunction(std::move(pin_table));
+  };
+  add_pin_table_overload({LogicalType::VARCHAR});
+  add_pin_table_overload({});
+  CreateTableFunctionInfo pin_table_info(pin_table_set);
+  catalog.CreateTableFunction(transaction, pin_table_info);
+
+  TableFunction unpin_table(
+    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
+  CreateTableFunctionInfo unpin_table_info(unpin_table);
+  catalog.CreateTableFunction(transaction, unpin_table_info);
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
@@ -2430,28 +2456,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo profiler_stop_info(profiler_stop);
   catalog.CreateTableFunction(transaction, profiler_stop_info);
 
-  // pin_table takes either a positional path (parquet) or no positional (duckdb,
-  // where 'name' is the catalog table reference) — register both arities as a set.
-  TableFunctionSet pin_table_set("pin_table");
-  auto add_pin_table_overload = [&](vector<LogicalType> positional_args) {
-    TableFunction pin_table(
-      "pin_table", std::move(positional_args), PinTableFunction, PinTableBind);
-    pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
-    pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
-    pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
-    pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
-    pin_table_set.AddFunction(std::move(pin_table));
-  };
-  add_pin_table_overload({LogicalType::VARCHAR});
-  add_pin_table_overload({});
-  CreateTableFunctionInfo pin_table_info(pin_table_set);
-  catalog.CreateTableFunction(transaction, pin_table_info);
-
-  TableFunction unpin_table(
-    "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
-  CreateTableFunctionInfo unpin_table_info(unpin_table);
-  catalog.CreateTableFunction(transaction, unpin_table_info);
+  RegisterPinTableFunctions(transaction, catalog);
 
   // sirius_create_ann_index(table, column, metric=>, index_type=>, n_lists=>, schema_name=>)
   TableFunction create_ann_index("sirius_create_ann_index",

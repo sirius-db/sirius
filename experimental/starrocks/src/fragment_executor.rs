@@ -69,6 +69,42 @@ pub struct StagedBatch {
     pub rows: Option<u64>,
 }
 
+/// Which memory tier a pinned table lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinTier {
+    /// GPU memory — fastest scans, bounded by VRAM.
+    Gpu,
+    /// Pinned host memory — for tables larger than GPU memory.
+    Host,
+}
+
+impl PinTier {
+    /// The engine-side tier string (`pin_table`'s `tier` argument).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinTier::Gpu => "gpu",
+            PinTier::Host => "host",
+        }
+    }
+}
+
+/// One table to pin into the engine's scan cache, mirroring `CALL pin_table(...)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinTableSpec {
+    /// Parquet file or glob; `None` for `format = duckdb`, where `name` is the catalog table.
+    pub path: Option<String>,
+    /// Memory tier the pinned columns land in.
+    pub tier: PinTier,
+    /// Pin-registry key; also selects the engine's compression plan file.
+    pub name: String,
+    /// Columns to pin; `None` pins every column.
+    pub cols: Option<Vec<String>>,
+    /// `"parquet"` or `"duckdb"`; `None` infers from the path suffix.
+    pub format: Option<String>,
+    /// Schema containing the table, for `format = duckdb` only.
+    pub schema: Option<String>,
+}
+
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
 #[derive(Debug)]
 pub struct FragmentRun<'a> {
@@ -147,6 +183,23 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         let _ = slot;
         Err("this fragment executor parks nothing to drop".to_string())
+    }
+
+    /// Pins a table into the engine's scan cache (`CALL pin_table` semantics). Blocks for the
+    /// whole materialization, serialized with fragment runs on the engine thread. Returns a
+    /// one-line summary.
+    fn pin_table(&self, spec: &PinTableSpec) -> Result<String, String> {
+        let _ = spec;
+        Err("this fragment executor does not support pin_table (engine build required)".to_string())
+    }
+
+    /// Removes the pinned entry `name`, releasing its memory. Returns a one-line summary.
+    fn unpin_table(&self, name: &str) -> Result<String, String> {
+        let _ = name;
+        Err(
+            "this fragment executor does not support unpin_table (engine build required)"
+                .to_string(),
+        )
     }
 }
 

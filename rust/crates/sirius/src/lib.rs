@@ -40,6 +40,26 @@ pub struct SiriusContext {
     inner: RefCell<UniquePtr<sirius_sys::Context>>,
 }
 
+/// Arguments for [`SiriusContext::pin_table`], mirroring the SQL surface of
+/// `CALL pin_table(...)` on the DuckDB extension path.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PinTableSpec {
+    /// Parquet file or glob; `None` for `format = "duckdb"`, where `name` is
+    /// the catalog table to pin.
+    pub path: Option<String>,
+    /// `"gpu"` or `"host"`.
+    pub tier: String,
+    /// Pin-registry key; also selects the compression plan file.
+    pub name: String,
+    /// Columns to pin; `None` (or empty) pins every column.
+    pub cols: Option<Vec<String>>,
+    /// `"parquet"` or `"duckdb"`; `None` infers from the path suffix (a glob
+    /// not ending in `.parquet` needs the explicit format).
+    pub format: Option<String>,
+    /// Schema containing the table, for `format = "duckdb"` only.
+    pub schema: Option<String>,
+}
+
 /// Fully materialized output of one Substrait execution.
 pub struct SubstraitResult {
     /// Arrow schema reported by the result stream, also available for empty results.
@@ -154,6 +174,38 @@ impl SiriusContext {
     pub fn staging_arena(&self) -> Option<StagingArena> {
         let handle = self.inner.borrow().staging_arena_handle();
         (!handle.is_null()).then(|| StagingArena { inner: handle })
+    }
+
+    /// Pin a table into the engine's scan cache so later plans that scan the
+    /// same resolved source are served from memory — the FFI mirror of
+    /// `CALL pin_table(...)`.
+    ///
+    /// Blocks for the whole materialization on this context's owning thread;
+    /// never call it while a fragment sits between `build` and `run`.
+    /// Compression engages per the context's YAML `sirius.compression.*`
+    /// config. Returns a one-line summary.
+    pub fn pin_table(&self, spec: &PinTableSpec) -> Result<String, Exception> {
+        let_cxx_string!(path = spec.path.as_deref().unwrap_or(""));
+        let_cxx_string!(tier = spec.tier.as_str());
+        let_cxx_string!(name = spec.name.as_str());
+        let cols_joined = spec.cols.as_deref().unwrap_or(&[]).join("\n");
+        let_cxx_string!(cols = cols_joined.as_str());
+        let_cxx_string!(format = spec.format.as_deref().unwrap_or(""));
+        let_cxx_string!(schema = spec.schema.as_deref().unwrap_or(""));
+        let summary = self
+            .inner
+            .borrow_mut()
+            .pin_mut()
+            .pin_table(&path, &tier, &name, &cols, &format, &schema)?;
+        Ok(summary.to_string_lossy().into_owned())
+    }
+
+    /// Remove the pinned entry `name` and release its memory. Same threading
+    /// contract as [`pin_table`](Self::pin_table).
+    pub fn unpin_table(&self, name: &str) -> Result<String, Exception> {
+        let_cxx_string!(name = name);
+        let summary = self.inner.borrow_mut().pin_mut().unpin_table(&name)?;
+        Ok(summary.to_string_lossy().into_owned())
     }
 }
 

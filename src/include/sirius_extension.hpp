@@ -75,6 +75,10 @@ class SiriusExtension : public Extension {
   /// their inherited starting point instead of being shadowed by the compiled default.
   static void InitialGPUConfigs(DBConfig& db, const sirius::sirius_config& defaults);
   static void RegisterGPUFunctions(DatabaseInstance& catalog);
+  /// Register only the pin_table/unpin_table table functions. Split out of
+  /// RegisterGPUFunctions so the FFI's embedded DuckDB (sirius_ffi.cpp) can expose
+  /// pinning without pulling in the rest of the extension surface.
+  static void RegisterPinTableFunctions(CatalogTransaction& transaction, Catalog& catalog);
 #ifdef SIRIUS_ENABLE_LEGACY
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
