@@ -48,7 +48,7 @@ Retractions: [`2026-08-09-gb200-sf100/HANDOFF.md`](2026-08-09-gb200-sf100/HANDOF
 | **#32** | Harness: discarded warmup masks M1.5; no row-count oracle; `grep -c true` over-counts Alive. Overlaps PLAN-05. |
 | **M0.5** | Engine B `setup-engine-b.sh` rewrites `mem_limit=16G` every run; Docker path. |
 | **Phase 2** | 8 CNs across 2 GB200 hosts. Phase 1 (1 CN/host, fabric arena, 98 GB/s) works — see `experimental/starrocks/benchmarks/2NODE-REPLICATE.md`. |
-| **SF10000 8-CN** | **14/22** with times (112/64 dop=9; q07 96/80). Empty: q03/q05/q08/q09/q10/q17/q18/q21. Log [`../bench/gb200-8gpu/sf10000/TUNING-DISCOVERY.md`](../bench/gb200-8gpu/sf10000/TUNING-DISCOVERY.md). Next: more CNs on **the same SF**, not a bigger scale; do not raise STAGING for q03/q09/q21. Handoff [`2026-08-28-8gpu-handoff.md`](2026-08-28-8gpu-handoff.md). |
+| **SF3000 8-CN** | **20/22** with times (112/64 dop=12 common, dop=9 q08/q18). Empty: q09, q21 (fill 64/72/80 GiB). Fleet is these two 4-GPU nodes; do not plan more hosts or SF10000. Do not raise STAGING for q09/q21. Log [`../bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md`](../bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md). Handoff [`2026-08-28-8gpu-handoff.md`](2026-08-28-8gpu-handoff.md). |
 
 ## Query workarounds still live
 

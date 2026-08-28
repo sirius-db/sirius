@@ -11,10 +11,9 @@ bringing up a cluster, or running a benchmark.
 | Size `GPU_MEM` / `STAGING` / operator budgets | `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` (this 4× GB200 box) or `bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md` (method) and the `cn-tuning` skill |
 | Single-host 4× GB200 ops | `.claude/skills/tpch-bench/SKILL.md`, `bench/gb200-4gpu/HARDWARE.md`, `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` |
 | Two physical GB200 hosts | `experimental/starrocks/benchmarks/2NODE-REPLICATE.md` and the `tpch-2host` skill |
-| 8× GB200 (2 hosts × 4) | [`bench/gb200-8gpu/`](../bench/gb200-8gpu/) (`sf1000/`, `sf3000/`, `sf10000/`) |
+| 8× GB200 (2 hosts × 4). Whole fleet. | [`bench/gb200-8gpu/`](../bench/gb200-8gpu/) (`sf1000/`, `sf3000/`; `sf10000/` is closed, not live) |
 | SF3000 8-CN knob log | [`bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md`](../bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md) |
-| SF10000 8-CN knob log | [`bench/gb200-8gpu/sf10000/TUNING-DISCOVERY.md`](../bench/gb200-8gpu/sf10000/TUNING-DISCOVERY.md) |
-| SF10000 8-CN session handoff (2026-08-28) | [`2026-08-28-8gpu-handoff.md`](2026-08-28-8gpu-handoff.md) |
+| SF3000 session handoff (2026-08-28) | [`2026-08-28-8gpu-handoff.md`](2026-08-28-8gpu-handoff.md) |
 | Super Sirius architecture | `docs/super-sirius/` |
 
 Do **not** quote timings, pass/fail tables, or commands from the SF1 / single-GPU L4 notes
