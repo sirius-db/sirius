@@ -12,11 +12,11 @@ use crate::local_exchange::{
 };
 use crate::nixl_chunk::{self, NixlEndpoint, NixlEnvelope};
 use crate::proto::starrocks::{
-    PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest,
-    PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest, PExecPlanFragmentResult,
-    PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest, PGetFileSchemaResult,
-    PSlotDescriptor, PTransmitChunkParams, PTransmitChunkResult, StatusPb,
-    p_internal_service_brpc::PInternalService,
+    ExecuteCommandRequestPb, ExecuteCommandResultPb, PCancelPlanFragmentRequest,
+    PCancelPlanFragmentResult, PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult,
+    PExecPlanFragmentRequest, PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult,
+    PGetFileSchemaRequest, PGetFileSchemaResult, PSlotDescriptor, PTransmitChunkParams,
+    PTransmitChunkResult, StatusPb, p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FragmentInstanceId, ResultStore};
@@ -199,6 +199,35 @@ impl PInternalService for SiriusComputeNodeService {
         }
     }
 
+    /// `ADMIN EXECUTE ON <node_id> '<script>'` — the FE's execute_script RPC, repurposed as this
+    /// CN's admin channel (`pin_table`/`unpin_table`, see [`crate::admin_command`]). Runs on a
+    /// blocking worker because a pin occupies the engine thread for the whole materialization.
+    #[instrument(skip_all)]
+    async fn execute_command(
+        &self,
+        request: ExecuteCommandRequestPb,
+        _attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<ExecuteCommandResultPb>, crate::prpc::Error> {
+        let service = self.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || service.handle_execute_command(&request)).await;
+        let (status, result) = match outcome {
+            Ok(Ok(text)) => (Self::ok_status(), text),
+            Ok(Err(err)) => (Self::internal_error(err), String::new()),
+            Err(join_err) => (
+                Self::internal_error(format!("execute_command task panicked: {join_err}")),
+                String::new(),
+            ),
+        };
+        // Both fields always set: the FE dereferences status.statusCode and splits result on
+        // '\n' without null checks (ExecuteScriptExecutor.java).
+        Ok(ExecuteCommandResultPb {
+            status: Some(status),
+            result: Some(result),
+        }
+        .into())
+    }
+
     /// Infers the schema of the FILES() target so the FE can resolve the table function.
     #[instrument(skip_all)]
     async fn get_file_schema(
@@ -282,6 +311,61 @@ impl SiriusComputeNodeService {
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
         self.process_fragment(&params)
+    }
+
+    /// Executes an `ADMIN EXECUTE` script: parse, then run each command on the fragment
+    /// executor in order, stopping at the first failure. Returns one summary line per command
+    /// ('\n'-joined — the FE renders each line as a result row).
+    fn handle_execute_command(
+        &self,
+        request: &ExecuteCommandRequestPb,
+    ) -> std::result::Result<String, String> {
+        // The FE hardcodes this command name for ADMIN EXECUTE (ExecuteScriptExecutor.java);
+        // reject anything else by name rather than guessing at its payload.
+        match request.command.as_deref() {
+            Some("execute_script") => {}
+            other => {
+                return Err(format!(
+                    "unsupported execute_command command {other:?}; this CN only accepts \
+                     'execute_script' (ADMIN EXECUTE ON <node_id> '<script>')"
+                ));
+            }
+        }
+        let script = request
+            .params
+            .as_deref()
+            .filter(|params| !params.trim().is_empty())
+            .ok_or_else(|| {
+                "empty script; supported commands: pin_table path=<file-or-glob> \
+                 tier=gpu|host name=<name> [cols=c1,c2,...] [format=parquet|duckdb] \
+                 [schema=<schema>] | unpin_table <name>"
+                    .to_string()
+            })?;
+        // Bound parse/log cost; the grammar never needs scripts anywhere near this size.
+        const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+        if script.len() > MAX_SCRIPT_BYTES {
+            return Err(format!(
+                "script is {} bytes; the CN caps admin scripts at {MAX_SCRIPT_BYTES}",
+                script.len()
+            ));
+        }
+        tracing::info!(script, "execute_command admin script accepted");
+        let commands = crate::admin_command::parse_script(script)?;
+        let total = commands.len();
+        let mut lines = Vec::with_capacity(total);
+        for (index, command) in commands.into_iter().enumerate() {
+            let line = match &command {
+                crate::admin_command::AdminCommand::PinTable(spec) => self.executor.pin_table(spec),
+                crate::admin_command::AdminCommand::UnpinTable { name } => {
+                    self.executor.unpin_table(name)
+                }
+            }
+            .map_err(|err| format!("command {} of {total}: {err}", index + 1))?;
+            lines.push(line);
+        }
+        let outcome = lines.join("\n");
+        tracing::info!(outcome, "execute_command admin script finished");
+        Ok(outcome)
     }
 
     /// Runs one fragment, or registers it as a receiver that runs once all its exchange senders
@@ -1187,6 +1271,124 @@ mod tests {
             Some(nixl.clone()),
         );
         (service, nixl)
+    }
+
+    /// Captures pin/unpin calls so execute_command tests can assert what reached the executor.
+    #[derive(Debug, Default)]
+    struct RecordingPinExecutor {
+        pins: Mutex<Vec<crate::fragment_executor::PinTableSpec>>,
+        unpins: Mutex<Vec<String>>,
+        fail_with: Mutex<Option<String>>,
+    }
+
+    impl FragmentExecutor for RecordingPinExecutor {
+        fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
+            StubExecutor.execute(translated)
+        }
+
+        fn pin_table(
+            &self,
+            spec: &crate::fragment_executor::PinTableSpec,
+        ) -> Result<String, String> {
+            if let Some(err) = self.fail_with.lock().unwrap().clone() {
+                return Err(err);
+            }
+            self.pins.lock().unwrap().push(spec.clone());
+            Ok(format!("pinned '{}'", spec.name))
+        }
+
+        fn unpin_table(&self, name: &str) -> Result<String, String> {
+            self.unpins.lock().unwrap().push(name.to_string());
+            Ok(format!("unpinned '{name}'"))
+        }
+    }
+
+    fn execute_command_response(
+        service: &SiriusComputeNodeService,
+        command: Option<&str>,
+        params: Option<&str>,
+    ) -> ExecuteCommandResultPb {
+        let response = route(
+            service,
+            methods::EXECUTE_COMMAND,
+            ExecuteCommandRequestPb {
+                command: command.map(str::to_string),
+                params: params.map(str::to_string),
+            }
+            .encode_to_vec(),
+            Vec::new(),
+        );
+        ExecuteCommandResultPb::decode(response.body.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn execute_command_pins_and_unpins_via_executor() {
+        let executor = Arc::new(RecordingPinExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(
+            executor.clone(),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        let result = execute_command_response(
+            &service,
+            Some("execute_script"),
+            Some(
+                "# warm cache\n\
+                 pin_table path=/data/li/*.parquet tier=gpu name=lineitem cols=a,b\n\
+                 unpin_table old_pin",
+            ),
+        );
+        let status = result.status.expect("status is always set");
+        assert_eq!(status.status_code, TStatusCode::OK.0, "{status:?}");
+        let text = result.result.expect("result is always set");
+        assert_eq!(text, "pinned 'lineitem'\nunpinned 'old_pin'");
+        let pins = executor.pins.lock().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "lineitem");
+        assert_eq!(pins[0].tier, crate::fragment_executor::PinTier::Gpu);
+        assert_eq!(pins[0].cols, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(executor.unpins.lock().unwrap().as_slice(), ["old_pin"]);
+    }
+
+    #[test]
+    fn execute_command_rejects_wrong_command_and_bad_grammar() {
+        let service = SiriusComputeNodeService::with_executor(
+            Arc::new(RecordingPinExecutor::default()),
+            &ComputeNodeConfig::default(),
+            None,
+        );
+        for (command, params) in [
+            (Some("run_groovy"), Some("pin_table tier=gpu name=x path=p")),
+            (Some("execute_script"), Some("bogus_verb x")),
+            (Some("execute_script"), None),
+        ] {
+            let result = execute_command_response(&service, command, params);
+            let status = result.status.expect("status is always set");
+            assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
+            assert!(!status.error_msgs.is_empty());
+            assert_eq!(result.result.as_deref(), Some(""));
+        }
+    }
+
+    #[test]
+    fn execute_command_propagates_executor_error_with_command_index() {
+        let executor = Arc::new(RecordingPinExecutor::default());
+        *executor.fail_with.lock().unwrap() = Some("no parquet files matched".to_string());
+        let service =
+            SiriusComputeNodeService::with_executor(executor, &ComputeNodeConfig::default(), None);
+        let result = execute_command_response(
+            &service,
+            Some("execute_script"),
+            Some("pin_table path=missing.parquet tier=gpu name=x"),
+        );
+        let status = result.status.expect("status is always set");
+        assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            status.error_msgs[0].contains("command 1 of 1")
+                && status.error_msgs[0].contains("no parquet files matched"),
+            "{:?}",
+            status.error_msgs
+        );
     }
 
     fn transmit(
