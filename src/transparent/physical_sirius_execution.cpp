@@ -110,7 +110,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
   bool cpu_plan_reads_s3,
   duckdb::idx_t estimated_cardinality,
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan)
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
+  std::uint64_t validated_plan_pin_epoch)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
@@ -118,7 +119,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
     cpu_plan_reads_s3_(cpu_plan_reads_s3),
-    validated_sirius_plan_(std::move(validated_sirius_plan))
+    validated_sirius_plan_(std::move(validated_sirius_plan)),
+    validated_plan_pin_epoch_(validated_plan_pin_epoch)
 {
 }
 
@@ -187,8 +189,36 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
 
       // One-shot by construction: the move empties the slot, so re-executions of the same
       // prepared operator fall through to the rebuild below.
-      duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan =
-        std::move(validated_sirius_plan_);
+      //
+      // The validated plan was built in an earlier lifecycle-slot window and bakes in
+      // pin-derived decisions (deferred metadata walks, compressed-materialization sidecars,
+      // the plan-time cache-or-CPU refusals). pin/unpin take the slot so they cannot interleave
+      // with a window, but they can land between two — so reuse the plan only while the pinned
+      // registry is unchanged, and otherwise rebuild against what this window actually sees.
+      duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan;
+      if (validated_sirius_plan_) {
+        duckdb::Value inject_registry_change;
+        if (state.sirius_context &&
+            context.client.TryGetCurrentSetting("sirius_test_inject_pin_registry_change",
+                                                inject_registry_change) &&
+            !inject_registry_change.IsNull() && inject_registry_change.GetValue<bool>()) {
+          state.sirius_context->get_scan_manager().bump_pin_registry_epoch_for_testing();
+        }
+        auto const planned_epoch = validated_plan_pin_epoch_;
+        auto const current_epoch = state.sirius_context
+                                     ? state.sirius_context->get_scan_manager().pin_registry_epoch()
+                                     : planned_epoch;
+        if (current_epoch == planned_epoch) {
+          sirius_plan = std::move(validated_sirius_plan_);
+        } else {
+          validated_sirius_plan_.reset();
+          SIRIUS_LOG_INFO(
+            "Transparent execution: discarding finalize-validated Sirius plan (pinned registry "
+            "changed: epoch {} -> {})",
+            planned_epoch,
+            current_epoch);
+        }
+      }
       if (sirius_plan) {
         SIRIUS_LOG_INFO("Transparent execution: reusing finalize-validated Sirius plan");
       } else {

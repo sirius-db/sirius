@@ -22,6 +22,8 @@
 #include <duckdb/execution/physical_operator.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <cstdint>
+
 namespace duckdb {
 class PreparedStatementData;
 }  // namespace duckdb
@@ -49,7 +51,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
     duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
     bool cpu_plan_reads_s3,
     duckdb::idx_t estimated_cardinality,
-    duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr);
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan = nullptr,
+    std::uint64_t validated_plan_pin_epoch                                         = 0);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -100,6 +103,11 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// The plan OnFinalizePrepare built while validating GPU support. The first GetData consumes
   /// it rather than rebuilding an identical one. Mutable: consumed from a `const` GetData.
   mutable duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan_;
+
+  /// Pinned-registry epoch observed while building validated_sirius_plan_. The plan bakes in
+  /// pin-derived decisions, and pin/unpin can land between that window and this operator's
+  /// execution window, so the plan is reused only while the epoch still matches.
+  std::uint64_t validated_plan_pin_epoch_ = 0;
 };
 
 }  // namespace sirius::transparent

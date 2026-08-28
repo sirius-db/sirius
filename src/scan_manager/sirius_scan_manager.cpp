@@ -2305,6 +2305,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
   // The replace path stored every column.
+  bump_pin_registry_epoch();
   return column_names;
 }
 
@@ -2409,6 +2410,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(
@@ -2466,6 +2468,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   retire_late_mat_handle(name);
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -2478,6 +2481,7 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
   // A (re-)pin resets the chunk layout the masks are indexed by.
   it->second.mvcc_mask_cache.reset();
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::attach_proven_unique_columns(
@@ -2498,12 +2502,14 @@ void sirius_scan_manager::attach_proven_unique_columns(
       if (names[i] == unique_name) { entry.proven_unique_columns[i] = true; }
     }
   }
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   retire_late_mat_handle(name);
   _pinned_entries.erase(name);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::publish_late_mat_handle(const std::string& name)
