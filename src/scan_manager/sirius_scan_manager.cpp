@@ -1405,6 +1405,7 @@ void sirius_scan_manager::insert_pinned_entry(
   }
 
   _pinned_entries[name] = std::move(entry);
+  bump_pin_registry_epoch();
 }
 
 namespace {
@@ -1502,6 +1503,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.zone_maps      = std::move(pin_zone_maps);
 
   _pinned_entries[name] = std::move(entry);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::insert_pinned_entry_device(
@@ -1553,6 +1555,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
                    new_num_rows);
 
   _pinned_entries[name] = std::move(entry);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
@@ -1563,11 +1566,13 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
   }
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
   _pinned_entries.erase(name);
+  bump_pin_registry_epoch();
 }
 
 void sirius_scan_manager::visit_pinned_entries(

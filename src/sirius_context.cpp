@@ -1433,7 +1433,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       plan_is_copyable = false;
     }
     // Hand the validated plan over instead of discarding it, so the first execution can skip
-    // an identical rebuild.
+    // an identical rebuild. Stamp the pinned-registry epoch the plan was built against: the
+    // execution window re-checks it and rebuilds if a pin or unpin landed in between.
+    auto const validated_plan_pin_epoch = get_scan_manager().pin_registry_epoch();
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan;
     if (plan_is_copyable) {
       validated_sirius_plan = planner.create_plan(std::move(validation_plan));
@@ -1467,7 +1469,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       std::move(cpu_fallback),
       plan_reads_s3,
       0,
-      std::move(validated_sirius_plan));
+      std::move(validated_sirius_plan),
+      validated_plan_pin_epoch);
     new_physical_plan->SetRoot(sirius_op);
 
     // Replace the DuckDB CPU physical plan.

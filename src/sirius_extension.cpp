@@ -2544,6 +2544,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   // option registration from growing scattered environment checks.
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_pin_registry_change",
+                    "simulate a pin or unpin landing between the finalize and execution windows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_inject_transparent_gpu_error",
                     "force transparent GPU execution to fail at runtime with this message",
                     LogicalType::VARCHAR,
