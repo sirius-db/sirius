@@ -332,6 +332,7 @@ set(EXTENSION_SOURCES
     src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
+    src/op/scan/duckdb_native_metadata_cache.cpp
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
@@ -864,6 +865,8 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
+    test/cpp/scan/bench_metadata_walk.cpp
+    test/cpp/scan/test_duckdb_native_metadata_cache.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
