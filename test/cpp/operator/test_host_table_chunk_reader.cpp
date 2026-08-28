@@ -472,8 +472,9 @@ TEST_CASE("host_table_chunk_reader handles null masks",
   REQUIRE(row_base == num_rows);
 }
 
-TEST_CASE("host_table_chunk_reader converts parquet TIMESTAMP_MILLIS to DuckDB TIMESTAMP microseconds",
-          "[operator][result_collector][host_table_chunk_reader][shared_context][timestamp]")
+TEST_CASE(
+  "host_table_chunk_reader converts parquet TIMESTAMP_MILLIS to DuckDB TIMESTAMP microseconds",
+  "[operator][result_collector][host_table_chunk_reader][shared_context][timestamp]")
 {
   // GPU parquet stores TIMESTAMP_MILLIS as cuDF TIMESTAMP_MILLISECONDS (INT64 millis).
   // DuckDB TIMESTAMP is microseconds. Copying by physical INT64 width (the pre-#1634 path)
@@ -550,9 +551,9 @@ TEST_CASE("host_table_chunk_reader preserves matching timestamp units without re
     std::vector<int64_t> micros{873431589000000LL, 0, -1};
     auto table =
       make_timestamp_table(micros, cudf::type_id::TIMESTAMP_MICROSECONDS, {}, stream, mr);
-    auto batch  = make_test_batch(std::move(table), *gpu_space, stream);
-    auto values = read_timestamp_chunks(
-      con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
     REQUIRE(values.size() == micros.size());
     for (size_t i = 0; i < micros.size(); ++i) {
       REQUIRE(values[i].value == micros[i]);
@@ -564,9 +565,9 @@ TEST_CASE("host_table_chunk_reader preserves matching timestamp units without re
     std::vector<int64_t> millis{873431589000LL, 0, -1000};
     auto table =
       make_timestamp_table(millis, cudf::type_id::TIMESTAMP_MILLISECONDS, {}, stream, mr);
-    auto batch  = make_test_batch(std::move(table), *gpu_space, stream);
-    auto values = read_timestamp_chunks(
-      con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP_MS, stream);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP_MS, stream);
     REQUIRE(values.size() == millis.size());
     for (size_t i = 0; i < millis.size(); ++i) {
       REQUIRE(values[i].value == millis[i]);
@@ -601,8 +602,7 @@ TEST_CASE("host_table_chunk_reader converts TIMESTAMP_SECONDS and TIMESTAMP_NS t
   SECTION("nanoseconds become microseconds")
   {
     std::vector<int64_t> nanos{873431589000000000LL, 1'500, -2'000};
-    auto table =
-      make_timestamp_table(nanos, cudf::type_id::TIMESTAMP_NANOSECONDS, {}, stream, mr);
+    auto table = make_timestamp_table(nanos, cudf::type_id::TIMESTAMP_NANOSECONDS, {}, stream, mr);
     auto batch = make_test_batch(std::move(table), *gpu_space, stream);
     auto values =
       read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
