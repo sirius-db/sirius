@@ -241,6 +241,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
   // Release ownership of the merged table's columns so we can move (not copy) them.
   // Acquire EXCLUSIVE lock since release_table() is a mutating operation
+  // `merged` must own its table: release_table() on a view-backed representation (PARTITION can
+  // emit those) destroys the type-erased owner inline while its deep copy is still in flight.
+  // Both producers above are owning.
   auto merged_mut    = merged->to_mutable();
   auto* space        = merged_mut.get_memory_space();
   auto mr            = space->get_default_allocator();
