@@ -825,6 +825,10 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   }
   info->projected_output_count = keep.size();
   info->approximate_batch_size = batch_size;
+  // Pin-only: never bundle two files' row groups into one chunk, so every pinned
+  // chunk has single-file provenance and a scan over a SUBSET of the pinned files
+  // can be served by whole-chunk selection.
+  info->batch_within_file_boundaries = true;
   return info;
 }
 
@@ -1373,7 +1377,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       std::move(pinned_column_types),
       std::move(host_result.chunk_stats),
       std::move(host_result.column_storage),
-      pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)));
+      pin_metadata(host_result.unique_verdicts, std::move(host_result.base_row_count_per_chunk)),
+      std::move(host_result.chunk_file_paths));
   } else if (pin_comp.enabled) {
     // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
     // on), then compress it when it qualifies, keeping the compressed payload in device
@@ -1399,7 +1404,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       std::move(dev_result.chunks),
       *gpu_spaces_mut[0],
       std::move(dev_result.column_storage),
-      pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)));
+      pin_metadata(dev_result.unique_verdicts, std::move(dev_result.base_row_count_per_chunk)),
+      std::move(dev_result.chunk_file_paths));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
@@ -1424,7 +1430,8 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       std::move(pinned_column_types),
       std::move(mat.chunk_stats),
       std::move(mat.column_storage),
-      pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)));
+      pin_metadata(mat.unique_verdicts, std::move(base_row_count_per_chunk)),
+      std::move(mat.chunk_file_paths));
   }
 
   output.SetCardinality(1);
