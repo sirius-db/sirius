@@ -790,7 +790,7 @@ class GPUExecutionIcebergFixture : public MultiFormatFixtureBase {
            << (flag && !flag->HasError() ? flag->GetValue(0, 0).ToString() : "unreadable")
            << ", iceberg extension_version is "
            << (ver && !ver->HasError() && ver->RowCount() == 1 ? ver->GetValue(0, 0).ToString()
-                                                              : "unreadable")
+                                                               : "unreadable")
            << " (verified: " << kVerifiedIcebergVersion
            << "). Both are reported together because neither predicts the other: the shipped "
               "binary's version string does not identify the tree it was built from.");

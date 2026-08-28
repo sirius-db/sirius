@@ -111,13 +111,12 @@ size_t deserialize_roaring32(const uint8_t* data,
                              std::vector<uint32_t>& out,
                              size_t max_out)
 {
-  size_t const bitmap_size =
-    roaring::api::roaring_bitmap_portable_deserialize_size(reinterpret_cast<const char*>(data),
-                                                           data_len);
+  size_t const bitmap_size = roaring::api::roaring_bitmap_portable_deserialize_size(
+    reinterpret_cast<const char*>(data), data_len);
   if (bitmap_size == 0) {
-    throw std::runtime_error(
-      "roaring: no valid portable-Roaring bitmap in the remaining " + std::to_string(data_len) +
-      " bytes; the deletion vector is truncated or corrupt");
+    throw std::runtime_error("roaring: no valid portable-Roaring bitmap in the remaining " +
+                             std::to_string(data_len) +
+                             " bytes; the deletion vector is truncated or corrupt");
   }
 
   roaring::Roaring bitmap =
@@ -161,9 +160,9 @@ std::string property_or_empty(duckdb_yyjson::yyjson_val* properties, char const*
 /// caller bounds the blob read against it: a manifest and footer are free to agree on a size that
 /// the FILE cannot hold, and believing them is a value-initialized allocation of whatever they say.
 std::streamoff validate_footer_descriptor(std::ifstream& f,
-                                std::streamoff file_size,
-                                DeletionVectorRef const& ref,
-                                char const (&puffin_magic)[4])
+                                          std::streamoff file_size,
+                                          DeletionVectorRef const& ref,
+                                          char const (&puffin_magic)[4])
 {
   // Footer = Magic | Payload | PayloadSize(4, LE) | Flags(4) | Magic
   static constexpr std::streamoff kFooterTail = 12;  // PayloadSize + Flags + trailing Magic
@@ -387,10 +386,12 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
   static constexpr std::streamoff kLeadingMagic = 4;
   if (content_offset < kLeadingMagic || content_offset > footer_start ||
       content_size_in_bytes > footer_start - content_offset) {
-    throw std::runtime_error(
-      "[puffin] Deletion vector at offset " + std::to_string(content_offset) + " size " +
-      std::to_string(content_size_in_bytes) + " does not fit between the leading magic and the "
-      "footer (which starts at " + std::to_string(footer_start) + ") of " + puffin_path);
+    throw std::runtime_error("[puffin] Deletion vector at offset " +
+                             std::to_string(content_offset) + " size " +
+                             std::to_string(content_size_in_bytes) +
+                             " does not fit between the leading magic and the "
+                             "footer (which starts at " +
+                             std::to_string(footer_start) + ") of " + puffin_path);
   }
 
   f.seekg(content_offset);

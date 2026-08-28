@@ -38,9 +38,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <numeric>
-#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -304,20 +304,21 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   // that is an argument about ordering, not about the totals. At the end both directions are a
   // reader disagreement: under-delivery drops a live vector's deletes, and over-delivery APPLIES
   // deletes the discovery pass never reported as live.
-  auto const reconcile = [&](std::pair<std::string, std::string> const& key,
-                             size_t reported,
-                             size_t expanded) {
-    if (reported == expanded) { return; }
-    throw std::runtime_error(
-      "[iceberg] The two metadata passes disagree about the deletion vector(s) at '" + key.second +
-      "' in manifest '" + key.first + "' for table '" + table_path + "': iceberg_metadata() "
-      "reports " + std::to_string(reported) + " live, re-reading the manifest returned " +
-      std::to_string(expanded) +
-      ". A Puffin may hold several vectors at one path, so this is a count and not a presence "
-      "check; proceeding would " +
-      (reported > expanded ? std::string("drop deleted rows back into the result")
-                           : std::string("apply deletes that were never reported as live")));
-  };
+  auto const reconcile =
+    [&](std::pair<std::string, std::string> const& key, size_t reported, size_t expanded) {
+      if (reported == expanded) { return; }
+      throw std::runtime_error(
+        "[iceberg] The two metadata passes disagree about the deletion vector(s) at '" +
+        key.second + "' in manifest '" + key.first + "' for table '" + table_path +
+        "': iceberg_metadata() "
+        "reports " +
+        std::to_string(reported) + " live, re-reading the manifest returned " +
+        std::to_string(expanded) +
+        ". A Puffin may hold several vectors at one path, so this is a count and not a presence "
+        "check; proceeding would " +
+        (reported > expanded ? std::string("drop deleted rows back into the result")
+                             : std::string("apply deletes that were never reported as live")));
+    };
   for (auto const& [key, reported] : puffin_rows_from_metadata) {
     auto const it = expanded_vectors.find(key);
     reconcile(key, reported, it == expanded_vectors.end() ? 0 : it->second);
@@ -460,7 +461,8 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
           "[iceberg] The live deletion vectors of this scan declare more than the " +
           std::to_string(kMaxDeletionVectorPositionsPerStatement) +
           " deleted positions this reader will retain while planning (reached at '" +
-          dv_entry.file_path + "'); the scan declines rather than sizing a plan-time allocation "
+          dv_entry.file_path +
+          "'); the scan declines rather than sizing a plan-time allocation "
           "from what the table wrote");
       }
       total_positions += dv_entry.record_count;
