@@ -97,7 +97,10 @@ CALL unpin_table('lineitem');
 ```
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
-pinned host memory instead, for tables larger than GPU memory.
+pinned host memory instead, for tables larger than GPU memory. Compressed pinning
+(`SET pin_table_compression = true`) fits much more data in either tier — see the
+[pinned-table reproduction guide](pinned-tables-repro.md) for a step-by-step walkthrough of
+GPU, host, and compressed pinning.
 
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
