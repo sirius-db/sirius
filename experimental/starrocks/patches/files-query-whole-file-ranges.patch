@@ -1,0 +1,40 @@
+diff --git a/fe/fe-core/src/main/java/com/starrocks/common/Config.java b/fe/fe-core/src/main/java/com/starrocks/common/Config.java
+index 814551c953b..b47f3b812c3 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/common/Config.java
++++ b/fe/fe-core/src/main/java/com/starrocks/common/Config.java
+@@ -1212,6 +1212,16 @@ public class Config extends ConfigBase {
+     @ConfField(mutable = true)
+     public static long min_bytes_per_broker_scanner = 67108864L; // 64MB
+ 
++    /**
++     * When true, FILES() query scans assign whole files to scan instances instead of
++     * cutting byte-range splits. Slightly worse load balance (an instance can overshoot
++     * by up to one file), but a compute node that pinned the scanned files in memory
++     * (Sirius pin_table) can then serve its assigned subset from the pin — byte-range
++     * splits are never served from pinned tables. Load paths are unaffected.
++     */
++    @ConfField(mutable = true)
++    public static boolean files_query_whole_file_ranges = false;
++
+     /**
+      * Default insert load timeout
+      */
+diff --git a/fe/fe-core/src/main/java/com/starrocks/planner/FileScanNode.java b/fe/fe-core/src/main/java/com/starrocks/planner/FileScanNode.java
+index 176962078dd..14e4eb4df12 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/planner/FileScanNode.java
++++ b/fe/fe-core/src/main/java/com/starrocks/planner/FileScanNode.java
+@@ -584,8 +584,13 @@ public class FileScanNode extends LoadScanNode {
+             long rangeBytes = 0;
+             // The rest of the file belongs to one range
+             boolean isEndOfFile = false;
++            // FILES() queries can be forced to whole-file assignment so a compute node
++            // serving from pinned tables (Sirius pin_table) can match its assigned
++            // subset — pinned tables never serve byte-range splits.
++            boolean wholeFileOnly = fileScanType == TFileScanType.FILES_QUERY
++                    && Config.files_query_whole_file_ranges;
+             if (smallestLocations.second + leftBytes > bytesPerInstance && isFileFormatSupportSplit(formatType)
+-                            && fileStatus.isSplitable) {
++                            && fileStatus.isSplitable && !wholeFileOnly) {
+                 rangeBytes = bytesPerInstance - smallestLocations.second;
+             } else {
+                 rangeBytes = leftBytes;
