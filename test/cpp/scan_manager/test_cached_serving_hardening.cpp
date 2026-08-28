@@ -1215,6 +1215,39 @@ TEST_CASE("build_cached_scan_plan counts device_chunks for a compression-enabled
   REQUIRE(plan.survivor_chunk_indices.size() == 5);
 }
 
+// File-subset serving restricts the plan to the chunks whose provenance the scan
+// covers; the restriction applies before zone-map pruning so the all-pruned
+// sentinel can only pick an allowed chunk.
+TEST_CASE("build_cached_scan_plan honors an allowed-chunks restriction",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, 5, 4);
+
+  SECTION("identity plan over the allowed set only")
+  {
+    std::vector<std::size_t> const allowed{1, 3};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices == allowed);
+    REQUIRE(plan.pruned == 0);
+  }
+
+  SECTION("out-of-range allowed indices are dropped, not served")
+  {
+    std::vector<std::size_t> const allowed{2, 99};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices == std::vector<std::size_t>{2});
+  }
+
+  SECTION("empty allowed set yields an empty plan (caller must treat as a miss)")
+  {
+    std::vector<std::size_t> const allowed{};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices.empty());
+    REQUIRE(plan.pruned == 0);
+  }
+}
+
 TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
           "[cached_serving][scan_manager]")
 {

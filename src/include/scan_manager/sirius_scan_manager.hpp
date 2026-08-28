@@ -147,6 +147,25 @@ class cache_entry_info {
   /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
   [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
 
+  /// How a scan's file set relates to this entry's pinned file set.
+  enum class parquet_file_match : std::uint8_t {
+    miss,    ///< different files (or duckdb entry / empty probe)
+    exact,   ///< same file set — every pinned chunk may serve
+    subset,  ///< strict subset — servable only from chunks whose provenance is covered
+  };
+
+  /// Set-relation form of @ref matches_parquet_files: classifies @p files as an
+  /// exact match, a strict subset of the pinned set, or a miss. Subset holds only
+  /// when BOTH canonical sets are duplicate-free — a duplicated pinned path means
+  /// the pin materialized that file's chunks more than once, and serving them to
+  /// a scan that lists the file once would double its rows (exact matching is
+  /// duplicate-symmetric, so `exact` keeps today's semantics). When non-null,
+  /// @p canonical_scan_files receives the canonicalized, sorted probe set for
+  /// the caller's per-chunk provenance filter.
+  [[nodiscard]] parquet_file_match matches_parquet_file_set(
+    std::span<std::string const> files,
+    std::vector<std::string>* canonical_scan_files = nullptr) const;
+
   /// Column-superset gather over @p requested_ids (requested order): for each
   /// requested column, its position within the cached @c column_ids. Empty
   /// when the cache cannot serve — a requested rowid/virtual/empty/
@@ -182,6 +201,14 @@ struct pinned_entry {
   /// share the same memory_space because they came from the same
   /// coalesced batch.
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  /// Per-chunk source-file provenance (canonical, sorted, deduplicated), in
+  /// emission order and parallel to whichever chunk storage backs this entry.
+  /// Lets a scan over a strict SUBSET of the pinned file set be served by
+  /// selecting only the chunks whose files the scan covers. Empty (or an empty
+  /// inner vector for a chunk) means provenance unknown — such entries/chunks
+  /// serve exact-file-set scans only, which is every pre-provenance pin's and
+  /// every duckdb-native pin's behavior.
+  std::vector<std::vector<std::string>> chunk_file_paths;
   /// HOST-tier storage: one chunk per emitted batch in emission order, each
   /// holding all pinned columns. Every element is either a
   /// cucascade::host_data_representation (uncompressed) or a
@@ -400,11 +427,19 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
  * @brief Build the survivor plan for serving @p entry to a scan into @p requiested_column_ids with
  * @p table_filters applied. A chunk is pruned when any usable filter proves it empty against the
  * pinned entry's zone-map statistics.
+ *
+ * @p allowed_chunks, when non-null, restricts the plan to those chunk indices (sorted,
+ * deduplicated) BEFORE zone-map pruning — the file-subset serve path passes the chunks whose
+ * provenance the scan's file set covers, so the all-pruned sentinel below can only ever pick an
+ * allowed chunk (a disallowed sentinel chunk would return another file's rows). An empty allowed
+ * set yields an empty plan (no survivors, nothing pruned); the caller must treat that as a cache
+ * miss rather than serve it — a zero-split scan hangs pipeline completion.
  */
 [[nodiscard]] cached_scan_plan build_cached_scan_plan(
   pinned_entry const& entry,
   duckdb::TableFilterSet const* table_filters,
-  duckdb::vector<duckdb::ColumnIndex> const* requested_column_ids);
+  duckdb::vector<duckdb::ColumnIndex> const* requested_column_ids,
+  std::vector<std::size_t> const* allowed_chunks = nullptr);
 
 /**
  * @brief Bind-time result of @ref sirius_scan_manager::describe_parquet.
@@ -543,7 +578,8 @@ class sirius_scan_manager {
     std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-    sirius::pinned_column_storage_matrix column_storage);
+    sirius::pinned_column_storage_matrix column_storage,
+    std::vector<std::vector<std::string>> chunk_file_paths = {});
 
   /// \brief Pin the host-tier entry for a table.
   ///
@@ -583,7 +619,8 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-    sirius::pinned_column_storage_matrix column_storage);
+    sirius::pinned_column_storage_matrix column_storage,
+    std::vector<std::vector<std::string>> chunk_file_paths = {});
 
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
   ///
@@ -607,7 +644,8 @@ class sirius_scan_manager {
                                   cache_entry_info cache_info,
                                   std::vector<sirius::device_pin_chunk> chunks,
                                   cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage);
+                                  sirius::pinned_column_storage_matrix column_storage,
+                                  std::vector<std::vector<std::string>> chunk_file_paths = {});
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///
@@ -667,10 +705,13 @@ class sirius_scan_manager {
     duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
-  /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
-  /// and read it inside one slot-scoped window, and never hold it across a pin
-  /// or unpin. First match wins if one file set was pinned under two names.
-  /// Read by the plan-time compressed-materialization residency gate.
+  /// (cache_entry_info::matches_parquet_file_set) — exactly, or as a strict
+  /// subset when the entry carries chunk provenance (the same condition the
+  /// serve path requires, keeping the one-matcher invariant) — or nullptr.
+  /// Non-owning; obtain and read it inside one slot-scoped window, and never
+  /// hold it across a pin or unpin. First match wins if one file set was pinned
+  /// under two names. Read by the plan-time compressed-materialization
+  /// residency gate.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_parquet_files(
     std::span<std::string const> resolved_file_paths) const;
 

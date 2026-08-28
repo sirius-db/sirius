@@ -89,6 +89,13 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// only by parquet_batch_coalescer when it bundles files / chunks row groups —
   /// the ingestible's metadata scan operates one file at a time and does no batching.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  /// When true the coalescer never bundles row groups of different files into one
+  /// split: each emitted split holds slices of exactly one file (a large file still
+  /// splits under approximate_batch_size). The pin path sets this so every pinned
+  /// chunk has single-file provenance and a scan over a subset of the pinned files
+  /// can be served by selecting whole chunks. The query read path keeps fused
+  /// batches (false).
+  bool batch_within_file_boundaries = false;
   std::size_t scan_output_arity      = 0;
 
   parquet_ingestible_table_info() = default;
