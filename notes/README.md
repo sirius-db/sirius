@@ -11,6 +11,7 @@ bringing up a cluster, or running a benchmark.
 | Size `GPU_MEM` / `STAGING` / operator budgets | `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` (this 4× GB200 box) or `bench/rtxpro6000-2gpu/SIRIUS-TUNING-RUNBOOK.md` (method) and the `cn-tuning` skill |
 | Single-host 4× GB200 ops | `.claude/skills/tpch-bench/SKILL.md`, `bench/gb200-4gpu/HARDWARE.md`, `bench/gb200-4gpu/SIRIUS-TUNING-RUNBOOK.md` |
 | Two physical GB200 hosts | `experimental/starrocks/benchmarks/2NODE-REPLICATE.md` and the `tpch-2host` skill |
+| 8× GB200 (2 hosts × 4) | [`bench/gb200-8gpu/`](../bench/gb200-8gpu/) (`sf1000/`, `sf3000/`, `sf10000/`) |
 | Super Sirius architecture | `docs/super-sirius/` |
 
 Do **not** quote timings, pass/fail tables, or commands from the SF1 / single-GPU L4 notes
