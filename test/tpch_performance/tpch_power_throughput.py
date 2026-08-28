@@ -28,6 +28,13 @@ continues on the same pinned database right after the power run, with no unpin o
 repin, so it sees the update-set-1 rows the power run left behind. The single
 modes each pin a fresh copy of the input.
 
+--staged-refresh takes the CSV parse off the timed path: every needed update
+set is pre-loaded as native staging tables during untimed prep (spec-legal —
+TPC-H v3.0.1 clause 2.5.3.1 allows providing the SUT with the RF data before
+the benchmark) and the timed RF1/RF2 become INSERT..SELECT plus a hash
+semi-join DELETE. Default on; --no-staged-refresh restores the legacy
+COPY/read_csv path.
+
 Every stream runs the same fixed substitution parameters by default, which keeps
 validation and the clean/post-RF1/post-RF2 comparison meaningful.
 --vary-predicates instead runs each stream's own qgen-generated parameters from
@@ -118,7 +125,14 @@ def refresh_file(refresh_dir, name):
     return path
 
 
-def rf1_statements(refresh_dir, n):
+def rf1_statements(refresh_dir, n, staged=False):
+    if staged:
+        # Insert from the pre-staged native tables (see stage_refresh_sets);
+        # the CSV parse already happened in untimed prep.
+        return [
+            f"INSERT INTO orders SELECT * FROM staging_orders_u{n}",
+            f"INSERT INTO lineitem SELECT * FROM staging_lineitem_u{n}",
+        ]
     orders = refresh_file(refresh_dir, f"orders.tbl.u{n}")
     lineitem = refresh_file(refresh_dir, f"lineitem.tbl.u{n}")
     return [
@@ -127,14 +141,149 @@ def rf1_statements(refresh_dir, n):
     ]
 
 
-def rf2_statements(refresh_dir, n):
-    delete = refresh_file(refresh_dir, f"delete.{n}")
-    # dbgen delete files are "orderkey|" lines; column0 is the key.
-    keys = f"SELECT column0 FROM read_csv('{delete}', delim='|', header=false)"
+def rf2_statements(refresh_dir, n, staged=False):
+    if staged:
+        # DuckDB plans IN (SELECT ...) as a hash semi-join against the staged
+        # key table, so the delete parses nothing and scans each target once.
+        keys = f"SELECT orderkey FROM staging_delete_u{n}"
+    else:
+        delete = refresh_file(refresh_dir, f"delete.{n}")
+        # dbgen delete files are "orderkey|" lines; column0 is the key.
+        keys = f"SELECT column0 FROM read_csv('{delete}', delim='|', header=false)"
     return [
         f"DELETE FROM lineitem WHERE l_orderkey IN ({keys})",
         f"DELETE FROM orders WHERE o_orderkey IN ({keys})",
     ]
+
+
+def staging_table_names(n):
+    return (
+        f"staging_orders_u{n}",
+        f"staging_lineitem_u{n}",
+        f"staging_delete_u{n}",
+    )
+
+
+def _set_cpu_execution(cur):
+    """Route this cursor's statements to plain DuckDB. Tolerates a connection
+    without the extension so the pure-DuckDB staging equivalence test can
+    drive stage_refresh_sets directly."""
+    try:
+        sql(cur, "SET gpu_execution = false")
+    except duckdb.CatalogException:
+        pass
+
+
+def stage_refresh_sets(con, refresh_dir, sets):
+    """Pre-load update sets as native staging tables, before anything is timed.
+
+    TPC-H v3.0.1 clause 2.5.3.1 explicitly permits making the RF1 rows and RF2
+    delete keys available to the SUT ahead of the benchmark — only
+    pre-executing the refresh functions themselves is banned — so the CSV
+    parse moves here and the timed RF1/RF2 (submission to commit, clause
+    5.3.7.3) become native-table DML.
+
+    The staging tables must hold exactly what the legacy path would have
+    applied: a LIMIT-0 CTAS clones each base table's exact schema and the same
+    COPY statement as the unstaged RF1 fills it, so parse semantics are
+    identical by construction; the delete keys use the same read_csv the
+    unstaged RF2 embeds. Row counts are checked against the files here, which
+    keeps power_run's post-RF1 count verification meaningful in staged mode.
+    """
+    cur = con.cursor()
+    try:
+        _set_cpu_execution(cur)
+        start = time.perf_counter()
+        for n in sets:
+            orders_t, lineitem_t, delete_t = staging_table_names(n)
+            for staging, base, path in (
+                (orders_t, "orders", refresh_file(refresh_dir, f"orders.tbl.u{n}")),
+                (
+                    lineitem_t,
+                    "lineitem",
+                    refresh_file(refresh_dir, f"lineitem.tbl.u{n}"),
+                ),
+            ):
+                sql(cur, f"DROP TABLE IF EXISTS {staging}")
+                sql(cur, f"CREATE TABLE {staging} AS SELECT * FROM {base} LIMIT 0")
+                sql(cur, f"COPY {staging} FROM '{path}' (HEADER false, DELIMITER '|')")
+                rows = sql(cur, f"SELECT count(*) FROM {staging}")[0][0]
+                expected = count_lines(path)
+                if rows != expected:
+                    raise SystemExit(
+                        f"Staging {staging} holds {rows} rows but {path} has "
+                        f"{expected} lines; the staged refresh would diverge "
+                        "from the legacy COPY path."
+                    )
+            delete_path = refresh_file(refresh_dir, f"delete.{n}")
+            sql(cur, f"DROP TABLE IF EXISTS {delete_t}")
+            sql(
+                cur,
+                f"CREATE TABLE {delete_t} AS SELECT column0::BIGINT AS orderkey "
+                f"FROM read_csv('{delete_path}', delim='|', header=false)",
+            )
+            rows = sql(cur, f"SELECT count(*) FROM {delete_t}")[0][0]
+            expected = count_lines(delete_path)
+            if rows != expected:
+                raise SystemExit(
+                    f"Staging {delete_t} holds {rows} keys but {delete_path} "
+                    f"has {expected} lines."
+                )
+        log(
+            f"Staged update set(s) {list(sets)} as native tables in "
+            f"{time.perf_counter() - start:.1f}s (untimed prep)"
+        )
+    finally:
+        cur.close()
+
+
+def drop_staged_refresh_sets(con, sets):
+    cur = con.cursor()
+    try:
+        _set_cpu_execution(cur)
+        for n in sets:
+            for t in staging_table_names(n):
+                sql(cur, f"DROP TABLE IF EXISTS {t}")
+    finally:
+        cur.close()
+
+
+@contextlib.contextmanager
+def staged_refresh_tables(con, args, sets):
+    """Stage the update sets around the timed phases (both ends untimed)."""
+    if not sets:
+        yield
+        return
+    stage_refresh_sets(con, args.refresh_dir, sets)
+    try:
+        yield
+    finally:
+        # Best-effort: a run that already earned its metrics must not lose
+        # them to a teardown failure on a dying database.
+        try:
+            drop_staged_refresh_sets(con, sets)
+        except Exception as e:  # noqa: BLE001 - reported, results still written
+            log(f"WARNING: staging teardown failed (continuing): {e}")
+
+
+def apply_refresh_write_config(cur):
+    """Write-path settings for a refresh cursor, best-effort.
+
+    enable_optimistic_write keeps large in-transaction appends flowing to disk
+    instead of buffering (backported from duckdb#24194, default true in-tree —
+    set explicitly so the run does not depend on the default);
+    preserve_insertion_order=false frees the insert/delete pipelines to run in
+    parallel. Both are global settings, but the refresh functions are the only
+    writers in a run. An engine without a setting keeps its behavior.
+    """
+    for stmt in (
+        "SET enable_optimistic_write = true",
+        "SET preserve_insertion_order = false",
+    ):
+        try:
+            sql(cur, stmt)
+        except duckdb.Error as e:
+            log(f"  refresh write config skipped: {stmt!r} ({e})")
 
 
 def check_refresh_matches_base(cur, refresh_dir, n):
@@ -568,6 +717,8 @@ def power_run(con, args, run_dir, writer):
         sql(gpu, "SET gpu_execution = true")
         sql(cpu, "SET gpu_execution = false")
         sql(rf, "SET gpu_execution = false")
+        if args.refresh_write_config:
+            apply_refresh_write_config(rf)
 
         def timed_pass(phase, result_name):
             times, rows_by_q = {}, {}
@@ -600,7 +751,9 @@ def power_run(con, args, run_dir, writer):
             t_clean, _ = timed_pass("power_clean", "result_clean.txt")
 
         log("=== Power: RF1 (insert update set 1) ===")
-        t_rf1 = run_refresh(rf, rf1_statements(args.refresh_dir, 1), "RF1")
+        t_rf1 = run_refresh(
+            rf, rf1_statements(args.refresh_dir, 1, args.staged_refresh), "RF1"
+        )
         with _write_lock:
             writer.writerow(["power", 0, "rf1", f"{t_rf1:.6f}"])
 
@@ -623,7 +776,9 @@ def power_run(con, args, run_dir, writer):
             stash_gpu_rows(run_dir, "after_rf1", rows_p0)
 
         log("=== Power: RF2 (delete update set 1) ===")
-        t_rf2 = run_refresh(rf, rf2_statements(args.refresh_dir, 1), "RF2")
+        t_rf2 = run_refresh(
+            rf, rf2_statements(args.refresh_dir, 1, args.staged_refresh), "RF2"
+        )
         with _write_lock:
             writer.writerow(["power", 0, "rf2", f"{t_rf2:.6f}"])
 
@@ -735,14 +890,20 @@ def throughput_run(con, args, run_dir, writer, streams):
         try:
             cur = con.cursor()
             sql(cur, "SET gpu_execution = false")
+            if args.refresh_write_config:
+                apply_refresh_write_config(cur)
             barrier.wait()
             for pair in range(1, streams + 1):
                 n = pair + 1  # set 1 belongs to the power run
                 t1 = run_refresh(
-                    cur, rf1_statements(args.refresh_dir, n), f"RF1(set {n})"
+                    cur,
+                    rf1_statements(args.refresh_dir, n, args.staged_refresh),
+                    f"RF1(set {n})",
                 )
                 t2 = run_refresh(
-                    cur, rf2_statements(args.refresh_dir, n), f"RF2(set {n})"
+                    cur,
+                    rf2_statements(args.refresh_dir, n, args.staged_refresh),
+                    f"RF2(set {n})",
                 )
                 refresh_times.append({"set": n, "rf1": t1, "rf2": t2})
                 with _write_lock:
@@ -806,9 +967,11 @@ def write_summary(run_dir, args, streams, power, throughput, qphh):
     out("=" * 72)
     predicates = "qgen" if args.vary_predicates else "fixed"
     pin_label = args.pin + ("+simpatico" if args.pin_compression else "")
+    refresh_label = "staged" if args.staged_refresh else "legacy"
     out(
         f"  TPC-H Power / Throughput — Sirius   "
-        f"(SF{args.sf:g}, pin={pin_label}, predicates={predicates})"
+        f"(SF{args.sf:g}, pin={pin_label}, predicates={predicates}, "
+        f"refresh={refresh_label})"
     )
     out("=" * 72)
     if power:
@@ -893,6 +1056,8 @@ def write_run_info(run_dir, args, streams):
         f"compression_plan_dir: "
         f"{args.compression_plan_dir if args.pin_compression else '(off)'}",
         f"mode: {args.mode}",
+        f"staged_refresh: {args.staged_refresh}",
+        f"refresh_write_config: {args.refresh_write_config}",
         f"vary_predicates: {args.vary_predicates}",
         f"query_dir: {args.query_dir if args.vary_predicates else '(fixed)'}",
         f"validation: {args.validation}",
@@ -962,6 +1127,26 @@ def parse_args():
         help="Directory of per-table Simpatico plan files (<table>.<ext>) for "
         "--pin-compression (default: the SF1000 plans under "
         "src/compression/simpatico_codegen/plans)",
+    )
+    p.add_argument(
+        "--staged-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pre-load every needed update set as native staging tables during "
+        "untimed prep, so the timed RF1 is INSERT..SELECT and RF2 deletes "
+        "against a pre-parsed key table instead of re-parsing CSV. Spec-legal: "
+        "TPC-H v3.0.1 clause 2.5.3.1 permits providing the SUT with the RF "
+        "data before the benchmark; only pre-executing the RFs is banned. "
+        "Default on; --no-staged-refresh restores the legacy COPY/read_csv "
+        "path.",
+    )
+    p.add_argument(
+        "--refresh-write-config",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="SET enable_optimistic_write=true and preserve_insertion_order="
+        "false on the refresh cursors (best-effort on older engines). Default: "
+        "follows --staged-refresh; pass it alone for the config-only A/B.",
     )
     p.add_argument(
         "--vary-predicates",
@@ -1052,6 +1237,9 @@ def main():
     if args.validation is None:
         args.validation = not args.vary_predicates
 
+    if args.refresh_write_config is None:
+        args.refresh_write_config = args.staged_refresh
+
     # Simpatico compression happens at pin time, so it needs a pinned tier, and
     # it is a no-op without at least one plan file naming a TPC-H table.
     compression_tables = []
@@ -1077,7 +1265,8 @@ def main():
                 "table; plan files are <table>.<ext>"
             )
 
-    # Fail fast if any needed refresh set or query stream is missing.
+    # Fail fast if any needed refresh set or query stream is missing. With
+    # --staged-refresh these same sets are pre-loaded as staging tables.
     needed = []
     if args.mode in ("power", "both"):
         needed.append(1)
@@ -1086,6 +1275,7 @@ def main():
     for n in needed:
         rf1_statements(args.refresh_dir, n)
         rf2_statements(args.refresh_dir, n)
+    staged_sets = needed if args.staged_refresh else []
     if args.vary_predicates:
         wanted = [0] if args.mode in ("power", "both") else []
         if args.mode in ("throughput", "both"):
@@ -1140,7 +1330,9 @@ def main():
         if args.mode == "both":
             # One pinned database for both phases: throughput continues on the
             # post-power state (update set 1 applied), with no unpin/repin.
-            with benchmark_db(args, run_dir, "bench.duckdb") as con:
+            with benchmark_db(
+                args, run_dir, "bench.duckdb"
+            ) as con, staged_refresh_tables(con, args, staged_sets):
                 power = power_run(con, args, run_dir, writer)
                 f.flush()
                 try:
@@ -1149,10 +1341,14 @@ def main():
                     throughput_error = str(e)
                     log(f"Throughput run failed, continuing to validation: {e}")
         elif args.mode == "power":
-            with benchmark_db(args, run_dir, "bench_power.duckdb") as con:
+            with benchmark_db(
+                args, run_dir, "bench_power.duckdb"
+            ) as con, staged_refresh_tables(con, args, staged_sets):
                 power = power_run(con, args, run_dir, writer)
         elif args.mode == "throughput":
-            with benchmark_db(args, run_dir, "bench_throughput.duckdb") as con:
+            with benchmark_db(
+                args, run_dir, "bench_throughput.duckdb"
+            ) as con, staged_refresh_tables(con, args, staged_sets):
                 throughput = throughput_run(con, args, run_dir, writer, streams)
 
     # Deliberately outside the benchmark_db blocks above: the tables are
@@ -1175,6 +1371,8 @@ def main():
         "compression_plan_dir": (
             args.compression_plan_dir if args.pin_compression else None
         ),
+        "staged_refresh": args.staged_refresh,
+        "refresh_write_config": args.refresh_write_config,
         "vary_predicates": args.vary_predicates,
         "query_dir": args.query_dir if args.vary_predicates else None,
         "input": args.input,
