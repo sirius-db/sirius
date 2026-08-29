@@ -592,7 +592,8 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   probe_meta.build(*probe_child.children[0]);
 }
 
-build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view> const& slots)
+build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view> const& slots,
+                                                bool probe_finished)
 {
   if (slots.empty()) { return {build_probe_action::none, std::nullopt}; }
 
@@ -612,21 +613,41 @@ build_probe_decision select_build_probe_action(std::vector<build_probe_slot_view
       return {build_probe_action::schedule_probe, p};
     }
   }
-  // 3. No schedulable work. If any partition still lacks its build batch, wait on the build
-  // producer
-  //    so builds can start; otherwise every partition is building or draining probe input. Only
-  //    when all partitions are torn down is the operator truly finished. These actions name no
-  //    partition (the caller waits on the port's single upstream producer, shared by all
-  //    partitions).
-  bool all_destroyed = true;
+  // 3. No schedulable work right now. A slot only keeps the operator "waiting" while the probe
+  //    side could still deliver more data for it:
+  //      - NOT_BUILT with no build batch yet always waits on the build producer, regardless of
+  //        probe_finished (its build hasn't even arrived).
+  //      - NOT_BUILT-with-build-but-no-probe (a broadcast orphan) and BUILT-and-drained slots
+  //        wait on the probe producer only until probe_finished -- after that they have nothing
+  //        left to do, whether or not they have been torn down yet (teardown is a resource-release
+  //        side effect handled by discard_build_only_slots_if_probe_complete / finalize, not a
+  //        precondition for reporting completion here).
+  //      - SCHEDULING/SCHEDULED means a task is in flight for that slot; treated as still-active so
+  //        completion can never be reported while a task could still be running against it.
+  //    These wait actions name no partition (the caller waits on the port's single upstream
+  //    producer, shared by all partitions).
+  bool waiting_on_build = false;
+  bool waiting_on_probe = false;
   for (auto const& s : slots) {
-    if (s.state != BUILD_HASH_TABLE_STATE::DESTROYED) { all_destroyed = false; }
-    if (s.state == BUILD_HASH_TABLE_STATE::NOT_BUILT && !s.has_build_batch) {
-      return {build_probe_action::wait_for_build, std::nullopt};
+    switch (s.state) {
+      case BUILD_HASH_TABLE_STATE::DESTROYED: continue;
+      case BUILD_HASH_TABLE_STATE::NOT_BUILT:
+        if (!s.has_build_batch) {
+          waiting_on_build = true;
+        } else if (!s.has_probe_batch && !probe_finished) {
+          waiting_on_probe = true;
+        }
+        continue;
+      case BUILD_HASH_TABLE_STATE::BUILT:
+        if (!s.has_probe_batch && !probe_finished) { waiting_on_probe = true; }
+        continue;
+      case BUILD_HASH_TABLE_STATE::SCHEDULING:
+      case BUILD_HASH_TABLE_STATE::SCHEDULED: waiting_on_probe = true; continue;
     }
   }
-  if (all_destroyed) { return {build_probe_action::none, std::nullopt}; }
-  return {build_probe_action::wait_for_probe, std::nullopt};
+  if (waiting_on_build) { return {build_probe_action::wait_for_build, std::nullopt}; }
+  if (waiting_on_probe) { return {build_probe_action::wait_for_probe, std::nullopt}; }
+  return {build_probe_action::none, std::nullopt};
 }
 
 //===----------------------------------------------------------------------===//
@@ -1049,7 +1070,9 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
     // Broadcast mode: reclaim slots that will never be probed before deciding the next action, so
     // the operator can reach completion instead of waiting forever on their absent probe data.
     discard_build_only_slots_if_probe_complete();
-    auto const decision = select_build_probe_action(snapshot_build_probe_slots());
+    bool const probe_finished =
+      probe_port->src_pipeline && probe_port->src_pipeline->is_pipeline_finished();
+    auto const decision = select_build_probe_action(snapshot_build_probe_slots(), probe_finished);
     switch (decision.action) {
       case build_probe_action::schedule_build:
         // Claim this partition's slot so exactly one build task is issued for it. The paired
