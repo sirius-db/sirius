@@ -372,6 +372,24 @@ void downgrade_executor::processing_loop()
     std::string request_label = req->is_monitor_request ? "monitor " : "";
     if (req->is_monitor_request) {
       _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+      // Outcome of the periodic check, at INFO so a normal run shows what the
+      // monitor path actually accomplished. `satisfied` is the honest signal:
+      // bytes freed can be non-zero while the request still failed to reach its
+      // target, which is exactly the silent-failure case that hid the broken
+      // spill directory (every convert threw, nothing was freed, no warning).
+      SIRIUS_LOG_INFO(
+        "[downgrade][monitor] [{}] request done: {} batches, {} bytes in {:.2f} ms ({:.1f} MB/s), "
+        "satisfied={} | to_host: {}/{} batches/bytes, to_disk: {}/{} batches/bytes",
+        _source_label,
+        total_batches,
+        total_bytes,
+        duration_ms,
+        throughput_mbs,
+        req->satisfied.load(),
+        host_target_stats.batches.load(std::memory_order_relaxed),
+        host_target_stats.bytes.load(std::memory_order_relaxed),
+        disk_target_stats.batches.load(std::memory_order_relaxed),
+        disk_target_stats.bytes.load(std::memory_order_relaxed));
     }
 
     SIRIUS_LOG_DEBUG(
@@ -469,8 +487,18 @@ void downgrade_executor::monitor_loop()
           req->predicate          = [&freed = req->bytes_freed, amount]() {
             return freed.load(std::memory_order_relaxed) >= amount;
           };
-          _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
+          auto const issued = _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed) + 1;
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
+          // Periodic-path attribution, counterpart to the "[downgrade][reserve]" line
+          // in gpu_pipeline_executor. Throttled in practice by _monitor_request_enqueued
+          // (one monitor request in flight at a time), so this is one line per
+          // request round-trip -- not one per candidate batch like the convert errors.
+          SIRIUS_LOG_INFO(
+            "[downgrade][monitor] [{}] memory pressure: requesting downgrade of {} bytes "
+            "(monitor request #{})",
+            _source_label,
+            amount,
+            issued);
           // Fire-and-forget: monitor does not wait for the result
           _request_queue.push(std::move(req));
         }

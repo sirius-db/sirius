@@ -279,6 +279,21 @@ void gpu_pipeline_executor::manager_loop()
         reservation = _memory_space->make_reservation(bytes_needs);
       }
 
+      // One INFO line per executor-driven (reserve-path) downgrade. The shortfall
+      // detail above is DEBUG, and the downgrade executor's own per-request line is
+      // DEBUG too, so without this a normal run cannot tell whether its spilling came
+      // from here or from the periodic monitor. Tagged to pair with the
+      // "[downgrade][monitor]" lines in downgrade_executor::monitor_loop.
+      SIRIUS_LOG_INFO(
+        "[downgrade][reserve] pipeline {} task {}: needed {} bytes (shortfall {}), downgrade freed "
+        "{} bytes, reservation {}",
+        gpu_task->get_pipeline_id(),
+        gpu_task->get_task_id(),
+        bytes_needs,
+        shortfall,
+        freed,
+        reservation ? (reservation->size() >= bytes_needs ? "satisfied" : "partial") : "failed");
+
       if (!reservation) {
         SIRIUS_LOG_ERROR(
           "GPU Pipeline Executor: Failed to acquire memory reservation after "
