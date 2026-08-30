@@ -28,8 +28,10 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/child_process_environment.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -620,19 +622,26 @@ class HivePartitionDataset {
     static std::atomic<std::uint64_t> next_child_id{0};
     auto const output_path =
       hive_dir / ("watchdog_result_" + std::to_string(next_child_id.fetch_add(1)) + ".txt");
-    auto const pid = ::fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-      ::setenv("SIRIUS_HIVE_WATCHDOG_QUERY", query.c_str(), 1);
-      ::setenv("SIRIUS_HIVE_WATCHDOG_OUTPUT", output_path.string().c_str(), 1);
-      ::setenv("SIRIUS_HIVE_WATCHDOG_CONFIG", config_path.string().c_str(), 1);
-      ::setenv("SIRIUS_CONFIG_FILE", config_path.string().c_str(), 1);
-      ::execl("/proc/self/exe",
-              "sirius_unittest",
-              "gpu_execution hive partition watchdog child runner",
-              static_cast<char*>(nullptr));
-      ::_exit(127);
+    std::vector<std::string> child_arguments{"sirius_unittest",
+                                             "gpu_execution hive partition watchdog child runner"};
+    std::vector<char*> child_argv;
+    child_argv.reserve(child_arguments.size() + 1);
+    for (auto& argument : child_arguments) {
+      child_argv.push_back(argument.data());
     }
+    child_argv.push_back(nullptr);
+
+    sirius::test::child_process_environment child_environment{
+      {{"SIRIUS_HIVE_WATCHDOG_QUERY", query},
+       {"SIRIUS_HIVE_WATCHDOG_OUTPUT", output_path.string()},
+       {"SIRIUS_HIVE_WATCHDOG_CONFIG", config_path.string()},
+       {"SIRIUS_CONFIG_FILE", config_path.string()}},
+      {"SIRIUS_DISABLE"}};
+
+    pid_t pid{};
+    auto const spawn_result = ::posix_spawn(
+      &pid, "/proc/self/exe", nullptr, nullptr, child_argv.data(), child_environment.data());
+    REQUIRE(spawn_result == 0);
 
     int status      = 0;
     auto const stop = std::chrono::steady_clock::now() + timeout;
@@ -732,12 +741,9 @@ TEST_CASE("gpu_execution hive partition watchdog child runner",
     auto const* config_raw = std::getenv("SIRIUS_HIVE_WATCHDOG_CONFIG");
     if (config_raw == nullptr) { out.error = "watchdog child missing config path"; }
 
-    std::unique_ptr<sirius_config_env_guard> config_guard;
     std::unique_ptr<duckdb::DuckDB> db;
     std::unique_ptr<duckdb::Connection> con;
     if (out.error.empty()) {
-      config_guard = std::make_unique<sirius_config_env_guard>(config_raw);
-      unsetenv("SIRIUS_DISABLE");
       db  = std::make_unique<duckdb::DuckDB>(nullptr);
       con = std::make_unique<duckdb::Connection>(*db);
     }

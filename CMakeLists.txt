@@ -889,6 +889,7 @@ set(TEST_SOURCES
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
