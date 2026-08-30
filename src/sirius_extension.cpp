@@ -1176,6 +1176,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  auto compression_it = input.named_parameters.find("compression");
+  if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
+    result->args.compression = BooleanValue::Get(compression_it->second);
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1364,15 +1369,17 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
   const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
-  if (comp_cfg.enable_pin_table_compression && comp_cfg.input_plan_dir.empty()) {
+  bool const compression_requested =
+    data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
+  if (compression_requested && comp_cfg.input_plan_dir.empty()) {
     SIRIUS_LOG_WARN(
-      "[pin_table] '{}': pin_table_compression is enabled but "
+      "[pin_table] '{}': compression was requested but "
       "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
       data.args.name);
   }
-  const bool comp_globally_enabled =
-    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
-  if (comp_globally_enabled) {
+  const bool compression_plan_lookup_enabled =
+    compression_requested && !comp_cfg.input_plan_dir.empty();
+  if (compression_plan_lookup_enabled) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1397,7 +1404,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (comp_globally_enabled) {
+  if (compression_plan_lookup_enabled) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -1428,7 +1435,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       }
     } else {
       SIRIUS_LOG_WARN(
-        "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "
+        "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
         "pinning uncompressed",
         data.args.name,
         comp_cfg.input_plan_dir);
@@ -2439,6 +2446,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
     pin_table_set.AddFunction(std::move(pin_table));
@@ -3300,9 +3308,9 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetEnableGpuExecution);
 
   config.AddExtensionOption("pin_table_compression",
-                            "Request Simpatico compression for pin_table chunks. Takes effect only "
-                            "when pin_table_input_compression_plan_dir is non-empty and contains a "
-                            "matching table plan",
+                            "Legacy default for pin_table calls that omit the compression named "
+                            "parameter. Takes effect only when pin_table_input_compression_plan_dir "
+                            "is non-empty and contains a matching table plan",
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
                             SetEnablePinTableCompression);
@@ -3311,8 +3319,8 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     "pin_table_input_compression_plan_dir",
     "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "May be set before pin_table_compression is enabled. Tables with no matching file are pinned "
-    "uncompressed. No effect on spill compression.",
+    "May be set before a compression-enabled pin_table call. Tables with no matching file are "
+    "pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);

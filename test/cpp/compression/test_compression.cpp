@@ -338,6 +338,49 @@ TEST_CASE("pin_table compression - result equality vs uncompressed pin",
   fs::remove_all(tmp);
 }
 
+TEST_CASE("pin_table compression - compression parameter overrides session setting",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("param");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(20000)", /*num_files=*/1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  auto plan_dir = tmp / "plans";
+  write_plan_file(plan_dir, "t_param_on", bitpack_plan(1));
+  write_plan_file(plan_dir, "t_param_off", bitpack_plan(1));
+
+  run_ok(
+    con, "SET pin_table_input_compression_plan_dir = '" + plan_dir.string() + "';", "plan dir");
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "min batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "fraction");
+
+  run_ok(con, "SET pin_table_compression = false;", "legacy compression off");
+  auto pin_on =
+    con.Query("CALL pin_table('" + glob + "', tier='host', name='t_param_on', compression=true);");
+  require_ok(pin_on, "pin parameter on");
+  auto const on = sirius::test::census_entry(con, "t_param_on");
+  REQUIRE(on.chunks > 0);
+  REQUIRE(on.compressed_chunks == on.chunks);
+  run_ok(con, "CALL unpin_table('t_param_on');", "unpin parameter on");
+
+  run_ok(con, "SET pin_table_compression = true;", "legacy compression on");
+  auto pin_off =
+    con.Query("CALL pin_table('" + glob + "', tier='host', name='t_param_off', compression=false);");
+  require_ok(pin_off, "pin parameter off");
+  auto const off = sirius::test::census_entry(con, "t_param_off");
+  REQUIRE(off.chunks > 0);
+  REQUIRE(off.compressed_chunks == 0);
+  run_ok(con, "CALL unpin_table('t_param_off');", "unpin parameter off");
+
+  fs::remove_all(tmp);
+}
+
 TEST_CASE("pin_table compression - device tier result equality vs uncompressed pin",
           "[compression][pin_table][isolated_context]")
 {
