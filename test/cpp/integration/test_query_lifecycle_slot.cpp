@@ -2109,6 +2109,8 @@ TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
   if (config_raw == nullptr) {
     out.error = "watchdog child missing config path";
   } else {
+    setenv("SIRIUS_CONFIG_FILE", config_raw, 1);
+    unsetenv("SIRIUS_DISABLE");
     auto const output_path = fs::path(output_raw);
     auto const database_path =
       output_path.parent_path() / ("scenario_" + std::string(variant_raw) + ".duckdb");

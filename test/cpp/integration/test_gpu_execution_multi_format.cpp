@@ -741,9 +741,12 @@ TEST_CASE("gpu_execution hive partition watchdog child runner",
     auto const* config_raw = std::getenv("SIRIUS_HIVE_WATCHDOG_CONFIG");
     if (config_raw == nullptr) { out.error = "watchdog child missing config path"; }
 
+    std::unique_ptr<sirius_config_env_guard> config_guard;
     std::unique_ptr<duckdb::DuckDB> db;
     std::unique_ptr<duckdb::Connection> con;
     if (out.error.empty()) {
+      config_guard = std::make_unique<sirius_config_env_guard>(config_raw);
+      unsetenv("SIRIUS_DISABLE");
       db  = std::make_unique<duckdb::DuckDB>(nullptr);
       con = std::make_unique<duckdb::Connection>(*db);
     }
