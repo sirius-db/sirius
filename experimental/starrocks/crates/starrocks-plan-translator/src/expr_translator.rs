@@ -21,6 +21,8 @@ pub(crate) struct ExprContext<'a> {
     registry: &'a mut ExtensionRegistry,
     /// Tuple ids that describe the input row visible to this expression.
     row_tuples: &'a [i32],
+    /// Synthetic StarRocks slots appended while evaluating common project expressions.
+    slot_overrides: Option<&'a std::collections::HashMap<(i32, i32), usize>>,
 }
 
 impl<'a> ExprContext<'a> {
@@ -34,6 +36,23 @@ impl<'a> ExprContext<'a> {
             desc,
             registry,
             row_tuples,
+            slot_overrides: None,
+        }
+    }
+
+    /// Creates an expression context that can resolve synthetic slots not present
+    /// in the descriptor table.
+    pub(crate) fn with_slot_overrides(
+        desc: &'a DescriptorTable,
+        registry: &'a mut ExtensionRegistry,
+        row_tuples: &'a [i32],
+        slot_overrides: &'a std::collections::HashMap<(i32, i32), usize>,
+    ) -> Self {
+        Self {
+            desc,
+            registry,
+            row_tuples,
+            slot_overrides: Some(slot_overrides),
         }
     }
 }
@@ -147,9 +166,18 @@ fn translate_slot_ref(
         context: "SLOT_REF",
         field: "slot_ref",
     })?;
-    let field =
-        ctx.desc
-            .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)? as i32;
+    let field = ctx
+        .slot_overrides
+        .and_then(|overrides| {
+            overrides
+                .get(&(slot_ref.tuple_id, slot_ref.slot_id))
+                .copied()
+        })
+        .map(Ok)
+        .unwrap_or_else(|| {
+            ctx.desc
+                .slot_global_index(slot_ref.tuple_id, slot_ref.slot_id, ctx.row_tuples)
+        })? as i32;
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
             reference_type: Some(field_reference::ReferenceType::DirectReference(
@@ -255,19 +283,27 @@ fn translate_decimal_literal(node: &TExprNode, children: Vec<Expression>) -> Res
             field: "decimal_literal",
         })?;
     let decimal_type = type_mapper::map_type_desc(&node.type_, true)?;
-    let Some(substrait::proto::r#type::Kind::Decimal(decimal)) = decimal_type.kind else {
-        return Err(TranslateError::malformed(
-            "DECIMAL_LITERAL has non-decimal type",
-        ));
-    };
-    let value = encode_decimal(&lit.value, decimal.scale)?;
-    Ok(literal(expression::literal::LiteralType::Decimal(
-        expression::literal::Decimal {
-            value: value.to_vec(),
-            precision: decimal.precision,
-            scale: decimal.scale,
-        },
-    )))
+    match decimal_type.kind {
+        Some(substrait::proto::r#type::Kind::Decimal(decimal)) => {
+            let value = encode_decimal(&lit.value, decimal.scale)?;
+            Ok(literal(expression::literal::LiteralType::Decimal(
+                expression::literal::Decimal {
+                    value: value.to_vec(),
+                    precision: decimal.precision,
+                    scale: decimal.scale,
+                },
+            )))
+        }
+        Some(substrait::proto::r#type::Kind::Fp64(_)) => {
+            let value = lit.value.parse::<f64>().map_err(|_| {
+                TranslateError::malformed(format!("invalid decimal literal {:?}", lit.value))
+            })?;
+            Ok(literal(expression::literal::LiteralType::Fp64(value)))
+        }
+        _ => Err(TranslateError::malformed(
+            "DECIMAL_LITERAL has non-numeric type",
+        )),
+    }
 }
 
 /// Converts a StarRocks `DATE_LITERAL` into a Substrait date literal.
@@ -346,22 +382,30 @@ fn translate_arithmetic(
         }
     };
     expect_child_count(node, &children, 2)?;
-    // Decimal-typed arithmetic is rejected for now: the StarRocks-shaped cast/width combination
-    // reliably segfaults the engine's GPU projection (see the starrocks tpch crash repro);
-    // fail with a structured error instead of taking down the compute node.
-    if is_decimal(&node.type_)? {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: node.node_type,
-            reason: "decimal arithmetic is not supported yet (crashes the engine projection)",
-        });
-    }
-    let output_type = type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?;
+    // Decimal arithmetic is evaluated in FP64: the Sirius GPU expression path cannot consume
+    // decimal arithmetic, and refusing it instead -- which is what this replaced -- rejects every
+    // TPC-H revenue query. The result is approximate and is NOT cast back: a project's output slot
+    // may be declared DECIMAL while the expression yields FP64, and nothing downstream can detect
+    // that, because a Substrait `ProjectRel` carries no per-column output type. Sums of money
+    // columns therefore differ from StarRocks in the last few digits (~1e-14 relative) and render
+    // as a double. A decimal-native GPU path is the real fix.
+    let decimal = is_decimal(&node.type_)?;
+    let children = if decimal {
+        children.into_iter().map(cast_to_fp64).collect()
+    } else {
+        children
+    };
+    let output_type = if decimal {
+        type_mapper::fp64_type(node.is_nullable.unwrap_or(true))
+    } else {
+        type_mapper::map_type_desc(&node.type_, node.is_nullable.unwrap_or(true))?
+    };
     let anchor = ctx.registry.register_function(URN_ARITHMETIC, name);
     Ok(scalar_function(anchor, children, output_type))
 }
 
 /// Returns whether a StarRocks type descriptor is any decimal flavour.
-fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
+pub(crate) fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
     Ok(matches!(
         type_mapper::scalar_primitive(type_desc)?,
         TPrimitiveType::DECIMAL
@@ -603,7 +647,14 @@ pub(crate) struct AggregateCall {
 
 /// Decomposes a StarRocks aggregate-function expression (the root of a
 /// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
-pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+///
+/// `merge` marks a measure of a merge-phase aggregation, whose arguments are references to
+/// partial-state columns rather than raw rows.
+pub(crate) fn aggregate_call(
+    expr: &TExpr,
+    ctx: &mut ExprContext<'_>,
+    merge: bool,
+) -> Result<AggregateCall> {
     let root = expr
         .nodes
         .first()
@@ -618,18 +669,9 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "aggregate function root is not an aggregate expression",
         });
     }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
-        });
-    }
+    // No merge check here: the phase decision belongs to the node-level classifier
+    // (`agg_phase::classify`), which sees every measure at once. Rejecting merges in one
+    // place and classifying them in another is how the two guards would drift apart.
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
         context: "aggregate expression",
         field: "fn",
@@ -652,24 +694,30 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "distinct aggregates over multiple columns are not supported",
         });
     }
-    // Only double-returning `avg` translates faithfully. StarRocks `avg` over decimals returns
-    // a decimal (DuckDB computes a double and the consumer ignores the declared output type),
-    // and temporal `avg` has StarRocks-specific day-rounding semantics.
-    if name == "avg" && type_mapper::scalar_primitive(&function.ret_type)? != TPrimitiveType::DOUBLE
-    {
+    let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
+    let decimal_result = is_decimal(&function.ret_type)?;
+    // Temporal AVG has StarRocks-specific rounding semantics. Decimal SUM/AVG are lowered to FP64
+    // below because the Sirius GPU expression/aggregate path cannot consume decimal arithmetic.
+    if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
-            reason: "only avg with a DOUBLE result is supported (decimal/temporal avg differ)",
+            reason: "temporal avg is not supported",
         });
     }
 
     let mut cursor = ExprNodeCursor::new(&expr.nodes);
     // Consume the root marker; its children are the aggregate arguments.
     cursor.idx = 1;
-    let arguments = (0..root.num_children)
+    let mut arguments = (0..root.num_children)
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
+    // Not on the merge side: a merge measure's argument is already the FP64 partial-state
+    // column; the decimal `ret_type` that drives this condition describes the original input,
+    // not the child the measure actually reads.
+    if decimal_result && matches!(name, "sum" | "avg") && !merge {
+        arguments = arguments.into_iter().map(cast_to_fp64).collect();
+    }
 
     Ok(AggregateCall {
         name: name.to_string(),
@@ -854,6 +902,26 @@ pub(crate) fn scalar_function(
                 ..Default::default()
             },
         )),
+    }
+}
+
+/// Wraps an expression in the throwing FP64 cast that lowers values Sirius cannot aggregate
+/// or divide in their declared type (decimals).
+pub(crate) fn cast_to_fp64(input: Expression) -> Expression {
+    cast_to(input, type_mapper::fp64_type(true))
+}
+
+/// Wraps an expression in a throwing cast to `ty`.
+///
+/// A cast to the type the expression already has is a no-op the consumer's binder elides, so
+/// this is safe to emit wherever the type has to be stated rather than inferred.
+pub(crate) fn cast_to(input: Expression, ty: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
     }
 }
 

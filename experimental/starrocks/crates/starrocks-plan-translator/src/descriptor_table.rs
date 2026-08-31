@@ -238,23 +238,43 @@ impl DescriptorTable {
 
     /// Builds the Substrait schema for a StarRocks tuple.
     pub fn named_struct(&self, tuple_id: i32) -> Result<NamedStruct> {
-        let (names, types): (Vec<_>, Vec<_>) = self
-            .materialized_slot_ids(tuple_id)?
-            .into_iter()
-            .map(|slot_id| {
+        self.named_struct_for_tuples(&[tuple_id], None)
+    }
+
+    /// Builds the Substrait schema for a row layout spanning one or more tuples.
+    ///
+    /// `names` overrides descriptor names when an exchange input was materialized with the
+    /// sender fragment's output names. Types and field order always come from the receiver's
+    /// descriptor table.
+    pub(crate) fn named_struct_for_tuples(
+        &self,
+        tuple_ids: &[i32],
+        names: Option<&[String]>,
+    ) -> Result<NamedStruct> {
+        let mut descriptor_names = Vec::new();
+        let mut types = Vec::new();
+        for &tuple_id in tuple_ids {
+            for slot_id in self.materialized_slot_ids(tuple_id)? {
                 let slot = self.slot(tuple_id, slot_id)?;
-                let substrait_type =
+                descriptor_names.push(slot.output_name());
+                types.push(
                     slot.substrait_type
                         .clone()
                         .ok_or(TranslateError::MissingField {
                             context: "materialized TSlotDescriptor",
                             field: "slotType",
-                        })?;
-                Ok((slot.output_name(), substrait_type))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .unzip();
+                        })?,
+                );
+            }
+        }
+        let names = names.map_or(descriptor_names, <[String]>::to_vec);
+        if names.len() != types.len() {
+            return Err(TranslateError::descriptor(format!(
+                "row layout {tuple_ids:?} has {} fields but exchange input has {} names",
+                types.len(),
+                names.len()
+            )));
+        }
 
         Ok(NamedStruct {
             names,
@@ -277,21 +297,37 @@ impl DescriptorTable {
         row_tuples: &[i32],
     ) -> Result<usize> {
         let mut offset = 0;
+        let mut by_slot_id = Vec::new();
         for &candidate_tuple in row_tuples {
             let materialized = self.materialized_slot_ids(candidate_tuple)?;
-            if candidate_tuple == tuple_id
-                && let Some(index) = materialized
-                    .iter()
-                    .position(|candidate| *candidate == slot_id)
+            if let Some(index) = materialized
+                .iter()
+                .position(|candidate| *candidate == slot_id)
             {
-                return Ok(offset + index);
+                if candidate_tuple == tuple_id {
+                    return Ok(offset + index);
+                }
+                by_slot_id.push(offset + index);
             }
             offset += materialized.len();
         }
 
-        Err(TranslateError::descriptor(format!(
-            "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
-        )))
+        // The FE never rebinds grouping-column refs above a multi-stage aggregation
+        // (buildAggregateTuple keeps the pre-agg tuple in colRefToExpr), so a node can
+        // name a slot through a tuple absent from its row. Exact match wins above; a
+        // unique same-id slot in the row is that column post-aggregation. Ambiguity
+        // stays a loud error.
+        match by_slot_id.as_slice() {
+            [index] => Ok(*index),
+            [] => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}"
+            ))),
+            _ => Err(TranslateError::descriptor(format!(
+                "slot {slot_id} (tuple {tuple_id}) is not part of row_tuples {row_tuples:?}, and {} \
+                 of those tuples carry a slot {slot_id} to fall back on",
+                by_slot_id.len()
+            ))),
+        }
     }
 
     /// Returns the Substrait named-table path for a tuple's backing table.

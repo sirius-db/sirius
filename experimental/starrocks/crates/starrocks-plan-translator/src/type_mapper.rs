@@ -23,6 +23,65 @@ pub(crate) fn bool_type() -> Type {
     }
 }
 
+/// Builds an FP64 type used to lower arithmetic Sirius cannot execute on decimal columns.
+pub(crate) fn fp64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::Fp64(r#type::Fp64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
+/// Builds an I64 (BIGINT) type, the partial-state width of integer sums and counts.
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
+/// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
+/// an input stream's schema.
+///
+/// A stream has no file to probe, so the engine cannot infer the schema; it is declared. Deriving
+/// the declaration from the very `Type` the plan's read carries is what keeps the two from
+/// drifting — the alternative, a second StarRocks-to-DuckDB mapping, would be a silent
+/// wrong-results bug the first time the two disagreed.
+pub fn duckdb_type_name(ty: &Type) -> Result<String> {
+    let kind = ty
+        .kind
+        .as_ref()
+        .ok_or_else(|| TranslateError::malformed("stream input column has no type"))?;
+    let name = match kind {
+        r#type::Kind::Bool(_) => "BOOLEAN".to_string(),
+        r#type::Kind::I8(_) => "TINYINT".to_string(),
+        r#type::Kind::I16(_) => "SMALLINT".to_string(),
+        r#type::Kind::I32(_) => "INTEGER".to_string(),
+        r#type::Kind::I64(_) => "BIGINT".to_string(),
+        r#type::Kind::Fp32(_) => "FLOAT".to_string(),
+        r#type::Kind::Fp64(_) => "DOUBLE".to_string(),
+        // DuckDB's CHAR is an alias of VARCHAR, so the declared length carries no information.
+        r#type::Kind::FixedChar(_) | r#type::Kind::Varchar(_) | r#type::Kind::String(_) => {
+            "VARCHAR".to_string()
+        }
+        r#type::Kind::Binary(_) | r#type::Kind::FixedBinary(_) => "BLOB".to_string(),
+        r#type::Kind::Date(_) => "DATE".to_string(),
+        r#type::Kind::PrecisionTimestamp(_) => "TIMESTAMP".to_string(),
+        r#type::Kind::Decimal(decimal) => {
+            format!("DECIMAL({},{})", decimal.precision, decimal.scale)
+        }
+        _ => {
+            return Err(TranslateError::malformed(
+                "stream input column type has no DuckDB name",
+            ));
+        }
+    };
+    Ok(name)
+}
+
 /// Maps a StarRocks type descriptor and slot nullability into a Substrait type.
 pub fn map_type_desc(type_desc: &TTypeDesc, nullable: bool) -> Result<Type> {
     let node = scalar_node(type_desc)?;
@@ -171,12 +230,19 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
                     reason: "decimal precision above 38 has no safe v1 Substrait mapping",
                 });
             }
-            r#type::Kind::Decimal(r#type::Decimal {
-                precision,
-                scale: scalar.scale.unwrap_or(0),
-                type_variation_reference: 0,
-                nullability: n,
-            })
+            if precision <= 18 {
+                r#type::Kind::Decimal(r#type::Decimal {
+                    precision,
+                    scale: scalar.scale.unwrap_or(0),
+                    type_variation_reference: 0,
+                    nullability: n,
+                })
+            } else {
+                r#type::Kind::Fp64(r#type::Fp64 {
+                    type_variation_reference: 0,
+                    nullability: n,
+                })
+            }
         }
         TPrimitiveType::DECIMAL256 => {
             return Err(TranslateError::UnsupportedType {

@@ -5,8 +5,9 @@ use std::{
 };
 
 use crate::{
-    compute_node_service::SiriusComputeNodeService,
-    fragment_executor::{FragmentExecutor, StubExecutor},
+    compute_node_service::{ExchangeIdentity, SiriusComputeNodeService},
+    fragment_executor::FragmentExecutor,
+    nixl_transport::NixlTransport,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
     prpc,
 };
@@ -32,16 +33,18 @@ struct BrpcServiceServer<S> {
 }
 
 impl BrpcServer {
-    /// Builds a BRPC server with the placeholder stub executor (no GPU engine).
-    pub fn new() -> Self {
-        Self::with_executor(Arc::new(StubExecutor))
-    }
-
     /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
-    /// `SiriusEngine`, or a stub).
-    pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
-        let service =
-            PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(executor));
+    /// `SiriusEngine`, or a stub). `identity` is the exchange endpoint this CN advertises,
+    /// used to tell local data-stream destinations from remote CNs; `transport` carries
+    /// remote destinations over nixl (`None` keeps them a loud error).
+    pub fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        identity: ExchangeIdentity,
+        transport: Option<NixlTransport>,
+    ) -> Self {
+        let service = PInternalServiceRouter::new(SiriusComputeNodeService::with_transport(
+            executor, identity, transport,
+        ));
         Self {
             inner: BrpcServiceServer::with_service(service),
         }
@@ -70,12 +73,6 @@ impl BrpcServer {
         self.inner
             .serve_with_listener_shutdown(listener, signal)
             .await
-    }
-}
-
-impl Default for BrpcServer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
