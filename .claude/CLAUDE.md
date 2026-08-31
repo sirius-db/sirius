@@ -18,6 +18,11 @@ write permissions are the third, narrower exception.
 "Enqueue stack" or `gh stack merge`, they don't reliably work with this repo's merge queue;
 stacks merge bottom-up instead.
 
+Before marking **any** PR ready for review (self-contained or stacked), check it against
+`CONTRIBUTING.md`'s "PR reviewability" checklist. Open as a Draft until it meets that bar, then
+convert to "Ready for review"; converting too early pings a reviewer before there's anything to
+review, which is the exact problem that checklist exists to prevent.
+
 ## Build & test
 
 Run commands through `pixi run <cmd>` (don't drop into the interactive `pixi shell`) so each

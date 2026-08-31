@@ -262,6 +262,25 @@ not just the stack's author. Steps 5-6 need a local checkout with the stack trac
 Our goal is to automate this process in the future; however, this is the current merge method
 that works with our repo's merge queue settings.
 
+### PR reviewability
+
+PRs sometimes stall for weeks after a reviewer is assigned, simply because the PR wasn't actually
+ready to review the moment CODEOWNERS pinged someone. Before marking a PR ready for review, please
+do the following:
+
+1. **State the motivation, not just the mechanics.** Link the originating issue (`Closes #NNN` /
+   `Refs #NNN`) if one exists; if there isn't one, the description itself should explain *why* the
+   change is needed, not just summarize the diff.
+2. **Scope the PR to one reviewable sitting.** If a reviewer can't get through it start-to-finish
+   without losing context, either split it (see [Stacked PRs](#stacked-prs)) or explicitly justify
+   in the description why it can't be split.
+3. **Make the description self-sufficient.** A reviewer should be able to start reviewing without
+   needing to ask what changed or why — cover what changed, why, how it was verified, and anything
+   non-obvious (e.g. "intentionally doesn't handle X, tracked in #NNN").
+4. **Open as a draft until 1-3 are actually true**, then convert to "Ready for review" — that's
+   the point CODEOWNERS review requests and author auto-assignment (`auto-assign.yml`) trigger, so
+   converting early means a reviewer gets pinged before there's anything reviewable yet.
+
 ### Commit and title convention
 
 Sirius squash-merges PRs, the PR titles become the commit message on merge. Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/) format for readability.
