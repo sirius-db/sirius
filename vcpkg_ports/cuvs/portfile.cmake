@@ -1,119 +1,145 @@
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  SOURCE_PATH
-  REPO
-  rapidsai/cuvs
-  REF
-  v${VERSION}
-  SHA512
-  73cdf0e16e701063528c71ac48f0d3d9072dce11d1ab2ac768173c676cb8d704fcb2d3eb5b0ae8892b3b657eefc8bc03e3d83fb204befaa81cb9538328410cf1
-  HEAD_REF
-  main)
+# cuVS is consumed as a prebuilt static library from the RAPIDS conda channel
+# instead of being compiled from source. Building libcuvs from source in the
+# distribution CI took roughly 50 to 75 minutes per matrix leg, because it
+# compiles the full cuVS kernel set across every GPU arch, even though Sirius
+# only uses brute_force and distance. The prebuilt libcuvs-static package
+# already carries the same all-arch archive, so here we just download and
+# install it.
+#
+# Two conda packages together provide what we need:
+#   1. libcuvs-static   gives lib/libcuvs_static.a and the static-target cmake files
+#   2. libcuvs-headers  gives include/cuvs/** and the header-target cmake file
+# They don't provide cuvs-config.cmake (RAPIDS keeps that in the shared libcuvs package),
+# so we write one down below.
 
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  RAPIDS_CMAKE_PATH
-  REPO
-  rapidsai/rapids-cmake
-  REF
-  v${VERSION}
-  SHA512
-  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
-  HEAD_REF
-  main)
+set(CUVS_PKG_VERSION "26.06.00")
+# Suffix of the conda build string for this exact version, shared by every
+# arch/cuda variant: libcuvs-<comp>-26.06.00-cuda<major>_<CUVS_BUILD_TAG>.conda
+set(CUVS_BUILD_TAG "260604_2bd7cd71")
 
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  RAPIDS_LOGGER_PATH
-  REPO
-  rapidsai/rapids-logger
-  REF
-  v0.2.3
-  SHA512
-  eb7b5ebf6289d10307b8a34d9d1469ffcb63e9371e9dd5ccbda0351923b920ebae8220ceaa8d1d52c9bed57200f35921a6365a5f9a25a209a98314f75195310c
-  HEAD_REF
-  main)
+# CUDA major comes from the triplet via VCPKG_CUDA_VERSION
+if(NOT DEFINED VCPKG_CUDA_VERSION)
+  message(FATAL_ERROR "VCPKG_CUDA_VERSION not set. Set it to 12 or 13.")
+endif()
+if(NOT VCPKG_CUDA_VERSION STREQUAL "12" AND NOT VCPKG_CUDA_VERSION STREQUAL "13")
+  message(
+    FATAL_ERROR
+      "Unsupported CUDA version: ${VCPKG_CUDA_VERSION}. Supported: 12, 13.")
+endif()
+set(CUDA_MAJOR "${VCPKG_CUDA_VERSION}")
 
-# cuvs CPM-clones raft (header-only, RAFT_COMPILE_LIBRARY OFF) via git; vcpkg
-# builds offline (FETCHCONTENT_FULLY_DISCONNECTED=ON), so provide it locally.
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  RAFT_PATH
-  REPO
-  rapidsai/raft
-  REF
-  v${VERSION}
-  SHA512
-  b5c25d369f7e69941118b342ac581d0908a0f0c7763f4e42c6bc7af0afee4ab85306dfed057b28b115096bdf2799d8da5ce7eb3d2eb796468b210ea5f7724d41
-  HEAD_REF
-  main)
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
+  set(CONDA_SUBDIR "linux-64")
+elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+  set(CONDA_SUBDIR "linux-aarch64")
+else()
+  message(
+    FATAL_ERROR "Unsupported architecture: ${VCPKG_TARGET_ARCHITECTURE}")
+endif()
 
-# cutlass 4.1.0 pinned via cpp/cmake/patches/cutlass_override.json
-# (header-only).
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  CUTLASS_PATH
-  REPO
-  NVIDIA/cutlass
-  REF
-  v4.1.0
-  SHA512
-  a8c2cdf772ea3b1a35bfc948ca70240477d6e8ee004ae9e487275a7b35e40424b2820396cbc827482ddb75172fcdf56372ea0d4d96ae6f3253369bd315de3ce6
-  HEAD_REF
-  main)
+if(CONDA_SUBDIR STREQUAL "linux-64" AND CUDA_MAJOR STREQUAL "12")
+  set(CUVS_STATIC_SHA512
+      "ab23e644b9d3767fc597907ba1bfd8a2bae98da94e3fae8bfaf60d7ec842dfbb057b03ecc71ea17d802c63c7e17d5091bb77a1ff07bdf26e0db836fdaf02285d")
+  set(CUVS_HEADERS_SHA512
+      "ee21f1608253892213c029df0dc50ee68fb29ddee828bc83b2374349719ae396e8f1e95d159f8acd221157c3179cf6cb4f8f5900595c0187588c59c51ca59474")
+elseif(CONDA_SUBDIR STREQUAL "linux-64" AND CUDA_MAJOR STREQUAL "13")
+  set(CUVS_STATIC_SHA512
+      "c05738f5bc9ca7dfa4fcfaa02cf2c56ed6421dfa4d79ba4d8fd2a879cb322422eed29127d6b07bf85383c1fc775a0c93a45043158490c632911e79dc54cd4dc5")
+  set(CUVS_HEADERS_SHA512
+      "7ba4ec90c312ff4b70311b900d018449802ed1960280a03b295c748efec0ff7ea66c6d81bc0116a20d415d0cb92b7adbaa219ab6bb91e7a9d71551a019e5dd89")
+elseif(CONDA_SUBDIR STREQUAL "linux-aarch64" AND CUDA_MAJOR STREQUAL "12")
+  set(CUVS_STATIC_SHA512
+      "e118b5b49749edc1d64de272ad7ae52723164cb84b4dfeed9528d8fd50f26a040bed2d233bece2dd826d789aaacff969bc0521a4b384aac0ccc0d1579db617fd")
+  set(CUVS_HEADERS_SHA512
+      "74d269c04e0f11632306191c076fcf7fe19b17f6ef08ebfec964e40ab7c52eff65adb1b8f13e9ce81a50a5709a27db04d9a02f6f2ff2a0c7dbb2acd853411ed2")
+elseif(CONDA_SUBDIR STREQUAL "linux-aarch64" AND CUDA_MAJOR STREQUAL "13")
+  set(CUVS_STATIC_SHA512
+      "54a62eb1a02e3f397cc16de64b6f3c75268c22de41e437341f178bab9f0d361bfc30bf9bcdd8baf2ff62dac0bee7693a2f583e3c58448f98d3c6cde02a181b48")
+  set(CUVS_HEADERS_SHA512
+      "84569dc5314c4bf0f1d14cfdba9b905d0eb7d25d354e3b1a93196d812f5b7c6a60aa882e1aca74e224c3582c2449de3479c9ea83ad505cf9831c5c4d25c821e4")
+endif()
 
-# cuco: rapids-cmake always_download forces a clone. Same pin as
-# vcpkg_ports/cudf.
-vcpkg_from_github(
-  OUT_SOURCE_PATH
-  CUCO_PATH
-  REPO
-  NVIDIA/cuCollections
-  REF
-  f517bbb1277753b1852dfd388993383e401eaa38
-  SHA512
-  53f6185db57eba7391fd9b93b342d9da3c4cdf906dc47fad02cc1eb34867bb11ce798f0e94fee71a3cfb6423e6cad907ebe21e46997b4f4ef2b6e1e3b0a45d82
-  HEAD_REF
-  dev)
+set(CUVS_STAGE "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-stage")
+file(REMOVE_RECURSE "${CUVS_STAGE}")
+file(MAKE_DIRECTORY "${CUVS_STAGE}")
 
-# Patch rapids_logger to use vcpkg's spdlog::spdlog target instead of spdlog
+function(cuvs_download_conda component sha)
+  set(filename
+      "libcuvs-${component}-${CUVS_PKG_VERSION}-cuda${CUDA_MAJOR}_${CUVS_BUILD_TAG}.conda")
+  vcpkg_download_distfile(
+    archive
+    URLS
+    "https://conda.anaconda.org/rapidsai/${CONDA_SUBDIR}/${filename}"
+    FILENAME
+    "${filename}"
+    SHA512
+    "${sha}")
+  set(unzip_dir "${CURRENT_BUILDTREES_DIR}/${TARGET_TRIPLET}-${component}-conda")
+  file(REMOVE_RECURSE "${unzip_dir}")
+  file(MAKE_DIRECTORY "${unzip_dir}")
+  file(ARCHIVE_EXTRACT INPUT "${archive}" DESTINATION "${unzip_dir}")
+  file(GLOB payload "${unzip_dir}/pkg-*.tar.zst")
+  file(ARCHIVE_EXTRACT INPUT "${payload}" DESTINATION "${CUVS_STAGE}")
+endfunction()
+
+cuvs_download_conda("static" "${CUVS_STATIC_SHA512}")
+cuvs_download_conda("headers" "${CUVS_HEADERS_SHA512}")
+
+file(INSTALL "${CUVS_STAGE}/lib/libcuvs_static.a"
+     DESTINATION "${CURRENT_PACKAGES_DIR}/lib")
+file(INSTALL "${CUVS_STAGE}/include/"
+     DESTINATION "${CURRENT_PACKAGES_DIR}/include")
+file(INSTALL
+     "${CUVS_STAGE}/lib/cmake/cuvs/cuvs-cuvs_static-static-targets.cmake"
+     "${CUVS_STAGE}/lib/cmake/cuvs/cuvs-cuvs_static-static-targets-release.cmake"
+     "${CUVS_STAGE}/lib/cmake/cuvs/cuvs-cuvs_cpp_headers-cpp-headers-targets.cmake"
+     DESTINATION "${CURRENT_PACKAGES_DIR}/share/cuvs")
+
 vcpkg_replace_string(
-  "${RAPIDS_LOGGER_PATH}/CMakeLists.txt"
-  "set_target_properties(spdlog PROPERTIES POSITION_INDEPENDENT_CODE ON)"
-  "set_target_properties(spdlog::spdlog PROPERTIES POSITION_INDEPENDENT_CODE ON)"
-)
+  "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-cuvs_static-static-targets.cmake"
+[[get_filename_component(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)]]
+[[get_filename_component(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)]])
+vcpkg_replace_string(
+  "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-cuvs_cpp_headers-cpp-headers-targets.cmake"
+[[get_filename_component(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)]]
+[[get_filename_component(_IMPORT_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)
+get_filename_component(_IMPORT_PREFIX "${_IMPORT_PREFIX}" PATH)]])
 
-# Static link forces BUILD_TESTS/BUILD_C_LIBRARY/BUILD_CAGRA_HNSWLIB OFF (so no
-# gtest/hnswlib source is needed). BUILD_MG_ALGOS OFF drops the multi-GPU/NCCL
-# path. Only cuvs::neighbors::brute_force + cuvs::distance are consumed by
-# Sirius, but libcuvs still compiles the full kernel set.
-vcpkg_cmake_configure(
-  SOURCE_PATH
-  "${SOURCE_PATH}/cpp"
-  OPTIONS
-  -DFETCHCONTENT_SOURCE_DIR_RAPIDS-CMAKE=${RAPIDS_CMAKE_PATH}
-  -DCPM_rapids_logger_SOURCE=${RAPIDS_LOGGER_PATH}
-  -DCPM_raft_SOURCE=${RAFT_PATH}
-  -DCPM_NvidiaCutlass_SOURCE=${CUTLASS_PATH}
-  -DCPM_cuco_SOURCE=${CUCO_PATH}
-  -DBUILD_SHARED_LIBS=OFF
-  -DBUILD_TESTS=OFF
-  -DBUILD_C_LIBRARY=OFF
-  -DBUILD_CAGRA_HNSWLIB=OFF
-  -DBUILD_MG_ALGOS=OFF
-  -DCUVS_NVTX=OFF
-  -DCMAKE_CUDA_ARCHITECTURES=RAPIDS
-  -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
-  "-DCMAKE_CXX_FLAGS=-I${CURRENT_INSTALLED_DIR}/include"
-  "-DCMAKE_CUDA_FLAGS=-I${CURRENT_INSTALLED_DIR}/include")
+# cuvs-config.cmake
+file(WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config.cmake"
+[[include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
+find_dependency(raft)
+find_dependency(rmm)
 
-vcpkg_cmake_install()
+include("${CMAKE_CURRENT_LIST_DIR}/cuvs-cuvs_cpp_headers-cpp-headers-targets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/cuvs-cuvs_static-static-targets.cmake")
 
-vcpkg_cmake_config_fixup(PACKAGE_NAME cuvs CONFIG_PATH lib/cmake/cuvs)
+set(cuvs_FOUND TRUE)
+]])
 
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/share")
+file(WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/cuvs-config-version.cmake"
+[[set(PACKAGE_VERSION "26.06.00")
+if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+  if(PACKAGE_VERSION VERSION_EQUAL PACKAGE_FIND_VERSION)
+    set(PACKAGE_VERSION_EXACT TRUE)
+  endif()
+endif()
+]])
 
-vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
+file(WRITE "${CURRENT_PACKAGES_DIR}/share/cuvs/copyright"
+     "cuVS is distributed under the Apache License 2.0.\nSee https://github.com/rapidsai/cuvs/blob/v26.06.00/LICENSE\n")
