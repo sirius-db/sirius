@@ -50,7 +50,7 @@ struct vector_search_request {
 
 /// Run a single-query k-NN search over a GPU-pinned table and return the result
 /// materialized on the HOST tier: one column per @c output_columns entry in
-/// order followed by a trailing FLOAT32 @c distance column, @c k rows
+/// order followed by a trailing FLOAT32 @c distance column, up to @c k rows
 /// nearest-first. The table must be pinned on the GPU tier; when @c use_index
 /// is true a matching cuVS index must exist.
 std::unique_ptr<cucascade::host_data_representation> run_vector_search(
