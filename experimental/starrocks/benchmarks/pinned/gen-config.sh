@@ -11,6 +11,7 @@
 #   HOST_MEM    pinned host capacity per CN          (default 180GiB)
 #   PLAN_DIR    Simpatico plan dir for the dataset   (default repo tpch_sf1000 plans)
 #   OUT_DIR     where cn<i>.yaml land                (default this directory/generated)
+#   ENABLE_PIN_COMPRESSION  1 (default) or 0
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
@@ -19,6 +20,22 @@ GPU_MEM=${GPU_MEM:-60GiB}
 HOST_MEM=${HOST_MEM:-180GiB}
 PLAN_DIR=${PLAN_DIR:-$REPO_ROOT/src/compression/simpatico_codegen/plans/tpch_sf1000}
 OUT_DIR=${OUT_DIR:-$HERE/generated}
+ENABLE_PIN_COMPRESSION=${ENABLE_PIN_COMPRESSION:-1}
+
+if [ "$ENABLE_PIN_COMPRESSION" = "1" ]; then
+  COMPRESSION_BLOCK=$(cat <<EOF
+  compression:
+    enable_pin_table_compression: true
+    input_plan_dir: "$PLAN_DIR"
+EOF
+)
+else
+  COMPRESSION_BLOCK=$(cat <<EOF
+  compression:
+    enable_pin_table_compression: false
+EOF
+)
+fi
 
 mkdir -p "$OUT_DIR"
 for i in $(seq 0 $((NUM_CNS - 1))); do
@@ -37,9 +54,7 @@ sirius:
     hash_partition_bytes: "1GiB"
     concat_batch_bytes: "1GiB"
     max_build_hash_table_bytes: "2GiB"
-  compression:
-    enable_pin_table_compression: true
-    input_plan_dir: "$PLAN_DIR"
+$COMPRESSION_BLOCK
   telemetry:
     output_directory: ".cn$i/telemetry"
 EOF

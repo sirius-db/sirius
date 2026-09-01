@@ -70,7 +70,17 @@ case $host in
      exit 1 ;;
 esac
 
+PER_HOST=${NUM_CNS_PER_HOST:-4}
+TOTAL_CNS=${NUM_CNS:-$((PER_HOST * 2))}
+export NUM_CNS_PER_HOST=$PER_HOST
+export NUM_CNS=$TOTAL_CNS
+
+# Unpinned 2-host arms leave this unset. set -u plus the unquoted 09 heredoc
+# expands $SIRIUS_CONFIG_DIR on 18; an empty default keeps that from aborting.
+SIRIUS_CONFIG_DIR="${SIRIUS_CONFIG_DIR:-}"
+
 say "SCALE_FACTOR=$SCALE_FACTOR GPU_MEM=$GPU_MEM STAGING=$STAGING HOST_MEM=$HOST_MEM"
+say "NUM_CNS_PER_HOST=$PER_HOST NUM_CNS=$TOTAL_CNS SIRIUS_CONFIG_DIR=${SIRIUS_CONFIG_DIR:-}"
 say "stopping $REMOTE_HOST"
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE_HOST" \
   "cd $(printf %q "$SR") && ./benchmarks/stop-cn-2host.sh"
@@ -88,10 +98,12 @@ cd "$SR"
 unset CUDA_VISIBLE_DEVICES
 export SCALE_FACTOR
 
-say "starting FE+4 CNs on 18 -> /tmp/gb200-8gpu-launch-18.log"
+say "starting FE+$PER_HOST CNs on 18 -> /tmp/gb200-8gpu-launch-18.log"
 nohup env SCALE_FACTOR="$SCALE_FACTOR" GPU_MEM="$GPU_MEM" HOST_MEM="$HOST_MEM" \
   STAGING="$STAGING" SIRIUS_EXCHANGE_STAGING_BYTES="$SIRIUS_EXCHANGE_STAGING_BYTES" \
   PIPELINE_DOP="$PIPELINE_DOP" \
+  NUM_CNS_PER_HOST="$PER_HOST" NUM_CNS="$TOTAL_CNS" \
+  SIRIUS_CONFIG_DIR="${SIRIUS_CONFIG_DIR:-}" \
   SIRIUS_QUERY_WATCHDOG_SECS="$SIRIUS_QUERY_WATCHDOG_SECS" \
   SIRIUS_CN_RPC_TIMEOUT_SECS="$SIRIUS_CN_RPC_TIMEOUT_SECS" \
   SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS="$SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS" \
@@ -100,22 +112,22 @@ nohup env SCALE_FACTOR="$SCALE_FACTOR" GPU_MEM="$GPU_MEM" HOST_MEM="$HOST_MEM" \
 echo $! >/tmp/gb200-8gpu-launch-18.pid
 
 MYSQL=${MYSQL:-$SR/.pixi/envs/default/bin/mysql}
-say "waiting for 4 local CNs"
+say "waiting for $PER_HOST local CNs"
 n=0
 for _ in $(seq 1 90); do
   n=$("$MYSQL" -h127.0.0.1 -P9030 -uroot -N -e 'SHOW COMPUTE NODES' 2>/dev/null \
       | awk -F'\t' '$9=="true"{c++} END{print c+0}') || n=0
-  [ "$n" -ge 4 ] && break
+  [ "$n" -ge "$PER_HOST" ] && break
   sleep 2
 done
-if [ "$n" -lt 4 ]; then
-  say "FE did not reach 4 alive CNs"
+if [ "$n" -lt "$PER_HOST" ]; then
+  say "FE did not reach $PER_HOST alive CNs"
   tail -20 /tmp/gb200-8gpu-launch-18.log || true
   exit 1
 fi
 say "18 has $n alive CNs"
 
-say "starting 4 CNs on 09 -> /tmp/gb200-8gpu-launch-09.log"
+say "starting $PER_HOST CNs on 09 -> /tmp/gb200-8gpu-launch-09.log"
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE_HOST" bash -s <<EOF
 set -euo pipefail
 source /scratch/prestouser/aocsa/env.sh
@@ -127,12 +139,17 @@ export HOST_MEM=$(printf %q "$HOST_MEM")
 export STAGING=$(printf %q "$STAGING")
 export SIRIUS_EXCHANGE_STAGING_BYTES=$(printf %q "$SIRIUS_EXCHANGE_STAGING_BYTES")
 export PIPELINE_DOP=$(printf %q "$PIPELINE_DOP")
+export NUM_CNS_PER_HOST=$(printf %q "$PER_HOST")
+export NUM_CNS=$(printf %q "$TOTAL_CNS")
+export SIRIUS_CONFIG_DIR=$(printf %q "${SIRIUS_CONFIG_DIR:-}")
 export SIRIUS_QUERY_WATCHDOG_SECS=$(printf %q "$SIRIUS_QUERY_WATCHDOG_SECS")
 export SIRIUS_CN_RPC_TIMEOUT_SECS=$(printf %q "$SIRIUS_CN_RPC_TIMEOUT_SECS")
 export SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS=$(printf %q "$SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS")
 nohup env SCALE_FACTOR=$SCALE_FACTOR GPU_MEM=$GPU_MEM HOST_MEM=$HOST_MEM \
   STAGING=$STAGING SIRIUS_EXCHANGE_STAGING_BYTES=$SIRIUS_EXCHANGE_STAGING_BYTES \
   PIPELINE_DOP=$PIPELINE_DOP \
+  NUM_CNS_PER_HOST=$NUM_CNS_PER_HOST NUM_CNS=$NUM_CNS \
+  SIRIUS_CONFIG_DIR=${SIRIUS_CONFIG_DIR:-} \
   SIRIUS_QUERY_WATCHDOG_SECS=$SIRIUS_QUERY_WATCHDOG_SECS \
   SIRIUS_CN_RPC_TIMEOUT_SECS=$SIRIUS_CN_RPC_TIMEOUT_SECS \
   SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS=$SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS \
@@ -143,22 +160,22 @@ echo \$! >/tmp/gb200-8gpu-launch-09.pid
 echo started_09 pid=\$(cat /tmp/gb200-8gpu-launch-09.pid)
 EOF
 
-say "waiting for 8 Alive=true"
+say "waiting for $TOTAL_CNS Alive=true"
 n=0
 for _ in $(seq 1 90); do
   n=$("$MYSQL" -h127.0.0.1 -P9030 -uroot -N -e 'SHOW COMPUTE NODES' 2>/dev/null \
       | awk -F'\t' '$9=="true"{c++} END{print c+0}') || n=0
-  [ "$n" -eq 8 ] && break
+  [ "$n" -eq "$TOTAL_CNS" ] && break
   sleep 2
 done
-if [ "$n" -ne 8 ]; then
-  say "expected 8 alive, got $n"
+if [ "$n" -ne "$TOTAL_CNS" ]; then
+  say "expected $TOTAL_CNS alive, got $n"
   "$MYSQL" -h127.0.0.1 -P9030 -uroot --vertical -e 'SHOW COMPUTE NODES' || true
   exit 1
 fi
 
 "$MYSQL" -h127.0.0.1 -P9030 -uroot -e \
   "SET GLOBAL enable_pipeline_engine=true; SET GLOBAL pipeline_dop=${PIPELINE_DOP}; SET GLOBAL query_timeout=${FE_QUERY_TIMEOUT};"
-say "8 CNs alive, pipeline_dop=$PIPELINE_DOP GPU_MEM=$GPU_MEM STAGING=$STAGING HOST_MEM=$HOST_MEM"
+say "$TOTAL_CNS CNs alive, pipeline_dop=$PIPELINE_DOP GPU_MEM=$GPU_MEM STAGING=$STAGING HOST_MEM=$HOST_MEM"
 "$MYSQL" -h127.0.0.1 -P9030 -uroot --vertical -e 'SHOW COMPUTE NODES' \
   | awk '/^[[:space:]]*IP:/ {ip=$2} /^[[:space:]]*HeartbeatPort:/ {hp=$2} /^[[:space:]]*Alive:/ {print ip, hp, $2}'

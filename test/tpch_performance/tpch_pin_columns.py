@@ -326,6 +326,58 @@ def emit_unpin_all() -> str:
     )
 
 
+def _pin_tier(table: str, tier: str | None = None) -> str:
+    if tier:
+        return tier
+    return os.environ.get(
+        f"SIRIUS_PIN_TIER_{table.upper()}", os.environ.get("SIRIUS_PIN_TIER", "gpu")
+    )
+
+
+def _admin_pin_line(table: str, cols: list[str], source: str, tier: str | None) -> str:
+    """One CN admin-script line: pin_table path=... tier=... name=... cols=..."""
+    path = detect_pin_glob(source, table)
+    col_list = ",".join(cols)
+    return (
+        f"pin_table path={path} tier={_pin_tier(table, tier)} "
+        f"name={table} cols={col_list}"
+    )
+
+
+def emit_admin_pin(query_num: int, source: str, tier: str | None = None) -> str:
+    """CN admin script for one query's tables (no ADMIN EXECUTE wrapper).
+
+    Packed as one script so every table shares the 600 s ADMIN EXECUTE ceiling.
+    The harness wraps this in `ADMIN EXECUTE ON <id> '...'` per alive CN.
+    """
+    cols_by_table = QUERY_COLUMNS[query_num]
+    lines = [
+        _admin_pin_line(table, cols, source, tier)
+        for table, cols in cols_by_table.items()
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def emit_admin_unpin(query_num: int) -> str:
+    cols_by_table = QUERY_COLUMNS[query_num]
+    return "\n".join(f"unpin_table {table}" for table in cols_by_table) + "\n"
+
+
+def emit_admin_pin_all(source: str, tier: str | None = None) -> str:
+    """Union pin across all 22 queries, for sequential mode."""
+    lines = [
+        _admin_pin_line(table, cols, source, tier)
+        for table, cols in union_columns_by_table().items()
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def emit_admin_unpin_all() -> str:
+    return (
+        "\n".join(f"unpin_table {table}" for table in union_columns_by_table()) + "\n"
+    )
+
+
 def _extract_format(args: list[str]) -> tuple[list[str], str]:
     """Pull an optional `--format parquet|duckdb` out of `args` (default parquet)."""
     data_source = "parquet"

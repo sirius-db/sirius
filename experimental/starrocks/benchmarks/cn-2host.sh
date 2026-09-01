@@ -13,9 +13,20 @@
 # would race on the same derived-sirius-config.yaml and the same log/ + telemetry/ trees.
 set -euo pipefail
 
-ADVERTISE=${1:?usage: cn-2host.sh <advertise-host> <fe-host> [--no-fe]}
-FE_HOST=${2:?usage: cn-2host.sh <advertise-host> <fe-host> [--no-fe]}
-START_FE=1; [ "${3:-}" = "--no-fe" ] && START_FE=0
+ADVERTISE=${1:?usage: cn-2host.sh <advertise-host> <fe-host> [--no-fe] [--sirius-config-dir DIR]}
+FE_HOST=${2:?usage: cn-2host.sh <advertise-host> <fe-host> [--no-fe] [--sirius-config-dir DIR]}
+shift 2
+START_FE=1
+SIRIUS_CONFIG_DIR=${SIRIUS_CONFIG_DIR:-}
+while [ $# -gt 0 ]; do
+    case $1 in
+        --no-fe) START_FE=0; shift ;;
+        --sirius-config-dir)
+            [ $# -ge 2 ] || { echo "cn-2host: --sirius-config-dir needs a path" >&2; exit 2; }
+            SIRIUS_CONFIG_DIR=$2; shift 2 ;;
+        *) echo "cn-2host: unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
 
 SR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$SR_DIR"
@@ -139,11 +150,27 @@ if [ "$START_FE" = 1 ]; then
     echo "FE started (membind=$FE_NODES, no cpubind) -> /tmp/fe.log"
 fi
 
+if [ -n "$SIRIUS_CONFIG_DIR" ]; then
+    for i in $(seq 0 $((PER_HOST - 1))); do
+        [ -f "$SIRIUS_CONFIG_DIR/cn$i.yaml" ] || {
+            echo "cn-2host: missing $SIRIUS_CONFIG_DIR/cn$i.yaml (run gen-config.sh)" >&2
+            exit 1
+        }
+    done
+    echo "cn-2host: using --sirius-config from $SIRIUS_CONFIG_DIR (no --gpu-memory-limit)"
+fi
+
 for i in $(seq 0 $((PER_HOST - 1))); do
     base=$((9100 + i * 10))
     # Pin engine pools to the same 36-core slice as physcpubind. Unset, the CN
     # discovers the GPU's full socket (72 cores) and the derived YAML disagrees
     # with the mask the kernel actually allows.
+    mem_args=()
+    if [ -n "$SIRIUS_CONFIG_DIR" ]; then
+        mem_args=(--sirius-config "$SIRIUS_CONFIG_DIR/cn$i.yaml")
+    else
+        mem_args=(--gpu-memory-limit "$GPU_MEM" --host-memory-limit "$HOST_MEM")
+    fi
     SIRIUS_CN_CPU_AFFINITY="${CPUS[$i]}" \
     numactl --physcpubind="${CPUS[$i]}" --membind="${NODES[$i]}" -- \
         "$CN_BIN" \
@@ -156,8 +183,7 @@ for i in $(seq 0 $((PER_HOST - 1))); do
             --brpc-port         "$((base + 2))" \
             --http-port         "$((base + 3))" \
             --starlet-port      "$((base + 4))" \
-            --gpu-memory-limit  "$GPU_MEM" \
-            --host-memory-limit "$HOST_MEM" \
+            "${mem_args[@]}" \
             --engine-dir        ".cn$i-${ADVERTISE##*.}" \
             > "/tmp/cn-${ADVERTISE##*.}-$i.log" 2>&1 &
     pids+=($!)

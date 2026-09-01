@@ -22,6 +22,13 @@ unset CUDA_VISIBLE_DEVICES
 export SIRIUS_QUERY_WATCHDOG_SECS=${SIRIUS_QUERY_WATCHDOG_SECS:-300}
 export SIRIUS_EXCHANGE_STAGING_BYTES=${STAGING:-32GiB}
 
+# CN_GPU="0 2" for a fair 2-GPU arm (one CN per socket). Default is 0..NUM_CNS-1.
+read -r -a GPUS <<< "${CN_GPU:-$(seq -s ' ' 0 $((NUM_CNS - 1)))}"
+[ "${#GPUS[@]}" -ge "$NUM_CNS" ] || {
+  echo "CN_GPU has ${#GPUS[@]} entries, need $NUM_CNS" >&2
+  exit 1
+}
+
 [ -x "$FE_BIN" ] || { echo "no packaged FE at $FE_BIN (pixi run -e fe fe-build)" >&2; exit 1; }
 [ -x "$CN_BIN" ] || { echo "no CN at $CN_BIN (pixi run cn-build)" >&2; exit 1; }
 for i in $(seq 0 $((NUM_CNS - 1))); do
@@ -39,7 +46,7 @@ cd "$SR_DIR"
 for i in $(seq 0 $((NUM_CNS - 1))); do
   base=$((PORT_BASE + i * PORT_STRIDE))
   "$CN_BIN" \
-    --gpu-device "$i" \
+    --gpu-device "${GPUS[$i]}" \
     --heartbeat-port "$base" \
     --thrift-port "$((base + 1))" \
     --brpc-port "$((base + 2))" \
@@ -48,7 +55,7 @@ for i in $(seq 0 $((NUM_CNS - 1))); do
     --sirius-config "$CONFIG_DIR/cn$i.yaml" \
     --engine-dir ".cn$i" &
   pids+=("$!")
-  echo "CN$i gpu=$i heartbeat=$base brpc=$((base + 2)) pid=${pids[-1]}"
+  echo "CN$i gpu=${GPUS[$i]} heartbeat=$base brpc=$((base + 2)) pid=${pids[-1]}"
 done
 echo "FE + $NUM_CNS CNs launched; each CN self-registers with the FE on :9030"
 wait -n "${pids[@]}"

@@ -14,6 +14,7 @@ bringing up a cluster, or running a benchmark.
 | 8× GB200 (2 hosts × 4). Whole fleet. | [`bench/gb200-8gpu/`](../bench/gb200-8gpu/) (`sf1000/`, `sf3000/`; `sf10000/` is closed, not live) |
 | SF3000 8-CN knob log | [`bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md`](../bench/gb200-8gpu/sf3000/TUNING-DISCOVERY.md) |
 | SF3000 session handoff (2026-08-28) | [`2026-08-28-8gpu-handoff.md`](2026-08-28-8gpu-handoff.md) |
+| SF1000 pinned GPU scale-out 2→4→8 (gcn-18+09) | [`2026-08-28-sf1000-pinned-gpu-scaleout-PLAN.md`](2026-08-28-sf1000-pinned-gpu-scaleout-PLAN.md) |
 | Super Sirius architecture | `docs/super-sirius/` |
 
 Do **not** quote timings, pass/fail tables, or commands from the SF1 / single-GPU L4 notes

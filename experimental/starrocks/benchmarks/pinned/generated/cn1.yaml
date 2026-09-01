@@ -1,0 +1,19 @@
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: "112GiB"
+      reservation_limit_fraction: 1.0
+    host:
+      capacity_bytes: "200GiB"
+  operator_params:
+    scan_task_batch_size: "1GiB"
+    hash_partition_bytes: "1GiB"
+    concat_batch_bytes: "1GiB"
+    max_build_hash_table_bytes: "2GiB"
+  compression:
+    enable_pin_table_compression: true
+    input_plan_dir: "/home/prestouser/aocsa/sirius/src/compression/simpatico_codegen/plans/tpch_sf1000"
+  telemetry:
+    output_directory: ".cn1/telemetry"
