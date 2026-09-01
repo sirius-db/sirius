@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "helper/logical_type.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -41,8 +43,9 @@ struct vector_search_request {
   std::int64_t dim{0};                      ///< Vector dimensionality.
   std::int64_t k{10};                       ///< Top-k neighbors to return.
   std::vector<std::string> output_columns;  ///< Base-table columns to return (in order).
-  bool use_index{true};                     ///< true => ann; false => enn.
-  std::int64_t n_probes{0};                 ///< IVF lists to probe for ann;
+  std::vector<sirius::logical_type> output_column_types;  ///< Catalog type of each output column
+  bool use_index{true};                                   ///< true => ann; false => enn.
+  std::int64_t n_probes{0};                               ///< IVF lists to probe for ann;
 };
 
 /// Run a single-query k-NN search over a GPU-pinned table and return the result

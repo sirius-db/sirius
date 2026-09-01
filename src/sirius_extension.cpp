@@ -2291,8 +2291,10 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   }
 
   for (auto const& col : req.output_columns) {
-    return_types.push_back(type_of(col));
+    auto const& col_type = type_of(col);
+    return_types.push_back(col_type);
     names.push_back(col);
+    req.output_column_types.push_back(sirius::from_duckdb(col_type));
   }
   return_types.push_back(LogicalType::FLOAT);
   names.push_back("distance");

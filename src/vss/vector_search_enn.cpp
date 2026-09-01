@@ -75,7 +75,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
   }
 
   if (candidates.empty()) {
-    return vss_result_to_host(c, make_empty_vss_output(c.pin, req.output_columns));
+    return vss_result_to_host(c, make_empty_vss_output(req.output_column_types));
   }
 
   // K-way merge the per-chunk top-k lists into the global top-k, sorted by distance

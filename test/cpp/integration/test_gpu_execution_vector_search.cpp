@@ -347,6 +347,42 @@ TEST_CASE_METHOD(VectorSearchFixture,
   run_ok("SELECT * FROM unpin_table('vs_subset');");
 }
 
+// A pinned table with zero rows has no data batches. The search must still return
+// the advertised result schema (output columns + a distance column) with zero
+// rows, rather than failing because there is no batch to read a column type from.
+// The empty-result branch sits before the ANN/ENN dispatch, so both use_index
+// modes reach it even with no ANN index built.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "sirius_knn_search - empty pinned table returns the empty result schema",
+                 "[integration][gpu_execution][array][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_empty AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "'row' || i AS payload FROM range(0) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_empty', tier => 'gpu', format => 'duckdb');");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+
+  for (bool use_index : {false, true}) {
+    INFO("use_index = " << use_index);
+    auto r = con->Query("SELECT * FROM sirius_knn_search('vs_empty', 'vec', " + origin +
+                        ", k => 5, output_columns => ['id', 'payload'], use_index => " +
+                        std::string(use_index ? "true" : "false") + ");");
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("empty-table search error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    // Schema is still the requested output columns plus the trailing distance.
+    REQUIRE(r->names.size() == 3);
+    REQUIRE(r->names[0] == "id");
+    REQUIRE(r->names[1] == "payload");
+    REQUIRE(r->names[2] == "distance");
+    REQUIRE(r->Cast<duckdb::MaterializedQueryResult>().RowCount() == 0);
+  }
+
+  run_ok("SELECT * FROM unpin_table('vs_empty');");
+}
+
 // output_columns => [] is stored as an empty vector; it must be rejected as a user
 // error, NOT treated like omitting the parameter (which defaults to the pinned
 // columns). Probed against a fully-pinned table, where "rejected" and "expanded to

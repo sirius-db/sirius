@@ -16,17 +16,14 @@
 
 #include "vss/vector_search.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/vector_search_internal.hpp"
 
-#include <cudf/column/column.hpp>
-#include <cudf/column/column_factories.hpp>
-#include <cudf/copying.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -43,21 +40,13 @@
 
 namespace sirius::vss {
 
-std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_entry& pin,
-                                                   const std::vector<std::string>& output_columns)
+std::unique_ptr<cudf::table> make_empty_vss_output(
+  const std::vector<sirius::logical_type>& output_column_types)
 {
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(output_columns.size() + 1);
-  for (auto const& name : output_columns) {
-    auto it = pin.data_batches_by_column.find(name);
-    if (it == pin.data_batches_by_column.end() || it->second.empty()) {
-      throw duckdb::InvalidInputException(
-        "sirius_knn_search: pinned table missing output column '" + name + "'");
-    }
-    cols.push_back(cudf::empty_like(it->second.front()->view()));
-  }
-  cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32}));
-  return std::make_unique<cudf::table>(std::move(cols));
+  duckdb::vector<sirius::logical_type> types(output_column_types.begin(),
+                                             output_column_types.end());
+  types.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
+  return sirius::make_empty_table(types);
 }
 
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
@@ -107,7 +96,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   if (k <= 0 || num_rows == 0) {
     vector_search_context empty_ctx{
       ctx, req, *space, *host_space, *pin, mr, stream, nullptr, target_gpu, k};
-    return vss_result_to_host(empty_ctx, make_empty_vss_output(*pin, req.output_columns));
+    return vss_result_to_host(empty_ctx, make_empty_vss_output(req.output_column_types));
   }
 
   // Upload the (constant) query vector once; both search impls read it on the device.

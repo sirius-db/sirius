@@ -23,7 +23,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace cudf {
@@ -61,10 +60,9 @@ struct vector_search_context {
   std::int64_t k;  ///< min(num_rows, req.k).
 };
 
-/// Return an empty table; column types come from the pinned table.
-/// Used for the no-result cases (empty table / k == 0 / no chunks).
-std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_entry& pin,
-                                                   const std::vector<std::string>& output_columns);
+/// Return an empty table with the search result schema.
+std::unique_ptr<cudf::table> make_empty_vss_output(
+  const std::vector<sirius::logical_type>& output_column_types);
 
 /// Move a GPU result table to a host_data_representation the table function can
 /// stream out. Synchronizes @c c.stream before returning.
