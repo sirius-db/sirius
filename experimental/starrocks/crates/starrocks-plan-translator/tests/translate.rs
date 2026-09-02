@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
-    translate_fragment,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
+    URN_COMPARISON, translate_fragment,
 };
+use starrocks_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
@@ -19,8 +20,9 @@ use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
     TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
-    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
-    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
+    TExchangeNode, TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp,
+    TNestLoopJoinNode, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -3202,24 +3204,483 @@ fn nestloop_join_without_a_liftable_comparison_still_translates() {
     }
 }
 
-/// Verifies an exchange node is still rejected: fragments are translated in isolation and
-/// multi-fragment plans are a later milestone.
+/// Builds an EXCHANGE_NODE `node_id` over `input_row_tuples`, optionally merging (`sort_info`)
+/// and skipping `offset` rows.
+fn exchange_node_with(
+    node_id: i32,
+    input_row_tuples: Vec<i32>,
+    sort_info: Option<TSortInfo>,
+    offset: Option<i64>,
+) -> TPlanNode {
+    let mut exchange = base_plan_node(
+        node_id,
+        TPlanNodeType::EXCHANGE_NODE,
+        0,
+        input_row_tuples.clone(),
+    );
+    exchange.exchange_node = Some(TExchangeNode::new(
+        input_row_tuples,
+        sort_info,
+        offset,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    exchange
+}
+
+/// Binds exchange node `node_id` to the engine view `sirius_stream_<node_id>` with the given
+/// sender names.
+fn stream_input(node_id: i32, names: &[&str]) -> ExchangeInput {
+    ExchangeInput {
+        node_id,
+        stream_view: format!("sirius_stream_{node_id}"),
+        names: names.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// Translates `plan` over `desc` with the given input streams bound.
+fn translate_with_streams(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    inputs: &[ExchangeInput],
+) -> Result<TranslatedPlan, TranslateError> {
+    PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(&params(Some(plan), Some(desc), None), inputs)
+}
+
+/// Verifies an exchange node without a bound input stream is rejected, naming the node: a
+/// fragment translated in isolation has nothing to read the exchange from.
 #[test]
 fn exchange_node_is_rejected() {
-    let exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
-        Some(TPlan::new(vec![exchange])),
+        Some(TPlan::new(vec![exchange_node_with(1, vec![0], None, None)])),
         Some(base_desc()),
         None,
     ))
     .unwrap_err();
-    assert!(matches!(
-        err,
-        TranslateError::UnsupportedPlanNode {
-            node_type: TPlanNodeType::EXCHANGE_NODE,
-            ..
-        }
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedPlanNode {
+                node_id: 1,
+                node_type: TPlanNodeType::EXCHANGE_NODE,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// Verifies a bound exchange becomes a stream read below the receiver aggregate, and that no
+/// file appears anywhere in the plan: the boundary is a stream, not a parquet round-trip.
+#[test]
+fn bound_exchange_feeds_aggregate_from_a_stream() {
+    let aggregate = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![aggregate, exchange_node_with(7, vec![0], None, None)]),
+        agg_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate receiver");
+    };
+    let rel::RelType::Read(read) = aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected exchange read");
+    };
+    let Some(read_rel::ReadType::NamedTable(table)) = read.read_type.as_ref() else {
+        panic!("expected a stream read for the exchange input");
+    };
+    assert_eq!(table.names, vec!["sirius_stream_7"]);
+    assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
+    assert!(translated.output_partition_columns.is_none());
+
+    // The declaration the engine needs, derived from the same schema the read carries.
+    assert_eq!(translated.stream_inputs.len(), 1);
+    let stream = &translated.stream_inputs[0];
+    assert_eq!(stream.node_id, 7);
+    assert_eq!(stream.stream_view, "sirius_stream_7");
+    assert_eq!(
+        stream
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "BIGINT"), ("name", "VARCHAR")]
+    );
+}
+
+/// The sender's names win over the receiver's descriptor names: the stream's columns are bound
+/// positionally and the fragment's root is named by its own tuple, so a rename at the boundary
+/// changes the read's schema and nothing else.
+#[test]
+fn exchange_columns_take_the_senders_names_positionally() {
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[stream_input(7, &["sender_id", "sender_name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["id", "name"]);
+    let rel::RelType::Read(read) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the exchange read at the root");
+    };
+    assert_eq!(
+        read.base_schema.as_ref().unwrap().names,
+        vec!["sender_id", "sender_name"]
+    );
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sender_id", "sender_name"]
+    );
+}
+
+/// A multi-stage DISTINCT reallocates its columns into a fresh tuple at every stage, but the
+/// FE's `buildAggregateTuple` never rebinds `colRefToExpr` for grouping columns, so every ref
+/// above the first aggregation keeps naming the tuple from below it (TPC-H q16's
+/// `count(distinct ps_suppkey)` reaches its final stage still naming the scan-side tuple). The
+/// BE resolves slot refs by slot id alone, so those stale refs must resolve the same way here.
+#[test]
+fn stale_tuple_ids_from_a_multi_stage_distinct_resolve_by_slot_id() {
+    // Four tuples reallocating the same two columns: suppkey keeps slot 2 and brand slot 9
+    // through tuple 0 (below the aggregation), tuple 1 (the exchange input), and tuple 2 (the
+    // dedup output); tuple 3 is the counting output (brand key, count slot 23).
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None), (3, None)],
+        vec![
+            slot(2, 0, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 0, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 1, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 2, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 2, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(9, 3, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(23, 3, "supplier_cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let exchange = exchange_node_with(4, vec![1], None, None);
+    // The dedup stage: grouping-only, its refs stale-bound to tuple 0.
+    let dedup = aggregation_node(
+        5,
+        2,
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+        Vec::new(),
+    );
+    // The counting stage: its count argument names tuple 0 too.
+    let count = aggregation_node(
+        6,
+        3,
+        vec![slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![count, dedup, exchange]),
+        desc,
+        &[stream_input(4, &["ps_suppkey", "p_brand"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["p_brand", "supplier_cnt"]);
+    let rel::RelType::Aggregate(counting) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected counting aggregate");
+    };
+    // The deduped row is [ps_suppkey, p_brand]: the count groups on brand and counts suppkey.
+    assert_eq!(counting.grouping_expressions.len(), 1);
+    assert_eq!(field_index(&counting.grouping_expressions[0]), 1);
+    assert_eq!(counting.measures.len(), 1);
+    let measure = counting.measures[0].measure.as_ref().unwrap();
+    assert_eq!(measure.arguments.len(), 1);
+    let substrait::proto::function_argument::ArgType::Value(argument) =
+        measure.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected value argument");
+    };
+    assert_eq!(field_index(argument), 0);
+
+    let rel::RelType::Aggregate(dedup) =
+        counting.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected dedup aggregate under the count");
+    };
+    let keys: Vec<_> = dedup.grouping_expressions.iter().map(field_index).collect();
+    assert_eq!(keys, vec![0, 1]);
+    assert!(dedup.measures.is_empty());
+}
+
+/// Verifies a merging exchange globally sorts the stream it reads: the senders' runs arrive in
+/// no particular interleaving, and a plain read would drop the cross-fragment ORDER BY.
+#[test]
+fn merging_exchange_becomes_sort_over_stream_read() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![false],
+        vec![false],
+        None,
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(
+            7,
+            vec![0],
+            Some(sort_info),
+            Some(0),
+        )]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected merging exchange sort");
+    };
+    let rel::RelType::Read(read) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected an exchange read under the sort");
+    };
+    assert!(
+        matches!(
+            read.read_type.as_ref(),
+            Some(read_rel::ReadType::NamedTable(_))
+        ),
+        "a merging exchange must stream its input too, not re-scan a file"
+    );
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 0);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+}
+
+/// Without `input_row_tuples` there is no row layout to type the stream with.
+#[test]
+fn exchange_without_input_row_tuples_is_rejected() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, Vec::new(), None, None)]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::MissingField {
+                context: "TExchangeNode",
+                field: "input_row_tuples"
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// The view name is what ties the read to the stream the engine fills. An empty one would bind
+/// a table named "" and fail far from the exchange that caused it.
+#[test]
+fn exchange_bound_to_an_empty_stream_view_is_rejected() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[ExchangeInput {
+            node_id: 7,
+            stream_view: String::new(),
+            names: vec!["id".to_string(), "name".to_string()],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::MalformedPlan { .. }),
+        "{err:?}"
+    );
+}
+
+/// The sender's name list must have one entry per column of the declared row layout; a mismatch
+/// would otherwise bind columns positionally under the wrong names.
+#[test]
+fn exchange_names_must_match_the_row_layout_arity() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[stream_input(7, &["only_one"])],
+    )
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::Descriptor(_)), "{err:?}");
+}
+
+/// An exchange node carries its own skip offset, not just a sort. It must reach the fetch with an
+/// explicit unlimited count, or the consumer decodes the unset count as `LIMIT 0`.
+#[test]
+#[allow(deprecated)]
+fn exchange_offset_becomes_a_fetch() {
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, Some(5))]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+    let rel::RelType::Fetch(fetch) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the exchange offset to become a fetch");
+    };
+    assert_eq!(
+        fetch.count_mode,
+        Some(substrait::proto::fetch_rel::CountMode::Count(-1))
+    );
+    assert_eq!(
+        fetch.offset_mode,
+        Some(substrait::proto::fetch_rel::OffsetMode::Offset(5))
+    );
+}
+
+/// Builds fragment params whose output sink is a data-stream sink with `partition`.
+fn params_with_stream_sink(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    output_exprs: Option<Vec<TExpr>>,
+    partition: TDataPartition,
+) -> TExecPlanFragmentParams {
+    let mut params = params(Some(plan), Some(desc), output_exprs);
+    params.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
+        TDataSinkType::DATA_STREAM_SINK,
+        Some(TDataStreamSink::new(
+            9, partition, None, None, None, None, None,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     ));
+    params
+}
+
+/// Builds a hash partition over the given key expressions.
+fn hash_partition(keys: Vec<TExpr>) -> TDataPartition {
+    TDataPartition::new(TPartitionType::HASH_PARTITIONED, Some(keys), None, None)
+}
+
+/// A hash-partitioned sink's keys resolve to output column indices in partition-expression
+/// order, and an unpartitioned sink resolves to none: the sender hashes exactly the columns the
+/// FE named, in the order it named them.
+#[test]
+fn hash_partitioned_sink_resolves_partition_keys_to_output_columns() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+    ))
+    .unwrap();
+    assert_eq!(translated.output_partition_columns, Some(vec![1, 0]));
+
+    let unpartitioned = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+    ))
+    .unwrap();
+    assert!(unpartitioned.output_partition_columns.is_none());
+}
+
+/// A transformed partition key is refused: this sender would hash a value its peers do not,
+/// silently splitting equal keys across destinations.
+#[test]
+fn hash_partitioned_sink_with_a_transformed_key_is_rejected() {
+    let err = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(vec![arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(1),
+        )]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::MalformedPlan { .. }),
+        "{err:?}"
+    );
+}
+
+/// A hash-partitioned sink with no partition expressions has nothing to hash, and one with
+/// fragment output expressions has a sink row the FE's slot refs no longer describe. Both are
+/// refused rather than guessed at.
+#[test]
+fn hash_partitioned_sink_without_resolvable_keys_is_rejected() {
+    let no_keys = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(Vec::new()),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(no_keys, TranslateError::MalformedPlan { .. }),
+        "{no_keys:?}"
+    );
+
+    let reprojected = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        hash_partition(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(reprojected, TranslateError::MalformedPlan { .. }),
+        "{reprojected:?}"
+    );
 }
 
 /// Returns every extension function name declared by the plan.
