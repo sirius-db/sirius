@@ -357,10 +357,12 @@ fn translate_arithmetic(
     // Decimal arithmetic is evaluated in FP64: the Sirius GPU expression path cannot consume
     // decimal arithmetic, and refusing it instead -- which is what this replaced -- rejects every
     // TPC-H revenue query. The result is approximate and is NOT cast back: a project's output slot
-    // may be declared DECIMAL while the expression yields FP64, and nothing downstream can detect
-    // that, because a Substrait `ProjectRel` carries no per-column output type. Sums of money
-    // columns therefore differ from StarRocks in the last few digits (~1e-14 relative) and render
-    // as a double. A decimal-native GPU path is the real fix.
+    // may be declared DECIMAL while the expression yields FP64. The emitted `Cast` and
+    // `ScalarFunction` nodes do carry the FP64 type; the mismatch is with anything that derives a
+    // row's schema from the frontend's slot types instead (a stream receiver, the result
+    // encoding), which still expects DECIMAL -- tracked in #1687. Sums of money columns therefore
+    // differ from StarRocks in the last few digits (~1e-14 relative) and render as a double. A
+    // decimal-native GPU path is the real fix.
     let decimal = is_decimal(&node.type_)?;
     let children = if decimal {
         children
