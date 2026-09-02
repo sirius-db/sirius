@@ -233,6 +233,19 @@ void task_scheduler::terminate_query(std::exception_ptr error)
   stop();
 }
 
+void task_scheduler::fail_stalled_query(uint64_t stalled_secs)
+{
+  std::scoped_lock lock(_query_mutex);
+  if (!_completion_handler) { return; }
+  SIRIUS_LOG_ERROR(
+    "task_scheduler: no scheduling progress for {}s (no task created or completed, no pipeline "
+    "finished); failing the query as stalled",
+    stalled_secs);
+  _completion_handler->report_error("sirius query watchdog: no scheduling progress for " +
+                                    std::to_string(stalled_secs) +
+                                    "s — failing the stalled query instead of wedging the engine");
+}
+
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
