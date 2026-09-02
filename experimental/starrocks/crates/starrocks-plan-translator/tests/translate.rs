@@ -214,6 +214,20 @@ fn bool_literal(value: bool) -> TExpr {
     TExpr::new(vec![node])
 }
 
+/// Builds an arithmetic expression and appends child nodes in preorder.
+fn arithmetic(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::ARITHMETIC_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        2,
+    );
+    node.opcode = Some(opcode);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
 /// Builds a binary predicate expression and appends child nodes in preorder.
 fn binary_pred(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
     let mut node = base_expr_node(
@@ -1109,6 +1123,199 @@ fn scan_project_preserves_descriptor_output_order() {
     {
         rel::RelType::Project(project) => assert_eq!(project.expressions.len(), 2),
         other => panic!("expected project rel, got {other:?}"),
+    }
+}
+
+/// Verifies hidden project expressions are appended in key order and can be
+/// referenced by visible expressions without descriptor-table slots.
+#[test]
+fn project_common_slots_are_materialized_before_visible_expressions() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    let expression::RexType::Selection(selection) =
+        visible.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected common-slot selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    assert_eq!(field.field, 2);
+
+    // The hidden project must pass its two input columns through and append the common slot,
+    // and the visible project must then read past all three. Asserting only that a project
+    // exists leaves the emit mappings -- the single line this lowering rests on -- unobserved.
+    let rel::RelType::Project(hidden) = visible.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the hidden project under the visible one");
+    };
+    assert_eq!(hidden.expressions.len(), 1);
+    assert_eq!(emit_mapping(hidden.common.as_ref()), vec![0, 1, 2]);
+    assert_eq!(emit_mapping(visible.common.as_ref()), vec![3]);
+}
+
+/// A later hidden slot may name an earlier one. The translator appends one
+/// project per entry in ascending slot id, so the second expression already
+/// sees the first column. Putting every hidden expression in one `ProjectRel`
+/// would evaluate them all against the scan and this case would break.
+#[test]
+fn nested_common_slots_are_appended_in_slot_id_order() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(4, slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)));
+    common_slot_map.insert(5, slot_ref(1, 0, bigint.clone()));
+    common_slot_map.insert(
+        6,
+        arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(5, 1, bigint.clone()),
+            int_literal(1),
+        ),
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(6, 1, bigint));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let visible = as_project(root(&translated.plan).input.as_ref().unwrap());
+    assert_eq!(struct_field(&visible.expressions[0]), 4);
+    assert_eq!(emit_mapping(visible.common.as_ref()), vec![5]);
+
+    let cse2 = as_project(visible.input.as_ref().unwrap());
+    assert_eq!(struct_field(scalar_arg(&cse2.expressions[0], 0)), 3);
+    assert_eq!(emit_mapping(cse2.common.as_ref()), vec![0, 1, 2, 3, 4]);
+
+    let cse1 = as_project(cse2.input.as_ref().unwrap());
+    assert_eq!(struct_field(&cse1.expressions[0]), 0);
+    assert_eq!(emit_mapping(cse1.common.as_ref()), vec![0, 1, 2, 3]);
+
+    let first = as_project(cse1.input.as_ref().unwrap());
+    assert_eq!(struct_field(&first.expressions[0]), 1);
+    assert_eq!(emit_mapping(first.common.as_ref()), vec![0, 1, 2]);
+}
+
+/// Unwraps a Substrait project relation.
+fn as_project(rel: &substrait::proto::Rel) -> &substrait::proto::ProjectRel {
+    match rel.rel_type.as_ref().unwrap() {
+        rel::RelType::Project(project) => project,
+        other => panic!("expected project rel, got {other:?}"),
+    }
+}
+
+/// Reads the zero-based field index from a Substrait struct-field selection.
+fn struct_field(expr: &substrait::proto::Expression) -> i32 {
+    let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected field selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    field.field
+}
+
+/// Only `PROJECT_NODE` materializes its common slots. A `SELECT_NODE`, hash join or nested-loop
+/// join carrying the same field is refused up front with a clear reason, instead of failing later
+/// with an opaque descriptor error when a conjunct references one of the shared sub-expressions.
+#[test]
+fn common_slots_outside_a_project_are_rejected() {
+    let common = || {
+        let mut map = BTreeMap::new();
+        map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+        Some(map)
+    };
+
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(common()));
+    let select_plan = TPlan::new(vec![select, scan_node(0, 0)]);
+
+    let mut hash_join = hash_join_node(TJoinOp::INNER_JOIN);
+    hash_join.hash_join_node.as_mut().unwrap().common_slot_map = common();
+    let hash_plan = TPlan::new(vec![hash_join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let mut nestloop = nestloop_join_node(
+        TJoinOp::INNER_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    nestloop
+        .nestloop_join_node
+        .as_mut()
+        .unwrap()
+        .common_slot_map = common();
+    let nestloop_plan = TPlan::new(vec![nestloop, scan_node(0, 0), scan_node(1, 1)]);
+
+    for (label, plan, desc) in [
+        ("SELECT_NODE", select_plan, base_desc()),
+        ("HASH_JOIN_NODE", hash_plan, join_desc()),
+        ("NESTLOOP_JOIN_NODE", nestloop_plan, join_desc()),
+    ] {
+        let err = translate_fragment(&params(Some(plan), Some(desc), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(reason, "common slots are only materialized on PROJECT_NODE");
     }
 }
 

@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
+use starrocks_thrift::types::TSlotId;
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
@@ -69,6 +72,15 @@ impl<'a> PlanContext<'a> {
     /// Creates an expression context for an expression over `row_tuples`.
     fn expr_context<'b>(&'b mut self, row_tuples: &'b [i32]) -> ExprContext<'b> {
         ExprContext::new(self.desc, self.registry, row_tuples)
+    }
+
+    /// Creates an expression context with synthetic slot-to-column mappings.
+    fn expr_context_with_slots<'b>(
+        &'b mut self,
+        row_tuples: &'b [i32],
+        slot_overrides: &'b std::collections::HashMap<(i32, i32), usize>,
+    ) -> ExprContext<'b> {
+        ExprContext::with_slot_overrides(self.desc, self.registry, row_tuples, slot_overrides)
     }
 }
 
@@ -262,6 +274,26 @@ fn translate_scan(
     apply_conjuncts(input, node, ctx)
 }
 
+/// Refuses a node whose `common_slot_map` this translator does not materialize.
+///
+/// Only `PROJECT_NODE` appends its common slots. On every other node carrying the field the
+/// shared sub-expressions would be read past: a conjunct or key that references one of them then
+/// fails later with an opaque descriptor error (`slot N (tuple T) is not part of row_tuples`),
+/// and a map nothing references is silently ignored. Report the unsupported shape up front.
+fn reject_common_slots(
+    node: &TPlanNode,
+    common_slot_map: Option<&BTreeMap<TSlotId, TExpr>>,
+) -> Result<()> {
+    if common_slot_map.is_some_and(|map| !map.is_empty()) {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "common slots are only materialized on PROJECT_NODE",
+        });
+    }
+    Ok(())
+}
+
 /// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
 fn translate_select(
     node: &TPlanNode,
@@ -269,6 +301,12 @@ fn translate_select(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 1)?;
+    reject_common_slots(
+        node,
+        node.select_node
+            .as_ref()
+            .and_then(|select| select.common_slot_map.as_ref()),
+    )?;
     apply_conjuncts(children.into_iter().next().unwrap(), node, ctx)
 }
 
@@ -631,6 +669,12 @@ fn translate_hash_join(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 2)?;
+    reject_common_slots(
+        node,
+        node.hash_join_node
+            .as_ref()
+            .and_then(|join| join.common_slot_map.as_ref()),
+    )?;
     let join = node
         .hash_join_node
         .as_ref()
@@ -821,6 +865,7 @@ fn translate_nestloop_join(
             context: "NESTLOOP_JOIN_NODE",
             field: "nestloop_join_node",
         })?;
+    reject_common_slots(node, join.common_slot_map.as_ref())?;
     match join.join_op {
         None | Some(TJoinOp::CROSS_JOIN) | Some(TJoinOp::INNER_JOIN) => {}
         Some(_) => {
@@ -997,6 +1042,19 @@ fn translate_project_node(
         node.row_tuples.clone()
     };
 
+    let output_tuple = output_tuples[0];
+    let mut input = child;
+    let mut common_slots = std::collections::HashMap::new();
+    for (&slot_id, expr) in project_node.common_slot_map.as_ref().into_iter().flatten() {
+        let expression = {
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            expr.translate(&mut expr_ctx)?
+        };
+        let field = input.output_width;
+        input = append_project(input, expression);
+        common_slots.insert((output_tuple, slot_id), field);
+    }
+
     let mut expressions = Vec::new();
     for &tuple_id in &output_tuples {
         for slot_id in ctx.desc.materialized_slot_ids(tuple_id)? {
@@ -1006,12 +1064,12 @@ fn translate_project_node(
                     node.node_id, slot_id
                 ))
             })?;
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
     }
 
-    Ok(project_rel(child, expressions, output_tuples))
+    Ok(project_rel(input, expressions, output_tuples))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
