@@ -31,6 +31,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_batch_layout.hpp>
+#include <op/scan/parquet_byte_range.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_materialize.hpp>
 #include <op/scan/parquet_metadata.hpp>
@@ -859,6 +860,14 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _file_paths = bind.resolved_file_paths;
+  if (!bind.resolved_file_ranges.empty() &&
+      bind.resolved_file_ranges.size() != bind.resolved_file_paths.size()) {
+    throw sirius::invalid_input_exception(
+      "parquet scan carries {} byte ranges for {} files; a partial pairing would make "
+      "row-group ownership ambiguous",
+      bind.resolved_file_ranges.size(),
+      bind.resolved_file_paths.size());
+  }
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -1242,6 +1251,24 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
+  // Distributed byte-range split: keep only the row groups this file's ranges own (start-offset
+  // containment, parquet_byte_range.hpp), BEFORE stats pruning. Several ranges of one file
+  // take the union. An empty selection is a valid empty split and flows through the
+  // all-pruned fallback below — never a whole-file read.
+  if (!_info->reads_whole_file(file_index)) {
+    std::vector<cudf::size_type> owned;
+    for (auto const& [start, length] : _info->resolved_file_ranges[file_index]) {
+      auto const in_range = detail::row_groups_in_byte_range(metadata, start, length);
+      owned.insert(owned.end(), in_range.begin(), in_range.end());
+    }
+    std::sort(owned.begin(), owned.end());
+    owned.erase(std::unique(owned.begin(), owned.end()), owned.end());
+    SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] {} byte range(s) of {} own {} row group(s)",
+                     _info->resolved_file_ranges[file_index].size(),
+                     file_path,
+                     owned.size());
+    row_group_indices = std::move(owned);
+  }
   // Virtual columns are not available to the reader, but physical footer pruning is.
   if (ast_expression) {
     auto const rgs_before = row_group_indices.size();
@@ -1525,6 +1552,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       if (!evidence->etag[evidence_index].empty()) {
         input_identity += "|etag=" + evidence->etag[evidence_index];
       }
+    }
+  }
+  // A byte-range split holds only the row groups its ranges own, so it is a different input
+  // from a whole-file read of the same file.
+  if (!_info->reads_whole_file(file_index)) {
+    for (auto const& [start, length] : _info->resolved_file_ranges[file_index]) {
+      input_identity += "|range=" + std::to_string(start) + "+" + std::to_string(length);
     }
   }
   out->set_contract_payload(
