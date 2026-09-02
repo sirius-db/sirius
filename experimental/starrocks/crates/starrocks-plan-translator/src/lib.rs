@@ -50,7 +50,7 @@
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
 //! | `CAST_EXPR`       | cast (throwing failure behavior) |
 //! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
-//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
@@ -64,6 +64,12 @@
 //! decimal precision &gt; 38 (both exceed the i128 decimal encoding), and
 //! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
 //! support lands.
+//!
+//! Decimal arithmetic is **not exact**. `ARITHMETIC_EXPR` over decimal operands, and decimal
+//! `sum`/`avg`, are evaluated in FP64 because the GPU expression and aggregate paths cannot
+//! consume decimal arithmetic; decimal slots of precision &gt; 18 likewise map to FP64. Results
+//! are not cast back, so a column the frontend declared DECIMAL can arrive as a double and
+//! differ from StarRocks in its final digits.
 //!
 //! # Adding a node
 //!
