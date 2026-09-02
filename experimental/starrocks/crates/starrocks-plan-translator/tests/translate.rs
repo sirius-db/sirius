@@ -1779,6 +1779,20 @@ fn decimal_literal_encodes_little_endian_unscaled_value() {
     }
 }
 
+/// A decimal literal wider than 18 digits follows the slot rule and is emitted as FP64.
+#[test]
+fn wide_decimal_literal_is_lowered_to_fp64() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        decimal_literal("1.5", 19, 2),
+    ));
+    match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+        expression::literal::LiteralType::Fp64(value) => assert_eq!(*value, 1.5),
+        other => panic!("expected fp64 literal, got {other:?}"),
+    }
+}
+
 /// Verifies an integer literal that overflows its declared width is a malformed plan.
 #[test]
 fn integer_literal_overflowing_declared_width_is_error() {

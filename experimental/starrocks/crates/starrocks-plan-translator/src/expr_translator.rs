@@ -679,12 +679,14 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
     }
     let return_primitive = type_mapper::scalar_primitive(&function.ret_type)?;
     let decimal_result = is_decimal(&function.ret_type)?;
-    // Temporal AVG has StarRocks-specific rounding semantics. Decimal SUM/AVG are lowered to FP64
-    // below because the Sirius GPU expression/aggregate path cannot consume decimal arithmetic.
+    // Decimal SUM/AVG are lowered to FP64 below because the Sirius GPU expression/aggregate
+    // path cannot consume decimal arithmetic; every other avg return type (temporal avg's
+    // StarRocks-specific rounding, in particular) has no GPU lowering.
     if name == "avg" && return_primitive != TPrimitiveType::DOUBLE && !decimal_result {
         return Err(TranslateError::UnsupportedExpression {
             node_type: root.node_type,
-            reason: "temporal avg is not supported",
+            reason: "avg is only supported where it lowers to the GPU's FP64 avg \
+                     (DOUBLE and DECIMAL inputs)",
         });
     }
 

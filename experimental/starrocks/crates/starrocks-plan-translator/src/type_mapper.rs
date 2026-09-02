@@ -221,3 +221,25 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
 
     Ok(Type { kind: Some(kind) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decimal(precision: i32) -> TScalarType {
+        TScalarType::new(TPrimitiveType::DECIMAL128, None, Some(precision), Some(2))
+    }
+
+    /// Precision 18 is the last width kept as DECIMAL; 19 and up lower to FP64.
+    #[test]
+    fn decimal_precision_boundary_is_18() {
+        assert!(matches!(
+            map_scalar_type(&decimal(18), true).unwrap().kind,
+            Some(r#type::Kind::Decimal(_))
+        ));
+        assert!(matches!(
+            map_scalar_type(&decimal(19), true).unwrap().kind,
+            Some(r#type::Kind::Fp64(_))
+        ));
+    }
+}
