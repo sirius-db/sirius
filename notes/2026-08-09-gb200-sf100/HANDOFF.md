@@ -3,7 +3,7 @@
 > # ✅ RESOLVED 2026-08-09 05:15 UTC
 >
 > **Everything in the "next steps" section below is DONE.** Read
-> [`benchmark-results/cn-distribution-and-numa.md`](../benchmark-results/cn-distribution-and-numa.md)
+> `benchmark-results/cn-distribution-and-numa.md`
 > and `OPEN-ISSUES.md` **M6** instead. This document is kept for the retraction table and the
 > traps, which are still accurate.
 >

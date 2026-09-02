@@ -240,10 +240,7 @@ mod ffi {
         /// # Safety
         /// `out_stream_addr` must be the address of a valid, writable
         /// `ArrowArrayStream` that outlives this call.
-        unsafe fn result_to_arrow(
-            self: Pin<&mut Fragment>,
-            out_stream_addr: usize,
-        ) -> Result<()>;
+        unsafe fn result_to_arrow(self: Pin<&mut Fragment>, out_stream_addr: usize) -> Result<()>;
 
         /// Batches currently parked on an output stream — the evidence that a
         /// fragment boundary carried native batches rather than nothing.

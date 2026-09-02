@@ -797,7 +797,7 @@ The engine-side `torn_down` check is naturally inert when nothing ever posts `Dr
 
 If §4.5's watch item fires, add `SIRIUS_CN_PARK_TEARDOWN_ON_QUERY_FINISHED` (default `true`) so
 teardown can be limited to the abort reasons while `QUERY_FINISHED` reverts to the stub. Do not add
-this pre-emptively.
+this preemptively.
 
 ---
 

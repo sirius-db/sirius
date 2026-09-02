@@ -38,7 +38,7 @@ demand becomes a function of *pool health* rather than of the query, which is wh
 | Datasets | SF500 f64 `/opt/dlami/nvme/tpch/tpch_parquet_sf500_f64`; SF300 f64 `/opt/dlami/nvme/tpch/tpch_parquet_sf300_f64`; SF100 f64 `/opt/dlami/nvme/tpch/tpch_parquet_sf100_f64`. (`/home/ubuntu/tpch_parquet_sf100` also exists but is the **DECIMAL** dataset, not the float64 twin.) |
 | Bring-up | `/opt/dlami/nvme/sirius-build/up-sf500-x.sh` — every knob is an env var |
 | Healthy baseline | `GPU_MEM=60GiB STAGING=32GiB HOST_MEM=200GiB HPB=1GiB MBHT=2GiB STB=1GiB CBB=1GiB` → SF500 **21/22** (only q09 fails) |
-| Context doc | [`../SF500-CONFIG-AND-ARCHITECTURE.md`](../SF500-CONFIG-AND-ARCHITECTURE.md) |
+| Context doc | [`../SF500-CONFIG-AND-ARCHITECTURE.md`](../../bench/rtxpro6000-2gpu/SF500-CONFIG-AND-ARCHITECTURE.md) |
 
 ### 2.1 The staging arena
 
@@ -376,7 +376,7 @@ partial …`, emitted at `src/pipeline/gpu_pipeline_executor.cpp:262-270`). Dist
 "bytes freed" field across all 356 events: `{0}`.
 
 So under exchange pressure the spill machinery is a no-op. This is load-bearing for
-[§8.6](#86-option-6--spill-staged-batches-to-host-memory).
+[§8.6](#86-option-6--spill-staged-batches-to-host-memory-under-arena-pressure).
 
 ---
 

@@ -4,8 +4,8 @@ Two Sirius compute-node processes on one host, splitting the GPU, executing the 
 single query across both — with the split configurable through `EngineConfig`, and **cross-node
 transport with nixl as the final goal** (M6.x), reached through a brpc/Arrow correctness baseline
 first. Extends the single-node native-batch exchange documented in
-[new-exchange-design.md](new-exchange-design.md); the transport tiers and memory constraints come
-from [old-exchange-design.md](old-exchange-design.md) §5–§6, whose upstream source
+[new-exchange-design.md](../2026-07-26-streaming/new-exchange-design.md); the transport tiers and memory constraints come
+from [old-exchange-design.md](../2026-07-26-streaming/old-exchange-design.md) §5–§6, whose upstream source
 (mbrobbel/sirius `starrocks-exchange-design`) is byte-identical to the local copy, and whose doris
 prior art is reachable in this repo's git objects at `origin/doris` (head `9d3d7fe9` —
 `doris/crates/doris-rpc/src/{nixl_exchange,nixl_service,gpu_staging_buffer}.rs`, line citations

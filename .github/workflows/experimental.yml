@@ -45,6 +45,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: git submodule update --init --depth=1 --jobs 2 experimental/starrocks/starrocks experimental/starrocks/brpc
 
+      # The CN's build.rs refuses to build unless internal_service.proto declares the Sirius
+      # exchange RPCs, which are not upstream. `git submodule update` above resets the tree,
+      # so the patch has to be re-applied here. The reverse-check keeps this a no-op on a
+      # runner that already has a patched tree.
+      - name: Patch starrocks proto
+        working-directory: ${{ github.workspace }}
+        run: |
+          patch=experimental/starrocks/patches/nixl-exchange-proto.patch
+          git -C experimental/starrocks/starrocks apply --reverse --check "$GITHUB_WORKSPACE/$patch" 2>/dev/null \
+            || git -C experimental/starrocks/starrocks apply "$GITHUB_WORKSPACE/$patch"
+
       - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: false

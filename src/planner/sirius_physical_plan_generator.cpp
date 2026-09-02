@@ -374,7 +374,7 @@ void wrap_table_scan_source(
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     // Parquet applies AST filters in the reader; post-decode uses membership only.
-    leaf = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params, context),
+    leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params, context),
                               scan,
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,

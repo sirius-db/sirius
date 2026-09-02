@@ -50,7 +50,7 @@ q22 r0 cold pass 1890ms rows=7
 q22 r1 warm pass 751ms rows=7
 q22 r2 warm pass 2398ms rows=7
 q22 r3 warm pass 2154ms rows=7
-q02 r0 cold REFUSED: ERROR 5024 (53400) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable and retry 
+q02 r0 cold REFUSED: ERROR 5024 (53400) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable and retry
 restarting cluster...
 q17 r0 cold pass 10809ms rows=1
 q17 r1 warm pass 8372ms rows=1

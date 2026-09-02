@@ -37,9 +37,7 @@ pub fn parse_script(script: &str) -> Result<Vec<AdminCommand>, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        commands.push(
-            parse_line(line).map_err(|err| format!("line {}: {err}", index + 1))?,
-        );
+        commands.push(parse_line(line).map_err(|err| format!("line {}: {err}", index + 1))?);
     }
     if commands.is_empty() {
         return Err(format!("empty script; supported commands: {GRAMMAR}"));

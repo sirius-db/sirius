@@ -998,8 +998,8 @@ std::vector<build_probe_slot_view> sirius_physical_hash_join::snapshot_build_pro
   return slots;
 }
 
-std::vector<std::size_t> build_only_slots_to_discard(std::vector<build_probe_slot_view> const& slots,
-                                                     bool probe_finished)
+std::vector<std::size_t> build_only_slots_to_discard(
+  std::vector<build_probe_slot_view> const& slots, bool probe_finished)
 {
   std::vector<std::size_t> to_discard;
   if (!probe_finished) { return to_discard; }

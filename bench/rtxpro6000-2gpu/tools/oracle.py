@@ -40,7 +40,9 @@ def fmt(v):
     return str(v)
 
 
-names = sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(qdir, "q*.sql")))
+names = sorted(
+    os.path.basename(p)[:-4] for p in glob.glob(os.path.join(qdir, "q*.sql"))
+)
 if only:
     names = [n for n in names if n in only]
 

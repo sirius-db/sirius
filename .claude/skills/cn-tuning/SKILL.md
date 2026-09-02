@@ -45,4 +45,4 @@ Open work on derivation: [`notes/OPEN.md`](../../../notes/OPEN.md) PLAN-03.
 5. If shuffle queries OOM at HASH_JOIN after a healthy arena, the lever is **operator budgets** (path B), not another STAGING bump.
 6. Confirm the CN log line `exchange staging arena: N bytes` matches what you passed. Teardown `high water N of M` is the measurement — 50% of those lines are lost if you kill CNs inside SHUTDOWN_GRACE.
 
-`use_odirect` is catastrophic on NFS (OPEN M4). Do not flip `use_sirius_datasource` to “fix” that.
+`use_odirect` is catastrophic on NFS (OPEN M4). Do not flip `use_sirius_datasource` to "fix" that.

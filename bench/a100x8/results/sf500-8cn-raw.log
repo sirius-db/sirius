@@ -59,6 +59,6 @@ q17 r2 warm pass 4209ms rows=1
 q17 r3 warm pass 4435ms rows=1
 q21 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: request_staging_lease failed with status 6: staging lease of 260369088 bytes failed: exchange staging arena exhausted: requested 2
 restarting cluster...
-q02 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable, pending time:0 
+q02 r0 cold REFUSED: ERROR 1064 (HY000) at line 1: Query reached its timeout of 300 seconds, please increase the 'query_timeout' session variable, pending time:0
 restarting cluster...
 == bench complete: /tmp/bench/sf500-8cn/timings.csv ==

@@ -51,9 +51,9 @@ bool want_fabric_arena()
   if (kind == nullptr) { return false; }
   if (std::strcmp(kind, "fabric") == 0) { return true; }
   if (std::strcmp(kind, "cudamalloc") == 0) { return false; }
-  throw sirius::invalid_input_exception(
-    std::string(exchange_staging_arena::kArenaKindEnvVar) +
-    ": expected \"fabric\" or \"cudamalloc\", got \"" + kind + "\"");
+  throw sirius::invalid_input_exception(std::string(exchange_staging_arena::kArenaKindEnvVar) +
+                                        ": expected \"fabric\" or \"cudamalloc\", got \"" + kind +
+                                        "\"");
 }
 }  // namespace
 
@@ -294,14 +294,18 @@ void exchange_staging_arena::release(std::uint64_t offset)
 std::uint64_t exchange_staging_arena::total_free_locked() const
 {
   std::uint64_t sum = 0;
-  for (const auto& [offset, len] : free_) { sum += len; }
+  for (const auto& [offset, len] : free_) {
+    sum += len;
+  }
   return sum;
 }
 
 std::uint64_t exchange_staging_arena::largest_free_locked() const
 {
   std::uint64_t best = 0;
-  for (const auto& [offset, len] : free_) { best = std::max(best, len); }
+  for (const auto& [offset, len] : free_) {
+    best = std::max(best, len);
+  }
   return best;
 }
 

@@ -261,7 +261,8 @@ def _is_pin_timeout(text):
         "rpc failed" in t
         or "timeout" in t
         or "timed out" in t
-        or "executecommand" in t and "fail" in t
+        or "executecommand" in t
+        and "fail" in t
     )
 
 
@@ -491,9 +492,7 @@ def admin_execute_on(mysql: MysqlClient, node_id, script, timeout=620):
                 f"watch CN log for pin_table finished): {out.strip()[-1500:]}"
             )
         if _is_validate_error(out) or rc != 0:
-            log(
-                f"PIN CN{node_id} try {attempt} failed: {out.strip()[:300]}"
-            )
+            log(f"PIN CN{node_id} try {attempt} failed: {out.strip()[:300]}")
             if attempt == PIN_RETRY_VALIDATE:
                 break
             time.sleep(PIN_RETRY_SLEEP_S)
@@ -589,9 +588,7 @@ def run_grouped(
             for it in range(iterations):
                 if pin_enabled and not pinned and it >= pin_after_iteration:
                     log(f"  Pinning tables for q{qnum} (from iter{it})")
-                    pin_all_cns(
-                        mysql, emit_admin_pin(qnum, data_dir, tier=pin)
-                    )
+                    pin_all_cns(mysql, emit_admin_pin(qnum, data_dir, tier=pin))
                     pinned = True
                 log(f"--- q{qnum} iter{it} engine=starrocks ---")
                 rc, out, elapsed = run_one_query(mysql, sql, query_timeout)
@@ -631,9 +628,7 @@ def run_sequential(
         for it in range(iterations):
             if pin_enabled and not pinned and it >= pin_after_iteration:
                 log(f"  Pinning all tables (from pass {it})")
-                pin_all_cns(
-                    mysql, emit_admin_pin_all(data_dir, tier=pin)
-                )
+                pin_all_cns(mysql, emit_admin_pin_all(data_dir, tier=pin))
                 pinned = True
             for qnum in queries:
                 sql = load_query_sql(qnum, data_dir, scale_factor)
@@ -683,7 +678,14 @@ def write_validation_csv(benchmark_dir, queries, duckdb_results_dir):
                 status = "row_count_match"
             else:
                 status = "row_count_mismatch"
-            w.writerow([f"q{qnum}", sc if sc is not None else "", dc if dc is not None else "", status])
+            w.writerow(
+                [
+                    f"q{qnum}",
+                    sc if sc is not None else "",
+                    dc if dc is not None else "",
+                    status,
+                ]
+            )
             log(f"validation q{qnum}: {status} (starrocks={sc} duckdb={dc})")
     log(
         "validation.csv compares row counts only. StarRocks FILES() SQL is not "

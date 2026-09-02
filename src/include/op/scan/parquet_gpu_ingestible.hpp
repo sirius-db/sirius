@@ -96,7 +96,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   /// can be served by selecting whole chunks. The query read path keeps fused
   /// batches (false).
   bool batch_within_file_boundaries = false;
-  std::size_t scan_output_arity      = 0;
+  std::size_t scan_output_arity     = 0;
 
   parquet_ingestible_table_info() = default;
 

@@ -1,8 +1,8 @@
 # TPC-H Benchmark Plan — 8× A100-SXM4-80GB
 
-**Box:** [`HARDWARE.md`](HARDWARE.md) · **Query set:** [`../common/QUERYSET.md`](../common/QUERYSET.md)
-**Engine A config:** [`engine-a-sirius.yaml`](engine-a-sirius.yaml)
-**Re-targeting:** [`../common/RETARGETING.md`](../common/RETARGETING.md) · **Sibling:** [`../gb200-4gpu/`](../gb200-4gpu/)
+**Box:** [`HARDWARE.md`](../../bench/a100x8/HARDWARE.md) · **Query set:** `../common/QUERYSET.md`
+**Engine A config:** [`engine-a-sirius.yaml`](../../bench/a100x8/engine-a-sirius.yaml)
+**Re-targeting:** [`../common/RETARGETING.md`](../../bench/common/RETARGETING.md) · **Sibling:** `../gb200-4gpu/`
 
 No configuration values live in this file — they are in the per-engine files.
 
@@ -32,7 +32,7 @@ confirm the target is local NVMe (`findmnt -T`), not network storage.
 
 ## What makes this box different from the GB200
 
-Read [`HARDWARE.md`](HARDWARE.md) for the full comparison. Three items change the studies:
+Read [`HARDWARE.md`](../../bench/a100x8/HARDWARE.md) for the full comparison. Three items change the studies:
 
 1. **80 GiB/GPU → a ~68 GiB usable pool** vs the GB200's ~159 GiB. Per-GPU working room is the
    binding constraint, and it drives every regime decision below.
@@ -104,10 +104,10 @@ data — hardware exactly matched.
 
 | Audit finding | Fix |
 |---|---|
-| A numerically wrong on 6 queries | Tier 3 excluded from aggregates ([`../common/QUERYSET.md`](../common/QUERYSET.md)) |
+| A numerically wrong on 6 queries | Tier 3 excluded from aggregates (`../common/QUERYSET.md`) |
 | C ran `--interleave=all` — 11.4% slower | Harmless *on this box* (no GPU HBM nodes), but prefer per-worker `bind_to_gpu(hardware_binding)` anyway |
 | "cold" was first-touch, not cache-dropped | `drop_caches` for A; `--io-mode cold` for C — **symmetric** |
-| A used KvikIO | uring datasource, tuned — [`engine-a-sirius.yaml`](engine-a-sirius.yaml) |
+| A used KvikIO | uring datasource, tuned — [`engine-a-sirius.yaml`](../../bench/a100x8/engine-a-sirius.yaml) |
 | A capped, no spill; C spills | A's `downgrade_*` + disk spill root. **Verify it engages under a CN** |
 | C from `--iterations 1` | `--iterations 4`: run 0 cold, 1–3 timed |
 

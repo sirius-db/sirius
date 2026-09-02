@@ -458,11 +458,10 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
       _num_partitions = 1;
       sizing_partition.set_num_partitions(1);
     } else {
-      partition_sizing_input const in{
-        /*total_bytes=*/0,
-        sizing_partition._is_build,
-        has_build_concat(*this) || has_build_concat(sizing_partition),
-        /*combined_total_bytes=*/0};
+      partition_sizing_input const in{/*total_bytes=*/0,
+                                      sizing_partition._is_build,
+                                      has_build_concat(*this) || has_build_concat(sizing_partition),
+                                      /*combined_total_bytes=*/0};
       auto const strategy = consumer->get_partition_strategy(in);
       if (strategy.build_probe) {
         // Mirror the task-time sizing block's fold wiring. With zero build batches there is

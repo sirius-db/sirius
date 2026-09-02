@@ -2382,11 +2382,17 @@ void SiriusExtension::RegisterPinTableFunctions(CatalogTransaction& transaction,
   add_pin_table_overload({LogicalType::VARCHAR});
   add_pin_table_overload({});
   CreateTableFunctionInfo pin_table_info(pin_table_set);
+  // Both callers can land on the same catalog: sirius_ffi.cpp registers these on its embedded
+  // DuckDB, and in a binary that links the extension statically (the unit tests) that instance
+  // has already auto-loaded Load() -> RegisterGPUFunctions -> here. The definitions are
+  // identical either way, so the second call should be a no-op rather than ENTRY_ALREADY_EXISTS.
+  pin_table_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
   catalog.CreateTableFunction(transaction, pin_table_info);
 
   TableFunction unpin_table(
     "unpin_table", {LogicalType::VARCHAR}, UnpinTableFunction, UnpinTableBind);
   CreateTableFunctionInfo unpin_table_info(unpin_table);
+  unpin_table_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
   catalog.CreateTableFunction(transaction, unpin_table_info);
 }
 

@@ -1,8 +1,8 @@
 # TPC-H Benchmark Plan — `presto-gb200-gcn-17` (4× GB200)
 
-**Box:** [`HARDWARE.md`](HARDWARE.md) · **Query set:** [`QUERYSET.md`](../common/QUERYSET.md)
-**Engines:** [A — Sirius](engine-a-sirius.md) · [B — StarRocks](engine-b-starrocks.md) · [C — cudf-polars](engine-c-cudf-polars.md)
-**Re-targeting:** [`RETARGETING.md`](../common/RETARGETING.md) · **Derived from:** [`../../TPCH-BENCHMARK-BRIEF.md`](../../TPCH-BENCHMARK-BRIEF.md)
+**Box:** [`HARDWARE.md`](../../bench/gb200-4gpu/HARDWARE.md) · **Query set:** `QUERYSET.md`
+**Engines:** A — Sirius · B — StarRocks · C — cudf-polars
+**Re-targeting:** [`RETARGETING.md`](../../bench/common/RETARGETING.md) · **Derived from:** [`../../TPCH-BENCHMARK-BRIEF.md`](TPCH-BENCHMARK-BRIEF.md)
 
 This plan contains **no configuration values**. Every engine's settings live in that engine's own
 file so the folder can be re-targeted by swapping `HARDWARE.md` and the three engine configs.
@@ -100,10 +100,10 @@ is exactly matched — which is the one thing the SF100 three-way comparison cou
 
 | Audit finding | Fix here |
 |---|---|
-| A numerically wrong on 6 queries | Tier 3 excluded from aggregates; defect magnitude reported separately ([`QUERYSET.md`](../common/QUERYSET.md)) |
-| C ran `--interleave=all` — **11.4% slower on 22/22** | Never `--interleave=all` on this box. See [`engine-c-cudf-polars.md`](engine-c-cudf-polars.md) |
+| A numerically wrong on 6 queries | Tier 3 excluded from aggregates; defect magnitude reported separately (`QUERYSET.md`) |
+| C ran `--interleave=all` — **11.4% slower on 22/22** | Never `--interleave=all` on this box. See `engine-c-cudf-polars.md` |
 | "cold" was first-touch, not cache-dropped | `drop_caches` before each run for A; `--io-mode cold` for C — **symmetric** |
-| A used KvikIO, not the fastest path | Sirius uring datasource, tuned. See [`engine-a-sirius.md`](engine-a-sirius.md) |
+| A used KvikIO, not the fastest path | Sirius uring datasource, tuned. See `engine-a-sirius.md` |
 | A capped with no spill; C spills device→host | A's `downgrade_*` path + disk spill root closes this. **Verify it engages under a CN** |
 | C quoted from `--iterations 1` | `--iterations 4`: run 0 cold, 1–3 timed |
 

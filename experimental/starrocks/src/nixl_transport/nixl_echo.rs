@@ -106,7 +106,11 @@ impl Config {
             "echo" => Role::Echo,
             other => panic!("NIXL_ECHO_ROLE must be 'origin' or 'echo', not '{other}'"),
         };
-        let role_name = if role == Role::Origin { "origin" } else { "echo" };
+        let role_name = if role == Role::Origin {
+            "origin"
+        } else {
+            "echo"
+        };
         let sizes = env_or("NIXL_ECHO_SIZES", DEFAULT_SIZES)
             .split(',')
             .map(|value| value.trim().parse::<u64>().expect("payload size in bytes"))
@@ -599,9 +603,14 @@ fn run_origin(config: &Config) {
         for step in 0..(config.warmup + config.iterations) {
             send_text(&mut control, &format!("go {nbytes}"));
             let start = Instant::now();
-            let out =
-                write_and_wait(endpoint.agent(), &peer.name, out_addr, peer.inbox_addr, nbytes)
-                    .expect("leg 1: nixl WRITE to the echo host");
+            let out = write_and_wait(
+                endpoint.agent(),
+                &peer.name,
+                out_addr,
+                peer.inbox_addr,
+                nbytes,
+            )
+            .expect("leg 1: nixl WRITE to the echo host");
             // The echo host cannot see the WRITE land (it is one-sided), so tell it.
             send_text(&mut control, &format!("sent {nbytes}"));
             let echoed = recv_text(&mut control);
@@ -745,7 +754,10 @@ fn run_echo(config: &Config) {
             ),
             Err(detail) => send_text(&mut control, &format!("corrupt {detail}")),
         }
-        send_text(&mut control, &after.tx.saturating_sub(before.tx).to_string());
+        send_text(
+            &mut control,
+            &after.tx.saturating_sub(before.tx).to_string(),
+        );
         eprintln!("[echo] {nbytes}B phase complete");
     }
 

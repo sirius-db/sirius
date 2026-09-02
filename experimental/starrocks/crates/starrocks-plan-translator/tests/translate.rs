@@ -4259,12 +4259,7 @@ fn stale_tuple_ids_from_a_multi_stage_distinct_resolve_by_slot_id() {
             slot(2, 2, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
             slot(9, 2, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
             slot(9, 3, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(
-                23,
-                3,
-                "supplier_cnt",
-                scalar_type(TPrimitiveType::BIGINT),
-            ),
+            slot(23, 3, "supplier_cnt", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -5738,18 +5733,8 @@ fn consumed_common_desc() -> TDescriptorTable {
             slot(21, 1, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
             slot(27, 1, "disc_price", scalar_type(TPrimitiveType::DOUBLE)),
             hidden,
-            slot(
-                36,
-                2,
-                "promo_revenue",
-                scalar_type(TPrimitiveType::DOUBLE),
-            ),
-            slot(
-                37,
-                2,
-                "total_revenue",
-                scalar_type(TPrimitiveType::DOUBLE),
-            ),
+            slot(36, 2, "promo_revenue", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(37, 2, "total_revenue", scalar_type(TPrimitiveType::DOUBLE)),
         ],
     )
 }
@@ -6061,12 +6046,7 @@ fn common_slot_consumed_beyond_the_aggregate_fails_loudly() {
             slot(21, 1, "p_type", scalar_type(TPrimitiveType::VARCHAR)),
             slot(27, 1, "disc_price", scalar_type(TPrimitiveType::DOUBLE)),
             hidden,
-            slot(
-                36,
-                2,
-                "total_revenue",
-                scalar_type(TPrimitiveType::DOUBLE),
-            ),
+            slot(36, 2, "total_revenue", scalar_type(TPrimitiveType::DOUBLE)),
             slot(40, 3, "promo", scalar_type(TPrimitiveType::DOUBLE)),
         ],
     );

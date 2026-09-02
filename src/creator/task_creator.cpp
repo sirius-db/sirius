@@ -406,7 +406,9 @@ void task_creator::manager_loop()
         // pool capacity cannot block on this thread; and nothing after the signal may touch
         // the pipeline or its operators, because it releases execute(), which destroys them.
         if (pipeline->is_pipeline_finished() && _task_scheduler != nullptr) {
-          { auto released = std::move(slot); }
+          {
+            auto released = std::move(slot);
+          }
           _task_scheduler->complete_query_if_finished();
         }
       }

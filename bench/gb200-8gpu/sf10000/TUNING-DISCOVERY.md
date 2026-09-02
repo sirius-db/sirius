@@ -93,4 +93,3 @@ GPU_MEM=96GiB STAGING=80GiB PIPELINE_DOP=9 ./bench/gb200-8gpu/sweep.sh 10000 q07
 
 Pass explicit `GPU_MEM` / `STAGING` / `PIPELINE_DOP` on relaunch and sweep. Persistent
 shell exports override `env.sh` `${VAR:-default}`.
-

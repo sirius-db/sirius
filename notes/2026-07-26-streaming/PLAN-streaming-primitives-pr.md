@@ -49,7 +49,7 @@ otherwise look for the channel. Backpressure design itself is explicitly **out o
 ## The evidence base
 
 Every claim below about what is load-bearing comes from
-[`status-next-steps.md`](status-next-steps.md) and [`HANDOFF.md`](HANDOFF.md) in this directory —
+`status-next-steps.md` and [`HANDOFF.md`](../2026-08-09-gb200-sf100/HANDOFF.md) in this directory —
 the demo branch ran TPC-H Q6 end to end over these primitives with the temp-parquet path deleted.
 That does not mean the demo work belongs in this PR; it means we know which lines of the primitives
 are actually exercised by a real query rather than only by a unit test.

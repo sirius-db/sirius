@@ -32,7 +32,9 @@ def read_tsv(path):
 
 
 rows = []
-for q in sorted({os.path.basename(p).split(".")[0] for p in glob.glob(os.path.join(sdir, "q*.out"))}):
+for q in sorted(
+    {os.path.basename(p).split(".")[0] for p in glob.glob(os.path.join(sdir, "q*.out"))}
+):
     # prefer the last warm run
     cands = sorted(glob.glob(os.path.join(sdir, f"{q}.r*.out")))
     opath = os.path.join(odir, f"{q}.tsv")
@@ -72,7 +74,9 @@ for q in sorted({os.path.basename(p).split(".")[0] for p in glob.glob(os.path.jo
                 elif a.strip() != b.strip():
                     bad += 1
         verdict = "MATCH" if bad == 0 else "VALUES-DIFFER"
-        detail = f"rows={len(srows)} maxreldiff={worst:.3e}" + (f" badcells={bad}" if bad else "")
+        detail = f"rows={len(srows)} maxreldiff={worst:.3e}" + (
+            f" badcells={bad}" if bad else ""
+        )
         break
     rows.append((q, verdict, detail, str(sn), str(len(orows))))
 

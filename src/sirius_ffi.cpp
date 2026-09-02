@@ -51,7 +51,7 @@
 #include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
-#include "sirius_extension.hpp"                        // duckdb::SiriusExtension (pin_table registration)
+#include "sirius_extension.hpp"  // duckdb::SiriusExtension (pin_table registration)
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
 #include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack

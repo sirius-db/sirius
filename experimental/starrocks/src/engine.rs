@@ -320,8 +320,7 @@ fn engine_thread(
                 let _ = respond.send(result);
             }
             EngineRequest::DropParked { slot, respond } => {
-                let result =
-                    release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
+                let result = release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
                 let _ = respond.send(result);
             }
             EngineRequest::PinTable { spec, respond } => {

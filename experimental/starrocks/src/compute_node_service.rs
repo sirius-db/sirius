@@ -755,9 +755,7 @@ impl ServiceCore {
         let mut lines = Vec::with_capacity(total);
         for (index, command) in commands.into_iter().enumerate() {
             let line = match &command {
-                crate::admin_command::AdminCommand::PinTable(spec) => {
-                    self.executor.pin_table(spec)
-                }
+                crate::admin_command::AdminCommand::PinTable(spec) => self.executor.pin_table(spec),
                 crate::admin_command::AdminCommand::UnpinTable { name } => {
                     self.executor.unpin_table(name)
                 }
@@ -1065,15 +1063,15 @@ impl ServiceCore {
                 ));
             }
             let route = self.route_destination(destination)?;
-            if let DestinationRoute::Remote { host, brpc_port } = &route {
-                if self.transport.is_none() {
-                    return Err(format!(
-                        "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
-                         tier, which is not active: build the CN with the `nixl-transport` \
-                         feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
-                         exchange staging arena exists"
-                    ));
-                }
+            if let DestinationRoute::Remote { host, brpc_port } = &route
+                && self.transport.is_none()
+            {
+                return Err(format!(
+                    "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
+                     tier, which is not active: build the CN with the `nixl-transport` \
+                     feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
+                     exchange staging arena exists"
+                ));
             }
             slots.push(slot);
             routes.push(route);
@@ -1728,10 +1726,7 @@ mod tests {
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].name, "lineitem");
         assert_eq!(pins[0].tier, crate::fragment_executor::PinTier::Gpu);
-        assert_eq!(
-            pins[0].cols,
-            Some(vec!["a".to_string(), "b".to_string()])
-        );
+        assert_eq!(pins[0].cols, Some(vec!["a".to_string(), "b".to_string()]));
         assert_eq!(executor.unpins.lock().unwrap().as_slice(), ["old_pin"]);
     }
 

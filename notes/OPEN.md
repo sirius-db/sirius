@@ -5,7 +5,7 @@ to act on. Last synthesized 2026-08-26 from the 2026-08-20 RTX status and the 20
 audit.
 
 **Do not re-open:** FE auto-blacklist (M6, fixed 2026-08-09), GDS on GB200 C2C (M5, wont-fix),
-aarch64 UCX/nixl bring-up (M0.1–4), “nixl is the bottleneck” (#34), byte-range splits,
+aarch64 UCX/nixl bring-up (M0.1–4), "nixl is the bottleneck" (#34), byte-range splits,
 partitioned output, two-phase agg, the SF1 22/22 defect list (q02 wedge, arena leak, `year()`
 casts, sort-tuple order), ASSERT as a TPC-H blocker, the Path B L4 demo, or bump-allocator
 drift (free-list has landed).
@@ -19,10 +19,10 @@ written to run in a fresh session.
 
 | # | Item | Plan |
 |---|---|---|
-| 1 | **Copy-out on arrival** — batches accumulate in `SenderSource::Remote`; leases release only when the whole sender set closes. Arena demand = the receiver’s entire remote input. This is what SF500 q09 needs. | [PLAN-01](2026-08-20-rtx-sf500/PLAN-01-copy-out-on-arrival.md) |
+| 1 | **Copy-out on arrival** — batches accumulate in `SenderSource::Remote`; leases release only when the whole sender set closes. Arena demand = the receiver's entire remote input. This is what SF500 q09 needs. | [PLAN-01](2026-08-20-rtx-sf500/PLAN-01-copy-out-on-arrival.md) |
 | 2 | **Query-scoped park ownership + real `cancel_plan_fragment`** — 11.3 GiB parked-sender leak per q07 per CN; cancel is a stub. | [PLAN-02](2026-08-20-rtx-sf500/PLAN-02-park-ownership-teardown.md) |
 | 3 | **`derived_default_batch_size()` off the configured pool** + bring-up reject of `pool + arena + overhead > allocatable`. YAML path is partial; flag path still uses physical HBM. | [PLAN-03](2026-08-20-rtx-sf500/PLAN-03-batch-size-derivation.md) |
-| 4 | **Scheduler stall** — q21 600 s hang and 207 s of q07’s warm run; one un-cancellable fragment HOL-blocks the CN engine thread. | [PLAN-04](2026-08-20-rtx-sf500/PLAN-04-scheduler-stall.md) |
+| 4 | **Scheduler stall** — q21 600 s hang and 207 s of q07's warm run; one un-cancellable fragment HOL-blocks the CN engine thread. | [PLAN-04](2026-08-20-rtx-sf500/PLAN-04-scheduler-stall.md) |
 | 5 | **`bench.sh` harness** — no correctness gate; 0-row answers logged as wedges; FE `query_timeout` never raised from 300 s. | [PLAN-05](2026-08-20-rtx-sf500/PLAN-05-bench-harness.md) |
 | 6 | **q21 flake rate** — only 3 samples (pass / 600 s hang / pass). Produces the corpus PLAN-04 consumes. | [PLAN-06](2026-08-20-rtx-sf500/PLAN-06-q21-flake-quantification.md) |
 | 7 | **q15 intermittent 0 rows** — exact float equality against a GPU aggregate (13/30 at SF100). | [PLAN-07](2026-08-20-rtx-sf500/PLAN-07-q15-float-determinism.md) |
@@ -54,4 +54,4 @@ Retractions: [`2026-08-09-gb200-sf100/HANDOFF.md`](2026-08-09-gb200-sf100/HANDOF
 
 q08/q09 `FROM` reorder pending real `FILES()` statistics:
 [`experimental/starrocks/benchmarks/tpch/QUERY-DEVIATIONS.md`](../experimental/starrocks/benchmarks/tpch/QUERY-DEVIATIONS.md).
-Tracked as PLAN-08’s last bullet.
+Tracked as PLAN-08's last bullet.

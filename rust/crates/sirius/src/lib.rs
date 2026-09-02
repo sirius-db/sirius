@@ -396,10 +396,10 @@ impl Fragment<'_> {
         let mut offset = 0u64;
         let mut len = 0u64;
         let mut rows = 0u64;
-        let metadata = self
-            .inner
-            .pin_mut()
-            .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
+        let metadata =
+            self.inner
+                .pin_mut()
+                .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
         if metadata.is_null() {
             return Ok(None);
         }
@@ -653,7 +653,7 @@ mod tests {
         ));
         let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -681,7 +681,7 @@ mod tests {
         ));
         let batch = RecordBatch::try_new(schema.clone(), vec![prices, names]).unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -1342,6 +1342,17 @@ mod tests {
         ZeroCount,
     }
 
+    /// The column vectors of a merge-state exchange row, in schema order:
+    /// `(rf, ls, q_sum, a_sum, a_cnt, c_cnt)`.
+    type MergeStateColumns = (
+        Vec<&'static str>,
+        Vec<&'static str>,
+        Vec<Option<f64>>,
+        Vec<Option<f64>>,
+        Vec<i64>,
+        Vec<i64>,
+    );
+
     /// Writes the exchange row a merge fragment reads, in one of the [`States`] shapes.
     fn write_merge_states(path: &Path, states: States) {
         use arrow_array::Float64Array;
@@ -1354,14 +1365,7 @@ mod tests {
             Field::new("a_cnt", DataType::Int64, true),
             Field::new("c_cnt", DataType::Int64, true),
         ]));
-        let (rf, ls, q_sum, a_sum, a_cnt, c_cnt): (
-            Vec<&str>,
-            Vec<&str>,
-            Vec<Option<f64>>,
-            Vec<Option<f64>>,
-            Vec<i64>,
-            Vec<i64>,
-        ) = match states {
+        let (rf, ls, q_sum, a_sum, a_cnt, c_cnt): MergeStateColumns = match states {
             States::Normal => (
                 vec!["A", "A", "N", "N", "R", "R"],
                 vec!["F", "F", "O", "O", "F", "F"],
@@ -1967,7 +1971,7 @@ mod tests {
             // A merged count is `sum(BIGINT)`, which DuckDB binds to HUGEINT and hands back as
             // a 38-digit decimal.
             let c = count_values(batch.column(4));
-            for i in 0..batch.num_rows() {
+            for (i, &count) in c.iter().enumerate().take(batch.num_rows()) {
                 let measure = |values: &Float64Array, index: usize| {
                     if values.is_null(index) {
                         f64::NAN
@@ -1980,7 +1984,7 @@ mod tests {
                     ls.value(i).to_string(),
                     measure(q, i),
                     measure(a, i),
-                    c[i],
+                    count,
                 ));
             }
         }
@@ -2547,12 +2551,12 @@ mod tests {
                             .downcast_ref::<Float64Array>()
                             .unwrap();
                         let count = count_values(batch.column(3));
-                        for i in 0..batch.num_rows() {
+                        for (i, &count_value) in count.iter().enumerate().take(batch.num_rows()) {
                             rows.push((
                                 name.value(i).to_string(),
                                 sum.value(i),
                                 avg_sum.value(i),
-                                count[i],
+                                count_value,
                             ));
                         }
                     }
@@ -2605,8 +2609,8 @@ mod tests {
                             .downcast_ref::<Float64Array>()
                             .unwrap();
                         let count = count_values(batch.column(2));
-                        for i in 0..batch.num_rows() {
-                            rows.push((name.value(i).to_string(), sum.value(i), count[i]));
+                        for (i, &count_value) in count.iter().enumerate().take(batch.num_rows()) {
+                            rows.push((name.value(i).to_string(), sum.value(i), count_value));
                         }
                     }
                     rows.sort_by(|left, right| left.0.cmp(&right.0));

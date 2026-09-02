@@ -1922,9 +1922,7 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     // Exact match or strict file subset both pass here; the serve path
     // (try_match_cached_entry) additionally requires chunk provenance before it
     // serves a subset, because only provenance says which chunks hold which files.
-    if (matches_parquet_file_set(p->resolved_file_paths) == parquet_file_match::miss) {
-      return {};
-    }
+    if (matches_parquet_file_set(p->resolved_file_paths) == parquet_file_match::miss) { return {}; }
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {

@@ -7,12 +7,12 @@ box means editing a known, bounded set of values rather than re-deriving the ben
 
 | File | Hardware-dependent? | What to do |
 |---|---|---|
-| [`HARDWARE.md`](HARDWARE.md) | **Entirely** | **Replace.** Re-probe the new box and rewrite |
-| [`engine-a-sirius.yaml`](engine-a-sirius.yaml) | **Heavily** | Re-derive — see the table below |
-| [`engine-a-sirius.env`](engine-a-sirius.env) | **Heavily** | CN count, GPU/CPU/NUMA mapping, memory |
-| [`engine-b-starrocks.conf`](engine-b-starrocks.conf) | **Heavily** | BE count, `num_cores`, `mem_limit`, storage paths |
-| [`engine-c-cudf-polars.env`](engine-c-cudf-polars.env) | Moderately | `--num-gpus`, NUMA policy, thread counts |
-| [`PLAN.md`](PLAN.md) | Lightly | Campaign plans now live under `notes/` (dated). Keep a short local plan only if this box is still being designed |
+| `HARDWARE.md` | **Entirely** | **Replace.** Re-probe the new box and rewrite |
+| [`engine-a-sirius.yaml`](../a100x8/engine-a-sirius.yaml) | **Heavily** | Re-derive — see the table below |
+| `engine-a-sirius.env` | **Heavily** | CN count, GPU/CPU/NUMA mapping, memory |
+| `engine-b-starrocks.conf` | **Heavily** | BE count, `num_cores`, `mem_limit`, storage paths |
+| `engine-c-cudf-polars.env` | Moderately | `--num-gpus`, NUMA policy, thread counts |
+| `PLAN.md` | Lightly | Campaign plans now live under `notes/` (dated). Keep a short local plan only if this box is still being designed |
 | Query set | **No** | All 22 TPC-H queries. Deviations and workarounds: [`../../experimental/starrocks/benchmarks/tpch/QUERY-DEVIATIONS.md`](../../experimental/starrocks/benchmarks/tpch/QUERY-DEVIATIONS.md). Per-box pass/fail: `STATUS.md` / `TPCH-STATUS.md` on that box — never reuse a dropped-query list from another campaign |
 | `RETARGETING.md` | No | This file |
 

@@ -270,8 +270,7 @@ TEST_CASE("cache_entry_info: matches_parquet_file_set classifies exact, subset, 
   // means the file's chunks were materialized twice; serving them once/twice
   // would return the wrong row count) — but exact stays duplicate-symmetric.
   auto dup_cache = parquet_cache({"a.parquet", "a.parquet", "b.parquet"}, {0});
-  REQUIRE(dup_cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet"}) ==
-          match::miss);
+  REQUIRE(dup_cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet"}) == match::miss);
   REQUIRE(dup_cache.matches_parquet_file_set(
             std::vector<std::string>{"a.parquet", "a.parquet", "b.parquet"}) == match::exact);
   REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet", "a.parquet"}) ==

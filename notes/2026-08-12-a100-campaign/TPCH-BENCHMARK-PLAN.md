@@ -5,10 +5,10 @@
 **Datasets:** both verified present on `/raid`, no generation needed —
 SF500 `/raid/prestouser/aocsa/tpch_parquet_sf500/` (**132 GB**),
 SF1000 `/raid/tpch-sf1000/` (**283 GB**, all 8 tables + `metadata.json`)
-**Engine A config:** [`bench/sf500-gb200/sirius-sf500.yaml`](bench/sf500-gb200/sirius-sf500.yaml) ·
-derivation in [`bench/sf500-gb200/README.md`](bench/sf500-gb200/README.md)
-**Tuning lineage:** [`bench/sf1000-repro/`](bench/sf1000-repro/) — PR #1371, merged on `demo-multi-cn`
-**Known failures:** [`TPCH-SF100-FAILURES.md`](TPCH-SF100-FAILURES.md)
+**Engine A config:** [`bench/sf500-gb200/sirius-sf500.yaml`](../../bench/sf500-gb200/sirius-sf500.yaml) ·
+derivation in [`bench/sf500-gb200/README.md`](../../bench/sf500-gb200/README.md)
+**Tuning lineage:** [`bench/sf1000-repro/`](../../bench/sf1000-repro/) — PR #1371, merged on `demo-multi-cn`
+**Known failures:** [`TPCH-SF100-FAILURES.md`](../2026-08-09-gb200-sf100/TPCH-SF100-FAILURES.md)
 
 Reference artifacts live outside the repo in `../benchmark-results/`:
 `ENGINE-CONFIGS-AND-EQUIVALENCE.md` (apples-to-apples audit), `scan-defaults-sweep.md`
@@ -213,7 +213,7 @@ Verified at HEAD `4e6439c8` on three independent lines:
    (`cn2-vs-cn4/`, `nfs-a-vs-c/`) both give q14 = `16.640448956692076` against an oracle of
    `16.640357433254103` — two different CN topologies, two different storage backends, same error.
 
-[`OPEN-ISSUES.md`](OPEN-ISSUES.md) **#24** tracks this as 🔴 OPEN and warns that fixing the SUM/AVG
+[`OPEN-ISSUES.md`](../2026-08-09-gb200-sf100/OPEN-ISSUES.md) **#24** tracks this as 🔴 OPEN and warns that fixing the SUM/AVG
 lowering at `:826-833` — *what the doc tells you to do* — **would change nothing**. Start at
 `translate_arithmetic`.
 
@@ -390,9 +390,9 @@ more useful than a raw cost ratio, because it survives price changes.
 
 ## Config: re-deriving for A100 80 GB
 
-The committed [`bench/sf500-gb200/sirius-sf500.yaml`](bench/sf500-gb200/sirius-sf500.yaml) targets
+The committed [`bench/sf500-gb200/sirius-sf500.yaml`](../../bench/sf500-gb200/sirius-sf500.yaml) targets
 GB200 (185 GiB). **A100 is 80 GB — 43% of that.** Deltas, on top of the GB200 derivation in
-[`bench/sf500-gb200/README.md`](bench/sf500-gb200/README.md):
+[`bench/sf500-gb200/README.md`](../../bench/sf500-gb200/README.md):
 
 | Knob | GB300 source | GB200 | **A100 80 GB** | Why |
 |---|---|---|---|---|

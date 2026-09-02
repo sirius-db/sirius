@@ -1894,7 +1894,12 @@ mod tests {
         let mut config = test_config();
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
-        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None, EngineReadiness::ready()) {
+        let server = match start_heartbeat_server(
+            config,
+            SharedHeartbeatState::new(),
+            None,
+            EngineReadiness::ready(),
+        ) {
             Ok(server) => server,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
@@ -1947,12 +1952,8 @@ mod tests {
     fn warming_heartbeat_is_answered_but_not_ok_until_the_engine_is_ready() {
         let state = SharedHeartbeatState::new();
         let readiness = EngineReadiness::warming();
-        let handler = ComputeNodeHeartbeatHandler::new(
-            test_config(),
-            state.clone(),
-            None,
-            readiness.clone(),
-        );
+        let handler =
+            ComputeNodeHeartbeatHandler::new(test_config(), state.clone(), None, readiness.clone());
 
         // Warming: answered (not a connection failure) but explicitly not OK.
         let warming = handler.handle_heartbeat(master(7)).unwrap();
@@ -2031,7 +2032,12 @@ mod tests {
         let mut config = test_config();
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
-        let server = match start_heartbeat_server(config, SharedHeartbeatState::new(), None, EngineReadiness::ready()) {
+        let server = match start_heartbeat_server(
+            config,
+            SharedHeartbeatState::new(),
+            None,
+            EngineReadiness::ready(),
+        ) {
             Ok(server) => server,
             Err(err) if is_permission_denied(&err) => return,
             Err(err) => panic!("{err:?}"),
@@ -2069,11 +2075,12 @@ mod tests {
         config.bind_host = Host::local();
         config.heartbeat_port = 0;
         let state = SharedHeartbeatState::new();
-        let server = match start_heartbeat_server(config, state.clone(), None, EngineReadiness::ready()) {
-            Ok(server) => server,
-            Err(err) if is_permission_denied(&err) => return,
-            Err(err) => panic!("{err:?}"),
-        };
+        let server =
+            match start_heartbeat_server(config, state.clone(), None, EngineReadiness::ready()) {
+                Ok(server) => server,
+                Err(err) if is_permission_denied(&err) => return,
+                Err(err) => panic!("{err:?}"),
+            };
         let addr = server.local_addr();
 
         let stream = TcpStream::connect(addr).unwrap();

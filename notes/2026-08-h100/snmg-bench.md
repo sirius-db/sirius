@@ -3,7 +3,7 @@
 Single Node Multi-GPU (SNMG) run of all 22 TPC-H queries at SF200 (~200 GB raw)
 using the `repro/sf1000-8.5s` branch on a dual-H100 SXM5 node.
 
-> This document adapts [`repro-sf1000.md`](repro-sf1000.md) for a 2-GPU H100 node.
+> This document adapts `repro-sf1000.md` for a 2-GPU H100 node.
 > Read that doc first for background on the branch changes and gotchas.
 
 ---

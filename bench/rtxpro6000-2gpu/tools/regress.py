@@ -33,7 +33,7 @@ nw, ns = load(new_p)
 bw, bs = load(base_p)
 
 rows, regressions = [], []
-for q in sorted(bw):                      # iterate the BASELINE's passing set
+for q in sorted(bw):  # iterate the BASELINE's passing set
     b = statistics.median(bw[q])
     if q not in nw or not nw[q]:
         st = ",".join(sorted(ns.get(q, {"absent"})))
@@ -57,9 +57,13 @@ for r in rows:
 nb = [statistics.median(bw[q]) for q in sorted(bw) if nw.get(q)]
 nn = [statistics.median(nw[q]) for q in sorted(bw) if nw.get(q)]
 if nb:
-    print(f"\ncommon-query total: baseline {sum(nb):.0f} ms -> new {sum(nn):.0f} ms "
-          f"({(sum(nn)/sum(nb)-1)*100:+.1f}%)")
-print(f"baseline passing: {len(bw)}   new passing (of those): {sum(1 for q in bw if nw.get(q))}")
+    print(
+        f"\ncommon-query total: baseline {sum(nb):.0f} ms -> new {sum(nn):.0f} ms "
+        f"({(sum(nn)/sum(nb)-1)*100:+.1f}%)"
+    )
+print(
+    f"baseline passing: {len(bw)}   new passing (of those): {sum(1 for q in bw if nw.get(q))}"
+)
 
 if regressions:
     print(f"\n!! {len(regressions)} REGRESSION(S) (band +-{band:g}%)")

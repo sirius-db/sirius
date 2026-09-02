@@ -311,7 +311,7 @@ Why 4-GPU stays 128/32/112: that is the unpinned 4-GPU GPFS arm
 (`abc-sf1000-gpfs-20260828T013342Z`) and today's pinned rerun. Changing staging here mixes
 "pin vs unpin" with "different split".
 
-Why 8-GPU stays 128/32/112 + dop=18 + uring + fabric: that is the **retuned** unpinned 8-GPU
+Why 8-GPU stays 128/32/112 + dop=18 + uring + fabric: that is the **returned** unpinned 8-GPU
 arm (`sf1000-8gpu-2host-20260828T035635Z`) that closed 22/22. 16 GiB staging died at q05 on
 8 CN. dop=36 + kvikio was 1.21× **slower** than 4-GPU; do not revive it.
 

@@ -2,7 +2,7 @@
 
 Everything below was **probed directly on the box**, 2026-08-12. This is the substrate every
 other file in this folder is tuned against. To re-target the folder, replace this file and follow
-[`RETARGETING.md`](RETARGETING.md).
+[`RETARGETING.md`](../common/RETARGETING.md).
 
 ---
 

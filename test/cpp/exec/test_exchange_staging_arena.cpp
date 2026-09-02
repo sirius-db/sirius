@@ -302,7 +302,9 @@ TEST_CASE("ARENA-10: out-of-order lease/release never drifts", "[staging_arena]"
 
   exchange_staging_arena arena(kCapacity);
   std::vector<std::uint64_t> live;
-  for (int i = 0; i < kConcurrent; ++i) { live.push_back(arena.lease(kLeaseSize)); }
+  for (int i = 0; i < kConcurrent; ++i) {
+    live.push_back(arena.lease(kLeaseSize));
+  }
 
   // Deterministic pseudo-shuffle: release a rotating non-adjacent slot each cycle and
   // immediately re-lease, so the live set size is constant but the release order is not.
@@ -317,7 +319,9 @@ TEST_CASE("ARENA-10: out-of-order lease/release never drifts", "[staging_arena]"
 
   REQUIRE(arena.outstanding() == kConcurrent);
   REQUIRE(arena.peak_live_bytes() == kConcurrent * kLeaseSize);
-  for (auto offset : live) { arena.release(offset); }
+  for (auto offset : live) {
+    arena.release(offset);
+  }
   REQUIRE(arena.largest_free() == kCapacity);
 }
 
@@ -329,7 +333,9 @@ TEST_CASE("ARENA-11: concurrent leases address disjoint device memory", "[stagin
   exchange_staging_arena arena(kMiB);
   constexpr std::size_t kLen = 4096;
   std::vector<std::uint64_t> offsets;
-  for (int i = 0; i < 16; ++i) { offsets.push_back(arena.lease(kLen)); }
+  for (int i = 0; i < 16; ++i) {
+    offsets.push_back(arena.lease(kLen));
+  }
 
   // Stamp each lease with its own byte pattern...
   for (std::size_t i = 0; i < offsets.size(); ++i) {
@@ -348,9 +354,13 @@ TEST_CASE("ARENA-11: concurrent leases address disjoint device memory", "[stagin
   }
 
   // Release a subset and re-lease: the reused space must still be disjoint from what is live.
-  for (std::size_t i = 0; i < offsets.size(); i += 2) { arena.release(offsets[i]); }
+  for (std::size_t i = 0; i < offsets.size(); i += 2) {
+    arena.release(offsets[i]);
+  }
   std::vector<std::uint64_t> reused;
-  for (std::size_t i = 0; i < offsets.size() / 2; ++i) { reused.push_back(arena.lease(kLen)); }
+  for (std::size_t i = 0; i < offsets.size() / 2; ++i) {
+    reused.push_back(arena.lease(kLen));
+  }
   for (auto offset : reused) {
     auto* p = reinterpret_cast<void*>(arena.base() + offset);
     REQUIRE(cudaMemset(p, 0xEE, kLen) == cudaSuccess);
@@ -394,7 +404,9 @@ TEST_CASE("ARENA-12: concurrent lease/release keeps its invariants", "[staging_a
       }
     });
   }
-  for (auto& th : threads) { th.join(); }
+  for (auto& th : threads) {
+    th.join();
+  }
 
   REQUIRE(failures.load() == 0);
   REQUIRE(arena.outstanding() == 0);

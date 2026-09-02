@@ -194,7 +194,9 @@ pub(super) mod cuda {
         /// Releases an [`alloc_device`](Self::alloc_device) allocation.
         pub fn free_device(&self, device_ptr: u64) {
             // SAFETY: `device_ptr` came from cudaMalloc and is not freed twice.
-            check("cudaFree", unsafe { (self.free)(device_ptr as *mut c_void) });
+            check("cudaFree", unsafe {
+                (self.free)(device_ptr as *mut c_void)
+            });
         }
 
         /// Page-locked host allocation for the TCP baseline, matching the reference harness's
@@ -283,8 +285,7 @@ pub(super) mod cuda_vmm {
     type FnDeviceGet = unsafe extern "C" fn(*mut i32, c_int) -> c_int;
     type FnGranularity = unsafe extern "C" fn(*mut usize, *const AllocationProp, u32) -> c_int;
     type FnMemCreate = unsafe extern "C" fn(*mut u64, usize, *const AllocationProp, u64) -> c_int;
-    type FnAddressReserve =
-        unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> c_int;
+    type FnAddressReserve = unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> c_int;
     type FnMemMap = unsafe extern "C" fn(u64, usize, usize, u64, u64) -> c_int;
     type FnSetAccess = unsafe extern "C" fn(u64, usize, *const AccessDesc, usize) -> c_int;
 

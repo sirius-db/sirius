@@ -30,8 +30,15 @@ cufile.log
 *output.txt
 *.tsv
 # pixi environments
+# `.pixi/*` only matches a real directory's contents, so it misses `.pixi` when a
+# runbook relocates the env by making it a symlink. Committing that symlink makes
+# `pixi install` fail with EEXIST on CI.
+/.pixi
 .pixi/*
 !.pixi/config.toml
+# Agent scratch git worktrees. Committing one records a gitlink to a commit that
+# exists only on this machine, which becomes a dangling submodule ref on clone.
+.claude/worktrees/
 # Generated nightly environment
 envs/
 compile_commands.json

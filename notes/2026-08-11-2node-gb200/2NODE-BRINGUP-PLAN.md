@@ -22,7 +22,7 @@ traffic stays on `bond0`.
 - [2NODE-RUNBOOK.md](2NODE-RUNBOOK.md) — engine A reference; §2 has the measured transport table.
 - [2NODE-RUNBOOK-GAPS.md](2NODE-RUNBOOK-GAPS.md) — corrections to that runbook. **Read part A before
   using the runbook**; several of its prescribed commands are wrong.
-- [2NODE-ENGINE-B-TUTORIAL.md](2NODE-ENGINE-B-TUTORIAL.md) — the stock-StarRocks baseline (Phase 3).
+- [2NODE-ENGINE-B-TUTORIAL.md](../../experimental/starrocks/benchmarks/2NODE-ENGINE-B-TUTORIAL.md) — the stock-StarRocks baseline (Phase 3).
 
 ---
 
@@ -1215,7 +1215,7 @@ likely a measurement error than a result.
 # Phase 3 — Engine B reference
 
 The stock-StarRocks CPU baseline, so the Phase 1 and Phase 2 numbers have something to be measured
-against. Full procedure: [2NODE-ENGINE-B-TUTORIAL.md](2NODE-ENGINE-B-TUTORIAL.md).
+against. Full procedure: [2NODE-ENGINE-B-TUTORIAL.md](../../experimental/starrocks/benchmarks/2NODE-ENGINE-B-TUTORIAL.md).
 
 - [ ] **Step 1: Stop engine A completely on both hosts (G1)**
 

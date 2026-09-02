@@ -375,4 +375,3 @@ FFI-marker assumption was overturned).
   (2 ignored; +1 = the parity gate, all 76 row-cases green); C++ suite 2189 passed / 1 skipped
   (32,513,712 assertions); Rust GPU harness 19/19 (now also pins `output_types()` before/after
   build beside the relay-guard negative); live gate on `cluster2` as above.
-

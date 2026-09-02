@@ -22,7 +22,7 @@ adding boxes even if boxes existed.
 | | | q09 (64, 72, and 80 GiB all full; dop=9 and dop=6 same ~217 leases) |
 | | | q21 (fresh cluster, 301–315 leases / ~63.7 of 64 GiB) |
 
-Warm bests: discovery “Common-arm warm best” plus q08 ~9.1s, q18 14.2s.
+Warm bests: discovery "Common-arm warm best" plus q08 ~9.1s, q18 14.2s.
 q11 **2,806,768 rows**. FRACTION `0.000000033333` is loose; not a correctness result.
 
 Physical HBM **189471 MiB ≈ 185 GiB**. Occupancy 112+64+0.76 = 176.8 / 185 ≈ 96 %.

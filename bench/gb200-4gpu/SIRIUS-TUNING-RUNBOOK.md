@@ -207,7 +207,7 @@ retries is **not** the same bug — more pool did nothing for RTX q09; the lever
 1. **Size memory first (§2).** `SCALE_FACTOR=<N>` then confirm with
    `nvidia-smi --query-compute-apps=used_memory`. Four distinct `gpu_uuid`s.
 2. **Read the two self-naming errors.** Arena exhausted → raise `STAGING`. HASH_JOIN OOM after
-   100 retries → not automatically “more `GPU_MEM`”.
+   100 retries → not automatically "more `GPU_MEM`".
 3. **Measure GPU-busy.** If >90 % of wall, skip thread-pool knobs.
 4. **Warm NVRTC** and `SET expression_evaluator_strategy = 'ast_jit'` before timing.
 5. **Only then** consider `scan_task_batch_size` (~6 GB), and only via path B.

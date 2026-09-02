@@ -42,8 +42,8 @@
 #include <stdexcept>
 #include <string_view>
 
-using sirius::op::build_only_slots_to_discard;
 using sirius::op::BUILD_HASH_TABLE_STATE;
+using sirius::op::build_only_slots_to_discard;
 using sirius::op::build_probe_action;
 using sirius::op::build_probe_slot_view;
 using sirius::op::compute_hash_join_partition_strategy;

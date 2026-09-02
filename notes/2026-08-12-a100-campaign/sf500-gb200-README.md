@@ -1,10 +1,10 @@
 # Adapting the SF1000 repro config to Engine A on GB200
 
 **Source:** [`felipeblazing/sirius@901287a1`](https://github.com/felipeblazing/sirius/blob/901287a1d55d01614966c83b4745a11b67443a52/bench/sf1000-repro/sirius-sf1000.yaml) · `bench/sf1000-repro/`
-**Fetched:** 2026-08-12 · **In-repo source:** [`../sf1000-repro/sirius-sf1000.yaml`](../sf1000-repro/sirius-sf1000.yaml)
+**Fetched:** 2026-08-12 · **In-repo source:** [`../sf1000-repro/sirius-sf1000.yaml`](../../bench/sf1000-repro/sirius-sf1000.yaml)
 — already merged here as PR #1371, so the fetched copy was redundant and was dropped.
-**Adapted config:** [`sirius-sf500.yaml`](sirius-sf500.yaml) ·
-**Study plan:** [`../../TPCH-BENCHMARK-PLAN.md`](../../TPCH-BENCHMARK-PLAN.md)
+**Adapted config:** [`sirius-sf500.yaml`](../../bench/sf500-gb200/sirius-sf500.yaml) ·
+**Study plan:** [`../../TPCH-BENCHMARK-PLAN.md`](TPCH-BENCHMARK-PLAN.md)
 
 > **Scope note:** this file derives the config for **GB200 (185 GiB)**. The benchmark has since
 > been retargeted to **8× A100 80 GB**, which is 43% of that — see the A100 re-derivation table in
