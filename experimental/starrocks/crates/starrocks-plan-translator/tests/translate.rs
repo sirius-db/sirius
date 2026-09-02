@@ -682,6 +682,43 @@ fn split_broker_range_is_unsupported() {
     }
 }
 
+/// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
+/// accepting the prefix would silently read a subset of the data.
+#[test]
+fn has_more_scan_ranges_are_refused() {
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            "file:///data/users.parquet",
+            TFileFormatType::FORMAT_PARQUET,
+            0,
+            -1,
+            Some(1024),
+        ),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()[0]
+        .has_more = Some(true);
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    assert_eq!(
+        reason,
+        "incremental scan-range delivery (has_more) is not supported"
+    );
+}
+
 /// Verifies complete byte-range splits are collapsed to one whole-file local read.
 #[test]
 fn complete_split_broker_ranges_produce_one_local_file() {

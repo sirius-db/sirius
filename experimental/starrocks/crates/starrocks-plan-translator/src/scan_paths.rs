@@ -104,6 +104,18 @@ impl ScanFilePaths {
         byte_ranges: &mut CollectedRanges,
     ) -> Result<()> {
         for range in ranges {
+            // Incremental delivery: more ranges follow through deliver_scan_ranges, which this
+            // CN does not implement — accepting the prefix would silently read a subset.
+            if range.has_more == Some(true) {
+                return Err(Self::unsupported(
+                    node_id,
+                    "incremental scan-range delivery (has_more) is not supported",
+                ));
+            }
+            // An explicitly empty placeholder range carries no file.
+            if range.empty == Some(true) {
+                continue;
+            }
             let Some(broker) = range.scan_range.broker_scan_range.as_ref() else {
                 continue;
             };
@@ -132,16 +144,17 @@ impl ScanFilePaths {
     /// Ensures split ranges assigned to this fragment collectively cover each file
     /// exactly once.
     ///
-    /// Completeness is required because the range cannot be plumbed through. DuckDB's
-    /// Substrait `local_files` reader drops `FileOrFiles.start` / `.length`, and
+    /// Completeness is required because the range is not plumbed through yet: today
+    /// DuckDB's Substrait `local_files` reader drops `FileOrFiles.start` / `.length`, and
     /// `parquet_scan` has no byte-range parameter, so `scan_rel` can only ever emit
     /// `parquet_scan(<whole path>)` — see the item it builds in `node_translator`. The
-    /// only split this translation can honor is therefore one it does not have to
+    /// only split this translation can honor today is therefore one it does not have to
     /// honor at all: ranges that tile the file from byte 0 to EOF, where reading the
     /// whole file *is* exactly the work this fragment was assigned. A lone partial
-    /// split has no faithful whole-file spelling and is refused.
+    /// split has no faithful whole-file spelling and is refused. Explicit partial splits
+    /// are enabled by the engine byte-range stack (follow-up).
     ///
-    /// That is why [`ByteRange`] is validated and discarded rather than forwarded.
+    /// That is why [`ByteRange`] is validated and discarded rather than forwarded for now.
     fn validate_complete_files(byte_ranges: &CollectedRanges) -> Result<()> {
         for (&node_id, files) in byte_ranges {
             for ranges in files.values() {
