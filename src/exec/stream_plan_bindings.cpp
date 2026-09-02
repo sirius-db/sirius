@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
@@ -64,6 +65,30 @@ void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&,
     "streaming input and is only valid inside a GPU-executed fragment plan");
 }
 
+/// Reports the caller-declared row count of a stream to DuckDB's optimizer
+/// (LogicalGet::EstimateCardinality consumes it, feeding both the join-order optimizer's base
+/// relation stats and the build/probe-side flip). Without it every stream source estimates
+/// cardinality 1, so a receiver fragment's hash joins pick build sides blind — the q07 2-CN
+/// regression built on a multi-GB lineitem-derived stream instead of a 2-row nation stream.
+///
+/// nullptr (= "no estimate, keep today's behavior") whenever anything is missing: no catalog on
+/// the connection, no bind data, an undeclared stream, or a declaration without a row count.
+/// Never throws — DuckDB may ask for cardinality outside the window where the fragment's
+/// declarations are alive.
+duckdb::unique_ptr<duckdb::NodeStatistics> stream_source_cardinality(
+  duckdb::ClientContext& context, const duckdb::FunctionData* bind_data)
+{
+  if (bind_data == nullptr) { return nullptr; }
+  auto const* bind = dynamic_cast<const stream_source_bind_data*>(bind_data);
+  if (bind == nullptr) { return nullptr; }
+  if (!context.registered_state) { return nullptr; }
+  auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
+  if (!catalog) { return nullptr; }
+  auto const rows = catalog->estimated_rows(bind->stream_id);
+  if (!rows.has_value()) { return nullptr; }
+  return duckdb::make_uniq<duckdb::NodeStatistics>(static_cast<duckdb::idx_t>(*rows));
+}
+
 }  // namespace
 
 void register_stream_source_function(duckdb::DatabaseInstance& instance)
@@ -75,6 +100,7 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
                                       {duckdb::LogicalType::BIGINT},
                                       stream_source_function,
                                       stream_source_bind);
+  stream_source.cardinality = stream_source_cardinality;
 
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: extension callback and explicit callers may both register.
