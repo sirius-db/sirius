@@ -1097,3 +1097,33 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   run_ok("SELECT * FROM unpin_table('vs_carrier');");
 }
+
+// A DATE output column is stored narrowed to a small integer at pin time, even in a single batch.
+// Without restoring it to the native type, the host reader asks for an unimplemented
+// SMALLINT -> DATE cast and the query fails. The search must widen it back to DATE.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "search restores a DATE output column narrowed at pin time",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  // Dates close together, so their epoch days fit INT16 and pin narrows the column to it.
+  run_ok(
+    "CREATE TABLE vs_date AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "DATE '2000-01-01' + i::INTEGER AS d FROM range(5000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_date', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_date', 'vec', metric => 'l2', n_lists => 16);");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+  // Nearest row is id 0, whose date is 2000-01-01.
+  auto ann = ok_col(*con,
+                    "SELECT d FROM sirius_knn_search('vs_date', 'vec', " + origin +
+                      ", k => 1, output_columns => ['id', 'd'], n_probes => 16);");
+  CHECK(ann == std::vector<std::vector<std::string>>{{"2000-01-01"}});
+
+  auto enn = ok_col(*con,
+                    "SELECT d FROM sirius_knn_search('vs_date', 'vec', " + origin +
+                      ", k => 1, output_columns => ['id', 'd'], use_index => false);");
+  CHECK(enn == std::vector<std::vector<std::string>>{{"2000-01-01"}});
+
+  run_ok("SELECT * FROM unpin_table('vs_date');");
+}
