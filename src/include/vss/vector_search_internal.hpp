@@ -26,6 +26,7 @@
 #include <vector>
 
 namespace cudf {
+class column;
 class table;
 }  // namespace cudf
 namespace cucascade {
@@ -63,6 +64,12 @@ struct vector_search_context {
 /// Return an empty table with the search result schema.
 std::unique_ptr<cudf::table> make_empty_vss_output(
   const std::vector<sirius::logical_type>& output_column_types);
+
+/// Widen gathered output columns back to their native carrier types.
+void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
+                             const std::vector<sirius::logical_type>& native_types,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr);
 
 /// Move a GPU result table to a host_data_representation the table function can
 /// stream out. Synchronizes @c c.stream before returning.

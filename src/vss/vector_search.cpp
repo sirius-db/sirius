@@ -19,10 +19,12 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/exception.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/vector_search_internal.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -47,6 +49,24 @@ std::unique_ptr<cudf::table> make_empty_vss_output(
                                              output_column_types.end());
   types.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
   return sirius::make_empty_table(types);
+}
+
+void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
+                             const std::vector<sirius::logical_type>& native_types,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr)
+{
+  auto const n = std::min(cols.size(), native_types.size());
+  for (std::size_t j = 0; j < n; ++j) {
+    if (cols[j] == nullptr) { continue; }
+    auto const native = sirius::get_cudf_type(native_types[j]);
+    // Only widen a genuinely-narrowed carrier; leave native columns and any type we can't
+    // safely widen back (e.g. non-numeric) untouched. cast_through_rep handles DATE, which a
+    // plain cudf::cast cannot restore from its narrowed integer carrier.
+    if (cols[j]->type() != native && sirius::can_restore_to(cols[j]->type(), native)) {
+      cols[j] = sirius::cast_through_rep(cols[j]->view(), native, stream, mr);
+    }
+  }
 }
 
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(

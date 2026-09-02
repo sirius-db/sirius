@@ -1061,3 +1061,39 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   run_ok("SELECT * FROM unpin_table('vs_null');");
 }
+
+// Pinning narrows each batch to its own value range, so the same output column can end up stored
+// at different widths across batches (here INT8 in batch 0, INT32 in batch 1 for a BIGINT column).
+// The search must widen every batch back to the native type before batches meet, or the cross-batch
+// combine (ANN copy_if_else, ENN merge) fails on the type mismatch.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "search widens output columns narrowed to different carriers per batch",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  // batch 0 (i < 122880): val in [0, 99]         -> narrowed to INT8
+  // batch 1 (i >= 122880): val in [122880, ...]  -> narrowed to INT32
+  run_ok(
+    "CREATE TABLE vs_carrier AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "(CASE WHEN i < 122880 THEN i % 100 ELSE i END)::BIGINT AS val FROM range(245760) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET scan_task_batch_size = 4096;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_carrier', tier => 'gpu', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 536870912;");
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('vs_carrier', 'vec', metric => 'l2', n_lists => 16);");
+
+  const std::string origin = "[0.0, 0.0, 0.0]::FLOAT[3]";
+  // The three nearest rows are ids 0, 1, 2, all in batch 0, so val is 0, 1, 2.
+  auto ann = ok_col(*con,
+                    "SELECT val FROM sirius_knn_search('vs_carrier', 'vec', " + origin +
+                      ", k => 3, output_columns => ['id', 'val'], n_probes => 16);");
+  CHECK(ann == std::vector<std::vector<std::string>>{{"0"}, {"1"}, {"2"}});
+
+  // Same root cause on the ENN path (cudf::merge across batches).
+  auto enn = ok_col(*con,
+                    "SELECT val FROM sirius_knn_search('vs_carrier', 'vec', " + origin +
+                      ", k => 3, output_columns => ['id', 'val'], use_index => false);");
+  CHECK(enn == std::vector<std::vector<std::string>>{{"0"}, {"1"}, {"2"}});
+
+  run_ok("SELECT * FROM unpin_table('vs_carrier');");
+}

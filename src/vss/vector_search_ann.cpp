@@ -84,6 +84,7 @@ std::vector<std::unique_ptr<cudf::column>> gather_pinned_by_global_index(
                              c.stream,
                              c.mr);
     auto part_cols = part->release();
+    restore_native_carriers(part_cols, c.req.output_column_types, c.stream, c.mr);
 
     for (std::size_t j = 0; j < n_out_cols; ++j) {
       if (ci == 0) {
