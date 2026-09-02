@@ -2865,66 +2865,91 @@ fn unsupported_join_type_is_reported_before_missing_conjuncts() {
     assert_eq!(reason, "hash join type is unsupported");
 }
 
-/// Verifies decimal arithmetic is lowered to FP64 casts for the GPU expression evaluator.
-#[test]
-fn decimal_arithmetic_is_lowered_to_fp64() {
-    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
-    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
-    arith.opcode = Some(TExprOpcode::MULTIPLY);
-    let mut nodes = vec![arith];
-    nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
-    nodes.extend(slot_ref(1, 0, decimal).nodes);
-
-    let translated = translate_fragment(&params(
-        Some(TPlan::new(vec![scan_node(0, 0)])),
-        Some(base_desc()),
-        Some(vec![TExpr::new(nodes)]),
-    ))
-    .unwrap();
-    let rel::RelType::Project(project) = root(&translated.plan)
-        .input
-        .as_ref()
-        .unwrap()
-        .rel_type
-        .as_ref()
-        .unwrap()
-    else {
-        panic!("expected output project");
+/// Asserts an expression is a throwing cast to FP64, the lowering every decimal operand and
+/// decimal aggregate argument goes through.
+fn assert_fp64_cast(expr: &substrait::proto::Expression) {
+    let Some(expression::RexType::Cast(cast)) = expr.rex_type.as_ref() else {
+        panic!("expected a cast, got {expr:?}");
     };
-    let expression::RexType::ScalarFunction(function) =
-        project.expressions[0].rex_type.as_ref().unwrap()
-    else {
-        panic!("expected arithmetic function");
-    };
-    assert!(function.arguments.iter().all(|argument| matches!(
-        argument.arg_type.as_ref().unwrap(),
-        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
-            rex_type: Some(expression::RexType::Cast(_)),
-        })
-    )));
-    assert!(matches!(
-        function
-            .output_type
-            .as_ref()
-            .unwrap()
-            .kind
-            .as_ref()
-            .unwrap(),
-        substrait::proto::r#type::Kind::Fp64(_)
-    ));
+    assert!(
+        matches!(
+            cast.r#type.as_ref().unwrap().kind,
+            Some(substrait::proto::r#type::Kind::Fp64(_))
+        ),
+        "cast target {:?}",
+        cast.r#type
+    );
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
 }
 
-/// Verifies decimal AVG arguments are lowered to FP64 for GPU execution.
+/// Verifies decimal arithmetic is lowered to throwing FP64 casts for the GPU expression
+/// evaluator, and that the result type is FP64 even when the FE result slot stays DECIMAL
+/// (precision <= 18, where `map_type_desc` alone would keep it decimal).
 #[test]
-fn decimal_avg_is_lowered_to_fp64() {
-    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8));
+fn decimal_arithmetic_is_lowered_to_fp64() {
+    for decimal in [
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
+    ] {
+        let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
+        arith.opcode = Some(TExprOpcode::MULTIPLY);
+        let mut nodes = vec![arith];
+        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+
+        let translated = translate_fragment(&params(
+            Some(TPlan::new(vec![scan_node(0, 0)])),
+            Some(base_desc()),
+            Some(vec![TExpr::new(nodes)]),
+        ))
+        .unwrap();
+        let rel::RelType::Project(project) = root(&translated.plan)
+            .input
+            .as_ref()
+            .unwrap()
+            .rel_type
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected output project");
+        };
+        let expression::RexType::ScalarFunction(function) =
+            project.expressions[0].rex_type.as_ref().unwrap()
+        else {
+            panic!("expected arithmetic function");
+        };
+        assert_eq!(function.arguments.len(), 2, "{decimal:?}");
+        for argument in &function.arguments {
+            let substrait::proto::function_argument::ArgType::Value(value) =
+                argument.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            assert_fp64_cast(value);
+        }
+        assert!(
+            matches!(
+                function.output_type.as_ref().unwrap().kind,
+                Some(substrait::proto::r#type::Kind::Fp64(_))
+            ),
+            "{decimal:?}"
+        );
+    }
+}
+
+/// Translates a one-phase aggregation with one measure over a BIGINT slot and returns that
+/// measure's (possibly lowered) argument.
+fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto::Expression {
     let agg = aggregation_node(
         1,
         1,
         vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
         vec![aggregate_expr(
-            "avg",
-            decimal,
+            name,
+            ret_type,
             Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
         )],
     );
@@ -2944,16 +2969,64 @@ fn decimal_avg_is_lowered_to_fp64() {
     else {
         panic!("expected aggregate");
     };
-    let argument = aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
-        .arg_type
-        .as_ref()
-        .unwrap();
-    assert!(matches!(
-        argument,
-        substrait::proto::function_argument::ArgType::Value(substrait::proto::Expression {
-            rex_type: Some(expression::RexType::Cast(_)),
-        })
+    let substrait::proto::function_argument::ArgType::Value(value) =
+        aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
+            .arg_type
+            .as_ref()
+            .unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    value.clone()
+}
+
+/// Verifies a decimal AVG argument is lowered to a throwing FP64 cast for GPU execution.
+#[test]
+fn decimal_avg_is_lowered_to_fp64() {
+    assert_fp64_cast(&single_measure_argument(
+        "avg",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8)),
     ));
+}
+
+/// Verifies a decimal SUM argument is lowered the same way, including when the FE result slot
+/// stays DECIMAL (precision <= 18).
+#[test]
+fn decimal_sum_is_lowered_to_fp64() {
+    assert_fp64_cast(&single_measure_argument(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
+    ));
+}
+
+/// Verifies an avg that lowers to neither the DOUBLE nor the decimal path (temporal avg, with
+/// StarRocks-specific rounding) is refused with a reason that names what is supported.
+#[test]
+fn temporal_avg_is_rejected() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "avg",
+            scalar_type(TPrimitiveType::DATE),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    let TranslateError::UnsupportedExpression { node_type, reason } = err else {
+        panic!("expected an unsupported expression, got {err:?}");
+    };
+    assert_eq!(node_type, TExprNodeType::AGG_EXPR);
+    assert_eq!(
+        reason,
+        "avg is only supported where it lowers to the GPU's FP64 avg (DOUBLE and DECIMAL inputs)"
+    );
 }
 
 /// Verifies partitioned top-N sorts are rejected rather than run as a global sort.
