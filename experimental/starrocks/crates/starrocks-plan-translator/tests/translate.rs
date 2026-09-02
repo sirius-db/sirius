@@ -1273,8 +1273,8 @@ fn struct_field(expr: &substrait::proto::Expression) -> i32 {
 }
 
 /// Only `PROJECT_NODE` materializes its common slots. A `SELECT_NODE`, hash join or nested-loop
-/// join carrying the same field is refused rather than having its shared sub-expressions dropped
-/// — a slot ref resolving to one of them would otherwise read a column that was never emitted.
+/// join carrying the same field is refused up front with a clear reason, instead of failing later
+/// with an opaque descriptor error when a conjunct references one of the shared sub-expressions.
 #[test]
 fn common_slots_outside_a_project_are_rejected() {
     let common = || {

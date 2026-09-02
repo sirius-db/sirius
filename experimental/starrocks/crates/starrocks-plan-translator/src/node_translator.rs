@@ -274,12 +274,12 @@ fn translate_scan(
     apply_conjuncts(input, node, ctx)
 }
 
-/// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
 /// Refuses a node whose `common_slot_map` this translator does not materialize.
 ///
-/// Only `PROJECT_NODE` appends its common slots. Every other node carrying the field would have
-/// its shared sub-expressions dropped, and any slot ref resolving to one of them then reads a
-/// column that was never emitted -- wrong values under the right names, with no error.
+/// Only `PROJECT_NODE` appends its common slots. On every other node carrying the field the
+/// shared sub-expressions would be read past: a conjunct or key that references one of them then
+/// fails later with an opaque descriptor error (`slot N (tuple T) is not part of row_tuples`),
+/// and a map nothing references is silently ignored. Report the unsupported shape up front.
 fn reject_common_slots(
     node: &TPlanNode,
     common_slot_map: Option<&BTreeMap<TSlotId, TExpr>>,
@@ -294,6 +294,7 @@ fn reject_common_slots(
     Ok(())
 }
 
+/// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
 fn translate_select(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
