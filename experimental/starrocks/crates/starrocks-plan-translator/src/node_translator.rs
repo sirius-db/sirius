@@ -664,9 +664,10 @@ fn translate_hash_join(
     // NULL-ness is decided per probe row. Neither executor does that: DuckDB sets one global
     // `has_null` if any build row has a NULL in any equality key and then rewrites every FALSE
     // marker to NULL (`duckdb/src/execution/join_hashtable.cpp:431` and `:1211-1217`), and the
-    // GPU path does the same with `table_has_any_null(right_keys)`
-    // (`src/op/sirius_physical_hash_join.cpp:1657`). The per-group path that would be correct is
-    // only reachable from DuckDB's own delim-join planner, never from a Substrait `JoinRel`.
+    // GPU path does the same with `set_build_has_null(_build_has_null,
+    // table_has_any_null(right_keys))` in `src/op/sirius_physical_hash_join.cpp`. The per-group
+    // path that would be correct is only reachable from DuckDB's own delim-join planner, never
+    // from a Substrait `JoinRel`.
     //
     // That is exact for a single equality key and nothing else, because then "unmatched with a
     // NULL somewhere on the build side" really is UNKNOWN. It is wrong as soon as another

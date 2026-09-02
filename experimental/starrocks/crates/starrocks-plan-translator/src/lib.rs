@@ -33,7 +33,7 @@
 //! | `PROJECT_NODE`       | `ProjectRel`       |
 //! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
-//! | `HASH_JOIN_NODE`     | `JoinRel` (inner/outer/left-semi; anti joins are rejected) |
+//! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
 //! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
 //!
 //! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
