@@ -182,6 +182,9 @@ SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
 /// DuckDB view name a plan must read to consume input stream `stream_id`.
 /// Fragment::build() creates this view; the plan emits a read of this name where a file scan
 /// would otherwise appear.
+///
+/// Returned by `unique_ptr` so the cxx bridge can bind it directly — the convention has to have
+/// exactly one definition, and that is only true if both languages read it from here.
 SIRIUS_FFI_EXPORT std::unique_ptr<std::string> stream_view_name(std::uint64_t stream_id);
 
 }  // namespace sirius::ffi
