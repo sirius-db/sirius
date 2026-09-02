@@ -2176,6 +2176,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   req.k                         = 10;
   req.use_index                 = true;
   req.n_probes                  = 0;
+  req.index_type                = "ivf_flat";
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
@@ -2191,6 +2192,8 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
       req.use_index = kv.second.GetValue<bool>();
     } else if (key == "n_probes") {
       req.n_probes = kv.second.GetValue<int64_t>();
+    } else if (key == "index_type") {
+      req.index_type = StringUtil::Lower(kv.second.ToString());
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "output_columns") {
@@ -2205,6 +2208,16 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
+  }
+  if (req.index_type != "ivf_flat") {
+    throw BinderException("sirius_knn_search: unsupported index_type '" + req.index_type + "'");
+  }
+  // NOTE: cuVS has a bug on approximate search over an IVF-Flat index with metric=cosine and
+  // k>256. Remove this guard once it's fixed.
+  if (req.use_index && req.index_type == "ivf_flat" && req.metric == "cosine" && req.k > 256) {
+    throw BinderException(
+      "sirius_knn_search: cosine ANN search with k > 256 is not supported; "
+      "pass use_index => false to run exact, or chose a lower k (k <= 256).");
   }
   // An explicitly-passed empty list is a user error.
   if (output_columns_specified && req.output_columns.empty()) {
@@ -2487,7 +2500,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, drop_ann_index_info);
 
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
-  // use_index =>, n_probes =>, schema_name =>)
+  // use_index =>, n_probes =>, index_type =>, schema_name =>)
   TableFunction vector_search("sirius_knn_search",
                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
                               SiriusVectorSearchFunction,
@@ -2498,6 +2511,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
   vector_search.named_parameters["use_index"]      = LogicalType::BOOLEAN;
   vector_search.named_parameters["n_probes"]       = LogicalType::BIGINT;
+  vector_search.named_parameters["index_type"]     = LogicalType::VARCHAR;
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);

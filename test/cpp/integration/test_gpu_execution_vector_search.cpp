@@ -851,6 +851,16 @@ TEST_CASE_METHOD(VectorSearchFixture,
                  "SELECT * FROM sirius_knn_search('vs_err', 'vec', " + origin +
                    ", output_columns => ['id'], metric => 'bogus');",
                  "metric must be");
+    // cuVS bug, remove this once it's fixed.
+    expect_error(*con,
+                 "SELECT * FROM sirius_knn_search('vs_err', 'vec', " + origin +
+                   ", k => 300, output_columns => ['id'], metric => 'cosine');",
+                 "k > 256");
+    // Only ivf_flat is supported as an index type today.
+    expect_error(*con,
+                 "SELECT * FROM sirius_knn_search('vs_err', 'vec', " + origin +
+                   ", output_columns => ['id'], index_type => 'bogus');",
+                 "unsupported index_type");
     run_ok("SELECT * FROM unpin_table('vs_err');");
   }
 
@@ -1051,4 +1061,3 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   run_ok("SELECT * FROM unpin_table('vs_null');");
 }
-// fill it in with a value gathered from the wrong row.

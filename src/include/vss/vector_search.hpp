@@ -39,6 +39,7 @@ struct vector_search_request {
   std::string table_name;                   ///< GPU-pinned base table to search.
   std::string column_name;                  ///< FLOAT[dim] vector column.
   std::string metric;                       ///< Distance metric.
+  std::string index_type{"ivf_flat"};       ///< ann index type.
   std::vector<float> query;                 ///< Query vector, length == dim.
   std::int64_t dim{0};                      ///< Vector dimensionality.
   std::int64_t k{10};                       ///< Top-k neighbors to return.
