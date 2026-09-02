@@ -80,6 +80,7 @@ std::vector<std::unique_ptr<cudf::column>> gather_pinned_by_global_index(
     auto part      = cudf::gather(cudf::table_view(chunk_cols),
                              local->view(),
                              cudf::out_of_bounds_policy::NULLIFY,
+                             cudf::negative_index_policy::NOT_ALLOWED,
                              c.stream,
                              c.mr);
     auto part_cols = part->release();

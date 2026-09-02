@@ -1019,3 +1019,36 @@ TEST_CASE_METHOD(VectorSearchFixture,
     run_ok("SELECT * FROM unpin_table('idx_err');");
   }
 }
+
+// A returned row (the neighbor) whose output column is NULL must come back NULL, not filled in with
+// value gathered from the wrong row.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "ANN search returns NULL for a neighbor whose output column is NULL",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_null AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "CASE WHEN i = 50000 THEN NULL ELSE 'row' || i END AS payload FROM range(245760) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET scan_task_batch_size = 4096;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_null', tier => 'gpu', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 536870912;");
+  run_ok("SELECT * FROM sirius_create_ann_index('vs_null', 'vec', metric => 'l2', n_lists => 16);");
+
+  // Row 50000 lives in chunk 0 and its payload is NULL. Chunk 1 must not contribute a
+  // value for it (global 50000 - base 122880 = -72880 is NOT a row of chunk 1).
+  auto r = con->Query(
+    "SELECT id, payload FROM sirius_knn_search('vs_null', 'vec', "
+    "[50000.0, 50000.0, 50000.0]::FLOAT[3], k => 1, output_columns => ['id', 'payload'], "
+    "n_probes => 16);");
+  REQUIRE(r);
+  REQUIRE_FALSE(r->HasError());
+  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  REQUIRE(mat.RowCount() == 1);
+  REQUIRE(mat.GetValue(0, 0).GetValue<int64_t>() == 50000);
+  INFO("payload was: " << mat.GetValue(1, 0).ToString());
+  REQUIRE(mat.GetValue(1, 0).IsNull());
+
+  run_ok("SELECT * FROM unpin_table('vs_null');");
+}
+// fill it in with a value gathered from the wrong row.
