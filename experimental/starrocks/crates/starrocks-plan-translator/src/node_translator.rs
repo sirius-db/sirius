@@ -8,8 +8,8 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
     AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
-    Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, join_rel, rel,
-    rel_common, sort_field,
+    Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, fetch_rel, function_argument,
+    join_rel, rel, rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -758,6 +758,7 @@ fn translate_hash_join(
         JoinOutput::LeftAnti => {
             let (_, right_key) = first_equality
                 .ok_or_else(|| TranslateError::malformed("left anti join has no equality key"))?;
+            require_column_key(node, &right_key)?;
             let filtered = filter_is_null(joined, right_key, ctx);
             emit_columns(
                 filtered.rel,
@@ -768,6 +769,7 @@ fn translate_hash_join(
         JoinOutput::RightAnti => {
             let (left_key, _) = first_equality
                 .ok_or_else(|| TranslateError::malformed("right anti join has no equality key"))?;
+            require_column_key(node, &left_key)?;
             let filtered = filter_is_null(joined, left_key, ctx);
             let start = left.output_width as i32;
             let end = start + right.output_width as i32;
@@ -1169,6 +1171,33 @@ fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
         row_tuples: input.row_tuples,
         output_width,
     }
+}
+
+/// Refuses an anti join whose null-tested key is not a column reference (casts allowed).
+///
+/// The outer-join + `is_null(key)` lowering identifies an unmatched row by the NULL padding the
+/// join puts on the other side. That is only exact when the key expression propagates NULL: a
+/// column reference does, and so does a cast of one, but `if`/`case`/`coalesce` over a column can
+/// yield a non-NULL value for the padded row, and the filter would then drop an unmatched row as
+/// if it had matched. Refuse those shapes rather than return too few rows.
+fn require_column_key(node: &TPlanNode, key: &Expression) -> Result<()> {
+    fn is_column_reference(expr: &Expression) -> bool {
+        match expr.rex_type.as_ref() {
+            Some(expression::RexType::Selection(_)) => true,
+            Some(expression::RexType::Cast(cast)) => {
+                cast.input.as_deref().is_some_and(is_column_reference)
+            }
+            _ => false,
+        }
+    }
+    if is_column_reference(key) {
+        return Ok(());
+    }
+    Err(TranslateError::UnsupportedPlanNode {
+        node_id: node.node_id,
+        node_type: node.node_type,
+        reason: "anti join key is not a plain column reference",
+    })
 }
 
 /// Filters to rows where an equality-key expression is null.

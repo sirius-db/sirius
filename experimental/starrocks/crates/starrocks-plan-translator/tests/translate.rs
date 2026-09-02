@@ -3733,6 +3733,58 @@ fn bare_cross_join_translates_to_constant_key_join() {
     assert_eq!(operands, vec![2, 4]);
 }
 
+/// The outer-join + `is_null(key)` lowering tells an unmatched row by the NULL the join pads the
+/// other side with, so the null-tested key must propagate NULL. A column reference does, and so
+/// does a cast of one; an arithmetic (or `if`/`case`) expression over the key is refused rather
+/// than risk dropping unmatched rows.
+#[test]
+fn anti_join_with_non_column_key_is_rejected() {
+    let times_two = |slot_id: i32, tuple_id: i32| {
+        let mut arith = base_expr_node(
+            TExprNodeType::ARITHMETIC_EXPR,
+            scalar_type(TPrimitiveType::BIGINT),
+            2,
+        );
+        arith.opcode = Some(TExprOpcode::MULTIPLY);
+        let mut nodes = vec![arith];
+        nodes.extend(slot_ref(slot_id, tuple_id, scalar_type(TPrimitiveType::BIGINT)).nodes);
+        nodes.extend(int_literal(2).nodes);
+        TExpr::new(nodes)
+    };
+
+    // LEFT ANTI null-tests the build (right) key; RIGHT ANTI null-tests the probe (left) key.
+    let mut left_anti = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    left_anti.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = times_two(1, 1);
+    let mut right_anti = hash_join_node(TJoinOp::RIGHT_ANTI_JOIN);
+    right_anti
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts[0]
+        .left = times_two(1, 0);
+    for (label, join) in [("LEFT_ANTI", left_anti), ("RIGHT_ANTI", right_anti)] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "anti join key is not a plain column reference",
+            "{label}"
+        );
+    }
+
+    // A cast over the column keeps NULL as NULL and stays supported.
+    let mut cast_key = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    cast_key.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = cast_expr(
+        scalar_type(TPrimitiveType::BIGINT),
+        slot_ref(1, 1, scalar_type(TPrimitiveType::INT)),
+    );
+    let plan = TPlan::new(vec![cast_key, scan_node(0, 0), scan_node(1, 1)]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("a cast of a column reference is still a column key");
+}
+
 /// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
 /// decides the match. Both executors null out *every* unmatched marker as soon as any build row
 /// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
