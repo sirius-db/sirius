@@ -278,6 +278,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
+    test/cpp/scan/test_parquet_byte_range.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
