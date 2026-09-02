@@ -1852,6 +1852,13 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
                                 "' must be pinned on the GPU tier before building an index");
   }
 
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  auto const& pinned_names = pin->cache_info.column_names();
+  if (std::find(pinned_names.begin(), pinned_names.end(), data.column_name) == pinned_names.end()) {
+    throw InvalidInputException("sirius_create_ann_index: vector column '" + data.column_name +
+                                "' is not pinned on table '" + data.table_name + "';");
+  }
+
   // Collect the vector column's batches as views:
   // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
   // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
@@ -2259,6 +2266,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   auto is_pinned           = [&](const std::string& col) {
     return std::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
   };
+
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  if (!is_pinned(req.column_name)) {
+    throw BinderException("sirius_knn_search: vector column '" + req.column_name +
+                          "' is not pinned on table '" + req.table_name + "';");
+  }
 
   if (req.output_columns.empty()) {
     // Default to the columns that are pinned and in catalog schema order.

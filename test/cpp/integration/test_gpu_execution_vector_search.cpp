@@ -1127,3 +1127,33 @@ TEST_CASE_METHOD(VectorSearchFixture,
 
   run_ok("SELECT * FROM unpin_table('vs_date');");
 }
+
+// Pin and unpin don't rebind a prepared query, so a pin can lose a column between PREPARE and
+// EXECUTE. That is a user mistake and must surface as a user-facing error, not an internal one.
+TEST_CASE_METHOD(VectorSearchFixture,
+                 "search reports a pin that changed after bind as a user-facing error",
+                 "[integration][gpu_execution][vss][vector_search]")
+{
+  run_ok(
+    "CREATE TABLE vs_stale AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec, "
+    "'row' || i AS payload FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vs_stale', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "PREPARE s AS SELECT id, payload FROM sirius_knn_search('vs_stale', 'vec', "
+    "[0.0, 0.0, 0.0]::FLOAT[3], k => 1, output_columns => ['id', 'payload'], use_index => false);");
+
+  // Re-pin without payload, so the prepared query's output column is no longer in the pin.
+  run_ok("SELECT * FROM unpin_table('vs_stale');");
+  run_ok(
+    "SELECT * FROM pin_table(name => 'vs_stale', tier => 'gpu', format => 'duckdb', "
+    "cols => ['id', 'vec']);");
+
+  auto r = con->Query("EXECUTE s;");
+  REQUIRE(r);
+  REQUIRE(r->HasError());
+  INFO("error was: " << r->GetError());
+  REQUIRE(r->GetErrorType() == duckdb::ExceptionType::INVALID_INPUT);
+
+  run_ok("SELECT * FROM unpin_table('vs_stale');");
+}

@@ -105,6 +105,21 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
                                         "' must be pinned on the GPU tier");
   }
 
+  // Pin and unpin don't rebind a prepared query, so the pin may have lost columns since bind.
+  // This checks if output and vector column are still pinned before we read them.
+  auto const& pinned_names = pin->cache_info.column_names();
+  auto require_pinned      = [&](const std::string& col) {
+    if (std::find(pinned_names.begin(), pinned_names.end(), col) == pinned_names.end()) {
+      throw duckdb::InvalidInputException(
+        "sirius_knn_search: column '" + col + "' is not pinned on table '" + req.table_name +
+        "' (the pin changed since the query was bound; re-pin it or re-run the query)");
+    }
+  };
+  require_pinned(req.column_name);
+  for (auto const& col : req.output_columns) {
+    require_pinned(col);
+  }
+
   auto host_spaces = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   if (host_spaces.empty()) {
     throw duckdb::InvalidInputException("sirius_knn_search: no HOST memory space available");
