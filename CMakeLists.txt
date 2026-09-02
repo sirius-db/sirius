@@ -291,6 +291,7 @@ set(EXTENSION_SOURCES
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
+    src/exec/exchange_staging_arena.cpp
     src/exec/stream_session.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
@@ -690,6 +691,7 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_staging_arena.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
