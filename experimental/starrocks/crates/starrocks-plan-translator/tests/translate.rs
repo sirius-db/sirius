@@ -682,6 +682,393 @@ fn split_broker_range_is_unsupported() {
     }
 }
 
+/// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
+/// accepting the prefix would silently read a subset of the data.
+#[test]
+fn has_more_scan_ranges_are_refused() {
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            "file:///data/users.parquet",
+            TFileFormatType::FORMAT_PARQUET,
+            0,
+            -1,
+            Some(1024),
+        ),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()[0]
+        .has_more = Some(true);
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    assert_eq!(
+        reason,
+        "incremental scan-range delivery (has_more) is not supported"
+    );
+}
+
+/// The FE ends a connector scan's assignment with a placeholder `TScanRangeParams` that carries
+/// an empty `scan_range`, `empty = true` and `has_more` telling whether more ranges follow. The
+/// placeholder itself is skipped; only `has_more = true` refuses the fragment, so the order of the
+/// two checks matters and is pinned here.
+#[test]
+fn empty_placeholder_scan_ranges_are_skipped() {
+    let path = "file:///data/users.parquet";
+    let placeholder = |has_more: bool| {
+        TScanRangeParams::new(TScanRange::default(), None, Some(true), Some(has_more))
+    };
+    let with_placeholder = |has_more: bool| {
+        let mut fragment = params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, -1, Some(1024)),
+        );
+        fragment
+            .params
+            .as_mut()
+            .unwrap()
+            .per_node_scan_ranges
+            .get_mut(&0)
+            .unwrap()
+            .push(placeholder(has_more));
+        fragment
+    };
+
+    let translated = PlanTranslator::new()
+        .translate_fragment(&with_placeholder(false))
+        .expect("an empty placeholder without has_more is skipped");
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+
+    let err = PlanTranslator::new()
+        .translate_fragment(&with_placeholder(true))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "incremental scan-range delivery (has_more) is not supported"
+    );
+}
+
+/// Verifies complete byte-range splits are collapsed to one whole-file local read.
+#[test]
+fn complete_split_broker_ranges_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+            None,
+            None,
+            None,
+        ));
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
+/// Builds fragment params whose node-0 scan carries every `(start, size)` split of `path`, all
+/// declaring `file_size`, in the order given.
+fn params_with_splits(
+    path: &str,
+    file_size: i64,
+    splits: &[(i64, i64)],
+) -> TExecPlanFragmentParams {
+    let (first, rest) = splits.split_first().expect("at least one split");
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            path,
+            TFileFormatType::FORMAT_PARQUET,
+            first.0,
+            first.1,
+            Some(file_size),
+        ),
+    );
+    let ranges = fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap();
+    for &(start, size) in rest {
+        ranges.push(TScanRangeParams::new(
+            broker_scan_range(
+                path,
+                TFileFormatType::FORMAT_PARQUET,
+                start,
+                size,
+                Some(file_size),
+            ),
+            None,
+            None,
+            None,
+        ));
+    }
+    fragment
+}
+
+/// Translates `splits` and returns the `UnsupportedScanRange` reason they were refused with.
+fn splits_rejected_because(file_size: i64, splits: &[(i64, i64)]) -> &'static str {
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            file_size,
+            splits,
+        ))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    reason
+}
+
+/// Splits that leave a hole are refused: collapsing them to a whole-file read would scan the
+/// hole, which a sibling instance is already scanning.
+#[test]
+fn split_broker_ranges_with_a_gap_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 256), (512, 512)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Splits that tile a prefix but stop short of the file are refused: the tail would be dropped.
+#[test]
+fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 256), (256, 256)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// A split that runs past the end of the file is malformed metadata, not a whole-file read. The
+/// sweep only asked whether EOF had been reached, so `(512, 1024)` over a 1024-byte file collapsed
+/// to a whole-file read instead of being refused.
+#[test]
+fn split_broker_ranges_extending_past_eof_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 512), (512, 1024)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 2048)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+}
+
+/// A zero-length split covers nothing, so it can never be part of a tiling: `(0, 0)` is refused
+/// outright, and a zero-length tail `(1024, -1)` after a whole-file split trips the same rule.
+#[test]
+fn zero_size_split_is_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 0)]),
+        "byte-range splits do not tile the parquet file"
+    );
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 1024), (1024, -1)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
+/// sweep that only rejects gaps collapses them into one whole-file read — Sirius would scan the
+/// shared row groups once where StarRocks scans them on both instances, and `count(*)` would
+/// disagree with no error.
+#[test]
+fn overlapping_split_broker_ranges_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 1024), (0, 512)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Splits of one file that disagree on how big that file is are refused — the coverage check
+/// would otherwise be measured against an arbitrary one of them.
+#[test]
+fn split_broker_ranges_disagreeing_on_file_size_are_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_splits(path, 1024, &[(0, 512)]);
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(2048)),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(reason, "scan ranges disagree on the parquet file size");
+}
+
+/// A split missing its `file_size` reports as missing wherever it lands in the list, not
+/// only when it happens to be inserted first. Checking agreement before presence made the
+/// message depend on arrival order: the same fragment reported "missing" or "disagree"
+/// depending on which range the FE sent first.
+#[test]
+fn split_broker_range_missing_file_size_after_the_first_is_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_splits(path, 1024, &[(0, 512)]);
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, None),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(reason, "scan range is missing the parquet file size");
+}
+
+/// Splits arriving out of order still tile the file: the sweep sorts before checking, and the FE
+/// does not promise an order. Without the sort this case would be refused.
+#[test]
+fn split_broker_ranges_in_descending_order_are_accepted() {
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            1024,
+            &[(512, 512), (0, 512)],
+        ))
+        .unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
+/// The motivating shape: with pipeline dop the FE hands one instance several splits of the same
+/// file under different driver sequences. They must be combined across sequences into one
+/// whole-file read, not validated per sequence.
+#[test]
+fn per_driver_split_ranges_across_sequences_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_per_driver_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .node_to_per_driver_seq_scan_ranges
+        .as_mut()
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .insert(
+            1,
+            vec![TScanRangeParams::new(
+                broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+                None,
+                None,
+                None,
+            )],
+        );
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
 /// Verifies a scan range delivered via the pipeline per-driver-sequence map is
 /// collected too (not just `per_node_scan_ranges`).
 #[test]
@@ -853,16 +1240,32 @@ fn bounded_split_with_unknown_file_size_is_unsupported() {
 }
 
 /// Verifies an empty (zero-byte) file range is rejected: it is not a readable
-/// parquet file, so it must not be passed to `parquet_scan`.
+/// parquet file, so it must not be passed to `parquet_scan`. Pins the reason too —
+/// an empty file used to be reported as a file-size disagreement, which sent the
+/// reader hunting for a second, differing range that does not exist.
 #[test]
 fn empty_file_scan_range_is_unsupported() {
-    assert_scan_range_unsupported(broker_scan_range(
-        "file:///data/users.parquet",
-        TFileFormatType::FORMAT_PARQUET,
-        0,
-        0,
-        Some(0),
-    ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                0,
+                0,
+                Some(0),
+            ),
+        ))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "parquet scan range reports an empty or negative file size"
+    );
 }
 
 /// Verifies a renamed column mapping is rejected: destination slot 1 ("id") fed
