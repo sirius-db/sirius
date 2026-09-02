@@ -20,6 +20,7 @@
 
 #include "sirius_ffi.hpp"
 
+#include "config.hpp"                                      // duckdb::Config (LOG_* knobs)
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
@@ -46,6 +47,7 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
+#include <cstdlib>  // std::getenv
 #include <map>
 #include <set>
 
@@ -70,29 +72,50 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
 {
   auto& client = *conn.context;
 
-  duckdb::SubstraitToDuckDB transformer(conn.context, substrait_plan, /*json=*/false);
-  auto relation = transformer.TransformPlan();
+  // Substrait transformation and planning both bind against the catalog, and every catalog lookup
+  // goes through TransactionContext::ActiveTransaction(). DuckDB 1.5.5 throws there when no
+  // transaction is open ("TransactionContext::ActiveTransaction called without active
+  // transaction"); 1.5.4 tolerated it. Fragment::build() commits its view-creation transaction
+  // before opening the StandaloneQueryScope, so by the time we are called there is usually none.
+  //
+  // Own one only if the caller has not already opened it — the single-shot path in
+  // execute_substrait() begins its own and expects to still own it on return.
+  //
+  // ClientContext::transaction, NOT Connection::BeginTransaction(): the latter runs
+  // Query("BEGIN TRANSACTION"), an ordinary statement that would take the lifecycle mutex the
+  // enclosing StandaloneQueryScope already holds.
+  const bool owned_transaction = !client.transaction.HasActiveTransaction();
+  if (owned_transaction) { client.transaction.BeginTransaction(); }
 
-  duckdb::Planner planner(client);
-  planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
+  try {
+    duckdb::SubstraitToDuckDB transformer(conn.context, substrait_plan, /*json=*/false);
+    auto relation = transformer.TransformPlan();
 
-  auto prepared =
-    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
-  prepared->names     = planner.names;
-  prepared->types     = planner.types;
-  prepared->value_map = std::move(planner.value_map);
+    duckdb::Planner planner(client);
+    planner.CreatePlan(duckdb::make_uniq<duckdb::RelationStatement>(relation));
 
-  auto logical_plan = std::move(planner.plan);
-  if (client.config.enable_optimizer) {
-    duckdb::Optimizer optimizer(*planner.binder, client);
-    logical_plan = optimizer.Optimize(std::move(logical_plan));
+    auto prepared = duckdb::make_shared_ptr<duckdb::PreparedStatementData>(
+      duckdb::StatementType::SELECT_STATEMENT);
+    prepared->names     = planner.names;
+    prepared->types     = planner.types;
+    prepared->value_map = std::move(planner.value_map);
+
+    auto logical_plan = std::move(planner.plan);
+    if (client.config.enable_optimizer) {
+      duckdb::Optimizer optimizer(*planner.binder, client);
+      logical_plan = optimizer.Optimize(std::move(logical_plan));
+    }
+    logical_plan->ResolveOperatorTypes();
+    duckdb::ColumnBindingResolver resolver;
+    duckdb::ColumnBindingResolver::Verify(*logical_plan);
+    resolver.VisitOperator(*logical_plan);
+
+    if (owned_transaction) { client.transaction.Commit(); }
+    return {std::move(prepared), std::move(logical_plan)};
+  } catch (...) {
+    if (owned_transaction) { client.transaction.Rollback(nullptr); }
+    throw;
   }
-  logical_plan->ResolveOperatorTypes();
-  duckdb::ColumnBindingResolver resolver;
-  duckdb::ColumnBindingResolver::Verify(*logical_plan);
-  resolver.VisitOperator(*logical_plan);
-
-  return {std::move(prepared), std::move(logical_plan)};
 }
 
 }  // namespace
@@ -108,6 +131,21 @@ struct Context::Impl {
 
   void bring_up(sirius::sirius_config& config)
   {
+    // The extension path installs the engine log sink from SiriusContextExtensionCallback's
+    // ctor, which this FFI path never constructs — leaving SIRIUS_LOG_* dead and every
+    // engine-side stall invisible on a compute node. Honor the env here, but only when
+    // explicitly configured, so embedders without SIRIUS_LOG_* keep today's behavior (no
+    // surprise ./log directory).
+    const char* log_backend = std::getenv("SIRIUS_LOG_BACKEND");
+    const char* log_dir     = std::getenv("SIRIUS_LOG_DIR");
+    const char* log_level   = std::getenv("SIRIUS_LOG_LEVEL");
+    if (log_backend != nullptr || log_dir != nullptr || log_level != nullptr) {
+      if (log_backend != nullptr) { duckdb::Config::LOG_BACKEND = log_backend; }
+      if (log_dir != nullptr) { duckdb::Config::LOG_DIR = log_dir; }
+      if (log_level != nullptr) { duckdb::Config::LOG_LEVEL = log_level; }
+      duckdb::install_configured_log_sink(nullptr);
+    }
+
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
     // Register the builtin + parquet representation converters the GPU scan/result

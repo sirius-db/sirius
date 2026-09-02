@@ -942,7 +942,13 @@ target_include_directories(
     # landed.
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
-)
+    # test/cpp/exec/test_sirius_ffi_fragment.cpp builds the Substrait plan it
+    # hands to Fragment::build() with the bundled protobuf (substrait/*.pb.h):
+    # the same two header roots from_substrait.hpp needs on the extension
+    # targets above. The generated code itself is already linked in through
+    # sirius_extension.
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
