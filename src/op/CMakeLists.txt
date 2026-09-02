@@ -18,6 +18,7 @@ target_sources(
           scan/host_keep_mask.cpp
           scan/owning_table_view.cpp
           scan/parquet_batch_layout.cpp
+          scan/parquet_byte_range.cpp
           scan/parquet_schema_mapping.cpp
           scan/scan_plan.cpp
           scan/scan_filter_analysis.cpp
