@@ -147,6 +147,42 @@ TEST_CASE("cache_entry_info: parquet different file set misses", "[scan][can_ser
   REQUIRE(pinned.can_serve_with_columns(two_files).empty());
 }
 
+TEST_CASE("cache_entry_info: a byte-range split scan neither serves nor is served by a pin",
+          "[scan][can_serve]")
+{
+  // A ranged scan holds a fraction of each file's rows, so the file set alone is not
+  // its identity: a whole-file pin would hand it extra rows, and a pin built from it
+  // would hand a whole-file scan missing rows. Both directions miss even though the
+  // file set and the columns match.
+  auto whole_file_pin = parquet_cache({"a.parquet"}, {0, 1});
+  parquet_ingestible_table_info ranged_scan;
+  fill(ranged_scan, {"a.parquet"}, {0});
+  ranged_scan.resolved_file_ranges = {{0, 4096}};
+  REQUIRE(ranged_scan.has_byte_ranges());
+  REQUIRE(whole_file_pin.can_serve_with_columns(ranged_scan).empty());
+
+  // The pin side records the fact at construction (cache_entry_info::from): a pin
+  // built from the ranged scan never serves a whole-file scan, while the same pin
+  // built from a whole-file scan does — so the miss is the range, not the file set.
+  ranged_scan.names = {"a"};
+  auto ranged_pin   = cache_entry_info::from(ranged_scan);
+  REQUIRE(ranged_pin.has_byte_ranges);
+  parquet_ingestible_table_info whole_file_scan;
+  fill(whole_file_scan, {"a.parquet"}, {0});
+  whole_file_scan.names = {"a"};
+  REQUIRE(ranged_pin.can_serve_with_columns(whole_file_scan).empty());
+  auto control_pin = cache_entry_info::from(whole_file_scan);
+  REQUIRE_FALSE(control_pin.has_byte_ranges);
+  REQUIRE(control_pin.can_serve_with_columns(whole_file_scan) == std::vector<std::size_t>{0});
+
+  // A (0,0) entry is a whole-file read, not a range: it still hits.
+  parquet_ingestible_table_info unranged_scan;
+  fill(unranged_scan, {"a.parquet"}, {0});
+  unranged_scan.resolved_file_ranges = {{0, 0}};
+  REQUIRE_FALSE(unranged_scan.has_byte_ranges());
+  REQUIRE(whole_file_pin.can_serve_with_columns(unranged_scan) == std::vector<std::size_t>{0});
+}
+
 TEST_CASE("cache_entry_info: duckdb same-table subset request hits with a gather projection",
           "[scan][can_serve]")
 {
