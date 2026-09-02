@@ -408,7 +408,8 @@ impl SiriusComputeNodeService {
             .map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id))
     }
 
-    /// Extracts the parquet path from the binary-thrift attachment and infers its schema.
+    /// Extracts the parquet paths from the binary-thrift attachment and infers their common
+    /// schema. The FE sends one request covering every FILES() file, one range per file.
     async fn file_schema_from_attachment(
         attachment: &[u8],
     ) -> std::result::Result<Vec<PSlotDescriptor>, String> {
@@ -417,26 +418,23 @@ impl SiriusComputeNodeService {
         let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
             "TGetFileSchemaRequest scan_range carries no broker_scan_range".to_string()
         })?;
-        // Cross-file sampling and type promotion (what the native scanner does for multi-file
-        // FILES()) is a follow-up; reject multiple ranges rather than resolve a partial schema.
-        let ranges = broker.ranges;
-        if ranges.len() > 1 {
-            return Err(format!(
-                "multi-file FILES() schema inference is not supported yet ({} files); use a single file path",
-                ranges.len()
-            ));
+        if broker.ranges.is_empty() {
+            return Err("broker_scan_range carries no file ranges".to_string());
         }
-        let range = ranges
+        let paths = broker
+            .ranges
             .into_iter()
-            .next()
-            .ok_or_else(|| "broker_scan_range carries no file ranges".to_string())?;
-        if range.format_type != TFileFormatType::FORMAT_PARQUET {
-            return Err(format!(
-                "unsupported file format {:?}; only parquet schema inference is implemented",
-                range.format_type
-            ));
-        }
-        crate::file_schema::parquet_file_schema(&range.path).await
+            .map(|range| {
+                if range.format_type != TFileFormatType::FORMAT_PARQUET {
+                    return Err(format!(
+                        "unsupported file format {:?} for '{}'; only parquet schema inference is implemented",
+                        range.format_type, range.path
+                    ));
+                }
+                Ok(range.path)
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        crate::file_schema::parquet_files_schema(&paths).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.
@@ -513,10 +511,14 @@ mod tests {
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
         internal_service::{InternalServiceVersion, TPlanFragmentExecParams},
         partitions::{TDataPartition, TPartitionType},
-        plan_nodes::{TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
+        plan_nodes::{
+            TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TFileScanNode, TPlan,
+            TPlanNode, TPlanNodeType, TScanRange,
+        },
         planner::TPlanFragment,
         types::{
-            TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
+            TFileType, TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode,
+            TTypeNodeType, TUniqueId,
         },
     };
     use thrift::{protocol::TBinaryOutputProtocol, transport::TIoChannel};
@@ -524,6 +526,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        file_schema::test_support::write_parquet,
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
@@ -797,6 +800,106 @@ mod tests {
             "{:?}",
             result.status.error_msgs
         );
+    }
+
+    #[tokio::test]
+    async fn get_file_schema_attachment_infers_across_multiple_ranges() {
+        let message = "message m { optional int64 a; optional binary b (UTF8); }";
+        let first = write_parquet("svc_multi_a", message);
+        let second = write_parquet("svc_multi_b", message);
+        let attachment = serialize_binary(&file_schema_request(vec![
+            broker_range(&first, TFileFormatType::FORMAT_PARQUET),
+            broker_range(&second, TFileFormatType::FORMAT_PARQUET),
+        ]));
+        let schema = SiriusComputeNodeService::file_schema_from_attachment(&attachment).await;
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        let schema = schema.unwrap();
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0].col_name, "a");
+        assert_eq!(schema[1].col_name, "b");
+    }
+
+    #[tokio::test]
+    async fn get_file_schema_attachment_rejects_non_parquet_range_by_path() {
+        let message = "message m { optional int64 a; }";
+        let first = write_parquet("svc_fmt_a", message);
+        let second = write_parquet("svc_fmt_b", message);
+        // The non-parquet range hides behind a parquet one; the error must still name it.
+        let attachment = serialize_binary(&file_schema_request(vec![
+            broker_range(&first, TFileFormatType::FORMAT_PARQUET),
+            broker_range(&second, TFileFormatType::FORMAT_CSV_PLAIN),
+        ]));
+        let result = SiriusComputeNodeService::file_schema_from_attachment(&attachment).await;
+        std::fs::remove_file(&first).ok();
+        std::fs::remove_file(&second).ok();
+        assert!(
+            result.as_ref().is_err_and(|err| {
+                err.contains("unsupported file format") && err.contains(second.to_str().unwrap())
+            }),
+            "{result:?}"
+        );
+    }
+
+    fn broker_range(path: &std::path::Path, format: TFileFormatType) -> TBrokerRangeDesc {
+        TBrokerRangeDesc::new(
+            TFileType::FILE_LOCAL,
+            format,
+            false,
+            path.to_str().unwrap().to_string(),
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Wraps FILES() ranges the way the FE does: one broker scan range inside a TScanRange.
+    fn file_schema_request(ranges: Vec<TBrokerRangeDesc>) -> TGetFileSchemaRequest {
+        let params = TBrokerScanRangeParams::new(
+            b'\t' as i8,
+            b'\n' as i8,
+            0,
+            Vec::new(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let broker = TBrokerScanRange::new(ranges, params, Vec::new(), None, None, None, None);
+        TGetFileSchemaRequest::new(
+            TScanRange::new(None, None, Some(broker), None, None, None),
+            None,
+        )
     }
 
     fn fetch_request(hi: i64, lo: i64) -> Vec<u8> {
