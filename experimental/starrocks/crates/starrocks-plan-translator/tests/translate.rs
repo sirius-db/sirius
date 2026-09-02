@@ -2819,28 +2819,238 @@ fn aggregation_conjuncts_become_having_filter() {
     };
 }
 
-/// Verifies anti joins are rejected: the Substrait consumer has no left-anti conversion.
+/// Names the extension function a scalar-function expression invokes.
+fn scalar_function_name(
+    plan: &substrait::proto::Plan,
+    expr: &substrait::proto::Expression,
+) -> String {
+    let expression::RexType::ScalarFunction(call) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected a scalar function, got {expr:?}");
+    };
+    plan.extensions
+        .iter()
+        .find_map(|ext| {
+            match ext.mapping_type.as_ref().unwrap() {
+            substrait::proto::extensions::simple_extension_declaration::MappingType
+                ::ExtensionFunction(f) if f.function_anchor == call.function_reference =>
+            {
+                Some(f.name.clone())
+            }
+            _ => None,
+        }
+        })
+        .unwrap_or_else(|| panic!("no extension for anchor {}", call.function_reference))
+}
+
+/// Verifies each anti join is lowered through the specific supported form it needs, not merely
+/// that it translates: a left anti becomes a LEFT join filtered on the build key being NULL, a
+/// right anti mirrors that, and a null-aware left anti becomes a MARK join filtered on NOT of the
+/// marker column the join appends. Asserting only the output arity cannot tell these apart, and
+/// every one of them is a different answer.
 #[test]
-fn anti_hash_join_is_rejected() {
-    for join_op in [TJoinOp::LEFT_ANTI_JOIN, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN] {
+fn anti_hash_joins_are_lowered() {
+    for (join_op, want_type, want_filter, want_filter_field, want_emit) in [
+        (
+            TJoinOp::LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Left,
+            "is_null",
+            vec![1],
+            vec![0],
+        ),
+        (
+            TJoinOp::RIGHT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Right,
+            "is_null",
+            vec![0],
+            vec![1],
+        ),
+        (
+            TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::LeftMark,
+            "not",
+            vec![1],
+            vec![0],
+        ),
+    ] {
         let plan = TPlan::new(vec![
             hash_join_node(join_op),
             scan_node(0, 0),
             scan_node(1, 1),
         ]);
-        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
-        assert!(
-            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
-            "{join_op:?}: {err:?}"
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None))
+            .unwrap_or_else(|err| panic!("{join_op:?}: {err:?}"));
+
+        let root = root(&translated.plan);
+        assert_eq!(root.names.len(), 1, "{join_op:?}");
+        let rel::RelType::Project(project) =
+            root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the output projection under the root");
+        };
+        assert_eq!(
+            emit_mapping(project.common.as_ref()),
+            want_emit,
+            "{join_op:?}"
         );
+
+        let rel::RelType::Filter(filter) =
+            project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the anti-join filter under the projection");
+        };
+        assert_eq!(
+            scalar_function_name(&translated.plan, filter.condition.as_ref().unwrap()),
+            want_filter,
+            "{join_op:?}"
+        );
+        let expression::RexType::ScalarFunction(scalar) = filter
+            .condition
+            .as_ref()
+            .unwrap()
+            .rex_type
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("{join_op:?}: expected a scalar-function filter");
+        };
+        assert_eq!(
+            argument_field_indices(scalar),
+            want_filter_field,
+            "{join_op:?}: the filter must test the build key (left anti), the probe key (right \
+             anti) or the appended marker (null-aware)"
+        );
+
+        let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the join under the filter");
+        };
+        assert_eq!(join.r#type, want_type as i32, "{join_op:?}");
     }
 }
 
+/// The outer-join + `is_null(key)` lowering tells an unmatched row by the NULL the join pads the
+/// other side with, so the null-tested key must propagate NULL. A column reference does, and so
+/// does a cast of one; an arithmetic (or `if`/`case`) expression over the key is refused rather
+/// than risk dropping unmatched rows.
+#[test]
+fn anti_join_with_non_column_key_is_rejected() {
+    let times_two = |slot_id: i32, tuple_id: i32| {
+        let mut arith = base_expr_node(
+            TExprNodeType::ARITHMETIC_EXPR,
+            scalar_type(TPrimitiveType::BIGINT),
+            2,
+        );
+        arith.opcode = Some(TExprOpcode::MULTIPLY);
+        let mut nodes = vec![arith];
+        nodes.extend(slot_ref(slot_id, tuple_id, scalar_type(TPrimitiveType::BIGINT)).nodes);
+        nodes.extend(int_literal(2).nodes);
+        TExpr::new(nodes)
+    };
+
+    // LEFT ANTI null-tests the build (right) key; RIGHT ANTI null-tests the probe (left) key.
+    let mut left_anti = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    left_anti.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = times_two(1, 1);
+    let mut right_anti = hash_join_node(TJoinOp::RIGHT_ANTI_JOIN);
+    right_anti
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts[0]
+        .left = times_two(1, 0);
+    for (label, join) in [("LEFT_ANTI", left_anti), ("RIGHT_ANTI", right_anti)] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "anti join key is not a plain column reference",
+            "{label}"
+        );
+    }
+
+    // A cast over the column keeps NULL as NULL and stays supported.
+    let mut cast_key = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    cast_key.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = cast_expr(
+        scalar_type(TPrimitiveType::BIGINT),
+        slot_ref(1, 1, scalar_type(TPrimitiveType::INT)),
+    );
+    let plan = TPlan::new(vec![cast_key, scan_node(0, 0), scan_node(1, 1)]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("a cast of a column reference is still a column key");
+}
+
+/// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
+/// decides the match. Both executors null out *every* unmatched marker as soon as any build row
+/// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
+/// UNKNOWN and dropped. Correlated `NOT IN` (correlation predicate in `other_join_conjuncts`) and
+/// tuple `NOT IN` (several eq conjuncts) are therefore refused rather than silently returning too
+/// few rows.
+#[test]
+fn null_aware_anti_join_with_extra_predicates_is_rejected() {
+    let extra_eq = || {
+        TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )
+    };
+    let correlation = || {
+        binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )
+    };
+
+    // Tuple NOT IN: two equality keys.
+    let mut multi_key = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    multi_key
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts
+        .push(extra_eq());
+
+    // Correlated NOT IN: the correlation predicate rides in other_join_conjuncts.
+    let mut correlated = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    correlated
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .other_join_conjuncts = Some(vec![correlation()]);
+
+    for (label, join) in [
+        ("tuple NOT IN", multi_key),
+        ("correlated NOT IN", correlated),
+    ] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "null-aware left anti join with correlated or multi-column keys",
+            "{label}"
+        );
+    }
+
+    // The single-key, no-extra-conjunct form stays supported: there, "unmatched with a NULL on
+    // the build side" really is UNKNOWN, so the global rule is exact.
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("plain single-key null-aware anti join is still supported");
+}
+
 /// Verifies an unsupported join op is named as the reason even when the plan also carries no join
-/// conjuncts, which is the shape an anti join arrives in once the FE has folded its predicate away.
+/// conjuncts, which is the shape some join types arrive in once the FE has folded predicates away.
 #[test]
 fn unsupported_join_type_is_reported_before_missing_conjuncts() {
-    let mut join = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    let mut join = hash_join_node(TJoinOp::CROSS_JOIN);
     join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![];
     let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
 
