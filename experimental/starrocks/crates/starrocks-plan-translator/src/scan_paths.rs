@@ -218,6 +218,14 @@ impl ScanFilePaths {
                             "byte-range splits do not tile the parquet file",
                         ));
                     }
+                    // A split that runs past EOF is malformed metadata, not a whole-file read;
+                    // without this the sweep below only asks whether EOF was reached.
+                    if end > file_size {
+                        return Err(Self::unsupported(
+                            node_id,
+                            "byte-range split extends past the end of the parquet file",
+                        ));
+                    }
                     covered_until = end;
                 }
                 if covered_until < file_size {

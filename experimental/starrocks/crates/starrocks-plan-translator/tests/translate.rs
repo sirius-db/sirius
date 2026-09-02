@@ -838,6 +838,21 @@ fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
     );
 }
 
+/// A split that runs past the end of the file is malformed metadata, not a whole-file read. The
+/// sweep only asked whether EOF had been reached, so `(512, 1024)` over a 1024-byte file collapsed
+/// to a whole-file read instead of being refused.
+#[test]
+fn split_broker_ranges_extending_past_eof_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 512), (512, 1024)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 2048)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+}
+
 /// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
 /// sweep that only rejects gaps collapses them into one whole-file read — Sirius would scan the
 /// shared row groups once where StarRocks scans them on both instances, and `count(*)` would
