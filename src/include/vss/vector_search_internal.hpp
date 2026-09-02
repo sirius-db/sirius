@@ -23,10 +23,10 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace cudf {
+class column;
 class table;
 }  // namespace cudf
 namespace cucascade {
@@ -44,7 +44,7 @@ struct pinned_entry;
 
 namespace sirius::vss {
 
-/// Resolved handles for vector search table function implementation. Built
+/// Resolved handles shared by the ANN and ENN table-function search impls. Built
 /// once by @ref run_vector_search after it locates the GPU space, pinned table,
 /// host space, and uploads the query, then passed by const-ref to whichever impl
 /// runs. All references outlive the impl call.
@@ -61,10 +61,15 @@ struct vector_search_context {
   std::int64_t k;  ///< min(num_rows, req.k).
 };
 
-/// Return an empty table; column types come from the pinned table.
-/// Used for the no-result cases (empty table / k == 0 / no chunks).
-std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_entry& pin,
-                                                   const std::vector<std::string>& output_columns);
+/// Return an empty table with the search result schema.
+std::unique_ptr<cudf::table> make_empty_vss_output(
+  const std::vector<sirius::logical_type>& output_column_types);
+
+/// Widen gathered output columns back to their native carrier types.
+void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
+                             const std::vector<sirius::logical_type>& native_types,
+                             rmm::cuda_stream_view stream,
+                             rmm::device_async_resource_ref mr);
 
 /// Move a GPU result table to a host_data_representation the table function can
 /// stream out. Synchronizes @c c.stream before returning.
@@ -73,6 +78,10 @@ std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
 
 /// ENN search, tiled per pinned chunk and merged.
 std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
+  const vector_search_context& c);
+
+/// ANN search over a pinned IVF-Flat index.
+std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
   const vector_search_context& c);
 
 }  // namespace sirius::vss

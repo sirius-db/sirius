@@ -1852,6 +1852,13 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
                                 "' must be pinned on the GPU tier before building an index");
   }
 
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  auto const& pinned_names = pin->cache_info.column_names();
+  if (std::find(pinned_names.begin(), pinned_names.end(), data.column_name) == pinned_names.end()) {
+    throw InvalidInputException("sirius_create_ann_index: vector column '" + data.column_name +
+                                "' is not pinned on table '" + data.table_name + "';");
+  }
+
   // Collect the vector column's batches as views:
   // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
   // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
@@ -2174,6 +2181,9 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // Optional params' default values
   req.metric                    = "l2";
   req.k                         = 10;
+  req.use_index                 = true;
+  req.n_probes                  = 0;
+  req.index_type                = "ivf_flat";
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
@@ -2185,6 +2195,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
       req.k = kv.second.GetValue<int64_t>();
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "use_index") {
+      req.use_index = kv.second.GetValue<bool>();
+    } else if (key == "n_probes") {
+      req.n_probes = kv.second.GetValue<int64_t>();
+    } else if (key == "index_type") {
+      req.index_type = StringUtil::Lower(kv.second.ToString());
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "output_columns") {
@@ -2195,9 +2211,20 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
+  if (req.n_probes < 0) { throw BinderException("sirius_knn_search: n_probes must be >= 0"); }
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
+  }
+  if (req.index_type != "ivf_flat") {
+    throw BinderException("sirius_knn_search: unsupported index_type '" + req.index_type + "'");
+  }
+  // NOTE: cuVS has a bug on approximate search over an IVF-Flat index with metric=cosine and
+  // k>256. Remove this guard once it's fixed.
+  if (req.use_index && req.index_type == "ivf_flat" && req.metric == "cosine" && req.k > 256) {
+    throw BinderException(
+      "sirius_knn_search: cosine ANN search with k > 256 is not supported; "
+      "pass use_index => false to run exact, or chose a lower k (k <= 256).");
   }
   // An explicitly-passed empty list is a user error.
   if (output_columns_specified && req.output_columns.empty()) {
@@ -2239,6 +2266,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   auto is_pinned           = [&](const std::string& col) {
     return std::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
   };
+
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  if (!is_pinned(req.column_name)) {
+    throw BinderException("sirius_knn_search: vector column '" + req.column_name +
+                          "' is not pinned on table '" + req.table_name + "';");
+  }
 
   if (req.output_columns.empty()) {
     // Default to the columns that are pinned and in catalog schema order.
@@ -2284,8 +2317,10 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   }
 
   for (auto const& col : req.output_columns) {
-    return_types.push_back(type_of(col));
+    auto const& col_type = type_of(col);
+    return_types.push_back(col_type);
     names.push_back(col);
+    req.output_column_types.push_back(sirius::from_duckdb(col_type));
   }
   return_types.push_back(LogicalType::FLOAT);
   names.push_back("distance");
@@ -2478,7 +2513,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, drop_ann_index_info);
 
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
-  // schema_name =>)
+  // use_index =>, n_probes =>, index_type =>, schema_name =>)
   TableFunction vector_search("sirius_knn_search",
                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
                               SiriusVectorSearchFunction,
@@ -2487,6 +2522,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["k"]              = LogicalType::BIGINT;
   vector_search.named_parameters["output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
+  vector_search.named_parameters["use_index"]      = LogicalType::BOOLEAN;
+  vector_search.named_parameters["n_probes"]       = LogicalType::BIGINT;
+  vector_search.named_parameters["index_type"]     = LogicalType::VARCHAR;
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);

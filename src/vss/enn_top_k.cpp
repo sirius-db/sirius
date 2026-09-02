@@ -103,6 +103,7 @@ std::unique_ptr<cudf::table> compute_enn_top_k(const vector_search_context& c,
   for (std::size_t i = 1; i < gathered_cols.size(); ++i) {
     out_cols.push_back(std::move(gathered_cols[i]));
   }
+  restore_native_carriers(out_cols, c.req.output_column_types, c.stream, c.mr);
   out_cols.push_back(std::move(knn.distances));
   return std::make_unique<cudf::table>(std::move(out_cols));
 }
