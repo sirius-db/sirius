@@ -29,7 +29,7 @@
 #include <cuda/std/bit>
 #include <cuda/std/cstddef>
 #include <cuda/std/limits>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
