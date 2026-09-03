@@ -254,7 +254,7 @@ TEST_CASE("sirius_physical_projection mixes evaluated and passthrough columns (p
   // alive even after the input variable disappears.
   inputs.clear();
   input_batch.reset();
-  cuda::stream_ref const stream = cudf::get_default_stream();
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
 
   auto out_view = sirius::get_cudf_table_view(*out_batch);
@@ -303,7 +303,7 @@ TEST_CASE("sirius_physical_projection passthrough output outlives input batch ha
   // output owner's read-only lock keeps the data alive.
   inputs.clear();
   input_batch.reset();
-  cuda::stream_ref const stream = cudf::get_default_stream();
+  ::cuda::stream_ref const stream = cudf::get_default_stream();
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
 
   auto out_view = sirius::get_cudf_table_view(*out_batch);
