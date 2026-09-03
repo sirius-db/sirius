@@ -43,6 +43,7 @@
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
+#include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
@@ -88,6 +89,17 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
   if (owned_transaction) { client.transaction.BeginTransaction(); }
 
   try {
+    // Byte-ranged parquet splits ride the plan's LocalFiles items, but DuckDB's consumer and
+    // parquet binding cannot carry them — extract into a per-plan state the physical plan
+    // generator consumes. Always replaced (and removed when this plan has none), so a stale
+    // registry can never leak a previous plan's ranges into this one.
+    client.registered_state->Remove(sirius::planner::scan_byte_ranges_state::kStateKey);
+    if (auto ranges = sirius::planner::extract_scan_byte_ranges(substrait_plan); !ranges.empty()) {
+      client.registered_state->Insert(
+        sirius::planner::scan_byte_ranges_state::kStateKey,
+        duckdb::make_shared_ptr<sirius::planner::scan_byte_ranges_state>(std::move(ranges)));
+    }
+
     duckdb::SubstraitToDuckDB transformer(conn.context, substrait_plan, /*json=*/false);
     auto relation = transformer.TransformPlan();
 

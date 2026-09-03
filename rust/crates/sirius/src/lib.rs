@@ -363,10 +363,11 @@ mod tests {
         let _ctx = SiriusContext::new().expect("bring up default Sirius context");
     }
 
-    /// Encodes a single-file `local_files` parquet read plan with `names` as the
-    /// root output names — the shape DuckDB's Substrait reader resolves to
-    /// `parquet_scan(<path>)`.
-    fn local_files_plan(path: &str, names: Vec<String>) -> Vec<u8> {
+    /// Encodes a `local_files` parquet read plan with `names` as the root output names and one
+    /// item per `(path, start, length)` — `(0, 0)` meaning the whole file. The shape DuckDB's
+    /// Substrait reader resolves to `parquet_scan(<path>)`; a non-zero range is what a compute
+    /// node emits for one byte-range split of a distributed scan.
+    fn local_files_plan_ranged(items: &[(&str, u64, u64)], names: Vec<String>) -> Vec<u8> {
         use substrait::proto::read_rel::local_files::FileOrFiles;
         use substrait::proto::read_rel::local_files::file_or_files::{
             FileFormat, ParquetReadOptions, PathType,
@@ -377,11 +378,16 @@ mod tests {
         let read = Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
                 read_type: Some(ReadType::LocalFiles(LocalFiles {
-                    items: vec![FileOrFiles {
-                        path_type: Some(PathType::UriFile(path.to_string())),
-                        file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
-                        ..Default::default()
-                    }],
+                    items: items
+                        .iter()
+                        .map(|(path, start, length)| FileOrFiles {
+                            path_type: Some(PathType::UriFile(path.to_string())),
+                            file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                            start: *start,
+                            length: *length,
+                            ..Default::default()
+                        })
+                        .collect(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -397,6 +403,11 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec()
+    }
+
+    /// Encodes a single-file whole-file `local_files` parquet read plan.
+    fn local_files_plan(path: &str, names: Vec<String>) -> Vec<u8> {
+        local_files_plan_ranged(&[(path, 0, 0)], names)
     }
 
     /// Writes the tiny `(id BIGINT, name VARCHAR)` parquet fixture at `path`:
@@ -734,6 +745,69 @@ mod tests {
             assignments[0], assignments[1],
             "independently built senders must route every decimal key identically"
         );
+    }
+
+    /// Byte-range splits of one parquet file must read every row exactly once: each split
+    /// yields a disjoint subset, their union is the whole file, and one plan carrying both
+    /// splits as separate LocalFiles items equals the whole-file plan. Requires a GPU.
+    #[test]
+    fn byte_range_splits_read_every_row_exactly_once() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.parquet");
+        // 30k rows in ~6 row groups: big enough that both halves hold data pages.
+        write_multi_row_group_parquet(&path, 30000, 5000);
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let half = file_size / 2;
+        let p = path.to_str().unwrap();
+        let names = || vec!["id".to_string(), "name".to_string()];
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let whole = ctx
+            .execute_substrait_result(&local_files_plan(p, names()))
+            .expect("whole-file plan");
+        let left = ctx
+            .execute_substrait_result(&local_files_plan_ranged(&[(p, 0, half)], names()))
+            .expect("left split plan");
+        let right = ctx
+            .execute_substrait_result(&local_files_plan_ranged(
+                &[(p, half, file_size - half)],
+                names(),
+            ))
+            .expect("right split plan");
+
+        let whole_rows = rows(&whole);
+        let left_rows = rows(&left);
+        let right_rows = rows(&right);
+        assert_eq!(whole_rows.len(), 30000);
+        assert!(!left_rows.is_empty(), "left split must own row groups");
+        assert!(!right_rows.is_empty(), "right split must own row groups");
+        let mut union = left_rows.clone();
+        union.extend(right_rows.iter().cloned());
+        union.sort();
+        assert_eq!(
+            union, whole_rows,
+            "splits must partition the file: no duplication, no loss"
+        );
+
+        // Both splits in ONE plan (two LocalFiles items for the same path) also equal the
+        // whole file — the multi-range-per-instance shape a CN emits when the FE co-locates
+        // two splits of one file.
+        let both = ctx
+            .execute_substrait_result(&local_files_plan_ranged(
+                &[(p, 0, half), (p, half, file_size - half)],
+                names(),
+            ))
+            .expect("two-splits-one-plan");
+        assert_eq!(rows(&both), whole_rows);
+
+        // An empty split (range inside one row group) is a valid empty result, not an error.
+        let empty = ctx
+            .execute_substrait_result(&local_files_plan_ranged(&[(p, 10, 5)], names()))
+            .expect("empty split plan");
+        assert_eq!(rows(&empty).len(), 0);
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`

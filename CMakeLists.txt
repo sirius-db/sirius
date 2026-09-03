@@ -419,6 +419,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/planner/substrait_scan_ranges.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/insert_delta_job.cpp
