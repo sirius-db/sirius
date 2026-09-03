@@ -1,6 +1,6 @@
 //! Per-scan-node parquet file paths collected from a fragment's broker scan ranges.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use starrocks_thrift::exprs::TExprNodeType;
 use starrocks_thrift::internal_service::{TExecPlanFragmentParams, TScanRangeParams};
@@ -12,32 +12,41 @@ use starrocks_thrift::types::TFileType;
 use crate::descriptor_table::DescriptorTable;
 use crate::error::{Result, TranslateError};
 
-/// Parquet file paths for each scan node in a fragment, keyed by plan node id.
+/// Parquet files (whole or byte-range slices) for each scan node in a fragment, keyed by plan
+/// node id.
 ///
-/// Built from the fragment's broker scan ranges so `FILE_SCAN` nodes emit
-/// Substrait `local_files` reads DuckDB resolves as `parquet_scan(<paths>)`.
-/// Nodes without broker ranges have no entry and fall back to a named-table read.
+/// Built from the fragment's broker scan ranges so `FILE_SCAN` nodes emit Substrait
+/// `local_files` reads DuckDB resolves as `parquet_scan(<paths>)`. Nodes without broker ranges
+/// have no entry and fall back to a named-table read.
 ///
-/// Collection fails closed: only the slice that maps faithfully onto a
-/// `parquet_scan` over local files is accepted — a `FILES()` query (not a load),
-/// reading local parquet files whose columns are direct passthroughs to the scan
-/// tuple. Byte-range splits assigned to one fragment are collapsed only when they
-/// collectively cover the whole file. Anything else (loads, partial files, remote
-/// schemes, casts or other column transforms, path-derived or flexibly-mapped
-/// columns) is rejected with [`TranslateError::UnsupportedScanRange`] rather than
-/// silently producing wrong results.
+/// Collection fails closed: only the slice that maps faithfully onto a `parquet_scan` over
+/// local files is accepted — a `FILES()` query (not a load), reading local parquet files whose
+/// columns are direct passthroughs to the scan tuple. Byte ranges assigned to this instance are
+/// normalized per file: overlaps are refused (they would read rows twice), adjacent ranges
+/// coalesce, an exact tiling of the whole file collapses to a whole-file read, and anything
+/// else is emitted as explicit `[start, start+length)` splits — the engine reads exactly the
+/// row groups whose start offset falls inside each split, so the instances of a distributed
+/// scan together read every row exactly once. Anything outside that slice (loads, remote
+/// schemes, casts or other column transforms, path-derived or flexibly-mapped columns,
+/// incremental `has_more` delivery) is rejected with [`TranslateError::UnsupportedScanRange`]
+/// rather than silently producing wrong results.
 #[derive(Debug, Default)]
 pub(crate) struct ScanFilePaths {
-    by_node: HashMap<i32, Vec<String>>,
+    // `BTreeMap`s so a fragment with several offending nodes always reports the same one; a
+    // `HashMap` here makes the error text vary run to run.
+    by_node: BTreeMap<i32, Vec<String>>,
+    byte_ranges: BTreeMap<i32, BTreeMap<String, Vec<ByteRange>>>,
+    resolved: BTreeMap<i32, Vec<ScanFile>>,
 }
 
-/// Byte ranges seen while collecting one fragment, keyed `node -> path -> ranges`.
-///
-/// Local to collection: the ranges are only ever used to prove each file is covered
-/// completely, and nothing downstream can act on them (see `validate_complete_files`).
-/// `BTreeMap` so a fragment with several offending nodes or files always reports the
-/// same one — a `HashMap` here makes the error text vary run to run.
-type CollectedRanges = BTreeMap<i32, BTreeMap<String, Vec<ByteRange>>>;
+/// One file — or one byte-range slice of a file — a scan node reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanFile {
+    pub path: String,
+    /// `Some((start, length))` for a byte-range split; `None` reads the whole file. `(0, 0)`
+    /// is never emitted as a range — it is the whole-file encoding on the wire.
+    pub range: Option<(u64, u64)>,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ByteRange {
@@ -57,12 +66,11 @@ impl ScanFilePaths {
         desc: &DescriptorTable,
     ) -> Result<Self> {
         let mut paths = Self::default();
-        let mut byte_ranges = CollectedRanges::new();
         let Some(exec_params) = params.params.as_ref() else {
             return Ok(paths);
         };
         for (node_id, ranges) in &exec_params.per_node_scan_ranges {
-            paths.add_ranges(*node_id, ranges, desc, &mut byte_ranges)?;
+            paths.add_ranges(*node_id, ranges, desc)?;
         }
         if let Some(per_driver) = exec_params.node_to_per_driver_seq_scan_ranges.as_ref() {
             for (node_id, per_seq) in per_driver {
@@ -78,18 +86,18 @@ impl ScanFilePaths {
                     ));
                 }
                 for ranges in per_seq.values() {
-                    paths.add_ranges(*node_id, ranges, desc, &mut byte_ranges)?;
+                    paths.add_ranges(*node_id, ranges, desc)?;
                 }
             }
         }
-        Self::validate_complete_files(&byte_ranges)?;
+        paths.resolve_ranges()?;
         Ok(paths)
     }
 
-    /// Returns the parquet file paths collected for `node_id`, empty when the node
-    /// has no broker scan ranges (it then falls back to a named-table read).
-    pub(crate) fn for_node(&self, node_id: i32) -> &[String] {
-        self.by_node
+    /// Returns the parquet files (whole or ranged) collected for `node_id`, empty when the
+    /// node has no broker scan ranges (it then falls back to a named-table read).
+    pub(crate) fn for_node(&self, node_id: i32) -> &[ScanFile] {
+        self.resolved
             .get(&node_id)
             .map(Vec::as_slice)
             .unwrap_or_default()
@@ -101,7 +109,6 @@ impl ScanFilePaths {
         node_id: i32,
         ranges: &[TScanRangeParams],
         desc: &DescriptorTable,
-        byte_ranges: &mut CollectedRanges,
     ) -> Result<()> {
         for range in ranges {
             // Incremental delivery: more ranges follow through deliver_scan_ranges, which this
@@ -126,7 +133,7 @@ impl ScanFilePaths {
                 if !node_paths.contains(&range_desc.path) {
                     node_paths.push(range_desc.path.clone());
                 }
-                byte_ranges
+                self.byte_ranges
                     .entry(node_id)
                     .or_default()
                     .entry(range_desc.path.clone())
@@ -141,37 +148,39 @@ impl ScanFilePaths {
         Ok(())
     }
 
-    /// Ensures split ranges assigned to this fragment collectively cover each file
-    /// exactly once.
+    /// Normalizes each file's byte ranges into the [`ScanFile`]s this instance reads.
     ///
-    /// Completeness is required because the range is not plumbed through yet: today
-    /// DuckDB's Substrait `local_files` reader drops `FileOrFiles.start` / `.length`, and
-    /// `parquet_scan` has no byte-range parameter, so `scan_rel` can only ever emit
-    /// `parquet_scan(<whole path>)` — see the item it builds in `node_translator`. The
-    /// only split this translation can honor today is therefore one it does not have to
-    /// honor at all: ranges that tile the file from byte 0 to EOF, where reading the
-    /// whole file *is* exactly the work this fragment was assigned. A lone partial
-    /// split has no faithful whole-file spelling and is refused. Explicit partial splits
-    /// are enabled by the engine byte-range stack (follow-up).
+    /// Overlaps are refused — under start-offset row-group ownership two overlapping ranges
+    /// would read the same row groups twice, silently. Adjacent ranges coalesce; an exact
+    /// tiling of the whole file collapses to a whole-file read (so single-instance plans stay
+    /// byte-identical to before splits existed); everything else becomes explicit ranges. The
+    /// rest of the file belongs to other instances of the same distributed scan.
     ///
-    /// That is why [`ByteRange`] is validated and discarded rather than forwarded for now.
-    fn validate_complete_files(byte_ranges: &CollectedRanges) -> Result<()> {
-        for (&node_id, files) in byte_ranges {
-            for ranges in files.values() {
-                // Ask "is any size missing" before "do the sizes agree": both questions
-                // are about `file_size`, and checking agreement first reports a missing
-                // size as a disagreement whenever the incomplete range is not the one
-                // that happened to be inserted first.
-                if ranges.iter().any(|range| range.file_size.is_none()) {
+    /// A file whose ranges are all empty is refused per file, so it cannot vanish from a node
+    /// that also owns real bytes of another file.
+    fn resolve_ranges(&mut self) -> Result<()> {
+        for (&node_id, node_paths) in &self.by_node {
+            let files = self.byte_ranges.get(&node_id);
+            let mut scan_files = Vec::new();
+            for path in node_paths {
+                let ranges = files
+                    .and_then(|files| files.get(path))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                // Every range must carry the parquet file size, and the question is asked over
+                // all of them before "do the sizes agree": otherwise a missing size on any range
+                // but the first is reported as a disagreement. `add_ranges` records a byte range
+                // for every path it names, so `ranges` is never empty; if it ever is, fail closed
+                // the same way rather than dropping the file.
+                let Some(file_size) = ranges
+                    .first()
+                    .and_then(|range| range.file_size)
+                    .filter(|_| ranges.iter().all(|range| range.file_size.is_some()))
+                else {
                     return Err(Self::unsupported(
                         node_id,
                         "scan range is missing the parquet file size",
                     ));
-                }
-                // `add_ranges` only ever creates an entry by pushing, so an empty vector
-                // does not occur; if one ever does there is nothing to validate.
-                let Some(file_size) = ranges.first().and_then(|range| range.file_size) else {
-                    continue;
                 };
                 if ranges
                     .iter()
@@ -182,59 +191,90 @@ impl ScanFilePaths {
                         "scan ranges disagree on the parquet file size",
                     ));
                 }
-                // Its own branch, not folded into the disagreement above: an empty file
-                // is a coherent thing the frontend can describe, and reporting it as a
-                // disagreement sends the reader looking for a second, differing range.
+                // Its own branch, not folded into the disagreement above: an empty file is a
+                // coherent thing the frontend can describe, and reporting it as a disagreement
+                // sends the reader looking for a second, differing range.
                 if file_size <= 0 {
                     return Err(Self::unsupported(
                         node_id,
                         "parquet scan range reports an empty or negative file size",
                     ));
                 }
-                let mut intervals = ranges
-                    .iter()
-                    .map(|range| {
-                        let end = if range.size == -1 {
-                            file_size
-                        } else if range.size > 0 {
-                            range.start.checked_add(range.size).unwrap_or(i64::MAX)
-                        } else {
-                            -1
-                        };
-                        (range.start, end)
-                    })
-                    .collect::<Vec<_>>();
-                intervals.sort_unstable();
-                let mut covered_until = 0;
-                for (start, end) in intervals {
-                    // Each split must begin exactly where the previous one ended. `>` alone
-                    // rejects gaps but absorbs overlaps into `covered_until`, and an overlap
-                    // survives as a single whole-file read: Sirius would scan the shared row
-                    // groups once where StarRocks scans them on both instances, so `count(*)`
-                    // disagrees with no error.
-                    if start < 0 || end <= start || start != covered_until {
+                let file_size = file_size as u64;
+
+                let mut intervals = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    if range.start < 0 {
                         return Err(Self::unsupported(
                             node_id,
-                            "byte-range splits do not tile the parquet file",
+                            "scan range has a negative start offset",
                         ));
                     }
-                    // A split that runs past EOF is malformed metadata, not a whole-file read;
-                    // without this the sweep below only asks whether EOF was reached.
+                    let start = range.start as u64;
+                    let end = match range.size {
+                        -1 => file_size, // "to end of file"
+                        size if size >= 0 => start.saturating_add(size as u64),
+                        _ => {
+                            return Err(Self::unsupported(
+                                node_id,
+                                "scan range has a negative size",
+                            ));
+                        }
+                    };
                     if end > file_size {
                         return Err(Self::unsupported(
                             node_id,
-                            "byte-range split extends past the end of the parquet file",
+                            "byte range extends past the end of the parquet file",
                         ));
                     }
-                    covered_until = end;
+                    // Empty ranges (size 0, or -1 starting at EOF) own nothing.
+                    if start >= end {
+                        continue;
+                    }
+                    intervals.push((start, end));
                 }
-                if covered_until < file_size {
+                intervals.sort_unstable();
+
+                let mut coalesced: Vec<(u64, u64)> = Vec::new();
+                for (start, end) in intervals {
+                    if let Some(last) = coalesced.last_mut() {
+                        if start < last.1 {
+                            return Err(Self::unsupported(
+                                node_id,
+                                "overlapping byte ranges would read the same rows twice",
+                            ));
+                        }
+                        if start == last.1 {
+                            last.1 = end;
+                            continue;
+                        }
+                    }
+                    coalesced.push((start, end));
+                }
+
+                // A file whose every range is empty owns nothing. Refused here, per file, so it
+                // cannot silently vanish from a node that also owns real bytes of another file.
+                if coalesced.is_empty() {
                     return Err(Self::unsupported(
                         node_id,
-                        "byte-range splits do not tile the parquet file",
+                        "all byte ranges of a parquet file are empty",
                     ));
                 }
+                if coalesced == [(0, file_size)] {
+                    scan_files.push(ScanFile {
+                        path: path.clone(),
+                        range: None,
+                    });
+                } else {
+                    for (start, end) in coalesced {
+                        scan_files.push(ScanFile {
+                            path: path.clone(),
+                            range: Some((start, end - start)),
+                        });
+                    }
+                }
             }
+            self.resolved.insert(node_id, scan_files);
         }
         Ok(())
     }
@@ -335,6 +375,18 @@ impl ScanFilePaths {
             return Err(Self::unsupported(
                 node_id,
                 "path-derived columns (columns_from_path) are not supported",
+            ));
+        }
+        // Parquet compression is per-page inside the file; an outer compression_type on the
+        // range describes a compressed *container* the reader would have to unwrap first.
+        // The FE leaves it unset (or NO_COMPRESSION) for plain parquet files.
+        if desc.compression_type.is_some_and(|compression| {
+            compression != starrocks_thrift::types::TCompressionType::NO_COMPRESSION
+                && compression != starrocks_thrift::types::TCompressionType::UNKNOWN_COMPRESSION
+        }) {
+            return Err(Self::unsupported(
+                node_id,
+                "an outer compression_type on a parquet scan range is not supported",
             ));
         }
         Self::check_local_path(node_id, &desc.path)
