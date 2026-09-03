@@ -162,12 +162,13 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 These settings control optional Simpatico compression when
 `pin_table` caches input tables. Prefer the per-call
 `CALL pin_table(..., compression => true)` argument to request compression for a specific pin.
-Compression also requires a matching plan in `input_plan_dir`; otherwise the table is pinned
-uncompressed.
+The settings below supply the default for calls that omit the argument and configure plan lookup
+and retention gates. Compression also requires a matching plan in `input_plan_dir`; otherwise the
+table is pinned uncompressed.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
-| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Legacy default for `pin_table` calls that omit the `compression` argument. |
+| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
@@ -676,10 +677,13 @@ test options; it is not part of the normal user surface.
 
 ### Pinned-Table Compression (Simpatico)
 
+Prefer the per-call `pin_table(..., compression => true/false)` argument for a specific pin. The
+variables below supply the default for calls that omit the argument and configure plan lookup and
+retention gates.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `pin_table(..., compression => true/false)` | omitted | Per-call Simpatico compression request. When omitted, `pin_table_compression` supplies the default. |
-| `pin_table_compression` | false | Legacy default for `pin_table` calls that omit the `compression` argument. |
+| `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |

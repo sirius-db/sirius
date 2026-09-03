@@ -360,23 +360,51 @@ TEST_CASE("pin_table compression - compression parameter overrides session setti
   run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "min batch");
   run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "fraction");
 
-  run_ok(con, "SET pin_table_compression = false;", "legacy compression off");
-  auto pin_on =
-    con.Query("CALL pin_table('" + glob + "', tier='host', name='t_param_on', compression=true);");
+  run_ok(con, "SET pin_table_compression = false;", "existing compression default off");
+  auto pin_on = con.Query("CALL pin_table('" + glob +
+                          "', tier => 'host', name => 't_param_on', compression => true);");
   require_ok(pin_on, "pin parameter on");
   auto const on = sirius::test::census_entry(con, "t_param_on");
   REQUIRE(on.chunks > 0);
   REQUIRE(on.compressed_chunks == on.chunks);
   run_ok(con, "CALL unpin_table('t_param_on');", "unpin parameter on");
 
-  run_ok(con, "SET pin_table_compression = true;", "legacy compression on");
-  auto pin_off =
-    con.Query("CALL pin_table('" + glob + "', tier='host', name='t_param_off', compression=false);");
+  run_ok(con, "SET pin_table_compression = true;", "existing compression default on");
+  auto pin_off = con.Query("CALL pin_table('" + glob +
+                           "', tier => 'host', name => 't_param_off', compression => false);");
   require_ok(pin_off, "pin parameter off");
   auto const off = sirius::test::census_entry(con, "t_param_off");
   REQUIRE(off.chunks > 0);
   REQUIRE(off.compressed_chunks == 0);
   run_ok(con, "CALL unpin_table('t_param_off');", "unpin parameter off");
+
+  fs::remove_all(tmp);
+}
+
+TEST_CASE("pin_table compression - empty plan dir pins uncompressed",
+          "[compression][pin_table][isolated_context]")
+{
+  if (no_gpu()) { return; }
+
+  auto [tmp, yaml_path] = make_comp_env("emptydir");
+  sirius::test::mgpu::generate_parquet_surface(
+    tmp, "SELECT (range % 1024)::BIGINT AS k FROM range(20000)", /*num_files=*/1);
+
+  sirius::test::mgpu::scoped_mgpu_env env(yaml_path);
+  auto con  = env.make_connection();
+  auto glob = sirius::test::mgpu::parquet_glob(tmp);
+
+  run_ok(con, "SET pin_table_compression_min_batch_size_bytes = 0;", "min batch");
+  run_ok(con, "SET pin_table_compression_max_compressed_fraction = 1.5;", "fraction");
+
+  auto pin = con.Query("CALL pin_table('" + glob +
+                       "', tier => 'host', name => 't_emptydir', compression => true);");
+  require_ok(pin, "pin with empty plan dir");
+  auto const census = sirius::test::census_entry(con, "t_emptydir");
+  REQUIRE(census.chunks > 0);
+  REQUIRE(census.compressed_chunks == 0);
+
+  run_ok(con, "CALL unpin_table('t_emptydir');", "unpin empty plan dir");
 
   fs::remove_all(tmp);
 }

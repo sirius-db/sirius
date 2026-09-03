@@ -1178,7 +1178,7 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
 
   auto compression_it = input.named_parameters.find("compression");
   if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
-    result->args.compression = BooleanValue::Get(compression_it->second);
+    result->args.compression = compression_it->second.GetValue<bool>();
   }
 
   // Resolve the source format: an explicit 'format' parameter, else inferred from
@@ -1377,9 +1377,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
       data.args.name);
   }
-  const bool compression_plan_lookup_enabled =
-    compression_requested && !comp_cfg.input_plan_dir.empty();
-  if (compression_plan_lookup_enabled) {
+  const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
+  if (compression_active) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1404,7 +1403,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (compression_plan_lookup_enabled) {
+  if (compression_active) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -3308,7 +3307,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     SetEnableGpuExecution);
 
   config.AddExtensionOption("pin_table_compression",
-                            "Legacy default for pin_table calls that omit the compression named "
+                            "Default for pin_table calls that omit the compression named "
                             "parameter. Takes effect only when pin_table_input_compression_plan_dir "
                             "is non-empty and contains a matching table plan",
                             LogicalType::BOOLEAN,

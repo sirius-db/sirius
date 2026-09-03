@@ -35,8 +35,8 @@ when `CALL pin_table(..., compression => true)` requests it, the plan-directory 
 non-empty, and a matching table plan exists. `pin_table` warns and pins uncompressed when
 compression is requested but the plan directory is empty; a missing table plan likewise warns and
 falls back. The batch-size and compressed-fraction settings are inert until a matching plan
-activates compression. The legacy `pin_table_compression` setting remains a default for calls that
-omit the `compression` argument; an explicit argument always wins.
+activates compression. The existing `pin_table_compression` setting remains the default for calls
+that omit the `compression` argument; an explicit argument always wins.
 
 ## Which tier to compress on (GB300, TPC-H SF1000, 22-query hot suite)
 
