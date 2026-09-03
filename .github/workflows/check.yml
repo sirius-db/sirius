@@ -108,7 +108,7 @@ jobs:
             build-type: release
             environment: default
             cudf-channel: nightly
-            run-on-pr: false
+            run-on-pr: true
         exclude:
           # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
           - build:
