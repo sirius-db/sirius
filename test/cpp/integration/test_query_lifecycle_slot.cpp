@@ -2109,8 +2109,10 @@ TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
   if (config_raw == nullptr) {
     out.error = "watchdog child missing config path";
   } else {
-    setenv("SIRIUS_CONFIG_FILE", config_raw, 1);
-    unsetenv("SIRIUS_DISABLE");
+    // Shared test-environment startup resets these values after exec, so restore the
+    // watchdog's isolated-context environment before running the scenario.
+    ::setenv("SIRIUS_CONFIG_FILE", config_raw, 1);
+    ::unsetenv("SIRIUS_DISABLE");
     auto const output_path = fs::path(output_raw);
     auto const database_path =
       output_path.parent_path() / ("scenario_" + std::string(variant_raw) + ".duckdb");
@@ -2157,15 +2159,13 @@ class QueryLifecycleSlotFixture {
     std::vector<sirius::test::child_process_environment::override> environment_overrides{
       {kEnvVariant, variant},
       {kEnvOutput, output_path.string()},
-      {kEnvConfig, config_path.string()},
-      {"SIRIUS_CONFIG_FILE", config_path.string()}};
+      {kEnvConfig, config_path.string()}};
     if (variant_requires_file_log(variant)) {
       environment_overrides.emplace_back("SIRIUS_LOG_BACKEND", "spdlog");
       environment_overrides.emplace_back("SIRIUS_LOG_DIR", log_dir.string());
       environment_overrides.emplace_back("SIRIUS_LOG_LEVEL", "debug");
     }
-    sirius::test::child_process_environment child_environment{std::move(environment_overrides),
-                                                              {"SIRIUS_DISABLE"}};
+    sirius::test::child_process_environment child_environment{std::move(environment_overrides)};
 
     // Re-exec before running an engine query so no live CUDA context is inherited.
     pid_t pid{};

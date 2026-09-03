@@ -53,6 +53,7 @@ TEST_CASE("child process environment applies changes without mutating the parent
   auto const parent_override          = environment_value(override_name);
   auto const parent_removal           = environment_value(removal_name);
   auto const parent_path              = environment_value("PATH");
+  auto const parent_home              = environment_value("HOME");
 
   sirius::test::child_process_environment child_environment{
     {{override_name, "child-only"}, {"PATH", "child-path"}}, {removal_name}};
@@ -60,6 +61,7 @@ TEST_CASE("child process environment applies changes without mutating the parent
   CHECK(child_environment_value(child_environment.data(), override_name) == "child-only");
   CHECK(child_environment_value(child_environment.data(), "PATH") == "child-path");
   CHECK_FALSE(child_environment_value(child_environment.data(), removal_name).has_value());
+  CHECK(child_environment_value(child_environment.data(), "HOME") == parent_home);
 
   CHECK(environment_value(override_name) == parent_override);
   CHECK(environment_value(removal_name) == parent_removal);

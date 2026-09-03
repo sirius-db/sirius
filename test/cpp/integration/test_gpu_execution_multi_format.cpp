@@ -635,8 +635,7 @@ class HivePartitionDataset {
       {{"SIRIUS_HIVE_WATCHDOG_QUERY", query},
        {"SIRIUS_HIVE_WATCHDOG_OUTPUT", output_path.string()},
        {"SIRIUS_HIVE_WATCHDOG_CONFIG", config_path.string()},
-       {"SIRIUS_CONFIG_FILE", config_path.string()}},
-      {"SIRIUS_DISABLE"}};
+       {"SIRIUS_CONFIG_FILE", config_path.string()}}};
 
     pid_t pid{};
     auto const spawn_result = ::posix_spawn(
@@ -745,8 +744,10 @@ TEST_CASE("gpu_execution hive partition watchdog child runner",
     std::unique_ptr<duckdb::DuckDB> db;
     std::unique_ptr<duckdb::Connection> con;
     if (out.error.empty()) {
+      // Shared test-environment startup resets these values after exec, so restore the
+      // watchdog's isolated-context environment before opening its database.
       config_guard = std::make_unique<sirius_config_env_guard>(config_raw);
-      unsetenv("SIRIUS_DISABLE");
+      ::unsetenv("SIRIUS_DISABLE");
       db  = std::make_unique<duckdb::DuckDB>(nullptr);
       con = std::make_unique<duckdb::Connection>(*db);
     }
