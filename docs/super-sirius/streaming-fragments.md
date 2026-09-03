@@ -6,7 +6,8 @@ Sessions](streaming-sessions.md) covers the low-level primitives a fragment is b
 (`exec::batch_stream`, `STREAMING_SOURCE`/`STREAMING_SINK`, the id-addressed `exec::stream_session`
 router). This document covers the layer above: how a Substrait or DuckDB plan becomes a fragment,
 how its declared streams get a schema before the plan is even bound, and how multiple fragments —
-possibly owned by different processes — chain together via `relay_from()`.
+possibly owned by different processes — chain together via `relay_from()` (in one process) or
+`export_packed()`/`push_packed()` (across processes, through the exchange staging arena).
 
 Two classes do this, at two different layers:
 
@@ -306,6 +307,45 @@ Only then does the schema check run — column count and type-id agreement betwe
 declared types and the source's `sink_types()` — before any batch actually moves, so a mismatch
 throws instead of silently corrupting a downstream cuDF operation.
 
+### `export_packed()` / `push_packed()` — moving batches between processes
+
+```cpp
+std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
+                                                         std::uint64_t& offset,
+                                                         std::uint64_t& length,
+                                                         std::uint64_t& rows);
+void push_packed(std::uint64_t stream_id, std::uintptr_t metadata_addr, std::size_t metadata_len,
+                 std::uint64_t offset, std::uint64_t length);
+```
+
+The cross-process form of the `relay_from()` hop, built on `exec::exchange_staging_arena` — one
+plain `cudaMalloc` region outside every RMM pool, opt-in via `SIRIUS_EXCHANGE_STAGING_BYTES` (see
+[Exchange Staging Arena](configuration.md#exchange-staging-arena)) — so a transport registers
+exactly one device region.
+
+- **`export_packed()`** pulls the next batch parked on an output stream, leases arena space and
+  `cudf::chunked_pack`s the table straight into the lease. It returns the pack metadata (host bytes
+  that travel with the payload) and writes the lease `offset`, the packed `length` and the exact
+  `rows` (what a receiver sums into `declare_input_cardinality()`); `nullptr` means nothing is
+  parked. The pack is synchronized before it returns, so the caller may transmit from
+  `staging_base() + offset` at once. Every `chunked_pack::next()` span must be a full chunk, so each
+  export leases `total + kPackChunkBytes` (8 MiB): size the arena for concurrently live leases.
+- **The lease outlives the call.** The sender returns it with `Context::staging_release(offset)`
+  only after the transmit completes. A zero-row batch is metadata-only — `offset == 0`,
+  `length == 0`, no lease, nothing to release.
+- **`push_packed()`** `cudf::unpack`s the bytes a transport landed at
+  `[staging_base() + offset, +length)`, runs `relay_from()`'s column-count/type-id guard against the
+  declared schema, deep-copies the table out of the lease into pool memory and pushes it. The copy
+  is synchronized before it returns (*copy-out-on-arrival*), so the receiver may release its lease
+  the moment the call returns. Legal exactly where `relay_from()` is (between `build()` and
+  `run()`); it does not close the sender (`close_input()` is the EOS mirror) and refuses a push
+  after the stream has ended.
+
+`Context::staging_arena_handle()` returns a `StagingArena` sharing ownership of the same allocator
+that the thread-affine `Context::staging_*` methods drive; its `lease`/`release` serialize on the
+arena's mutex and make no CUDA calls, so any thread — an RPC thread while the context thread is
+inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + Sync` on that argument.
+
 ### Other contracts
 
 - **A partition mode needs at least two destinations.** `declare_output_broadcast()` /
@@ -328,6 +368,14 @@ throws instead of silently corrupting a downstream cuDF operation.
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
 | `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_exchange_staging_arena.cpp` | `[staging_arena]` |
+
+The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/lib.rs`:
+`packed_hop_matches_relay_hop` (an `export_packed` → `push_packed` hop delivers exactly what the
+`relay_from` hop delivers, leases release before the receiver runs, push after EOS errors),
+`zero_row_export_is_metadata_only_and_holds_no_lease` (a `len == 0` frame holds no lease and the
+whole arena is grantable again afterwards), and `push_packed_rejects_a_mismatched_schema`. They need
+a GPU; CI only compile-checks them.
 
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
@@ -343,7 +391,7 @@ right after) rather than inspecting DuckDB catalog state directly.
 which takes the future from `start_query()` and waits immediately. Fragments therefore run
 store-and-forward, one at a time (`relay_from(...)` orders strictly before `run()`, and only one
 fragment may sit between its own `build()` and `run()`). The `Fragment` surface exposes no
-`push`/`pull`/`wait`, so a genuinely remote sender cannot feed a fragment yet — `relay_from()` only
-moves batches that are already sitting in a *local*, already-finished source fragment's output
-repository. Non-blocking scheduling and a `push`/`pull`/`wait` FFI are tracked separately, not
-claimed here.
+`pull`/`wait` and no push *during* `run()`: a remote sender feeds a fragment only store-and-forward,
+through `push_packed()` between `build()` and `run()`, and `relay_from()` only moves batches that
+are already sitting in a *local*, already-finished source fragment's output repository. Non-blocking
+scheduling and a streaming `push`/`pull`/`wait` FFI are tracked separately, not claimed here.

@@ -38,9 +38,14 @@
 #define SIRIUS_FFI_EXPORT __attribute__((visibility("default")))
 #endif
 
+namespace sirius::exec {
+class exchange_staging_arena;
+}  // namespace sirius::exec
+
 namespace sirius::ffi {
 
 class Fragment;
+class StagingArena;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -71,12 +76,86 @@ class SIRIUS_FFI_EXPORT Context {
   /// translation or execution failure.
   void execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr);
 
+  /// Lease `len` bytes of the exchange staging arena; returns the lease's byte offset from
+  /// `staging_base()`. For the receive side of a transport: lease, land the remote bytes at
+  /// `staging_base() + offset`, `Fragment::push_packed`, then `staging_release`. (The send side's
+  /// `Fragment::export_packed` takes its own lease; releasing it after the transmit completes is
+  /// still the caller's job, through `staging_release`.)
+  /// @throws when no arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) or on
+  /// exhaustion — the error names the requested/free/capacity byte counts.
+  std::uint64_t staging_lease(std::uint64_t len);
+
+  /// Return the staging lease at `offset`. The block goes back to the arena's address-ordered
+  /// free list and coalesces with its free neighbours, so the space is reusable regardless of
+  /// release order — leases are short-lived by design (copy-out-on-arrival).
+  /// @throws on an offset that is not an outstanding lease, or when no arena is configured.
+  void staging_release(std::uint64_t offset);
+
+  /// Device base address of the staging arena, for transport memory registration.
+  /// @throws when no arena is configured.
+  std::uintptr_t staging_base() const;
+
+  /// Capacity of the staging arena in bytes.
+  /// @throws when no arena is configured.
+  std::uint64_t staging_capacity() const;
+
+  /// Thread-safe handle to the staging arena, sharing ownership with this context — or null
+  /// when no arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset). A caller that must
+  /// serve leases off the context's owning thread (e.g. an RPC handler answering a peer's
+  /// lease request) holds this instead of funneling through the `staging_*` methods above.
+  std::unique_ptr<StagingArena> staging_arena_handle() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
+};
+
+/// Thread-safe handle to a [`Context`]'s exchange staging arena.
+///
+/// Why this exists: the `Context` is single-threaded by contract, so its `staging_*` methods can
+/// only be served by the thread that owns it — in an embedding that thread also runs fragments,
+/// so a long (or wedged) `Fragment::run` starves every lease request arriving from transport/RPC
+/// threads and stalls the peers' cross-node exchanges with it. The arena itself needs no such
+/// funnel: `lease`/`release` serialize on the arena's internal mutex and make **no CUDA calls**
+/// (the region is one `cudaMalloc` owned for the arena's lifetime), so any thread may call any
+/// method here, concurrently with the context thread's own staging traffic.
+///
+/// This handle shares ownership of the ONE allocator the context uses — `Fragment::export_packed`
+/// leases from the same arena on the context's thread — so the two sides can never double-book a
+/// region, and the handle stays valid even if the `Context` is torn down first.
+class SIRIUS_FFI_EXPORT StagingArena {
+ public:
+  explicit StagingArena(std::shared_ptr<sirius::exec::exchange_staging_arena> arena);
+  ~StagingArena();
+
+  StagingArena(const StagingArena&)            = delete;
+  StagingArena& operator=(const StagingArena&) = delete;
+
+  /// Lease `len` bytes; returns the lease's byte offset from `base()`. Same contract as
+  /// `Context::staging_lease`, callable from any thread.
+  /// @throws on a zero-length request or on exhaustion — it never blocks.
+  std::uint64_t lease(std::uint64_t len) const;
+
+  /// Return the lease at `offset`. Same contract as `Context::staging_release`.
+  /// @throws on an offset that is not an outstanding lease.
+  void release(std::uint64_t offset) const;
+
+  /// Device base address of the arena, for transport memory registration.
+  std::uintptr_t base() const noexcept;
+
+  /// Capacity of the arena in bytes.
+  std::uint64_t capacity() const noexcept;
+
+  /// Leases currently held. Nonzero once a query has quiesced means a leaked lease, which is
+  /// the only way a caller outside C++ can observe one. Not `noexcept`: it takes the arena
+  /// mutex, unlike the two trivial getters above.
+  std::size_t outstanding() const;
+
+ private:
+  std::shared_ptr<sirius::exec::exchange_staging_arena> arena_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -110,6 +189,13 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// @throws after build().
   void declare_input_sender(std::uint64_t stream_id, std::uint32_t sender_id);
 
+  /// Declare the row count of input stream `stream_id` (summed over all its senders; exact when
+  /// the caller already holds the stream's batches, an estimate otherwise). Optional: DuckDB's
+  /// optimizer uses it to size the stream for join order / build-side selection; undeclared
+  /// streams keep today's behavior (the optimizer assumes cardinality 1). Last call wins.
+  /// @throws after build().
+  void declare_input_cardinality(std::uint64_t stream_id, std::uint64_t rows);
+
   /// Declare an output stream. A fragment with no output stream is a result fragment.
   /// @throws after build() or on duplicate id.
   void declare_output(std::uint64_t stream_id);
@@ -141,8 +227,49 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease
+  /// (`cudf::chunked_pack` gathers directly into the lease — the staging copy is the pack's own
+  /// gather, no extra copy). Returns the cudf pack metadata the receiver's `push_packed` needs,
+  /// or nullptr when nothing is parked right now; on success writes the lease offset and the
+  /// packed payload length.
+  ///
+  /// The packing stream is synchronized before returning, so the caller may transmit from
+  /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
+  /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
+  /// the caller's responsibility.
+  ///
+  /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
+  /// `length == 0` and holds NO lease — the caller must not release anything for it. This is
+  /// the same `length == 0` frame the transports already pass end-to-end.
+  ///
+  /// On success also writes the batch's exact row count to `rows`, so a transport can carry it
+  /// to the receiver, which sums the counts into declare_input_cardinality before building.
+  /// @throws before `build()`, on an unknown output stream, when no arena is configured, on
+  /// lease exhaustion, or on a parked batch that is not GPU-resident.
+  std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
+                                                           std::uint64_t& offset,
+                                                           std::uint64_t& length,
+                                                           std::uint64_t& rows);
+
+  /// The receive-side mirror of `export_packed`: unpack the `length` packed bytes at staging
+  /// offset `offset` using the pack metadata at `metadata_addr` (`metadata_len` bytes, host
+  /// memory), deep-copy the table out of the lease into ordinary pool memory, and push it into
+  /// input stream `stream_id`. The copy is synchronized before returning, so the lease is
+  /// reusable (and releasable) immediately — copy-out-on-arrival.
+  ///
+  /// Legal between `build()` and `run()`, exactly where `relay_from` sits.
+  /// @throws before `build()`, on an unknown input stream, when no arena is configured, on an
+  /// out-of-bounds lease range or empty metadata, or when the stream already ended (a push
+  /// after EOS never disappears silently).
+  void push_packed(std::uint64_t stream_id,
+                   std::uintptr_t metadata_addr,
+                   std::size_t metadata_len,
+                   std::uint64_t offset,
+                   std::uint64_t length);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender). Idempotent per sender.
+  /// (relay_from closes its own sender; push_packed does not). Idempotent per sender; the
+  /// stream ends once every expected sender has closed.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
@@ -157,6 +284,13 @@ class SIRIUS_FFI_EXPORT Fragment {
 
   /// Batches currently parked on output stream `stream_id`. For diagnostics.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
+
+  /// Total rows parked on output stream `stream_id`, without draining it. What a local relay's
+  /// receiver feeds into declare_input_cardinality before its own build(). 0 on a fragment with
+  /// no streaming sink (mirroring output_batch_count).
+  /// @throws on an unknown output stream, or on a parked batch that is not GPU-resident (the
+  /// same contract as export_packed; the caller should skip the cardinality declaration then).
+  [[nodiscard]] std::uint64_t output_row_count(std::uint64_t stream_id) const;
 
   /// DuckDB type-name strings for each output column. Matches what declare_input_column accepts.
   /// @throws before build() or on a result fragment.
