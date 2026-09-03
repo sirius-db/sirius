@@ -5,7 +5,7 @@
 //! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier).
 //! Either way, what is tracked here is which senders have finished and where their output sits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
@@ -84,6 +84,11 @@ struct PendingReceiver {
     expected_senders: HashMap<i32, usize>,
 }
 
+/// How many cancelled receivers are remembered; the oldest is forgotten first. A `const`, not a
+/// knob: eviction only lets a very late frame re-create a source (today's behaviour), never
+/// touches a live receiver, and StarRocks instance ids never recur.
+const RETIRED_CAPACITY: usize = 1024;
+
 #[derive(Debug, Default)]
 struct ExchangeState {
     receivers: HashMap<FragmentInstanceId, PendingReceiver>,
@@ -92,6 +97,11 @@ struct ExchangeState {
     /// dropped idempotently — brpc reconnect-retry can replay a frame — and a gap (above) is a
     /// lost frame, which must fail the query rather than silently drop rows.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
+    /// Receivers the FE cancelled (`retire_receiver`), so a frame from a peer's still-draining
+    /// sender is refused instead of re-creating the entry. `HashSet` twin of the FIFO so the
+    /// per-frame check is O(1).
+    retired: HashSet<FragmentInstanceId>,
+    retired_order: VecDeque<FragmentInstanceId>,
 }
 
 /// Matches receiver-first StarRocks dispatch with later same-node sender results.
@@ -310,6 +320,57 @@ impl LocalExchange {
             params: receiver.params,
             inputs,
         }))
+    }
+
+    /// Forgets a receiver the FE cancelled: its pending registration, every sender source recorded
+    /// for it (all exchange nodes), and its remote sequence tracking. Returns the removed sources
+    /// so the caller releases the staging leases of the remote ones. Remembers the id (bounded) so
+    /// a frame from a peer's still-draining sender is refused instead of re-creating the entry.
+    /// Idempotent; a receiver `take_ready` already released is a no-op plus the set insert.
+    pub(crate) fn retire_receiver(
+        &self,
+        fragment_instance_id: FragmentInstanceId,
+    ) -> Vec<SenderSource> {
+        let mut state = self.lock();
+        state.receivers.remove(&fragment_instance_id);
+        let mut keys = state
+            .sources
+            .keys()
+            .filter(|key| key.fragment_instance_id == fragment_instance_id)
+            .copied()
+            .collect::<Vec<_>>();
+        keys.sort_unstable_by_key(|key| key.node_id);
+        let mut removed = Vec::new();
+        for key in keys {
+            let mut senders = state.sources.remove(&key).unwrap_or_default();
+            let mut sender_ids = senders.keys().copied().collect::<Vec<_>>();
+            sender_ids.sort_unstable();
+            removed.extend(
+                sender_ids
+                    .into_iter()
+                    .map(|sender_id| senders.remove(&sender_id).expect("sender id came from map")),
+            );
+        }
+        state
+            .remote_seq
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        if state.retired.insert(fragment_instance_id) {
+            state.retired_order.push_back(fragment_instance_id);
+            while state.retired.len() > RETIRED_CAPACITY {
+                match state.retired_order.pop_front() {
+                    Some(oldest) => {
+                        state.retired.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+        }
+        removed
+    }
+
+    /// Whether `retire_receiver` was called for this receiver (O(1)).
+    pub(crate) fn is_retired(&self, fragment_instance_id: FragmentInstanceId) -> bool {
+        self.lock().retired.contains(&fragment_instance_id)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ExchangeState> {
@@ -750,5 +811,100 @@ mod tests {
         let key = key(10, 7);
         assert_eq!(local(key, 0).names(), names().as_slice());
         assert_eq!(remote(0, false).names(), names().as_slice());
+    }
+
+    /// A cancelled receiver leaves the rendezvous with every source recorded for it (so the
+    /// caller can release the remote ones' leases), is remembered as retired, and its remote
+    /// sequence tracking is gone; other receivers are unaffected.
+    #[test]
+    fn retire_receiver_returns_its_sources_and_refuses_later_frames() {
+        let exchange = LocalExchange::default();
+        let other = key(11, 7);
+        let key = key(10, 7);
+        assert!(
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 2)], params())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            exchange
+                .push_sender(
+                    key,
+                    0,
+                    SenderSource::LocalParked {
+                        names: names(),
+                        slot: local_slot(key, 0),
+                    },
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            exchange
+                .push_remote_frame(key, 1, 0, false, names(), Some(staged(1)))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut removed = exchange.retire_receiver(key.fragment_instance_id);
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(matches!(removed[0], SenderSource::LocalParked { .. }));
+        let SenderSource::Remote {
+            batches, closed, ..
+        } = removed.remove(1)
+        else {
+            panic!("expected a remote source");
+        };
+        assert_eq!(batches, vec![staged(1)]);
+        assert!(!closed, "an open remote source is returned too");
+        assert!(exchange.is_retired(key.fragment_instance_id));
+
+        // Idempotent: nothing left to remove.
+        assert!(
+            exchange
+                .retire_receiver(key.fragment_instance_id)
+                .is_empty()
+        );
+        // The sequence tracking went with it: a frame for the retired receiver is judged from
+        // seq 0 again (the service refuses such frames before they get here; this pins the state).
+        let err = exchange
+            .push_remote_frame(key, 1, 5, false, names(), Some(staged(2)))
+            .unwrap_err();
+        assert!(err.contains("skipped from frame seq 0 to 5"), "{err}");
+
+        // Another receiver is unaffected.
+        assert!(
+            exchange
+                .register_receiver(other.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            exchange
+                .push_sender(
+                    other,
+                    0,
+                    SenderSource::LocalParked {
+                        names: names(),
+                        slot: local_slot(other, 0),
+                    },
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(!exchange.is_retired(other.fragment_instance_id));
+    }
+
+    /// The retired set is bounded; the oldest entry is forgotten first.
+    #[test]
+    fn retired_receivers_are_bounded() {
+        let exchange = LocalExchange::default();
+        for i in 0..=RETIRED_CAPACITY {
+            exchange.retire_receiver(FragmentInstanceId::from_halves(12, i as i64));
+        }
+        assert!(!exchange.is_retired(FragmentInstanceId::from_halves(12, 0)));
+        assert!(exchange.is_retired(FragmentInstanceId::from_halves(12, 1)));
+        assert!(exchange.is_retired(FragmentInstanceId::from_halves(12, RETIRED_CAPACITY as i64)));
     }
 }

@@ -58,11 +58,12 @@ A two-CN smoke test on one GPU is `pixi run cluster2` with `MIN_BACKENDS=2`;
 [`DEMO.md`](../../DEMO.md) walks through a Q6-shaped query on that cluster (different date
 and discount bounds, so its `61567694.9502` is not q06's answer).
 
-**Caveat:** the CN does not implement `cancel_plan_fragment`, so a hung or
-mid-execution-failed query strands its fragments; the stranded fragments eventually starve
-the CNs and the FE reports "No available backends" for everything after. `RESTART_CMD` is
-therefore mandatory for a Sirius cluster — without it, every measurement after the first
-failure is invalid:
+**Caveat:** the CN's `cancel_plan_fragment` retires a cancelled query's parked output
+and rendezvous state and refuses its later fragments, but it cannot abort a fragment
+already inside the engine's `run()`; a query wedged there still strands that fragment
+until it ends, and the stranded fragment starves the CN (the FE reports "No available
+backends" for everything after). `RESTART_CMD` therefore stays mandatory for a Sirius
+cluster — without it, every measurement after a wedge is invalid:
 
 ```bash
 RESTART_CMD='pkill -f "[s]irius-starrocks-cn"; pkill -f "[S]tarRocksFE"; sleep 5; \

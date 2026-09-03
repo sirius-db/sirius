@@ -15,8 +15,8 @@ use crate::proto::starrocks::{
     PCancelPlanFragmentRequest, PCancelPlanFragmentResult, PExchangeNixlMd, PExchangeNixlMdResult,
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, PStagingLeaseRequest, PStagingLeaseResult,
-    PTransmitPackedParams, PTransmitPackedResult, StatusPb,
+    PGetFileSchemaResult, PPlanFragmentCancelReason, PSlotDescriptor, PStagingLeaseRequest,
+    PStagingLeaseResult, PTransmitPackedParams, PTransmitPackedResult, StatusPb,
     p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
@@ -304,12 +304,17 @@ impl PInternalService for SiriusComputeNodeService {
         .into())
     }
 
-    /// Best-effort cancellation stub: acknowledges the FE with OK so its shared jprotobuf
-    /// channel stays healthy — the default unrouted reply is a PRPC-level error frame, and the
-    /// FE reaps the timed-out future in a way that misattributes later replies on the channel.
-    /// A still-waiting result entry is failed so a `fetch_data` long-poll returns immediately.
-    /// Real teardown (aborting the engine run, freeing GPU buffers, dropping parked exchange
-    /// state) is a separate work item.
+    /// Tears the cancelled query down on this CN. Always answers OK so the FE's shared
+    /// jprotobuf channel stays healthy — the default unrouted reply is a PRPC-level error frame,
+    /// and the FE reaps the timed-out future in a way that misattributes later replies on the
+    /// channel.
+    ///
+    /// Per instance: a still-waiting result entry is failed so a `fetch_data` long-poll returns
+    /// now, and the instance leaves the rendezvous with its staged leases released. Per query
+    /// (when the FE sent the id): a failure reason records a query-level failure so later
+    /// fragments of the query are refused on arrival, and every reason retires the query's
+    /// parked sender output on the executor. What it still cannot do is abort a fragment already
+    /// inside `run()`: that one finishes first, and its output is dropped when it ends.
     #[instrument(skip_all)]
     async fn cancel_plan_fragment(
         &self,
@@ -317,18 +322,63 @@ impl PInternalService for SiriusComputeNodeService {
         _attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PCancelPlanFragmentResult>, crate::prpc::Error> {
         let id = FragmentInstanceId::from(&request.finst_id);
-        info!(
-            fragment_instance_id = %id,
-            query_id = ?request.query_id.as_ref().map(FragmentInstanceId::from),
-            cancel_reason = request.cancel_reason,
-            error_message = ?request.error_message,
-            "acknowledging cancel_plan_fragment (best-effort: no engine-side abort yet)"
-        );
+        let query_id = request.query_id.as_ref().map(FragmentInstanceId::from);
+        let reason_code = request
+            .cancel_reason
+            .and_then(|code| PPlanFragmentCancelReason::try_from(code).ok());
+        let reason_name = reason_code.map_or("none", |code| code.as_str_name());
         let mut reason = format!("fragment instance {id} was cancelled by the FE");
         if let Some(message) = request.error_message.as_ref().filter(|msg| !msg.is_empty()) {
             reason = format!("{reason}: {message}");
         }
-        self.core.results.cancel(id, reason);
+        self.core.results.cancel(id, reason.clone());
+        if let Some(query_id) = query_id {
+            // QUERY_FINISHED / LIMIT_REACH arrive after eos on every successful multi-instance
+            // query: they clean up parked and rendezvous state but must not fail the query's
+            // result entries (a repeat fetch_data still reports EOS).
+            let finished = matches!(
+                reason_code,
+                Some(
+                    PPlanFragmentCancelReason::QueryFinished
+                        | PPlanFragmentCancelReason::LimitReach
+                )
+            );
+            if !finished {
+                self.core.results.cancel_query(query_id, reason.clone());
+            }
+            // Phased schedules cancel with a dummy instance (0, 0): nothing to retire by
+            // instance, everything by query.
+            let released_leases = if id == FragmentInstanceId::from_halves(0, 0) {
+                0
+            } else {
+                self.core
+                    .release_sources(self.core.exchanges.retire_receiver(id))
+            };
+            if let Err(err) = self.core.executor.retire_query(
+                query_id,
+                RetireTrigger::Cancel(reason_name.to_string()),
+                &reason,
+            ) {
+                tracing::warn!(
+                    %query_id,
+                    error = %err,
+                    "could not retire the cancelled query's parked output"
+                );
+            }
+            info!(
+                %query_id,
+                fragment_instance_id = %id,
+                reason = reason_name,
+                released_leases,
+                "cancel_plan_fragment retired the query on this CN"
+            );
+        } else {
+            info!(
+                fragment_instance_id = %id,
+                reason = reason_name,
+                "cancel_plan_fragment without a query id: failed the waiting result entry only"
+            );
+        }
         Ok(PCancelPlanFragmentResult {
             status: Self::ok_status(),
         }
@@ -530,7 +580,29 @@ impl SiriusComputeNodeService {
         Self::ensure_binary_protocol(protocol)?;
         let params = Self::deserialize_binary::<TExecPlanFragmentParams>(attachment)
             .map_err(|err| format!("failed to deserialize TExecPlanFragmentParams: {err}"))?;
-        self.dispatch_ready(self.core.process_fragment(&params)?)
+        self.process_inline(&params)
+    }
+
+    /// Runs one FE-dispatched fragment on the RPC path: processed here, with the receivers it
+    /// readied handed to the dispatch worker. A failure is also recorded at query level
+    /// (`fail_fragment`), so a result instance of the query reserved on this CN reports the
+    /// real cause on its first poll instead of the fetch_data timeout, and the query's later
+    /// fragments are refused. Any RPC error fails the query on the FE, so marking here is never
+    /// premature. Survey mode returns `Ok` and is unaffected.
+    fn process_inline(&self, params: &TExecPlanFragmentParams) -> std::result::Result<(), String> {
+        let outcome = self
+            .core
+            .process_fragment(params)
+            .and_then(|outcome| self.dispatch_ready(outcome));
+        if let Err(err) = &outcome
+            && let (Some(id), Some(query_id)) = (
+                ServiceCore::fragment_instance_id(params),
+                ServiceCore::query_id(params),
+            )
+        {
+            self.core.fail_fragment(id, query_id, err.clone());
+        }
+        outcome
     }
 
     /// Records one remote exchange frame in the rendezvous (or releases a canary lease), handing
@@ -585,6 +657,25 @@ impl SiriusComputeNodeService {
                 rows: params.rows,
             })
         };
+        // A frame for a receiver the FE already cancelled here: the peer's drain is still
+        // running and must complete quietly (it gets OK, and its own drop_parked frees the
+        // sender side), but nothing may re-enter the rendezvous. Release the lease it landed in.
+        if self.core.exchanges.is_retired(key.fragment_instance_id) {
+            if let Some(batch) = &batch
+                && batch.len > 0
+            {
+                self.core.executor.staging_release(batch.offset)?;
+            }
+            info!(
+                receiver_fragment_instance_id = %key.fragment_instance_id,
+                stream_id = key.node_id,
+                sender_id,
+                seq,
+                eos,
+                "released a remote frame for a retired receiver"
+            );
+            return Ok(());
+        }
         tracing::debug!(
             exchange = ?key,
             sender_id,
@@ -1545,13 +1636,9 @@ impl SiriusComputeNodeService {
                 params.resource_info = common.resource_info.clone();
             }
 
-            let outcome = self
-                .core
-                .process_fragment(&params)
-                .map_err(|err| format!("fragment {idx}: {err}"))?;
             // Per instance, exactly like the single-attachment path, so the `fragment {idx}`
-            // attribution of a dispatch failure names the instance that readied the receiver.
-            self.dispatch_ready(outcome)
+            // attribution of a failure names the instance that readied the receiver.
+            self.process_inline(&params)
                 .map_err(|err| format!("fragment {idx}: {err}"))?;
         }
 
@@ -3286,6 +3373,364 @@ mod tests {
             status.error_msgs[0].contains("already failed on this CN"),
             "{:?}",
             status.error_msgs
+        );
+    }
+
+    /// A `cancel_plan_fragment` request body as the FE builds it.
+    fn cancel_request(
+        instance: &TUniqueId,
+        query_id: Option<&TUniqueId>,
+        reason: Option<PPlanFragmentCancelReason>,
+        message: Option<&str>,
+    ) -> Vec<u8> {
+        PCancelPlanFragmentRequest {
+            finst_id: PUniqueId {
+                hi: instance.hi,
+                lo: instance.lo,
+            },
+            cancel_reason: reason.map(|reason| reason as i32),
+            is_pipeline: None,
+            query_id: query_id.map(|id| PUniqueId {
+                hi: id.hi,
+                lo: id.lo,
+            }),
+            error_message: message.map(str::to_string),
+        }
+        .encode_to_vec()
+    }
+
+    /// Cancels and asserts the FE-facing OK the shared jprotobuf channel depends on.
+    fn cancel_ok(service: &SiriusComputeNodeService, body: Vec<u8>) {
+        let response = route(service, methods::CANCEL_PLAN_FRAGMENT, body, Vec::new());
+        let cancel = PCancelPlanFragmentResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(
+            cancel.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            cancel.status.error_msgs
+        );
+    }
+
+    /// A sender failing inside its own RPC fails the query on this CN, so a result fragment of the query reserved afterwards reports the real cause on its
+    /// first poll instead of running out the fetch_data timeout.
+    #[test]
+    fn an_inline_sender_failure_is_recorded_at_query_level() {
+        let executor = Arc::new(Retiring::new(StubExecutor));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(150, 1);
+
+        let mut sender = supported_fragment();
+        sender.fragment.as_mut().unwrap().output_sink =
+            Some(sink_of_type(TDataSinkType::OLAP_TABLE_SINK));
+        sender.params = Some(exec_params(query_id.clone(), TUniqueId::new(150, 2)));
+        let status = exec_status(&service, &sender);
+        assert_eq!(
+            status.status_code,
+            TStatusCode::INTERNAL_ERROR.0,
+            "{status:?}"
+        );
+        assert!(
+            status.error_msgs[0].contains("OLAP_TABLE_SINK"),
+            "{:?}",
+            status.error_msgs
+        );
+
+        let root_id = TUniqueId::new(150, 3);
+        let mut root = fragment_params(Some(exchange_plan(9, 0)), Some(desc_table()));
+        root.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut root_exec = exec_params(query_id.clone(), root_id.clone());
+        root_exec.per_exch_num_senders.insert(9, 1);
+        root.params = Some(root_exec);
+        assert_exec_ok(&service, &root);
+        let result = fetch_error_eventually(&service, root_id.hi, root_id.lo);
+        assert!(
+            result.status.error_msgs[0].contains("OLAP_TABLE_SINK"),
+            "{:?}",
+            result.status.error_msgs
+        );
+
+        let retired = executor.retired();
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(retired[0].0, FragmentInstanceId::from(&query_id));
+        assert_eq!(retired[0].1, RetireTrigger::CnErr);
+    }
+
+    /// Every cancel reason retires the query's parked output and rendezvous state; only the
+    /// failure reasons (and a missing reason) record a query-level failure, so a finished
+    /// query's result entries are never clobbered. Without a query id nothing is retired.
+    #[test]
+    fn cancel_reason_matrix_retires_and_records_by_reason() {
+        use PPlanFragmentCancelReason as Reason;
+        let cases = [
+            (Some(Reason::InternalError), "INTERNAL_ERROR", true),
+            (Some(Reason::Timeout), "TIMEOUT", true),
+            (Some(Reason::UserCancel), "USER_CANCEL", true),
+            (None, "none", true),
+            (Some(Reason::QueryFinished), "QUERY_FINISHED", false),
+            (Some(Reason::LimitReach), "LIMIT_REACH", false),
+        ];
+        for (index, (reason, name, records_failure)) in cases.into_iter().enumerate() {
+            let executor = Arc::new(Retiring::new(StubExecutor));
+            let service =
+                SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+            let hi = 110 + index as i64;
+            let query_id = TUniqueId::new(hi, 1);
+            let message = format!("cancelled for {name}");
+            cancel_ok(
+                &service,
+                cancel_request(
+                    &TUniqueId::new(hi, 2),
+                    Some(&query_id),
+                    reason,
+                    Some(&message),
+                ),
+            );
+
+            let retired = executor.retired();
+            assert_eq!(retired.len(), 1, "{name}: {retired:?}");
+            assert_eq!(retired[0].0, FragmentInstanceId::from(&query_id), "{name}");
+            assert_eq!(
+                retired[0].1,
+                RetireTrigger::Cancel(name.to_string()),
+                "{name}"
+            );
+            assert!(retired[0].2.contains(&message), "{name}: {}", retired[0].2);
+            assert_eq!(
+                service
+                    .core
+                    .results
+                    .failure_of(FragmentInstanceId::from(&query_id))
+                    .is_some(),
+                records_failure,
+                "{name}"
+            );
+        }
+
+        let executor = Arc::new(Retiring::new(StubExecutor));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        cancel_ok(
+            &service,
+            cancel_request(
+                &TUniqueId::new(117, 2),
+                None,
+                Some(Reason::InternalError),
+                None,
+            ),
+        );
+        assert!(
+            executor.retired().is_empty(),
+            "no query id, nothing to retire by query"
+        );
+    }
+
+    /// The FE's QUERY_FINISHED cancels after eos retire parked state but never touch the result
+    /// store: a repeat fetch_data still reports EOS and no query-level failure is recorded.
+    #[test]
+    fn query_finished_cancel_keeps_delivered_rows() {
+        let executor = Arc::new(Retiring::new(CountingExecutor::default()));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let hi = 120;
+        let query_id = TUniqueId::new(hi, 1);
+        let root_id = TUniqueId::new(hi, 2);
+        let middle_id = TUniqueId::new(hi, 3);
+        let leaf_id = TUniqueId::new(hi, 4);
+        let (root, middle, leaf) = propagation_chain(&query_id, &root_id, &middle_id, &leaf_id);
+        assert_exec_ok(&service, &root);
+        assert_exec_ok(&service, &middle);
+        assert_exec_ok(&service, &leaf);
+        let fetched = fetch_rows_eventually(&service, root_id.hi, root_id.lo);
+        assert!(!fetched.attachment.is_empty());
+
+        for instance in [&root_id, &middle_id, &leaf_id] {
+            cancel_ok(
+                &service,
+                cancel_request(
+                    instance,
+                    Some(&query_id),
+                    Some(PPlanFragmentCancelReason::QueryFinished),
+                    None,
+                ),
+            );
+        }
+
+        let second = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(root_id.hi, root_id.lo),
+            Vec::new(),
+        );
+        let second = PFetchDataResult::decode(second.body.as_slice()).unwrap();
+        assert_eq!(
+            second.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            second.status.error_msgs
+        );
+        assert_eq!(second.eos, Some(true));
+        assert!(
+            service
+                .core
+                .results
+                .failure_of(FragmentInstanceId::from(&query_id))
+                .is_none()
+        );
+        let retired = executor.retired();
+        assert_eq!(
+            retired.len(),
+            3,
+            "one retire per cancelled instance: {retired:?}"
+        );
+        assert!(
+            retired.iter().all(|(id, trigger, _)| {
+                *id == FragmentInstanceId::from(&query_id)
+                    && *trigger == RetireTrigger::Cancel("QUERY_FINISHED".to_string())
+            }),
+            "{retired:?}"
+        );
+    }
+
+    /// An INTERNAL_ERROR cancel for a receiver still waiting on a remote sender purges its staged
+    /// frames from the rendezvous (leases back to the arena) and releases the frames the peer's
+    /// still-draining sender sends afterwards, dispatching nothing.
+    #[test]
+    fn cancel_purges_the_receivers_staged_frames_and_refuses_late_ones() {
+        let executor = Arc::new(Retiring::new(RecordingExecutor::default()));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(130, 1);
+        let receiver_id = TUniqueId::new(130, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let frame_ok = |seq: i64, eos: bool, offset: u64| {
+            let (length, attachment) = if eos {
+                (0, Vec::new())
+            } else {
+                (256, vec![0xAB; 16])
+            };
+            let frame = route(
+                &service,
+                methods::TRANSMIT_PACKED,
+                transmit_params(
+                    &receiver_id,
+                    7,
+                    0,
+                    seq,
+                    eos,
+                    offset,
+                    length,
+                    &["id", "name"],
+                ),
+                attachment,
+            );
+            let frame = PTransmitPackedResult::decode(frame.body.as_slice()).unwrap();
+            assert_eq!(
+                frame.status.status_code,
+                TStatusCode::OK.0,
+                "{:?}",
+                frame.status.error_msgs
+            );
+        };
+        frame_ok(0, false, 1024);
+        frame_ok(1, false, 2048);
+
+        cancel_ok(
+            &service,
+            cancel_request(
+                &receiver_id,
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                Some("peer failed"),
+            ),
+        );
+        assert_eq!(
+            executor.inner.released.lock().unwrap().as_slice(),
+            &[1024, 2048],
+            "the cancelled receiver's staged leases went back to the arena"
+        );
+
+        // The peer is still draining: a late data frame and its eos are released and acked.
+        frame_ok(2, false, 3072);
+        frame_ok(3, true, 0);
+        assert_eq!(
+            executor.inner.released.lock().unwrap().as_slice(),
+            &[1024, 2048, 3072]
+        );
+        assert!(
+            executor.inner.remote_inputs.lock().unwrap().is_empty(),
+            "nothing was dispatched"
+        );
+
+        // The receiver's own poll reports the cancel, and the query is failed on this CN.
+        let result = fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(
+            result.status.error_msgs[0].contains("cancelled by the FE")
+                && result.status.error_msgs[0].contains("peer failed"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        let retired = executor.retired();
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(
+            retired[0].1,
+            RetireTrigger::Cancel("INTERNAL_ERROR".to_string())
+        );
+    }
+
+    /// The FE's phased-schedule cancel names the dummy instance (0, 0) with a real query id: it
+    /// must still retire the query while fabricating nothing for the dummy instance.
+    #[test]
+    fn cancel_for_the_phased_dummy_instance_still_retires_the_query() {
+        let executor = Arc::new(Retiring::new(StubExecutor));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(140, 1);
+        cancel_ok(
+            &service,
+            cancel_request(
+                &TUniqueId::new(0, 0),
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                None,
+            ),
+        );
+        let retired = executor.retired();
+        assert_eq!(retired.len(), 1, "{retired:?}");
+        assert_eq!(retired[0].0, FragmentInstanceId::from(&query_id));
+        assert_eq!(
+            retired[0].1,
+            RetireTrigger::Cancel("INTERNAL_ERROR".to_string())
+        );
+        assert!(
+            service
+                .core
+                .results
+                .failure_of(FragmentInstanceId::from(&query_id))
+                .is_some()
+        );
+
+        // The dummy instance stays unknown to fetch_data and is not a receiver to retire.
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(0, 0),
+            Vec::new(),
+        );
+        let fetched = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            fetched.status.error_msgs[0].contains("no buffered result"),
+            "{:?}",
+            fetched.status.error_msgs
+        );
+        assert!(
+            !service
+                .core
+                .exchanges
+                .is_retired(FragmentInstanceId::from_halves(0, 0))
         );
     }
 

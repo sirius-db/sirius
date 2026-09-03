@@ -22,6 +22,9 @@ pub enum RetireTrigger {
     /// A fragment of the query failed on the CN before or around the engine (translation, sink
     /// validation, remote drain).
     CnErr,
+    /// `cancel_plan_fragment` with the FE's reason name (`PPlanFragmentCancelReason::as_str_name`,
+    /// or "none" when the field was absent).
+    Cancel(String),
 }
 
 impl fmt::Display for RetireTrigger {
@@ -29,6 +32,7 @@ impl fmt::Display for RetireTrigger {
         match self {
             Self::EngineErr => f.write_str("engine_err"),
             Self::CnErr => f.write_str("cn_err"),
+            Self::Cancel(name) => write!(f, "cancel:{name}"),
         }
     }
 }

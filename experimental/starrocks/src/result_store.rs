@@ -199,10 +199,35 @@ impl ResultStore {
         self.ready.notify_all();
     }
 
-    /// The first failure recorded for `query_id` (by `fail_query`), if any. The dispatch and
-    /// arrival gates consult it so no further fragment of a dead query runs on this CN.
+    /// The first failure recorded for `query_id` (by `fail_query` or `cancel_query`), if any.
+    /// The dispatch and arrival gates consult it so no further fragment of a dead query runs on
+    /// this CN.
     pub(crate) fn failure_of(&self, query_id: FragmentInstanceId) -> Option<String> {
         self.lock().query_failures.get(&query_id).cloned()
+    }
+
+    /// Records an FE cancel at query level: later fragments of the query are refused on arrival
+    /// and its still-`Waiting` result entries fail now with `reason`. Delivered, drained and
+    /// failed entries keep their state (the rule `cancel` follows). First cause wins.
+    pub(crate) fn cancel_query(&self, query_id: FragmentInstanceId, reason: String) {
+        let mut state = self.lock();
+        let results = state
+            .query_results
+            .get(&query_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut woke_a_poll = false;
+        for id in results {
+            if let Some(entry @ FragmentState::Waiting) = state.fragments.get_mut(&id) {
+                *entry = FragmentState::Failed(reason.clone());
+                woke_a_poll = true;
+            }
+        }
+        state.query_failures.entry(query_id).or_insert(reason);
+        drop(state);
+        if woke_a_poll {
+            self.ready.notify_all();
+        }
     }
 
     /// Best-effort cancellation mark: a still-`Waiting` entry becomes a failure so a
@@ -513,6 +538,47 @@ mod tests {
 
         // Another query is unaffected.
         assert_eq!(store.failure_of(query(13)), None);
+    }
+
+    #[test]
+    fn cancel_query_fails_waiting_entries_only_and_is_visible_to_failure_of() {
+        let store = ResultStore::default();
+        let waiting = FragmentInstanceId::from_halves(14, 1);
+        let delivered = FragmentInstanceId::from_halves(14, 2);
+        store.reserve(waiting, query(14));
+        store.reserve(delivered, query(14));
+        store.insert(delivered, batch(&["row"]));
+
+        store.cancel_query(query(14), "cancelled by the FE".to_string());
+
+        let cause = failure(store.take_next(waiting).expect("known"));
+        assert!(cause.contains("cancelled by the FE"), "cause: {cause}");
+        // Delivered rows keep flowing.
+        let (rows_batch, eos) = rows(store.take_next(delivered).expect("known"));
+        assert!(!eos);
+        assert_eq!(rows_batch.expect("rows survive the cancel").rows.len(), 1);
+        assert_eq!(
+            store.failure_of(query(14)).as_deref(),
+            Some("cancelled by the FE")
+        );
+
+        // A result fragment reserving after the cancel lands failed on arrival.
+        let late = FragmentInstanceId::from_halves(14, 3);
+        store.reserve(late, query(14));
+        let cause = failure(
+            store
+                .wait_ready(late, std::time::Duration::from_secs(5))
+                .expect("known"),
+        );
+        assert!(cause.contains("cancelled by the FE"), "cause: {cause}");
+
+        // First cause wins, as for fail_query; another query is untouched.
+        store.cancel_query(query(14), "second cancel".to_string());
+        assert_eq!(
+            store.failure_of(query(14)).as_deref(),
+            Some("cancelled by the FE")
+        );
+        assert_eq!(store.failure_of(query(15)), None);
     }
 
     #[test]

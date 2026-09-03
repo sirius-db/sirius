@@ -40,6 +40,9 @@ INFO sirius_starrocks_cn::engine: relayed native batches across a fragment bound
   its receiver starts. Concurrency needs per-query lifecycle isolation.
 - **A pre-filled stream.** Senders finish before the receiver is built, so the live producer path
   — a push arriving while the receiver runs — is still untested here.
+- **Cancellation mid-run.** `cancel_plan_fragment` retires the query's parked output and
+  rendezvous state on this CN, but a fragment already inside `run()` finishes first; its output is
+  dropped when it ends.
 
 ## Running it
 
