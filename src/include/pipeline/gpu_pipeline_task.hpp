@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/retry_futility.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
@@ -92,6 +93,9 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
   uint32_t retry_count = 0;
   /// Task ID of the original (non-retried) task; only meaningful when retry_count > 0.
   std::optional<uint64_t> original_task_id = std::nullopt;
+  /// Filled by the GPU executor's reservation gate on every attempt; consumed by the reschedule
+  /// path to decide whether an OOM retry is futile.
+  std::optional<retry_gate_observation> gate_observation;
 
   /// Request-size fallback used when an OOM does not expose the failed allocation size.
   static constexpr std::size_t kDefaultRetryRequestBytes = 1024 * 1024;
@@ -101,22 +105,32 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
                                                 std::optional<std::size_t> requested_bytes) noexcept
   {
     auto const request_bytes = requested_bytes.value_or(kDefaultRetryRequestBytes);
+    auto const required      = memory::saturating_add(live_allocated_bytes, request_bytes);
     auto next_floor          = memory::saturating_mul(current_reservation_bytes, 2);
-    next_floor = std::max(next_floor, memory::saturating_add(live_allocated_bytes, request_bytes));
-    next_floor = std::max(next_floor, kDefaultRetryRequestBytes);
+    next_floor               = std::max(next_floor, required);
+    next_floor               = std::max(next_floor, kDefaultRetryRequestBytes);
     _retry_reservation_floor = std::max(_retry_reservation_floor, next_floor);
+    // Hard lower bound on what the failed attempt had to allocate on its own stream (a
+    // LIMIT_EXCEEDED OOM proves live + requested exceeded the reservation). Unlike the floor it
+    // carries no policy multiplier; the reschedule path compares the gate's grant against it.
+    _oom_required_bytes = std::max(_oom_required_bytes, required);
   }
 
   void inherit_retry_reservation_floor(const gpu_pipeline_task_local_state& previous) noexcept
   {
     _retry_reservation_floor =
       std::max(_retry_reservation_floor, previous._retry_reservation_floor);
+    _oom_required_bytes = std::max(_oom_required_bytes, previous._oom_required_bytes);
   }
 
   [[nodiscard]] std::size_t get_retry_reservation_floor() const noexcept
   {
     return _retry_reservation_floor;
   }
+
+  /// live + requested recorded by the most demanding OOM of this task chain; 0 when no OOM
+  /// handler recorded one (the futility rule then stays dormant).
+  [[nodiscard]] std::size_t get_oom_required_bytes() const noexcept { return _oom_required_bytes; }
 
   [[nodiscard]] std::size_t get_task_consumption_basis() const override
   {
@@ -141,6 +155,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
   std::size_t _retry_reservation_floor = 0;
+  std::size_t _oom_required_bytes      = 0;
 };
 
 /**

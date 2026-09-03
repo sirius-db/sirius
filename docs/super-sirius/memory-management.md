@@ -81,7 +81,7 @@ Pipeline tasks acquire memory reservations before execution to prevent GPU OOM:
 
 Wraps RMM device memory resource. On each allocation:
 - Checks if the reservation has sufficient capacity
-- If exhausted → fails gracefully, triggering `oom_reschedule_exception`
+- If exhausted → fails gracefully, triggering `oom_reschedule_exception`; the GPU executor retries with a raised reservation floor, or fails the query fast when the retry's gate could not grant what the OOM needed and nothing can free memory (`assess_retry_futility`, see [Pipeline Execution](pipeline-execution.md#reschedule-handling-oom-and-cuda-launch-failures))
 - Enables predictable memory usage per task
 
 ### Caller reservations for HOST conversions

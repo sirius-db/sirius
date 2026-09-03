@@ -21,6 +21,7 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/retry_futility.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_space.hpp>
@@ -52,6 +53,8 @@ namespace pipeline {
 
 struct executor_metrics {
   size_t tasks_executed{0};
+  size_t oom_reschedules{0};  ///< OOM retries handed back to the manager loop
+  size_t futile_aborts{0};    ///< queries failed because an OOM retry could not make progress
 };
 
 /**
@@ -72,13 +75,17 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    * @param downgrade_executor Pointer to the downgrade executor. This is used so that the
    * gpu_pipeline_executor can request memory downgrade if it cannot obtain a reservation from the
    * memory space.
+   * @param progress Progress signals shared by all executors of one task_scheduler, consulted by
+   * the OOM fail-fast rule. When null the executor creates a private instance (what tests and
+   * any single-executor caller get).
    */
   explicit gpu_pipeline_executor(
     exec::thread_pool_config config,
     cucascade::memory::memory_space* mem_space,
     exec::publisher<std::unique_ptr<task_request>> task_request_publisher,
     sirius::parallel::downgrade_executor* downgrade_executor,
-    std::shared_ptr<const telemetry::telemetry_context> telemetry_context);
+    std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
+    std::shared_ptr<execution_progress> progress = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -149,7 +156,10 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
+  std::shared_ptr<execution_progress> _progress;
   std::atomic<size_t> _tasks_executed{0};
+  std::atomic<size_t> _oom_reschedules{0};
+  std::atomic<size_t> _futile_aborts{0};
 };
 
 }  // namespace pipeline

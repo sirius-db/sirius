@@ -120,7 +120,8 @@ task_scheduler::task_scheduler(
                                               const_cast<cucascade::memory::memory_space*>(space),
                                               _task_request_channel.make_publisher(),
                                               dg_exec,
-                                              _telemetry_context));
+                                              _telemetry_context,
+                                              _execution_progress));
   }
 }
 
@@ -275,6 +276,14 @@ void task_scheduler::drain_after_error()
   // tasks to finish, then restart the manager for the next query.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
+    auto const m = gpu_exec->get_metrics();
+    SIRIUS_LOG_INFO(
+      "task_scheduler: GPU:{} executor metrics (cumulative): tasks_executed={} "
+      "oom_reschedules={} futile_aborts={}",
+      device_id,
+      m.tasks_executed,
+      m.oom_reschedules,
+      m.futile_aborts);
   }
 
   // Now that no executor can generate further task_creation_requests, discard

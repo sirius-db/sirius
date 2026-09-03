@@ -426,15 +426,16 @@ Retryable execution failures are modeled as a small exception hierarchy: `task_r
 The GPU executor catches the **base** `task_reschedule_exception` and:
 
 1. Checks if the completion handler already has an error (skip if so)
-2. Increments `retry_count` (max 100 retries, `MAX_RETRIES`)
-3. Logs the retry attempt
-4. Marks the original task as rescheduled (skips pipeline completion tracking)
-5. Transitions intermediate data from idle to `task_created` state
-6. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
-7. Sleeps 50ms for backoff
-8. Reschedules the new task back through the manager loop
+2. Increments `retry_count` (max 100 retries, `MAX_RETRIES` = `kMaxTaskRetries`)
+3. Checks whether an OOM retry is futile (`assess_retry_futility`, `src/include/pipeline/retry_futility.hpp`): the reservation gate granted less than requested, the downgrade it requested freed 0 bytes, the OOM needed more than the grant (`live + requested`, recorded by the OOM handler as `oom_required_bytes`), and nothing completed or was running anywhere since the gate (`execution_progress`, shared by all executors of a `task_scheduler`). If so the query fails at that retry with a message naming the bytes needed vs granted and the bytes held outside any task reservation vs the pool. A first attempt never fails fast; CUDA-launch reschedules and full-grant OOMs (the cross-GPU batch-lock contention case) keep the retry budget.
+4. Logs the retry attempt
+5. Marks the original task as rescheduled (skips pipeline completion tracking)
+6. Transitions intermediate data from idle to `task_created` state
+7. Creates a new rescheduled task via `create_rescheduled_task()` virtual factory
+8. Sleeps 50ms for backoff
+9. Reschedules the new task back through the manager loop
 
-If max retries are exceeded, the error propagates and terminates the query.
+If max retries are exceeded, or a retry is futile, the error propagates and terminates the query. The manager loop also drops queued tasks once the completion handler has an error, so a failed query's remaining retries do not each pay a blocking `make_reservation()`.
 
 ## Error Handling and Draining
 

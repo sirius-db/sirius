@@ -23,6 +23,7 @@
 #include "parallel/task.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
+#include "pipeline/retry_futility.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
 
@@ -228,6 +229,11 @@ class task_scheduler {
   /// Only mutated by the management thread (matches device_ready signals from
   /// _task_request_channel and erases on dispatch), so no synchronization needed.
   std::vector<int> _ready_devices;
+
+  /// Progress signals shared by every GPU executor below (the OOM fail-fast reads them so a
+  /// completion on one GPU counts as progress for a retry on another). Declared before the
+  /// executors, which also hold a shared_ptr, so it outlives them either way.
+  std::shared_ptr<execution_progress> _execution_progress = std::make_shared<execution_progress>();
 
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
