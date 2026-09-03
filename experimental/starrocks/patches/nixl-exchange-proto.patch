@@ -1,0 +1,64 @@
+diff --git a/gensrc/proto/internal_service.proto b/gensrc/proto/internal_service.proto
+index 1e392043e89..6679b2d8d72 100644
+--- a/gensrc/proto/internal_service.proto
++++ b/gensrc/proto/internal_service.proto
+@@ -786,6 +786,49 @@ message PLookUpResponse {
+     repeated PColumn columns = 2;
+ }
+ 
++// Sirius multi-CN nixl exchange (GPU-to-GPU staging over UCX cuda_ipc).
++// These RPCs are Sirius-only extensions; upstream StarRocks does not define them.
++message PExchangeNixlMd {
++    optional string agent_name = 1;
++    optional bytes agent_metadata = 2;
++}
++
++message PExchangeNixlMdResult {
++    required StatusPB status = 1;
++    optional string agent_name = 2;
++    optional bytes agent_metadata = 3;
++}
++
++message PStagingLeaseRequest {
++    required uint64 length = 1;
++}
++
++message PStagingLeaseResult {
++    required StatusPB status = 1;
++    optional uint64 remote_addr = 2;
++    optional uint64 offset = 3;
++}
++
++message PTransmitPackedParams {
++    optional PUniqueId finst_id = 1;
++    optional int32 node_id = 2;
++    optional int32 sender_id = 3;
++    optional bool eos = 4;
++    optional int64 seq = 5;
++    optional uint64 offset = 6;
++    optional uint64 length = 7;
++    repeated string column_names = 8;
++    optional bool canary = 9;
++    // Exact row count of this batch frame (from export_packed). The receiver sums the counts
++    // per stream into declare_input_cardinality so the optimizer can size the stream; absent
++    // on EOS/canary frames and from senders that predate the field (receiver then declares
++    // nothing and keeps the legacy blind planning).
++    optional uint64 rows = 10;
++}
++
++message PTransmitPackedResult {
++    required StatusPB status = 1;
++}
+ 
+ service PInternalService {
+     rpc transmit_data(PTransmitDataParams) returns (PTransmitDataResult);
+@@ -838,4 +881,9 @@ service PInternalService {
+ 
+     rpc update_transaction_state(PUpdateTransactionStateRequest) returns (PUpdateTransactionStateResponse);
+     rpc lookup(PLookUpRequest) returns (PLookUpResponse);
++
++    // Sirius multi-CN nixl exchange.
++    rpc exchange_nixl_md(PExchangeNixlMd) returns (PExchangeNixlMdResult);
++    rpc request_staging_lease(PStagingLeaseRequest) returns (PStagingLeaseResult);
++    rpc transmit_packed(PTransmitPackedParams) returns (PTransmitPackedResult);
+ };
