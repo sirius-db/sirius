@@ -650,39 +650,169 @@ fn non_parquet_broker_range_is_unsupported() {
     ));
 }
 
-/// Verifies a byte-range split broker scan range is rejected as unsupported,
-/// both for a non-zero start offset and for a first split (offset 0, partial size).
+/// Verifies a byte-range split without the total file size is rejected: the range cannot
+/// be validated against EOF or collapsed when it tiles the whole file.
 #[test]
-fn split_broker_range_is_unsupported() {
-    for range in [
-        broker_scan_range(
-            "file:///data/users.parquet",
-            TFileFormatType::FORMAT_PARQUET,
-            1024,
-            -1,
-            None,
-        ),
-        broker_scan_range(
-            "file:///data/users.parquet",
-            TFileFormatType::FORMAT_PARQUET,
+fn split_broker_range_without_a_file_size_is_unsupported() {
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
             0,
-            512,
-            Some(1024),
-        ),
-    ] {
-        let err = PlanTranslator::new()
-            .translate_fragment(&params_with_scan_range(
-                TPlan::new(vec![scan_node(0, 0)]),
-                base_desc(),
-                0,
-                range,
-            ))
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            TranslateError::UnsupportedScanRange { node_id: 0, .. }
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                1024,
+                -1,
+                None,
+            ),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        TranslateError::UnsupportedScanRange { node_id: 0, .. }
+    ));
+}
+
+/// Extracts the LocalFiles items of the plan's root read.
+fn local_files_items(
+    translated: &TranslatedPlan,
+) -> &[substrait::proto::read_rel::local_files::FileOrFiles] {
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    &files.items
+}
+
+/// Verifies a byte-range split translates to a local-files item carrying the range — the
+/// exact shape a live 2-CN FE emits (162140518-byte lineitem split at 81070259).
+#[test]
+fn split_broker_range_emits_a_ranged_local_file() {
+    let path = "file:///data/lineitem.parquet";
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                path,
+                TFileFormatType::FORMAT_PARQUET,
+                81070259,
+                81070259,
+                Some(162140518),
+            ),
+        ))
+        .unwrap();
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].start, 81070259);
+    assert_eq!(items[0].length, 81070259);
+}
+
+/// Verifies `size == -1` reads from the start offset to the end of the file.
+#[test]
+fn open_ended_split_reads_to_the_end_of_the_file() {
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                1024,
+                -1,
+                Some(4096),
+            ),
+        ))
+        .unwrap();
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].start, items[0].length), (1024, 3072));
+}
+
+/// Verifies overlapping ranges are refused: under start-offset row-group ownership they would
+/// read the same rows twice, silently.
+#[test]
+fn overlapping_split_ranges_are_refused() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 600, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+            None,
+            None,
+            None,
         ));
-    }
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    assert!(err.to_string().contains("overlapping"), "{err}");
+}
+
+/// Verifies a range extending past the end of the file is refused.
+#[test]
+fn split_past_the_end_of_the_file_is_refused() {
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                512,
+                1024,
+                Some(1024),
+            ),
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("past the end"), "{err}");
+}
+
+/// Verifies an outer compression_type on a parquet range is refused — it describes a
+/// compressed container the reader would have to unwrap, not parquet's per-page compression.
+#[test]
+fn compressed_container_scan_range_is_refused() {
+    let mut range = broker_scan_range(
+        "file:///data/users.parquet",
+        TFileFormatType::FORMAT_PARQUET,
+        0,
+        -1,
+        Some(1024),
+    );
+    range.broker_scan_range.as_mut().unwrap().ranges[0].compression_type =
+        Some(starrocks_thrift::types::TCompressionType::GZIP);
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            range,
+        ))
+        .unwrap_err();
+    assert!(err.to_string().contains("compression"), "{err}");
 }
 
 /// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
@@ -880,22 +1010,40 @@ fn splits_rejected_because(file_size: i64, splits: &[(i64, i64)]) -> &'static st
     reason
 }
 
-/// Splits that leave a hole are refused: collapsing them to a whole-file read would scan the
-/// hole, which a sibling instance is already scanning.
+/// Translates `splits` and returns the `(start, length)` of each emitted local-files item;
+/// `(0, 0)` is the whole-file encoding.
+fn split_items(file_size: i64, splits: &[(i64, i64)]) -> Vec<(u64, u64)> {
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            file_size,
+            splits,
+        ))
+        .unwrap();
+    local_files_items(&translated)
+        .iter()
+        .map(|item| (item.start, item.length))
+        .collect()
+}
+
+/// Splits that leave a hole are emitted as one ranged item each: the hole belongs to a sibling
+/// instance of the same distributed scan, so nothing here may read it.
 #[test]
-fn split_broker_ranges_with_a_gap_are_unsupported() {
+fn split_broker_ranges_with_a_gap_emit_one_item_per_split() {
     assert_eq!(
-        splits_rejected_because(1024, &[(0, 256), (512, 512)]),
-        "byte-range splits do not tile the parquet file"
+        split_items(1024, &[(0, 256), (512, 512)]),
+        [(0, 256), (512, 512)]
     );
 }
 
-/// Splits that tile a prefix but stop short of the file are refused: the tail would be dropped.
+/// Adjacent splits coalesce into one ranged item whatever order the FE sent them in. A coalesced
+/// range that stops short of the file stays an explicit range rather than collapsing to a
+/// whole-file read: the tail belongs to another instance.
 #[test]
-fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
+fn adjacent_split_broker_ranges_coalesce_into_one_ranged_item() {
     assert_eq!(
-        splits_rejected_because(1024, &[(0, 256), (256, 256)]),
-        "byte-range splits do not tile the parquet file"
+        split_items(1024, &[(256, 256), (0, 256), (512, 128)]),
+        [(0, 640)]
     );
 }
 
@@ -906,26 +1054,70 @@ fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
 fn split_broker_ranges_extending_past_eof_are_unsupported() {
     assert_eq!(
         splits_rejected_because(1024, &[(0, 512), (512, 1024)]),
-        "byte-range split extends past the end of the parquet file"
+        "byte range extends past the end of the parquet file"
     );
     assert_eq!(
         splits_rejected_because(1024, &[(0, 2048)]),
-        "byte-range split extends past the end of the parquet file"
+        "byte range extends past the end of the parquet file"
     );
 }
 
-/// A zero-length split covers nothing, so it can never be part of a tiling: `(0, 0)` is refused
-/// outright, and a zero-length tail `(1024, -1)` after a whole-file split trips the same rule.
+/// A zero-length split owns nothing. Alone it leaves the file with no bytes to read and is
+/// refused; a zero-length tail `(1024, -1)` after a whole-file split is dropped and the file still
+/// collapses to a single whole-file read.
 #[test]
-fn zero_size_split_is_unsupported() {
+fn zero_size_split_alone_is_unsupported_and_a_zero_size_tail_is_dropped() {
     assert_eq!(
         splits_rejected_because(1024, &[(0, 0)]),
-        "byte-range splits do not tile the parquet file"
+        "all byte ranges of a parquet file are empty"
     );
-    assert_eq!(
-        splits_rejected_because(1024, &[(0, 1024), (1024, -1)]),
-        "byte-range splits do not tile the parquet file"
+    assert_eq!(split_items(1024, &[(0, 1024), (1024, -1)]), [(0, 0)]);
+}
+
+/// The all-empty check is per file, not per scan node: node 0 still owns real bytes of
+/// `a.parquet`, so a per-node check would pass and `b.parquet` — whose only split is empty —
+/// would silently vanish from the read.
+#[test]
+fn all_empty_splits_of_one_file_are_refused_beside_a_real_file() {
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            "file:///data/a.parquet",
+            TFileFormatType::FORMAT_PARQUET,
+            0,
+            -1,
+            Some(1024),
+        ),
     );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(
+                "file:///data/b.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                0,
+                0,
+                Some(1024),
+            ),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    assert_eq!(reason, "all byte ranges of a parquet file are empty");
 }
 
 /// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
@@ -936,7 +1128,7 @@ fn zero_size_split_is_unsupported() {
 fn overlapping_split_broker_ranges_are_unsupported() {
     assert_eq!(
         splits_rejected_because(1024, &[(0, 1024), (0, 512)]),
-        "byte-range splits do not tile the parquet file"
+        "overlapping byte ranges would read the same rows twice"
     );
 }
 

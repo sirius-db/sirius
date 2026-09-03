@@ -2107,24 +2107,18 @@ fn and_conditions(
 /// `parquet_scan(<paths>)`. v1 assumes parquet files whose column order matches
 /// the scan tuple's slot order, which holds for `FILES()` `SELECT *`. Without
 /// paths (e.g. HDFS scans) it falls back to a named-table read.
-fn scan_rel(desc: &DescriptorTable, tuple_id: i32, file_paths: &[String]) -> Result<Rel> {
-    let read_type = if file_paths.is_empty() {
+fn scan_rel(
+    desc: &DescriptorTable,
+    tuple_id: i32,
+    files: &[crate::scan_paths::ScanFile],
+) -> Result<Rel> {
+    let read_type = if files.is_empty() {
         ReadType::NamedTable(NamedTable {
             names: desc.table_names_for_tuple(tuple_id)?,
             ..Default::default()
         })
     } else {
-        ReadType::LocalFiles(LocalFiles {
-            items: file_paths
-                .iter()
-                .map(|path| FileOrFiles {
-                    path_type: Some(PathType::UriFile(path.clone())),
-                    file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        })
+        return Ok(local_files_rel(desc.named_struct(tuple_id)?, files));
     };
     Ok(Rel {
         rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -2145,6 +2139,37 @@ fn stream_read_rel(schema: substrait::proto::NamedStruct, stream_view: &str) -> 
             base_schema: Some(schema),
             read_type: Some(ReadType::NamedTable(NamedTable {
                 names: vec![stream_view.to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }))),
+    }
+}
+
+/// Builds a local parquet read with an explicit schema, one item per file or byte-range
+/// split. A split's `start`/`length` ride the Substrait item; `(0, 0)` — the proto default —
+/// is the whole-file encoding, which is why a real range is never emitted as `(0, 0)`.
+fn local_files_rel(
+    schema: substrait::proto::NamedStruct,
+    files: &[crate::scan_paths::ScanFile],
+) -> Rel {
+    Rel {
+        rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
+            base_schema: Some(schema),
+            read_type: Some(ReadType::LocalFiles(LocalFiles {
+                items: files
+                    .iter()
+                    .map(|file| {
+                        let (start, length) = file.range.unwrap_or((0, 0));
+                        FileOrFiles {
+                            path_type: Some(PathType::UriFile(file.path.clone())),
+                            file_format: Some(FileFormat::Parquet(ParquetReadOptions {})),
+                            start,
+                            length,
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
                 ..Default::default()
             })),
             ..Default::default()
