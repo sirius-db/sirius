@@ -56,6 +56,7 @@ mod gpu_affinity;
 mod local_exchange;
 mod proto;
 mod prpc;
+mod prpc_client;
 mod result_encoder;
 mod result_store;
 mod tunable;
