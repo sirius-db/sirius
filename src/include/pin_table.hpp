@@ -119,6 +119,12 @@ using pinned_column_storage_matrix = std::vector<std::vector<pinned_column_stora
 struct materialized_pin {
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces;
+  /// Canonicalized, sorted, deduplicated source files of each chunk, in emission
+  /// order (parallel to @c tables). Inner vectors are empty for duckdb-native
+  /// pins (no file provenance); the whole vector is what
+  /// @c sirius_scan_manager::insert_pinned_entry stores as chunk provenance to
+  /// let a scan over a subset of the pinned files be served per chunk.
+  std::vector<std::vector<std::string>> chunk_file_paths;
   /// Chunk-major stored-column metadata, parallel to @c tables and their columns.
   pinned_column_storage_matrix column_storage;
   /// Row count of each materialized chunk (parallel to @c tables). For duckdb-native
@@ -207,6 +213,8 @@ materialized_pin materialize_all_batches(
 /// compressed_host_representation; both derive from @c cucascade::idata_representation.
 struct host_pin_result {
   std::vector<std::shared_ptr<cucascade::idata_representation>> chunks;
+  /// Per-chunk source-file provenance; see @ref materialized_pin::chunk_file_paths.
+  std::vector<std::vector<std::string>> chunk_file_paths;
   /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
   /// compressed or converted to host storage. Parallel to @c chunks and their columns.
   pinned_column_storage_matrix column_storage;
@@ -257,6 +265,8 @@ struct device_pin_chunk {
 /// chunks may be interleaved within a single pin.
 struct device_pin_result {
   std::vector<device_pin_chunk> chunks;
+  /// Per-chunk source-file provenance; see @ref materialized_pin::chunk_file_paths.
+  std::vector<std::vector<std::string>> chunk_file_paths;
   /// Chunk-major stored-column metadata, recorded from each GPU table right before it is
   /// compressed or split into device columns. Parallel to @c chunks and their columns.
   pinned_column_storage_matrix column_storage;
