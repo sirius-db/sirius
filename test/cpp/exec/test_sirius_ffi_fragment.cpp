@@ -14,21 +14,28 @@
  * limitations under the License.
  */
 
-// Regression coverage for Fragment::Impl::end_lifecycle() (src/sirius_ffi.cpp): a build()
-// failure while the transaction is still open must roll it back, not commit it (a7bb47e2).
+// Regression coverage for the transaction handling in src/sirius_ffi.cpp:
+//
+// 1. Fragment::Impl::end_lifecycle(): a build() failure while the transaction is still open must
+//    roll it back, not commit it (a7bb47e2).
+// 2. lower_substrait(): Fragment::build() commits its view-creation transaction before it lowers
+//    the plan, and DuckDB 1.5.5 throws "TransactionContext::ActiveTransaction called without
+//    active transaction" from every catalog lookup made without one — so lowering must own a
+//    transaction of its own.
 //
 // The public FFI surface links only DuckDB's substrait consumer (no substrait-plan-from-SQL
-// helper, no raw-SQL passthrough), so no test here can construct a valid Fragment or inspect
-// catalog state after a failed build(). Instead these tests use a declared column type name
-// that TransformStringToLogicalType() can never resolve, which fails build() inside
-// resolve_inputs() before `substrait_plan` is ever parsed — and check the one thing observable
-// through the public API: that end_lifecycle() leaves the connection able to start and fail a
-// second, independent Fragment cleanly.
+// helper, no raw-SQL passthrough), so a valid plan has to be built here by hand with the bundled
+// protobuf, and catalog state after a failed build() cannot be inspected. The end_lifecycle()
+// tests therefore use a declared column type name that TransformStringToLogicalType() can never
+// resolve, which fails build() inside resolve_inputs() before `substrait_plan` is ever parsed —
+// and check the one thing observable through the public API: that end_lifecycle() leaves the
+// connection able to start and fail a second, independent Fragment cleanly.
 
 #include "sirius_ffi.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
+#include <substrait/plan.pb.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -49,6 +56,27 @@ fs::path isolated_memory_config_path()
 void declare_unresolvable_column(sirius::ffi::Fragment& fragment, const std::string& type_name)
 {
   fragment.declare_input_column(0, "a", type_name);
+}
+
+// A plan whose only read is the engine's stream view for input stream `stream_id`, projecting a
+// single nullable INTEGER column `a` — the shape a front end emits where it would otherwise emit
+// a file scan. Mirrors what Fragment::build() creates: `CREATE VIEW sirius_stream_<id> AS
+// SELECT * FROM sirius_stream_source(<id>)`.
+std::string stream_read_plan(std::uint64_t stream_id)
+{
+  substrait::Plan plan;
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("a");
+
+  auto* read   = root->mutable_input()->mutable_read();
+  auto* schema = read->mutable_base_schema();
+  schema->add_names("a");
+  auto* row_type = schema->mutable_struct_();
+  row_type->set_nullability(substrait::Type::NULLABILITY_REQUIRED);
+  row_type->add_types()->mutable_i32()->set_nullability(substrait::Type::NULLABILITY_NULLABLE);
+  read->mutable_named_table()->add_names(*sirius::ffi::stream_view_name(stream_id));
+
+  return plan.SerializeAsString();
 }
 
 // Both TransactionContext::Commit() and ::Rollback() clear current_transaction before doing any
@@ -104,4 +132,29 @@ TEST_CASE("Fragment destroyed between a failed build() and reuse also closes the
   auto second = sirius::ffi::make_fragment(*context);
   declare_unresolvable_column(*second, "also_not_a_real_type_xyz");
   require_build_fails_without_transaction_exception(*second);
+}
+
+// Exercises the success path the two cases above never reach: a well-formed plan over a declared
+// input stream. Fragment::build() commits its own transaction (type resolution + CREATE VIEW)
+// before opening the query lifecycle and only then calls lower_substrait(), so the Substrait
+// consumer's view lookup and the planner's binding run with no ambient transaction. Without
+// lower_substrait() owning one, DuckDB 1.5.5 fails this build() with
+// "TransactionContext::ActiveTransaction called without active transaction".
+TEST_CASE("Fragment::build() lowers its Substrait plan without an ambient transaction",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+
+  {
+    auto first = sirius::ffi::make_fragment(*context);
+    first->declare_input_column(0, "a", "INTEGER");
+    REQUIRE_NOTHROW(first->build(stream_read_plan(0)));
+  }
+
+  // The transaction lower_substrait() opened must be closed again on return: the next build()
+  // begins its own on the same connection and would throw "cannot start a transaction within a
+  // transaction" if the first one were still open.
+  auto second = sirius::ffi::make_fragment(*context);
+  second->declare_input_column(1, "a", "INTEGER");
+  REQUIRE_NOTHROW(second->build(stream_read_plan(1)));
 }
