@@ -23,6 +23,8 @@
 
 #include <filesystem>
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace {
@@ -146,6 +148,36 @@ duckdb::vector<duckdb::HivePartitioningIndex> year_partition()
   return {duckdb::HivePartitioningIndex("2024", 4)};
 }
 
+std::unique_ptr<scan::parquet_file_scan_info> one_row_group_file(std::string path)
+{
+  auto file       = std::make_unique<scan::parquet_file_scan_info>();
+  file->file_path = std::move(path);
+  file->row_groups.push_back({0, 20, 60, 10, 1});
+  return file;
+}
+
+// Three one-row-group files through a coalescer whose byte budget never fills, so
+// the only reason to split is the file-boundary mode under test.
+std::vector<std::unique_ptr<scan::scan_info>> coalesce_three_files(bool file_boundaries)
+{
+  auto info                          = std::make_unique<scan::parquet_ingestible_table_info>();
+  info->approximate_batch_size       = std::size_t{1} << 30;
+  info->batch_within_file_boundaries = file_boundaries;
+  scan::parquet_gpu_ingestible ingestible{std::move(info)};
+  auto coalescer = ingestible.create_batch_coalescer();
+
+  std::vector<std::unique_ptr<scan::scan_info>> batches;
+  for (auto const* path : {"f0.parquet", "f1.parquet", "f2.parquet"}) {
+    for (auto& batch : coalescer->push(one_row_group_file(path))) {
+      batches.push_back(std::move(batch));
+    }
+  }
+  for (auto& batch : coalescer->flush()) {
+    batches.push_back(std::move(batch));
+  }
+  return batches;
+}
+
 }  // namespace
 
 TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
@@ -203,6 +235,38 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
   masked.mvcc_keep_mask = sirius::scan_manager::mvcc_chunk_mask{{words, words->data()}, rows};
   CHECK(masked.get_estimated_working_set_size_in_bytes() ==
         2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
+}
+
+TEST_CASE("parquet coalescer file-boundary mode never bundles two files into one split",
+          "[scan][parquet][sizing][pin_table]")
+{
+  SECTION("bundling across files stays the default")
+  {
+    auto batches = coalesce_three_files(false);
+    REQUIRE(batches.size() == 1);
+    auto* split = dynamic_cast<scan::parquet_split_info*>(batches.front().get());
+    REQUIRE(split);
+    REQUIRE(split->rg_slices.size() == 3);
+  }
+
+  SECTION("batch_within_file_boundaries emits one single-file split per file")
+  {
+    auto batches = coalesce_three_files(true);
+    REQUIRE(batches.size() == 3);
+    std::set<std::string> seen;
+    for (auto const& batch : batches) {
+      auto* split = dynamic_cast<scan::parquet_split_info*>(batch.get());
+      REQUIRE(split);
+      REQUIRE_FALSE(split->rg_slices.empty());
+      std::set<std::string> files;
+      for (auto const& slice : split->rg_slices) {
+        files.insert(slice.file_path);
+      }
+      REQUIRE(files.size() == 1);
+      seen.insert(*files.begin());
+    }
+    REQUIRE(seen == std::set<std::string>{"f0.parquet", "f1.parquet", "f2.parquet"});
+  }
 }
 
 TEST_CASE("parquet synthetic filter-only columns only increase the decode working set",

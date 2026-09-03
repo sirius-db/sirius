@@ -27,6 +27,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
@@ -170,7 +171,8 @@ using pin_batch_sink =
                      cucascade::memory::memory_space* target,
                      rmm::cuda_stream_view stream,
                      std::vector<pinned_column_storage_meta> column_storage,
-                     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
+                     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+                     std::vector<std::string> batch_files)>;
 
 struct narrowed_pin_chunk {
   std::unique_ptr<cudf::table> table;
@@ -311,6 +313,19 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     auto materialized     = ingestible.materialize_metadata_to_table(*batch, *target, stream);
     auto tbl              = materialized.table.release(stream, target->get_default_allocator());
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
+    // Chunk provenance: the source files this batch decodes, canonicalized so
+    // they compare against cache_entry_info's canonical file set. Empty for
+    // duckdb-native batches (no file identity) — such chunks serve exact-set
+    // scans only.
+    std::vector<std::string> batch_files;
+    if (auto const* split = dynamic_cast<op::scan::parquet_split_info const*>(batch.get())) {
+      batch_files.reserve(split->rg_slices.size());
+      for (auto const& slice : split->rg_slices) {
+        batch_files.push_back(op::scan::canonical_scan_file_path(slice.file_path));
+      }
+      std::ranges::sort(batch_files);
+      batch_files.erase(std::unique(batch_files.begin(), batch_files.end()), batch_files.end());
+    }
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
     // Zone-map capture, while the decode device guard + stream are active and the
@@ -378,7 +393,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                                 narrowed_columns[static_cast<std::size_t>(i)],
                                 native_types[static_cast<std::size_t>(i)]});
     }
-    on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
+    on_batch(std::move(tbl),
+             target,
+             stream,
+             std::move(column_storage),
+             std::move(chunk_stats),
+             std::move(batch_files));
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -576,13 +596,16 @@ materialized_pin materialize_all_batches(
         cucascade::memory::memory_space* target,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+        std::vector<std::string> batch_files) {
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
       stream.synchronize();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.tables.emplace_back(std::move(tbl));
       out.chunk_memory_spaces.push_back(target);
+      // Unconditional (unlike chunk_stats): provenance must stay parallel to tables.
+      out.chunk_file_paths.emplace_back(std::move(batch_files));
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
     });
@@ -612,10 +635,12 @@ host_pin_result materialize_pin_to_host(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+        std::vector<std::string> batch_files) {
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
       bool compressed_this_chunk = false;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
+      out.chunk_file_paths.emplace_back(std::move(batch_files));
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
@@ -724,10 +749,12 @@ device_pin_result materialize_all_batches_compressed(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/,
+        std::vector<std::string> batch_files) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       const std::int64_t chunk_rows = tbl->num_rows();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(chunk_rows));
+      out.chunk_file_paths.emplace_back(std::move(batch_files));
       out.column_storage.emplace_back(std::move(column_storage));
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
