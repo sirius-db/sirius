@@ -24,6 +24,7 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -43,6 +44,9 @@ struct stream_input_spec {
   duckdb::vector<sirius::logical_type> types;
   /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
+  /// Optional caller-declared row count, forwarded to the bind catalog so DuckDB's optimizer
+  /// can size the stream (see stream_input_binding::estimated_rows). nullopt = undeclared.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Bound, optimized DuckDB logical plan (Substrait bytes, SQL, …).
