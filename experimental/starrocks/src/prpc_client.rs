@@ -222,6 +222,7 @@ mod tests {
                 BrpcServer::with_executor(
                     Arc::new(StubExecutor),
                     ExchangeIdentity::new("127.0.0.1", port),
+                    None,
                 )
                 .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
@@ -338,6 +339,7 @@ mod tests {
                 BrpcServer::with_executor(
                     Arc::new(StubExecutor),
                     ExchangeIdentity::new("127.0.0.1", port),
+                    None,
                 )
                 .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )

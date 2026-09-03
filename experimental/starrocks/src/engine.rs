@@ -12,6 +12,13 @@
 //! shutdown cancellation while a query runs. Each fragment result is fully materialized, and the
 //! single process-global context serializes fragment execution — both lifted by the streaming
 //! evolution.
+//!
+//! Staging-arena calls deliberately BYPASS the request channel: bring-up hands back a
+//! `Send + Sync` [`sirius::StagingArena`] handle and every `staging_*` call is served from it on
+//! the caller's own thread. Funneling leases through the engine thread turns any engine stall
+//! into a peer's exchange stall — a fragment wedged inside `run()` starved the peer CN's
+//! `request_staging_lease` for the PRPC timeout and failed the whole query (the q02 wedge's
+//! second act) — so leases must never wait behind engine work.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,7 +33,9 @@ use starrocks_plan_translator::StreamInputSchema;
 use tracing::{info, warn};
 
 use crate::engine_settings::{EngineSettings, resolve_cuda_visible_devices};
-use crate::fragment_executor::{FragmentExecutor, FragmentResult, FragmentRun, SenderSlot};
+use crate::fragment_executor::{
+    FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
+};
 
 /// A sender fragment's parked output, shared by its destinations: stream i belongs to
 /// destination i. `outstanding` counts destinations that have not yet released their stream
@@ -48,6 +57,10 @@ struct ExecuteRequest {
     stream_inputs: Vec<StreamInputSchema>,
     /// Parked sender outputs to relay in, keyed by receiver exchange node id.
     inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender batches staged in this CN's arena, as `(node id, sender id, batches)`:
+    /// pushed via `push_packed` + `close_input` before `run()`, each lease released the moment
+    /// its push returns (copy-out-on-arrival makes that safe).
+    remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     outputs: Vec<SenderSlot>,
     /// Every destination receives the full output (broadcast sink).
@@ -60,9 +73,22 @@ struct ExecuteRequest {
 
 /// One message to the engine thread — the only caller of `SiriusContext`, which is `!Send`.
 /// Every variant carries its own respond channel, so callers block for exactly their answer.
+///
+/// Staging lease/release/info are deliberately NOT variants here: they are served from the
+/// thread-safe arena handle on the caller's thread (see the module doc), because a request
+/// queued here waits for whatever fragment the engine thread is running.
 enum EngineRequest {
     /// Run one fragment (the original request shape).
     Run(ExecuteRequest),
+    /// Test-only: occupy the engine thread for the duration — a stand-in for a long (or
+    /// wedged) fragment run, so a test can prove staging leases do not queue behind it.
+    #[cfg(test)]
+    Sleep(std::time::Duration),
+    /// Pack the next batch parked under `slot` into a fresh staging lease (`None` when drained).
+    ExportNext {
+        slot: SenderSlot,
+        respond: Sender<Result<Option<StagedBatch>, String>>,
+    },
     /// Drop the parked fragment under `slot` (after its output was transmitted, or on a failed
     /// transmit so the GPU memory is not pinned by a dead query).
     DropParked {
@@ -83,6 +109,16 @@ pub struct SiriusEngine {
     requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Thread-safe staging-arena handle (`None` when `SIRIUS_EXCHANGE_STAGING_BYTES` is unset),
+    /// serving every `staging_*` call directly on the caller's thread.
+    ///
+    /// INVARIANT: staging leases must never funnel through `requests` — a fragment wedged
+    /// inside `run()` would starve every peer's `request_staging_lease` and stall their
+    /// cross-CN exchanges. Off-thread service is safe because lease/release/base/capacity only
+    /// take the arena's internal mutex and make no CUDA calls; the engine thread keeps its own
+    /// direct arena access (`Context::staging_release` for remote-input leases, and
+    /// `export_packed` leasing internally) — one shared C++ allocator, two entry points.
+    staging: Option<sirius::StagingArena>,
 }
 
 impl SiriusEngine {
@@ -95,15 +131,19 @@ impl SiriusEngine {
     pub fn start(settings: EngineSettings) -> Result<Self, String> {
         Self::configure_engine_environment(&settings)?;
         let (request_tx, request_rx) = channel::<EngineRequest>();
-        let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+        // Readiness carries the staging-arena handle out of the engine thread: the context
+        // itself never leaves that thread, but the handle is `Send + Sync` by design so
+        // staging calls can bypass the request channel (see the module doc).
+        let (ready_tx, ready_rx) = channel::<Result<Option<sirius::StagingArena>, String>>();
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
             .spawn(move || engine_thread(settings.config, request_rx, ready_tx))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(staging)) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
+                staging,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -146,12 +186,13 @@ impl SiriusEngine {
 fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
-    ready: Sender<Result<(), String>>,
+    ready: Sender<Result<Option<sirius::StagingArena>, String>>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
-            // A send error means the caller is already gone; nothing to serve.
-            if ready.send(Ok(())).is_err() {
+            // A send error means the caller is already gone; nothing to serve. The staging
+            // handle crosses to the caller so leases are served off this thread.
+            if ready.send(Ok(context.staging_arena())).is_err() {
                 return;
             }
             context
@@ -219,6 +260,12 @@ fn engine_thread(
                 }
                 let _ = request.respond.send(result);
             }
+            #[cfg(test)]
+            EngineRequest::Sleep(duration) => std::thread::sleep(duration),
+            EngineRequest::ExportNext { slot, respond } => {
+                let result = export_next(&mut parked, &parked_slots, &poisoned, slot);
+                let _ = respond.send(result);
+            }
             EngineRequest::DropParked { slot, respond } => {
                 let result = release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
                 let _ = respond.send(result);
@@ -245,6 +292,32 @@ fn missing_slot(poisoned: &HashMap<SenderSlot, String>, slot: &SenderSlot, verb:
     }
 }
 
+/// Packs the next batch parked under `slot` into a fresh staging lease.
+fn export_next(
+    parked: &mut HashMap<u64, ParkedOutput<'_>>,
+    parked_slots: &HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
+    slot: SenderSlot,
+) -> Result<Option<StagedBatch>, String> {
+    let (park_id, stream) = parked_slots
+        .get(&slot)
+        .copied()
+        .ok_or_else(|| missing_slot(poisoned, &slot, "export"))?;
+    let entry = parked
+        .get_mut(&park_id)
+        .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
+    let batch = entry
+        .fragment
+        .export_packed(stream)
+        .map_err(|err| format!("failed to export a packed batch for {slot:?}: {err}"))?;
+    Ok(batch.map(|batch| StagedBatch {
+        metadata: batch.metadata,
+        offset: batch.offset,
+        len: batch.len,
+        rows: Some(batch.rows),
+    }))
+}
+
 /// Releases one destination's claim on a parked fragment; the fragment (and the GPU memory its
 /// remaining batches hold) drops when the LAST destination releases. Exactly-once per slot: a
 /// second release of the same slot is a loud error, never a silent double-drop.
@@ -267,8 +340,9 @@ fn release_slot(
     Ok(())
 }
 
-/// Runs one fragment on the engine thread: declare its input streams, relay every parked sender
-/// into them, execute, then either park the output or return the rows.
+/// Runs one fragment on the engine thread, guaranteeing that the staging leases its remote
+/// inputs sit in are released exactly once — immediately after each successful push, or in a
+/// sweep when the run fails partway (a leaked lease would pin the arena for later queries).
 fn run_fragment<'ctx>(
     context: &'ctx SiriusContext,
     parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
@@ -276,6 +350,49 @@ fn run_fragment<'ctx>(
     poisoned: &HashMap<SenderSlot, String>,
     next_park_id: &mut u64,
     request: &ExecuteRequest,
+) -> Result<Option<FragmentResult>, String> {
+    let mut released = std::collections::HashSet::new();
+    let result = run_fragment_inner(
+        context,
+        parked,
+        parked_slots,
+        poisoned,
+        next_park_id,
+        request,
+        &mut released,
+    );
+    if result.is_err() {
+        for (_, _, batches) in &request.remote_inputs {
+            for batch in batches {
+                // `len == 0` batches never held a lease (metadata-only), and offsets in
+                // `released` already went back in the push loop.
+                if batch.len == 0 || released.contains(&batch.offset) {
+                    continue;
+                }
+                if let Err(err) = context.staging_release(batch.offset) {
+                    warn!(
+                        offset = batch.offset,
+                        error = %err,
+                        "failed to release a remote-input staging lease after a fragment error"
+                    );
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Runs one fragment on the engine thread: declare its input streams, relay every parked sender
+/// and push every staged remote batch into them, execute, then either park the output or return
+/// the rows. Records each released remote-input lease offset in `released`.
+fn run_fragment_inner<'ctx>(
+    context: &'ctx SiriusContext,
+    parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
+    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
+    poisoned: &HashMap<SenderSlot, String>,
+    next_park_id: &mut u64,
+    request: &ExecuteRequest,
+    released: &mut std::collections::HashSet<u64>,
 ) -> Result<Option<FragmentResult>, String> {
     let mut fragment = context
         .fragment()
@@ -299,28 +416,40 @@ fn run_fragment<'ctx>(
             .find(|(node_id, _)| *node_id == schema.node_id)
             .map(|(_, senders)| senders.as_slice())
             .unwrap_or_default();
-        if senders.is_empty() {
+        let remote_senders = request
+            .remote_inputs
+            .iter()
+            .filter(|(node_id, _, _)| *node_id == schema.node_id)
+            .map(|(_, sender_id, _)| *sender_id)
+            .collect::<Vec<_>>();
+        if senders.is_empty() && remote_senders.is_empty() {
             return Err(format!(
-                "exchange node {} is read as a stream but no parked sender output exists for it",
+                "exchange node {} is read as a stream but no sender output — parked or remote — \
+                 exists for it",
                 schema.node_id
             ));
         }
-        for slot in senders {
-            let sender_id = u32::try_from(slot.sender_id)
-                .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
+        for sender_id in senders
+            .iter()
+            .map(|slot| slot.sender_id)
+            .chain(remote_senders)
+        {
+            let sender_id =
+                u32::try_from(sender_id).map_err(|_| format!("negative sender id {sender_id}"))?;
             fragment
                 .declare_input_sender(stream_id, sender_id)
                 .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
         }
 
-        // The CN already holds every input of this fragment — the parked local sender outputs —
-        // so it can declare the stream's EXACT row count and let DuckDB's optimizer size join
-        // order / build-side selection (a stream source binds with no rows behind it, so
-        // undeclared streams all estimate cardinality 1: the q07 2-CN regression built its hash
-        // join on a multi-GB stream while a 2-row stream probed). Best-effort by design: when
-        // any contributor's count is unknown (a spilled parked batch), skip the declaration and
-        // keep the legacy blind planning for this stream rather than failing the fragment.
-        let rows: Option<u64> = senders
+        // The CN already holds every input of this fragment — parked local sender outputs and
+        // staged remote batches — so it can declare the stream's EXACT row count and let
+        // DuckDB's optimizer size join order / build-side selection (a stream source binds with
+        // no rows behind it, so undeclared streams all estimate cardinality 1: the q07 2-CN
+        // regression built its hash join on a multi-GB stream while a 2-row stream probed).
+        // Best-effort by design: when any contributor's count is unknown (a spilled parked
+        // batch, a remote frame that predates the wire's `rows` field), skip the declaration
+        // and keep the legacy blind planning for this stream rather than failing the fragment.
+        let local_rows: Option<u64> = senders
             .iter()
             .map(|slot| {
                 let (park_id, sender_stream) = parked_slots.get(slot).copied()?;
@@ -328,8 +457,15 @@ fn run_fragment<'ctx>(
                 entry.fragment.output_row_count(sender_stream).ok()
             })
             .sum();
-        match rows {
-            Some(rows) => {
+        let remote_rows: Option<u64> = request
+            .remote_inputs
+            .iter()
+            .filter(|(node_id, _, _)| *node_id == schema.node_id)
+            .flat_map(|(_, _, batches)| batches.iter().map(|batch| batch.rows))
+            .sum();
+        match (local_rows, remote_rows) {
+            (Some(local), Some(remote)) => {
+                let rows = local + remote;
                 fragment
                     .declare_input_cardinality(stream_id, rows)
                     .map_err(|err| {
@@ -337,7 +473,7 @@ fn run_fragment<'ctx>(
                     })?;
                 info!(stream_id, rows, "declared input stream cardinality");
             }
-            None => warn!(
+            _ => warn!(
                 stream_id,
                 "input stream row count unknown; planning without a declared cardinality"
             ),
@@ -401,6 +537,49 @@ fn run_fragment<'ctx>(
                 "relayed native batches across a fragment boundary"
             );
         }
+    }
+
+    // Remote senders: their packed batches already sit in this CN's staging arena. Push each
+    // (deep copy into pool memory), release its lease immediately — copy-out-on-arrival makes
+    // that safe — then close the sender.
+    for (node_id, sender_id, batches) in &request.remote_inputs {
+        let stream_id = stream_id_of(*node_id)?;
+        let sender = u32::try_from(*sender_id)
+            .map_err(|_| format!("negative remote sender id {sender_id}"))?;
+        for batch in batches {
+            let staged = sirius::PackedBatch {
+                metadata: batch.metadata.clone(),
+                offset: batch.offset,
+                len: batch.len,
+                // push_packed never reads the count; the receiver consumed it before build()
+                // through declare_input_cardinality.
+                rows: batch.rows.unwrap_or(0),
+            };
+            fragment.push_packed(stream_id, &staged).map_err(|err| {
+                format!(
+                    "failed to push a staged remote batch from sender {sender_id} into stream \
+                     {stream_id}: {err}"
+                )
+            })?;
+            if batch.len > 0 {
+                context.staging_release(batch.offset).map_err(|err| {
+                    format!(
+                        "failed to release the staging lease at offset {} after pushing it: {err}",
+                        batch.offset
+                    )
+                })?;
+                released.insert(batch.offset);
+            }
+        }
+        fragment.close_input(stream_id, sender).map_err(|err| {
+            format!("failed to close remote sender {sender_id} on stream {stream_id}: {err}")
+        })?;
+        info!(
+            stream_id,
+            sender_id,
+            batches = batches.len(),
+            "received remote batches"
+        );
     }
 
     fragment
@@ -474,6 +653,14 @@ impl SiriusEngine {
             .recv()
             .map_err(|_| "sirius-engine thread dropped the response".to_string())?
     }
+
+    /// The staging-arena handle, or the loud not-configured error (the exact message the C++
+    /// arena raises, so operators see one spelling either way).
+    fn staging_arena(&self) -> Result<&sirius::StagingArena, String> {
+        self.staging.as_ref().ok_or_else(|| {
+            "exchange staging arena not configured (set SIRIUS_EXCHANGE_STAGING_BYTES)".to_string()
+        })
+    }
 }
 
 impl FragmentExecutor for SiriusEngine {
@@ -483,12 +670,37 @@ impl FragmentExecutor for SiriusEngine {
                 plan: run.plan.to_substrait_bytes(),
                 stream_inputs: run.plan.stream_inputs.clone(),
                 inputs: run.inputs,
+                remote_inputs: run.remote_inputs,
                 outputs: run.outputs,
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
                 respond,
             })
         })
+    }
+
+    // The three staging calls below run on the CALLER's thread, never the engine thread: a
+    // peer's lease request must succeed even while the engine is deep inside a fragment run.
+
+    fn staging_info(&self) -> Result<(u64, u64), String> {
+        let arena = self.staging_arena()?;
+        Ok((arena.base() as u64, arena.capacity()))
+    }
+
+    fn staging_lease(&self, len: u64) -> Result<u64, String> {
+        self.staging_arena()?
+            .lease(len)
+            .map_err(|err| format!("staging lease of {len} bytes failed: {err}"))
+    }
+
+    fn staging_release(&self, offset: u64) -> Result<(), String> {
+        self.staging_arena()?
+            .release(offset)
+            .map_err(|err| format!("staging release of offset {offset} failed: {err}"))
+    }
+
+    fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        self.engine_call(|respond| EngineRequest::ExportNext { slot, respond })
     }
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
@@ -655,6 +867,7 @@ mod tests {
             .run(FragmentRun {
                 plan,
                 inputs: Vec::new(),
+                remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
@@ -756,6 +969,7 @@ mod tests {
                 plan,
                 stream_inputs: Vec::new(),
                 inputs: Vec::new(),
+                remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
@@ -772,6 +986,156 @@ mod tests {
         for batch in &result.batches {
             eprintln!("{batch:?}");
         }
+    }
+
+    /// Writes the tiny `(id BIGINT, name VARCHAR)` parquet fixture at `path`:
+    /// rows (1, "a"), (2, "b"), (3, "c").
+    fn write_users_parquet(path: &std::path::Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, names]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// The engine-actor mirror of the sirius crate's `packed_hop_matches_relay_hop`: a sender
+    /// parks its output, `export_packed_next` drains it into staging leases, and a receiver run
+    /// with `remote_inputs` delivers exactly the fixture rows — proving the staging info/lease/
+    /// release handle path, the ExportNext/DropParked plumbing, and the push-then-release
+    /// contract, GPU-side, without any network. Requires a GPU and
+    /// `SIRIUS_EXCHANGE_STAGING_BYTES` support.
+    #[test]
+    fn engine_pushes_staged_remote_batches() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+        let (base, capacity) = engine.staging_info().expect("staging arena info");
+        assert_ne!(base, 0);
+        assert_eq!(capacity, 64 << 20);
+
+        const EXCHANGE_NODE: i32 = 9;
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(3, 4),
+            node_id: EXCHANGE_NODE,
+            sender_id: 0,
+        };
+        engine
+            .run(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+            })
+            .expect("run the sender fragment");
+
+        let mut staged = Vec::new();
+        while let Some(batch) = engine.export_packed_next(slot).expect("export packed") {
+            assert!(!batch.metadata.is_empty());
+            staged.push(batch);
+        }
+        assert!(!staged.is_empty(), "the sender parked batches to export");
+        // The packed bytes live in arena leases, independent of the parked fragment.
+        engine.drop_parked(slot).expect("drop the drained sender");
+        assert!(
+            engine.drop_parked(slot).is_err(),
+            "double drop must be a loud error"
+        );
+
+        let receiver = stream_plan(EXCHANGE_NODE, &[("id", false), ("name", true)]);
+        let result = engine
+            .run(FragmentRun {
+                plan: &receiver,
+                inputs: Vec::new(),
+                remote_inputs: vec![(EXCHANGE_NODE, 0, staged)],
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+            })
+            .expect("execute the remote-fed receiver on GPU")
+            .expect("a result fragment returns rows");
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3, "the staged remote hop preserved every row");
+
+        // Every lease went back (push-then-release), so the free list coalesced back to one
+        // whole-arena block and the next lease lands at the base.
+        let probe = engine.staging_lease(1024).expect("arena drained");
+        assert_eq!(probe, 0);
+        engine.staging_release(probe).unwrap();
+
+        // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The regression guard for the q02 lease starvation: a peer's `request_staging_lease`
+    /// lands while this CN's engine thread is busy running a fragment, and the old
+    /// engine-channel funnel made that lease wait for the whole run (forever, for a wedged
+    /// one). With the arena handle serving leases on the caller's thread, a lease taken while
+    /// the engine thread is occupied must return immediately. Requires a GPU.
+    #[test]
+    fn staging_lease_does_not_queue_behind_engine_work() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // The arena is constructed at context bring-up, only when this is set.
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+        // Occupy the engine thread the way a long fragment run would (the raw-request door the
+        // dumped-plan harness also uses); anything funneled through the channel now waits.
+        let busy_for = std::time::Duration::from_secs(3);
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(EngineRequest::Sleep(busy_for))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let offset = engine
+            .staging_lease(4096)
+            .expect("lease while the engine thread is busy");
+        engine
+            .staging_release(offset)
+            .expect("release while the engine thread is busy");
+        let (base, capacity) = engine.staging_info().expect("info while busy");
+        assert_ne!(base, 0);
+        assert_eq!(capacity, 64 << 20);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "staging calls queued behind engine work: served in {elapsed:?} while the engine \
+             thread was held for {busy_for:?}"
+        );
+
+        // Keep the arena out of the other tests' context bring-ups. Dropping `engine` below
+        // joins the engine thread, which finishes its sleep first — ordered teardown holds.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
@@ -827,6 +1191,7 @@ mod tests {
                 .run(FragmentRun {
                     plan: &plan,
                     inputs: Vec::new(),
+                    remote_inputs: Vec::new(),
                     outputs: vec![slot],
                     broadcast: false,
                     hash_keys: Vec::new(),
@@ -841,6 +1206,7 @@ mod tests {
             .run(FragmentRun {
                 plan: &receiver,
                 inputs: vec![(EXCHANGE_NODE, vec![slot])],
+                remote_inputs: Vec::new(),
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),

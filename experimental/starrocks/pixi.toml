@@ -20,6 +20,7 @@ engine = ["engine"]
 [tasks]
 cluster = {cmd = """
 bash -lc 'set -euo pipefail
+source scripts/cn-env.sh
 
 cleanup() {
     status=$?
@@ -38,12 +39,71 @@ cn_pid="$!"
 
 wait -n "${fe_pid}" "${cn_pid}"
 '
-""",cwd = ".",depends-on = ["fe-build","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs"}
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the local StarRocks FE and Rust CN in the foreground with logs",env = {SIRIUS_QUERY_WATCHDOG_SECS = "60"}}
+
+# Two CNs share one GPU: each carves out an 8GiB slice (reservation == usage limit in the
+# derived config), so neither primes the default ~0.95x of device memory. CN2 shifts every
+# listener port by +2 and keeps its engine artifacts in .cn2.
+#
+# Cross-node exchange rides the nixl tier: SIRIUS_EXCHANGE_STAGING_BYTES gives each CN a
+# 1280MiB cudaMalloc exchange staging arena (512MiB starved TPC-H q09: one packed-table lease
+# of 648MB exceeded the whole arena). NOTE: the arena sits OUTSIDE --gpu-memory-limit — each
+# CN really occupies ~8GiB + 1.25GiB + CUDA context overhead, sized below to still fit two CNs
+# on the 23GiB L4. UCX_TLS must include cuda_copy (VRAM detection;
+# registration fails without it) and cuda_ipc (the fast same-host path the bandwidth canary
+# demands).
+#
+# SIRIUS_QUERY_WATCHDOG_SECS turns an engine-side scheduling stall into a loud query failure
+# after 60s of zero progress instead of a silent, SIGTERM-resistant head-of-line CN wedge.
+# Opt-in here because a single kernel legitimately running longer than the threshold would
+# be misread as a stall; TPC-H SF100 operator runtimes sit far below it.
+cluster2 = {cmd = """
+bash -lc 'set -euo pipefail
+source scripts/cn-env.sh
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    kill "${fe_pid:-}" "${cn1_pid:-}" "${cn2_pid:-}" 2>/dev/null || true
+    wait "${fe_pid:-}" "${cn1_pid:-}" "${cn2_pid:-}" 2>/dev/null || true
+    exit "${status}"
+}
+trap cleanup EXIT INT TERM
+
+starrocks/output/fe/bin/start_fe.sh --logconsole &
+fe_pid="$!"
+
+target/release/sirius-starrocks-cn \
+    --gpu-memory-limit 8GiB --host-memory-limit 12GiB --engine-dir .cn1 &
+cn1_pid="$!"
+
+target/release/sirius-starrocks-cn \
+    --heartbeat-port 9052 --thrift-port 9062 --brpc-port 8062 --http-port 8042 \
+    --starlet-port 9072 \
+    --gpu-memory-limit 8GiB --host-memory-limit 12GiB --engine-dir .cn2 &
+cn2_pid="$!"
+
+wait -n "${fe_pid}" "${cn1_pid}" "${cn2_pid}"
+'
+""",cwd = ".",depends-on = ["fe-check","cn-build"],description = "Run the FE and two 8GiB-carve-out CNs sharing one GPU, cross-node exchange over nixl",env = {SIRIUS_EXCHANGE_STAGING_BYTES = "1280MiB",SIRIUS_QUERY_WATCHDOG_SECS = "60"}}
 
 # Re-applies Sirius-only StarRocks patches (nixl exchange RPCs) after a clean submodule checkout.
 # The CN's build.rs refuses an unpatched submodule, so every task that builds the CN depends on
 # this one; the script is idempotent.
 apply-starrocks-patches = {cmd = "bash scripts/apply-starrocks-patches.sh",cwd = ".",description = "Apply Sirius patches onto the StarRocks submodule"}
+
+# This demo project ships the StarRocks FE pre-packaged under starrocks/output/fe, so `cluster`
+# does not depend on `fe-build` (a multi-hour Maven build of the whole front end). Assert the
+# package is there and point at `fe-build` if it is not.
+fe-check = {cmd = """
+bash -lc 'test -x starrocks/output/fe/bin/start_fe.sh || {
+    echo "No packaged FE at starrocks/output/fe." >&2
+    echo "Run: git submodule update --init --recursive experimental/starrocks/starrocks" >&2
+    echo "then: pixi run apply-starrocks-patches" >&2
+    echo "then: pixi run fe-build   (long — builds the StarRocks front end from source)" >&2
+    exit 1
+}'
+""",cwd = ".",depends-on = ["apply-starrocks-patches"],description = "Assert the packaged StarRocks FE is present"}
 
 [feature.client.dependencies]
 # Provides the `mysql` CLI that speaks the FE's MySQL wire protocol on query_port.

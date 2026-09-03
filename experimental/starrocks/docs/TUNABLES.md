@@ -13,8 +13,7 @@ launcher echoed.
 
 Unset means the compiled default. Empty string is treated as unset.
 
-The transport that reads these knobs lands in later PRs; until then the
-registry only validates and logs.
+Everything else below is read outside that registry and follows its own rules.
 
 ## Transport (validated registry)
 
@@ -24,3 +23,9 @@ registry only validates and logs.
 | `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS` | How long one nixl WRITE may take. Distinguishes a stuck fabric from a busy peer. |
 | `SIRIUS_CN_NIXL_CANARY_BYTES` / `_FLOOR_GBPS` | First-contact bandwidth probe. A slow link is refused so a silent staged-copy fallback cannot look like a healthy transfer. `0` on the floor disables the check. |
 | `SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS` / `_EXPECT_PEERS` | Bring-up session warmup. The timeout is a budget, not a hard fail; expect-peers ends the loop early once that many peers are up. |
+
+## Exchange staging
+
+`SIRIUS_EXCHANGE_STAGING_BYTES` sizes each CN's GPU staging arena. Unset means
+**no arena**: the CN boots and serves local work, then every remote exchange
+fails. There is no engine default — launchers pick a size per box.

@@ -1,4 +1,4 @@
-//! The nixl exchange transport tier (PLAN-PATH-B B5).
+//! The nixl exchange transport tier.
 //!
 //! One dedicated thread owns the nixl [`Agent`] — the Rust binding documents a multithreading
 //! deadlock caveat, so every agent touch funnels through the request channel, mirroring the
@@ -33,7 +33,6 @@ const ENV_HINT: &str = "source tools/nvda_nixl/ENV.sh (NIXL_PREFIX/NIXL_PLUGIN_D
 
 /// Reply to a metadata exchange: this CN's agent identity for the peer to load.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 pub(crate) struct MdReply {
     /// This CN's nixl agent name (`{advertise_host}:{brpc_port}`).
     pub(crate) agent_name: String,
@@ -106,9 +105,6 @@ impl NixlTransport {
     }
 
     /// Loads a peer's agent metadata and returns ours (the `exchange_nixl_md` handler body).
-    // Called by the exchange handlers once the service is wired to the transport (the next
-    // layer); until then nothing outside this module sends a request.
-    #[allow(dead_code)]
     pub(crate) fn exchange_md(
         &self,
         peer_agent_name: String,
@@ -129,17 +125,12 @@ impl NixlTransport {
     /// so the drains it is handed run one at a time, in the order they were posted, and every
     /// frame of a destination — the counter and the eos frame live inside the thread's
     /// `send_fragment` — is issued by that single thread.
-    // Called by the exchange dispatch once per remote destination when the service is wired to
-    // the transport (the next layer).
-    #[allow(dead_code)]
     pub(crate) fn send_fragment(&self, spec: RemoteSendSpec) -> Result<(), String> {
         self.transport_call(|respond| TransportRequest::SendFragment { spec, respond })
     }
 
     /// Test seam: a handle whose requests land on `requests` instead of a real transport thread.
-    // Exercised by the service's handler tests once those exist (the next layer).
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn for_test(requests: Sender<TransportRequest>) -> Self {
         Self {
             requests: Mutex::new(Some(requests)),
@@ -799,35 +790,8 @@ mod agent_tier {
         use std::sync::Arc;
 
         use super::*;
-        use crate::fragment_executor::{FragmentResult, FragmentRun};
-
-        /// The engine's `cudaMalloc` staging arena behind the [`FragmentExecutor`] staging
-        /// calls, without the engine thread: a context brought up here hands out its
-        /// `Send + Sync` arena handle, which is exactly what `SiriusEngine` serves its own
-        /// `staging_*` calls from once the exchange handlers are wired (the next layer swaps
-        /// this stand-in for `SiriusEngine::start`).
-        #[derive(Debug)]
-        struct ArenaExecutor {
-            arena: sirius::StagingArena,
-        }
-
-        impl FragmentExecutor for ArenaExecutor {
-            fn run(&self, _run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
-                Err("the arena stand-in runs no fragments".to_string())
-            }
-
-            fn staging_info(&self) -> Result<(u64, u64), String> {
-                Ok((self.arena.base() as u64, self.arena.capacity()))
-            }
-
-            fn staging_lease(&self, len: u64) -> Result<u64, String> {
-                self.arena.lease(len).map_err(|err| err.to_string())
-            }
-
-            fn staging_release(&self, offset: u64) -> Result<(), String> {
-                self.arena.release(offset).map_err(|err| err.to_string())
-            }
-        }
+        use crate::engine::SiriusEngine;
+        use crate::engine_settings::EngineSettings;
 
         /// GPU + libnixl smoke for the agent tier in one process: proves that two real agents
         /// come up over the engine's `cudaMalloc` staging arena (registered as VRAM by both,
@@ -847,14 +811,15 @@ mod agent_tier {
             // SAFETY: the GPU lock is held, so no other thread touches the environment here.
             unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "128MiB") };
 
-            // The context outlives the agents and the executor: it owns the engine the arena
-            // was carved from, and the production teardown order is transport before engine.
-            let context = sirius::SiriusContext::new().expect("bring up sirius context");
-            let executor: Arc<dyn FragmentExecutor> = Arc::new(ArenaExecutor {
-                arena: context
-                    .staging_arena()
-                    .expect("SIRIUS_EXCHANGE_STAGING_BYTES gives the context a staging arena"),
-            });
+            let engine_dir = std::env::temp_dir().join("sirius-nixl-smoke");
+            let executor: Arc<dyn FragmentExecutor> = Arc::new(
+                SiriusEngine::start(EngineSettings {
+                    config: None,
+                    engine_dir,
+                    gpu_device: None,
+                })
+                .expect("bring up sirius engine"),
+            );
             let (base, capacity) = executor.staging_info().expect("staging arena info");
 
             let (sender_agent, _sender_registration, _sender_md) =
@@ -904,12 +869,10 @@ mod agent_tier {
 
             executor.staging_release(target).unwrap();
             executor.staging_release(source).unwrap();
-            // Drop the agents (and their registrations) before the executor, and the executor
-            // before the context that owns the arena.
+            // Drop the agents (and their registrations) before the engine that owns the arena.
             drop(sender_agent);
             drop(receiver_agent);
             drop(executor);
-            drop(context);
             // SAFETY: the GPU lock is still held.
             unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
         }

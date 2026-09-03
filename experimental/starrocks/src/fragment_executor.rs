@@ -76,6 +76,10 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender outputs already staged in this CN's arena, as
+    /// `(exchange node id, sender id, batches)`: pushed via `push_packed` + `close_input`
+    /// before the fragment runs, with each lease released the moment its push returns.
+    pub remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Non-empty for a sender fragment: the fragment parks ONCE and output stream i belongs to
     /// destination `outputs[i]` (the FE's destination order). Each destination drains its own
     /// stream; the parked fragment drops when the last destination releases it.

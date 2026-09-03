@@ -102,3 +102,60 @@ WITH lineitem AS (SELECT * FROM FILES(
 SELECT l_returnflag, count(*) AS n, sum(l_quantity) AS qty
 FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag;
 ```
+
+## Two compute nodes, one GPU: the exchange hop over nixl
+
+`pixi run cluster2` starts the FE plus TWO CN processes on one host, each with an 8 GiB engine
+carve-out (`--gpu-memory-limit 8GiB`) and a 1280 MiB `cudaMalloc` exchange staging arena
+(`SIRIUS_EXCHANGE_STAGING_BYTES`; the arena sits *outside* the engine limit). When a sender's
+destination lives in the other process, its parked output is packed with `cudf::chunked_pack`
+into a staging lease and moved **GPU-to-GPU through nixl over UCX `cuda_ipc`** — no Arrow, no
+host serialization of data; only control frames (agent metadata, lease grants, per-batch
+signaling, EOS) cross on brpc.
+
+```sql
+WITH lineitem AS (SELECT * FROM FILES(
+  "path"="file:///home/ubuntu/git/sirius/scratch/tpch_sf1/lineitem/*.parquet",
+  "format"="parquet"))
+SELECT sum(l_extendedprice * l_discount) AS revenue
+FROM lineitem
+WHERE l_shipdate >= date '1997-01-01' AND l_shipdate < date '1998-01-01'
+  AND l_discount BETWEEN 0.03 - 0.01 AND 0.03 + 0.01 AND l_quantity < 24;
+```
+
+returns `61567694.9502` (`count(*)` is `6001215` — the exactly-once check; a duplicated or
+lost split shifts it). Exact low digits vary with double-precision summation order across
+the distributed scan (`61567694.95019999` single-node). Read the logs, not just the answer:
+
+```
+nixl bandwidth canary peer=127.0.0.1:8062 gbps="145.3" bytes=16777216         <- first contact
+transmitted batches via nixl stream_id=3 sender_id=0 dest=127.0.0.1:8062 batches=1 bytes=64
+relayed native batches across a fragment boundary stream_id=3 sender_id=1 batches=1
+received remote batches stream_id=3 sender_id=0 batches=1
+```
+
+The receiver aggregates a **cross-node fan-in**: one sender relayed in-process, the other
+arrived over nixl. `batches=0` anywhere would mean the boundary carried nothing. Those 64 bytes
+are the whole point of two-phase aggregation: each CN reduces its scan to a single partial-state
+row before the hop, where the one-phase plan (`agg_stage = 1`) ships every filtered row —
+`bytes=457856` for the same query. The canary is the guard against the one failure nothing else
+reports: `cudaMallocAsync` pool memory over `cuda_ipc` does not error — it silently degrades
+~220× — so a first-contact transfer below 2 GB/s refuses the tier loudly. (`nvidia-smi`: two
+CNs at ~8.9 GiB each — pool + arena + context — on the 23 GiB L4.)
+
+## The pre-packaged front end
+
+`cluster` depends on `fe-check`, not `fe-build`: this demo ships the front end already packaged
+under `starrocks/output/fe` so bringing the cluster up does not require a multi-hour Maven build
+of the whole StarRocks front end. `fe-check` just asserts the package is present and tells you
+what to run if it is not:
+
+```bash
+git submodule update --init --recursive experimental/starrocks/starrocks
+# Sirius-only nixl RPCs (not upstream): re-apply after every clean submodule checkout
+experimental/starrocks/scripts/apply-starrocks-patches.sh
+pixi run fe-build    # long
+```
+
+Everything else — the compute node and the Sirius engine — is built from this worktree by
+`cn-build` → `engine-build`.

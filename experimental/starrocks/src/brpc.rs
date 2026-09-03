@@ -7,6 +7,7 @@ use std::{
 use crate::{
     compute_node_service::{ExchangeIdentity, SiriusComputeNodeService},
     fragment_executor::FragmentExecutor,
+    nixl_transport::NixlTransport,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
     prpc,
 };
@@ -34,10 +35,15 @@ struct BrpcServiceServer<S> {
 impl BrpcServer {
     /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
     /// `SiriusEngine`, or a stub). `identity` is the exchange endpoint this CN advertises,
-    /// used to tell local data-stream destinations from remote CNs.
-    pub fn with_executor(executor: Arc<dyn FragmentExecutor>, identity: ExchangeIdentity) -> Self {
-        let service = PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(
-            executor, identity,
+    /// used to tell local data-stream destinations from remote CNs; `transport` carries
+    /// exchanges to remote CNs over nixl (`None` keeps remote destinations a loud error).
+    pub fn with_executor(
+        executor: Arc<dyn FragmentExecutor>,
+        identity: ExchangeIdentity,
+        transport: Option<NixlTransport>,
+    ) -> Self {
+        let service = PInternalServiceRouter::new(SiriusComputeNodeService::with_transport(
+            executor, identity, transport,
         ));
         Self {
             inner: BrpcServiceServer::with_service(service),
