@@ -54,6 +54,7 @@ mod file_schema;
 mod fragment_executor;
 mod gpu_affinity;
 mod local_exchange;
+mod nixl_transport;
 mod proto;
 mod prpc;
 mod prpc_client;
@@ -70,6 +71,7 @@ pub use engine_settings::{
 };
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
 pub use gpu_affinity::{GpuSocket, cpu_affinity_for_gpu, gpu_socket};
+pub use nixl_transport::NixlTransport;
 pub use tunable::Tunables;
 
 /// Serializes tests that bring up a GPU engine context: the engine keeps process-global GPU

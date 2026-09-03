@@ -63,11 +63,28 @@ thrift-compiler = "*"
 # sirius-sys links by default).
 engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",description = "Build the Sirius engine (libsirius) from source for the CN to link"}
 
-# Engine-linked CN (default `sirius-engine` feature); needs the engine artifact and
-# the `engine` feature's toolchain/libs (in the default env).
-cn-build = {cmd = "cargo build --release -p sirius-starrocks-cn",depends-on = ["engine-build","apply-starrocks-patches"],description = "Build the engine-linked StarRocks CN release binary"}
-cn-test = {cmd = "cargo test -p sirius-starrocks-cn",depends-on = ["engine-build","apply-starrocks-patches"],description = "Run engine-linked StarRocks CN tests"}
-cn-run = {cmd = "cargo run -p sirius-starrocks-cn --",depends-on = ["engine-build","apply-starrocks-patches"],description = "Run the engine-linked StarRocks CN with local FE defaults"}
+# Engine-linked CN (default `sirius-engine` + `nixl-transport` features); needs the engine
+# artifact, the `engine` feature's toolchain/libs (in the default env), and the local libnixl
+# install. Every machine-specific path — the nixl/UCX prefixes (TOOLS_DIR, default: a `tools/`
+# sibling of the repo root), the bindgen libclang headers from the repo pixi env, the system
+# toolchain overrides that keep conda's CXXFLAGS out of the nixl-sys build — is derived in
+# scripts/cn-env.sh so the tasks work from any clone path. NIXL_NO_STUBS_FALLBACK=1 (also set
+# there) is mandatory: without it a broken nixl link silently degrades to a dlopen stub.
+cn-build = {cmd = """
+bash -lc 'set -euo pipefail
+source scripts/cn-env.sh
+cargo build --release -p sirius-starrocks-cn'
+""",depends-on = ["engine-build","apply-starrocks-patches"],description = "Build the engine-linked StarRocks CN release binary",env = {NIXL_NO_STUBS_FALLBACK = "1"}}
+cn-test = {cmd = """
+bash -lc 'set -euo pipefail
+source scripts/cn-env.sh
+cargo test -p sirius-starrocks-cn'
+""",depends-on = ["engine-build","apply-starrocks-patches"],description = "Run engine-linked StarRocks CN tests",env = {NIXL_NO_STUBS_FALLBACK = "1"}}
+cn-run = {cmd = """
+bash -lc 'set -euo pipefail
+source scripts/cn-env.sh
+cargo run -p sirius-starrocks-cn --'
+""",depends-on = ["engine-build","apply-starrocks-patches"],description = "Run the engine-linked StarRocks CN with local FE defaults",env = {NIXL_NO_STUBS_FALLBACK = "1"}}
 
 # Pure-Rust path (no engine, build tree, or GPU). What CI runs.
 cn-test-no-engine = {cmd = "cargo test -p sirius-starrocks-cn --no-default-features",depends-on = ["apply-starrocks-patches"],description = "Run Rust StarRocks CN tests without the embedded Sirius engine"}

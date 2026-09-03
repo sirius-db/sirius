@@ -48,6 +48,27 @@ pub struct SenderSlot {
     pub sender_id: i32,
 }
 
+/// One packed batch sitting in an exchange staging arena as cudf packed bytes.
+///
+/// The neutral wire shape of the nixl tier: on the sender it names a lease in the *local* arena
+/// (filled by `export_packed`), on the receiver a lease in the *receiver's* arena (filled by a
+/// nixl WRITE). Whoever holds the arena releases the lease after the bytes leave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedBatch {
+    /// Host-side cudf pack metadata (travels over brpc next to the device payload).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
+    /// lease exists for this batch (a metadata-only empty batch) — nothing to release.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+    /// Exact row count of the packed table (from `export_packed`, carried on the transmit
+    /// frame). The receiver sums the counts per stream into `declare_input_cardinality` so the
+    /// optimizer can size the stream. `None` when the frame predates the wire field: the
+    /// receiver then declares nothing for the stream and keeps the legacy blind planning.
+    pub rows: Option<u64>,
+}
+
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
 #[derive(Debug)]
 pub struct FragmentRun<'a> {
@@ -80,6 +101,41 @@ pub struct FragmentRun<'a> {
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Runs `run`. Returns rows only for a fragment with no `output` slot — a result fragment.
     fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String>;
+
+    /// Exchange staging arena `(device base address, capacity in bytes)`, for transport memory
+    /// registration. Errors when the executor has no arena — the default for every executor
+    /// that is not the engine with `SIRIUS_EXCHANGE_STAGING_BYTES` set.
+    fn staging_info(&self) -> Result<(u64, u64), String> {
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Leases `len` bytes of the staging arena, returning the lease offset from the base.
+    fn staging_lease(&self, len: u64) -> Result<u64, String> {
+        let _ = len;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Returns the staging lease at `offset`.
+    fn staging_release(&self, offset: u64) -> Result<(), String> {
+        let _ = offset;
+        Err("this fragment executor has no exchange staging arena \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Packs the next batch parked under `slot` into a fresh staging lease; `Ok(None)` once the
+    /// parked output is drained. The lease stays outstanding until
+    /// [`staging_release`](Self::staging_release).
+    fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        let _ = slot;
+        Err("this fragment executor cannot export packed batches \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
 
     /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called
     /// after the drained output has been transmitted (or on a failed transmit, so a wedged

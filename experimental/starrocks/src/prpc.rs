@@ -151,8 +151,7 @@ impl Error {
 
     /// Wraps an error code + text a peer put in its response metadata, so the client side can
     /// surface brpc-level failures with their original code.
-    // Dead until the nixl transport tier lands; it narrows this to a cfg_attr on its feature.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
     fn remote(code: i32, text: impl Into<String>) -> Self {
         Self {
             code,
@@ -161,7 +160,7 @@ impl Error {
     }
 
     /// The BRPC/PRPC error code carried in response metadata.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
     pub(crate) fn code(&self) -> i32 {
         self.code
     }
@@ -240,7 +239,7 @@ impl Frame {
     /// Consumes a decoded response frame into the service response it carries: `Ok` with the
     /// body/attachment when the peer reported success, `Err` with the peer's brpc error code and
     /// text otherwise. The client side of the PRPC framing.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
     pub(crate) fn into_response(self) -> std::result::Result<Response, Error> {
         let Some(response) = self.meta.response else {
             return Err(Error::server("missing PRPC response metadata"));
@@ -261,7 +260,7 @@ impl Frame {
     }
 
     /// Builds a request frame without going through the TCP reader — the client-side encoder.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
     pub(crate) fn for_request(
         service_name: impl Into<String>,
         method_name: impl Into<String>,
@@ -297,7 +296,7 @@ impl Frame {
 
     /// Reads one PRPC frame from a blocking stream, returning `None` on normal connection close.
     /// The synchronous mirror of [`read_async`](Self::read_async), used by the blocking client.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
     pub(crate) fn read(stream: &mut impl Read) -> Result<Option<Self>> {
         let mut header = [0u8; PRPC_HEAD_SIZE];
         match stream.read_exact(&mut header) {
@@ -436,7 +435,7 @@ async fn read_payload(stream: &mut (impl AsyncRead + Unpin), len: usize) -> Resu
 }
 
 /// Synchronous counterpart to [`read_payload`] used by the blocking frame reader.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 fn read_payload_sync(stream: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(len.min(PRPC_READ_CHUNK));
     while payload.len() < len {

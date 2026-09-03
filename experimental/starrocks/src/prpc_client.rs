@@ -7,10 +7,8 @@
 //! code; method-level StarRocks failures stay in the response body's `StatusPB` for the caller.
 
 // The nixl transport tier is the only production caller; the client still compiles (and its
-// tests run) in every build so CI catches breakage without a libnixl install. The
-// `nixl-transport` feature arrives with the agent tier, which narrows this to
-// `cfg_attr(not(feature = "nixl-transport"), allow(dead_code))`.
-#![allow(dead_code)]
+// tests run) in every build so CI catches breakage without a libnixl install.
+#![cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 
 use std::io::Write;
 use std::net::TcpStream;
