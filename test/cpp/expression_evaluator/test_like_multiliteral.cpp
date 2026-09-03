@@ -417,8 +417,8 @@ TEST_CASE("like_multiliteral matches cudf on seeded random near-miss data",
 TEST_CASE("like_multiliteral handles column-layout edges",
           "[expression_evaluator][like_multiliteral]")
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  auto mr                       = cudf::get_current_device_resource_ref();
 
   SECTION("INT64 offsets (large-strings layout) execute the int64 kernel instantiation")
   {
