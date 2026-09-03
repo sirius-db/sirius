@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
+use starrocks_plan_translator::fusion::{fusable_edge, sender_shape, splice};
 use starrocks_plan_translator::{
     ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
     URN_COMPARISON, URN_DATETIME, URN_STRING, translate_fragment,
 };
-use starrocks_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
+use starrocks_thrift::data_sinks::{
+    TDataSink, TDataSinkType, TDataStreamSink, TPlanFragmentDestination,
+};
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
@@ -26,8 +29,8 @@ use starrocks_thrift::plan_nodes::{
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
-    TFileType, TFunction, TFunctionBinaryType, TFunctionName, TPrimitiveType, TScalarType,
-    TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
+    TFileType, TFunction, TFunctionBinaryType, TFunctionName, TNetworkAddress, TPrimitiveType,
+    TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
 };
 use substrait::proto::{expression, plan_rel, read_rel, rel};
 
@@ -7350,4 +7353,241 @@ fn sort_over_a_carried_common_slot_resolves_and_narrows() {
         panic!("expected the sort under the narrowing projection");
     };
     assert_eq!(field_index(sorted.sorts[0].expr.as_ref().unwrap()), 2);
+}
+
+// Same-node fragment fusion (`fusion.rs`): a sender plan spliced over its receiver's exchange
+// translates exactly like the single fragment the FE would have planned without the boundary.
+
+/// A plain exchange leaf over `input_row_tuples`, as the FE ships a shuffle receiver.
+fn exchange_node(node_id: i32, input_row_tuples: Vec<i32>) -> TPlanNode {
+    let mut exchange = base_plan_node(
+        node_id,
+        TPlanNodeType::EXCHANGE_NODE,
+        0,
+        input_row_tuples.clone(),
+    );
+    exchange.exchange_node = Some(TExchangeNode::new(
+        input_row_tuples,
+        None,
+        Some(0),
+        Some(TPartitionType::HASH_PARTITIONED),
+        Some(true),
+        None,
+    ));
+    exchange
+}
+
+/// Execution params of a registered receiver (instance 2 of query 1) declaring `per_exch`.
+fn receiver_exec_params(per_exch: &[(i32, i32)]) -> TPlanFragmentExecParams {
+    TPlanFragmentExecParams::new(
+        TUniqueId::new(1, 0),
+        TUniqueId::new(1, 2),
+        BTreeMap::new(),
+        per_exch.iter().copied().collect(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// A leaf sender (instance 3 of query 1) whose `node_id` scan reads `path` and whose
+/// HASH_PARTITIONED stream sink has exactly one destination: exchange `dest_node_id` of the
+/// receiver instance 2 on this CN. The measured 1-CN lineitem shape.
+fn hash_partitioned_leaf_sender(
+    plan: TPlan,
+    node_id: i32,
+    path: &str,
+    dest_node_id: i32,
+) -> TExecPlanFragmentParams {
+    let mut sender = params_with_scan_range(plan, base_desc(), node_id, parquet_query_range(path));
+    let exec = sender.params.as_mut().unwrap();
+    exec.query_id = TUniqueId::new(1, 0);
+    exec.fragment_instance_id = TUniqueId::new(1, 3);
+    exec.sender_id = Some(0);
+    exec.destinations = Some(vec![TPlanFragmentDestination::new(
+        TUniqueId::new(1, 2),
+        None,
+        Some(TNetworkAddress::new("127.0.0.1".to_string(), 8060)),
+        None,
+    )]);
+    sender.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
+        TDataSinkType::DATA_STREAM_SINK,
+        Some(TDataStreamSink::new(
+            dest_node_id,
+            TDataPartition::new(
+                TPartitionType::HASH_PARTITIONED,
+                Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+                None,
+                None,
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    sender
+}
+
+/// Verifies a hash-partitioned leaf spliced over a receiver's only exchange translates to a
+/// `local_files` parquet read with no stream input left to declare: the boundary is gone.
+#[test]
+fn spliced_leaf_translates_to_a_local_files_scan_with_no_stream_inputs() {
+    let path = "file:///data/users.parquet";
+    let mut receiver = params(
+        Some(TPlan::new(vec![exchange_node(7, vec![0])])),
+        Some(base_desc()),
+        None,
+    );
+    receiver.params = Some(receiver_exec_params(&[(7, 1)]));
+    let sender = hash_partitioned_leaf_sender(TPlan::new(vec![scan_node(0, 0)]), 0, path, 7);
+
+    let shape = sender_shape(&sender).unwrap();
+    assert!(shape.is_leaf);
+    assert_eq!(shape.partition, TPartitionType::HASH_PARTITIONED);
+    assert_eq!(shape.dest_node_id, 7);
+    assert_eq!(shape.destination.fragment_instance_id, TUniqueId::new(1, 2));
+    fusable_edge(&receiver, 7, &sender).unwrap();
+    let fused = splice(receiver, 7, &sender).unwrap();
+
+    let exec = fused.params.as_ref().unwrap();
+    assert_eq!(exec.fragment_instance_id, TUniqueId::new(1, 2));
+    assert!(exec.per_exch_num_senders.is_empty());
+    assert!(exec.per_node_scan_ranges.contains_key(&0));
+
+    let translated = PlanTranslator::new().translate_fragment(&fused).unwrap();
+    assert!(translated.stream_inputs.is_empty());
+    assert_eq!(translated.output_names, vec!["id", "name"]);
+    let items = local_files_items(&translated);
+    assert_eq!(items.len(), 1);
+    match items[0].path_type.as_ref().unwrap() {
+        read_rel::local_files::file_or_files::PathType::UriFile(uri) => assert_eq!(uri, path),
+        other => panic!("expected uri_file, got {other:?}"),
+    }
+}
+
+/// Verifies the fused translation is byte-for-byte the plan of the same scan planned as one
+/// fragment: the engine cannot tell a fused receiver from a single-fragment query.
+#[test]
+fn fused_plan_equals_the_hand_built_single_fragment_plan() {
+    let path = "file:///data/users.parquet";
+    let mut receiver = params(
+        Some(TPlan::new(vec![exchange_node(7, vec![0])])),
+        Some(base_desc()),
+        None,
+    );
+    receiver.params = Some(receiver_exec_params(&[(7, 1)]));
+    let sender = hash_partitioned_leaf_sender(TPlan::new(vec![scan_node(0, 0)]), 0, path, 7);
+    let fused = PlanTranslator::new()
+        .translate_fragment(&splice(receiver, 7, &sender).unwrap())
+        .unwrap();
+
+    let direct = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            parquet_query_range(path),
+        ))
+        .unwrap();
+
+    assert_eq!(fused.plan, direct.plan);
+    assert_eq!(fused.output_names, direct.output_names);
+    assert_eq!(fused.stream_inputs, direct.stream_inputs);
+    assert_eq!(fused.to_substrait_bytes(), direct.to_substrait_bytes());
+}
+
+/// Verifies a partial fusion: one exchange of a join receiver absorbs its leaf while the other
+/// keeps its stream boundary, so the fused fragment declares exactly that one stream input.
+#[test]
+fn spliced_receiver_keeps_its_other_exchange_as_a_stream_input() {
+    let path = "file:///data/users.parquet";
+    let mut receiver = params(
+        Some(TPlan::new(vec![
+            hash_join_node(TJoinOp::INNER_JOIN),
+            exchange_node(7, vec![0]),
+            exchange_node(8, vec![1]),
+        ])),
+        Some(join_desc()),
+        None,
+    );
+    receiver.params = Some(receiver_exec_params(&[(7, 1), (8, 1)]));
+    let sender = hash_partitioned_leaf_sender(TPlan::new(vec![scan_node(0, 0)]), 0, path, 7);
+
+    let fused = splice(receiver, 7, &sender).unwrap();
+    let node_ids: Vec<i32> = fused
+        .fragment
+        .as_ref()
+        .unwrap()
+        .plan
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .map(|node| node.node_id)
+        .collect();
+    assert_eq!(node_ids, vec![2, 0, 8]);
+    assert_eq!(
+        fused.params.as_ref().unwrap().per_exch_num_senders,
+        BTreeMap::from([(8, 1)])
+    );
+
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &fused,
+            &[ExchangeInput {
+                node_id: 8,
+                stream_view: "sirius_stream_8".to_string(),
+                names: vec!["b".to_string()],
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(translated.stream_inputs.len(), 1);
+    assert_eq!(translated.stream_inputs[0].node_id, 8);
+    assert_eq!(translated.stream_inputs[0].stream_view, "sirius_stream_8");
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    let rel::RelType::Read(probe) = join.left.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the spliced scan on the probe side");
+    };
+    assert!(matches!(
+        probe.read_type.as_ref(),
+        Some(read_rel::ReadType::LocalFiles(_))
+    ));
+    let rel::RelType::Read(build) = join.right.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the streamed exchange on the build side");
+    };
+    let Some(read_rel::ReadType::NamedTable(table)) = build.read_type.as_ref() else {
+        panic!("expected a stream read for exchange 8");
+    };
+    assert_eq!(table.names, vec!["sirius_stream_8"]);
 }

@@ -101,12 +101,14 @@ use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 
 // These modules are crate-internal plumbing. The public surface this foundation
 // commits to is intentionally small: `PlanTranslator`, `translate_fragment`,
-// `TranslatedPlan`, `TranslateError`, and the extension registry. Widen a module
-// to `pub` only when a real consumer needs it.
+// `TranslatedPlan`, `TranslateError`, the extension registry, and `fusion` (the
+// compute node splices same-node sender plans over their receiver's exchange
+// before translating). Widen a module to `pub` only when a real consumer needs it.
 pub(crate) mod agg_phase;
 pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
+pub mod fusion;
 mod node_translator;
 pub(crate) mod partial_state;
 mod scan_paths;
@@ -115,6 +117,7 @@ pub(crate) mod type_mapper;
 use descriptor_table::{DescriptorTable, SlotInfo};
 use error::Result;
 pub use error::TranslateError;
+pub use fusion::{FusionRefusal, SenderShape};
 use scan_paths::ScanFilePaths;
 
 /// Substrait comparison function extension URN used for scalar predicates.
