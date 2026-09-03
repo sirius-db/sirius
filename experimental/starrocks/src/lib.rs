@@ -53,6 +53,10 @@ mod engine_settings;
 mod file_schema;
 mod fragment_executor;
 mod gpu_affinity;
+// Consumed by the dispatch layer (stacked/cn-exchange-dispatch); nothing on this base
+// constructs the rendezvous yet.
+#[allow(dead_code)]
+mod local_exchange;
 mod proto;
 mod prpc;
 mod result_encoder;
