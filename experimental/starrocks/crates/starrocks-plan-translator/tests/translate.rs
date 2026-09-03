@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
-    translate_fragment,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
+    URN_COMPARISON, translate_fragment,
 };
+use starrocks_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
@@ -19,8 +20,9 @@ use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
     TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
-    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
-    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
+    TExchangeNode, TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp,
+    TNestLoopJoinNode, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -2761,33 +2763,867 @@ fn multi_distinct_count_translates_to_distinct_count() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
-/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
-#[test]
-fn merge_aggregation_is_rejected() {
-    let mut aggregate = aggregate_expr(
-        "sum",
-        scalar_type(TPrimitiveType::BIGINT),
-        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
-    );
-    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
-    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
-    // single aggregate output slot.
-    let desc = desc_table(
+/// Descriptor for the phase-classification tests: scan tuple 0 and an aggregation output
+/// tuple 1 with a single ungrouped aggregate slot.
+fn scalar_agg_desc() -> TDescriptorTable {
+    desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
             slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
             slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
             slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
+    )
+}
+
+/// A scalar `sum(id)` aggregation node with per-measure merge flags and the node's
+/// `need_finalize`, for driving the phase classifier from tests.
+fn phase_aggregation_node(merge_flags: &[bool], need_finalize: bool) -> TPlanNode {
+    let aggregates = merge_flags
+        .iter()
+        .map(|&is_merge| {
+            let mut aggregate = aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            );
+            aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(is_merge));
+            aggregate
+        })
+        .collect();
+    let mut node = aggregation_node(1, 1, Vec::new(), aggregates);
+    node.agg_node.as_mut().unwrap().need_finalize = need_finalize;
+    node
+}
+
+fn translate_phase_case(node: TPlanNode) -> Result<TranslatedPlan, TranslateError> {
+    translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(scalar_agg_desc()),
+        None,
+    ))
+}
+
+/// Verifies a merge aggregation whose child is not an exchange is rejected: its input columns
+/// would carry FE-declared types the wire-type override never corrected.
+#[test]
+fn merge_over_a_scan_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("exchange"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Builds the merge fragment of a two-phase `sum(decimal), count(*)` query: a merge
+/// aggregation (node 8, output tuple 3) over an exchange (node 7) carrying the intermediate
+/// tuple 2, whose FE-declared slot types are the ones the wire-type model must override.
+fn merge_fragment_params() -> TExecPlanFragmentParams {
+    let exchange = exchange_node_with(7, vec![2], None, None);
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        Some(slot_ref(
+            10,
+            2,
+            scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        )),
     );
-    let err = translate_fragment(&params(
-        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(11, 2, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let aggregate = aggregation_node(8, 3, Vec::new(), vec![sum, count]);
+
+    let desc = desc_table(
+        vec![(2, None), (3, None)],
+        vec![
+            // The FE declares the intermediate sum slot as DECIMAL128, the lie the override
+            // corrects; the wire column is the partial fragment's FP64 output.
+            slot(
+                10,
+                2,
+                "s",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(11, 2, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(
+                12,
+                3,
+                "revenue",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(13, 3, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    params(
+        Some(TPlan::new(vec![aggregate, exchange])),
+        Some(desc),
+        None,
+    )
+}
+
+/// Verifies the merge fragment of a two-phase aggregation translates to a plain aggregate
+/// with the substituted merge functions (count merges as SUM of partial counts) over an
+/// exchange whose declared stream types are the modeled wire types, not the FE's
+/// DECIMAL128 intermediate slot type, and that the fragment leaves through the finalizing
+/// projection that casts every measure to its FE-declared output-slot type. The engine binds
+/// the merged count (a sum over BIGINT) as HUGEINT, so without the cast this fragment's output
+/// feeding a further downstream fragment would be refused by the hop's schema guard.
+#[test]
+fn merge_aggregation_translates_with_substituted_functions() {
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_fragment_params(),
+            &[stream_input(7, &["s", "c"])],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["revenue", "cnt"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the finalizing project over the merge aggregate");
+    };
+    // One throwing cast per measure, to the FE's output-slot types as the type mapper declares
+    // them: the DECIMAL128(38,2) sum slot lowers to FP64 (precision > 18), the same lowering a
+    // downstream exchange applies when it derives its stream schema from this very slot, and
+    // the count leaves as the BIGINT its slot declares (the engine binds it as HUGEINT).
+    assert_eq!(project.expressions.len(), 2);
+    let (sum_type, sum_input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(sum_type, substrait::proto::r#type::Kind::Fp64(_)),
+        "{sum_type:?}"
+    );
+    assert_eq!(field_index(sum_input), 0);
+    let (count_type, count_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
+        "{count_type:?}"
+    );
+    assert_eq!(field_index(count_input), 1);
+
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 2);
+    for measure in &aggregate.measures {
+        assert_eq!(
+            measure.measure.as_ref().unwrap().phase,
+            substrait::proto::AggregationPhase::IntermediateToResult as i32
+        );
+    }
+    // count merged as count would count rows instead of summing partial counts; the only
+    // registered aggregate must be sum.
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(!names.contains(&"count".to_string()), "{names:?}");
+
+    // The engine declaration derives from the overridden types: DOUBLE, not DECIMAL(38,2).
+    assert_eq!(translated.stream_inputs.len(), 1);
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("s", "DOUBLE"), ("c", "BIGINT")]
+    );
+}
+
+/// Verifies both fragments of one two-phase query derive the same wire types: the partial
+/// fragment's measure output types match the merge fragment's declared stream columns
+/// column-for-column (FP64 <-> DOUBLE, I64 <-> BIGINT).
+#[test]
+fn two_phase_wire_types_agree_end_to_end() {
+    // Partial fragment: sum(decimal) + count(*) over a scan, need_finalize = false.
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        Some(slot_ref(
+            1,
+            0,
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+        )),
+    );
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut count = aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None);
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![sum, count]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(
+                1,
+                0,
+                "price",
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            ),
+            slot(
+                20,
+                1,
+                "s",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(21, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let partial = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
         Some(desc),
         None,
     ))
+    .unwrap();
+
+    let root = root(&partial.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    let partial_kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| {
+            match measure
+                .measure
+                .as_ref()
+                .unwrap()
+                .output_type
+                .as_ref()
+                .unwrap()
+                .kind
+                .as_ref()
+                .unwrap()
+            {
+                substrait::proto::r#type::Kind::Fp64(_) => "DOUBLE",
+                substrait::proto::r#type::Kind::I64(_) => "BIGINT",
+                other => panic!("unexpected partial state kind {other:?}"),
+            }
+        })
+        .collect();
+
+    // Merge fragment of the same query (identical FE-serialized functions).
+    let merge = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_fragment_params(),
+            &[stream_input(7, &["s", "c"])],
+        )
+        .unwrap();
+    let merge_types: Vec<_> = merge.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| column.ty.as_str())
+        .collect();
+
+    assert_eq!(partial_kinds, merge_types);
+}
+
+/// Verifies a partial-phase ("update serialize") aggregation translates to a plain aggregate
+/// whose measure carries the InitialToIntermediate phase and the modeled partial-state type
+/// (I64 for an integer sum), not the FE's declared slot type.
+#[test]
+fn partial_aggregation_translates_with_the_modeled_state_type() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], false)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(
+        measure.phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
+    let output_type = measure.output_type.as_ref().unwrap();
+    assert!(
+        matches!(
+            output_type.kind.as_ref().unwrap(),
+            substrait::proto::r#type::Kind::I64(_)
+        ),
+        "{output_type:?}"
+    );
+    let names: Vec<_> = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+}
+
+/// Extracts a measure's argument expressions.
+fn measure_arguments(
+    measure: &substrait::proto::aggregate_rel::Measure,
+) -> Vec<&substrait::proto::Expression> {
+    measure
+        .measure
+        .as_ref()
+        .unwrap()
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(expr) => expr,
+            other => panic!("expected a value argument, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Names a measure's declared output type the way the engine declares a stream column.
+fn measure_output_type(measure: &substrait::proto::aggregate_rel::Measure) -> &'static str {
+    match measure
+        .measure
+        .as_ref()
+        .unwrap()
+        .output_type
+        .as_ref()
+        .unwrap()
+        .kind
+        .as_ref()
+        .unwrap()
+    {
+        substrait::proto::r#type::Kind::Fp64(_) => "DOUBLE",
+        substrait::proto::r#type::Kind::I64(_) => "BIGINT",
+        substrait::proto::r#type::Kind::Varchar(_) => "VARCHAR",
+        other => panic!("unexpected measure output type {other:?}"),
+    }
+}
+
+/// Extracts the aggregate relation a plan roots at, through an optional finalizing project.
+fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
+    let mut input = root(plan).input.as_ref().unwrap();
+    if let rel::RelType::Project(project) = input.rel_type.as_ref().unwrap() {
+        input = project.input.as_ref().unwrap();
+    }
+    let rel::RelType::Aggregate(aggregate) = input.rel_type.as_ref().unwrap() else {
+        panic!("expected an aggregate relation, got {input:?}");
+    };
+    aggregate
+}
+
+/// Verifies a partial avg expands into the two measures its Sirius state really is: a summed
+/// FP64 and a count, named so the receiver can tell the two columns apart. The FE allocates a
+/// single opaque slot for that state, so the emitted row is one column wider than its tuple.
+#[test]
+fn partial_avg_expands_to_sum_and_count() {
+    let mut aggregate = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let translated = translate_phase_case(node).unwrap();
+
+    // The FE's output tuple has one slot, "total"; the sender ships two columns.
+    assert_eq!(root(&translated.plan).names, vec!["total", "total__count"]);
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 2);
+    for measure in &aggregate.measures {
+        assert_eq!(
+            measure.measure.as_ref().unwrap().phase,
+            substrait::proto::AggregationPhase::InitialToIntermediate as i32
+        );
+    }
+    assert_eq!(
+        aggregate
+            .measures
+            .iter()
+            .map(measure_output_type)
+            .collect::<Vec<_>>(),
+        vec!["DOUBLE", "BIGINT"]
+    );
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+
+    // The sum's argument is cast so the modeled DOUBLE wire column holds for an integer avg
+    // too; the count is over the raw values.
+    let sum_argument = measure_arguments(&aggregate.measures[0])[0];
+    assert!(
+        matches!(
+            sum_argument.rex_type.as_ref().unwrap(),
+            expression::RexType::Cast(_)
+        ),
+        "{sum_argument:?}"
+    );
+    let count_argument = measure_arguments(&aggregate.measures[1])[0];
+    assert_eq!(field_index(count_argument), 0);
+}
+
+/// Builds the merge fragment of a two-phase `avg(price), count(id) GROUP BY name` query: a
+/// merge aggregation (node 8, output tuple 3) over an exchange (node 7) whose intermediate
+/// tuple 2 carries the grouping key, the FE's single opaque slot for avg's state, and the
+/// partial count.
+fn merge_avg_fragment_params() -> TExecPlanFragmentParams {
+    let mut exchange = base_plan_node(7, TPlanNodeType::EXCHANGE_NODE, 0, vec![2]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![2],
+        None,
+        None,
+        Some(TPartitionType::HASH_PARTITIONED),
+        Some(true),
+        None,
+    ));
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(11, 2, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(12, 2, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let aggregate = aggregation_node(
+        8,
+        3,
+        vec![slot_ref(10, 2, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![avg, count],
+    );
+
+    let desc = desc_table(
+        vec![(2, None), (3, None)],
+        vec![
+            slot(10, 2, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            // The FE allocates one opaque VARBINARY slot for avg's state; the sender really
+            // shipped the sum and the count side by side.
+            slot(11, 2, "a", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 2, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(20, 3, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(21, 3, "avg_price", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(22, 3, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    params(
+        Some(TPlan::new(vec![aggregate, exchange])),
+        Some(desc),
+        None,
+    )
+}
+
+/// The sender's output names for [`merge_avg_fragment_params`], as the partial fragment of the
+/// same query emits them.
+fn merge_avg_exchange_names() -> Vec<String> {
+    ["name", "a", "a__count", "c"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Verifies the merge fragment of a two-phase avg reads both state columns and divides them
+/// back into an average: the exchange declares the extra count column the sender shipped, both
+/// halves merge with sum, and a projection on top restores the FE's output row.
+#[test]
+fn merge_avg_divides_the_summed_state() {
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_avg_fragment_params(),
+            &[ExchangeInput {
+                node_id: 7,
+                stream_view: "sirius_stream_7".to_string(),
+                names: merge_avg_exchange_names(),
+            }],
+        )
+        .unwrap();
+
+    // The declared stream is the sender's row, one column wider than the FE's tuple.
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("name", "VARCHAR"),
+            ("a", "DOUBLE"),
+            ("a__count", "BIGINT"),
+            ("c", "BIGINT")
+        ]
+    );
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "avg_price", "cnt"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the finalizing project over the aggregate");
+    };
+    // The FE's output row is three columns wide, whatever the aggregate below emitted.
+    let emit = match project.common.as_ref().unwrap().emit_kind.as_ref().unwrap() {
+        substrait::proto::rel_common::EmitKind::Emit(emit) => emit,
+        other => panic!("expected emit, got {other:?}"),
+    };
+    assert_eq!(emit.output_mapping, vec![4, 5, 6]);
+
+    // Three merged measures for two StarRocks ones, all summing: a count here would count
+    // arriving rows instead of summing the partial counts.
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 3);
+    let names = extension_function_names(&translated.plan);
+    assert!(!names.contains(&"count".to_string()), "{names:?}");
+    assert!(!names.contains(&"avg".to_string()), "{names:?}");
+    assert_eq!(
+        aggregate
+            .measures
+            .iter()
+            .map(|measure| field_index(measure_arguments(measure)[0]))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    // Key passthrough, the divided avg, then the merged count. Every measure leaves through a
+    // throwing cast to its FE-declared output type: the merged count is otherwise DuckDB's
+    // widened sum(BIGINT) = HUGEINT, which the next hop's declared BIGINT stream refuses.
+    assert_eq!(project.expressions.len(), 3);
+    assert_eq!(field_index(&project.expressions[0]), 0);
+    let (count_type, count_input) = cast_parts(&project.expressions[2]);
+    assert!(
+        matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
+        "{count_type:?}"
+    );
+    assert_eq!(field_index(count_input), 3);
+    let (avg_type, avg_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(avg_type, substrait::proto::r#type::Kind::Fp64(_)),
+        "{avg_type:?}"
+    );
+    let expression::RexType::IfThen(if_then) = avg_input.rex_type.as_ref().unwrap() else {
+        panic!("expected the zero-count guard around the division");
+    };
+    // A group whose values were all NULL arrives with a zero count: SQL's average of no
+    // values is NULL, not a division by zero.
+    let condition = if_then.ifs[0].r#if.as_ref().unwrap();
+    assert_eq!(
+        resolved_function(&translated.plan, scalar_fn(condition).function_reference).1,
+        "equal"
+    );
+    assert_eq!(field_index(scalar_arg(condition, 0)), 2);
+    assert!(matches!(
+        literal_type(scalar_arg(condition, 1)),
+        expression::literal::LiteralType::I64(0)
+    ));
+    assert!(matches!(
+        literal_type(if_then.ifs[0].then.as_ref().unwrap()),
+        expression::literal::LiteralType::Null(_)
+    ));
+    let quotient = if_then.r#else.as_ref().unwrap();
+    assert_eq!(
+        resolved_function(&translated.plan, scalar_fn(quotient).function_reference).1,
+        "divide"
+    );
+    assert_eq!(field_index(scalar_arg(quotient, 0)), 1);
+    assert!(
+        matches!(
+            scalar_arg(quotient, 1).rex_type.as_ref().unwrap(),
+            expression::RexType::Cast(_)
+        ),
+        "the count is divided as a double, not by an integer rule"
+    );
+}
+
+/// Verifies both fragments of a two-phase avg query describe the same wire row: the partial
+/// fragment's output names and measure types match the merge fragment's declared stream
+/// column-for-column, including the count column neither FE tuple has a slot for.
+#[test]
+fn two_phase_avg_columns_agree_end_to_end() {
+    // Partial fragment: avg(price), count(id) GROUP BY name over a scan, need_finalize=false.
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(3, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![avg, count],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "price", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(10, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 1, "a", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let partial = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    // The sender's row: the grouping key (typed by its slot) then one column per emitted
+    // measure, named the way the partial fragment names them.
+    let partial_columns = std::iter::once("VARCHAR")
+        .chain(
+            root_aggregate(&partial.plan)
+                .measures
+                .iter()
+                .map(measure_output_type),
+        )
+        .zip(&partial.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+
+    let merge = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_avg_fragment_params(),
+            &[ExchangeInput {
+                node_id: 7,
+                stream_view: "sirius_stream_7".to_string(),
+                names: partial.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(
+        partial_columns,
+        merge.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A partial `avg(id)` over a scan (need_finalize=false): the shape whose state expands.
+fn partial_avg_node() -> TPlanNode {
+    let mut aggregate = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    node
+}
+
+/// Verifies fragment output expressions over an expanded partial are refused: they resolve the
+/// aggregate's slots at their FE positions, which the extra count column moved.
+#[test]
+fn expanded_partial_refuses_fragment_output_exprs() {
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![partial_avg_node(), scan_node(0, 0)])),
+        Some(scalar_agg_desc()),
+        Some(vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))]),
+    ))
     .unwrap_err();
-    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+    assert!(matches!(err, TranslateError::MalformedPlan(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(message.contains("cannot be reprojected"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies an expanded partial has to be the fragment root: a node above it would read the
+/// aggregate's columns at the positions the state moved, silently.
+#[test]
+fn expanded_partial_must_be_the_fragment_root() {
+    let mut select = base_plan_node(2, TPlanNodeType::SELECT_NODE, 1, vec![1]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            select,
+            partial_avg_node(),
+            scan_node(0, 0),
+        ])),
+        Some(scalar_agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedPlanNode {
+                node_id: 1,
+                node_type: TPlanNodeType::AGGREGATION_NODE,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("must be the fragment root"),
+        "{err}"
+    );
+}
+
+/// Verifies HAVING conjuncts on an expanded partial are refused for the same reason: they are
+/// evaluated over the aggregate's row, whose columns sit past the FE positions.
+#[test]
+fn conjuncts_over_an_expanded_partial_are_rejected() {
+    let mut node = partial_avg_node();
+    node.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let err = translate_phase_case(node).unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("conjuncts over a partial aggregation"),
+        "{message}"
+    );
+}
+
+/// The partial fragment of `avg(price), count(id) GROUP BY name` over a scan, with the FE's
+/// one opaque slot (11) for avg's state, as a plan and its descriptor table.
+fn grouped_partial_avg_plan() -> (TPlan, TDescriptorTable) {
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(3, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![avg, count],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "price", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(10, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 1, "a", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    (TPlan::new(vec![node, scan_node(0, 0)]), desc)
+}
+
+/// Verifies a hash-partitioned sink over an expanded partial keeps a grouping key (it sits
+/// ahead of every measure, so its index holds) and refuses a measure slot, whose FE index
+/// points at the wrong column once the avg state occupies two.
+#[test]
+fn hash_partition_key_on_an_expanded_measure_is_rejected() {
+    let (plan, desc) = grouped_partial_avg_plan();
+    let translated = translate_fragment(&params_with_stream_sink(
+        plan.clone(),
+        desc.clone(),
+        None,
+        hash_partition(vec![slot_ref(10, 1, scalar_type(TPrimitiveType::VARCHAR))]),
+    ))
+    .unwrap();
+    assert_eq!(translated.output_partition_columns, Some(vec![0]));
+    assert_eq!(translated.output_names, vec!["name", "a", "a__count", "c"]);
+
+    let err = translate_fragment(&params_with_stream_sink(
+        plan,
+        desc,
+        None,
+        hash_partition(vec![slot_ref(12, 1, scalar_type(TPrimitiveType::BIGINT))]),
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)), "{err:?}");
+    assert!(err.to_string().contains("position moved"), "{err}");
+}
+
+/// Verifies grouped two-phase aggregation translates: the partial node keeps its grouping key
+/// and emits the modeled state type for the measure.
+#[test]
+fn grouped_two_phase_translates() {
+    let mut aggregate = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
+}
+
+/// Verifies the one-shot path labels its measures InitialToResult (advisory; the engine
+/// ignores phases, but dumped plans should say what each aggregate is).
+#[test]
+fn one_shot_measures_are_labeled_initial_to_result() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], true)).unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToResult as i32
+    );
+}
+
+/// Verifies the "merge serialize" combination (a 3/4-phase DISTINCT plan's middle stage) is
+/// rejected as such.
+#[test]
+fn merge_serialize_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], false)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("merge-serialize"), "{message}");
+}
+
+/// Verifies a node mixing merge and update measures cannot be phase-classified and is rejected.
+#[test]
+fn mixed_phase_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true, false], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("mixes merge and update"), "{message}");
 }
 
 /// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
@@ -2869,6 +3705,579 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected sort-tuple projection under sort");
     };
+}
+
+/// Descriptor for the cross-fragment sort-order tests: scan tuple 0 = {o_orderdate DATE,
+/// revenue DOUBLE}; sort tuple 1 re-materializes both, serialized in the order
+/// [3 o_orderdate, 5 revenue].
+fn sort_wire_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(2, 0, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 1, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(5, 1, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    )
+}
+
+/// Builds a SORT_NODE over sort tuple 1 with the given ordering and materialization exprs.
+fn sort_node_over_tuple_1(ordering: Vec<TExpr>, slot_exprs: Vec<TExpr>) -> TPlanNode {
+    let directions = vec![false; ordering.len()];
+    let sort_info = TSortInfo::new(ordering, directions.clone(), directions, Some(slot_exprs));
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    sort
+}
+
+/// The projected field indices of the sort-tuple materialization, in output order.
+fn sort_projection_fields(translated: &TranslatedPlan) -> Vec<i32> {
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    let rel::RelType::Project(project) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort-tuple projection under sort");
+    };
+    project.expressions.iter().map(field_index).collect()
+}
+
+/// An ORDER BY whose key (`revenue`, a measure) is not the sort tuple's leading slot: the FE
+/// lists the key's materialization first, but the wire row must ship in the tuple's
+/// materialized slot order, because that is the order the receiving fragment declares its
+/// stream with. This is the q03/q05 shape ("stream N column 0 is declared DATE but the source
+/// sink produces DOUBLE").
+#[test]
+fn order_by_on_a_non_leading_sort_slot_ships_tuple_slot_order() {
+    // FE list order: the ordering key `revenue` (child field 1) first, then `o_orderdate`.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(5, 1, scalar_type(TPrimitiveType::DOUBLE))],
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    // The sender ships materialized-slot order: o_orderdate (child field 0) leads.
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    // The ORDER BY key still resolves to `revenue`, now at column 1 of the shipped row.
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 1);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+
+    // The receiving fragment reads the same sort tuple through an exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![exchange])),
+                Some(sort_wire_desc()),
+                None,
+            ),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column: what the sender produces is what the receiver declares.
+    // Sender column types come from mapping each projected field into the scan row
+    // (field 0 = o_orderdate DATE, field 1 = revenue DOUBLE).
+    let scan_types = ["DATE", "DOUBLE"];
+    let produced = sort_projection_fields(&sender)
+        .into_iter()
+        .zip(&sender.output_names)
+        .map(|(field, name)| (name.as_str(), scan_types[field as usize]))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![("o_orderdate", "DATE"), ("revenue", "DOUBLE")]
+    );
+}
+
+/// Control: an ORDER BY on the leading sort-tuple slot already lists the materialization in
+/// slot order, so the projection is the identity mapping and nothing moves.
+#[test]
+fn order_by_on_the_leading_sort_slot_keeps_slot_order() {
+    // FE list order: the ordering key `o_orderdate` (child field 0) first -- which is also the
+    // sort tuple's leading materialized slot.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(3, 1, scalar_type(TPrimitiveType::DATE))],
+        vec![
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 0);
+}
+
+/// Descriptor for the q03-shaped aggregation tests: scan tuple 0 lists the columns in query
+/// order (l_orderkey BIGINT, o_orderdate DATE, o_shippriority INT, price DOUBLE); the
+/// aggregation output tuple 1 and the sort tuple 2 both re-materialize the keys and the sum,
+/// serialized in ascending slot-id order [13, 16, 18, 35] -- so the tuples' wire order is not
+/// the GROUP BY order [18, 13, 16].
+fn q03_desc() -> TDescriptorTable {
+    let mut slots = vec![
+        slot(18, 0, "l_orderkey", scalar_type(TPrimitiveType::BIGINT)),
+        slot(13, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+        slot(16, 0, "o_shippriority", scalar_type(TPrimitiveType::INT)),
+        slot(20, 0, "price", scalar_type(TPrimitiveType::DOUBLE)),
+    ];
+    for tuple_id in [1, 2] {
+        slots.extend([
+            slot(
+                13,
+                tuple_id,
+                "o_orderdate",
+                scalar_type(TPrimitiveType::DATE),
+            ),
+            slot(
+                16,
+                tuple_id,
+                "o_shippriority",
+                scalar_type(TPrimitiveType::INT),
+            ),
+            slot(
+                18,
+                tuple_id,
+                "l_orderkey",
+                scalar_type(TPrimitiveType::BIGINT),
+            ),
+            slot(35, tuple_id, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+        ]);
+    }
+    desc_table(vec![(0, Some(100)), (1, None), (2, None)], slots)
+}
+
+/// The q03 one-shot aggregation: GROUP BY l_orderkey, o_orderdate, o_shippriority (slot refs
+/// 18, 13, 16 -- not ascending) with one sum measure, over scan tuple 0 into output tuple 1.
+fn q03_aggregation_node(grouping_slots: &[i32]) -> TPlanNode {
+    let scan_types = BTreeMap::from([
+        (18, TPrimitiveType::BIGINT),
+        (13, TPrimitiveType::DATE),
+        (16, TPrimitiveType::INT),
+        (20, TPrimitiveType::DOUBLE),
+    ]);
+    aggregation_node(
+        1,
+        1,
+        grouping_slots
+            .iter()
+            .map(|slot_id| slot_ref(*slot_id, 0, scalar_type(scan_types[slot_id])))
+            .collect(),
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::DOUBLE),
+            Some(slot_ref(20, 0, scalar_type(TPrimitiveType::DOUBLE))),
+        )],
+    )
+}
+
+/// The grouping-key field indices an aggregate reads from its input, in emitted order.
+fn grouping_fields(aggregate: &substrait::proto::AggregateRel) -> Vec<i32> {
+    aggregate
+        .grouping_expressions
+        .iter()
+        .map(field_index)
+        .collect()
+}
+
+/// Scan-tuple-0 column types of [`q03_desc`], indexed by field.
+const Q03_SCAN_TYPES: [&str; 4] = ["BIGINT", "DATE", "INTEGER", "DOUBLE"];
+
+/// GROUP BY keys whose slot ids are not in ascending order (the q03 shape: l_orderkey=18,
+/// o_orderdate=13, o_shippriority=16): the FE lists the grouping exprs in GROUP BY order, but
+/// every consumer of the output tuple resolves the row through the descriptor's
+/// materialized-slot order, so the keys must be emitted in the tuple's order and the next
+/// hop's declared stream schema must match the sender column-for-column. This is the q03/q18
+/// shape ("stream 14 column 0 is declared DATE but the source sink produces BIGINT").
+#[test]
+fn group_by_keys_out_of_slot_order_ship_tuple_slot_order() {
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[18, 13, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+
+    // Keys in materialized order [13, 16, 18]: o_orderdate (scan field 1), o_shippriority
+    // (field 2), l_orderkey (field 0) -- not the GROUP BY order [0, 1, 2].
+    let aggregate = root_aggregate(&sender.plan);
+    let key_fields = grouping_fields(aggregate);
+    assert_eq!(key_fields, vec![1, 2, 0]);
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+
+    // The receiving fragment reads the aggregation output tuple through an exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(q03_desc()), None),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column: what the aggregate produces is what the receiver declares.
+    let produced = key_fields
+        .iter()
+        .map(|&field| Q03_SCAN_TYPES[field as usize])
+        .chain(aggregate.measures.iter().map(measure_output_type))
+        .zip(&sender.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![
+            ("o_orderdate", "DATE"),
+            ("o_shippriority", "INTEGER"),
+            ("l_orderkey", "BIGINT"),
+            ("revenue", "DOUBLE")
+        ]
+    );
+}
+
+/// Builds the q03 TOP-N sort info: ORDER BY revenue DESC (nulls last), o_orderdate ASC (nulls
+/// first), ordering over `ordering_tuple` and materializing from `input_tuple` in the FE's
+/// list order (ordering keys first, then the leftover payload slots).
+fn q03_sort_info(ordering_tuple: i32, input_tuple: i32) -> TSortInfo {
+    TSortInfo::new(
+        vec![
+            slot_ref(35, ordering_tuple, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(13, ordering_tuple, scalar_type(TPrimitiveType::DATE)),
+        ],
+        vec![false, true],
+        vec![false, true],
+        Some(vec![
+            slot_ref(35, input_tuple, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(13, input_tuple, scalar_type(TPrimitiveType::DATE)),
+            slot_ref(16, input_tuple, scalar_type(TPrimitiveType::INT)),
+            slot_ref(18, input_tuple, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+    )
+}
+
+/// The full q03 sender shape: the one-shot aggregation (keys 18, 13, 16) under a TOP-N with
+/// two ordering keys (revenue DESC nulls-last, o_orderdate ASC nulls-first) and a limit. The
+/// two sender-side reorders compose: the aggregate emits its keys in tuple order, the sort
+/// projection re-materializes that row in the sort tuple's order, and each ordering key
+/// resolves to the field really holding its column -- so the wire row matches the receiving
+/// merging exchange's declared stream column-for-column.
+#[test]
+fn topn_over_group_by_keys_out_of_slot_order_resolves_both_sort_keys() {
+    let mut sort = base_plan_node(2, TPlanNodeType::SORT_NODE, 1, vec![2]);
+    sort.limit = 10;
+    sort.sort_node = Some(TSortNode::new(
+        q03_sort_info(2, 1),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            sort,
+            q03_aggregation_node(&[18, 13, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+
+    // Fetch(limit 10) over Sort over Project(sort tuple) over Aggregate.
+    let root = root(&sender.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the top-N fetch");
+    };
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            fetch.count_mode,
+            Some(substrait::proto::fetch_rel::CountMode::Count(10))
+        );
+    }
+    let rel::RelType::Sort(sort) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort under fetch");
+    };
+    // Both ordering keys resolve to the fields really holding their columns in the shipped
+    // row: revenue at field 3 (DESC nulls-last), o_orderdate at field 0 (ASC nulls-first).
+    assert_eq!(sort.sorts.len(), 2);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 3);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+    assert_eq!(field_index(sort.sorts[1].expr.as_ref().unwrap()), 0);
+    assert_eq!(
+        sort.sorts[1].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::AscNullsFirst as i32
+        ))
+    );
+    let rel::RelType::Project(project) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort-tuple projection under sort");
+    };
+    // The aggregate row and the sort tuple order the same slots the same way, so the
+    // materialization projection is the identity.
+    let projection_fields = project
+        .expressions
+        .iter()
+        .map(field_index)
+        .collect::<Vec<_>>();
+    assert_eq!(projection_fields, vec![0, 1, 2, 3]);
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate under the sort projection");
+    };
+    let key_fields = grouping_fields(aggregate);
+    assert_eq!(key_fields, vec![1, 2, 0]);
+
+    // The receiving fragment merge-sorts the same tuple through a merging exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![2]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![2],
+        Some(q03_sort_info(2, 2)),
+        Some(0),
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(q03_desc()), None),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column across the hop: the sender's sink row (the sort projection over the
+    // aggregate row, whose key columns map into the scan) is what the receiver declares.
+    let agg_row_types = key_fields
+        .iter()
+        .map(|&field| Q03_SCAN_TYPES[field as usize])
+        .chain(aggregate.measures.iter().map(measure_output_type))
+        .collect::<Vec<_>>();
+    let produced = projection_fields
+        .iter()
+        .map(|&field| agg_row_types[field as usize])
+        .zip(&sender.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![
+            ("o_orderdate", "DATE"),
+            ("o_shippriority", "INTEGER"),
+            ("l_orderkey", "BIGINT"),
+            ("revenue", "DOUBLE")
+        ]
+    );
+    // The receiver's merge-sort keys resolve against the declared row the same way.
+    let receiver_root = crate::root(&receiver.plan);
+    let rel::RelType::Sort(merge_sort) = receiver_root
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected merging exchange sort");
+    };
+    assert_eq!(merge_sort.sorts.len(), 2);
+    assert_eq!(field_index(merge_sort.sorts[0].expr.as_ref().unwrap()), 3);
+    assert_eq!(field_index(merge_sort.sorts[1].expr.as_ref().unwrap()), 0);
+}
+
+/// Control: GROUP BY keys already listed in ascending slot-id order translate exactly as
+/// before -- the materialized order is the FE order, so nothing moves (the rewritten-q03
+/// shape that passes on a live cluster).
+#[test]
+fn group_by_keys_in_slot_order_keep_their_order() {
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[13, 16, 18]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+    let aggregate = root_aggregate(&sender.plan);
+    // The FE-order translation and the materialized-order translation coincide.
+    assert_eq!(grouping_fields(aggregate), vec![1, 2, 0]);
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+}
+
+/// A multi-key GROUP BY whose grouping expression is not a bare slot ref cannot be paired
+/// with the output key slots, so the key order is unrecoverable and the node must refuse
+/// rather than guess.
+#[test]
+fn non_slot_ref_grouping_expr_with_multiple_keys_is_rejected() {
+    let mut agg = q03_aggregation_node(&[18, 13, 16]);
+    agg.agg_node
+        .as_mut()
+        .unwrap()
+        .grouping_exprs
+        .as_mut()
+        .unwrap()[1] = cast_expr(
+        scalar_type(TPrimitiveType::DATE),
+        slot_ref(13, 0, scalar_type(TPrimitiveType::DATE)),
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedPlanNode {
+                node_type: TPlanNodeType::AGGREGATION_NODE,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("bare slot ref"), "{err}");
+}
+
+/// Multi-key grouping refs whose ids do not pair with the output tuple's key slots (a layout
+/// the FE never serializes -- each output key slot reuses its grouping ref's id) must refuse
+/// loudly: reordering on a wrong pairing would ship wrong columns.
+#[test]
+fn group_by_keys_that_do_not_pair_with_output_slots_are_rejected() {
+    // Grouping refs [18, 20, 16]: slot 20 (the measure argument) is not an output key slot,
+    // and key slot 13 pairs with nothing.
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[18, 20, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::Descriptor(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("output key slot 13 pairs with no grouping expression"),
+        "{err}"
+    );
 }
 
 /// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
@@ -3202,24 +4611,483 @@ fn nestloop_join_without_a_liftable_comparison_still_translates() {
     }
 }
 
-/// Verifies an exchange node is still rejected: fragments are translated in isolation and
-/// multi-fragment plans are a later milestone.
+/// Builds an EXCHANGE_NODE `node_id` over `input_row_tuples`, optionally merging (`sort_info`)
+/// and skipping `offset` rows.
+fn exchange_node_with(
+    node_id: i32,
+    input_row_tuples: Vec<i32>,
+    sort_info: Option<TSortInfo>,
+    offset: Option<i64>,
+) -> TPlanNode {
+    let mut exchange = base_plan_node(
+        node_id,
+        TPlanNodeType::EXCHANGE_NODE,
+        0,
+        input_row_tuples.clone(),
+    );
+    exchange.exchange_node = Some(TExchangeNode::new(
+        input_row_tuples,
+        sort_info,
+        offset,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    exchange
+}
+
+/// Binds exchange node `node_id` to the engine view `sirius_stream_<node_id>` with the given
+/// sender names.
+fn stream_input(node_id: i32, names: &[&str]) -> ExchangeInput {
+    ExchangeInput {
+        node_id,
+        stream_view: format!("sirius_stream_{node_id}"),
+        names: names.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// Translates `plan` over `desc` with the given input streams bound.
+fn translate_with_streams(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    inputs: &[ExchangeInput],
+) -> Result<TranslatedPlan, TranslateError> {
+    PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(&params(Some(plan), Some(desc), None), inputs)
+}
+
+/// Verifies an exchange node without a bound input stream is rejected, naming the node: a
+/// fragment translated in isolation has nothing to read the exchange from.
 #[test]
 fn exchange_node_is_rejected() {
-    let exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
-        Some(TPlan::new(vec![exchange])),
+        Some(TPlan::new(vec![exchange_node_with(1, vec![0], None, None)])),
         Some(base_desc()),
         None,
     ))
     .unwrap_err();
-    assert!(matches!(
-        err,
-        TranslateError::UnsupportedPlanNode {
-            node_type: TPlanNodeType::EXCHANGE_NODE,
-            ..
-        }
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedPlanNode {
+                node_id: 1,
+                node_type: TPlanNodeType::EXCHANGE_NODE,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// Verifies a bound exchange becomes a stream read below the receiver aggregate, and that no
+/// file appears anywhere in the plan: the boundary is a stream, not a parquet round-trip.
+#[test]
+fn bound_exchange_feeds_aggregate_from_a_stream() {
+    let aggregate = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![aggregate, exchange_node_with(7, vec![0], None, None)]),
+        agg_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate receiver");
+    };
+    let rel::RelType::Read(read) = aggregate.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected exchange read");
+    };
+    let Some(read_rel::ReadType::NamedTable(table)) = read.read_type.as_ref() else {
+        panic!("expected a stream read for the exchange input");
+    };
+    assert_eq!(table.names, vec!["sirius_stream_7"]);
+    assert_eq!(read.base_schema.as_ref().unwrap().names, vec!["id", "name"]);
+    assert!(translated.output_partition_columns.is_none());
+
+    // The declaration the engine needs, derived from the same schema the read carries.
+    assert_eq!(translated.stream_inputs.len(), 1);
+    let stream = &translated.stream_inputs[0];
+    assert_eq!(stream.node_id, 7);
+    assert_eq!(stream.stream_view, "sirius_stream_7");
+    assert_eq!(
+        stream
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "BIGINT"), ("name", "VARCHAR")]
+    );
+}
+
+/// The sender's names win over the receiver's descriptor names: the stream's columns are bound
+/// positionally and the fragment's root is named by its own tuple, so a rename at the boundary
+/// changes the read's schema and nothing else.
+#[test]
+fn exchange_columns_take_the_senders_names_positionally() {
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[stream_input(7, &["sender_id", "sender_name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["id", "name"]);
+    let rel::RelType::Read(read) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the exchange read at the root");
+    };
+    assert_eq!(
+        read.base_schema.as_ref().unwrap().names,
+        vec!["sender_id", "sender_name"]
+    );
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sender_id", "sender_name"]
+    );
+}
+
+/// A multi-stage DISTINCT reallocates its columns into a fresh tuple at every stage, but the
+/// FE's `buildAggregateTuple` never rebinds `colRefToExpr` for grouping columns, so every ref
+/// above the first aggregation keeps naming the tuple from below it (TPC-H q16's
+/// `count(distinct ps_suppkey)` reaches its final stage still naming the scan-side tuple). The
+/// BE resolves slot refs by slot id alone, so those stale refs must resolve the same way here.
+#[test]
+fn stale_tuple_ids_from_a_multi_stage_distinct_resolve_by_slot_id() {
+    // Four tuples reallocating the same two columns: suppkey keeps slot 2 and brand slot 9
+    // through tuple 0 (below the aggregation), tuple 1 (the exchange input), and tuple 2 (the
+    // dedup output); tuple 3 is the counting output (brand key, count slot 23).
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None), (2, None), (3, None)],
+        vec![
+            slot(2, 0, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 0, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 1, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 2, "ps_suppkey", scalar_type(TPrimitiveType::BIGINT)),
+            slot(9, 2, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(9, 3, "p_brand", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(23, 3, "supplier_cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let exchange = exchange_node_with(4, vec![1], None, None);
+    // The dedup stage: grouping-only, its refs stale-bound to tuple 0.
+    let dedup = aggregation_node(
+        5,
+        2,
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+        Vec::new(),
+    );
+    // The counting stage: its count argument names tuple 0 too.
+    let count = aggregation_node(
+        6,
+        3,
+        vec![slot_ref(9, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(2, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![count, dedup, exchange]),
+        desc,
+        &[stream_input(4, &["ps_suppkey", "p_brand"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["p_brand", "supplier_cnt"]);
+    let rel::RelType::Aggregate(counting) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected counting aggregate");
+    };
+    // The deduped row is [ps_suppkey, p_brand]: the count groups on brand and counts suppkey.
+    assert_eq!(counting.grouping_expressions.len(), 1);
+    assert_eq!(field_index(&counting.grouping_expressions[0]), 1);
+    assert_eq!(counting.measures.len(), 1);
+    let measure = counting.measures[0].measure.as_ref().unwrap();
+    assert_eq!(measure.arguments.len(), 1);
+    let substrait::proto::function_argument::ArgType::Value(argument) =
+        measure.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected value argument");
+    };
+    assert_eq!(field_index(argument), 0);
+
+    let rel::RelType::Aggregate(dedup) =
+        counting.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected dedup aggregate under the count");
+    };
+    let keys: Vec<_> = dedup.grouping_expressions.iter().map(field_index).collect();
+    assert_eq!(keys, vec![0, 1]);
+    assert!(dedup.measures.is_empty());
+}
+
+/// Verifies a merging exchange globally sorts the stream it reads: the senders' runs arrive in
+/// no particular interleaving, and a plain read would drop the cross-fragment ORDER BY.
+#[test]
+fn merging_exchange_becomes_sort_over_stream_read() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![false],
+        vec![false],
+        None,
+    );
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(
+            7,
+            vec![0],
+            Some(sort_info),
+            Some(0),
+        )]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected merging exchange sort");
+    };
+    let rel::RelType::Read(read) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected an exchange read under the sort");
+    };
+    assert!(
+        matches!(
+            read.read_type.as_ref(),
+            Some(read_rel::ReadType::NamedTable(_))
+        ),
+        "a merging exchange must stream its input too, not re-scan a file"
+    );
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 0);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+}
+
+/// Without `input_row_tuples` there is no row layout to type the stream with.
+#[test]
+fn exchange_without_input_row_tuples_is_rejected() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, Vec::new(), None, None)]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::MissingField {
+                context: "TExchangeNode",
+                field: "input_row_tuples"
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// The view name is what ties the read to the stream the engine fills. An empty one would bind
+/// a table named "" and fail far from the exchange that caused it.
+#[test]
+fn exchange_bound_to_an_empty_stream_view_is_rejected() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[ExchangeInput {
+            node_id: 7,
+            stream_view: String::new(),
+            names: vec!["id".to_string(), "name".to_string()],
+        }],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::MalformedPlan { .. }),
+        "{err:?}"
+    );
+}
+
+/// The sender's name list must have one entry per column of the declared row layout; a mismatch
+/// would otherwise bind columns positionally under the wrong names.
+#[test]
+fn exchange_names_must_match_the_row_layout_arity() {
+    let err = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, None)]),
+        base_desc(),
+        &[stream_input(7, &["only_one"])],
+    )
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::Descriptor(_)), "{err:?}");
+}
+
+/// An exchange node carries its own skip offset, not just a sort. It must reach the fetch with an
+/// explicit unlimited count, or the consumer decodes the unset count as `LIMIT 0`.
+#[test]
+#[allow(deprecated)]
+fn exchange_offset_becomes_a_fetch() {
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node_with(7, vec![0], None, Some(5))]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+    let rel::RelType::Fetch(fetch) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected the exchange offset to become a fetch");
+    };
+    assert_eq!(
+        fetch.count_mode,
+        Some(substrait::proto::fetch_rel::CountMode::Count(-1))
+    );
+    assert_eq!(
+        fetch.offset_mode,
+        Some(substrait::proto::fetch_rel::OffsetMode::Offset(5))
+    );
+}
+
+/// Builds fragment params whose output sink is a data-stream sink with `partition`.
+fn params_with_stream_sink(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    output_exprs: Option<Vec<TExpr>>,
+    partition: TDataPartition,
+) -> TExecPlanFragmentParams {
+    let mut params = params(Some(plan), Some(desc), output_exprs);
+    params.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
+        TDataSinkType::DATA_STREAM_SINK,
+        Some(TDataStreamSink::new(
+            9, partition, None, None, None, None, None,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     ));
+    params
+}
+
+/// Builds a hash partition over the given key expressions.
+fn hash_partition(keys: Vec<TExpr>) -> TDataPartition {
+    TDataPartition::new(TPartitionType::HASH_PARTITIONED, Some(keys), None, None)
+}
+
+/// A hash-partitioned sink's keys resolve to output column indices in partition-expression
+/// order, and an unpartitioned sink resolves to none: the sender hashes exactly the columns the
+/// FE named, in the order it named them.
+#[test]
+fn hash_partitioned_sink_resolves_partition_keys_to_output_columns() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+    ))
+    .unwrap();
+    assert_eq!(translated.output_partition_columns, Some(vec![1, 0]));
+
+    let unpartitioned = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+    ))
+    .unwrap();
+    assert!(unpartitioned.output_partition_columns.is_none());
+}
+
+/// A transformed partition key is refused: this sender would hash a value its peers do not,
+/// silently splitting equal keys across destinations.
+#[test]
+fn hash_partitioned_sink_with_a_transformed_key_is_rejected() {
+    let err = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(vec![arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            int_literal(1),
+        )]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::MalformedPlan { .. }),
+        "{err:?}"
+    );
+}
+
+/// A hash-partitioned sink with no partition expressions has nothing to hash, and one with
+/// fragment output expressions has a sink row the FE's slot refs no longer describe. Both are
+/// refused rather than guessed at.
+#[test]
+fn hash_partitioned_sink_without_resolvable_keys_is_rejected() {
+    let no_keys = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        None,
+        hash_partition(Vec::new()),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(no_keys, TranslateError::MalformedPlan { .. }),
+        "{no_keys:?}"
+    );
+
+    let reprojected = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        hash_partition(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(reprojected, TranslateError::MalformedPlan { .. }),
+        "{reprojected:?}"
+    );
 }
 
 /// Returns every extension function name declared by the plan.
@@ -3369,6 +5237,26 @@ fn function_calls_use_allowlist() {
     ))
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Splits a throwing cast into its target-type kind and input expression.
+fn cast_parts(
+    expr: &substrait::proto::Expression,
+) -> (
+    &substrait::proto::r#type::Kind,
+    &substrait::proto::Expression,
+) {
+    let expression::RexType::Cast(cast) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected cast, got {expr:?}");
+    };
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+    (
+        cast.r#type.as_ref().unwrap().kind.as_ref().unwrap(),
+        cast.input.as_ref().unwrap(),
+    )
 }
 
 /// Verifies CASE WHEN chains become Substrait if-then expressions with a null default.
