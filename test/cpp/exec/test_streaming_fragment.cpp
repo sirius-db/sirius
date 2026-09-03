@@ -31,9 +31,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -652,6 +655,111 @@ TEST_CASE_METHOD(fragment_fixture,
 
     // Both sides carry 1..5, so the equi-join yields exactly the 5 matches whichever side built.
     REQUIRE(drain_row_count(receiver, 2) == kLeafRows);
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-11: a fragment over an input stream that closes empty before run().
+// A hash fan-out gives one CN zero keys: its exchange input closes with zero
+// batches before run(), so the pipeline finishes between build() and run() —
+// before the query's completion handler exists — and no task is ever created
+// to carry the completion. run() must still return, with an empty result.
+//
+// This pins behaviour dev already has since #1624: the manager loop re-statuses
+// the scheduled head's pipeline once the query is live, and
+// update_pipeline_status() signals completion for a finished query-terminal
+// pipeline. It is the C++ mirror of the CN suite's
+// fragment_over_an_empty_input_stream_terminates; the watchdog guard turns a
+// regression into a named failure in seconds instead of a hung suite.
+// ============================================================================
+
+namespace {
+
+//! Turns a wedged run() into a loud failure: the engine-side scheduling watchdog
+//! (SIRIUS_QUERY_WATCHDOG_SECS) fails a query with no scheduling progress, and
+//! streaming_fragment::run() rethrows it — so a hang fails in seconds instead of
+//! blocking the suite forever. `secs` is the test's own threshold, sized for a fast
+//! GPU; a non-empty SIRIUS_TEST_WATCHDOG_SECS in the environment overrides it so a
+//! slow CI machine can raise every guarded test at once without editing the tests.
+//! Restores whatever the environment held before.
+struct watchdog_guard {
+  explicit watchdog_guard(const char* secs)
+  {
+    if (const char* previous = std::getenv("SIRIUS_QUERY_WATCHDOG_SECS")) { _previous = previous; }
+    const char* override_secs = std::getenv("SIRIUS_TEST_WATCHDOG_SECS");
+    setenv("SIRIUS_QUERY_WATCHDOG_SECS",
+           (override_secs != nullptr && *override_secs != '\0') ? override_secs : secs,
+           1);
+  }
+  ~watchdog_guard()
+  {
+    if (_previous) {
+      setenv("SIRIUS_QUERY_WATCHDOG_SECS", _previous->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_QUERY_WATCHDOG_SECS");
+    }
+  }
+  watchdog_guard(const watchdog_guard&)            = delete;
+  watchdog_guard& operator=(const watchdog_guard&) = delete;
+
+ private:
+  std::optional<std::string> _previous;
+};
+
+}  // namespace
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-11: a fragment over an input stream that closes empty before run() "
+                 "terminates",
+                 "[integration][streaming_fragment]")
+{
+  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  REQUIRE(sirius_ctx != nullptr);
+
+  // The query does no GPU work at all, so 20 s of zero scheduling progress is a wedge, not a
+  // slow kernel: a regression fails here in seconds instead of hanging the suite. On a slow CI
+  // GPU, export SIRIUS_TEST_WATCHDOG_SECS to raise the threshold without touching the test.
+  watchdog_guard watchdog("20");
+
+  con->BeginTransaction();
+  try {
+    fragment_spec spec;
+    spec.plan_source = sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
+    spec.inputs[0]   = stream_input_spec{
+        {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+        {0}};
+    spec.outputs = {1};
+    streaming_fragment receiver(*con->context, std::move(spec));
+
+    query_window window(*sirius_ctx, *con->context, "frag11_receiver");
+    receiver.build(window.query_id());
+
+    // No sender ever parked a batch for this partition; the stream just ends, before run().
+    receiver.session().close_input(0, 0);
+
+    receiver.run();
+    window.finish();
+
+    // The premise, not just the outcome: nothing was scheduled, so no task epilogue could have
+    // carried the completion signal that let run() return.
+    std::size_t created = 0, completed = 0;
+    for (const auto& p : receiver.engine().sirius_pipelines) {
+      created += p->get_tasks_created();
+      completed += p->get_tasks_completed();
+    }
+    INFO("pipelines=" << receiver.engine().sirius_pipelines.size() << " tasks_created=" << created
+                      << " tasks_completed=" << completed);
+    REQUIRE(created == 0);
+    REQUIRE(completed == 0);
+
+    // An empty stream yields no rows — but it must yield.
+    REQUIRE(drain_row_count(receiver, 1) == 0);
 
     con->Rollback();
   } catch (...) {

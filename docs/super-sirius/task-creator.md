@@ -215,6 +215,8 @@ while running:
 
 The `mark_task_created()` call before data popping prevents a race condition where the pipeline could appear finished between data check and task creation.
 
+**Zero-task completion.** A pipeline whose input stream closes without ever carrying a batch finishes between `build()` and `run()` — before `prepare_for_query()` installs the query's completion handler — so no task ever runs; step 4's re-status of the scheduled head, together with `update_pipeline_status()` signalling completion for a finished query-terminal pipeline (#1624), still completes the query. `FRAG-11` in `test/cpp/exec/test_streaming_fragment.cpp` pins this.
+
 ### Look-ahead task creation
 
 **Files:** `src/include/creator/config.hpp`, `src/creator/task_creator.cpp`
