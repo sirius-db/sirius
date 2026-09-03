@@ -24,8 +24,8 @@ use crate::prpc;
 /// this is treated as wedged and the query fails loudly.
 ///
 /// Tunable, and worth tuning at scale — see [`SIRIUS_CN_RPC_TIMEOUT_SECS`](crate::tunable).
-/// Read per dial rather than cached in the client: `Tunables::get` is one atomic load, dials are
-/// rare, and reading through keeps a single source of truth.
+/// Read per dial rather than cached in the client: `Tunables::get` is an atomic load plus a
+/// small clone, dials are rare, and reading through keeps a single source of truth.
 fn reply_timeout() -> Duration {
     crate::tunable::Tunables::get().rpc_timeout
 }

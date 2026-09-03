@@ -103,6 +103,22 @@ const WARMUP_EXPECT_PEERS: Knob<u64> = Knob {
     max: 4096,
 };
 
+/// Kill switch for the bring-up session warmup. `off` returns to purely lazy sessions: the first
+/// cross-node query after bring-up pays first contact, and on a cold cluster that is the
+/// deadlock the warmup exists to prevent (see `nixl_transport/warmup.rs`).
+const WARMUP: Switch = Switch {
+    name: "SIRIUS_CN_NIXL_WARMUP",
+    default: true,
+};
+
+/// Explicit warmup peer list, `host:port,host:port`, bypassing FE discovery. Unset means "ask
+/// the FE for its alive compute nodes"; this CN's own `host:brpc_port` is filtered out either
+/// way. Rule 1 applies per entry: a malformed one rejects the whole list instead of being
+/// dropped with a warning, which is how a typo'd peer used to stay cold unnoticed.
+const WARMUP_PEERS: PeerList = PeerList {
+    name: "SIRIUS_CN_NIXL_WARMUP_PEERS",
+};
+
 /// One environment-backed knob: where it is read from, what it is when unset, and the range
 /// outside which a value is an error rather than a clamp.
 struct Knob<T> {
@@ -181,6 +197,73 @@ impl Knob<f64> {
     }
 }
 
+/// An on/off knob. Accepts the usual spellings of a boolean and rejects anything else.
+struct Switch {
+    name: &'static str,
+    default: bool,
+}
+
+impl Switch {
+    /// The configured value, or the default when unset.
+    ///
+    /// # Errors
+    /// When the value is none of `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off` (any case).
+    fn read(&self) -> Result<bool, String> {
+        let Some(raw) = env_value(self.name) else {
+            return Ok(self.default);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(format!(
+                "{}: expected one of 1/0, true/false, yes/no, on/off, got \"{raw}\" (unset means \
+                 the default, {})",
+                self.name, self.default
+            )),
+        }
+    }
+}
+
+/// A `host:port,host:port` list knob. Unset means `None`, not an empty list.
+struct PeerList {
+    name: &'static str,
+}
+
+impl PeerList {
+    /// The configured pairs, or `None` when unset.
+    ///
+    /// # Errors
+    /// When any entry is not a non-empty host and a port in `1..=65535`.
+    fn read(&self) -> Result<Option<Vec<(String, u16)>>, String> {
+        env_value(self.name)
+            .map(|raw| {
+                parse_peer_list(&raw).map_err(|why| format!("{}: {why}, got \"{raw}\"", self.name))
+            })
+            .transpose()
+    }
+}
+
+/// Parses `host:port,host:port`. Blank entries are skipped; every other entry must be a
+/// non-empty host and a port in `1..=65535`. The port is the last `:`-separated field, so an
+/// IPv6 literal keeps its brackets.
+fn parse_peer_list(list: &str) -> Result<Vec<(String, u16)>, String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let Some((host, port)) = entry.rsplit_once(':') else {
+                return Err(format!("entry \"{entry}\" has no ':port'"));
+            };
+            match port.parse::<u16>() {
+                Ok(port) if port != 0 && !host.is_empty() => Ok((host.to_string(), port)),
+                _ => Err(format!(
+                    "entry \"{entry}\" is not host:port with a port between 1 and 65535"
+                )),
+            }
+        })
+        .collect()
+}
+
 /// The variable's value, or `None` when it is unset OR set to the empty string.
 ///
 /// Empty counts as unset on purpose: `export FOO=${FOO:-}` and an unset variable are the same
@@ -193,12 +276,14 @@ fn env_value(name: &str) -> Option<String> {
     }
 }
 
-/// The resolved transport tunables. Copy so call sites can hold one cheaply.
+/// The resolved transport tunables. Clone so call sites can hold one cheaply: the peer list is
+/// the one heap field, and it is `None` in every configuration but an explicit
+/// `SIRIUS_CN_NIXL_WARMUP_PEERS`.
 ///
 /// `main` calls [`resolve`](Self::resolve) at bring-up; the transport, the PRPC client and the
 /// session warmup read the fields through [`get`](Self::get). Those consumers are part of the
 /// library crate's public API, so the fields are `pub` rather than `pub(crate)`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tunables {
     /// See [`RPC_TIMEOUT_SECS`].
     pub rpc_timeout: Duration,
@@ -212,6 +297,10 @@ pub struct Tunables {
     pub warmup_timeout: Duration,
     /// See [`WARMUP_EXPECT_PEERS`]; `None` when the sentinel `0` leaves early exit off.
     pub warmup_expect_peers: Option<usize>,
+    /// See [`WARMUP`]; `false` leaves every peer session lazy.
+    pub warmup: bool,
+    /// See [`WARMUP_PEERS`]; `None` means discover the peers from the FE.
+    pub warmup_peers: Option<Vec<(String, u16)>>,
 }
 
 impl Tunables {
@@ -223,6 +312,8 @@ impl Tunables {
         canary_floor_gbps: CANARY_FLOOR_GBPS.default,
         warmup_timeout: Duration::from_secs(WARMUP_TIMEOUT_SECS.default),
         warmup_expect_peers: None,
+        warmup: WARMUP.default,
+        warmup_peers: None,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -244,6 +335,8 @@ impl Tunables {
                 0 => None,
                 peers => Some(peers as usize),
             },
+            warmup: WARMUP.read()?,
+            warmup_peers: WARMUP_PEERS.read()?,
         })
     }
 
@@ -258,11 +351,11 @@ impl Tunables {
     /// silently reverting to a default mid-sweep.
     pub fn resolve() -> Result<Self, String> {
         if let Some(already) = RESOLVED.get() {
-            return Ok(*already);
+            return Ok(already.clone());
         }
         let tunables = Self::from_env()?;
         // A racing resolve may have won; either way the published value is the one in force.
-        let published = *RESOLVED.get_or_init(|| tunables);
+        let published = RESOLVED.get_or_init(|| tunables).clone();
         if published.canary_floor_gbps == 0.0 {
             tracing::warn!(
                 knob = CANARY_FLOOR_GBPS.name,
@@ -278,6 +371,8 @@ impl Tunables {
             canary_floor_gbps = published.canary_floor_gbps,
             warmup_timeout_secs = published.warmup_timeout.as_secs(),
             warmup_expect_peers = published.warmup_expect_peers,
+            warmup = published.warmup,
+            warmup_peers = ?published.warmup_peers,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -287,7 +382,7 @@ impl Tunables {
     /// [`DEFAULTS`](Self::DEFAULTS) — which is correct for unit tests, and unreachable in
     /// production because `main` resolves before it binds a port or starts the engine.
     pub fn get() -> Self {
-        RESOLVED.get().copied().unwrap_or(Self::DEFAULTS)
+        RESOLVED.get().cloned().unwrap_or(Self::DEFAULTS)
     }
 }
 
@@ -346,6 +441,8 @@ mod tests {
                 (CANARY_FLOOR_GBPS.name, None),
                 (WARMUP_TIMEOUT_SECS.name, None),
                 (WARMUP_EXPECT_PEERS.name, None),
+                (WARMUP.name, None),
+                (WARMUP_PEERS.name, None),
             ],
             Tunables::from_env,
         )
@@ -358,6 +455,8 @@ mod tests {
         assert_eq!(resolved.canary_floor_gbps, 2.0);
         assert_eq!(resolved.warmup_timeout, Duration::from_secs(180));
         assert_eq!(resolved.warmup_expect_peers, None);
+        assert!(resolved.warmup);
+        assert_eq!(resolved.warmup_peers, None);
     }
 
     #[test]
@@ -449,6 +548,70 @@ mod tests {
         let three = with_env(&[(WARMUP_EXPECT_PEERS.name, Some("3"))], Tunables::from_env)
             .expect("3 resolves");
         assert_eq!(three.warmup_expect_peers, Some(3));
+    }
+
+    /// The warmup kill switch takes the spellings an operator would type and, per rule 1,
+    /// rejects anything else rather than reading it as "on".
+    #[test]
+    fn the_warmup_switch_accepts_the_usual_spellings_and_rejects_the_rest() {
+        for (raw, expected) in [
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("OFF", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            (" On ", true),
+        ] {
+            let value = with_env(&[(WARMUP.name, Some(raw))], || WARMUP.read());
+            assert_eq!(value, Ok(expected), "{raw:?}");
+        }
+        let error = with_env(&[(WARMUP.name, Some("maybe"))], || WARMUP.read())
+            .expect_err("'maybe' is not a boolean");
+        assert!(error.contains(WARMUP.name), "{error}");
+        assert!(error.contains("maybe"), "{error}");
+    }
+
+    /// The peer list accepts what an operator would write; junk fails bring-up (rule 1) instead
+    /// of being dropped, which used to leave a typo'd peer cold with only a warning to show.
+    #[test]
+    fn peer_list_parses_host_port_pairs_and_rejects_junk() {
+        assert_eq!(
+            parse_peer_list("127.0.0.1:9102, 127.0.0.1:9112 ,,"),
+            Ok(vec![
+                ("127.0.0.1".to_string(), 9102),
+                ("127.0.0.1".to_string(), 9112),
+            ])
+        );
+        for junk in [
+            "bad",
+            "127.0.0.1:0",
+            "host:70000",
+            ":9102",
+            "127.0.0.1:9102,bad",
+        ] {
+            assert!(parse_peer_list(junk).is_err(), "{junk:?} must be rejected");
+        }
+
+        let error = with_env(&[(WARMUP_PEERS.name, Some("127.0.0.1:9102,bad"))], || {
+            WARMUP_PEERS.read()
+        })
+        .expect_err("one junk entry rejects the whole list");
+        assert!(error.contains(WARMUP_PEERS.name), "{error}");
+        assert!(error.contains("bad"), "{error}");
+
+        let unset = with_env(&[(WARMUP_PEERS.name, None)], || WARMUP_PEERS.read());
+        assert_eq!(unset, Ok(None));
+    }
+
+    /// An IPv6 literal keeps its brackets: the port is the last `:`-separated field.
+    #[test]
+    fn peer_list_splits_on_the_last_colon() {
+        assert_eq!(
+            parse_peer_list("[::1]:9102"),
+            Ok(vec![("[::1]".to_string(), 9102)])
+        );
     }
 
     /// A bad knob has to fail the whole resolution, not just its own field.

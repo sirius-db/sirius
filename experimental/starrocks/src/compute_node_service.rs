@@ -2001,7 +2001,8 @@ mod tests {
                     respond.send(Ok(())).unwrap();
                     spec
                 }
-                crate::nixl_transport::TransportRequest::ExchangeMd { .. } => {
+                crate::nixl_transport::TransportRequest::ExchangeMd { .. }
+                | crate::nixl_transport::TransportRequest::WarmSession { .. } => {
                     panic!("the sender flow never exchanges metadata itself")
                 }
             }

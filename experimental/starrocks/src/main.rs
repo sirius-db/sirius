@@ -202,7 +202,7 @@ impl Args {
         };
         // The cross-node exchange tier, when this build carries nixl and the staging arena is
         // configured; a remote exchange destination stays a loud error otherwise.
-        let transport = build_nixl_transport(&self.compute_node, executor.clone())?;
+        let transport = build_nixl_transport(&self.fe, &self.compute_node, executor.clone())?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
         let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), transport)?;
 
@@ -509,6 +509,7 @@ async fn maintain_frontend_report(compute_node: ComputeNodeConfig, state: Shared
 /// and its absence must be discoverable, not deduced from a later query failure.
 #[cfg(feature = "nixl-transport")]
 fn build_nixl_transport(
+    fe: &FeConfig,
     compute_node: &ComputeNodeConfig,
     executor: Arc<dyn FragmentExecutor>,
 ) -> Result<Option<NixlTransport>> {
@@ -523,7 +524,9 @@ fn build_nixl_transport(
     // The agent is named by this CN's exchange identity, so two CNs on one host get distinct
     // agents and the FE-routed destination address doubles as the peer's agent name.
     let agent_name = format!("{}:{}", compute_node.advertise_host, compute_node.brpc_port);
-    NixlTransport::start(executor, agent_name)
+    // The FE settings come along because the transport's session warmup discovers this CN's
+    // peers from the FE's compute-node list — they are not knowable here, at bring-up.
+    NixlTransport::start(executor, agent_name, fe.clone())
         .map(Some)
         .map_err(|err| anyhow!("failed to bring up the nixl exchange transport: {err}"))
 }
@@ -532,6 +535,7 @@ fn build_nixl_transport(
 /// destinations fail loudly with the build-time remedy in the message.
 #[cfg(not(feature = "nixl-transport"))]
 fn build_nixl_transport(
+    _fe: &FeConfig,
     _compute_node: &ComputeNodeConfig,
     _executor: Arc<dyn FragmentExecutor>,
 ) -> Result<Option<NixlTransport>> {

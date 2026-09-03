@@ -23,6 +23,8 @@ Everything else below is read outside that registry and follows its own rules.
 | `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS` | How long one nixl WRITE may take. Distinguishes a stuck fabric from a busy peer. |
 | `SIRIUS_CN_NIXL_CANARY_BYTES` / `_FLOOR_GBPS` | First-contact bandwidth probe. A slow link is refused so a silent staged-copy fallback cannot look like a healthy transfer. `0` on the floor disables the check. |
 | `SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS` / `_EXPECT_PEERS` | Bring-up session warmup. The timeout is a budget, not a hard fail; expect-peers ends the loop early once that many peers are up. |
+| `SIRIUS_CN_NIXL_WARMUP` | Warmup kill switch, `on` by default. `off` returns to lazy sessions: the first cross-node query after bring-up pays first contact, and on a cold cluster that is the first-contact deadlock the warmup exists to prevent. |
+| `SIRIUS_CN_NIXL_WARMUP_PEERS` | Explicit `host:port,host:port` warmup peer list, skipping FE discovery. A malformed entry fails startup instead of leaving that peer cold. |
 
 ## Exchange staging
 

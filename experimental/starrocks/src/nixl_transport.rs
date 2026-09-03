@@ -19,11 +19,18 @@
 //! reports a mismatch, so bring-up refuses a `CUDA_VISIBLE_DEVICES` that names several devices
 //! (see [`check_single_visible_device`]).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::fragment_executor::SenderSlot;
+use crate::prpc_client::PrpcClient;
+
+/// Bring-up pre-establishment of the peer sessions; see the module for why it exists.
+#[cfg(feature = "nixl-transport")]
+mod warmup;
 
 /// A bare `nixl_capi_is_stub()` build would dlopen-fail at agent creation; every startup error
 /// message points here so the fix is discoverable.
@@ -71,6 +78,46 @@ pub(crate) enum TransportRequest {
         spec: RemoteSendSpec,
         respond: Sender<Result<(), String>>,
     },
+    /// Install one peer session whose metadata handshake the [`warmup`] thread already ran off
+    /// this thread; only the agent-local load and the bandwidth canary happen here. Idempotent.
+    WarmSession {
+        host: String,
+        brpc_port: u16,
+        client: PrpcClient,
+        peer: MdReply,
+        respond: Sender<Result<(), String>>,
+    },
+}
+
+/// The bring-up session warmup thread and its stop flag; see the [`warmup`] module.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct SessionWarmup {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+impl SessionWarmup {
+    /// Asks the warmup thread to stop and joins it. An attempt already in flight still has to
+    /// finish its brpc call (bounded by `PrpcClient`'s reply timeout).
+    fn stop_and_join(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+/// Backoff after a peer's first failed warmup attempt; doubles up to [`MAX_BACKOFF`].
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+/// Cap on the per-peer warmup retry backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(15);
+
+/// Delay before the warmup retries a peer after its `attempt`-th consecutive failure (1-based):
+/// grows per attempt and stops at the cap, so a permanently unreachable peer is retried for the
+/// whole budget without being hammered.
+// Pure, so its test runs in every build; the warmup thread that calls it compiles in no CI job.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn retry_backoff(attempt: u32) -> Duration {
+    (MIN_BACKOFF * 2u32.pow(attempt.clamp(1, 4) - 1)).min(MAX_BACKOFF)
 }
 
 /// Handle to the transport thread. Constructible only with the `nixl-transport` feature (via
@@ -83,6 +130,8 @@ pub struct NixlTransport {
     requests: Mutex<Option<Sender<TransportRequest>>>,
     /// Transport thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Bring-up peer-session warmup; `None` when it is disabled or this build has no nixl.
+    warmup: Mutex<Option<SessionWarmup>>,
 }
 
 impl NixlTransport {
@@ -135,12 +184,23 @@ impl NixlTransport {
         Self {
             requests: Mutex::new(Some(requests)),
             thread: Mutex::new(None),
+            warmup: Mutex::new(None),
         }
     }
 }
 
 impl Drop for NixlTransport {
     fn drop(&mut self) {
+        // Stop the warmup first: it holds its own clone of the request sender, and the transport
+        // thread's `recv()` only returns once every sender is gone.
+        if let Some(warmup) = self
+            .warmup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            warmup.stop_and_join();
+        }
         // Close the request channel so the thread's `recv()` returns, then join for an ordered
         // teardown (the thread holds an executor handle that must release before the engine).
         self.requests
@@ -204,13 +264,13 @@ mod agent_tier {
     use tracing::{info, warn};
 
     use super::*;
+    use crate::FeConfig;
     use crate::fragment_executor::FragmentExecutor;
     use crate::proto::starrocks::p_internal_service_brpc::methods;
     use crate::proto::starrocks::{
         PExchangeNixlMd, PExchangeNixlMdResult, PStagingLeaseRequest, PStagingLeaseResult,
         PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
     };
-    use crate::prpc_client::PrpcClient;
     use crate::tunable::Tunables;
 
     /// Bytes of the mandatory first-contact bandwidth canary (finding F1): pool memory over
@@ -239,21 +299,34 @@ mod agent_tier {
         /// `agent_name`, UCX backend, and the executor's staging arena registered as VRAM.
         /// Blocks until the agent is ready — or bring-up fails — so a missing libnixl, plugin
         /// dir, or arena surfaces here, before any cross-node query is accepted.
+        ///
+        /// Then starts the [`warmup`](super::warmup) thread, which discovers this CN's peers
+        /// through `fe` and pre-establishes every directed session off the query path. That is
+        /// best-effort: a warmup failure is loud but never fails bring-up, because a cold peer
+        /// still works (slowly) through [`TransportState::ensure_session`].
         pub fn start(
             executor: Arc<dyn FragmentExecutor>,
             agent_name: String,
+            fe: FeConfig,
         ) -> Result<Self, String> {
             let (request_tx, request_rx) = channel::<TransportRequest>();
-            let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+            // The agent's serialized metadata comes back out of bring-up because the warmup
+            // thread sends it to peers itself, without borrowing the transport thread.
+            let (ready_tx, ready_rx) = channel::<Result<Vec<u8>, String>>();
+            let thread_agent_name = agent_name.clone();
             let thread = std::thread::Builder::new()
                 .name("nixl-transport".to_string())
-                .spawn(move || transport_thread(executor, agent_name, request_rx, ready_tx))
+                .spawn(move || transport_thread(executor, thread_agent_name, request_rx, ready_tx))
                 .map_err(|err| format!("failed to spawn nixl-transport thread: {err}"))?;
             match ready_rx.recv() {
-                Ok(Ok(())) => Ok(Self {
-                    requests: Mutex::new(Some(request_tx)),
-                    thread: Mutex::new(Some(thread)),
-                }),
+                Ok(Ok(local_md)) => {
+                    let warmup = warmup::spawn(agent_name, local_md, request_tx.clone(), fe);
+                    Ok(Self {
+                        requests: Mutex::new(Some(request_tx)),
+                        thread: Mutex::new(Some(thread)),
+                        warmup: Mutex::new(warmup),
+                    })
+                }
                 Ok(Err(err)) => {
                     let _ = thread.join();
                     Err(err)
@@ -269,12 +342,12 @@ mod agent_tier {
         executor: Arc<dyn FragmentExecutor>,
         agent_name: String,
         requests: Receiver<TransportRequest>,
-        ready: Sender<Result<(), String>>,
+        ready: Sender<Result<Vec<u8>, String>>,
     ) {
         let mut state = match TransportState::bring_up(executor, agent_name) {
             Ok(state) => {
                 // A send error means the caller is already gone; nothing to serve.
-                if ready.send(Ok(())).is_err() {
+                if ready.send(Ok(state.local_md.clone())).is_err() {
                     return;
                 }
                 state
@@ -309,6 +382,16 @@ mod agent_tier {
                         }
                     }
                     let _ = respond.send(result);
+                }
+                TransportRequest::WarmSession {
+                    host,
+                    brpc_port,
+                    client,
+                    peer,
+                    respond,
+                } => {
+                    let key = format!("{host}:{brpc_port}");
+                    let _ = respond.send(state.install_session(key, client, peer));
                 }
             }
         }
@@ -462,9 +545,11 @@ mod agent_tier {
         /// Establishes the peer session on first contact: metadata exchange over brpc, then the
         /// mandatory bandwidth canary. Returns the session key.
         ///
-        /// Lazy by design: the outbound `exchange_nixl_md` blocks this thread on the peer's
-        /// transport thread, so first contact is paid on the query path by the first sender that
-        /// needs the peer.
+        /// This is the LAZY path, and it is the one that hangs a cold cluster: the outbound
+        /// `exchange_nixl_md` below blocks this thread on the peer's transport thread, which may
+        /// itself be blocked calling back here (see the [`warmup`](super::warmup) module). It
+        /// survives as the fallback for peers the warmup never reached; the warmup is what keeps
+        /// queries off it.
         fn ensure_session(&mut self, host: &str, brpc_port: u16) -> Result<String, String> {
             let key = format!("{host}:{brpc_port}");
             if self.peers.contains_key(&key) {
@@ -472,6 +557,24 @@ mod agent_tier {
             }
             let mut client = PrpcClient::new(host, brpc_port);
             let peer = rpc_exchange_md(&mut client, &self.agent_name, &self.local_md)?;
+            self.install_session(key.clone(), client, peer)?;
+            Ok(key)
+        }
+
+        /// Second half of session set-up, once the peer's metadata is in hand: load it into this
+        /// agent and clear the bandwidth canary. Split out so the warmup can run the metadata
+        /// handshake on its own thread and hand the result in here — none of this blocks on the
+        /// peer's transport thread (`request_staging_lease`/`transmit_packed` are served from the
+        /// peer's blocking pool), so it cannot take part in the first-contact cycle.
+        fn install_session(
+            &mut self,
+            key: String,
+            mut client: PrpcClient,
+            peer: MdReply,
+        ) -> Result<(), String> {
+            if self.peers.contains_key(&key) {
+                return Ok(());
+            }
             let loaded = self
                 .agent
                 .load_remote_md(&peer.metadata)
@@ -484,13 +587,13 @@ mod agent_tier {
             }
             self.bandwidth_canary(&mut client, &loaded)?;
             self.peers.insert(
-                key.clone(),
+                key,
                 PeerSession {
                     client,
                     remote_agent: loaded,
                 },
             );
-            Ok(key)
+            Ok(())
         }
 
         /// F1's silent-degradation guard: nothing in nixl/UCX flags the ~220x staged-copy path
@@ -718,7 +821,9 @@ mod agent_tier {
         ))
     }
 
-    /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back.
+    /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back. Reachable from
+    /// the [`warmup`](super::warmup) thread on purpose — this is the one call that must NOT run
+    /// on the transport thread.
     pub(super) fn rpc_exchange_md(
         client: &mut PrpcClient,
         agent_name: &str,
@@ -881,7 +986,9 @@ mod agent_tier {
 
 #[cfg(test)]
 mod tests {
-    use super::check_single_visible_device;
+    use std::time::Duration;
+
+    use super::{check_single_visible_device, retry_backoff};
 
     #[test]
     fn unset_cuda_visible_devices_is_accepted() {
@@ -899,5 +1006,15 @@ mod tests {
         let err = check_single_visible_device(Some("0,1,2,3")).unwrap_err();
         assert!(err.contains("names 4 devices"), "{err}");
         assert!(err.contains("--gpu-device"), "{err}");
+    }
+
+    /// Backoff grows per attempt and stops at the cap, so a permanently unreachable peer is
+    /// retried for the whole budget without being hammered.
+    #[test]
+    fn retry_backoff_doubles_up_to_the_cap() {
+        assert_eq!(retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(retry_backoff(2), Duration::from_secs(2));
+        assert_eq!(retry_backoff(4), Duration::from_secs(8));
+        assert_eq!(retry_backoff(9), Duration::from_secs(8));
     }
 }

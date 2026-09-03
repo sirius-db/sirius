@@ -1431,6 +1431,62 @@ async fn node_is_registered(
     Ok(false)
 }
 
+/// Every compute node the FE currently reports as alive, as `(advertised host, brpc port)` —
+/// which is exactly the nixl agent name (`{advertise_host}:{brpc_port}`) of each peer, so the
+/// caller can tell itself apart from its peers by string comparison.
+///
+/// The FE only learns a node's `BrpcPort` from its heartbeat reply (`TBackendInfo`), and that is
+/// the same event that flips `Alive` to true — so filtering on `Alive` is what makes the port
+/// trustworthy. Column fallbacks mirror [`node_is_registered`]: `ComputeNodeProcDir.java` orders
+/// the row `ComputeNodeId, IP, HeartbeatPort, BePort, HttpPort, BrpcPort, LastStartTime,
+/// LastHeartbeat, Alive, ...`.
+pub async fn list_alive_compute_nodes(fe: &FeConfig) -> Result<Vec<(String, u16)>> {
+    let opts = OptsBuilder::default()
+        .ip_or_hostname(fe.host.to_string())
+        .tcp_port(fe.query_port)
+        .prefer_socket(false)
+        .user(Some(fe.user.clone()))
+        .pass(Some(fe.password.expose_secret().to_string()));
+    let pool = Pool::new(opts);
+    let mut conn = pool
+        .get_conn()
+        .await
+        .with_context(|| format!("failed to connect to FE at {}:{}", fe.host, fe.query_port))?;
+    let rows: Vec<Row> = conn
+        .query(format!("SHOW PROC '{COMPUTE_NODE_PROC_PATH}'"))
+        .await
+        .context("failed to query FE compute node list")?;
+    drop(conn);
+    pool.disconnect()
+        .await
+        .context("failed to disconnect FE MySQL pool")?;
+
+    let mut nodes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let alive = row
+            .get::<String, _>("Alive")
+            .or_else(|| row.get::<String, _>(8));
+        if alive.as_deref() != Some("true") {
+            continue;
+        }
+        let (Some(host), Some(port)) = (
+            row.get::<String, _>("IP")
+                .or_else(|| row.get::<String, _>(1)),
+            row.get::<String, _>("BrpcPort")
+                .or_else(|| row.get::<String, _>(5)),
+        ) else {
+            continue;
+        };
+        // A node whose brpc port is still unknown (or nonsense) is simply not warmable yet.
+        if let Ok(port) = port.parse::<u16>()
+            && port != 0
+        {
+            nodes.push((host, port));
+        }
+    }
+    Ok(nodes)
+}
+
 /// StarRocks success status helper.
 fn ok_status() -> TStatus {
     TStatus::new(TStatusCode::OK, None)
