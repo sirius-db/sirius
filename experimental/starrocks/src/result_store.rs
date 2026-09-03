@@ -199,6 +199,12 @@ impl ResultStore {
         self.ready.notify_all();
     }
 
+    /// The first failure recorded for `query_id` (by `fail_query`), if any. The dispatch and
+    /// arrival gates consult it so no further fragment of a dead query runs on this CN.
+    pub(crate) fn failure_of(&self, query_id: FragmentInstanceId) -> Option<String> {
+        self.lock().query_failures.get(&query_id).cloned()
+    }
+
     /// Best-effort cancellation mark: a still-`Waiting` entry becomes a failure so a
     /// `fetch_data` long-poll returns instead of blocking out its timeout. Delivered,
     /// drained, or already-failed entries keep their state; unknown ids are ignored.
@@ -484,6 +490,29 @@ mod tests {
 
         let cause = failure(store.take_next(result_id).expect("known"));
         assert!(cause.contains("boom"), "cause: {cause}");
+    }
+
+    #[test]
+    fn failure_of_reports_the_first_recorded_failure() {
+        let store = ResultStore::default();
+        assert_eq!(store.failure_of(query(12)), None);
+
+        let first_id = FragmentInstanceId::from_halves(12, 1);
+        store.fail_query(query(12), first_id, "first".to_string());
+        store.fail_query(
+            query(12),
+            FragmentInstanceId::from_halves(12, 2),
+            "second".to_string(),
+        );
+        let cause = store.failure_of(query(12)).expect("recorded");
+        assert!(
+            cause.contains(&first_id.to_string()) && cause.contains("first"),
+            "cause: {cause}"
+        );
+        assert!(!cause.contains("second"), "first cause wins: {cause}");
+
+        // Another query is unaffected.
+        assert_eq!(store.failure_of(query(13)), None);
     }
 
     #[test]

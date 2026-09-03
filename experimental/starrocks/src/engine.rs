@@ -19,31 +19,26 @@
 //! into a peer's exchange stall — a fragment wedged inside `run()` starved the peer CN's
 //! `request_staging_lease` for the PRPC timeout and failed the whole query (the q02 wedge's
 //! second act) — so leases must never wait behind engine work.
+//!
+//! Parked output is owned per query; a query is retired (dropped, later runs refused) by its own
+//! engine error or by the CN's `retire_query`, never by another query's failure.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 #[cfg(test)]
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
 use starrocks_plan_translator::StreamInputSchema;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::engine_settings::{EngineSettings, resolve_cuda_visible_devices};
 use crate::fragment_executor::{
-    FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
+    FragmentExecutor, FragmentLabel, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
 };
-
-/// A sender fragment's parked output, shared by its destinations: stream i belongs to
-/// destination i. `outstanding` counts destinations that have not yet released their stream
-/// (drained + dropped); the fragment -- and its GPU batches -- drop when it reaches zero.
-struct ParkedOutput<'ctx> {
-    fragment: sirius::Fragment<'ctx>,
-    outstanding: usize,
-}
+use crate::parked_registry::{ParkedRegistry, QueryId, Release, RetireTrigger, RetiredQueries};
 
 /// One fragment execution handed to the engine thread.
 ///
@@ -67,12 +62,19 @@ struct ExecuteRequest {
     broadcast: bool,
     /// Hash-partition key columns for a hash fan-out (empty otherwise).
     hash_keys: Vec<usize>,
+    /// The query and instance this run belongs to; parked output is owned by `label.query_id`.
+    label: FragmentLabel,
     /// Channel the engine thread sends the result (or a flattened error) back on.
     respond: Sender<Result<Option<FragmentResult>, String>>,
+    /// Test-only: runs between `fragment.run()` and the park, standing in for a cancel or a
+    /// sibling's failure that lands while this fragment is inside the engine (the gate-2 case).
+    #[cfg(test)]
+    after_run: Option<Box<dyn Fn() + Send>>,
 }
 
 /// One message to the engine thread — the only caller of `SiriusContext`, which is `!Send`.
-/// Every variant carries its own respond channel, so callers block for exactly their answer.
+/// Every variant that answers carries its own respond channel, so callers block for exactly
+/// their answer.
 ///
 /// Staging lease/release/info are deliberately NOT variants here: they are served from the
 /// thread-safe arena handle on the caller's thread (see the module doc), because a request
@@ -94,6 +96,17 @@ enum EngineRequest {
     DropParked {
         slot: SenderSlot,
         respond: Sender<Result<(), String>>,
+    },
+    /// Drop every parked output of `query_id` and refuse its later runs. Sent by the CN when it
+    /// learns a query is over by a route the engine cannot see: a pre-run failure or an FE
+    /// cancel. No respond channel: the sender already marked the shared [`RetiredQueries`], so
+    /// the refusal is visible to the very next dequeue; the drop happens when the engine thread
+    /// is free. Fire-and-forget because the cancel RPC and the dispatch worker must never wait
+    /// behind a running fragment.
+    RetireQuery {
+        query_id: QueryId,
+        trigger: RetireTrigger,
+        cause: String,
     },
 }
 
@@ -119,6 +132,10 @@ pub struct SiriusEngine {
     /// direct arena access (`Context::staging_release` for remote-input leases, and
     /// `export_packed` leasing internally) — one shared C++ allocator, two entry points.
     staging: Option<sirius::StagingArena>,
+    /// Queries retired on this CN, shared with the engine thread. The CN's `retire_query` marks
+    /// here BEFORE queueing its `RetireQuery`, so a `Run` already sitting in the FIFO ahead of it
+    /// is refused when the thread dequeues it (the same off-thread shape as `staging`).
+    retired: Arc<Mutex<RetiredQueries>>,
 }
 
 impl SiriusEngine {
@@ -135,15 +152,18 @@ impl SiriusEngine {
         // itself never leaves that thread, but the handle is `Send + Sync` by design so
         // staging calls can bypass the request channel (see the module doc).
         let (ready_tx, ready_rx) = channel::<Result<Option<sirius::StagingArena>, String>>();
+        let retired: Arc<Mutex<RetiredQueries>> = Arc::default();
+        let thread_retired = Arc::clone(&retired);
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(settings.config, request_rx, ready_tx))
+            .spawn(move || engine_thread(settings.config, request_rx, ready_tx, thread_retired))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
             Ok(Ok(staging)) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
                 staging,
+                retired,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -187,6 +207,7 @@ fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
     ready: Sender<Result<Option<sirius::StagingArena>, String>>,
+    retired: Arc<Mutex<RetiredQueries>>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
@@ -204,19 +225,10 @@ fn engine_thread(
     };
 
     // Sender fragments whose output is parked on the GPU, waiting for their receivers to be
-    // dispatched. Parked ONCE per fragment; `parked_slots` maps each destination's SenderSlot to
-    // (park id, its output stream). Declared after `context` so the fragments drop *first*: a
+    // dispatched, owned per query. Declared after `context` so the fragments drop *first*: a
     // fragment borrows the engine it runs on, and the borrow checker enforces the order the C++
     // side depends on.
-    let mut parked: HashMap<u64, ParkedOutput<'_>> = HashMap::new();
-    let mut parked_slots: HashMap<SenderSlot, (u64, u64)> = HashMap::new();
-    let mut next_park_id: u64 = 0;
-    // Why a slot's parked output went away, for the slots the blanket wipe below destroys.
-    // Without this the wipe is silent and the NEXT export of an unrelated slot reports
-    // "no parked sender output", which is collateral -- it masks the error that actually killed
-    // the query. MEASURED: TPC-H q08 reported that error for weeks while the real failure was an
-    // OOM in HASH_JOIN. Bounded: an entry is dropped as soon as the slot is parked again.
-    let mut poisoned: HashMap<SenderSlot, String> = HashMap::new();
+    let mut registry: ParkedRegistry<sirius::Fragment<'_>> = ParkedRegistry::new();
 
     info!("sirius-engine thread ready");
     // One request at a time until the handle (and its sender) is dropped. Every respond-send
@@ -224,90 +236,88 @@ fn engine_thread(
     while let Ok(request) = requests.recv() {
         match request {
             EngineRequest::Run(request) => {
-                let result = run_fragment(
-                    &context,
-                    &mut parked,
-                    &mut parked_slots,
-                    &poisoned,
-                    &mut next_park_id,
-                    &request,
-                );
+                let result = run_fragment(&context, &mut registry, &retired, &request);
                 if let Err(err) = &result {
-                    // A failed query leaves its parked senders unreachable — the receiver that
-                    // would have consumed them is the thing that just failed. Dropping them
-                    // releases the GPU memory their batches hold rather than leaking it for the
-                    // process's lifetime.
-                    //
-                    // The wipe is process-wide, so it also destroys OTHER in-flight fragments'
-                    // parked output. Record why, and say so out loud: a drain that fails right
-                    // after this used to report only "no parked sender output", which names the
-                    // victim and hides the culprit.
-                    if !parked_slots.is_empty() {
-                        warn!(
-                            slots = parked_slots.len(),
-                            error = %err,
-                            "discarding every parked sender output on this CN after a fragment failure"
-                        );
-                    }
-                    // Replace, never accumulate: only the most recent wipe can explain a slot
-                    // that is missing now, and this bounds the map by the live slot count.
-                    poisoned.clear();
-                    for slot in parked_slots.keys() {
-                        poisoned.insert(*slot, err.clone());
-                    }
-                    parked.clear();
-                    parked_slots.clear();
+                    // The failed query's parked senders are unreachable now — the receiver that
+                    // would have consumed them is the thing that just failed — and a run of it
+                    // still queued behind this one must not park more. Retire the query; every
+                    // other query's parked output stays where it is.
+                    retire(
+                        &mut registry,
+                        &retired,
+                        request.label.query_id,
+                        &RetireTrigger::EngineErr,
+                        err,
+                    );
                 }
                 let _ = request.respond.send(result);
             }
             #[cfg(test)]
             EngineRequest::Sleep(duration) => std::thread::sleep(duration),
             EngineRequest::ExportNext { slot, respond } => {
-                let result = export_next(&mut parked, &parked_slots, &poisoned, slot);
-                let _ = respond.send(result);
+                let _ = respond.send(export_next(&mut registry, &slot));
             }
             EngineRequest::DropParked { slot, respond } => {
-                let result = release_slot(&mut parked, &mut parked_slots, &poisoned, &slot);
-                let _ = respond.send(result);
+                let _ = respond.send(drop_parked(&mut registry, &slot));
             }
+            EngineRequest::RetireQuery {
+                query_id,
+                trigger,
+                cause,
+            } => retire(&mut registry, &retired, Some(query_id), &trigger, &cause),
         }
     }
     // Fragments must be gone before the context they borrow.
-    drop(parked_slots);
-    drop(parked);
+    drop(registry);
     info!("sirius-engine thread shutting down");
 }
 
-/// The error for a slot whose parked output is gone. When the blanket wipe took it, name the
-/// failure that triggered the wipe — that is the query's REAL error, and reporting only the
-/// generic message is what made TPC-H q08 look like an exchange bug for weeks when it was an
-/// OOM in HASH_JOIN.
-fn missing_slot(poisoned: &HashMap<SenderSlot, String>, slot: &SenderSlot, verb: &str) -> String {
-    match poisoned.get(slot) {
-        Some(cause) => format!(
-            "sender output for {slot:?} was discarded when another fragment on this CN failed: \
-             {cause}"
-        ),
-        None => format!("no parked sender output to {verb} for {slot:?}"),
+/// The retired set, recovering from a poisoned mutex (a panic elsewhere must not wedge the gates).
+fn lock(retired: &Mutex<RetiredQueries>) -> std::sync::MutexGuard<'_, RetiredQueries> {
+    retired.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The cause `query_id` was retired for, if it was.
+fn retired_cause(retired: &Mutex<RetiredQueries>, query_id: QueryId) -> Option<String> {
+    lock(retired).cause(query_id).map(str::to_owned)
+}
+
+/// Retires one query on the engine thread: drops its parked fragments, poisons its slots with
+/// `cause`, marks it so later runs are refused. `None` retires only unlabeled output (test
+/// fixtures) and marks nothing.
+fn retire<F>(
+    registry: &mut ParkedRegistry<F>,
+    retired: &Mutex<RetiredQueries>,
+    query_id: Option<QueryId>,
+    trigger: &RetireTrigger,
+    cause: &str,
+) {
+    let dropped = registry.retire(query_id, cause);
+    if let Some(query_id) = query_id {
+        lock(retired).mark(query_id, cause);
+    }
+    if dropped.fragments > 0 {
+        warn!(
+            query_id = ?query_id,
+            trigger = %trigger,
+            fragments = dropped.fragments,
+            slots = dropped.slots,
+            still_parked = registry.fragments(),
+            cause,
+            "retired a query's parked sender outputs"
+        );
+    } else {
+        debug!(query_id = ?query_id, trigger = %trigger, "retire found nothing parked");
     }
 }
 
 /// Packs the next batch parked under `slot` into a fresh staging lease.
 fn export_next(
-    parked: &mut HashMap<u64, ParkedOutput<'_>>,
-    parked_slots: &HashMap<SenderSlot, (u64, u64)>,
-    poisoned: &HashMap<SenderSlot, String>,
-    slot: SenderSlot,
+    registry: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    slot: &SenderSlot,
 ) -> Result<Option<StagedBatch>, String> {
-    let (park_id, stream) = parked_slots
-        .get(&slot)
-        .copied()
-        .ok_or_else(|| missing_slot(poisoned, &slot, "export"))?;
-    let entry = parked
-        .get_mut(&park_id)
-        .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
-    let batch = entry
-        .fragment
+    let (fragment, stream) = registry.claim(slot, "export")?;
+    let batch = fragment
         .export_packed(stream)
         .map_err(|err| format!("failed to export a packed batch for {slot:?}: {err}"))?;
     Ok(batch.map(|batch| StagedBatch {
@@ -319,23 +329,16 @@ fn export_next(
 }
 
 /// Releases one destination's claim on a parked fragment; the fragment (and the GPU memory its
-/// remaining batches hold) drops when the LAST destination releases. Exactly-once per slot: a
-/// second release of the same slot is a loud error, never a silent double-drop.
-fn release_slot(
-    parked: &mut HashMap<u64, ParkedOutput<'_>>,
-    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
-    poisoned: &HashMap<SenderSlot, String>,
-    slot: &SenderSlot,
-) -> Result<(), String> {
-    let (park_id, _) = parked_slots
-        .remove(slot)
-        .ok_or_else(|| missing_slot(poisoned, slot, "drop"))?;
-    let entry = parked
-        .get_mut(&park_id)
-        .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
-    entry.outstanding -= 1;
-    if entry.outstanding == 0 {
-        parked.remove(&park_id);
+/// remaining batches hold) drops when the LAST destination releases. Exactly-once per live slot:
+/// a second release is a loud error, never a silent double-drop. A slot already retired with its
+/// query returns `Ok` once, so the transport's post-drain and failure-path drops of a dead
+/// query's output are not errors.
+fn drop_parked<F>(registry: &mut ParkedRegistry<F>, slot: &SenderSlot) -> Result<(), String> {
+    if registry.release(slot)? == Release::AlreadyTornDown {
+        debug!(
+            ?slot,
+            "drop_parked for a slot already retired with its query"
+        );
     }
     Ok(())
 }
@@ -345,22 +348,12 @@ fn release_slot(
 /// sweep when the run fails partway (a leaked lease would pin the arena for later queries).
 fn run_fragment<'ctx>(
     context: &'ctx SiriusContext,
-    parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
-    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
-    poisoned: &HashMap<SenderSlot, String>,
-    next_park_id: &mut u64,
+    registry: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
+    retired: &Mutex<RetiredQueries>,
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
     let mut released = std::collections::HashSet::new();
-    let result = run_fragment_inner(
-        context,
-        parked,
-        parked_slots,
-        poisoned,
-        next_park_id,
-        request,
-        &mut released,
-    );
+    let result = run_fragment_inner(context, registry, retired, request, &mut released);
     if result.is_err() {
         for (_, _, batches) in &request.remote_inputs {
             for batch in batches {
@@ -382,18 +375,37 @@ fn run_fragment<'ctx>(
     result
 }
 
+#[cfg(test)]
+fn run_after_run_hook(request: &ExecuteRequest) {
+    if let Some(hook) = &request.after_run {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_after_run_hook(_request: &ExecuteRequest) {}
+
 /// Runs one fragment on the engine thread: declare its input streams, relay every parked sender
 /// and push every staged remote batch into them, execute, then either park the output or return
 /// the rows. Records each released remote-input lease offset in `released`.
 fn run_fragment_inner<'ctx>(
     context: &'ctx SiriusContext,
-    parked: &mut HashMap<u64, ParkedOutput<'ctx>>,
-    parked_slots: &mut HashMap<SenderSlot, (u64, u64)>,
-    poisoned: &HashMap<SenderSlot, String>,
-    next_park_id: &mut u64,
+    registry: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
+    retired: &Mutex<RetiredQueries>,
     request: &ExecuteRequest,
     released: &mut std::collections::HashSet<u64>,
 ) -> Result<Option<FragmentResult>, String> {
+    // Gate 1: a run of a query this CN already retired is refused before it touches the engine.
+    // Here, not at the dequeue, so `run_fragment`'s sweep still releases every remote-input
+    // lease the refused run carried.
+    if let Some(query_id) = request.label.query_id
+        && let Some(cause) = retired_cause(retired, query_id)
+    {
+        return Err(format!(
+            "query {query_id} was already retired on this CN: {cause}"
+        ));
+    }
+
     let mut fragment = context
         .fragment()
         .map_err(|err| format!("failed to create fragment: {err}"))?;
@@ -452,9 +464,8 @@ fn run_fragment_inner<'ctx>(
         let local_rows: Option<u64> = senders
             .iter()
             .map(|slot| {
-                let (park_id, sender_stream) = parked_slots.get(slot).copied()?;
-                let entry = parked.get(&park_id)?;
-                entry.fragment.output_row_count(sender_stream).ok()
+                let (sender, sender_stream) = registry.peek(slot)?;
+                sender.output_row_count(sender_stream).ok()
             })
             .sum();
         let remote_rows: Option<u64> = request
@@ -515,21 +526,15 @@ fn run_fragment_inner<'ctx>(
             .map(|(_, senders)| senders.as_slice())
             .unwrap_or_default();
         for slot in senders {
-            let (park_id, sender_stream) = parked_slots
-                .get(slot)
-                .copied()
-                .ok_or_else(|| format!("no parked sender output for {slot:?}"))?;
-            let sender = parked
-                .get_mut(&park_id)
-                .ok_or_else(|| format!("parked fragment vanished under {slot:?}"))?;
             let sender_id = u32::try_from(slot.sender_id)
                 .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
+            let (sender, sender_stream) = registry.claim(slot, "relay")?;
             let moved = fragment
-                .relay_from(&mut sender.fragment, sender_stream, stream_id, sender_id)
+                .relay_from(sender, sender_stream, stream_id, sender_id)
                 .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
             // This destination's stream is drained; release its claim (the fragment drops with
             // the last claim, freeing the GPU batches).
-            release_slot(parked, parked_slots, poisoned, slot)?;
+            registry.release(slot)?;
             info!(
                 stream_id,
                 sender_id,
@@ -585,27 +590,23 @@ fn run_fragment_inner<'ctx>(
     fragment
         .run()
         .map_err(|err| format!("failed to execute fragment: {err}"))?;
+    run_after_run_hook(request);
 
     if !request.outputs.is_empty() {
-        // Park ONCE; each destination claims (park id, its stream). A duplicate slot would let
-        // two claims race over one stream -- refuse before inserting anything.
-        let park_id = *next_park_id;
-        *next_park_id += 1;
-        for (stream, slot) in request.outputs.iter().enumerate() {
-            if parked_slots.contains_key(slot) {
-                return Err(format!(
-                    "duplicate destination slot {slot:?} in one sender fan-out"
-                ));
-            }
-            parked_slots.insert(*slot, (park_id, stream as u64));
+        // Gate 2: the query may have been retired while this fragment ran (a cancel mid-run, or
+        // a sibling failing on another CN). Output parked now would have no owner-triggered
+        // release, so drop the fragment instead of parking it.
+        if let Some(query_id) = request.label.query_id
+            && let Some(cause) = retired_cause(retired, query_id)
+        {
+            return Err(format!(
+                "fragment of query {query_id} finished after the query was retired on this CN; \
+                 its output was dropped instead of parked: {cause}"
+            ));
         }
-        parked.insert(
-            park_id,
-            ParkedOutput {
-                fragment,
-                outstanding: request.outputs.len(),
-            },
-        );
+        // Park ONCE; each destination claims (park id, its stream). A duplicate slot would let
+        // two claims race over one stream — the registry refuses before inserting anything.
+        registry.park(request.label.query_id, &request.outputs, fragment)?;
         return Ok(None);
     }
     // `result_to_arrow` drains the stream and drops the context-referencing wrapper here, on the
@@ -642,16 +643,21 @@ impl SiriusEngine {
         make_request: impl FnOnce(Sender<Result<T, String>>) -> EngineRequest,
     ) -> Result<T, String> {
         let (respond_tx, respond_rx) = channel();
-        self.requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
-            .send(make_request(respond_tx))
-            .map_err(|_| "sirius-engine thread is not running".to_string())?;
+        self.engine_send(make_request(respond_tx))?;
         respond_rx
             .recv()
             .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+    }
+
+    /// Sends one request without waiting for an answer.
+    fn engine_send(&self, request: EngineRequest) -> Result<(), String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
+            .send(request)
+            .map_err(|_| "sirius-engine thread is not running".to_string())
     }
 
     /// The staging-arena handle, or the loud not-configured error (the exact message the C++
@@ -674,7 +680,10 @@ impl FragmentExecutor for SiriusEngine {
                 outputs: run.outputs,
                 broadcast: run.broadcast,
                 hash_keys: run.hash_keys,
+                label: run.label,
                 respond,
+                #[cfg(test)]
+                after_run: None,
             })
         })
     }
@@ -705,6 +714,21 @@ impl FragmentExecutor for SiriusEngine {
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         self.engine_call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn retire_query(
+        &self,
+        query_id: QueryId,
+        trigger: RetireTrigger,
+        cause: &str,
+    ) -> Result<(), String> {
+        // Mark first: a Run already queued ahead of the RetireQuery is refused at its dequeue.
+        lock(&self.retired).mark(query_id, cause);
+        self.engine_send(EngineRequest::RetireQuery {
+            query_id,
+            trigger,
+            cause: cause.to_string(),
+        })
     }
 }
 
@@ -871,6 +895,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute fragment on GPU")
             .expect("a result fragment returns rows")
@@ -973,7 +998,9 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
                 respond: respond_tx,
+                after_run: None,
             }))
             .unwrap();
         let result = respond_rx
@@ -1046,6 +1073,7 @@ mod tests {
                 outputs: vec![slot],
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("run the sender fragment");
 
@@ -1071,6 +1099,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute the remote-fed receiver on GPU")
             .expect("a result fragment returns rows");
@@ -1195,6 +1224,7 @@ mod tests {
                     outputs: vec![slot],
                     broadcast: false,
                     hash_keys: Vec::new(),
+                    label: FragmentLabel::default(),
                 })
                 .expect("run the sender fragment")
                 .is_none(),
@@ -1210,6 +1240,7 @@ mod tests {
                 outputs: Vec::new(),
                 broadcast: false,
                 hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
             })
             .expect("execute exchange receiver on GPU")
             .expect("a result fragment returns rows");
@@ -1281,5 +1312,306 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("second output column is the int64 id column");
         assert_eq!(id_col.value(0), 1);
+    }
+
+    /// A run labelled with query `hi` and instance `(hi, instance)`.
+    fn labelled(hi: i64, instance: i64) -> FragmentLabel {
+        FragmentLabel {
+            query_id: Some(FragmentInstanceId::from_halves(hi, 0)),
+            fragment_instance_id: Some(FragmentInstanceId::from_halves(hi, instance)),
+        }
+    }
+
+    /// A destination slot on receiver `(100, receiver)`, exchange node `node_id`, sender 0.
+    fn slot_for(receiver: i64, node_id: i32) -> SenderSlot {
+        SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(100, receiver),
+            node_id,
+            sender_id: 0,
+        }
+    }
+
+    /// Parks the users fixture (3 rows) under `slot`, labelled `label`.
+    fn park(engine: &SiriusEngine, plan: &TranslatedPlan, slot: SenderSlot, label: FragmentLabel) {
+        assert!(
+            engine
+                .run(FragmentRun {
+                    plan,
+                    inputs: Vec::new(),
+                    remote_inputs: Vec::new(),
+                    outputs: vec![slot],
+                    broadcast: false,
+                    hash_keys: Vec::new(),
+                    label,
+                })
+                .expect("run the sender fragment")
+                .is_none()
+        );
+    }
+
+    /// Runs a receiver over `slot`'s stream, labelled `label`.
+    fn receive(
+        engine: &SiriusEngine,
+        slot: SenderSlot,
+        label: FragmentLabel,
+    ) -> Result<Option<FragmentResult>, String> {
+        let receiver = stream_plan(slot.node_id, &[("id", false), ("name", true)]);
+        engine.run(FragmentRun {
+            plan: &receiver,
+            inputs: vec![(slot.node_id, vec![slot])],
+            remote_inputs: Vec::new(),
+            outputs: Vec::new(),
+            broadcast: false,
+            hash_keys: Vec::new(),
+            label,
+        })
+    }
+
+    fn row_count(result: Option<FragmentResult>) -> usize {
+        result
+            .expect("a result fragment returns rows")
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// A run that fails before `build()`: a stream read with no sender behind it.
+    fn failing_run(engine: &SiriusEngine, label: FragmentLabel) -> String {
+        let plan = stream_plan(99, &[("id", false)]);
+        engine
+            .run(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label,
+            })
+            .expect_err("a stream with no sender fails before build")
+    }
+
+    /// A run of query A fails: A's parked output is dropped and poisoned with the cause, later
+    /// runs of A are refused at gate 1 (still sweeping the remote-input leases they carried),
+    /// and query B's parked output is untouched.
+    #[test]
+    fn a_failed_run_retires_only_its_own_query() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        let (a1, b1) = (slot_for(1, 7), slot_for(2, 8));
+        park(&engine, &plan, a1, labelled(200, 1));
+        park(&engine, &plan, b1, labelled(201, 1));
+
+        let err = failing_run(&engine, labelled(200, 2));
+        assert!(err.contains("no sender output"), "{err}");
+
+        // Gate 1: any later run of A is refused and names the original failure.
+        let err = failing_run(&engine, labelled(200, 3));
+        assert!(
+            err.contains("already retired") && err.contains("no sender output"),
+            "{err}"
+        );
+
+        // A's parked output is gone, and its slot says why.
+        let err = receive(&engine, a1, FragmentLabel::default()).unwrap_err();
+        assert!(
+            err.contains("was discarded when its query was retired"),
+            "{err}"
+        );
+        engine
+            .drop_parked(a1)
+            .expect("a slot retired with its query releases Ok once");
+        assert!(
+            engine.drop_parked(a1).is_err(),
+            "and is a loud error the second time"
+        );
+
+        // B is untouched.
+        assert_eq!(
+            row_count(receive(&engine, b1, labelled(201, 2)).unwrap()),
+            3
+        );
+
+        // A refused run still sweeps the remote-input leases it carried.
+        let lease = engine.staging_lease(4096).expect("lease");
+        let receiver = stream_plan(9, &[("id", false), ("name", true)]);
+        let err = engine
+            .run(FragmentRun {
+                plan: &receiver,
+                inputs: Vec::new(),
+                remote_inputs: vec![(
+                    9,
+                    0,
+                    vec![StagedBatch {
+                        metadata: vec![1],
+                        offset: lease,
+                        len: 4096,
+                        rows: Some(1),
+                    }],
+                )],
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: labelled(200, 4),
+            })
+            .expect_err("refused at gate 1");
+        assert!(err.contains("already retired"), "{err}");
+        let probe = engine.staging_lease(1024).expect("arena drained");
+        assert_eq!(probe, 0, "the sweep returned the refused run's lease");
+        engine.staging_release(probe).unwrap();
+
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// The CN-side route: `retire_query` drops the query's parked output (fire-and-forget, but
+    /// FIFO ahead of the next run) and refuses its later runs with the CN's cause.
+    #[test]
+    fn retire_query_drops_parked_output_and_refuses_later_runs() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        let c1 = slot_for(3, 7);
+        park(&engine, &plan, c1, labelled(202, 1));
+        engine
+            .retire_query(
+                FragmentInstanceId::from_halves(202, 0),
+                RetireTrigger::CnErr,
+                "translation failed",
+            )
+            .expect("retire is a non-blocking send");
+
+        let err = failing_run(&engine, labelled(202, 2));
+        assert!(
+            err.contains("already retired") && err.contains("translation failed"),
+            "{err}"
+        );
+        let err = receive(&engine, c1, FragmentLabel::default()).unwrap_err();
+        assert!(err.contains("retired: translation failed"), "{err}");
+        let probe = engine.staging_lease(1024).expect("arena untouched");
+        assert_eq!(probe, 0);
+        engine.staging_release(probe).unwrap();
+
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// An unlabeled failure (test fixtures, no StarRocks ids) retires only unlabeled output.
+    #[test]
+    fn an_unlabeled_failure_retires_only_the_unlabeled_bucket() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        let (u1, u2, l) = (slot_for(5, 7), slot_for(6, 7), slot_for(7, 8));
+        park(&engine, &plan, u1, FragmentLabel::default());
+        park(&engine, &plan, u2, FragmentLabel::default());
+        park(&engine, &plan, l, labelled(203, 1));
+
+        failing_run(&engine, FragmentLabel::default());
+
+        for slot in [u1, u2] {
+            let err = receive(&engine, slot, FragmentLabel::default()).unwrap_err();
+            assert!(
+                err.contains("was discarded when its query was retired"),
+                "{err}"
+            );
+        }
+        assert_eq!(row_count(receive(&engine, l, labelled(203, 2)).unwrap()), 3);
+    }
+
+    /// Gate 2: a query retired while one of its senders is inside `run()` gets that sender's
+    /// output dropped, not parked -- there would be nobody left to release it.
+    #[test]
+    fn output_parked_after_a_retire_is_dropped_not_parked() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        let d = FragmentInstanceId::from_halves(204, 0);
+        let d1 = slot_for(8, 7);
+        let retired = Arc::clone(&engine.retired);
+        let (respond_tx, respond_rx) = channel();
+        engine
+            .requests
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(EngineRequest::Run(ExecuteRequest {
+                plan: plan.to_substrait_bytes(),
+                stream_inputs: Vec::new(),
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![d1],
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: labelled(204, 1),
+                respond: respond_tx,
+                // The cancel lands while the fragment runs.
+                after_run: Some(Box::new(move || {
+                    lock(&retired).mark(d, "cancelled mid-run");
+                })),
+            }))
+            .unwrap();
+        let err = respond_rx
+            .recv()
+            .expect("engine response")
+            .expect_err("dropped instead of parked");
+        assert!(
+            err.contains("dropped instead of parked") && err.contains("cancelled mid-run"),
+            "{err}"
+        );
+
+        // Never parked: the drop is the generic loud error, not a torn-down release.
+        let err = engine.drop_parked(d1).unwrap_err();
+        assert!(err.contains("no parked sender output to drop"), "{err}");
+        // And D stays retired.
+        let err = failing_run(&engine, labelled(204, 2));
+        assert!(err.contains("already retired"), "{err}");
     }
 }

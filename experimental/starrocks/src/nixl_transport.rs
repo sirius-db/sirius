@@ -372,7 +372,8 @@ mod agent_tier {
                     let result = state.send_fragment(&spec);
                     if result.is_err() {
                         // Best-effort GPU cleanup: without it a failed transmit pins the parked
-                        // output for the process lifetime (per-query GC is cut from Path B).
+                        // output for the process lifetime. Per-query retirement makes a late
+                        // drop idempotent: a slot already retired with its query returns Ok once.
                         if let Err(drop_err) = state.executor.drop_parked(spec.slot) {
                             warn!(
                                 slot = ?spec.slot,

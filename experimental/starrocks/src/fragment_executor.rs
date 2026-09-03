@@ -10,6 +10,7 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+pub use crate::parked_registry::RetireTrigger;
 use crate::result_store::FragmentInstanceId;
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
@@ -46,6 +47,30 @@ pub struct SenderSlot {
     pub node_id: i32,
     /// Sender ordinal within that exchange's sender set.
     pub sender_id: i32,
+}
+
+/// Identity of one fragment run, as the engine's parked-output bookkeeping and the CN's run log
+/// lines see it.
+///
+/// The engine owns parked sender output per `query_id` (see `parked_registry`), and the CN's
+/// start/finish lines carry both ids next to this CN's exchange endpoint, so one StarRocks query's
+/// halves on different CNs line up. Both `None` when the dispatch carried no ids (fixtures).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FragmentLabel {
+    /// StarRocks query id, shared by every fragment instance of the query.
+    pub query_id: Option<FragmentInstanceId>,
+    /// The fragment instance the FE dispatched.
+    pub fragment_instance_id: Option<FragmentInstanceId>,
+}
+
+impl FragmentLabel {
+    /// The two ids as log-line text, `-` where the dispatch carried none.
+    pub fn log_ids(&self) -> (String, String) {
+        let text = |id: Option<FragmentInstanceId>| {
+            id.map_or_else(|| "-".to_string(), |id| id.to_string())
+        };
+        (text(self.query_id), text(self.fragment_instance_id))
+    }
 }
 
 /// One packed batch sitting in an exchange staging arena as cudf packed bytes.
@@ -90,6 +115,8 @@ pub struct FragmentRun<'a> {
     /// Hash-partition key columns (output column indices, in the exchange's shared
     /// partition-expression order). Non-empty exactly for a hash-partitioned fan-out.
     pub hash_keys: Vec<usize>,
+    /// The query and instance this run belongs to; the engine parks output under `query_id`.
+    pub label: FragmentLabel,
 }
 
 /// Runs a translated fragment, either parking its output for a downstream fragment or returning
@@ -147,6 +174,20 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         let _ = slot;
         Err("this fragment executor parks nothing to drop".to_string())
+    }
+
+    /// Drops every parked output of `query_id` and refuses later runs for it. Non-blocking and
+    /// idempotent. Called when the CN learns the query is over: a fragment failed before the engine
+    /// ran it, or the FE cancelled. Unlike `drop_parked` this is a sweep, not an exactly-once
+    /// release, so an executor that parks nothing succeeds trivially.
+    fn retire_query(
+        &self,
+        query_id: FragmentInstanceId,
+        trigger: RetireTrigger,
+        cause: &str,
+    ) -> Result<(), String> {
+        let _ = (query_id, trigger, cause);
+        Ok(())
     }
 }
 
@@ -225,5 +266,21 @@ mod tests {
     fn stub_executor_handles_empty_output() {
         let result = StubExecutor.execute(&plan_with_outputs(&[])).unwrap();
         assert!(result.batches.is_empty());
+    }
+
+    /// A dispatch without ids logs `-` for both; with ids, the two render distinctly.
+    #[test]
+    fn fragment_label_renders_ids_or_dashes() {
+        let label = FragmentLabel {
+            query_id: Some(FragmentInstanceId::from_halves(1, 2)),
+            fragment_instance_id: Some(FragmentInstanceId::from_halves(1, 3)),
+        };
+        let (query, instance) = label.log_ids();
+        assert_ne!(query, instance);
+        assert_eq!(query, FragmentInstanceId::from_halves(1, 2).to_string());
+        assert_eq!(
+            FragmentLabel::default().log_ids(),
+            ("-".to_string(), "-".to_string())
+        );
     }
 }

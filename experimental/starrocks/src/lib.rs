@@ -55,6 +55,7 @@ mod fragment_executor;
 mod gpu_affinity;
 mod local_exchange;
 mod nixl_transport;
+mod parked_registry;
 mod proto;
 mod prpc;
 mod prpc_client;
