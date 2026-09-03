@@ -27,6 +27,7 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
@@ -51,8 +52,8 @@ TEST_CASE("debug_schema produces output without throwing", "[debug_utils]")
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create INT32 column (5 rows)
   std::vector<int32_t> vals_a{10, 20, 30, 40, 50};
@@ -86,8 +87,8 @@ TEST_CASE("debug_schema with no column names uses defaults", "[debug_utils]")
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   std::vector<int32_t> vals_a{1, 2, 3, 4, 5};
   auto col_a =
@@ -120,8 +121,8 @@ TEST_CASE("debug_nulls produces output without throwing", "[debug_utils]")
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   std::vector<int32_t> vals_a{10, 20, 30, 40, 50};
   auto col_a =
@@ -153,8 +154,8 @@ TEST_CASE("debug_schema handles empty batch (0 rows)", "[debug_utils]")
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create two columns with 0 rows
   auto col_a = cudf::make_numeric_column(
@@ -184,8 +185,8 @@ TEST_CASE("debug_nulls reports correct null counts for columns with nulls", "[de
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
 
@@ -239,8 +240,8 @@ TEST_CASE("copy_null_mask_to_host returns correct null positions", "[debug_utils
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 8;
 
@@ -294,8 +295,8 @@ TEST_CASE("copy_null_mask_to_host returns has_nulls=false for non-null column", 
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a column with no nulls (UNALLOCATED mask)
   auto col = cudf::make_numeric_column(
@@ -341,8 +342,8 @@ TEST_CASE("debug_head on multi-type numeric batch (ALIGNED)", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -379,8 +380,8 @@ TEST_CASE("debug_head CSV format produces output without throwing", "[debug_util
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {1, 2, 3, 4, 5}, stream, mr);
@@ -408,8 +409,8 @@ TEST_CASE("debug_head clamps N to row count without throwing", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -434,8 +435,8 @@ TEST_CASE("debug_head on empty batch prints note without throwing", "[debug_util
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
@@ -459,8 +460,8 @@ TEST_CASE("debug_head shows NULL for null positions", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
   auto col                           = cudf::make_numeric_column(
@@ -513,8 +514,8 @@ TEST_CASE("debug_stats on numeric columns produces output without throwing", "[d
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -547,8 +548,8 @@ TEST_CASE("debug_stats skips BOOL column as non-numeric", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -575,8 +576,8 @@ TEST_CASE("debug_stats on all-NULL numeric column shows NULL", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
   auto col                           = cudf::make_numeric_column(
@@ -602,8 +603,8 @@ TEST_CASE("debug_stats on empty batch prints note without throwing", "[debug_uti
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT32}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
@@ -641,8 +642,8 @@ TEST_CASE("debug_head on STRING column shows string values", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col =
     sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
@@ -667,8 +668,8 @@ TEST_CASE("debug_head on STRING column truncates with max_string_len", "[debug_u
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col =
     sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<test_utils::string_tag>>(
@@ -694,8 +695,8 @@ TEST_CASE("debug_head on DECIMAL64 column shows scaled values", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // decimal64_tag: scale=-2, values {12345, -100, 5} represent 123.45, -1.00, 0.05
   auto col =
@@ -721,8 +722,8 @@ TEST_CASE("debug_head on TIMESTAMP_MICROSECONDS column shows calendar format", "
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // 1705305000000000 us = 2024-01-15 08:30:00 UTC
   // 0 = 1970-01-01 00:00:00
@@ -750,8 +751,8 @@ TEST_CASE("debug_head on DATE column shows date format", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // 19738 days since epoch = 2024-01-15
   // 0 = 1970-01-01
@@ -779,8 +780,8 @@ TEST_CASE("debug_head on mixed batch with all supported types", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_int = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -821,8 +822,8 @@ TEST_CASE("debug_head on STRING column with nulls shows NULL", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create string column with 3 rows
   auto col =
@@ -863,8 +864,8 @@ TEST_CASE("debug_checksum on numeric column produces output without throwing", "
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -888,8 +889,8 @@ TEST_CASE("debug_checksum on multi-type batch produces per-column output", "[deb
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   auto col_i32 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
     {10, 20, 30}, stream, mr);
@@ -921,8 +922,8 @@ TEST_CASE("debug_checksum on empty batch prints note without throwing", "[debug_
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create empty INT32 column (0 rows)
   auto col = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
@@ -946,8 +947,8 @@ TEST_CASE("debug_checksum on all-NULL column produces zero checksum", "[debug_ut
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create INT32 column with 5 rows, all NULL
   constexpr cudf::size_type num_rows = 5;
@@ -987,8 +988,8 @@ TEST_CASE("debug_diff identical batches reports no diffs", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create two identical batches: INT32 + INT64, 5 rows each
   auto make_batch = [&]() {
@@ -1021,8 +1022,8 @@ TEST_CASE("debug_diff column count mismatch logs schema mismatch", "[debug_utils
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // batch_a: 2 columns (INT32, INT64)
   auto col_a1 = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1061,8 +1062,8 @@ TEST_CASE("debug_diff column type mismatch logs schema mismatch", "[debug_utils]
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // batch_a: 1 column (INT32, values {1,2,3})
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1098,8 +1099,8 @@ TEST_CASE("debug_diff row count mismatch logs row count mismatch", "[debug_utils
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // batch_a: 1 column (INT32, 3 rows)
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1135,8 +1136,8 @@ TEST_CASE("debug_diff value differences reports per-column diff counts", "[debug
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // batch_a: 1 column (INT32, 5 rows: {1, 2, 3, 4, 5})
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1172,8 +1173,8 @@ TEST_CASE("debug_diff with null differences detects null position diffs", "[debu
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   constexpr cudf::size_type num_rows = 5;
 
@@ -1249,8 +1250,8 @@ TEST_CASE("debug_diff row limit guard skips comparison for large batches", "[deb
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a small batch (5 rows) but pass max_rows=2 to trigger the guard
   auto make_batch = [&]() {
@@ -1282,8 +1283,8 @@ TEST_CASE("debug_diff empty batches handles gracefully", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create two empty batches (0 rows, 1 INT32 column each)
   auto make_empty_batch = [&]() {
@@ -1317,8 +1318,8 @@ TEST_CASE("debug_sample basic operation with named columns", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a batch with 2 columns (INT32, INT64), 10 rows
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1348,8 +1349,8 @@ TEST_CASE("debug_sample with fixed seed is reproducible", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a batch with 1 column (INT32, 20 rows: {0..19})
   std::vector<int32_t> vals(20);
@@ -1382,8 +1383,8 @@ TEST_CASE("debug_sample N > num_rows clamps silently", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a batch with 1 column (INT32, 3 rows)
   auto col = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1410,8 +1411,8 @@ TEST_CASE("debug_sample CSV format produces output without throwing", "[debug_ut
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a batch with 2 columns (INT32, FLOAT64), 5 rows
   auto col_a = sirius::test::vector_to_cudf_column<test_utils::gpu_type_traits<int32_t>>(
@@ -1441,8 +1442,8 @@ TEST_CASE("debug_sample empty batch handles gracefully", "[debug_utils]")
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create an empty batch (0 rows, 1 INT32 column)
   auto col = cudf::make_numeric_column(
@@ -1468,8 +1469,8 @@ TEST_CASE("debug_sample with STRING columns extracts values correctly", "[debug_
   auto memory_manager = test_utils::initialize_memory_manager();
   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = test_utils::get_resource_ref(*space);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = test_utils::get_resource_ref(*space);
 
   // Create a STRING column following established pattern from test case 20
   auto col =

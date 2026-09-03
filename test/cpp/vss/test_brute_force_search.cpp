@@ -31,6 +31,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
@@ -91,7 +92,7 @@ std::vector<T> to_host(cudf::column_view const& col)
 
 TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   // Dataset row i is [i, i, i]; query is the origin, so distances grow with i and
@@ -135,7 +136,7 @@ TEST_CASE("brute_force_knn returns the exact nearest rows in order", "[vss]")
 
 TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   constexpr cudf::size_type dim = 2;
@@ -174,7 +175,7 @@ TEST_CASE("brute_force_knn cosine orders by angle, not magnitude", "[vss]")
 
 TEST_CASE("brute_force_knn rejects out-of-range k and mismatched dims", "[vss]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   raft::device_resources res{stream};
 
   constexpr cudf::size_type n_rows = 4;

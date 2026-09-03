@@ -16,6 +16,8 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -73,7 +75,7 @@ void io_roundtrip(char const* label,
                   std::string const& dsl,
                   std::vector<std::string> column_names = {})
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
 
   // Compress.
   simpatico::compressed_table ct1 = simpatico::compress_with_plan(
@@ -130,8 +132,8 @@ void io_roundtrip(char const* label,
 // through the same fetch seam pin_table uses.
 void memory_roundtrip(char const* label, cudf::table_view input, std::string const& dsl)
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = rmm::mr::get_current_device_resource_ref();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = rmm::mr::get_current_device_resource_ref();
 
   simpatico::compressed_table ct = simpatico::compress_with_plan(input, dsl, stream, mr);
 
@@ -337,16 +339,16 @@ void test_multi_column()
 // column. Exercise all three overload families.
 void test_selective_decompression()
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = rmm::mr::get_current_device_resource_ref();
-  auto t      = make_int32_table(3, 2048, 29);
-  auto ct     = simpatico::compress_with_plan(t->view(),
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = rmm::mr::get_current_device_resource_ref();
+  auto t                       = make_int32_table(3, 2048, 29);
+  auto ct                      = simpatico::compress_with_plan(t->view(),
                                           "input -> for -> deltas, references\n"
-                                              "---\n"
-                                              "input -> delta -> differences\n"
-                                              "delta.differences -> bitpack\n"
-                                              "---\n"
-                                              "input -> bitpack\n",
+                                                               "---\n"
+                                                               "input -> delta -> differences\n"
+                                                               "delta.differences -> bitpack\n"
+                                                               "---\n"
+                                                               "input -> bitpack\n",
                                           stream,
                                           mr);
 
@@ -391,19 +393,19 @@ void test_selective_decompression()
 // in addition to metadata, order, duplicate, empty, and error behavior.
 void test_memory_subset_read()
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = rmm::mr::get_current_device_resource_ref();
-  auto t      = make_int32_table(3, 2048, 37);
-  auto ct     = simpatico::compress_with_plan(t->view(),
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto mr                      = rmm::mr::get_current_device_resource_ref();
+  auto t                       = make_int32_table(3, 2048, 37);
+  auto ct                      = simpatico::compress_with_plan(t->view(),
                                           "input -> for -> deltas, references\n"
-                                              "---\n"
-                                              "input -> delta -> differences\n"
-                                              "delta.differences -> bitpack\n"
-                                              "---\n"
-                                              "input -> bitpack\n",
+                                                               "---\n"
+                                                               "input -> delta -> differences\n"
+                                                               "delta.differences -> bitpack\n"
+                                                               "---\n"
+                                                               "input -> bitpack\n",
                                           stream,
                                           mr,
-                                              {"first", "second", "third"});
+                                                               {"first", "second", "third"});
 
   std::vector<std::uint8_t> header;
   std::vector<simpatico::payload_buffer_ref> buffers;
@@ -578,8 +580,8 @@ void test_error_bad_version()
 // file (both the file path and the in-memory pin path).
 void test_identity_string_roundtrip()
 {
-  auto stream = cudf::get_default_stream();
-  auto input  = make_string_table(128, stream);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto input                   = make_string_table(128, stream);
   io_roundtrip("identity_string", input->view(), "input -> identity\n");
   memory_roundtrip("identity_string_mem", input->view(), "input -> identity\n");
 }
@@ -591,7 +593,7 @@ void test_identity_string_roundtrip()
 // rerouted sf1000 plans serialize in production.
 void test_str_split_plan_shapes_roundtrip()
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
 
   std::vector<std::string> addresses;
   std::vector<std::string> phones;

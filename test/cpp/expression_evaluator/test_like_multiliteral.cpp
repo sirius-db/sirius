@@ -43,6 +43,7 @@
 // rmm
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 // standard library
@@ -64,9 +65,9 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
                                            std::vector<bool> const& valids = {},
                                            bool int64_offsets              = false)
 {
-  auto stream  = cudf::get_default_stream();
-  auto mr      = cudf::get_current_device_resource_ref();
-  auto const n = static_cast<cudf::size_type>(rows.size());
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  auto mr                       = cudf::get_current_device_resource_ref();
+  auto const n                  = static_cast<cudf::size_type>(rows.size());
 
   std::string chars;
   std::vector<int64_t> offsets(rows.size() + 1, 0);
@@ -84,7 +85,7 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
                     offsets.data(),
                     offsets.size() * sizeof(int64_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   } else {
     std::vector<int32_t> offsets32(offsets.begin(), offsets.end());
     offsets_col = cudf::make_numeric_column(
@@ -93,8 +94,8 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
                     offsets32.data(),
                     offsets32.size() * sizeof(int32_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    stream.synchronize();  // offsets32 goes out of scope here
+                    stream.get());
+    stream.sync();  // offsets32 goes out of scope here
   }
 
   rmm::device_buffer mask_buf{};
@@ -116,7 +117,7 @@ std::unique_ptr<cudf::column> make_strings(std::vector<std::string> const& rows,
 
   auto col = cudf::make_strings_column(
     n, std::move(offsets_col), std::move(chars_buf), null_count, std::move(mask_buf));
-  stream.synchronize();  // host vectors go out of scope
+  stream.sync();  // host vectors go out of scope
   return col;
 }
 
@@ -146,9 +147,9 @@ std::vector<bool> to_host_validity(cudf::column_view const& col)
 /// (values on valid rows, validity everywhere) for both LIKE and NOT LIKE.
 void require_matches_cudf(cudf::column_view const& view, std::string const& pattern)
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
-  auto scv    = cudf::strings_column_view(view);
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  auto mr                       = cudf::get_current_device_resource_ref();
+  auto scv                      = cudf::strings_column_view(view);
 
   auto const parsed = classify_like_multiliteral(pattern, {});
   REQUIRE(parsed.has_value());
@@ -416,8 +417,8 @@ TEST_CASE("like_multiliteral matches cudf on seeded random near-miss data",
 TEST_CASE("like_multiliteral handles column-layout edges",
           "[expression_evaluator][like_multiliteral]")
 {
-  auto stream = cudf::get_default_stream();
-  auto mr     = cudf::get_current_device_resource_ref();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  auto mr                       = cudf::get_current_device_resource_ref();
 
   SECTION("INT64 offsets (large-strings layout) execute the int64 kernel instantiation")
   {
@@ -470,15 +471,15 @@ TEST_CASE("like_multiliteral handles column-layout edges",
                     chars.data(),
                     chars.size(),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
     auto offsets_col = cudf::make_numeric_column(
       cudf::data_type{cudf::type_id::INT32}, n + 1, cudf::mask_state::UNALLOCATED, stream, mr);
     cudaMemcpyAsync(offsets_col->mutable_view().data<int32_t>(),
                     offsets.data(),
                     offsets.size() * sizeof(int32_t),
                     cudaMemcpyHostToDevice,
-                    stream.value());
-    stream.synchronize();
+                    stream.get());
+    stream.sync();
 
     cudf::column_view const strings_view(cudf::data_type{cudf::type_id::STRING},
                                          n,
