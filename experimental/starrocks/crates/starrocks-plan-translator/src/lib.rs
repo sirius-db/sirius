@@ -30,7 +30,7 @@
 //! | `FILE_SCAN_NODE`     | `ReadRel` (local files) |
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
-//! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
+//! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s; those an ancestor consumes are carried as trailing columns and confined at the fragment root) |
 //! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or either half of a two-phase plan) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
@@ -295,6 +295,7 @@ impl PlanTranslator {
             partial_expansion,
         } = node_translator::translate_plan(
             plan,
+            fragment.output_exprs.as_deref().unwrap_or_default(),
             &desc,
             &scan_paths,
             &exchange_inputs,
@@ -323,13 +324,22 @@ impl PlanTranslator {
             translated =
                 node_translator::project_exprs(translated, output_exprs, &desc, &mut registry)?;
             names
-        } else if let Some(expansion) = &partial_expansion {
-            // A partial avg ships more columns than the FE's output tuple has slots, so the
-            // descriptor table cannot name the row. These names are what the receiver reads
-            // the stream's columns by.
-            expansion.names.clone()
         } else {
-            desc.output_names_for_tuples(&translated.row_tuples)?
+            // Carried common-expr columns are a fragment-internal mechanism and never leave
+            // the fragment. Narrow back to the descriptor row BEFORE deriving names: a
+            // width-preserving root (a SELECT conjunct above the carrying project, say) would
+            // otherwise ship columns the sender's names and the receiver's declared stream
+            // schema do not describe. (The output_exprs branch above narrows naturally; its
+            // root projection emits only the output expressions.)
+            translated = node_translator::confine_carried(translated);
+            if let Some(expansion) = &partial_expansion {
+                // A partial avg ships more columns than the FE's output tuple has slots, so
+                // the descriptor table cannot name the row. These names are what the receiver
+                // reads the stream's columns by.
+                expansion.names.clone()
+            } else {
+                desc.output_names_for_tuples(&translated.row_tuples)?
+            }
         };
 
         let output_names = unique_names(output_names).collect::<Vec<_>>();
