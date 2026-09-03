@@ -6,8 +6,8 @@ use clap::Parser;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, EngineReadiness, FeConfig, FragmentExecutor,
-    HeartbeatServer, HttpServer, SharedHeartbeatState, Tunables, register_node,
+    BackendServer, BrpcServer, ComputeNodeConfig, EngineReadiness, ExchangeIdentity, FeConfig,
+    FragmentExecutor, HeartbeatServer, HttpServer, SharedHeartbeatState, Tunables, register_node,
     report_to_frontend_once, start_backend_server, start_heartbeat_server, start_http_server,
 };
 #[cfg(feature = "sirius-engine")]
@@ -516,6 +516,9 @@ impl BrpcRuntime {
         executor: Arc<dyn FragmentExecutor>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
+        // The identity the FE routes exchanges by: the advertised host plus this brpc port.
+        let identity =
+            ExchangeIdentity::new(compute_node.advertise_host.as_str(), compute_node.brpc_port);
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let join = tokio::task::spawn_blocking(move || {
@@ -524,7 +527,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor)
+                BrpcServer::with_executor(executor, identity)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

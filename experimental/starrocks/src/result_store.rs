@@ -61,19 +61,6 @@ enum FragmentState {
     Failed(String),
 }
 
-/// Result-stream progress for a live fragment, in the shape dev's `fetch_data` handler reads
-/// today (`take_next`). The dispatch layer switches that handler to [`ResultStore::wait_ready`]
-/// and [`FetchOutcome`], which also carry a failure, and retires this struct with it.
-#[derive(Debug)]
-pub(crate) struct FetchProgress {
-    /// Result rows to ship as the response attachment, when present.
-    pub(crate) batch: Option<TResultBatch>,
-    /// Monotonic packet sequence the FE uses to detect lost packets.
-    pub(crate) packet_seq: i64,
-    /// End-of-stream marker; the FE stops polling once true.
-    pub(crate) eos: bool,
-}
-
 /// What a single `fetch_data` poll should return to the FE.
 #[derive(Debug)]
 pub(crate) enum FetchOutcome {
@@ -87,8 +74,6 @@ pub(crate) enum FetchOutcome {
         eos: bool,
     },
     /// The fragment failed; the poll must surface this cause as an error.
-    // Read by the dispatch layer's fetch_data (stacked/cn-exchange-dispatch); dev's take_next drops it.
-    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -126,8 +111,6 @@ impl ResultStore {
     /// remembering which query it belongs to. If that query already failed (an intermediate
     /// fragment can fail before the FE dispatches the result fragment), the reservation lands
     /// as the failure so the very first `fetch_data` poll reports it.
-    // Called by the dispatch worker (stacked/cn-exchange-dispatch); nothing on this base reserves.
-    #[allow(dead_code)]
     pub(crate) fn reserve(&self, id: FragmentInstanceId, query_id: FragmentInstanceId) {
         let mut state = self.lock();
         let results = state.query_results.entry(query_id).or_default();
@@ -158,8 +141,6 @@ impl ResultStore {
     /// Marks a fragment failed so `fetch_data` reports the cause instead of waiting forever.
     /// The failure sticks: like `Drained`, repeat polls keep re-reporting it rather than
     /// reverting to "unknown fragment".
-    // Called by the dispatch worker (stacked/cn-exchange-dispatch); nothing on this base fails.
-    #[allow(dead_code)]
     pub(crate) fn fail(&self, id: FragmentInstanceId, error: String) {
         self.lock()
             .fragments
@@ -169,11 +150,9 @@ impl ResultStore {
 
     /// Fails fragment `failed_id` and every result-fragment instance reserved for `query_id`,
     /// waking any `fetch_data` long-poll. Also records the failure at query level so a result
-    /// fragment that reserves later fails on arrival. Without this, an intermediate fragment
+    /// fragment that reserves later fails on arrival — without this, an intermediate fragment
     /// failing before the result fragment registers would be lost and the FE would poll until
     /// its timeout. The propagated message carries the original fragment's error verbatim.
-    // Called by the dispatch worker (stacked/cn-exchange-dispatch); nothing on this base fails.
-    #[allow(dead_code)]
     pub(crate) fn fail_query(
         &self,
         query_id: FragmentInstanceId,
@@ -216,8 +195,6 @@ impl ResultStore {
     /// Best-effort cancellation mark: a still-`Waiting` entry becomes a failure so a
     /// `fetch_data` long-poll returns instead of blocking out its timeout. Delivered,
     /// drained, or already-failed entries keep their state; unknown ids are ignored.
-    // Called from cancel_plan_fragment in the dispatch layer (stacked/cn-exchange-dispatch).
-    #[allow(dead_code)]
     pub(crate) fn cancel(&self, id: FragmentInstanceId, reason: String) {
         let mut state = self.lock();
         if let Some(entry @ FragmentState::Waiting) = state.fragments.get_mut(&id) {
@@ -227,13 +204,11 @@ impl ResultStore {
         }
     }
 
-    /// Blocks until fragment `id` has something to report, then advances the state machine.
-    /// This is the long-poll `fetch_data` needs once receivers execute on the dispatch thread.
-    /// The stock BE holds the rpc open until the sink produces; replying not-ready instead
-    /// desyncs the FE's packet counter (see `ready`). A timeout is a *loud* failure rather than
-    /// an empty reply, for the same reason.
-    // The dispatch layer (stacked/cn-exchange-dispatch) moves fetch_data onto this long-poll.
-    #[allow(dead_code)]
+    /// Blocks until fragment `id` has something to report, then advances the state machine —
+    /// the long-poll `fetch_data` needs now that receivers execute on the dispatch thread. The
+    /// stock BE holds the rpc open until the sink produces; replying not-ready instead desyncs
+    /// the FE's packet counter (see `ready`). A timeout is a *loud* failure rather than an empty
+    /// reply, for the same reason.
     pub(crate) fn wait_ready(
         &self,
         id: FragmentInstanceId,
@@ -257,11 +232,10 @@ impl ResultStore {
             let _ = wait;
         }
         drop(guard);
-        self.poll(id)
+        self.take_next(id)
     }
 
-    /// Advances the `fetch_data` state machine for one fragment without blocking: not-ready
-    /// while `Waiting`, deliver rows once, then EOS, and the recorded cause once `Failed`.
+    /// Advances the `fetch_data` state machine for one fragment: deliver rows once, then EOS.
     /// Returns `None` for an id this CN never buffered, which the caller reports as an error
     /// (StarRocks treats a missing result buffer as a failure, not an empty result). A drained
     /// fragment stays in the map so a repeat poll still reports EOS rather than reading as unknown.
@@ -271,7 +245,7 @@ impl ResultStore {
     /// concurrent polls (advance state only after the response is written; keep a per-fragment
     /// in-flight guard), and (c) eviction of drained entries (and the per-query bookkeeping) on
     /// `cancel_plan_fragment`/timeout so the maps do not grow for the process lifetime.
-    pub(crate) fn poll(&self, id: FragmentInstanceId) -> Option<FetchOutcome> {
+    pub(crate) fn take_next(&self, id: FragmentInstanceId) -> Option<FetchOutcome> {
         let mut guard = self.lock();
         match guard.fragments.get_mut(&id) {
             None => None,
@@ -298,26 +272,6 @@ impl ResultStore {
                 eos: true,
             }),
             Some(FragmentState::Failed(error)) => Some(FetchOutcome::Failed(error.clone())),
-        }
-    }
-
-    /// Dev's `fetch_data` poll: [`Self::poll`] narrowed to the rows-only shape that handler
-    /// reads. A `Failed` entry reads as `None` here, so the handler still answers with its
-    /// "no buffered result" error rather than hanging; the cause text reaches the FE once the
-    /// dispatch layer moves `fetch_data` onto [`Self::wait_ready`]. Nothing on this base records
-    /// a failure, so that narrowing is unreachable outside tests until then.
-    pub(crate) fn take_next(&self, id: FragmentInstanceId) -> Option<FetchProgress> {
-        match self.poll(id)? {
-            FetchOutcome::Rows {
-                batch,
-                packet_seq,
-                eos,
-            } => Some(FetchProgress {
-                batch,
-                packet_seq,
-                eos,
-            }),
-            FetchOutcome::Failed(_) => None,
         }
     }
 
@@ -350,31 +304,24 @@ mod tests {
         }
     }
 
-    /// Destructures a poll that must be a failure, returning its cause.
-    fn failure(outcome: FetchOutcome) -> String {
-        match outcome {
-            FetchOutcome::Failed(error) => error,
-            other => panic!("expected failure, got {other:?}"),
-        }
-    }
-
     #[test]
     fn delivers_rows_once_then_reports_eos_on_repeat_polls() {
         let store = ResultStore::default();
         let id = FragmentInstanceId::from_halves(1, 2);
         store.insert(id, batch(&["a", "b"]));
 
-        let first = store.take_next(id).expect("known fragment");
-        assert!(!first.eos);
-        assert_eq!(first.batch.unwrap().rows.len(), 2);
+        let (first_batch, first_eos) = rows(store.take_next(id).expect("known fragment"));
+        assert!(!first_eos);
+        assert_eq!(first_batch.unwrap().rows.len(), 2);
 
         // A drained fragment keeps reporting EOS, never reverting to "unknown".
-        let second = store.take_next(id).expect("drained fragment still known");
-        assert!(second.eos);
-        assert!(second.batch.is_none());
+        let (second_batch, second_eos) =
+            rows(store.take_next(id).expect("drained fragment still known"));
+        assert!(second_eos);
+        assert!(second_batch.is_none());
 
-        let third = store.take_next(id).expect("drained fragment still known");
-        assert!(third.eos);
+        let (_, third_eos) = rows(store.take_next(id).expect("drained fragment still known"));
+        assert!(third_eos);
     }
 
     #[test]
@@ -385,17 +332,6 @@ mod tests {
                 .take_next(FragmentInstanceId::from_halves(9, 9))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn take_next_reads_a_failed_entry_as_none() {
-        let store = ResultStore::default();
-        let id = FragmentInstanceId::from_halves(3, 3);
-        store.fail(id, "receiver exploded".to_string());
-
-        // Dev's rows-only poll has no failure channel; it must not hang or fabricate rows.
-        assert!(store.take_next(id).is_none());
-        assert_eq!(failure(store.poll(id).expect("known")), "receiver exploded");
     }
 
     /// A query id for tests that only need the reserve association, not failure propagation.
@@ -410,12 +346,13 @@ mod tests {
         store.reserve(id, query(4));
 
         let (waiting_batch, waiting_eos) =
-            rows(store.poll(id).expect("reserved fragment is known"));
+            rows(store.take_next(id).expect("reserved fragment is known"));
         assert!(!waiting_eos);
         assert!(waiting_batch.is_none());
 
         store.insert(id, batch(&["ready"]));
-        let (ready_batch, ready_eos) = rows(store.poll(id).expect("completed fragment is known"));
+        let (ready_batch, ready_eos) =
+            rows(store.take_next(id).expect("completed fragment is known"));
         assert!(!ready_eos);
         assert_eq!(ready_batch.unwrap().rows.len(), 1);
     }
@@ -427,7 +364,7 @@ mod tests {
         let id = FragmentInstanceId::from_halves(9, 1);
         store.reserve(id, query(9));
 
-        // Rows land from another thread while the poll is blocked, the dispatch-worker shape.
+        // Rows land from another thread while the poll is blocked -- the dispatch-worker shape.
         let producer = {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
@@ -469,10 +406,18 @@ mod tests {
         // The failure sticks across polls, mirroring Drained: the FE must never see the
         // fragment revert to "waiting" or "unknown" after its execution failed.
         for _ in 0..2 {
-            match store.poll(id).expect("failed fragment is known") {
+            match store.take_next(id).expect("failed fragment is known") {
                 FetchOutcome::Failed(error) => assert_eq!(error, "receiver exploded"),
                 other => panic!("expected failure, got {other:?}"),
             }
+        }
+    }
+
+    /// Destructures a poll that must be a failure, returning its cause.
+    fn failure(outcome: FetchOutcome) -> String {
+        match outcome {
+            FetchOutcome::Failed(error) => error,
+            other => panic!("expected failure, got {other:?}"),
         }
     }
 
@@ -486,9 +431,9 @@ mod tests {
         store.fail_query(query(6), intermediate_id, "relay guard fired".to_string());
 
         // The failing instance carries its raw error; the result instance names the origin.
-        let intermediate = failure(store.poll(intermediate_id).expect("known"));
+        let intermediate = failure(store.take_next(intermediate_id).expect("known"));
         assert_eq!(intermediate, "relay guard fired");
-        let result = failure(store.poll(result_id).expect("known"));
+        let result = failure(store.take_next(result_id).expect("known"));
         assert!(
             result.contains(&intermediate_id.to_string()) && result.contains("relay guard fired"),
             "cause: {result}"
@@ -530,7 +475,7 @@ mod tests {
 
         store.insert(result_id, batch(&["late rows"]));
 
-        let cause = failure(store.poll(result_id).expect("known"));
+        let cause = failure(store.take_next(result_id).expect("known"));
         assert!(cause.contains("boom"), "cause: {cause}");
     }
 
@@ -540,20 +485,20 @@ mod tests {
         let waiting = FragmentInstanceId::from_halves(11, 1);
         store.reserve(waiting, query(11));
         store.cancel(waiting, "cancelled by the FE".to_string());
-        let cause = failure(store.poll(waiting).expect("known"));
+        let cause = failure(store.take_next(waiting).expect("known"));
         assert!(cause.contains("cancelled"), "cause: {cause}");
 
         // Delivered rows keep flowing; cancel must not clobber them.
         let delivered = FragmentInstanceId::from_halves(11, 2);
         store.insert(delivered, batch(&["row"]));
         store.cancel(delivered, "cancelled by the FE".to_string());
-        let (rows_batch, eos) = rows(store.poll(delivered).expect("known"));
+        let (rows_batch, eos) = rows(store.take_next(delivered).expect("known"));
         assert!(!eos);
         assert_eq!(rows_batch.expect("rows survive cancel").rows.len(), 1);
 
         // Unknown ids stay unknown: cancel must not fabricate result entries.
         let unknown = FragmentInstanceId::from_halves(11, 3);
         store.cancel(unknown, "cancelled by the FE".to_string());
-        assert!(store.poll(unknown).is_none());
+        assert!(store.take_next(unknown).is_none());
     }
 }

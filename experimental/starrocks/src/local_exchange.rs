@@ -32,6 +32,9 @@ pub(crate) enum SenderSource {
     },
     /// A remote sender whose batches arrive over the cross-CN transport tier. Counts toward
     /// readiness only once `closed`.
+    // Constructed by the cross-node transport tier (`push_remote_frame`); this base only matches
+    // on it, in `names()` and `is_complete()`.
+    #[allow(dead_code)]
     Remote {
         /// Sender output names carried on every transmitted frame (first frame wins, later
         /// frames must match).

@@ -81,23 +81,6 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     /// Runs `run`. Returns rows only for a fragment with no `output` slot — a result fragment.
     fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String>;
 
-    /// Runs `translated` as a result fragment — no exchange inputs, no destinations — and
-    /// returns its rows.
-    ///
-    /// Transitional: the single-fragment dispatch path still executes one plan at a time through
-    /// this method. The dispatch layer (`stacked/cn-exchange-dispatch`) moves onto
-    /// [`run`](Self::run) and removes it.
-    fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
-        self.run(FragmentRun {
-            plan: translated,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            broadcast: false,
-            hash_keys: Vec::new(),
-        })?
-        .ok_or_else(|| "a result fragment returned no rows".to_string())
-    }
-
     /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called
     /// after the drained output has been transmitted (or on a failed transmit, so a wedged
     /// cross-node query does not pin its output for the process lifetime).

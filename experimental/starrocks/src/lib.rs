@@ -53,9 +53,6 @@ mod engine_settings;
 mod file_schema;
 mod fragment_executor;
 mod gpu_affinity;
-// Consumed by the dispatch layer (stacked/cn-exchange-dispatch); nothing on this base
-// constructs the rendezvous yet.
-#[allow(dead_code)]
 mod local_exchange;
 mod proto;
 mod prpc;
@@ -64,6 +61,7 @@ mod result_store;
 mod tunable;
 
 pub use brpc::BrpcServer;
+pub use compute_node_service::ExchangeIdentity;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use engine_settings::{
@@ -610,13 +608,20 @@ impl BackendServiceSyncHandler for ComputeNodeBackendHandler {
         ))
     }
 
-    // Cancellation is unsupported because this CN cannot start fragments yet.
+    // Best-effort cancellation stub: acknowledge with OK so the FE's cancel path completes
+    // cleanly instead of surfacing "not implemented" into unrelated queries. Real fragment
+    // teardown is a separate work item; fragments are dispatched over brpc, so the brpc
+    // `cancel_plan_fragment` is the surface that marks the results registry.
     fn handle_cancel_plan_fragment(
         &self,
-        _params: internal_service::TCancelPlanFragmentParams,
+        params: internal_service::TCancelPlanFragmentParams,
     ) -> thrift::Result<internal_service::TCancelPlanFragmentResult> {
+        info!(
+            fragment_instance_id = ?params.fragment_instance_id,
+            "acknowledging BackendService.cancelPlanFragment (best-effort: no engine-side abort yet)"
+        );
         Ok(internal_service::TCancelPlanFragmentResult::new(Some(
-            not_implemented_status("BackendService.cancelPlanFragment"),
+            ok_status(),
         )))
     }
 
