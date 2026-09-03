@@ -19,6 +19,8 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cuda/stream>
+
 #include <catch.hpp>
 #include <op/aggregate/dense_count_join_impl.hpp>
 #include <op/sirius_physical_dense_count_join.hpp>
@@ -626,7 +628,8 @@ TEST_CASE("dense_count_join: retained multi-batch extrema merge on a non-default
 
   // The direct operator-test path does not run task input preparation, so order batch creation
   // before deliberately executing the operator on another stream.
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const default_stream = cudf::get_default_stream();
+  default_stream.sync();
   rmm::cuda_stream stream;
   auto rows = run_dense_count_join<int32_t>(*space,
                                             duckdb::LogicalTypeId::INTEGER,

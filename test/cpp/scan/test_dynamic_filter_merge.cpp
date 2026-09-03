@@ -36,6 +36,8 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -324,8 +326,8 @@ std::shared_ptr<sirius_dynamic_zone_map_filter> make_zone_map_from_reduce(
 TEST_CASE("apply_dynamic_filters_to_view drops rows outside the zone",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);  // [0..9]
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_sequence_table(10, stream);  // [0..9]
 
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_zone_map(3, 6));  // inclusive [3,6] keeps 3,4,5,6
@@ -343,8 +345,8 @@ TEST_CASE("apply_dynamic_filters_to_view drops rows outside the zone",
 TEST_CASE("apply_dynamic_filters_to_view honors an exclusive upper bound [lo, hi)",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);  // [0..9]
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_sequence_table(10, stream);  // [0..9]
 
   sirius_dynamic_filter_set filters;
   // [3,6): inclusive_min, exclusive_max -> GREATER_EQUAL(3) AND LESS(6) -> {3,4,5}
@@ -360,8 +362,8 @@ TEST_CASE("apply_dynamic_filters_to_view honors an exclusive upper bound [lo, hi
 TEST_CASE("apply_dynamic_filters_to_view honors an exclusive lower bound (lo, hi]",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);  // [0..9]
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_sequence_table(10, stream);  // [0..9]
 
   sirius_dynamic_filter_set filters;
   // (3,6]: exclusive_min, inclusive_max -> GREATER(3) AND LESS_EQUAL(6) -> {4,5,6}
@@ -377,7 +379,7 @@ TEST_CASE("apply_dynamic_filters_to_view honors an exclusive lower bound (lo, hi
 TEST_CASE("zone-map-only filter from a device reduce keeps a correct superset (no false negative)",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
 
   // Build keys spanning [100, 200] — the producer reduces these to min=100, max=200 and, with no
   // membership filter, publishes a zone-map alone. Probe [0..299]: only [100..200] can possibly
@@ -402,8 +404,8 @@ TEST_CASE("zone-map-only filter from a device reduce keeps a correct superset (n
 TEST_CASE("apply_dynamic_filters_to_view returns nullptr for an empty channel",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_sequence_table(10, stream);
 
   sirius_dynamic_filter_set filters;  // empty
 
@@ -432,8 +434,8 @@ TEST_CASE("sirius_dynamic_filter_set ignore_columns drops filters for ignored co
 TEST_CASE("apply_dynamic_filters_to_view AND-conjoins multiple zone filters on a column",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_sequence_table(10, stream);  // [0..9]
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_sequence_table(10, stream);  // [0..9]
 
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_zone_map(2, 8));  // keeps 2..8
@@ -499,7 +501,7 @@ std::vector<int64_t> to_host_int64(cudf::column_view const& col, rmm::cuda_strea
 TEST_CASE("sirius_dynamic_in_list_filter keeps exactly the rows whose key is a build key",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   // Build key set {0,1,2,3,4}; probe table [0..9]. Exact membership keeps the first five.
   auto keys = cudf::sequence(5,
                              cudf::numeric_scalar<int64_t>(0, true, stream),
@@ -521,12 +523,12 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps exactly the rows whose key is a b
 TEST_CASE("sirius_dynamic_in_list_filter INT64 path uses a persistent set and probes repeatedly",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto keys   = cudf::sequence(5,
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto keys                    = cudf::sequence(5,
                              cudf::numeric_scalar<int64_t>(0, true, stream),
                              cudf::numeric_scalar<int64_t>(1, true, stream),
                              stream);
-  auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+  auto filter                  = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
     keys->view(), stream, cudf::get_current_device_resource_ref());
   REQUIRE(filter->has_persistent_set());  // INT64, non-null keys → fast path
 
@@ -547,8 +549,8 @@ TEST_CASE("sirius_dynamic_in_list_filter INT64 path uses a persistent set and pr
 TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negatives)",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto keys   = cudf::sequence(5,
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto keys                    = cudf::sequence(5,
                              cudf::numeric_scalar<int64_t>(0, true, stream),
                              cudf::numeric_scalar<int64_t>(1, true, stream),
                              stream);
@@ -571,7 +573,7 @@ TEST_CASE("sirius_dynamic_bloom_filter never drops a true match (no false negati
 TEST_CASE("sirius_dynamic_in_list_filter supports INT32 keys exactly",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   // INT32 build key set {0,1,2,3,4}; INT32 probe [0..9]. Exact membership keeps exactly
   // {0,1,2,3,4}.
   auto keys   = cudf::sequence(5,
@@ -595,8 +597,8 @@ TEST_CASE("sirius_dynamic_in_list_filter supports INT32 keys exactly",
 TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negatives",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto keys   = cudf::sequence(5,
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto keys                    = cudf::sequence(5,
                              cudf::numeric_scalar<int32_t>(0, true, stream),
                              cudf::numeric_scalar<int32_t>(1, true, stream),
                              stream);
@@ -621,7 +623,7 @@ TEST_CASE("sirius_dynamic_bloom_filter supports INT32 keys with no false negativ
 TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key set",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
 
   // Build keys [0,1,2,3,4,999] with the 999 slot nulled: only {0..4} may enter the set.
   std::vector<int64_t> const key_values{0, 1, 2, 3, 4, 999};
@@ -676,8 +678,8 @@ TEST_CASE("sirius_dynamic_bloom_filter excludes null build slots from the key se
 TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 sentinel",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream      = cudf::get_default_stream();
-  auto const dtype = cudf::data_type{cudf::type_id::INT64};
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto const dtype             = cudf::data_type{cudf::type_id::INT64};
   // Build keys include INT64_MIN — the cuco empty-slot sentinel that static_set never inserts.
   auto keys =
     make_values_table<int64_t>({std::numeric_limits<int64_t>::min(), 0, 1, 2}, dtype, stream);
@@ -701,8 +703,8 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT64 se
 TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 sentinel",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream      = cudf::get_default_stream();
-  auto const dtype = cudf::data_type{cudf::type_id::INT32};
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto const dtype             = cudf::data_type{cudf::type_id::INT32};
   auto keys =
     make_values_table<int32_t>({std::numeric_limits<int32_t>::min(), 0, 1, 2}, dtype, stream);
   auto filter = std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
@@ -724,7 +726,7 @@ TEST_CASE("sirius_dynamic_in_list_filter keeps a build key equal to the INT32 se
 TEST_CASE("sirius_dynamic_small_in_list_filter keeps exactly the rows whose key is a build key",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   // Small build key set {0,1,2,3,4}; probe [0..9]. The brute-force scan keeps the first five.
   auto keys = cudf::sequence(5,
                              cudf::numeric_scalar<int64_t>(0, true, stream),
@@ -746,8 +748,8 @@ TEST_CASE("sirius_dynamic_small_in_list_filter keeps exactly the rows whose key 
 TEST_CASE("sirius_dynamic_small_in_list_filter supports INT32 keys exactly",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto keys   = cudf::sequence(5,
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto keys                    = cudf::sequence(5,
                              cudf::numeric_scalar<int32_t>(0, true, stream),
                              cudf::numeric_scalar<int32_t>(1, true, stream),
                              stream);
@@ -766,8 +768,8 @@ TEST_CASE("sirius_dynamic_small_in_list_filter supports INT32 keys exactly",
 TEST_CASE("sirius_dynamic_small_in_list_filter matches a key equal to INT32_MIN (cuco's sentinel)",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream      = cudf::get_default_stream();
-  auto const dtype = cudf::data_type{cudf::type_id::INT32};
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto const dtype             = cudf::data_type{cudf::type_id::INT32};
   // Single build key {INT32_MIN} — the value cuco::static_set reserves as its empty slot and never
   // stores. The brute-force scan has no reserved value, so INT32_MIN is a valid needle: this filter
   // prunes non-matches exactly, where sirius_dynamic_in_list_filter would (harmlessly) keep them.
@@ -793,9 +795,9 @@ TEST_CASE("sirius_dynamic_small_in_list_filter matches a key equal to INT32_MIN 
 TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and supports gate",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream   = cudf::get_default_stream();
-  auto const mr = cudf::get_current_device_resource_ref();
-  using F       = sirius::op::sirius_dynamic_small_in_list_filter;
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto const mr                = cudf::get_current_device_resource_ref();
+  using F                      = sirius::op::sirius_dynamic_small_in_list_filter;
 
   auto one_i32       = cudf::sequence(1,
                                 cudf::numeric_scalar<int32_t>(0, true, stream),
@@ -890,8 +892,8 @@ class counting_in_list_filter final : public sirius_dynamic_filter,
 TEST_CASE("apply_dynamic_filters_to_view returns nullptr when no filter contributes",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_int64_sequence_table(10, stream);
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_int64_sequence_table(10, stream);
 
   sirius_dynamic_filter_set filters;  // empty
 
@@ -903,8 +905,8 @@ TEST_CASE("apply_dynamic_filters_to_view returns nullptr when no filter contribu
 TEST_CASE("apply_dynamic_filters_to_view gathers survivors without consuming the input",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
-  auto table  = make_int64_sequence_table(10, stream);  // [0..9]
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto table                   = make_int64_sequence_table(10, stream);  // [0..9]
 
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_in_list_prefix(2, stream));  // keeps 0,1
@@ -932,7 +934,7 @@ TEST_CASE("dynamic_filter_gate is not applicable before any filter publishes",
 TEST_CASE("dynamic_filter_gate disables after an unselective first split",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   sirius_dynamic_filter_set filters;
@@ -956,7 +958,7 @@ TEST_CASE("dynamic_filter_gate disables after an unselective first split",
 TEST_CASE("dynamic_filter_gate ignores a device with no local replica",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   sirius_dynamic_filter_set filters;
@@ -986,7 +988,7 @@ TEST_CASE("dynamic_filter_gate ignores a device with no local replica",
 TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable decision",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   // Unselective filter publishes first and disables the gate (the Q8 supplier hazard).
@@ -1014,7 +1016,7 @@ TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable
 TEST_CASE("dynamic_filter_gate stays active once a selective split proves the filter useful",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   sirius_dynamic_filter_set filters;
@@ -1097,7 +1099,7 @@ TEST_CASE("dynamic_filter_gate serializes concurrent stale and re-armed decision
 TEST_CASE("cascaded membership filters produce the conjunction of all filters",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
 
   sirius_dynamic_filter_set filters;
   filters.push_filter(0, make_in_list_prefix(7, stream));  // keeps 0..6
@@ -1113,7 +1115,7 @@ TEST_CASE("cascaded membership filters produce the conjunction of all filters",
 TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on later splits",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   auto useless   = make_in_list_prefix(10, stream);  // covers the whole domain — keep 1.0
@@ -1149,7 +1151,7 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
 TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   auto useless = make_in_list_prefix(10, stream);  // covers the whole domain -- keep 1.0
@@ -1177,7 +1179,7 @@ TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
 TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply without re-running it",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   // The only filter covers the whole domain: the first split disables the scan-level gate and
@@ -1220,7 +1222,7 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
 TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
           "[dynamic_filter][scan_merge]")
 {
-  auto stream = cudf::get_default_stream();
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
   sirius::op::scan::dynamic_filter_gate gate;
 
   auto selective = make_in_list_prefix(2, stream);  // keeps 20%
