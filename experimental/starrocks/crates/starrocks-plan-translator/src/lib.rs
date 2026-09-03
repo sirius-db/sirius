@@ -54,6 +54,7 @@
 //! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
+//! | `CLONE_EXPR`      | its child, unwrapped (the frontend's copy marker has no value semantics) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
     ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, TranslatedPlan, URN_BOOLEAN,
-    URN_COMPARISON, translate_fragment,
+    URN_COMPARISON, URN_DATETIME, URN_STRING, translate_fragment,
 };
 use starrocks_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
 use starrocks_thrift::descriptors::{
@@ -2061,6 +2061,15 @@ fn is_null_pred(is_not_null: bool, child: TExpr) -> TExpr {
 /// Builds a cast of `child` to `target` in preorder.
 fn cast_expr(target: TTypeDesc, child: TExpr) -> TExpr {
     let node = base_expr_node(TExprNodeType::CAST_EXPR, target, 1);
+    let mut nodes = vec![node];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Builds a `CLONE_EXPR` around `child`, carrying the child's declared type as the frontend
+/// emits it (`CloneExpr.getType()` delegates to its child).
+fn clone_expr(child: TExpr) -> TExpr {
+    let node = base_expr_node(TExprNodeType::CLONE_EXPR, child.nodes[0].type_.clone(), 1);
     let mut nodes = vec![node];
     nodes.extend(child.nodes);
     TExpr::new(nodes)
@@ -5239,6 +5248,26 @@ fn function_calls_use_allowlist() {
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
 }
 
+/// Builds a one-argument builtin function call declaring `ret` as the FE return type.
+fn unary_fn_call(name: &str, ret: TPrimitiveType, child: TExpr) -> TExpr {
+    let mut call = base_expr_node(TExprNodeType::FUNCTION_CALL, scalar_type(ret), 1);
+    call.fn_ = Some(builtin_function(name, scalar_type(ret)));
+    let mut nodes = vec![call];
+    nodes.extend(child.nodes);
+    TExpr::new(nodes)
+}
+
+/// Descriptor table with a DATE slot and a VARCHAR slot for scalar-function tests.
+fn date_and_string_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100))],
+        vec![
+            slot(1, 0, "d", scalar_type(TPrimitiveType::DATE)),
+            slot(2, 0, "s", scalar_type(TPrimitiveType::VARCHAR)),
+        ],
+    )
+}
+
 /// Splits a throwing cast into its target-type kind and input expression.
 fn cast_parts(
     expr: &substrait::proto::Expression,
@@ -5257,6 +5286,88 @@ fn cast_parts(
         cast.r#type.as_ref().unwrap().kind.as_ref().unwrap(),
         cast.input.as_ref().unwrap(),
     )
+}
+
+/// Verifies FE-narrowed builtins are wrapped in a throwing cast back to the declared return
+/// type: the engine's year/month/day and octet_length/char_length return BIGINT, while the FE
+/// slots the next fragment derives its stream schema from declare SMALLINT/TINYINT/INT.
+#[test]
+fn fe_narrowed_functions_cast_to_declared_return_type() {
+    use substrait::proto::r#type::Kind;
+    let cases = [
+        ("year", TPrimitiveType::SMALLINT, URN_DATETIME, "year"),
+        ("month", TPrimitiveType::TINYINT, URN_DATETIME, "month"),
+        ("day", TPrimitiveType::TINYINT, URN_DATETIME, "day"),
+        ("length", TPrimitiveType::INT, URN_STRING, "octet_length"),
+        (
+            "char_length",
+            TPrimitiveType::INT,
+            URN_STRING,
+            "char_length",
+        ),
+    ];
+    for (name, declared, expected_urn, mapped) in cases {
+        let (child_slot, child_ty) = if expected_urn == URN_STRING {
+            (2, TPrimitiveType::VARCHAR)
+        } else {
+            (1, TPrimitiveType::DATE)
+        };
+        let call = unary_fn_call(
+            name,
+            declared,
+            slot_ref(child_slot, 0, scalar_type(child_ty)),
+        );
+        let translated = translate_fragment(&params(
+            Some(filtered_scan(binary_pred(
+                TExprOpcode::EQ,
+                call,
+                int_literal_typed(1, declared),
+            ))),
+            Some(date_and_string_desc()),
+            None,
+        ))
+        .unwrap();
+        let (kind, input) = cast_parts(scalar_arg(filter_condition(&translated.plan), 0));
+        match declared {
+            TPrimitiveType::SMALLINT => assert!(matches!(kind, Kind::I16(_)), "{name}: {kind:?}"),
+            TPrimitiveType::TINYINT => assert!(matches!(kind, Kind::I8(_)), "{name}: {kind:?}"),
+            _ => assert!(matches!(kind, Kind::I32(_)), "{name}: {kind:?}"),
+        }
+        let inner = scalar_fn(input);
+        assert!(
+            matches!(
+                inner.output_type.as_ref().unwrap().kind.as_ref().unwrap(),
+                Kind::I64(_)
+            ),
+            "{name} should state the BIGINT the engine produces before the cast"
+        );
+        let (urn, resolved) = resolved_function(&translated.plan, inner.function_reference);
+        assert_eq!(resolved, mapped, "{name}");
+        assert_eq!(urn, expected_urn, "{name}");
+    }
+}
+
+/// Pins that a builtin whose engine return type already matches the FE declaration
+/// (BOOLEAN `like`) is not wrapped in a cast.
+#[test]
+fn matching_return_type_function_stays_cast_free() {
+    let mut call = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    call.fn_ = Some(builtin_function(
+        "like",
+        scalar_type(TPrimitiveType::BOOLEAN),
+    ));
+    let mut nodes = vec![call];
+    nodes.extend(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)).nodes);
+    nodes.extend(string_literal("%x%").nodes);
+    let plan = filter_with_conjunct(TExpr::new(nodes));
+    // `scalar_fn` panics if the conjunct got wrapped in a cast.
+    let scalar = scalar_fn(filter_condition(&plan));
+    let (_, resolved) = resolved_function(&plan, scalar.function_reference);
+    assert_eq!(resolved, "like");
 }
 
 /// Verifies CASE WHEN chains become Substrait if-then expressions with a null default.
@@ -5571,6 +5682,118 @@ fn unsupported_join_type_is_reported_before_missing_conjuncts() {
         panic!("expected an unsupported plan node, got {err:?}");
     };
     assert_eq!(reason, "hash join type is unsupported");
+}
+
+/// Verifies `CLONE_EXPR` unwraps to its child, so a cloned projection slot translates
+/// identically to the slot it clones.
+#[test]
+fn clone_expr_is_transparent() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+    slot_map.insert(
+        4,
+        clone_expr(slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT))),
+    );
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "value", scalar_type(TPrimitiveType::BIGINT)),
+            slot(4, 1, "value_clone", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    assert_eq!(visible.expressions.len(), 2);
+    assert_eq!(
+        visible.expressions[0], visible.expressions[1],
+        "a cloned column must translate identically to the column it clones"
+    );
+}
+
+/// Verifies `CLONE_EXPR` returns its child uncast, preserving the FP64 lowering the
+/// arithmetic path applied instead of re-narrowing to the declared decimal type.
+#[test]
+fn clone_expr_keeps_the_child_lowering() {
+    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
+    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
+    arith.opcode = Some(TExprOpcode::MULTIPLY);
+    let mut nodes = vec![arith];
+    nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+    nodes.extend(slot_ref(1, 0, decimal).nodes);
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![clone_expr(TExpr::new(nodes))]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected output project");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        project.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected the multiply itself, not a cast around it");
+    };
+    assert!(matches!(
+        function
+            .output_type
+            .as_ref()
+            .unwrap()
+            .kind
+            .as_ref()
+            .unwrap(),
+        substrait::proto::r#type::Kind::Fp64(_)
+    ));
+}
+
+/// Verifies a childless `CLONE_EXPR` is reported as a malformed plan.
+#[test]
+fn clone_expr_requires_exactly_one_child() {
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(None));
+    select.conjuncts = Some(vec![TExpr::new(vec![base_expr_node(
+        TExprNodeType::CLONE_EXPR,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        0,
+    )])]);
+
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![select, scan_node(0, 0)])),
+        Some(base_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::MalformedPlan(_)));
 }
 
 /// Asserts an expression is a throwing cast to FP64, the lowering every decimal operand and
