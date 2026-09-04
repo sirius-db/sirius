@@ -25,6 +25,8 @@
 #include "io/uring/config.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <thread>
 
 namespace sirius::scan_manager {
@@ -32,14 +34,67 @@ namespace sirius::scan_manager {
 /// Default uring reactor count; counted in the scan-manager sizing budget below.
 inline constexpr std::size_t default_uring_n_reactors = 1;
 
-/// Default scan-manager pool size: every core left after the other default pools
-/// (downgrade, task_creator, pipeline, uring reactor), never below 4.
+/// Extra worker added by sirius_scan_manager beyond the configured scan-manager count.
+inline constexpr int scan_manager_internal_worker_count = 1;
+
+/// Largest configured count whose constructor-time internal-worker addition is representable.
+inline constexpr int max_scan_manager_num_threads =
+  std::numeric_limits<int>::max() - scan_manager_internal_worker_count;
+
+/// Total scan-manager pool size, checked here as well as at the YAML boundary because callers can
+/// install a scan_manager_config programmatically.
+[[nodiscard]] inline int scan_manager_pool_num_threads(int configured_threads)
+{
+  if (configured_threads > max_scan_manager_num_threads) {
+    throw std::out_of_range("scan-manager thread count exceeds the constructible maximum");
+  }
+  return configured_threads + scan_manager_internal_worker_count;
+}
+
+/// Scan-manager pool size from the live sibling-pool configuration: every core left after the
+/// internal scan-manager worker, per-space downgrade, task-creator, per-GPU pipeline, and io_uring
+/// pools, never below 4.
+[[nodiscard]] inline int derived_scan_manager_num_threads(unsigned hardware_threads,
+                                                          std::size_t downgrade_threads,
+                                                          std::size_t downgrade_executors,
+                                                          std::size_t task_creator_threads,
+                                                          std::size_t pipeline_threads,
+                                                          std::size_t pipeline_executors,
+                                                          std::size_t uring_reactors)
+{
+  std::size_t remaining = hardware_threads;
+  auto subtract_product = [&remaining](std::size_t threads, std::size_t executors) {
+    if (threads != 0 && executors > remaining / threads) {
+      remaining = 0;
+    } else {
+      auto const reserved = threads * executors;
+      remaining           = reserved >= remaining ? 0 : remaining - reserved;
+    }
+  };
+  auto subtract = [&remaining](std::size_t reserved) {
+    remaining = reserved >= remaining ? 0 : remaining - reserved;
+  };
+
+  subtract(scan_manager_internal_worker_count);
+  subtract_product(downgrade_threads, downgrade_executors);
+  subtract(task_creator_threads);
+  subtract_product(pipeline_threads, pipeline_executors);
+  subtract(uring_reactors);
+
+  remaining = std::clamp<std::size_t>(remaining, 4, max_scan_manager_num_threads);
+  return static_cast<int>(remaining);
+}
+
+/// Default scan-manager pool size derived from the default sibling pools.
 [[nodiscard]] inline int default_scan_manager_num_threads()
 {
-  constexpr int reserved =
-    exec::default_downgrade_num_threads + creator::default_task_creator_num_threads +
-    exec::default_gpu_pipeline_num_threads + static_cast<int>(default_uring_n_reactors);
-  return std::max(4, static_cast<int>(std::thread::hardware_concurrency()) - reserved);
+  return derived_scan_manager_num_threads(std::thread::hardware_concurrency(),
+                                          exec::default_downgrade_num_threads,
+                                          1,
+                                          creator::default_task_creator_num_threads,
+                                          exec::default_gpu_pipeline_num_threads,
+                                          1,
+                                          default_uring_n_reactors);
 }
 
 /**
