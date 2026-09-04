@@ -27,9 +27,17 @@ namespace sirius::planner {
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalSetOperation& op)
 {
-  // Distinct UNION lowers to a separate LOGICAL_DISTINCT above this node, which has no builder
-  // yet, so it would fall back one node later anyway; rejecting here keeps the message specific.
-  // Delete this throw once the DISTINCT builder lands.
+  // A distinct UNION usually lowers to a LOGICAL_DISTINCT above this node, so declining here
+  // rather than one node later only sharpens the message. Usually, not always: a WITH RECURSIVE
+  // body with no self-reference degrades to a plain LogicalSetOperation carrying the CTE's
+  // `union_all`, and nothing inserts a DistinctModifier on that path (duckdb
+  // `bind_recursive_cte_node.cpp:124`-`:127`). For that shape this throw is the only thing between
+  // a distinct UNION and duplicate rows.
+  //
+  // So lifting this once the DISTINCT builder lands is not a deletion: `create_plan` dispatches on
+  // node type with no parent context, so this builder cannot tell whether a LOGICAL_DISTINCT sits
+  // above it. The pair has to be recognised from the DISTINCT side and planned as one dedup over a
+  // bag union, leaving this throw for the bare case.
   if (!op.setop_all) {
     throw duckdb::NotImplementedException(
       "UNION (distinct) not supported yet; only UNION ALL is on the GPU path");
