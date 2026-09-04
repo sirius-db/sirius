@@ -152,6 +152,21 @@ reports: `cudaMallocAsync` pool memory over `cuda_ipc` does not error — it sil
 ~220× — so a first-contact transfer below 2 GB/s refuses the tier loudly. (`nvidia-smi`: two
 CNs at ~8.9 GiB each — pool + arena + context — on the 23 GiB L4.)
 
+The same hop can run over host Arrow instead, for an A/B against nixl: start the CNs with
+`SIRIUS_CN_EXCHANGE_TRANSPORT=arrow` (default `nixl`; see `docs/TUNABLES.md`). A sender whose
+destination lives in the other process then drains its parked output with `export_arrow` (one
+host Arrow record batch per parked batch, no staging lease), slices it into chunks of at most
+64 MiB and ships each chunk as an Arrow IPC stream in the `transmit_packed` attachment
+(`arrow_ipc=true`); the receiver decodes it and feeds the fragment through `push_arrow`. The
+log lines to read are the Arrow twins of the ones above, same field names:
+
+```
+transmitted batches via arrow stream_id=3 sender_id=0 dest=127.0.0.1:8062 batches=1 bytes=1234 elapsed_ms=3
+received remote batches via arrow stream_id=3 sender_id=0 batches=1 bytes=1200
+```
+
+Same-CN exchanges (the `relayed native batches` line) are the same in both modes.
+
 ## The pre-packaged front end
 
 `cluster` depends on `fe-check`, not `fe-build`: this demo ships the front end already packaged

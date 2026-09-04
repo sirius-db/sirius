@@ -50,6 +50,15 @@ impl BrpcServer {
         }
     }
 
+    /// Test seam: serves an already-built service (so a test can register fragments on the
+    /// same instance it serves over the wire, e.g. a loopback peer CN).
+    #[cfg(test)]
+    pub(crate) fn from_service(service: SiriusComputeNodeService) -> Self {
+        Self {
+            inner: BrpcServiceServer::with_service(PInternalServiceRouter::new(service)),
+        }
+    }
+
     /// Binds a std listener that can be moved into the runtime that serves it.
     pub fn bind(bind_host: &str, brpc_port: u16) -> Result<StdTcpListener> {
         let listen_addr = format!("{bind_host}:{brpc_port}");

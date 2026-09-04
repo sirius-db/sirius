@@ -357,6 +357,23 @@ M1 and M2 are delivered (`e354d5d1`, `0d873ac3`, `e51943af`, `d39f72a0`). M3 to 
 
 ### M3: CN seam, Arrow input kind, loopback A/B
 
+**Delivered as an Arrow-over-brpc exchange transport** behind the CN knob `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow`
+(default `nixl`, any other value fails bring-up; `experimental/starrocks/src/tunable.rs`, `ExchangeTransport`). With it
+set, a sender whose destination is REMOTE drains its parked output through the new `Fragment::export_arrow` /
+`export_arrow_next` (host Arrow `RecordBatch` per parked batch, no staging lease), slices each batch into chunks of at
+most 64 MiB by rows, serializes every chunk as one Arrow IPC stream into the attachment of the existing
+`transmit_packed` RPC (`arrow_ipc = true`, field 11 of `PTransmitPackedParams`, offset/length 0), then sends the eos
+frame and drops the parked output (`experimental/starrocks/src/arrow_exchange.rs`). The receiver decodes each
+attachment into `RecordBatch`es staged lease-free (`StagedBatch::arrow`, rows from `num_rows` feeding the exact
+cardinality branch) and the engine thread feeds them through `push_arrow` instead of `push_packed`
+(`engine.rs`, `run_fragment_inner`). Same-CN exchanges keep today's `relay_from` / fusion behaviour; nothing changes
+with the knob off. The sender logs `transmitted batches via arrow` with `stream_id`, `sender_id`, `dest`, `batches`,
+`bytes`, `elapsed_ms` (the nixl line's field names, so one extractor reads both); the receiver logs
+`received remote batches via arrow` with `batches` and `bytes`. The same 2-CN TPC-H arm can therefore run once over
+NIXL and once over Arrow, which is the M5 comparison.
+
+Original plan, kept for the record:
+
 - Files:
   - `experimental/starrocks/src/fragment_executor.rs`: `FragmentRun::arrow_inputs`.
   - `experimental/starrocks/src/engine.rs`: `ExecuteRequest::arrow_inputs`, the push loop between `:579` and `:590`,

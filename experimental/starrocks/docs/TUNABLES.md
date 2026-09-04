@@ -27,6 +27,7 @@ knob listed under "Dispatch").
 | `SIRIUS_CN_NIXL_WARMUP_TIMEOUT_SECS` / `_EXPECT_PEERS` | Bring-up session warmup. The timeout is a budget, not a hard fail; expect-peers ends the loop early once that many peers are up. |
 | `SIRIUS_CN_NIXL_WARMUP` | Warmup kill switch, `on` by default. `off` returns to lazy sessions: the first cross-node query after bring-up pays first contact, and on a cold cluster that is the first-contact deadlock the warmup exists to prevent. |
 | `SIRIUS_CN_NIXL_WARMUP_PEERS` | Explicit `host:port,host:port` warmup peer list, skipping FE discovery. A malformed entry fails startup instead of leaving that peer cold. |
+| `SIRIUS_CN_EXCHANGE_TRANSPORT` | How a sender's parked output reaches a REMOTE receiver. `nixl` (default): `export_packed` into a staging lease, nixl WRITE into the peer's lease, `transmit_packed` with the pack metadata. `arrow`: `export_arrow` to host Arrow, each batch sliced into chunks of at most 64 MiB and sent as one Arrow IPC stream in the `transmit_packed` attachment (`arrow_ipc=true`, no lease, no nixl), decoded on the receiver and fed through `push_arrow`. Same-CN exchanges are untouched either way. Any other value fails CN startup; logged as `exchange_transport=` in the `resolved CN transport tunables` line. The sender logs `transmitted batches via arrow` (`stream_id`, `sender_id`, `dest`, `batches`, `bytes`, `elapsed_ms`) next to the nixl tier's `transmitted batches via nixl`; the receiver logs `received remote batches via arrow`. |
 
 ## Exchange staging
 

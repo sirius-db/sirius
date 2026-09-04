@@ -260,16 +260,16 @@ mod agent_tier {
         XferOp, XferStatus,
     };
     use prost::Message;
-    use starrocks_thrift::status_code::TStatusCode;
     use tracing::{info, warn};
 
     use super::*;
     use crate::FeConfig;
+    use crate::arrow_exchange::check_status;
     use crate::fragment_executor::FragmentExecutor;
     use crate::proto::starrocks::p_internal_service_brpc::methods;
     use crate::proto::starrocks::{
         PExchangeNixlMd, PExchangeNixlMdResult, PStagingLeaseRequest, PStagingLeaseResult,
-        PTransmitPackedParams, PTransmitPackedResult, PUniqueId, StatusPb,
+        PTransmitPackedParams, PTransmitPackedResult, PUniqueId,
     };
     use crate::tunable::Tunables;
 
@@ -712,6 +712,7 @@ mod agent_tier {
                             // Exact per-batch count from export_packed; the receiver sums the
                             // frames into declare_input_cardinality before it builds its plan.
                             rows: batch.rows,
+                            arrow_ipc: None,
                         },
                         metadata,
                     )
@@ -751,6 +752,7 @@ mod agent_tier {
                     column_names: spec.names.clone(),
                     canary: None,
                     rows: None,
+                    arrow_ipc: None,
                 },
                 Vec::new(),
             )?;
@@ -811,17 +813,6 @@ mod agent_tier {
     }
 
     /// Fails on a non-OK StarRocks method status, naming the peer's error messages.
-    fn check_status(what: &str, status: &StatusPb) -> Result<(), String> {
-        if status.status_code == TStatusCode::OK.0 {
-            return Ok(());
-        }
-        Err(format!(
-            "{what} failed with status {}: {}",
-            status.status_code,
-            status.error_msgs.join("; ")
-        ))
-    }
-
     /// `exchange_nixl_md` over brpc: our identity out, the peer's identity back. Reachable from
     /// the [`warmup`](super::warmup) thread on purpose — this is the one call that must NOT run
     /// on the transport thread.

@@ -73,25 +73,48 @@ impl FragmentLabel {
     }
 }
 
-/// One packed batch sitting in an exchange staging arena as cudf packed bytes.
+/// One remote batch staged on this CN for a receiver: cudf packed bytes sitting in an exchange
+/// staging arena lease (the nixl tier), or host Arrow record batches (the Arrow tier).
 ///
 /// The neutral wire shape of the nixl tier: on the sender it names a lease in the *local* arena
 /// (filled by `export_packed`), on the receiver a lease in the *receiver's* arena (filled by a
-/// nixl WRITE). Whoever holds the arena releases the lease after the bytes leave it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// nixl WRITE). Whoever holds the arena releases the lease after the bytes leave it. An Arrow
+/// frame (`arrow_ipc` on the wire) decodes into `arrow` with `offset == len == 0` and empty
+/// `metadata`: it holds no lease, so every release path skips it by the existing `len == 0` rule.
+#[derive(Clone, Debug, PartialEq)]
 pub struct StagedBatch {
-    /// Host-side cudf pack metadata (travels over brpc next to the device payload).
+    /// Host-side cudf pack metadata (travels over brpc next to the device payload). Empty for an
+    /// Arrow batch.
     pub metadata: Vec<u8>,
     /// Byte offset of the packed payload from the arena base. `0` with `len == 0` means no
-    /// lease exists for this batch (a metadata-only empty batch) — nothing to release.
+    /// lease exists for this batch (a metadata-only empty batch, or an Arrow batch) — nothing to
+    /// release.
     pub offset: u64,
     /// Length of the packed payload in bytes.
     pub len: u64,
-    /// Exact row count of the packed table (from `export_packed`, carried on the transmit
-    /// frame). The receiver sums the counts per stream into `declare_input_cardinality` so the
-    /// optimizer can size the stream. `None` when the frame predates the wire field: the
-    /// receiver then declares nothing for the stream and keeps the legacy blind planning.
+    /// Exact row count of the batch (from `export_packed`, carried on the transmit frame; for an
+    /// Arrow batch, the decoded `num_rows`). The receiver sums the counts per stream into
+    /// `declare_input_cardinality` so the optimizer can size the stream. `None` when the frame
+    /// predates the wire field: the receiver then declares nothing for the stream and keeps the
+    /// legacy blind planning.
     pub rows: Option<u64>,
+    /// The Arrow record batches one `arrow_ipc` frame decoded into (one IPC stream may carry
+    /// several); pushed with `push_arrow` instead of `push_packed`. `None` for a packed batch.
+    pub arrow: Option<Vec<RecordBatch>>,
+}
+
+impl StagedBatch {
+    /// A lease-free staged batch holding decoded Arrow record batches; `rows` is their total.
+    pub fn arrow(batches: Vec<RecordBatch>) -> Self {
+        let rows = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+        Self {
+            metadata: Vec::new(),
+            offset: 0,
+            len: 0,
+            rows: Some(rows),
+            arrow: Some(batches),
+        }
+    }
 }
 
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
@@ -166,6 +189,17 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
         Err("this fragment executor cannot export packed batches \
              (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
             .to_string())
+    }
+
+    /// Pops the next batch parked under `slot` as one host Arrow [`RecordBatch`] (the batch owns
+    /// its buffers; no lease is involved); `Ok(None)` once the parked output is drained. The
+    /// Arrow twin of [`export_packed_next`](Self::export_packed_next).
+    fn export_arrow_next(&self, slot: SenderSlot) -> Result<Option<RecordBatch>, String> {
+        let _ = slot;
+        Err(
+            "this fragment executor cannot export Arrow batches (engine build required)"
+                .to_string(),
+        )
     }
 
     /// Drops the parked fragment under `slot`, releasing the GPU memory its batches hold. Called

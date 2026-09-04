@@ -1,8 +1,8 @@
 diff --git a/gensrc/proto/internal_service.proto b/gensrc/proto/internal_service.proto
-index 1e392043e89..6679b2d8d72 100644
+index 1e392043e89..a9381c046f3 100644
 --- a/gensrc/proto/internal_service.proto
 +++ b/gensrc/proto/internal_service.proto
-@@ -786,6 +786,49 @@ message PLookUpResponse {
+@@ -786,6 +786,53 @@ message PLookUpResponse {
      repeated PColumn columns = 2;
  }
  
@@ -44,6 +44,10 @@ index 1e392043e89..6679b2d8d72 100644
 +    // on EOS/canary frames and from senders that predate the field (receiver then declares
 +    // nothing and keeps the legacy blind planning).
 +    optional uint64 rows = 10;
++    // The attachment is one Arrow IPC stream (one or more record batches) instead of cudf pack
++    // metadata; offset/length are 0 and no staging lease is involved (the Arrow exchange
++    // transport, SIRIUS_CN_EXCHANGE_TRANSPORT=arrow). Absent or false: the nixl packed frame.
++    optional bool arrow_ipc = 11;
 +}
 +
 +message PTransmitPackedResult {
@@ -52,7 +56,7 @@ index 1e392043e89..6679b2d8d72 100644
  
  service PInternalService {
      rpc transmit_data(PTransmitDataParams) returns (PTransmitDataResult);
-@@ -838,4 +881,9 @@ service PInternalService {
+@@ -838,4 +885,9 @@ service PInternalService {
  
      rpc update_transaction_state(PUpdateTransactionStateRequest) returns (PUpdateTransactionStateResponse);
      rpc lookup(PLookUpRequest) returns (PLookUpResponse);

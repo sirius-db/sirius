@@ -343,6 +343,67 @@ impl FusionMode {
     }
 }
 
+/// How a sender fragment's parked output reaches a REMOTE receiver (`compute_node_service.rs`,
+/// `execute_ready_fragment`'s remote drain). Same-CN exchanges are untouched by this knob: they
+/// stay native relays (or fusions) on the GPU either way.
+///
+/// Not a [`Knob`]: the value is a word, not a number in a range, so it has its own reader with
+/// the same three rules (reject, log, unset means the default) — the [`FusionMode`] pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ExchangeTransport {
+    /// `export_packed` into a staging lease, nixl WRITE into the peer's lease, `transmit_packed`
+    /// with the pack metadata (the shipped default; needs the staging arena and libnixl).
+    Nixl = 0,
+    /// `export_arrow` to host Arrow, one Arrow IPC stream per `transmit_packed` attachment
+    /// (`arrow_ipc = true`), `push_arrow` on the receiver. No staging lease, no nixl.
+    Arrow = 1,
+}
+
+/// Environment name of the exchange transport.
+const EXCHANGE_TRANSPORT_NAME: &str = "SIRIUS_CN_EXCHANGE_TRANSPORT";
+
+impl ExchangeTransport {
+    /// The transport when the variable is unset.
+    pub(crate) const DEFAULT: Self = Self::Nixl;
+
+    /// The accepted spellings, for the rejection message.
+    const ACCEPTED: &'static str = "nixl, arrow";
+
+    /// The configured transport, or the default when unset. Trimmed and case-insensitive.
+    ///
+    /// # Errors
+    /// Any other value, naming the variable, the value and the accepted set.
+    fn read() -> Result<Self, String> {
+        let Some(raw) = env_value(EXCHANGE_TRANSPORT_NAME) else {
+            return Ok(Self::DEFAULT);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "nixl" => Ok(Self::Nixl),
+            "arrow" => Ok(Self::Arrow),
+            _ => Err(format!(
+                "{EXCHANGE_TRANSPORT_NAME}: expected one of {}, got \"{raw}\" (unset means the \
+                 default, nixl)",
+                Self::ACCEPTED
+            )),
+        }
+    }
+
+    /// The transport as the byte an `AtomicU8` holds; [`from_code`](Self::from_code) inverts it.
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for a byte no transport produces.
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Nixl),
+            1 => Some(Self::Arrow),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved transport tunables. Clone so call sites can hold one cheaply: the peer list is
 /// the one heap field, and it is `None` in every configuration but an explicit
 /// `SIRIUS_CN_NIXL_WARMUP_PEERS`.
@@ -370,6 +431,8 @@ pub struct Tunables {
     pub warmup_peers: Option<Vec<(String, u16)>>,
     /// See [`FusionMode`].
     pub(crate) fusion_mode: FusionMode,
+    /// See [`ExchangeTransport`].
+    pub(crate) exchange_transport: ExchangeTransport,
 }
 
 impl Tunables {
@@ -385,6 +448,7 @@ impl Tunables {
         warmup: WARMUP.default,
         warmup_peers: None,
         fusion_mode: FusionMode::DEFAULT,
+        exchange_transport: ExchangeTransport::DEFAULT,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -409,6 +473,7 @@ impl Tunables {
             warmup: WARMUP.read()?,
             warmup_peers: WARMUP_PEERS.read()?,
             fusion_mode: FusionMode::read()?,
+            exchange_transport: ExchangeTransport::read()?,
         })
     }
 
@@ -446,6 +511,7 @@ impl Tunables {
             warmup = published.warmup,
             warmup_peers = ?published.warmup_peers,
             fusion_mode = ?published.fusion_mode,
+            exchange_transport = ?published.exchange_transport,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -518,6 +584,7 @@ pub(crate) mod tests {
                 (WARMUP.name, None),
                 (WARMUP_PEERS.name, None),
                 (FUSION_MODE_NAME, None),
+                (EXCHANGE_TRANSPORT_NAME, None),
             ],
             Tunables::from_env,
         )
@@ -533,6 +600,7 @@ pub(crate) mod tests {
         assert!(resolved.warmup);
         assert_eq!(resolved.warmup_peers, None);
         assert_eq!(resolved.fusion_mode, FusionMode::Leaf);
+        assert_eq!(resolved.exchange_transport, ExchangeTransport::Nixl);
     }
 
     /// The fusion knob: unset is `leaf`; the off spellings, case and whitespace are tolerated;
@@ -576,6 +644,75 @@ pub(crate) mod tests {
         let error = with_env(&[(FUSION_MODE_NAME, Some("all"))], Tunables::from_env)
             .expect_err("a bad mode fails the whole resolution");
         assert!(error.contains(FUSION_MODE_NAME), "{error}");
+    }
+
+    /// The exchange transport knob: unset is `nixl`; case and whitespace are tolerated; anything
+    /// else fails the whole resolution naming the variable, the value and the accepted set (so
+    /// `off`, `ucx` or a typo is a bring-up error, not a silent `nixl`).
+    #[test]
+    fn exchange_transport_parses_nixl_arrow_and_rejects_others() {
+        assert_eq!(
+            with_env(&[(EXCHANGE_TRANSPORT_NAME, None)], ExchangeTransport::read),
+            Ok(ExchangeTransport::Nixl)
+        );
+        for nixl in ["nixl", "NIXL", " nixl "] {
+            assert_eq!(
+                with_env(
+                    &[(EXCHANGE_TRANSPORT_NAME, Some(nixl))],
+                    ExchangeTransport::read
+                ),
+                Ok(ExchangeTransport::Nixl),
+                "{nixl:?}"
+            );
+        }
+        for arrow in ["arrow", "Arrow", " ARROW "] {
+            assert_eq!(
+                with_env(
+                    &[(EXCHANGE_TRANSPORT_NAME, Some(arrow))],
+                    ExchangeTransport::read
+                ),
+                Ok(ExchangeTransport::Arrow),
+                "{arrow:?}"
+            );
+        }
+        for bad in ["off", "ucx", "arrow-ipc", "1"] {
+            let error = with_env(
+                &[(EXCHANGE_TRANSPORT_NAME, Some(bad))],
+                ExchangeTransport::read,
+            )
+            .expect_err("not an accepted transport");
+            assert!(
+                error.contains(EXCHANGE_TRANSPORT_NAME)
+                    && error.contains(bad)
+                    && error.contains("nixl, arrow"),
+                "{error}"
+            );
+        }
+
+        let resolved = with_env(
+            &[(EXCHANGE_TRANSPORT_NAME, Some("arrow"))],
+            Tunables::from_env,
+        )
+        .expect("arrow resolves");
+        assert_eq!(resolved.exchange_transport, ExchangeTransport::Arrow);
+        let error = with_env(
+            &[(EXCHANGE_TRANSPORT_NAME, Some("ucx"))],
+            Tunables::from_env,
+        )
+        .expect_err("a bad transport fails the whole resolution");
+        assert!(error.contains(EXCHANGE_TRANSPORT_NAME), "{error}");
+    }
+
+    /// The byte an `AtomicU8` holds round-trips; a byte no transport produces decodes to nothing.
+    #[test]
+    fn exchange_transport_codes_round_trip() {
+        for transport in [ExchangeTransport::Nixl, ExchangeTransport::Arrow] {
+            assert_eq!(
+                ExchangeTransport::from_code(transport.code()),
+                Some(transport)
+            );
+        }
+        assert_eq!(ExchangeTransport::from_code(2), None);
     }
 
     /// The byte an `AtomicU8` holds round-trips; a byte no mode produces decodes to nothing.

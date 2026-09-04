@@ -45,6 +45,7 @@ use thrift::{
 };
 use tracing::{debug, info, instrument, warn};
 
+mod arrow_exchange;
 mod brpc;
 mod compute_node_service;
 #[cfg(feature = "sirius-engine")]

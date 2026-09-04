@@ -391,11 +391,22 @@ impl LocalExchange {
             ));
         }
         if let Some(batch) = batch {
-            if batch.metadata.is_empty() {
-                return Err(format!(
-                    "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} with \
-                     empty pack metadata"
-                ));
+            // A frame that claims a batch must carry one: pack metadata for a packed frame,
+            // at least one record batch for an Arrow frame.
+            match &batch.arrow {
+                None if batch.metadata.is_empty() => {
+                    return Err(format!(
+                        "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} \
+                         with empty pack metadata"
+                    ));
+                }
+                Some(arrow) if arrow.is_empty() => {
+                    return Err(format!(
+                        "remote sender {sender_id} for exchange {key:?} sent Arrow frame seq \
+                         {seq} with no record batches"
+                    ));
+                }
+                _ => {}
             }
             batches.push(batch);
         }
@@ -589,6 +600,7 @@ mod tests {
             offset: u64::from(fill) * 1024,
             len: 512,
             rows: Some(u64::from(fill)),
+            arrow: None,
         }
     }
 

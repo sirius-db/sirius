@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::arrow_exchange;
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{
@@ -22,7 +23,7 @@ use crate::proto::starrocks::{
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
-use crate::tunable::{FusionMode, Tunables};
+use crate::tunable::{ExchangeTransport, FusionMode, Tunables};
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan, fusion};
 use starrocks_thrift::{
     data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
@@ -162,6 +163,9 @@ struct ServiceCore {
     /// [`FusionMode`] code. From `SIRIUS_CN_FRAGMENT_FUSION` at bring-up (or a test's setter);
     /// see [`ServiceCore::try_defer_sender`].
     fragment_fusion: std::sync::atomic::AtomicU8,
+    /// The exchange transport for REMOTE destinations (`ExchangeTransport::code`), from the
+    /// registry at bring-up; tests override it per instance.
+    exchange_transport: std::sync::atomic::AtomicU8,
 }
 
 impl SiriusComputeNodeService {
@@ -204,6 +208,9 @@ impl SiriusComputeNodeService {
             transport,
             staging_info: Mutex::new(None),
             fragment_fusion: std::sync::atomic::AtomicU8::new(Tunables::get().fusion_mode.code()),
+            exchange_transport: std::sync::atomic::AtomicU8::new(
+                Tunables::get().exchange_transport.code(),
+            ),
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -227,6 +234,15 @@ impl SiriusComputeNodeService {
         self.core
             .fragment_fusion
             .store(mode.code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Overrides the bring-up exchange transport for this service instance; tests use it to
+    /// drive the Arrow tier without touching the process environment.
+    #[cfg(test)]
+    pub(crate) fn set_exchange_transport(&self, transport: ExchangeTransport) {
+        self.core
+            .exchange_transport
+            .store(transport.code(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
@@ -655,9 +671,21 @@ impl SiriusComputeNodeService {
             fragment_instance_id: FragmentInstanceId::from(finst_id),
             node_id,
         };
-        // The pack metadata rides the attachment; its presence is what makes a frame a batch.
+        // The payload rides the attachment; its presence is what makes a frame a batch. Packed
+        // frames carry cudf pack metadata for a lease the peer WROTE into; `arrow_ipc` frames
+        // carry the rows themselves as one Arrow IPC stream and hold no lease.
         let batch = if attachment.is_empty() {
             None
+        } else if params.arrow_ipc() {
+            let batches = arrow_exchange::decode_ipc(&attachment).map_err(|err| {
+                format!(
+                    "transmit_packed arrow_ipc frame seq {seq} from sender {sender_id} for \
+                     exchange {key:?}: {err}"
+                )
+            })?;
+            // Exact rows from the decoded batches themselves (the frame's `rows` is the same
+            // count as the sender saw; the decoded one is what push_arrow will deliver).
+            Some(StagedBatch::arrow(batches))
         } else {
             let length = params.length.ok_or_else(|| {
                 "transmit_packed batch frame carries no payload length".to_string()
@@ -672,11 +700,13 @@ impl SiriusComputeNodeService {
                 // None from a sender that predates the wire field: the receiver then skips the
                 // stream's cardinality declaration instead of failing the frame.
                 rows: params.rows,
+                arrow: None,
             })
         };
         // A frame for a receiver the FE already cancelled here: the peer's drain is still
         // running and must complete quietly (it gets OK, and its own drop_parked frees the
-        // sender side), but nothing may re-enter the rendezvous. Release the lease it landed in.
+        // sender side), but nothing may re-enter the rendezvous. Release the lease it landed in
+        // (an Arrow frame held none: its batches simply drop here).
         if self.core.exchanges.is_retired(key.fragment_instance_id) {
             if let Some(batch) = &batch
                 && batch.len > 0
@@ -699,6 +729,7 @@ impl SiriusComputeNodeService {
             seq,
             eos,
             batch_bytes = batch.as_ref().map(|batch| batch.len),
+            arrow_ipc = params.arrow_ipc(),
             "received remote exchange frame"
         );
         if let Some(ready) = self.core.exchanges.push_remote_frame(
@@ -966,6 +997,15 @@ impl ServiceCore {
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
         .expect("fragment_fusion only ever holds a FusionMode code")
+    }
+
+    /// The exchange transport for remote destinations in force on this instance.
+    fn exchange_transport(&self) -> ExchangeTransport {
+        ExchangeTransport::from_code(
+            self.exchange_transport
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .expect("exchange_transport only ever holds an ExchangeTransport code")
     }
 
     /// Tries to defer a sender into its local receiver's plan instead of running it. Returns the
@@ -1316,13 +1356,15 @@ impl ServiceCore {
             }
             let route = self.route_destination(destination)?;
             if let DestinationRoute::Remote { host, brpc_port } = &route
+                && self.exchange_transport() == ExchangeTransport::Nixl
                 && self.transport.is_none()
             {
                 return Err(format!(
                     "cross-node exchange to {host}:{brpc_port} needs the nixl transport \
                      tier, which is not active: build the CN with the `nixl-transport` \
                      feature (default) and set SIRIUS_EXCHANGE_STAGING_BYTES so the \
-                     exchange staging arena exists"
+                     exchange staging arena exists (or set SIRIUS_CN_EXCHANGE_TRANSPORT=arrow \
+                     to exchange host Arrow over brpc without an arena)"
                 ));
             }
             slots.push(slot);
@@ -1363,23 +1405,33 @@ impl ServiceCore {
             }
         }
         // Remote destinations second, drained one at a time in the FE's destination order. Each
-        // `send_fragment` blocks until the transport thread has exported this destination's
-        // parked stream into staging leases, WRITTEN every batch into a lease the peer granted,
-        // signaled each batch and the eos over brpc, and released the destination's claim on
-        // the parked output (dropped on failure, so a dead query does not pin its output). The
-        // seq counter and the eos frame live inside that one thread's drain, which is what the
-        // receiver's per-(exchange, sender) gap check relies on. A failure fails the sender's
-        // RPC — the FE sees the error, never a receiver that waits forever — and the
-        // destinations after it are not drained; their claims go with the engine's next wipe.
+        // `send_fragment` blocks until this destination's parked stream has been exported,
+        // every batch and the eos have been signaled over brpc, and the destination's claim on
+        // the parked output released (dropped on failure, so a dead query does not pin its
+        // output). Over nixl that is the transport thread exporting into staging leases and
+        // WRITING each batch into a lease the peer granted; over Arrow it is this thread
+        // exporting host Arrow batches and shipping them as IPC attachments. Either way the seq
+        // counter and the eos frame live inside that one drain, which is what the receiver's
+        // per-(exchange, sender) gap check relies on. A failure fails the sender's RPC — the FE
+        // sees the error, never a receiver that waits forever — and the destinations after it
+        // are not drained; their claims go with the engine's next wipe.
         for (slot, route) in slots.iter().zip(&routes) {
             if let DestinationRoute::Remote { host, brpc_port } = route {
-                let transport = self.transport.as_ref().expect("routed before running");
-                transport.send_fragment(RemoteSendSpec {
+                let spec = RemoteSendSpec {
                     host: host.clone(),
                     brpc_port: *brpc_port,
                     slot: *slot,
                     names: translated.output_names.clone(),
-                })?;
+                };
+                match self.exchange_transport() {
+                    ExchangeTransport::Nixl => {
+                        let transport = self.transport.as_ref().expect("routed before running");
+                        transport.send_fragment(spec)?;
+                    }
+                    ExchangeTransport::Arrow => {
+                        arrow_exchange::send_fragment(self.executor.as_ref(), &spec)?;
+                    }
+                }
             }
         }
         Ok(FragmentOutcome::from_ready(ready_receivers))
@@ -2182,6 +2234,13 @@ pub(crate) mod tests {
 
         fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
             self.inner.export_packed_next(slot)
+        }
+
+        fn export_arrow_next(
+            &self,
+            slot: SenderSlot,
+        ) -> Result<Option<arrow_array::RecordBatch>, String> {
+            self.inner.export_arrow_next(slot)
         }
 
         fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
@@ -2990,6 +3049,7 @@ pub(crate) mod tests {
             // A fixed per-batch row count on batch frames, so the receiver-side test can assert
             // the count rode the wire into the staged batch; EOS frames carry none.
             rows: if eos { None } else { Some(3) },
+            arrow_ipc: None,
         }
         .encode_to_vec()
     }
@@ -3054,9 +3114,348 @@ pub(crate) mod tests {
                     offset: 4096,
                     len: 256,
                     rows: Some(3),
+                    arrow: None,
                 }],
             )],
             "the dispatched receiver consumed exactly the staged batch, row count included"
+        );
+    }
+
+    /// One `transmit_packed` frame of the Arrow tier: `arrow_ipc` set, no lease, the rows in
+    /// the attachment.
+    fn arrow_transmit_params(
+        receiver: &TUniqueId,
+        node_id: i32,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        rows: Option<u64>,
+        names: &[&str],
+    ) -> Vec<u8> {
+        PTransmitPackedParams {
+            finst_id: Some(crate::proto::starrocks::PUniqueId {
+                hi: receiver.hi,
+                lo: receiver.lo,
+            }),
+            node_id: Some(node_id),
+            sender_id: Some(sender_id),
+            eos: Some(eos),
+            seq: Some(seq),
+            offset: Some(0),
+            length: Some(0),
+            column_names: names.iter().map(|name| name.to_string()).collect(),
+            canary: None,
+            rows,
+            arrow_ipc: Some(true),
+        }
+        .encode_to_vec()
+    }
+
+    /// The Arrow twin of `transmit_packed_frames_feed_a_dispatched_receiver`: an `arrow_ipc`
+    /// frame's attachment decodes into record batches staged lease-free (offset and len 0, rows
+    /// from `num_rows`), the eos completes the set, and the dispatched receiver consumes exactly
+    /// those batches as `remote_inputs` — with no staging lease ever released.
+    #[test]
+    fn transmit_packed_arrow_frames_feed_a_dispatched_receiver() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(63, 1);
+        let receiver_id = TUniqueId::new(63, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id, receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        // Two Arrow chunks of one sender: the rows ride the attachment as IPC streams.
+        let batch = arrow_array::RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"]))
+                    as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let chunks = [batch.slice(0, 2), batch.slice(2, 1)];
+        for (seq, chunk) in chunks.iter().enumerate() {
+            let data = route(
+                &service,
+                methods::TRANSMIT_PACKED,
+                arrow_transmit_params(
+                    &receiver_id,
+                    7,
+                    0,
+                    seq as i64,
+                    false,
+                    Some(chunk.num_rows() as u64),
+                    &["id", "name"],
+                ),
+                arrow_exchange::encode_ipc(chunk).unwrap(),
+            );
+            let data = PTransmitPackedResult::decode(data.body.as_slice()).unwrap();
+            assert_eq!(
+                data.status.status_code,
+                TStatusCode::OK.0,
+                "{:?}",
+                data.status.error_msgs
+            );
+        }
+
+        let eos = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            arrow_transmit_params(&receiver_id, 7, 0, 2, true, None, &["id", "name"]),
+            Vec::new(),
+        );
+        let eos = PTransmitPackedResult::decode(eos.body.as_slice()).unwrap();
+        assert_eq!(
+            eos.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            eos.status.error_msgs
+        );
+
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        let expected: Vec<StagedBatch> = chunks
+            .iter()
+            .map(|chunk| StagedBatch::arrow(vec![chunk.clone()]))
+            .collect();
+        assert_eq!(expected[0].rows, Some(2));
+        assert_eq!(expected[1].rows, Some(1));
+        assert_eq!(
+            executor.remote_inputs.lock().unwrap().as_slice(),
+            &[(7, 0, expected)],
+            "the dispatched receiver consumed exactly the decoded Arrow batches"
+        );
+        assert!(
+            executor.released.lock().unwrap().is_empty(),
+            "an Arrow frame holds no staging lease to release"
+        );
+    }
+
+    /// A sender-side executor for the Arrow tier without a GPU: a sender run parks one Arrow
+    /// batch per output slot (one int64 column per plan output name, rows 1..=3), which
+    /// `export_arrow_next` drains and `drop_parked` releases exactly once.
+    #[derive(Debug, Default)]
+    struct ArrowParkingExecutor {
+        parked: Mutex<HashMap<SenderSlot, std::collections::VecDeque<arrow_array::RecordBatch>>>,
+        dropped: Mutex<Vec<SenderSlot>>,
+    }
+
+    /// The batch `ArrowParkingExecutor` parks for a plan with these output names.
+    fn parked_arrow_batch(names: &[String]) -> arrow_array::RecordBatch {
+        arrow_array::RecordBatch::try_from_iter(names.iter().map(|name| {
+            (
+                name.as_str(),
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            )
+        }))
+        .unwrap()
+    }
+
+    impl FragmentExecutor for ArrowParkingExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if run.outputs.is_empty() {
+                return StubExecutor.run(run);
+            }
+            let mut parked = self.parked.lock().unwrap();
+            for slot in &run.outputs {
+                parked.insert(
+                    *slot,
+                    std::collections::VecDeque::from([parked_arrow_batch(&run.plan.output_names)]),
+                );
+            }
+            Ok(None)
+        }
+
+        fn export_arrow_next(
+            &self,
+            slot: SenderSlot,
+        ) -> Result<Option<arrow_array::RecordBatch>, String> {
+            let mut parked = self.parked.lock().unwrap();
+            let queue = parked
+                .get_mut(&slot)
+                .ok_or_else(|| format!("nothing parked under {slot:?}"))?;
+            Ok(queue.pop_front())
+        }
+
+        fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
+            self.parked
+                .lock()
+                .unwrap()
+                .remove(&slot)
+                .ok_or_else(|| format!("nothing parked under {slot:?} to drop"))?;
+            self.dropped.lock().unwrap().push(slot);
+            Ok(())
+        }
+    }
+
+    /// Serves `service` as a peer CN on a loopback port; returns the port and a guard that stops
+    /// the server on drop. `None` when the sandbox denies binding (the brpc tests skip alike).
+    fn serve_peer(service: SiriusComputeNodeService) -> Option<(u16, PeerGuard)> {
+        let listener = match crate::BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(err)
+                if err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+                }) =>
+            {
+                return None;
+            }
+            Err(err) => panic!("{err:?}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                crate::BrpcServer::from_service(service)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+        Some((
+            port,
+            PeerGuard {
+                shutdown,
+                join: Some(join),
+            },
+        ))
+    }
+
+    struct PeerGuard {
+        shutdown: tokio_util::sync::CancellationToken,
+        join: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    }
+
+    impl Drop for PeerGuard {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+            if let Some(join) = self.join.take() {
+                join.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    /// The Arrow tier end to end over a real loopback brpc hop, with no GPU and no nixl
+    /// transport: CN A (transport `None`, knob `arrow`) runs a sender whose destination is CN B
+    /// (a second service on a loopback listener). A drains the parked output through
+    /// `export_arrow_next` into `arrow_ipc` frames and drops it exactly once; B decodes and
+    /// stages the batch lease-free, the eos completes the sender set, and B's dispatched
+    /// receiver consumes it as Arrow `remote_inputs`.
+    #[test]
+    fn arrow_transport_sends_a_remote_destination_over_brpc_without_nixl() {
+        let peer_executor = Arc::new(RecordingExecutor::default());
+        let peer_listener = match crate::BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(_) => return, // sandbox denies binding; the brpc tests skip alike
+        };
+        let peer_port = peer_listener.local_addr().unwrap().port();
+        drop(peer_listener);
+        let peer = SiriusComputeNodeService::with_executor(
+            peer_executor.clone(),
+            ExchangeIdentity::new("127.0.0.1", peer_port),
+        );
+        let Some((port, _peer_guard)) = serve_peer(peer.clone()) else {
+            return;
+        };
+
+        // StarRocks dispatch order: the receiver registers at B first.
+        let query_id = TUniqueId::new(65, 1);
+        let receiver_id = TUniqueId::new(65, 2);
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&peer, &receiver);
+
+        // CN A: no nixl transport exists; the knob routes the remote destination over Arrow.
+        let executor = Arc::new(ArrowParkingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id, TUniqueId::new(65, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![remote_destination(
+            receiver_id.clone(),
+            i32::from(port),
+        )]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        // A dropped its parked output exactly once, after the drain.
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+            node_id: 7,
+            sender_id: 0,
+        };
+        assert_eq!(executor.dropped.lock().unwrap().as_slice(), &[slot]);
+        assert!(executor.parked.lock().unwrap().is_empty());
+
+        // B ran its receiver over the decoded batch, staged lease-free.
+        let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        let translated_names = {
+            let inputs = peer_executor.remote_inputs.lock().unwrap();
+            assert_eq!(inputs.len(), 1, "{inputs:?}");
+            let (node_id, sender_id, batches) = &inputs[0];
+            assert_eq!((*node_id, *sender_id), (7, 0));
+            assert_eq!(batches.len(), 1, "one Arrow frame for one parked batch");
+            assert_eq!((batches[0].offset, batches[0].len), (0, 0));
+            assert_eq!(batches[0].rows, Some(3));
+            let arrow = batches[0].arrow.as_ref().expect("an Arrow batch");
+            assert_eq!(arrow.len(), 1);
+            let names: Vec<String> = arrow[0]
+                .schema_ref()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            assert_eq!(arrow[0], parked_arrow_batch(&names));
+            names
+        };
+        assert!(
+            !translated_names.is_empty(),
+            "the sender plan's output names ride the IPC schema"
+        );
+        assert!(
+            peer_executor.released.lock().unwrap().is_empty(),
+            "an Arrow frame holds no staging lease to release"
+        );
+    }
+
+    /// An `arrow_ipc` frame whose attachment is not an IPC stream is refused, naming the frame.
+    #[test]
+    fn transmit_packed_arrow_frame_with_garbage_is_an_internal_error() {
+        let service = SiriusComputeNodeService::new();
+        let receiver_id = TUniqueId::new(64, 2);
+        let response = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            arrow_transmit_params(&receiver_id, 7, 0, 0, false, Some(3), &["id"]),
+            vec![0xAB; 16],
+        );
+        let result = PTransmitPackedResult::decode(response.body.as_slice()).unwrap();
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("arrow_ipc frame seq 0")
+                && result.status.error_msgs[0].contains("Arrow IPC"),
+            "{:?}",
+            result.status.error_msgs
         );
     }
 
