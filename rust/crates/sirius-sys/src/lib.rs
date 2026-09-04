@@ -233,10 +233,31 @@ mod ffi {
             length: u64,
         ) -> Result<()>;
 
+        /// Import one host-memory Arrow record batch (Arrow C Data Interface) at
+        /// `array_addr` / `schema_addr` into input stream `stream_id` as sender
+        /// `sender_id`: the host-memory twin of `push_packed`. The buffers are
+        /// copied to the GPU before this returns, so the caller may release the
+        /// Arrow structs right after. Legal between `build()` and `run()`; it
+        /// does not close the sender. A schema mismatch, an undeclared sender
+        /// and a push after the stream ended are all `Err`, never a silent drop.
+        ///
+        /// # Safety
+        /// `array_addr` and `schema_addr` must be the addresses of a valid,
+        /// readable `ArrowArray` (a struct array, one child per declared column)
+        /// and its `ArrowSchema`, both outliving this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_arrow(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            sender_id: u32,
+            array_addr: usize,
+            schema_addr: usize,
+        ) -> Result<()>;
+
         /// Close `sender_id` on input stream `stream_id`. The end-of-stream mirror
         /// for senders that are not local fragments — `relay_from` closes its own
-        /// sender; `push_packed` does not. Idempotent per sender; the stream ends
-        /// once every expected sender has closed.
+        /// sender; `push_packed` and `push_arrow` do not. Idempotent per sender;
+        /// the stream ends once every expected sender has closed.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
         /// Execute the fragment and close its query lifecycle. Blocks until its

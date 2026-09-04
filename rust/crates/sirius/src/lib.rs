@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{Array, RecordBatch, RecordBatchReader, StructArray};
 use arrow_schema::SchemaRef;
 use cxx::{Exception, UniquePtr, let_cxx_string};
 
@@ -417,10 +417,52 @@ impl Fragment<'_> {
         }
     }
 
+    /// Push one host-memory Arrow record batch into input stream `stream_id` as sender
+    /// `sender_id`: the host-memory twin of [`push_packed`](Fragment::push_packed), for a producer
+    /// that has Arrow batches rather than a device pointer and cudf pack metadata.
+    ///
+    /// The batch crosses the Arrow C Data Interface (`arrow_array::ffi::to_ffi` on its struct
+    /// array) and every buffer is copied to the GPU before this returns, so `batch` is untouched
+    /// afterwards and the engine keeps no pointer into it. Legal between
+    /// [`build`](Fragment::build) and [`run`](Fragment::run), like `push_packed`; it does not
+    /// close the sender — call [`close_input`](Fragment::close_input) when the producer is done.
+    ///
+    /// Errs on a schema that disagrees with the declared input columns (naming the column), on a
+    /// sender not declared for the stream, on a shape the engine refuses by name (dictionary,
+    /// large_list, large_utf8, timezone-aware timestamps, decimal256, HUGEINT), and on a push
+    /// after the stream ended — never a silent drop.
+    pub fn push_arrow(
+        &mut self,
+        stream_id: u64,
+        sender_id: u32,
+        batch: &RecordBatch,
+    ) -> Result<(), SiriusError> {
+        // A RecordBatch is a struct array whose children are the columns; cloning shares the
+        // buffers, and exporting hands out pointers into them for the duration of the call.
+        let array = StructArray::from(batch.clone());
+        let (ffi_array, ffi_schema) =
+            arrow_array::ffi::to_ffi(&array.to_data()).map_err(SiriusError::Arrow)?;
+        // SAFETY: both addresses name live, readable `FFI_ArrowArray` / `FFI_ArrowSchema` values
+        // owned by this stack frame (repr(C), ABI-identical to the C structs) that outlive the
+        // call; the engine copies out of them and never releases them.
+        unsafe {
+            self.inner
+                .pin_mut()
+                .push_arrow(
+                    stream_id,
+                    sender_id,
+                    std::ptr::addr_of!(ffi_array) as usize,
+                    std::ptr::addr_of!(ffi_schema) as usize,
+                )
+                .map_err(SiriusError::Engine)
+        }
+        // Dropping `ffi_array` / `ffi_schema` runs their release callbacks and frees the export.
+    }
+
     /// Record that `sender_id` finished producing into input stream `stream_id` — the EOS mirror
-    /// of [`push_packed`](Fragment::push_packed) for remote senders
-    /// ([`relay_from`](Fragment::relay_from) closes its own sender). Idempotent per sender; the
-    /// stream ends once every expected sender has closed.
+    /// of [`push_packed`](Fragment::push_packed) and [`push_arrow`](Fragment::push_arrow) for
+    /// remote senders ([`relay_from`](Fragment::relay_from) closes its own sender). Idempotent
+    /// per sender; the stream ends once every expected sender has closed.
     pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
         self.inner.pin_mut().close_input(stream_id, sender_id)
     }
@@ -506,8 +548,9 @@ impl std::fmt::Debug for StagingArena {
     }
 }
 
-/// Error returned by the Arrow-producing entry points: [`SiriusContext::execute_substrait`],
-/// [`SiriusContext::execute_substrait_result`], and [`Fragment::result_to_arrow`].
+/// Error returned by the Arrow-crossing entry points: [`SiriusContext::execute_substrait`],
+/// [`SiriusContext::execute_substrait_result`], [`Fragment::result_to_arrow`] and
+/// [`Fragment::push_arrow`].
 #[derive(Debug)]
 pub enum SiriusError {
     /// The engine failed to translate or execute the plan (a C++ exception).
@@ -1295,6 +1338,110 @@ mod tests {
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }
 
+    /// The decisive equivalence for the Arrow input: a fragment hop carried as host Arrow batches
+    /// (`result_to_arrow` on a result fragment → `push_arrow`) must deliver exactly the values the
+    /// proven in-process `relay_from` hop delivers for the identical receiver plan. Also pins the
+    /// surrounding contracts: the batch is untouched after the push, a second sender may still
+    /// push after the first closed, and a push after EOS is a loud error. Requires a GPU.
+    #[test]
+    fn arrow_hop_matches_relay_hop() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+
+        let make_receiver = |senders: &[u32]| {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            for &sender in senders {
+                receiver.declare_input_sender(0, sender).unwrap();
+            }
+            receiver.declare_input_cardinality(0, 3).unwrap();
+            receiver.build(&receiver_plan).unwrap();
+            receiver
+        };
+
+        // Reference: the proven in-process native relay.
+        let relay_result = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender.build(&sender_plan).unwrap();
+            sender.run().unwrap();
+
+            let mut receiver = make_receiver(&[]);
+            let moved = receiver.relay_from(&mut sender, 0, 0, 0).unwrap();
+            assert!(moved > 0, "the relay hop must carry batches");
+            receiver.run().unwrap();
+            receiver.result_to_arrow().unwrap()
+        };
+
+        // The same rows as host Arrow batches: what an embedding host that did its own scan holds.
+        let host_batches = ctx.execute_substrait(&sender_plan).unwrap();
+        assert!(!host_batches.is_empty(), "the scan produced Arrow batches");
+        assert_eq!(host_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        // The same hop through push_arrow, from one declared sender.
+        let arrow_result = {
+            let mut receiver = make_receiver(&[]);
+            for batch in &host_batches {
+                receiver.push_arrow(0, 0, batch).unwrap();
+            }
+            receiver.close_input(0, 0).unwrap();
+
+            // A push after EOS must refuse loudly, never vanish.
+            let refused = receiver.push_arrow(0, 0, &host_batches[0]);
+            assert!(refused.is_err(), "push_arrow after close_input must error");
+            assert!(refused.unwrap_err().to_string().contains("already ended"));
+
+            receiver.run().unwrap();
+            receiver.result_to_arrow().unwrap()
+        };
+
+        assert_eq!(rows(&relay_result), rows(&arrow_result));
+        assert_eq!(
+            rows(&arrow_result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+        // The engine copied out of the batch; the host still owns it intact.
+        assert_eq!(host_batches[0].num_rows(), 3);
+
+        // Two declared senders on one stream: the stream ends only once both closed, and an
+        // undeclared sender is refused before anything is copied.
+        let two_senders_result = {
+            let mut receiver = make_receiver(&[1, 2]);
+            receiver.push_arrow(0, 1, &host_batches[0]).unwrap();
+            receiver.close_input(0, 1).unwrap();
+            receiver.push_arrow(0, 2, &host_batches[0]).unwrap();
+            let undeclared = receiver.push_arrow(0, 7, &host_batches[0]);
+            assert!(
+                undeclared.unwrap_err().to_string().contains("sender 7"),
+                "an undeclared sender must be named in the error"
+            );
+            receiver.close_input(0, 2).unwrap();
+            receiver.run().unwrap();
+            receiver.result_to_arrow().unwrap()
+        };
+        let mut doubled = rows(&relay_result);
+        doubled.extend(rows(&relay_result));
+        doubled.sort();
+        assert_eq!(rows(&two_senders_result), doubled);
+    }
+
     /// The zero-row export contract: a zero-row batch leaves `export_packed` as a metadata-only
     /// frame (`offset == 0`, `len == 0`) holding NO staging lease, and the frame round-trips
     /// through `push_packed` into an empty result. Pins the q15 leak: `export_packed` used to
@@ -1467,6 +1614,55 @@ mod tests {
         assert!(
             what.contains("DOUBLE") && what.contains("BIGINT"),
             "the error must name the declared and the produced type: {what}"
+        );
+    }
+
+    /// The Arrow leg of the same guard: a host batch whose Arrow types disagree with the
+    /// receiver's declared stream schema must be refused by `push_arrow`, naming the column and the
+    /// declared type, before any buffer is copied. Requires a GPU.
+    #[test]
+    fn push_arrow_rejects_a_mismatched_schema() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+
+        // (id Int64, name Utf8) built on the host; the receiver declares id as DOUBLE.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let batch = RecordBatch::try_new(schema, vec![ids, names]).unwrap();
+
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "DOUBLE").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.build(&stream_read_plan_f64(0)).unwrap();
+
+        let err = receiver.push_arrow(0, 0, &batch).unwrap_err();
+        let what = err.to_string();
+        assert!(what.contains("column 0 (id)"), "unexpected error: {what}");
+        assert!(
+            what.contains("declared DOUBLE"),
+            "the error must name the declared type: {what}"
+        );
+
+        // A batch with the wrong column count is refused the same way.
+        let one_column = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        let what = receiver
+            .push_arrow(0, 0, &one_column)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            what.contains("carries 1 columns") && what.contains("declares 2"),
+            "unexpected error: {what}"
         );
     }
 
