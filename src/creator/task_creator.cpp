@@ -350,12 +350,13 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
 void task_creator::stop()
 {
   _task_creation_queue.interrupt();
+  std::lock_guard<std::mutex> lock(_thread_pool_mutex);
   do_stop_thread_pool();
 }
 
 void task_creator::start_thread_pool()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  std::lock_guard<std::mutex> lock(_thread_pool_mutex);
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
   // Re-arm the request queue. stop_thread_pool() calls
@@ -384,7 +385,7 @@ void task_creator::do_stop_thread_pool()
 
 void task_creator::stop_thread_pool()
 {
-  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  std::lock_guard<std::mutex> lock(_thread_pool_mutex);
   do_stop_thread_pool();
 }
 
@@ -435,8 +436,15 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
 
 void task_creator::report_fatal_error(std::exception_ptr error)
 {
+  // Report-only: this can run on one of _bounded_pool's own worker threads (schedule() throws
+  // from inside the dispatched task-creation lambda, or via notify_downstream_pipelines() called
+  // from ~gpu_pipeline_task on a GPU executor thread). Calling stop() here would join
+  // _manager_thread and then block in _bounded_pool->wait_all() waiting for this very task's slot
+  // to free -- a self-wait deadlock, since the slot can't free until this call returns.
+  // terminate_query() only fulfills the completion future; the query thread (sirius_engine.cpp,
+  // future.get() catch block) observes the error and calls task_scheduler::drain_after_error(),
+  // which drains and restarts every pool from a thread that is never one of their own workers.
   if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(std::move(error)); }
-  stop();
 }
 
 void task_creator::schedule_lookahead(sirius::query_id_t query_id,

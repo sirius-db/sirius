@@ -198,13 +198,20 @@ std::future<void> task_scheduler::start_query()
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
+  // Report-only: this can be reached from a GPU executor's own worker thread (via
+  // notify_downstream_pipelines() in ~gpu_pipeline_task) or from the task_creator's own worker
+  // thread. stop() below joins each gpu_pipeline_executor's manager thread and then blocks in
+  // that executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of
+  // that pool's workers, its slot cannot free until this call returns, so wait_all() would never
+  // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
+  // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
+  // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
   std::shared_ptr<completion_handler> completion;
   {
     std::scoped_lock lock(_query_mutex);
     completion = _completion_handler;
   }
   if (completion) { completion->report_error(std::move(error)); }
-  stop();
 }
 
 void task_scheduler::drain_after_error()

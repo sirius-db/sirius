@@ -190,12 +190,19 @@ class task_creator {
   void schedule_lookahead(sirius::query_id_t query_id,
                           std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail the running query with @p error and stop the creator.
+  /// \brief Fail the running query with @p error.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
   /// surfaces the error rather than the process terminating.
+  ///
+  /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
+  /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
+  /// ~gpu_pipeline_task), and synchronously stopping/draining a pool from its own worker is a
+  /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
+  /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
+  /// called by the query thread once it observes the error, does the actual draining.
   void report_fatal_error(std::exception_ptr error);
 
   /**
@@ -318,6 +325,16 @@ class task_creator {
   //! One entry per in-flight query. Guarded by _global_state_mutex.
   std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
   mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
+
+  //! Serializes start_thread_pool()/stop_thread_pool() against each other and guards
+  //! _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
+  //! do_stop_thread_pool() joins _manager_thread while holding this lock, and manager_loop()
+  //! (running on that thread) takes _global_state_mutex on every request via
+  //! get_query_task_global_state(). Sharing one mutex between the two let a worker thread's
+  //! error-triggered stop_thread_pool() call block on the join while holding the very lock
+  //! manager_loop() needed to reach its own exit check -- a real deadlock, not a theoretical one,
+  //! since manager_loop() passes through that lock on every iteration.
+  std::mutex _thread_pool_mutex;
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
   /// Scoped to the memory manager's reserved GPU/HOST spaces:
