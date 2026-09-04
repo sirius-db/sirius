@@ -267,6 +267,34 @@ class SIRIUS_FFI_EXPORT Fragment {
                    std::uint64_t offset,
                    std::uint64_t length);
 
+  /// Import one host-memory Arrow record batch (Arrow C Data Interface) into input stream
+  /// `stream_id` as sender `sender_id`. Buffers are copied to the GPU before returning, so the
+  /// caller may release the Arrow structs immediately after. Does not close the sender — call
+  /// close_input(stream_id, sender_id) when the producer is done.
+  ///
+  /// The host-memory twin of `push_packed`: same call site, same `session().push()`, different
+  /// input format. `array_addr` / `schema_addr` are the addresses of the caller's `ArrowArray`
+  /// and `ArrowSchema` (a struct array, one child per declared column), so this header still
+  /// needs no Arrow headers. The batch is reconciled against the declared stream schema column by
+  /// column (see `helper/arrow_host_import.hpp` for the exact rules: decimal width from the
+  /// declared precision, bool bitmap to BOOL8, and by-name refusal of dictionary, large_list,
+  /// large_utf8, timezone-aware timestamps, decimal256 and HUGEINT columns).
+  ///
+  /// Contract in this milestone: legal between `build()` and `run()`, exactly where `push_packed`
+  /// sits. It touches only the stream session (mutex-protected) and immutable post-`build()`
+  /// state — the declared schemas and senders — never the DuckDB connection or the query
+  /// lifecycle, so a producer thread other than the one that owns the `Context` may call it in
+  /// that window today, and widening it to "any thread, including while `run()` blocks on
+  /// another thread" needs no redesign of this entry point. There is no backpressure: the queue
+  /// is unbounded.
+  /// @throws before `build()`, on an unknown input stream, on a sender not declared for the
+  /// stream, on null addresses, on schema mismatch, or when the stream already ended (a push
+  /// after EOS never disappears silently).
+  void push_arrow(std::uint64_t stream_id,
+                  std::uint32_t sender_id,
+                  std::uintptr_t array_addr,
+                  std::uintptr_t schema_addr);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
   /// (relay_from closes its own sender; push_packed does not). Idempotent per sender; the
   /// stream ends once every expected sender has closed.

@@ -435,6 +435,7 @@ set(EXTENSION_SOURCES
     src/sirius_engine.cpp
     src/sirius_extension.cpp
     src/sirius_ffi.cpp
+    src/helper/arrow_host_import.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/batch_telemetry.cpp

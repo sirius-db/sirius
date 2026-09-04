@@ -43,6 +43,7 @@
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/arrow_host_import.hpp"   // sirius::import_arrow_host_table
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
@@ -857,6 +858,65 @@ void Fragment::push_packed(std::uint64_t stream_id,
   if (!impl_->session().push(stream_id, std::move(data_batch))) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
                                           " refused a packed batch; it had already ended");
+  }
+}
+
+void Fragment::push_arrow(std::uint64_t stream_id,
+                          std::uint32_t sender_id,
+                          std::uintptr_t array_addr,
+                          std::uintptr_t schema_addr)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_arrow()");
+  }
+  if (array_addr == 0 || schema_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() requires non-null ArrowArray and ArrowSchema addresses");
+  }
+  // Unlike push_packed, which tolerates an undeclared stream (the session then throws), the
+  // declared schema is what this batch is reconciled against, so it has to exist.
+  auto declared_it = impl_->resolved_inputs.find(stream_id);
+  if (declared_it == impl_->resolved_inputs.end()) {
+    throw sirius::invalid_input_exception("Fragment: push_arrow() target input stream " +
+                                          std::to_string(stream_id) +
+                                          " was never declared on this fragment");
+  }
+  const auto& declared = declared_it->second;
+  if (!declared.expected_senders.contains(sender_id)) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() into stream {} from sender {}, which was not declared for it (an "
+      "undeclared sender could never close the stream)",
+      stream_id,
+      sender_id);
+  }
+
+  auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, /*device_id=*/0);
+  if (gpu_space == nullptr) {
+    throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
+  }
+
+  // The H2D copy is mandatory: the HOST tier is addressed by offsets inside cuCascade-owned
+  // blocks and spill assumes it owns the memory, so caller memory cannot be pinned into it. The
+  // batch the engine keeps lives in ordinary pool memory — fully accounted and spillable like any
+  // other — and the synchronize below is what lets the caller release its Arrow structs on return.
+  auto stream = cudf::get_default_stream();
+  auto table =
+    sirius::import_arrow_host_table(reinterpret_cast<const ArrowSchema*>(schema_addr),
+                                    reinterpret_cast<const ArrowArray*>(array_addr),
+                                    "Fragment: Arrow batch for stream " + std::to_string(stream_id),
+                                    declared.names,
+                                    declared.types,
+                                    stream,
+                                    gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  // A host batch has no local producing operator, so there is no telemetry lineage to thread.
+  auto data_batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+  if (!impl_->session().push(stream_id, std::move(data_batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused an Arrow batch; it had already ended");
   }
 }
 

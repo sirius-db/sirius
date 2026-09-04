@@ -341,6 +341,33 @@ exactly one device region.
   `run()`); it does not close the sender (`close_input()` is the EOS mirror) and refuses a push
   after the stream has ended.
 
+### `push_arrow()` — a host-memory Arrow batch as input
+
+```cpp
+void push_arrow(std::uint64_t stream_id, std::uint32_t sender_id,
+                std::uintptr_t array_addr, std::uintptr_t schema_addr);
+```
+
+The host-memory twin of `push_packed()`, for an embedding host that did its own scan and holds
+Arrow record batches rather than a device pointer and cudf pack metadata. `array_addr` /
+`schema_addr` are the caller's `ArrowArray` / `ArrowSchema` (Arrow C Data Interface, one struct
+array whose children are the columns), so the header still needs no Arrow headers.
+`helper/arrow_host_import.hpp` imports the batch with `cudf::from_arrow` (every buffer is copied
+host→device; pinning caller memory into the HOST tier does not fit the tier model, whose blocks are
+cuCascade-owned and spillable), reconciles it against the declared schema with the same
+`sirius::get_cudf_type` column guard `push_packed()` uses — narrowing an Arrow `decimal128` to the
+width the declared precision picks — and refuses by name what the engine cannot consume: dictionary
+encoding, `large_list` / `large_utf8` / `large_binary` (64-bit offsets), timezone-aware timestamps,
+`decimal256`, and `HUGEINT` columns. The copy is synchronized before the call returns, so the caller
+may release its Arrow structs at once. `sender_id` must be a declared sender of the stream; the
+call does not close it (`close_input()` is the EOS mirror) and a push after the stream ended throws.
+
+Legal exactly where `push_packed()` is, between `build()` and `run()`. It touches only the stream
+session and immutable post-`build()` state (the declared schemas and senders), never the DuckDB
+connection or the query lifecycle, so a producer thread other than the context's may call it in
+that window today; widening it to "any thread, including while `run()` blocks" needs no redesign of
+the entry point. There is no backpressure: the queue is unbounded.
+
 `Context::staging_arena_handle()` returns a `StagingArena` sharing ownership of the same allocator
 that the thread-affine `Context::staging_*` methods drive; its `lease`/`release` serialize on the
 arena's mutex and make no CUDA calls, so any thread — an RPC thread while the context thread is
@@ -367,7 +394,7 @@ inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + S
 |---|---|
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
-| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]`, `[sirius_ffi][arrow_host_import]`, `[.][sirius_ffi_bench]` |
 | `test/cpp/exec/test_exchange_staging_arena.cpp` | `[staging_arena]` |
 
 The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/lib.rs`:
@@ -376,6 +403,15 @@ The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/
 `zero_row_export_is_metadata_only_and_holds_no_lease` (a `len == 0` frame holds no lease and the
 whole arena is grantable again afterwards), and `push_packed_rejects_a_mismatched_schema`. They need
 a GPU; CI only compile-checks them.
+
+The Arrow input is covered on both sides. C++ (`test_sirius_ffi_fragment.cpp`): a
+`cudf::to_arrow_host` → `push_arrow` → `run` → `result_to_arrow` round trip over BIGINT, DOUBLE,
+BOOLEAN, VARCHAR, DECIMAL(15,2) and DATE; several batches and senders on one stream; schema, column
+count, unknown stream, undeclared sender and post-EOS refusals; a push from a second `std::thread`
+between `build()` and `run()`; the helper's by-name refusals without an engine context; and a hidden
+`[sirius_ffi_bench]` case that prints H2D/D2H GB/s for a 512 MiB batch. Rust:
+`arrow_hop_matches_relay_hop` (the Arrow hop equals the `relay_from` hop) and
+`push_arrow_rejects_a_mismatched_schema`.
 
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
@@ -392,6 +428,6 @@ which takes the future from `start_query()` and waits immediately. Fragments the
 store-and-forward, one at a time (`relay_from(...)` orders strictly before `run()`, and only one
 fragment may sit between its own `build()` and `run()`). The `Fragment` surface exposes no
 `pull`/`wait` and no push *during* `run()`: a remote sender feeds a fragment only store-and-forward,
-through `push_packed()` between `build()` and `run()`, and `relay_from()` only moves batches that
+through `push_packed()` or `push_arrow()` between `build()` and `run()`, and `relay_from()` only moves batches that
 are already sitting in a *local*, already-finished source fragment's output repository. Non-blocking
 scheduling and a streaming `push`/`pull`/`wait` FFI are tracked separately, not claimed here.
