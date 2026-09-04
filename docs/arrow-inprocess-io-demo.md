@@ -405,15 +405,32 @@ Original plan, kept for the record:
 - Risks: the `sirius_interface` result path (2.5); decimal precision fidelity at the MySQL edge. Dependencies: M1;
   independent of M2 and M3.
 
-### M5: measured comparison against NIXL
+### M5: measured comparison against NIXL (first end-to-end run, 2026-09-04 20:00 UTC)
 
-- Reuse the harness (section 6), run the arms of 5.4, store each under the harness's arms directory, and add the
-  results table to this document. Also the follow-ups both hops share: reservation accounting for arriving bytes
-  (`make_reservation_or_null`, 2.3) and folding `push_packed`'s inline schema guard onto the helper (2.2).
-- Acceptance: every arm reports GB/s per hop, end-to-end time, copies and host memory, with `compare.py` verdicts
-  against the DuckDB oracle. Dependencies: M2 for the micro-benchmark arm, M3 for the loopback arm, M4 optional.
-- Risks: A2 needs a CN switch that does not exist yet; A1 at the 5.1 byte totals needs host memory for up to 48 GB of
-  Arrow buffers per query, and its result path alone (1.1-1.2 GB/s) is about 40 s on q07.
+Same CN binary (this branch at 664653c5), 2 CNs, `GPU_MEM=60GiB STAGING=32GiB`, SF1000, cold + 2 warm, six queries,
+knob `SIRIUS_CN_EXCHANGE_TRANSPORT=nixl` then `=arrow` (`harness/arms-arrow-vs-nixl.sh`; arms `X-nixl`, `X-arrow`).
+
+| query | nixl cold / warm | arrow cold / warm | exchange traffic |
+|---|---|---|---|
+| q01 | 6.9 s / 6.5 s | 6.7 s / 6.6 s | a few KB (partial aggregates); no difference |
+| q06 | 5.5 / 5.5 | 5.5 / 5.5 | same |
+| q03 | 8.4 / 7.5 | **92.5 / 84.1** | 4 streams of 19.7 GB each; each took 68 s over Arrow: **0.29 GB/s per stream**, 0.28 GB/s aggregate over the arm's 22 transmits (149 GB in 525 s) |
+| q04 | 10.3 / 5.9 | fail after 64 s: `std::bad_alloc: out_of_memory` in a fragment | |
+| q07 | 9.7 / 9.7 | fail: one CN **segfaulted** (`cluster8.sh` line 96, core to apport) right after translating the lineitem fragment; the launcher tore the cluster down | |
+| q22 | 2.6 / 2.5 | not run (cluster gone) | |
+
+Oracle: nixl q01 q03 q07 VALUES-DIFFER (the known decimal class), q04 q06 q22 MATCH; arrow q01/q03 identical verdicts.
+
+Reading. The device-to-device WRITE moves the same bytes at 48-56 GB/s (5.1); the host path measured 0.28-0.29 GB/s
+end to end, about 180x slower, far below the sum of its per-leg costs in 5.2 (D2H 4 GB/s, H2D 10 GB/s): the sender
+exports, IPC-encodes and ships 64 MiB frames sequentially on the drain thread, the receiver decodes and pushes
+sequentially on the engine thread, and every frame is one brpc round trip. Two defects surfaced: q04 ran out of pool
+memory (arriving Arrow batches are copied into the 60 GiB pool with no reservation accounting, the M5 follow-up
+already listed), and q07 crashed a CN (not yet reproduced; the last CN log lines are the lineitem fragment's
+translation, then the segfault). Conclusion for the design question: for CN-to-CN exchange on one host NIXL stays;
+the Arrow path is the host-input contract for a CPU-side producer (its intended role), and needs pipelining
+(overlap export, encode, send, decode, push), reservation accounting and the crash fix before it can be measured
+against NIXL on equal terms. Evidence: `starrocks-tools/evidence/rtxpro6000-fix4/X-nixl`, `X-arrow`, `arrow-vs-nixl.md`.
 
 ## 5. Performance comparison against NIXL
 
