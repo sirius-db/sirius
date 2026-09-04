@@ -303,7 +303,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `use_sirius_datasource` | bool | true | Exact local-read backend selector: `true` routes through the Sirius `io_uring` datasource; `false` uses kvikio. The kvikio path is single-GPU only, so `false` is rejected when multiple GPUs are configured. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |

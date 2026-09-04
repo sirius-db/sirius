@@ -234,6 +234,53 @@ TEST_CASE("sirius_config rejects removed s3_use_async_backend object_store key",
   std::filesystem::remove(path, ec);
 }
 
+TEST_CASE("sirius_config preserves the explicit single-GPU kvikio selector",
+          "[scan_manager][config][datasource]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_single_gpu_kvikio.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  space:\n"
+             "    gpu:\n"
+             "      - device_id: 0\n"
+             "        memory_capacity: 1GiB\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      use_sirius_datasource: false\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  CHECK_FALSE(cfg.get_scan_manager_config().use_sirius_datasource);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config rejects the kvikio selector for multiple GPUs",
+          "[scan_manager][config][datasource][multi_gpu]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_multi_gpu_kvikio.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  space:\n"
+             "    gpu:\n"
+             "      - device_id: 0\n"
+             "        memory_capacity: 1GiB\n"
+             "      - device_id: 1\n"
+             "        memory_capacity: 1GiB\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      use_sirius_datasource: false\n");
+
+  sirius::sirius_config cfg;
+  CHECK_THROWS_WITH(
+    cfg.load_from_file(path),
+    Catch::Contains("use_sirius_datasource=false is only supported with one configured GPU"));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("sirius_config defaults chunk prewarm to enabled when YAML omits the key",
           "[scan_manager][config][prefetching_cache]")
 {

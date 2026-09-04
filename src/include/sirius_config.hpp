@@ -302,11 +302,12 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
-  /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
-  /// datasource is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from the end of @ref load_from_file.
-  void enforce_sirius_datasource_for_multi_gpu();
+  /// Reject @c use_sirius_datasource=false when @c _memory_space_configs
+  /// contains more than one GPU memory space. The Sirius datasource is
+  /// required for multi-GPU IO routing; silently overriding the explicit
+  /// selector would make the effective backend differ from the configuration.
+  /// Called from the end of @ref load_from_file.
+  void validate_sirius_datasource_for_multi_gpu() const;
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   int _gpus_per_query = 0;
