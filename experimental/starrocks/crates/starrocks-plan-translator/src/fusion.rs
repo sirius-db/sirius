@@ -992,6 +992,72 @@ mod tests {
         assert!(exec.per_node_scan_ranges.is_empty());
     }
 
+    /// q05's join over two shuffled leaves, folded one edge at a time: the second edge is
+    /// checked against the receiver the first splice already rewrote (its scan ranges now hold
+    /// the first leaf's node), and the fused preorder stays one valid tree.
+    #[test]
+    fn splice_twice_into_one_receiver() {
+        let receiver = receiver_params(
+            vec![
+                join(2, vec![0, 1]),
+                exchange(7, vec![0]),
+                exchange(8, vec![1]),
+            ],
+            &[(7, 1), (8, 1)],
+            &[0, 1],
+        );
+        let mut lineitem = sender_params(vec![scan(0, 0)], TPartitionType::HASH_PARTITIONED);
+        exec_mut(&mut lineitem)
+            .per_node_scan_ranges
+            .insert(0, scan_range());
+        let mut orders = sender_params(vec![scan(1, 1)], TPartitionType::HASH_PARTITIONED);
+        stream_sink_mut(&mut orders).dest_node_id = 8;
+        exec_mut(&mut orders)
+            .per_node_scan_ranges
+            .insert(1, scan_range());
+
+        // The CN's fold pops the ready inputs last-first: exchange 8, then 7.
+        let once = splice(receiver, 8, &orders).unwrap();
+        assert_eq!(node_ids(&once), vec![2, 7, 1]);
+        assert_eq!(
+            once.params.as_ref().unwrap().per_exch_num_senders,
+            BTreeMap::from([(7, 1)])
+        );
+        // A leaf reusing the spliced-in scan's node collides with it, not with the exchange.
+        let mut duplicate = sender_params(vec![scan(1, 0)], TPartitionType::HASH_PARTITIONED);
+        exec_mut(&mut duplicate)
+            .per_node_scan_ranges
+            .insert(1, scan_range());
+        assert_eq!(
+            fusable_edge(&once, 7, &duplicate),
+            Err(FusionRefusal::ScanRangeCollision { node_id: 1 })
+        );
+
+        let twice = splice(once, 7, &lineitem).unwrap();
+        assert_eq!(node_ids(&twice), vec![2, 0, 1]);
+        let exec = twice.params.as_ref().unwrap();
+        assert!(exec.per_exch_num_senders.is_empty());
+        assert_eq!(
+            exec.per_node_scan_ranges
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(exec.fragment_instance_id, TUniqueId::new(1, 2));
+        let nodes = &twice
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert_eq!(preorder_span(nodes, 0).unwrap(), nodes.len());
+        assert_eq!(preorder_parent(nodes, 1), Some(0));
+        assert_eq!(preorder_parent(nodes, 2), Some(0));
+    }
+
     #[test]
     fn fusable_edge_refuses_scan_range_collision() {
         // Receiver holds node 0 in per_node_scan_ranges.
