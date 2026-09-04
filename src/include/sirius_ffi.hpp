@@ -258,13 +258,18 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// The caller owns both and frees them through their `release` callbacks; the engine keeps no
   /// pointer into them and no staging lease is involved.
   ///
-  /// Returns false, touching nothing, when no batch is parked right now (for a fragment that
-  /// finished `run()`, the stream is drained). On success writes the batch's exact row count to
-  /// `rows` and synchronizes the copy stream before returning, so the host buffers are complete.
+  /// Returns false when no batch is parked right now (for a fragment that finished `run()`, the
+  /// stream is drained): `rows` is written as 0 and the caller's structs are left untouched, as
+  /// `export_packed` does. On success writes the batch's exact row count to `rows` — 0 for an
+  /// empty batch, which exports as a zero-length struct array, not as false — and synchronizes
+  /// the copy stream before returning, so the host buffers are complete.
   /// The schema carries no column names (cudf emits the types only); the transport that moves the
   /// batch carries the names, exactly as it does for `export_packed`. Decimal columns keep their
   /// cudf width at cudf's widest precision for it (`cudf::to_arrow_schema`: a DECIMAL64 column is
   /// `d:18,2,64`), which the receiving `push_arrow` reconciles against the declared precision.
+  /// A strings column whose cudf offsets are 64-bit (a batch holding more than 2 GiB of
+  /// characters in one column) exports as `large_utf8`, which `push_arrow` refuses by name; keep
+  /// a parked batch under that size (the packed hop carries such a batch, this one does not).
   /// @throws before `build()`, on an unknown output stream, on null addresses, or on a parked
   /// batch that is not GPU-resident (same contract as `export_packed`).
   bool export_arrow(std::uint64_t stream_id,

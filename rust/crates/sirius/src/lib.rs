@@ -1603,6 +1603,75 @@ mod tests {
         );
     }
 
+    /// The Arrow twin of the wire half of [`zero_row_export_is_metadata_only_and_holds_no_lease`]:
+    /// the zero-row sender instance of a distributed scan (q15's empty byte-range split) parks
+    /// one empty batch, which `export_arrow_next` hands over as a zero-row `RecordBatch` — not
+    /// `None` — and `push_arrow` imports at length 0 into a receiver that terminates with zero
+    /// rows: an empty stream, not an error. The 2-CN TPC-H arm over
+    /// `SIRIUS_CN_EXCHANGE_TRANSPORT=arrow` ships exactly this frame. Requires a GPU.
+    #[test]
+    fn zero_row_arrow_export_hop_delivers_an_empty_stream() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let names = vec!["id".to_string(), "name".to_string()];
+        // A byte range strictly inside the file's single row group owns no row groups: the
+        // zero-row sender instance of a distributed scan.
+        let empty_split_plan =
+            local_files_plan_ranged(&[(path.to_str().unwrap(), 10, 5)], names.clone());
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&empty_split_plan).unwrap();
+        sender.run().unwrap();
+        assert_eq!(sender.output_row_count(0).unwrap(), 0);
+        let parked = sender.output_batch_count(0).unwrap();
+        assert!(
+            parked > 0,
+            "the empty split must park a zero-row batch to export"
+        );
+
+        let mut exported = Vec::new();
+        while let Some(batch) = sender.export_arrow_next(0).unwrap() {
+            assert_eq!(
+                batch.num_rows(),
+                0,
+                "an empty split's batch carries no rows"
+            );
+            assert_eq!(batch.num_columns(), 2);
+            let schema = batch.schema();
+            assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
+            assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Utf8);
+            exported.push(batch);
+        }
+        assert_eq!(
+            exported.len(),
+            parked,
+            "a zero-row parked batch exports as a batch, never as `None`"
+        );
+        assert!(sender.export_arrow_next(0).unwrap().is_none());
+
+        // The receiver as the CN builds it for an Arrow frame: the exact cardinality is the sum
+        // of the decoded row counts, here 0.
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.declare_input_cardinality(0, 0).unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        for batch in &exported {
+            receiver.push_arrow(0, 0, batch).unwrap();
+        }
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.result_to_arrow().unwrap();
+        assert_eq!(rows(&result), Vec::new(), "an empty split carries no rows");
+    }
+
     /// Flattens a result into sorted nullable `(id, name)` rows.
     fn nullable_rows(result: &super::SubstraitResult) -> Vec<(Option<i64>, Option<String>)> {
         let mut rows = Vec::new();

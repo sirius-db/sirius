@@ -218,8 +218,10 @@ mod ffi {
         /// `ArrowArray` (a struct array, one child per output column) and
         /// `ArrowSchema` into the caller's structs at `array_addr` /
         /// `schema_addr`: the host-Arrow twin of `export_packed`. Returns
-        /// `false`, touching nothing, when nothing is parked right now; on
-        /// success writes the exact row count to `rows` and the host buffers
+        /// `false` when nothing is parked right now, with `rows` written as 0
+        /// and the structs untouched (as `export_packed` does); on success
+        /// writes the exact row count to `rows` (0 for an empty batch, which
+        /// is a zero-length struct array, not `false`) and the host buffers
         /// are complete (the copy stream is synchronized). The caller owns
         /// both structs and frees them through their `release` callbacks.
         ///

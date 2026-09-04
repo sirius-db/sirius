@@ -942,7 +942,8 @@ TEST_CASE("Fragment::export_arrow exports a parked output batch equal to the rel
   REQUIRE(total_rows == rows.size());
   REQUIRE(sender->output_batch_count(10) == 0);
 
-  // Drained: false, and the caller's structs and row count are left untouched.
+  // Drained: false; `rows` is written as 0 (export_packed's drained behaviour) and the caller's
+  // structs are left untouched — no live release callback.
   {
     arrow_array_guard array;
     arrow_schema_guard schema;
@@ -972,6 +973,68 @@ TEST_CASE("Fragment::export_arrow exports a parked output batch equal to the rel
     REQUIRE_THROWS_WITH(sender->export_arrow(10, 0, addr(schema.schema), n),
                         Catch::Matchers::Contains("non-null"));
   }
+}
+
+// The q15 empty-split shape on the Arrow hop: a sender whose only input batch has zero rows parks
+// a zero-row batch, which export_arrow hands over as a zero-length struct array (rows 0, live
+// structs — not false), and push_arrow on the receiving side imports it at length 0 into an
+// empty stream: not an error, and the receiver terminates with zero rows. Both imports here
+// (into the sender, and of the exported structs into the receiver) run the struct-window and
+// `cudf::from_arrow` paths at length 0.
+TEST_CASE("Fragment::export_arrow exports a zero-row parked batch as an empty struct array",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto host = to_host_arrow(fixture_table(fixture_rows(0))->view(), fixture_columns());
+  const auto addr = [](auto& c_struct) { return reinterpret_cast<std::uintptr_t>(&c_struct); };
+  REQUIRE(host.array->array.length == 0);
+
+  auto sender = sirius::ffi::make_fragment(*context);
+  declare_columns(*sender, 0, fixture_columns());
+  sender->declare_output(10);
+  sender->build(stream_read_plan(0, fixture_columns()));
+  sender->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  sender->close_input(0, 0);
+  sender->run();
+  REQUIRE(sender->output_row_count(10) == 0);
+  REQUIRE(sender->output_batch_count(10) == 1);
+
+  auto receiver = build_result_fragment(*context, fixture_columns());
+  {
+    arrow_array_guard array;
+    arrow_schema_guard schema;
+    std::uint64_t n = 7;
+    REQUIRE(sender->export_arrow(10, addr(array.array), addr(schema.schema), n));
+    REQUIRE(n == 0);
+    REQUIRE(array.array.release != nullptr);
+    REQUIRE(schema.schema.release != nullptr);
+    REQUIRE(std::string(schema.schema.format) == "+s");
+    REQUIRE(array.array.length == 0);
+    REQUIRE(array.array.n_children == 6);
+    REQUIRE(schema.schema.n_children == 6);
+    for (std::int64_t i = 0; i < array.array.n_children; ++i) {
+      REQUIRE(array.array.children[i]->length == 0);
+    }
+    std::vector<fixture_row> exported;
+    append_fixture_rows(array.array, exported, decimal_words_of(schema.schema.children[4]->format));
+    REQUIRE(exported.empty());
+    REQUIRE_NOTHROW(receiver->push_arrow(0, 0, addr(array.array), addr(schema.schema)));
+  }
+  REQUIRE(sender->output_batch_count(10) == 0);
+  {
+    arrow_array_guard array;
+    arrow_schema_guard schema;
+    std::uint64_t n = 7;
+    REQUIRE_FALSE(sender->export_arrow(10, addr(array.array), addr(schema.schema), n));
+    REQUIRE(n == 0);
+    REQUIRE(array.array.release == nullptr);
+  }
+
+  receiver->close_input(0, 0);
+  receiver->run();
+  arrow_stream_guard out;
+  receiver->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+  REQUIRE(read_fixture_result(out.stream).empty());
 }
 
 // A producer that splits one big batch into pieces hands over arrays with a non-zero Arrow
