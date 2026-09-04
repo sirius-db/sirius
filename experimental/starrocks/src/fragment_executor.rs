@@ -101,11 +101,17 @@ pub struct StagedBatch {
     /// The Arrow record batches one `arrow_ipc` frame decoded into (one IPC stream may carry
     /// several); pushed with `push_arrow` instead of `push_packed`. `None` for a packed batch.
     pub arrow: Option<Vec<RecordBatch>>,
+    /// Length of the Arrow IPC stream an `arrow_ipc` frame carried in its brpc attachment: the
+    /// bytes the sender's `transmitted batches via arrow` line counts, so the receiver's
+    /// `received remote batches via arrow` line reports the same total. 0 for a packed batch
+    /// (its payload moved over nixl; `len` is that count).
+    pub ipc_bytes: u64,
 }
 
 impl StagedBatch {
-    /// A lease-free staged batch holding decoded Arrow record batches; `rows` is their total.
-    pub fn arrow(batches: Vec<RecordBatch>) -> Self {
+    /// A lease-free staged batch holding the record batches one Arrow IPC stream of `ipc_bytes`
+    /// decoded into; `rows` is their total.
+    pub fn arrow(batches: Vec<RecordBatch>, ipc_bytes: u64) -> Self {
         let rows = batches.iter().map(|batch| batch.num_rows() as u64).sum();
         Self {
             metadata: Vec::new(),
@@ -113,6 +119,7 @@ impl StagedBatch {
             len: 0,
             rows: Some(rows),
             arrow: Some(batches),
+            ipc_bytes,
         }
     }
 }

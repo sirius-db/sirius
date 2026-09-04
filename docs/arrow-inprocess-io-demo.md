@@ -231,7 +231,9 @@ CPU. Two facts for it: cudf writes decimal32/64 out as decimal128 at the widest 
   (`rust/crates/sirius/Cargo.toml:21`) and stays inside `sirius::Fragment::push_arrow(&mut self, stream_id, sender_id,
   &RecordBatch)` (`rust/crates/sirius/src/lib.rs:434-460`). The CN only passes `RecordBatch` values, and `engine.rs`
   already sits behind `#[cfg(feature = "sirius-engine")]` (`experimental/starrocks/src/lib.rs:50-51`), so CI's
-  `--no-default-features` needs no Cargo change.
+  `--no-default-features` needs no Cargo change for `ffi`. As delivered, M3 changed Cargo for another reason:
+  `arrow-ipc = "59"` (already in `Cargo.lock` through `parquet`) for the IPC framing of the Arrow transport; the CN's
+  manifest names no `ffi` feature.
 - A CPU-only host feeding `sirius_stream_<id>`. In-process (the Doris shape): include `sirius_ffi.hpp` (no Arrow
   headers), `make_context`, `make_fragment`, `declare_input_column` with DuckDB type names, `declare_input_sender`,
   `declare_input_cardinality` if known, `build` a plan whose read names `stream_view_name(id)`, `push_arrow` per
@@ -368,9 +370,14 @@ attachment into `RecordBatch`es staged lease-free (`StagedBatch::arrow`, rows fr
 cardinality branch) and the engine thread feeds them through `push_arrow` instead of `push_packed`
 (`engine.rs`, `run_fragment_inner`). Same-CN exchanges keep today's `relay_from` / fusion behaviour; nothing changes
 with the knob off. The sender logs `transmitted batches via arrow` with `stream_id`, `sender_id`, `dest`, `batches`,
-`bytes`, `elapsed_ms` (the nixl line's field names, so one extractor reads both); the receiver logs
-`received remote batches via arrow` with `batches` and `bytes`. The same 2-CN TPC-H arm can therefore run once over
-NIXL and once over Arrow, which is the M5 comparison.
+`bytes`, `elapsed_ms`: the nixl line's fields plus `elapsed_ms`, which this tree's nixl line does not carry, so one
+extractor reads the shared fields from both lines and `elapsed_ms` from the Arrow one. The receiver logs
+`received remote batches via arrow` with `batches`, `bytes` (the IPC payload, the same total as the sender's line) and
+`host_bytes` (the decoded Arrow footprint the receiving CN held in host RAM until dispatch: Arrow mode buffers a
+receiver's entire remote input on the host with no bound but the host, where the nixl tier is bounded by the arena; the
+M5 SF1000 arm lands tens of GB per query on the receiving CN's host). A parked batch holding more than 2 GiB of
+characters in one string column exports as `large_utf8`, which `push_arrow` refuses by name; the nixl tier carries such
+a batch. The same 2-CN TPC-H arm can therefore run once over NIXL and once over Arrow, which is the M5 comparison.
 
 Original plan, kept for the record:
 

@@ -335,6 +335,7 @@ fn export_next(
         len: batch.len,
         rows: Some(batch.rows),
         arrow: None,
+        ipc_bytes: 0,
     }))
 }
 
@@ -575,9 +576,11 @@ fn run_fragment_inner<'ctx>(
         let sender = u32::try_from(*sender_id)
             .map_err(|_| format!("negative remote sender id {sender_id}"))?;
         let mut arrow_batches = 0usize;
-        let mut arrow_bytes = 0usize;
+        let mut arrow_ipc_bytes = 0u64;
+        let mut arrow_host_bytes = 0usize;
         for batch in batches {
             if let Some(arrow) = &batch.arrow {
+                arrow_ipc_bytes += batch.ipc_bytes;
                 for record_batch in arrow {
                     fragment
                         .push_arrow(stream_id, sender, record_batch)
@@ -588,7 +591,7 @@ fn run_fragment_inner<'ctx>(
                             )
                         })?;
                     arrow_batches += 1;
-                    arrow_bytes += record_batch.get_array_memory_size();
+                    arrow_host_bytes += record_batch.get_array_memory_size();
                 }
                 continue;
             }
@@ -625,12 +628,16 @@ fn run_fragment_inner<'ctx>(
             batches = batches.len(),
             "received remote batches"
         );
+        // `bytes` is the IPC payload the sender's `transmitted batches via arrow` line counts
+        // (the two totals match per stream and sender); `host_bytes` is the decoded footprint
+        // this CN held in host RAM for these batches from their arrival until now.
         if arrow_batches > 0 {
             info!(
                 stream_id,
                 sender_id,
                 batches = arrow_batches,
-                bytes = arrow_bytes,
+                bytes = arrow_ipc_bytes,
+                host_bytes = arrow_host_bytes,
                 "received remote batches via arrow"
             );
         }
@@ -1225,8 +1232,13 @@ mod tests {
         engine.drop_parked(slot).expect("drop the drained sender");
 
         // Staged exactly as the receiving CN stages a decoded `arrow_ipc` frame: lease-free,
-        // rows from `num_rows` (which feed the exact cardinality declaration before build()).
-        let staged = StagedBatch::arrow(exported);
+        // rows from `num_rows` (which feed the exact cardinality declaration before build()),
+        // the IPC length the frame would have carried.
+        let ipc_bytes: u64 = exported
+            .iter()
+            .map(|batch| crate::arrow_exchange::encode_ipc(batch).unwrap().len() as u64)
+            .sum();
+        let staged = StagedBatch::arrow(exported, ipc_bytes);
         assert_eq!((staged.offset, staged.len), (0, 0));
         assert_eq!(staged.rows, Some(3));
 
@@ -1683,6 +1695,7 @@ mod tests {
                         len: 4096,
                         rows: Some(1),
                         arrow: None,
+                        ipc_bytes: 0,
                     }],
                 )],
                 outputs: Vec::new(),

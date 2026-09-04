@@ -2,7 +2,8 @@
 //!
 //! The exchange matches StarRocks' receiver-first dispatch with the senders that arrive later.
 //! A same-node sender's rows stay on the GPU, parked in the engine as native batches; a remote
-//! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier).
+//! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier) or as decoded
+//! Arrow record batches in host memory (arrow tier).
 //! Either way, what is tracked here is which senders have finished and where their output sits.
 //!
 //! A third kind of sender never runs at all: a same-node leaf whose plan was deferred into its
@@ -38,8 +39,10 @@ pub(crate) enum SenderSource {
         /// Where the engine parked this sender's batches.
         slot: SenderSlot,
     },
-    /// A remote sender whose packed batches were nixl-WRITTEN into this CN's staging arena and
-    /// announced over `transmit_packed`. Counts toward readiness only once `closed`.
+    /// A remote sender whose batches arrived over `transmit_packed`: packed bytes nixl-WRITTEN
+    /// into this CN's staging arena, or Arrow IPC frames decoded into host `RecordBatch`es (the
+    /// arrow tier keeps a receiver's whole remote input in host RAM until dispatch; nothing but
+    /// the host bounds it). Counts toward readiness only once `closed`.
     Remote {
         /// Sender output names carried on every `transmit_packed` frame (first frame wins,
         /// later frames must match).
@@ -601,6 +604,7 @@ mod tests {
             len: 512,
             rows: Some(u64::from(fill)),
             arrow: None,
+            ipc_bytes: 0,
         }
     }
 
@@ -947,6 +951,35 @@ mod tests {
             .push_remote_frame(key, 0, 0, false, names(), Some(staged(1)))
             .unwrap_err();
         assert!(err.contains("collides with a local parked sender"), "{err}");
+    }
+
+    /// A frame that claims a batch must carry one: a packed frame with empty pack metadata and
+    /// an Arrow frame that decoded to no record batches (a schema-only IPC stream) are both
+    /// refused, naming the frame.
+    #[test]
+    fn a_batch_frame_without_a_payload_is_refused() {
+        let exchange = LocalExchange::default();
+        let packed = StagedBatch {
+            metadata: Vec::new(),
+            ..staged(1)
+        };
+        let err = exchange
+            .push_remote_frame(key(12, 7), 0, 0, false, names(), Some(packed))
+            .unwrap_err();
+        assert!(
+            err.contains("frame seq 0 with empty pack metadata"),
+            "{err}"
+        );
+
+        let arrow = StagedBatch::arrow(Vec::new(), 0);
+        assert_eq!(arrow.rows, Some(0));
+        let err = exchange
+            .push_remote_frame(key(13, 7), 0, 0, false, names(), Some(arrow))
+            .unwrap_err();
+        assert!(
+            err.contains("Arrow frame seq 0 with no record batches"),
+            "{err}"
+        );
     }
 
     /// An open remote sender is present but not finished; it must not count toward readiness.

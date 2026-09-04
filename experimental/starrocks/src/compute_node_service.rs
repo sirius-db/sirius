@@ -674,6 +674,7 @@ impl SiriusComputeNodeService {
         // The payload rides the attachment; its presence is what makes a frame a batch. Packed
         // frames carry cudf pack metadata for a lease the peer WROTE into; `arrow_ipc` frames
         // carry the rows themselves as one Arrow IPC stream and hold no lease.
+        let attachment_bytes = attachment.len();
         let batch = if attachment.is_empty() {
             None
         } else if params.arrow_ipc() {
@@ -684,8 +685,9 @@ impl SiriusComputeNodeService {
                 )
             })?;
             // Exact rows from the decoded batches themselves (the frame's `rows` is the same
-            // count as the sender saw; the decoded one is what push_arrow will deliver).
-            Some(StagedBatch::arrow(batches))
+            // count as the sender saw; the decoded one is what push_arrow will deliver). The
+            // IPC length rides along so the receiver's byte total matches the sender's.
+            Some(StagedBatch::arrow(batches, attachment_bytes as u64))
         } else {
             let length = params.length.ok_or_else(|| {
                 "transmit_packed batch frame carries no payload length".to_string()
@@ -701,6 +703,7 @@ impl SiriusComputeNodeService {
                 // stream's cardinality declaration instead of failing the frame.
                 rows: params.rows,
                 arrow: None,
+                ipc_bytes: 0,
             })
         };
         // A frame for a receiver the FE already cancelled here: the peer's drain is still
@@ -729,6 +732,7 @@ impl SiriusComputeNodeService {
             seq,
             eos,
             batch_bytes = batch.as_ref().map(|batch| batch.len),
+            attachment_bytes,
             arrow_ipc = params.arrow_ipc(),
             "received remote exchange frame"
         );
@@ -3115,6 +3119,7 @@ pub(crate) mod tests {
                     len: 256,
                     rows: Some(3),
                     arrow: None,
+                    ipc_bytes: 0,
                 }],
             )],
             "the dispatched receiver consumed exactly the staged batch, row count included"
@@ -3225,10 +3230,14 @@ pub(crate) mod tests {
         assert!(!fetched.attachment.is_empty());
         let expected: Vec<StagedBatch> = chunks
             .iter()
-            .map(|chunk| StagedBatch::arrow(vec![chunk.clone()]))
+            .map(|chunk| {
+                let ipc = arrow_exchange::encode_ipc(chunk).unwrap();
+                StagedBatch::arrow(vec![chunk.clone()], ipc.len() as u64)
+            })
             .collect();
         assert_eq!(expected[0].rows, Some(2));
         assert_eq!(expected[1].rows, Some(1));
+        assert!(expected.iter().all(|batch| batch.ipc_bytes > 0));
         assert_eq!(
             executor.remote_inputs.lock().unwrap().as_slice(),
             &[(7, 0, expected)],
@@ -3240,24 +3249,28 @@ pub(crate) mod tests {
         );
     }
 
-    /// A sender-side executor for the Arrow tier without a GPU: a sender run parks one Arrow
-    /// batch per output slot (one int64 column per plan output name, rows 1..=3), which
-    /// `export_arrow_next` drains and `drop_parked` releases exactly once.
+    /// A sender-side executor for the Arrow tier without a GPU: a sender run parks two Arrow
+    /// batches per output slot (one int64 column per plan output name; rows 1..=3, then 4..=5),
+    /// which `export_arrow_next` drains in order and `drop_parked` releases exactly once.
     #[derive(Debug, Default)]
     struct ArrowParkingExecutor {
         parked: Mutex<HashMap<SenderSlot, std::collections::VecDeque<arrow_array::RecordBatch>>>,
         dropped: Mutex<Vec<SenderSlot>>,
     }
 
-    /// The batch `ArrowParkingExecutor` parks for a plan with these output names.
-    fn parked_arrow_batch(names: &[String]) -> arrow_array::RecordBatch {
-        arrow_array::RecordBatch::try_from_iter(names.iter().map(|name| {
-            (
-                name.as_str(),
-                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
-            )
-        }))
-        .unwrap()
+    /// The batches `ArrowParkingExecutor` parks for a plan with these output names, in order.
+    fn parked_arrow_batches(names: &[String]) -> [arrow_array::RecordBatch; 2] {
+        let batch = |values: &[i64]| {
+            arrow_array::RecordBatch::try_from_iter(names.iter().map(|name| {
+                (
+                    name.as_str(),
+                    Arc::new(arrow_array::Int64Array::from(values.to_vec()))
+                        as arrow_array::ArrayRef,
+                )
+            }))
+            .unwrap()
+        };
+        [batch(&[1, 2, 3]), batch(&[4, 5])]
     }
 
     impl FragmentExecutor for ArrowParkingExecutor {
@@ -3269,7 +3282,7 @@ pub(crate) mod tests {
             for slot in &run.outputs {
                 parked.insert(
                     *slot,
-                    std::collections::VecDeque::from([parked_arrow_batch(&run.plan.output_names)]),
+                    std::collections::VecDeque::from(parked_arrow_batches(&run.plan.output_names)),
                 );
             }
             Ok(None)
@@ -3351,10 +3364,11 @@ pub(crate) mod tests {
 
     /// The Arrow tier end to end over a real loopback brpc hop, with no GPU and no nixl
     /// transport: CN A (transport `None`, knob `arrow`) runs a sender whose destination is CN B
-    /// (a second service on a loopback listener). A drains the parked output through
-    /// `export_arrow_next` into `arrow_ipc` frames and drops it exactly once; B decodes and
-    /// stages the batch lease-free, the eos completes the sender set, and B's dispatched
-    /// receiver consumes it as Arrow `remote_inputs`.
+    /// (a second service on a loopback listener). A drains the two parked batches through
+    /// `export_arrow_next` into `arrow_ipc` frames seq 0 and 1 plus the eos (seq 2), all from
+    /// the one `send_fragment` drain, and drops the output exactly once; B decodes and stages
+    /// both lease-free with the sender plan's column names, the eos completes the sender set,
+    /// and B's dispatched receiver consumes them as Arrow `remote_inputs`.
     #[test]
     fn arrow_transport_sends_a_remote_destination_over_brpc_without_nixl() {
         let peer_executor = Arc::new(RecordingExecutor::default());
@@ -3406,35 +3420,173 @@ pub(crate) mod tests {
         assert_eq!(executor.dropped.lock().unwrap().as_slice(), &[slot]);
         assert!(executor.parked.lock().unwrap().is_empty());
 
-        // B ran its receiver over the decoded batch, staged lease-free.
+        // B ran its receiver over the decoded batches, staged lease-free, in parked order.
         let fetched = fetch_rows_eventually(&peer, receiver_id.hi, receiver_id.lo);
         assert!(!fetched.attachment.is_empty());
-        let translated_names = {
+        {
             let inputs = peer_executor.remote_inputs.lock().unwrap();
             assert_eq!(inputs.len(), 1, "{inputs:?}");
             let (node_id, sender_id, batches) = &inputs[0];
             assert_eq!((*node_id, *sender_id), (7, 0));
-            assert_eq!(batches.len(), 1, "one Arrow frame for one parked batch");
-            assert_eq!((batches[0].offset, batches[0].len), (0, 0));
-            assert_eq!(batches[0].rows, Some(3));
-            let arrow = batches[0].arrow.as_ref().expect("an Arrow batch");
-            assert_eq!(arrow.len(), 1);
-            let names: Vec<String> = arrow[0]
-                .schema_ref()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect();
-            assert_eq!(arrow[0], parked_arrow_batch(&names));
-            names
-        };
-        assert!(
-            !translated_names.is_empty(),
-            "the sender plan's output names ride the IPC schema"
-        );
+            // The sender plan's output names (scan_plan(0, 0) over desc_table(): id, name) ride
+            // the IPC schema; the engine exports types only, and with_names puts them back.
+            let names = vec!["id".to_string(), "name".to_string()];
+            let parked = parked_arrow_batches(&names);
+            assert_eq!(
+                batches.len(),
+                parked.len(),
+                "one Arrow frame per parked batch: {batches:?}"
+            );
+            for (staged, parked) in batches.iter().zip(&parked) {
+                assert_eq!((staged.offset, staged.len), (0, 0));
+                assert_eq!(staged.rows, Some(parked.num_rows() as u64));
+                assert_eq!(
+                    staged.arrow.as_deref(),
+                    Some(std::slice::from_ref(parked)),
+                    "the decoded batch equals the parked one, names included"
+                );
+                assert_eq!(
+                    staged.ipc_bytes,
+                    arrow_exchange::encode_ipc(parked).unwrap().len() as u64,
+                    "the receiver counts the IPC bytes the sender shipped"
+                );
+            }
+        }
         assert!(
             peer_executor.released.lock().unwrap().is_empty(),
             "an Arrow frame holds no staging lease to release"
+        );
+    }
+
+    /// The Arrow tier's failure path: a remote destination nothing listens on fails the sender's
+    /// dispatch — the FE sees the connect error, never a hang — and the parked output is still
+    /// dropped, exactly once, so a dead query does not pin it. The nixl twin is
+    /// `remote_transmit_failure_fails_the_sender_dispatch`.
+    #[test]
+    fn arrow_transport_failure_fails_the_sender_dispatch_and_drops_the_parked_output() {
+        // A port that was just bound and released: nothing listens there.
+        let dead_port = match crate::BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener.local_addr().unwrap().port(),
+            Err(_) => return, // sandbox denies binding; the brpc tests skip alike
+        };
+        let executor = Arc::new(ArrowParkingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_exchange_transport(ExchangeTransport::Arrow);
+
+        let receiver_id = TUniqueId::new(66, 3);
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(TUniqueId::new(66, 1), TUniqueId::new(66, 2));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![remote_destination(
+            receiver_id.clone(),
+            i32::from(dead_port),
+        )]);
+        sender.params = Some(sender_exec);
+
+        let status = exec_status(&service, &sender);
+        assert_eq!(
+            status.status_code,
+            TStatusCode::INTERNAL_ERROR.0,
+            "{status:?}"
+        );
+        assert!(
+            status.error_msgs[0].contains(&format!("127.0.0.1:{dead_port}"))
+                && status.error_msgs[0].contains("failed to connect"),
+            "{:?}",
+            status.error_msgs
+        );
+
+        // The parked output went with the failed send, exactly once.
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from(&receiver_id),
+            node_id: 7,
+            sender_id: 0,
+        };
+        assert_eq!(executor.dropped.lock().unwrap().as_slice(), &[slot]);
+        assert!(executor.parked.lock().unwrap().is_empty());
+    }
+
+    /// An `arrow_ipc` frame for a receiver the FE already cancelled here is acknowledged (the
+    /// peer's drain must complete quietly) and its batches simply drop: no lease was held, so
+    /// nothing is released, and nothing re-enters the rendezvous. The packed twin releases the
+    /// lease the frame landed in.
+    #[test]
+    fn arrow_frame_for_a_retired_receiver_is_dropped_without_a_release() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(67, 1);
+        let receiver_id = TUniqueId::new(67, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        cancel_ok(
+            &service,
+            cancel_request(
+                &receiver_id,
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                Some("peer failed"),
+            ),
+        );
+        assert!(
+            service
+                .core
+                .exchanges
+                .is_retired(FragmentInstanceId::from(&receiver_id))
+        );
+
+        let batch = arrow_array::RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"]))
+                    as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let frames = [
+            (0, false, arrow_exchange::encode_ipc(&batch).unwrap()),
+            (1, true, Vec::new()),
+        ];
+        for (seq, eos, attachment) in frames {
+            let response = route(
+                &service,
+                methods::TRANSMIT_PACKED,
+                arrow_transmit_params(
+                    &receiver_id,
+                    7,
+                    0,
+                    seq,
+                    eos,
+                    (!eos).then_some(3),
+                    &["id", "name"],
+                ),
+                attachment,
+            );
+            let result = PTransmitPackedResult::decode(response.body.as_slice()).unwrap();
+            assert_eq!(
+                result.status.status_code,
+                TStatusCode::OK.0,
+                "{:?}",
+                result.status.error_msgs
+            );
+        }
+        assert!(
+            executor.released.lock().unwrap().is_empty(),
+            "an Arrow frame holds no lease to release"
+        );
+        assert!(
+            executor.remote_inputs.lock().unwrap().is_empty(),
+            "a retired receiver never runs"
         );
     }
 

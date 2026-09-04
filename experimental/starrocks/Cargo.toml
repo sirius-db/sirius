@@ -13,10 +13,10 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1"
 # Pinned to the arrow version `parquet` already pulls in, so the engine→CN result interchange
-# (Arrow C Data Interface) and the parquet schema reader share one arrow build.
-# `ffi` (Arrow C Data Interface) is what the engine crate hands batches across; naming it here
-# keeps the CN compiling under `--no-default-features`, where the `sirius` dependency is absent.
-arrow-array = { version = "59", features = ["ffi"] }
+# (Arrow C Data Interface, inside the `sirius` crate, which enables arrow-array's `ffi` feature
+# for its own bindings) and the parquet schema reader share one arrow build. The CN itself uses
+# no `arrow_array::ffi` item, so no feature is named here.
+arrow-array = "59"
 # Arrow IPC stream framing for the Arrow exchange transport (`SIRIUS_CN_EXCHANGE_TRANSPORT=arrow`).
 arrow-ipc = "59"
 arrow-schema = "59"
