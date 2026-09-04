@@ -1,0 +1,6 @@
+sirius:
+  memory:
+    disk:
+      disk_id: 7
+      capacity_bytes: 1Gi
+      downgrade_root_dirs: /tmp/sirius-disk

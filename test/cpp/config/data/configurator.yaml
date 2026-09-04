@@ -9,11 +9,11 @@ sirius:
       downgrade_stop_fraction: 0.02
     host:
       capacity_bytes: 160000000
+      initial_number_pools: 1
       reservation_limit_fraction: 0.9
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.7
     disk:
-      disk_id: 0
       capacity_bytes: 1000000000
       downgrade_root_dirs: "/tmp/sirius_disk_memory"
   executor:

@@ -92,6 +92,49 @@ static void validate_downgrade_fractions(std::string_view scope, double trigger,
   }
 }
 
+static void reject_zero_bytes(std::string_view scope,
+                              std::string_view field,
+                              const std::optional<std::uint64_t>& value)
+{
+  if (value && *value == 0) {
+    throw std::runtime_error(std::string(scope) + "." + std::string(field) +
+                             ": must be greater than zero");
+  }
+}
+
+static void validate_host_pool_features(std::string_view scope,
+                                        std::size_t block_size,
+                                        std::size_t pool_size,
+                                        std::size_t initial_number_pools)
+{
+  auto require_positive = [scope](std::string_view field, std::size_t value) {
+    if (value == 0) {
+      throw std::runtime_error(std::string(scope) + "." + std::string(field) +
+                               ": must be greater than zero");
+    }
+  };
+  require_positive("block_size", block_size);
+  require_positive("pool_size", pool_size);
+  require_positive("initial_number_pools", initial_number_pools);
+}
+
+static void validate_host_pool_capacity(std::string_view scope,
+                                        const cucascade::memory::host_memory_space_config& config)
+{
+  // The low-level replacement API retains memory_capacity == 0 semantics. For every
+  // bounded host space, however, the pool constructor preallocates the complete initial
+  // footprint from its upstream allocator before logical reservations begin.
+  if (config.memory_capacity == 0) { return; }
+  auto const pool_fits  = config.block_size <= config.memory_capacity / config.pool_size;
+  auto const pool_bytes = pool_fits ? config.block_size * config.pool_size : 0;
+  auto const initial_fits =
+    pool_fits && config.initial_number_pools <= config.memory_capacity / pool_bytes;
+  if (!initial_fits) {
+    throw std::runtime_error(std::string(scope) +
+                             ": initial host pool footprint exceeds memory capacity");
+  }
+}
+
 static void from_yaml(const YAML::Node& node, cucascade::memory::gpu_memory_space_config& opt)
 {
   opt.per_stream_reservation = false;  // default to false for sirius
@@ -123,6 +166,8 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::host_memory_spa
   r.optional("pool_size", opt.pool_size);
   r.optional("initial_number_pools", opt.initial_number_pools);
   r.reject_unknown();
+  validate_host_pool_features(
+    "sirius.space.host", opt.block_size, opt.pool_size, opt.initial_number_pools);
   validate_downgrade_fractions(
     "sirius.space.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
 }
@@ -418,7 +463,8 @@ struct gpu_mem_config {
     double usage_frac = 0.95;
     reject_mutually_exclusive(r, "memory.gpu", "usage_limit_bytes", "usage_limit_fraction");
     r.optional("usage_limit_bytes", yaml::bytes(usage_bytes));
-    r.optional("usage_limit_fraction", usage_frac, yaml::fraction<double>{});
+    reject_zero_bytes("sirius.memory.gpu", "usage_limit_bytes", usage_bytes);
+    r.optional("usage_limit_fraction", usage_frac, yaml::positive_fraction<double>{});
     opt.usage_limit = usage_bytes ? std::variant<double, std::uint64_t>{*usage_bytes}
                                   : std::variant<double, std::uint64_t>{usage_frac};
     // reservation_limit: fraction or absolute bytes
@@ -427,7 +473,7 @@ struct gpu_mem_config {
     reject_mutually_exclusive(
       r, "memory.gpu", "reservation_limit_bytes", "reservation_limit_fraction");
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
-    r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
+    r.optional("reservation_limit_fraction", res_frac, yaml::positive_fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
                                       : std::variant<double, std::uint64_t>{res_frac};
     r.optional(
@@ -436,6 +482,12 @@ struct gpu_mem_config {
     r.reject_unknown();
     validate_downgrade_fractions(
       "sirius.memory.gpu", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
+  }
+
+  [[nodiscard]] std::optional<std::uint64_t> absolute_reservation_limit() const
+  {
+    if (auto const* bytes = std::get_if<std::uint64_t>(&reservation_limit)) { return *bytes; }
+    return std::nullopt;
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
@@ -448,7 +500,9 @@ struct gpu_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_gpu(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_gpu(std::get<std::uint64_t>(reservation_limit));
+      // Apply absolute bytes against each resolved effective capacity below. cuCascade's
+      // absolute GPU setter converts against physical capacity before applying the usage cap.
+      builder.set_reservation_fraction_per_gpu(1.0);
     }
     builder.set_downgrade_fractions_per_gpu(downgrade_trigger_fraction, downgrade_stop_fraction);
     // Keep the high-level path on Sirius's default. The low-level
@@ -477,6 +531,7 @@ struct host_mem_config {
     std::optional<double> cap_frac;
     reject_mutually_exclusive(r, "memory.host", "capacity_bytes", "capacity_fraction");
     r.optional("capacity_bytes", yaml::bytes(cap_bytes));
+    reject_zero_bytes("sirius.memory.host", "capacity_bytes", cap_bytes);
     r.optional("capacity_fraction", cap_frac);
     if (cap_frac && !(*cap_frac > 0.0 && *cap_frac <= 1.0)) {
       throw std::runtime_error("memory.host.capacity_fraction: must be in (0.0, 1.0], got " +
@@ -492,7 +547,7 @@ struct host_mem_config {
     reject_mutually_exclusive(
       r, "memory.host", "reservation_limit_bytes", "reservation_limit_fraction");
     r.optional("reservation_limit_bytes", yaml::bytes(res_bytes));
-    r.optional("reservation_limit_fraction", res_frac, yaml::fraction<double>{});
+    r.optional("reservation_limit_fraction", res_frac, yaml::positive_fraction<double>{});
     opt.reservation_limit = res_bytes ? std::variant<double, std::uint64_t>{*res_bytes}
                                       : std::variant<double, std::uint64_t>{res_frac};
     r.optional(
@@ -502,8 +557,16 @@ struct host_mem_config {
     r.optional("pool_size", opt.pool_size);
     r.optional("initial_number_pools", opt.initial_number_pools);
     r.reject_unknown();
+    validate_host_pool_features(
+      "sirius.memory.host", opt.block_size, opt.pool_size, opt.initial_number_pools);
     validate_downgrade_fractions(
       "sirius.memory.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
+  }
+
+  [[nodiscard]] std::optional<std::uint64_t> absolute_reservation_limit() const
+  {
+    if (auto const* bytes = std::get_if<std::uint64_t>(&reservation_limit)) { return *bytes; }
+    return std::nullopt;
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
@@ -517,7 +580,9 @@ struct host_mem_config {
     if (std::holds_alternative<double>(reservation_limit)) {
       builder.set_reservation_fraction_per_numa_region(std::get<double>(reservation_limit));
     } else {
-      builder.set_reservation_limit_per_numa_region(std::get<std::uint64_t>(reservation_limit));
+      // Apply absolute bytes against each resolved NUMA-space capacity below so invalid user
+      // input is reported as a configuration error instead of relying on a builder assertion.
+      builder.set_reservation_fraction_per_numa_region(1.0);
     }
     builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
                                                     downgrade_stop_fraction);
@@ -538,23 +603,33 @@ struct host_mem_config {
 };
 
 struct disk_mem_config {
-  int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
 
   static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
   {
     yaml::reader r(node, "memory.disk");
-    r.optional("disk_id", opt.id);
+    if (r.has("disk_id")) {
+      throw std::runtime_error(
+        "'sirius.memory.disk.disk_id': removed; the single high-level disk space uses internal "
+        "ID 0; remove this key or use 'sirius.space.disk[]' for explicit multi-space IDs");
+    }
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
     r.reject_unknown();
+    if (r.has_value("capacity_bytes") && opt.capacity_bytes > 0 &&
+        opt.downgrade_root_dirs.empty()) {
+      throw std::runtime_error(
+        "sirius.memory.disk.capacity_bytes: inactive without a non-empty "
+        "sirius.memory.disk.downgrade_root_dirs; configure the spill directory or remove "
+        "capacity_bytes");
+    }
   }
 
   void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
-    builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_mounting_point(0, capacity_bytes, downgrade_root_dirs);
   }
 };
 
@@ -753,6 +828,37 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       host_cfg.setup_configurator(builder);
       disk_cfg.setup_configurator(builder);
       _memory_space_configs = builder.build(_hw_topology);
+
+      auto apply_absolute_limit =
+        [](std::string_view scope, std::string_view field, std::uint64_t bytes, auto& config) {
+          if (bytes > config.memory_capacity) {
+            throw std::runtime_error(std::string(scope) + "." + std::string(field) +
+                                     ": must not exceed resolved memory capacity " +
+                                     std::to_string(config.memory_capacity));
+          }
+          config.reservation_limit_fraction =
+            config.memory_capacity == 0
+              ? 0.0
+              : static_cast<double>(bytes) / static_cast<double>(config.memory_capacity);
+        };
+      for (auto& space : _memory_space_configs) {
+        if (auto* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+          if (auto const bytes = gpu_cfg.absolute_reservation_limit()) {
+            apply_absolute_limit("sirius.memory.gpu", "reservation_limit_bytes", *bytes, *gpu);
+          }
+        } else if (auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+          if (auto const bytes = host_cfg.absolute_reservation_limit()) {
+            apply_absolute_limit("sirius.memory.host", "reservation_limit_bytes", *bytes, *host);
+          }
+        }
+      }
+    }
+
+    for (auto const& space : _memory_space_configs) {
+      if (auto const* host = std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+        validate_host_pool_capacity(using_configurator ? "sirius.memory.host" : "sirius.space.host",
+                                    *host);
+      }
     }
 
     bool const explicit_low_level_gpu_capacity =

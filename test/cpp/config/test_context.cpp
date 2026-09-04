@@ -449,6 +449,9 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST).size() == 1);
   REQUIRE(manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).size() == 1);
+  REQUIRE(
+    manager.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).front()->get_device_id() ==
+    0);
 
   auto const& spaces = sirius_ctx->get_config().get_memory_space_configs();
   auto const gpu     = std::ranges::find_if(spaces, [](auto const& space) {
@@ -461,6 +464,34 @@ TEST_CASE("Sirius configuration loading from file with configurator",
   REQUIRE_FALSE(telemetry.enable_quent);
   REQUIRE(telemetry.output_directory == "/tmp/sirius_telemetry_config_test");
   REQUIRE(telemetry.engine_name == "sirius_config_test");
+}
+
+TEST_CASE("Sirius keeps the high-level disk space id internal", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_memory_disk_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.memory.disk.disk_id") && Catch::Contains("removed") &&
+                        Catch::Contains("sirius.space.disk"));
+}
+
+TEST_CASE("Sirius rejects an inactive high-level disk capacity", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(
+    config.load_from_file(data_dir / "invalid_memory_disk_capacity_without_root.yaml"),
+    Catch::Contains("sirius.memory.disk.capacity_bytes") && Catch::Contains("inactive") &&
+      Catch::Contains("downgrade_root_dirs"));
+
+  REQUIRE_NOTHROW(config.load_from_file(data_dir / "valid_memory_disk_zero_optout.yaml"));
+  auto const& spaces = config.get_memory_space_configs();
+  REQUIRE(std::ranges::none_of(spaces, [](auto const& space) {
+    return std::holds_alternative<cucascade::memory::disk_memory_space_config>(space);
+  }));
 }
 
 TEST_CASE("Sirius configuration rejects zero hash partition bytes", "[sirius][config]")
@@ -1032,6 +1063,218 @@ TEST_CASE("Sirius configuration accepts one form of each memory budget", "[siriu
 
   sirius::sirius_config config;
   REQUIRE_NOTHROW(config.load_from_file(cfg));
+}
+
+TEST_CASE("Sirius applies absolute reservation limits to effective capacities", "[sirius][config]")
+{
+  constexpr std::size_t mib = 1024ULL * 1024;
+  auto const path           = fs::temp_directory_path() / "sirius_absolute_reservation_limits.yaml";
+  finally cleanup{[path]() {
+    std::error_code ec;
+    fs::remove(path, ec);
+  }};
+  {
+    std::ofstream out(path);
+    REQUIRE(out);
+    out << "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 1Gi\n"
+           "      reservation_limit_bytes: 256Mi\n    host:\n      capacity_bytes: 1Gi\n"
+           "      reservation_limit_bytes: 256Mi\n";
+  }
+
+  sirius::sirius_config config;
+  REQUIRE_NOTHROW(config.load_from_file(path));
+  bool saw_gpu  = false;
+  bool saw_host = false;
+  for (auto const& space : config.get_memory_space_configs()) {
+    if (auto const* gpu = std::get_if<cucascade::memory::gpu_memory_space_config>(&space)) {
+      saw_gpu = true;
+      REQUIRE(gpu->reservation_limit() == 256 * mib);
+    } else if (auto const* host =
+                 std::get_if<cucascade::memory::host_memory_space_config>(&space)) {
+      saw_host = true;
+      REQUIRE(host->reservation_limit() == 256 * mib);
+    }
+  }
+  REQUIRE(saw_gpu);
+  REQUIRE(saw_host);
+}
+
+TEST_CASE("Sirius rejects absolute reservation limits above effective capacity", "[sirius][config]")
+{
+  struct invalid_limit {
+    const char* tier;
+    const char* yaml;
+  };
+  const invalid_limit cases[] = {
+    {"gpu",
+     "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 1Gi\n"
+     "      reservation_limit_bytes: 2Gi\n"},
+    {"host",
+     "sirius:\n  memory:\n    host:\n      capacity_bytes: 1Gi\n"
+     "      reservation_limit_bytes: 2Gi\n"},
+  };
+  for (auto const& test : cases) {
+    DYNAMIC_SECTION(test.tier)
+    {
+      auto const path = fs::temp_directory_path() /
+                        (std::string("sirius_absolute_reservation_") + test.tier + ".yaml");
+      finally cleanup{[path]() {
+        std::error_code ec;
+        fs::remove(path, ec);
+      }};
+      {
+        std::ofstream out(path);
+        REQUIRE(out);
+        out << test.yaml;
+      }
+
+      sirius::sirius_config config;
+      REQUIRE_THROWS_WITH(
+        config.load_from_file(path),
+        Catch::Contains(std::string("sirius.memory.") + test.tier + ".reservation_limit_bytes") &&
+          Catch::Contains("must not exceed resolved memory capacity"));
+    }
+  }
+}
+
+TEST_CASE("Sirius configuration rejects zero host pool dimensions", "[sirius][config]")
+{
+  struct zero_case {
+    const char* surface;
+    const char* field;
+  };
+  constexpr std::array cases{
+    zero_case{"memory", "block_size"},
+    zero_case{"memory", "pool_size"},
+    zero_case{"memory", "initial_number_pools"},
+    zero_case{"space", "block_size"},
+    zero_case{"space", "pool_size"},
+    zero_case{"space", "initial_number_pools"},
+  };
+
+  for (auto const& test : cases) {
+    DYNAMIC_SECTION(test.surface << ".host." << test.field)
+    {
+      auto const path = fs::temp_directory_path() / (std::string("sirius_zero_host_") +
+                                                     test.surface + "_" + test.field + ".yaml");
+      finally cleanup{[path]() {
+        std::error_code ec;
+        fs::remove(path, ec);
+      }};
+      {
+        std::ofstream out(path);
+        REQUIRE(out);
+        if (std::string_view{test.surface} == "memory") {
+          out << "sirius:\n  memory:\n    host:\n      " << test.field << ": 0\n";
+        } else {
+          out << "sirius:\n  space:\n    host:\n      - " << test.field << ": 0\n";
+        }
+      }
+
+      sirius::sirius_config config;
+      REQUIRE_THROWS_WITH(
+        config.load_from_file(path),
+        Catch::Contains(std::string("sirius.") + test.surface + ".host." + test.field) &&
+          Catch::Contains("greater than zero"));
+    }
+  }
+}
+
+TEST_CASE("Sirius configuration keeps initial host pools within capacity", "[sirius][config]")
+{
+  struct invalid_pool {
+    const char* name;
+    const char* yaml;
+    const char* scope;
+  };
+  const invalid_pool cases[] = {
+    {"high_level",
+     "sirius:\n  memory:\n    host:\n      capacity_bytes: 1Mi\n",
+     "sirius.memory.host"},
+    {"low_level",
+     "sirius:\n  space:\n    host:\n      - numa_id: -1\n        memory_capacity: 1Mi\n",
+     "sirius.space.host"},
+    {"overflow",
+     "sirius:\n  space:\n    host:\n      - numa_id: -1\n        memory_capacity: 1Gi\n"
+     "        block_size: 9223372036854775808\n        pool_size: 2\n"
+     "        initial_number_pools: 1\n",
+     "sirius.space.host"},
+  };
+
+  for (auto const& test : cases) {
+    DYNAMIC_SECTION(test.name)
+    {
+      auto const path = fs::temp_directory_path() /
+                        (std::string("sirius_host_pool_capacity_") + test.name + ".yaml");
+      finally cleanup{[path]() {
+        std::error_code ec;
+        fs::remove(path, ec);
+      }};
+      {
+        std::ofstream out(path);
+        REQUIRE(out);
+        out << test.yaml;
+      }
+
+      sirius::sirius_config config;
+      REQUIRE_THROWS_WITH(config.load_from_file(path),
+                          Catch::Contains(test.scope) && Catch::Contains("initial host pool") &&
+                            Catch::Contains("exceeds memory capacity"));
+    }
+  }
+}
+
+TEST_CASE("Sirius configuration rejects zero high-level memory budgets", "[sirius][config]")
+{
+  struct invalid_budget {
+    const char* name;
+    const char* yaml;
+    const char* field;
+    const char* message;
+  };
+  const invalid_budget cases[] = {
+    {"gpu_usage_bytes",
+     "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 0\n",
+     "usage_limit_bytes",
+     "greater than zero"},
+    {"gpu_usage",
+     "sirius:\n  memory:\n    gpu:\n      usage_limit_fraction: 0\n",
+     "usage_limit_fraction",
+     "value out of range"},
+    {"gpu_reservation",
+     "sirius:\n  memory:\n    gpu:\n      reservation_limit_fraction: 0\n",
+     "reservation_limit_fraction",
+     "value out of range"},
+    {"host_capacity_bytes",
+     "sirius:\n  memory:\n    host:\n      capacity_bytes: 0\n",
+     "capacity_bytes",
+     "greater than zero"},
+    {"host_reservation",
+     "sirius:\n  memory:\n    host:\n      reservation_limit_fraction: 0\n",
+     "reservation_limit_fraction",
+     "value out of range"},
+  };
+
+  for (auto const& test : cases) {
+    DYNAMIC_SECTION(test.name)
+    {
+      auto const path =
+        fs::temp_directory_path() / (std::string("sirius_zero_fraction_") + test.name + ".yaml");
+      finally cleanup{[path]() {
+        std::error_code ec;
+        fs::remove(path, ec);
+      }};
+      {
+        std::ofstream out(path);
+        out << test.yaml;
+        REQUIRE(out);
+      }
+
+      sirius::sirius_config config;
+      REQUIRE_THROWS_WITH(config.load_from_file(path),
+                          Catch::Contains(test.field) && Catch::Contains(test.message));
+    }
+  }
 }
 
 TEST_CASE("Sirius configuration treats null memory budget forms as absent", "[sirius][config]")

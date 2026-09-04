@@ -9,6 +9,7 @@ sirius:
       downgrade_stop_fraction: 0.02
     host:
       capacity_bytes: 160000000
+      initial_number_pools: 1
   executor:
     downgrade:
       num_threads: 1

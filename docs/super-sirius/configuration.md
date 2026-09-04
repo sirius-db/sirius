@@ -78,7 +78,7 @@ sirius:
       downgrade_trigger_fraction: 0.8
       downgrade_stop_fraction: 0.6
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
-    disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
+    disk: { capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
     scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
     pipeline:     { num_threads: 4 }
@@ -120,10 +120,10 @@ Controls how much GPU VRAM Sirius claims and when it starts evicting data to hos
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `usage_limit_fraction` | double | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. Mutually exclusive with `usage_limit_bytes`; configuration loading rejects both when both values are non-null. |
-| `usage_limit_bytes` | bytes | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_fraction` | double | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `usage_limit_fraction` | double (0,1] | 0.95 | Fraction of total VRAM to use as Sirius's GPU memory capacity. The remaining 5% is left for the CUDA runtime, cuDF temporaries, and other GPU consumers. Mutually exclusive with `usage_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `usage_limit_bytes` | bytes > 0 | — | Absolute VRAM limit. Mutually exclusive with `usage_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double (0,1] | 1.0 | Fraction of the GPU capacity (set by `usage_limit_*`) that can be reserved by pipeline tasks. Reservations are acquired before task execution and prevent overcommit. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit against each GPU's resolved effective capacity. Must not exceed that capacity. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.8 | Start evicting GPU-resident data to host when reserved memory exceeds this fraction of capacity. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | 0.6 | Stop evicting when reserved memory drops to this fraction of capacity. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
 
@@ -138,14 +138,16 @@ Controls pinned host memory pools. One pool group is created per NUMA node (auto
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `capacity_fraction` | double (0,1] | 0.9 | Pinned host memory capacity as a fraction of **each backing NUMA node's total RAM** (read from `/sys/devices/system/node/node<id>/meminfo`). Mutually exclusive with `capacity_bytes`; configuration loading rejects both when both values are non-null. Initialization fails if a node's capacity cannot be determined. |
-| `capacity_bytes` | bytes | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_fraction` | double | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
-| `reservation_limit_bytes` | bytes | — | Absolute reservation limit. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
+| `capacity_bytes` | bytes > 0 | — | Pinned host memory capacity **per NUMA node** as absolute bytes, allocated with `cudaMallocHost`. Mutually exclusive with `capacity_fraction`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_fraction` | double (0,1] | 1.0 | Fraction of host capacity that can be reserved. Mutually exclusive with `reservation_limit_bytes`; configuration loading rejects both when both values are non-null. |
+| `reservation_limit_bytes` | bytes | — | Absolute reservation limit against each resolved NUMA-space capacity. Must not exceed that capacity. Mutually exclusive with `reservation_limit_fraction`; configuration loading rejects both when both values are non-null. |
 | `downgrade_trigger_fraction` | double (0,1] | 0.9 | Start evicting host-resident data to disk when reserved memory exceeds this fraction. Must be greater than `downgrade_stop_fraction`. Eviction also requires a configured `downgrade_root_dirs`; without one the downgrade executor logs a warning and skips. |
 | `downgrade_stop_fraction` | double (0,1] | 0.8 | Stop evicting when reserved memory drops to this fraction. Must be less than `downgrade_trigger_fraction`; configuration loading rejects an invalid pair. |
-| `block_size` | bytes | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
-| `pool_size` | int | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
-| `initial_number_pools` | int | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+| `block_size` | bytes (**> 0**) | 1Mi | Size of each allocation block in the pool. Larger blocks reduce allocation overhead but waste memory on small allocations. |
+| `pool_size` | int (**> 0**) | 128 | Number of blocks per pool. Total pool capacity = `block_size × pool_size`. |
+| `initial_number_pools` | int (**> 0**) | 4 | Number of pools pre-allocated at startup. Additional pools are created on demand. Initial host footprint = `block_size × pool_size × initial_number_pools`. |
+
+The initial host footprint must not exceed the resolved capacity of each host space.
 
 ### Disk Memory (`sirius.memory.disk`)
 
@@ -153,8 +155,7 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `disk_id` | int | 0 | Identifier for the disk space. |
-| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
+| `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. An explicitly positive capacity requires a non-empty `downgrade_root_dirs`; `0` remains an explicit spill-tier opt-out. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
 
 ### Input-table compression (`sirius.compression`)
@@ -231,9 +232,12 @@ Each tier is a **YAML sequence** of space configs. Byte fields accept suffixes; 
 | `downgrade_trigger_fraction` | double (0,1] | space default | Start evicting above this fraction. Must be greater than `downgrade_stop_fraction`. |
 | `downgrade_stop_fraction` | double (0,1] | space default | Stop evicting below this fraction. Must be less than `downgrade_trigger_fraction`. |
 | `memory_capacity` | bytes | space default | Absolute capacity of the space. |
-| `block_size` | bytes | pool default | Allocation block size. |
-| `pool_size` | int | pool default | Blocks per pool. |
-| `initial_number_pools` | int | pool default | Pools pre-allocated at startup. |
+| `block_size` | bytes (**> 0**) | pool default | Allocation block size. |
+| `pool_size` | int (**> 0**) | pool default | Blocks per pool. |
+| `initial_number_pools` | int (**> 0**) | pool default | Pools pre-allocated at startup. |
+
+For every low-level host space with a non-zero `memory_capacity`, the initial pool footprint
+must fit within that capacity.
 
 #### `sirius.space.disk[]` — one entry per disk spill space
 
