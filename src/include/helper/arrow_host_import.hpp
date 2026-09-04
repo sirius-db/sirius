@@ -28,9 +28,10 @@
 #include <string_view>
 #include <vector>
 
-// Arrow C Data Interface structs (arrow/c/abi.h). Forward-declared only: DuckDB defines the same
-// two structs under the shared ARROW_C_DATA_INTERFACE guard, and this header must be includable
-// next to either definition. The .cpp includes the real ABI header.
+// Arrow C Data Interface structs. Forward-declared only, so this header needs no Arrow header
+// and can sit next to any definition of them (DuckDB's `duckdb/common/arrow/arrow.hpp`, Apache
+// Arrow's `arrow/c/abi.h`, a vendored copy — all under the shared ARROW_C_DATA_INTERFACE guard,
+// all layout-identical). The .cpp uses DuckDB's, the one definition this library already has.
 struct ArrowSchema;
 struct ArrowArray;
 
@@ -69,9 +70,10 @@ namespace sirius {
  * @param stream CUDA stream for the host-to-device copies and the decimal casts.
  * @param mr     Device memory resource the table is allocated from.
  * @return The imported table, column types equal to `get_cudf_type(types[i])` for every `i`.
- * @throws sirius::invalid_input_exception on null pointers, a non-struct top-level array, a
- *         column-count mismatch, a refused shape, or a type mismatch; every message names the
- *         column by index and declared name.
+ * @throws sirius::invalid_input_exception on null pointers, on structs that were already
+ *         released (`release == NULL`), a non-struct top-level array, a column-count mismatch,
+ *         a refused shape, or a type mismatch (a fixed-point scale mismatch names both scales);
+ *         every per-column message names the column by index and declared name.
  */
 std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
                                                      const ArrowArray* array,

@@ -14,20 +14,23 @@
  * limitations under the License.
  */
 
-// The real Arrow C ABI structs, included first so they win the ARROW_C_DATA_INTERFACE guard in
-// this translation unit (DuckDB's arrow.hpp defines layout-identical structs under the same
-// guard; nothing below includes it, and cudf/interop.hpp only forward-declares).
 #include "helper/arrow_host_import.hpp"
 
 #include "cudf/cudf_utils.hpp"  // sirius::get_cudf_type
 #include "sirius/exception.hpp"
 
+// The Arrow C Data Interface structs (ArrowSchema, ArrowArray). DuckDB's copy is the one every
+// other TU of this library sees (sirius_ffi.cpp reads result streams through it), it is a hard
+// dependency in every build flavour, and it is layout-identical to Apache Arrow's abi.h. Apache
+// Arrow's own header is NOT a dependency of this tree (cudf's vcpkg port brings nanoarrow, the
+// pixi default env only has it through pyarrow), so including it here would break the vcpkg
+// build and give libsirius two definitions of the same struct.
+#include "duckdb/common/arrow/arrow.hpp"
+
 #include <cudf/interop.hpp>
 #include <cudf/unary.hpp>                      // cudf::cast, cudf::is_supported_cast
 #include <cudf/utilities/traits.hpp>           // cudf::is_fixed_point
 #include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
-
-#include <arrow/c/abi.h>
 
 #include <cstddef>
 #include <utility>
@@ -102,6 +105,12 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
     throw invalid_input_exception("{}: requires non-null ArrowSchema and ArrowArray pointers",
                                   what);
   }
+  // The C Data Interface marks a released struct by nulling its `release`; its buffer pointers
+  // are dangling from then on, so this has to be a loud error, not a read of freed memory.
+  if (schema->release == nullptr || array->release == nullptr) {
+    throw invalid_input_exception(
+      "{}: the ArrowSchema/ArrowArray were already released (release == NULL)", what);
+  }
   if (names.size() != types.size()) {
     throw internal_exception(
       "{}: {} declared names but {} declared types", what, names.size(), types.size());
@@ -115,7 +124,11 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
   if (static_cast<std::size_t>(schema->n_children) != types.size() ||
       static_cast<std::size_t>(array->n_children) != types.size()) {
     throw invalid_input_exception(
-      "{}: carries {} columns but the stream declares {}", what, schema->n_children, types.size());
+      "{}: carries {} columns (schema) / {} columns (array) but the stream declares {}",
+      what,
+      schema->n_children,
+      array->n_children,
+      types.size());
   }
 
   std::vector<cudf::data_type> expected;
@@ -139,13 +152,22 @@ std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
       columns[i] = cudf::cast(columns[i]->view(), expected[i], stream, mr);
       continue;
     }
-    throw invalid_input_exception("{}: column {} ({}) is declared {} ({}) but carries {}",
+    // Two fixed-point types that differ in scale would pass the width cast above with a silently
+    // shifted value, so name the scales: the width alone would send the producer the wrong way.
+    std::string scale_note;
+    if (cudf::is_fixed_point(actual) && cudf::is_fixed_point(expected[i]) &&
+        actual.scale() != expected[i].scale()) {
+      scale_note = "; declared scale " + std::to_string(-expected[i].scale()) +
+                   " but carries scale " + std::to_string(-actual.scale());
+    }
+    throw invalid_input_exception("{}: column {} ({}) is declared {} ({}) but carries {}{}",
                                   what,
                                   i,
                                   names[i],
                                   types[i].to_string(),
                                   cudf::type_to_name(expected[i]),
-                                  cudf::type_to_name(actual));
+                                  cudf::type_to_name(actual),
+                                  scale_note);
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }

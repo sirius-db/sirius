@@ -429,8 +429,8 @@ impl Fragment<'_> {
     ///
     /// Errs on a schema that disagrees with the declared input columns (naming the column), on a
     /// sender not declared for the stream, on a shape the engine refuses by name (dictionary,
-    /// large_list, large_utf8, timezone-aware timestamps, decimal256, HUGEINT), and on a push
-    /// after the stream ended — never a silent drop.
+    /// large_list, large_utf8, large_binary, timezone-aware timestamps, decimal256, HUGEINT), and
+    /// on a push after the stream ended — never a silent drop.
     pub fn push_arrow(
         &mut self,
         stream_id: u64,
@@ -582,7 +582,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use prost::Message;
@@ -1390,6 +1390,9 @@ mod tests {
         let host_batches = ctx.execute_substrait(&sender_plan).unwrap();
         assert!(!host_batches.is_empty(), "the scan produced Arrow batches");
         assert_eq!(host_batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        // The two-senders block below pushes `host_batches[0]` per sender and expects the whole
+        // relay result twice, so the 3 rows must have arrived as one batch.
+        assert_eq!(host_batches.len(), 1, "the 3-row scan arrives as one batch");
 
         // The same hop through push_arrow, from one declared sender.
         let arrow_result = {
@@ -1440,6 +1443,101 @@ mod tests {
         doubled.extend(rows(&relay_result));
         doubled.sort();
         assert_eq!(rows(&two_senders_result), doubled);
+    }
+
+    /// Flattens a result into sorted nullable `(id, name)` rows.
+    fn nullable_rows(result: &super::SubstraitResult) -> Vec<(Option<i64>, Option<String>)> {
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column");
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    (!ids.is_null(i)).then(|| ids.value(i)),
+                    (!names.is_null(i)).then(|| names.value(i).to_string()),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Two shapes a real producer hands over that the parquet fixture never does: nulls in every
+    /// column (validity bitmaps cross the C Data Interface and survive the GPU round trip), and
+    /// pieces of one batch cut with `RecordBatch::slice`, whose columns carry a non-zero Arrow
+    /// offset that `cudf::from_arrow` must honour. Requires a GPU.
+    #[test]
+    fn push_arrow_carries_nulls_and_sliced_batches() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ids: ArrayRef = Arc::new(Int64Array::from(
+            (0..10i64)
+                .map(|i| (i % 3 != 1).then_some(i))
+                .collect::<Vec<_>>(),
+        ));
+        let names: ArrayRef = Arc::new(StringArray::from(
+            (0..10i64)
+                .map(|i| (i % 3 != 2).then(|| format!("n{i}")))
+                .collect::<Vec<_>>(),
+        ));
+        let whole = RecordBatch::try_new(schema, vec![ids, names]).unwrap();
+        let expected = {
+            let mut rows: Vec<(Option<i64>, Option<String>)> = (0..10i64)
+                .map(|i| {
+                    (
+                        (i % 3 != 1).then_some(i),
+                        (i % 3 != 2).then(|| format!("n{i}")),
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let make_receiver = || {
+            let mut receiver = ctx.fragment().unwrap();
+            receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+            receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+            receiver.build(&stream_read_plan(0)).unwrap();
+            receiver
+        };
+
+        // Nulls in both columns, one batch.
+        let mut receiver = make_receiver();
+        receiver.push_arrow(0, 0, &whole).unwrap();
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        assert_eq!(
+            nullable_rows(&receiver.result_to_arrow().unwrap()),
+            expected
+        );
+
+        // The same rows as two slices; the second one's columns start at Arrow offset 4.
+        let mut receiver = make_receiver();
+        for piece in [whole.slice(0, 4), whole.slice(4, 6)] {
+            receiver.push_arrow(0, 0, &piece).unwrap();
+        }
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        assert_eq!(
+            nullable_rows(&receiver.result_to_arrow().unwrap()),
+            expected
+        );
     }
 
     /// The zero-row export contract: a zero-row batch leaves `export_packed` as a metadata-only
@@ -1619,7 +1717,8 @@ mod tests {
 
     /// The Arrow leg of the same guard: a host batch whose Arrow types disagree with the
     /// receiver's declared stream schema must be refused by `push_arrow`, naming the column and the
-    /// declared type, before any buffer is copied. Requires a GPU.
+    /// declared type. (Only the by-name shape refusals and the column count are checked before the
+    /// buffers are copied; a plain type mismatch is found on the imported table.) Requires a GPU.
     #[test]
     fn push_arrow_rejects_a_mismatched_schema() {
         let _guard = GPU_CONTEXT_LOCK

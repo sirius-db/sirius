@@ -6,8 +6,9 @@ Sessions](streaming-sessions.md) covers the low-level primitives a fragment is b
 (`exec::batch_stream`, `STREAMING_SOURCE`/`STREAMING_SINK`, the id-addressed `exec::stream_session`
 router). This document covers the layer above: how a Substrait or DuckDB plan becomes a fragment,
 how its declared streams get a schema before the plan is even bound, and how multiple fragments —
-possibly owned by different processes — chain together via `relay_from()` (in one process) or
-`export_packed()`/`push_packed()` (across processes, through the exchange staging arena).
+possibly owned by different processes — chain together via `relay_from()` (in one process),
+`export_packed()`/`push_packed()` (across processes, through the exchange staging arena), or
+`push_arrow()` (a host that holds Arrow record batches, not device memory).
 
 Two classes do this, at two different layers:
 
@@ -406,12 +407,14 @@ a GPU; CI only compile-checks them.
 
 The Arrow input is covered on both sides. C++ (`test_sirius_ffi_fragment.cpp`): a
 `cudf::to_arrow_host` → `push_arrow` → `run` → `result_to_arrow` round trip over BIGINT, DOUBLE,
-BOOLEAN, VARCHAR, DECIMAL(15,2) and DATE; several batches and senders on one stream; schema, column
-count, unknown stream, undeclared sender and post-EOS refusals; a push from a second `std::thread`
-between `build()` and `run()`; the helper's by-name refusals without an engine context; and a hidden
-`[sirius_ffi_bench]` case that prints H2D/D2H GB/s for a 512 MiB batch. Rust:
-`arrow_hop_matches_relay_hop` (the Arrow hop equals the `relay_from` hop) and
-`push_arrow_rejects_a_mismatched_schema`.
+BOOLEAN, VARCHAR, DECIMAL(15,2) and DATE; several batches and senders on one stream; a hash
+partition keyed on the pushed VARCHAR column (the string kernel that requires 32-bit offsets); a
+batch pushed as two slices with non-zero Arrow offsets; schema, column count, decimal scale, unknown
+stream, undeclared sender, null-pointer and post-EOS refusals; a push from a second `std::thread`
+between `build()` and `run()`; the helper's by-name refusals (and its released-struct refusal)
+without an engine context; and a hidden `[sirius_ffi_bench]` case that prints H2D/D2H GB/s for a
+512 MiB batch. Rust: `arrow_hop_matches_relay_hop` (the Arrow hop equals the `relay_from` hop),
+`push_arrow_carries_nulls_and_sliced_batches` and `push_arrow_rejects_a_mismatched_schema`.
 
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses

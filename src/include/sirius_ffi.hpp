@@ -278,7 +278,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// needs no Arrow headers. The batch is reconciled against the declared stream schema column by
   /// column (see `helper/arrow_host_import.hpp` for the exact rules: decimal width from the
   /// declared precision, bool bitmap to BOOL8, and by-name refusal of dictionary, large_list,
-  /// large_utf8, timezone-aware timestamps, decimal256 and HUGEINT columns).
+  /// large_utf8, large_binary, timezone-aware timestamps, decimal256 and HUGEINT columns).
+  /// `sender_id` must be one of the stream's declared senders (declare_input_sender); that is
+  /// a membership check only — the batch carries no sender identity past this call, so a push
+  /// from a sender that already called close_input() is refused only once every sender has
+  /// closed and the stream ended.
   ///
   /// Contract in this milestone: legal between `build()` and `run()`, exactly where `push_packed`
   /// sits. It touches only the stream session (mutex-protected) and immutable post-`build()`
@@ -288,16 +292,16 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// another thread" needs no redesign of this entry point. There is no backpressure: the queue
   /// is unbounded.
   /// @throws before `build()`, on an unknown input stream, on a sender not declared for the
-  /// stream, on null addresses, on schema mismatch, or when the stream already ended (a push
-  /// after EOS never disappears silently).
+  /// stream, on null addresses or already-released structs, on schema mismatch, or when the
+  /// stream already ended (a push after EOS never disappears silently).
   void push_arrow(std::uint64_t stream_id,
                   std::uint32_t sender_id,
                   std::uintptr_t array_addr,
                   std::uintptr_t schema_addr);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender; push_packed does not). Idempotent per sender; the
-  /// stream ends once every expected sender has closed.
+  /// (relay_from closes its own sender; push_packed and push_arrow do not). Idempotent per
+  /// sender; the stream ends once every expected sender has closed.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 

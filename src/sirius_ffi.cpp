@@ -376,9 +376,10 @@ struct Fragment::Impl {
   bool broadcast_outputs{false};
   std::vector<int> hash_key_columns;
 
-  // Resolved at build() time; kept so the hop entry points (relay_from, push_packed) can
-  // validate an arriving batch against the schema the plan was bound against — a disagreement
-  // there would otherwise reinterpret cudf columns silently.
+  // Resolved at build() time; kept so the hop entry points (relay_from, push_packed, push_arrow)
+  // can validate an arriving batch against the schema the plan was bound against — a
+  // disagreement there would otherwise reinterpret cudf columns silently. push_arrow also
+  // requires the entry to exist (it reconciles the batch against it).
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved_inputs;
 
   // Intermediate fragment (has output streams).

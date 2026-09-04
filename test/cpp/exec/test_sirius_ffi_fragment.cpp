@@ -35,9 +35,6 @@
 //    stream, is checked against the declared schema, and comes back out of result_to_arrow() with
 //    the same rows. The by-name refusals of helper/arrow_host_import.hpp are unit-tested directly.
 
-// The C ABI structs first: cudf/interop.hpp only forward-declares them, and DuckDB's own
-// definitions (duckdb/common/arrow/arrow.hpp) share the ARROW_C_DATA_INTERFACE guard, so whichever
-// header comes first wins. abi.h is the one that also defines ArrowDeviceArray (to_arrow_host).
 #include "helper/arrow_host_import.hpp"
 #include "sirius_ffi.hpp"
 
@@ -51,10 +48,29 @@
 
 #include <cuda_runtime_api.h>
 
-#include <arrow/c/abi.h>
 #include <catch.hpp>
+// The Arrow C Data Interface structs (ArrowSchema, ArrowArray, ArrowArrayStream): DuckDB's copy,
+// the definition libsirius itself is built against. Apache Arrow's arrow/c/abi.h is not a
+// dependency of this tree (absent from the vcpkg build), so it is not included here.
+#include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
 #include <substrait/plan.pb.h>
+
+// cudf::to_arrow_host returns an ArrowDeviceArray (Arrow C Device Data Interface), which DuckDB's
+// header does not define and cudf/interop.hpp only forward-declares (it typedefs ArrowDeviceType).
+// The interface is meant to be vendored — arrow/c/abi.h says so in its preamble — so this is the
+// spec's definition under the spec's guard.
+#ifndef ARROW_C_DEVICE_DATA_INTERFACE
+#define ARROW_C_DEVICE_DATA_INTERFACE
+#define ARROW_DEVICE_CPU 1
+struct ArrowDeviceArray {
+  struct ArrowArray array;
+  int64_t device_id;
+  ArrowDeviceType device_type;
+  void* sync_event;
+  int64_t reserved[3];
+};
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -297,6 +313,19 @@ host_arrow_batch to_host_arrow(const cudf::table_view& table,
   return batch;
 }
 
+// Presents rows [offset, offset + length) of the host batch: every child gets that Arrow offset,
+// the struct keeps offset 0 — the shape arrow-rs's RecordBatch::slice() hands a producer that
+// splits one big batch into pieces. The buffers are untouched.
+void slice_host_arrow(host_arrow_batch& host, std::int64_t offset, std::int64_t length)
+{
+  auto& array  = host.array->array;
+  array.length = length;
+  for (std::int64_t i = 0; i < array.n_children; ++i) {
+    array.children[i]->offset = offset;
+    array.children[i]->length = length;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reading the result back out of result_to_arrow()'s ArrowArrayStream.
 // ---------------------------------------------------------------------------
@@ -396,6 +425,10 @@ std::unique_ptr<sirius::ffi::Fragment> build_result_fragment(
 // imports anything, so the array only has to be a well-formed empty struct.
 // ---------------------------------------------------------------------------
 
+// A live Arrow struct has a non-null `release`; the helper refuses one that was already released.
+void noop_release_schema(ArrowSchema*) {}
+void noop_release_array(ArrowArray*) {}
+
 struct handmade_arrow_column {
   ArrowSchema schema{};
   ArrowSchema* schema_children[1]{};
@@ -418,6 +451,8 @@ struct handmade_arrow_column {
     schema.n_children  = 1;
     schema_children[0] = &child;
     schema.children    = schema_children;
+    schema.release     = noop_release_schema;
+    array.release      = noop_release_array;
 
     child.format = child_format;
     child.name   = "c";
@@ -661,9 +696,91 @@ TEST_CASE("Fragment::push_arrow refuses a batch whose schema disagrees with the 
   SECTION("null Arrow pointers are refused")
   {
     auto fragment = build_result_fragment(*context, fixture_columns());
-    REQUIRE_THROWS(fragment->push_arrow(0, 0, 0, host.schema_addr()));
-    REQUIRE_THROWS(fragment->push_arrow(0, 0, host.array_addr(), 0));
+    REQUIRE_THROWS_WITH(fragment->push_arrow(0, 0, 0, host.schema_addr()),
+                        Catch::Matchers::Contains("non-null"));
+    REQUIRE_THROWS_WITH(fragment->push_arrow(0, 0, host.array_addr(), 0),
+                        Catch::Matchers::Contains("non-null"));
   }
+
+  SECTION("a decimal whose scale disagrees is refused naming both scales")
+  {
+    // The helper narrows a decimal128 to the declared width when only the width differs; a scale
+    // difference must not be mistaken for that case, so the message names the scales.
+    const std::vector<plan_column> price{{"price", col_kind::DECIMAL_15_2}};
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL64, -3},
+                                         std::vector<std::int64_t>{1234, 5678}));
+    const cudf::table scale_3(std::move(columns));
+    const auto host_scale_3 = to_host_arrow(scale_3.view(), price);
+
+    auto fragment = build_result_fragment(*context, price);
+    REQUIRE_THROWS_WITH(
+      fragment->push_arrow(0, 0, host_scale_3.array_addr(), host_scale_3.schema_addr()),
+      Catch::Matchers::Contains("column 0 (price)") &&
+        Catch::Matchers::Contains("declared scale 2") &&
+        Catch::Matchers::Contains("carries scale 3"));
+  }
+}
+
+// A string kernel over the pushed VARCHAR column. Hash-partitioning on `name` runs
+// crc32_partition_hash over the strings cudf imported, and that kernel refuses INT64 (large)
+// string offsets (src/op/partition/crc32_partition_hash.cu). This is the check that keeping
+// cudf's `utf8` -> 32-bit offsets, and refusing `large_utf8` by name, is what the engine needs.
+TEST_CASE("Fragment::push_arrow feeds a hash partition keyed on the pushed VARCHAR column",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto rows = fixture_rows(64);
+  const auto host = to_host_arrow(fixture_table(rows)->view(), fixture_columns());
+
+  auto sender = sirius::ffi::make_fragment(*context);
+  declare_columns(*sender, 0, fixture_columns());
+  sender->declare_output(10);
+  sender->declare_output(11);
+  sender->declare_output_hash_key(3);  // `name`, the VARCHAR column
+  sender->build(stream_read_plan(0, fixture_columns()));
+  sender->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  sender->close_input(0, 0);
+  REQUIRE_NOTHROW(sender->run());
+  REQUIRE(sender->output_row_count(10) + sender->output_row_count(11) == rows.size());
+
+  // Drain both partitions through relay_from into result fragments: the union is the input.
+  std::vector<fixture_row> drained;
+  for (const auto output : {std::uint64_t{10}, std::uint64_t{11}}) {
+    auto receiver = build_result_fragment(*context, fixture_columns());
+    receiver->relay_from(*sender, output, 0, 0);
+    receiver->run();
+    arrow_stream_guard out;
+    receiver->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    const auto part = read_fixture_result(out.stream);
+    drained.insert(drained.end(), part.begin(), part.end());
+  }
+  std::sort(
+    drained.begin(), drained.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+  REQUIRE(drained == rows);
+}
+
+// A producer that splits one big batch into pieces hands over arrays with a non-zero Arrow
+// offset on every child (arrow-rs RecordBatch::slice()). cudf::from_arrow must honour the offsets
+// for every fixture type, the bool bitmap and the string offsets included.
+TEST_CASE("Fragment::push_arrow honours Arrow offsets on a sliced host batch",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto rows = fixture_rows(10);
+  auto host       = to_host_arrow(fixture_table(rows)->view(), fixture_columns());
+
+  auto fragment = build_result_fragment(*context, fixture_columns());
+  slice_host_arrow(host, 0, 4);
+  fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  slice_host_arrow(host, 4, 6);
+  fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  fragment->close_input(0, 0);
+  REQUIRE_NOTHROW(fragment->run());
+
+  arrow_stream_guard out;
+  fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+  REQUIRE(read_fixture_result(out.stream) == rows);
 }
 
 TEST_CASE("Fragment::push_arrow before build() and after close_input() both throw",
@@ -756,6 +873,26 @@ TEST_CASE("arrow_host_import refuses the shapes the engine cannot consume, by na
     const auto what = import_error(column, logical_type::make(type_id::VARCHAR));
     CHECK_THAT(what, Catch::Matchers::Contains("column 0 (c)"));
     CHECK_THAT(what, Catch::Matchers::Contains("large_utf8"));
+  }
+
+  SECTION("large_binary (64-bit offsets)")
+  {
+    handmade_arrow_column column("Z");
+    const auto what = import_error(column, logical_type::make(type_id::VARCHAR));
+    CHECK_THAT(what, Catch::Matchers::Contains("column 0 (c)"));
+    CHECK_THAT(what, Catch::Matchers::Contains("large_binary"));
+  }
+
+  SECTION("already-released structs (release == NULL)")
+  {
+    handmade_arrow_column column("l");
+    column.array.release = nullptr;
+    CHECK_THAT(import_error(column, logical_type::make(type_id::BIGINT)),
+               Catch::Matchers::Contains("already released"));
+    column.array.release  = noop_release_array;
+    column.schema.release = nullptr;
+    CHECK_THAT(import_error(column, logical_type::make(type_id::BIGINT)),
+               Catch::Matchers::Contains("already released"));
   }
 
   SECTION("128-bit integers declared as HUGEINT")
