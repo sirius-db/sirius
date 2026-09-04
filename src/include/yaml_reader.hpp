@@ -18,10 +18,13 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -96,7 +99,13 @@ inline std::uint64_t parse_bytes(std::string_view sv)
 
   if (pos == 0) { throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'"); }
 
-  double number = std::stod(std::string(sv.substr(0, pos)));
+  auto const numeric = std::string(sv.substr(0, pos));
+  std::size_t consumed{};
+  long double number = std::stold(numeric, &consumed);
+  if (consumed != numeric.size()) {
+    throw std::runtime_error("invalid byte value: '" + std::string(sv) + "'");
+  }
+  if (!std::isfinite(number)) { throw std::runtime_error("byte value must be finite"); }
   if (number < 0) { throw std::runtime_error("byte value must be non-negative"); }
   auto suffix = sv.substr(pos);
 
@@ -105,24 +114,39 @@ inline std::uint64_t parse_bytes(std::string_view sv)
     suffix.remove_prefix(1);
   }
 
-  if (suffix.empty() || suffix == "B" || suffix == "b") {
-    return static_cast<std::uint64_t>(number);
+  std::string normalized_suffix;
+  normalized_suffix.reserve(suffix.size());
+  for (char c : suffix) {
+    normalized_suffix.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   }
 
-  // Determine if binary (Ki, Mi, Gi, Ti, KiB, MiB, GiB, TiB) or decimal (K, KB, M, MB, ...)
-  char unit   = static_cast<char>(std::toupper(static_cast<unsigned char>(suffix[0])));
-  bool binary = (suffix.size() >= 2 && suffix[1] == 'i');
-
-  std::uint64_t base = binary ? 1024ULL : 1000ULL;
-  std::uint64_t multiplier;
-  switch (unit) {
-    case 'K': multiplier = base; break;
-    case 'M': multiplier = base * base; break;
-    case 'G': multiplier = base * base * base; break;
-    case 'T': multiplier = base * base * base * base; break;
-    default: throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
+  std::uint64_t multiplier = 1;
+  if (normalized_suffix.empty() || normalized_suffix == "b") {
+    multiplier = 1;
+  } else if (normalized_suffix == "k" || normalized_suffix == "kb") {
+    multiplier = 1000ULL;
+  } else if (normalized_suffix == "m" || normalized_suffix == "mb") {
+    multiplier = 1000ULL * 1000;
+  } else if (normalized_suffix == "g" || normalized_suffix == "gb") {
+    multiplier = 1000ULL * 1000 * 1000;
+  } else if (normalized_suffix == "t" || normalized_suffix == "tb") {
+    multiplier = 1000ULL * 1000 * 1000 * 1000;
+  } else if (normalized_suffix == "ki" || normalized_suffix == "kib") {
+    multiplier = 1024ULL;
+  } else if (normalized_suffix == "mi" || normalized_suffix == "mib") {
+    multiplier = 1024ULL * 1024;
+  } else if (normalized_suffix == "gi" || normalized_suffix == "gib") {
+    multiplier = 1024ULL * 1024 * 1024;
+  } else if (normalized_suffix == "ti" || normalized_suffix == "tib") {
+    multiplier = 1024ULL * 1024 * 1024 * 1024;
+  } else {
+    throw std::runtime_error("unknown byte suffix: '" + std::string(suffix) + "'");
   }
 
+  if (number > static_cast<long double>(std::numeric_limits<std::uint64_t>::max()) /
+                 static_cast<long double>(multiplier)) {
+    throw std::runtime_error("byte value is too large");
+  }
   return static_cast<std::uint64_t>(number * static_cast<double>(multiplier));
 }
 
@@ -155,8 +179,14 @@ inline std::chrono::nanoseconds parse_duration(std::string_view sv)
 
   if (pos == 0) { throw std::runtime_error("invalid time value: '" + std::string(sv) + "'"); }
 
-  double number = std::stod(std::string(sv.substr(0, pos)));
-  auto suffix   = sv.substr(pos);
+  auto const numeric = std::string(sv.substr(0, pos));
+  std::size_t consumed{};
+  long double number = std::stold(numeric, &consumed);
+  if (consumed != numeric.size()) {
+    throw std::runtime_error("invalid time value: '" + std::string(sv) + "'");
+  }
+  if (!std::isfinite(number)) { throw std::runtime_error("time value must be finite"); }
+  auto suffix = sv.substr(pos);
 
   // Strip leading whitespace from suffix
   while (!suffix.empty() && suffix[0] == ' ') {
@@ -173,7 +203,15 @@ inline std::chrono::nanoseconds parse_duration(std::string_view sv)
   // Scale the (possibly fractional) count by the chrono literal for the unit,
   // then round down to whole nanoseconds.
   auto scale = [number](auto literal_unit) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(number * literal_unit);
+    auto const nanoseconds_value =
+      std::chrono::duration_cast<std::chrono::duration<long double, std::nano>>(number *
+                                                                                literal_unit)
+        .count();
+    if (nanoseconds_value < static_cast<long double>(std::chrono::nanoseconds::min().count()) ||
+        nanoseconds_value > static_cast<long double>(std::chrono::nanoseconds::max().count())) {
+      throw std::runtime_error("time value is out of range");
+    }
+    return std::chrono::nanoseconds{static_cast<std::chrono::nanoseconds::rep>(nanoseconds_value)};
   };
 
   if (unit == "ns" || unit == "nsec") { return scale(1ns); }
@@ -204,10 +242,12 @@ template <std::integral T>
   requires(!std::is_same_v<T, bool>)
 void read_yaml(const YAML::Node& node, T& out)
 {
-  if constexpr (sizeof(T) > 4)
-    out = static_cast<T>(node.as<long long>());
-  else
-    out = static_cast<T>(node.as<int>());
+  using parsed_type = std::conditional_t<(sizeof(T) > 4), long long, int>;
+  auto const parsed = node.as<parsed_type>();
+  if constexpr (std::is_unsigned_v<T>) {
+    if (parsed < 0) { throw std::runtime_error("unsigned value must be non-negative"); }
+  }
+  out = static_cast<T>(parsed);
 }
 
 /// Wrapper that marks an integral field as accepting byte suffixes (e.g. "8Gi", "512M").
@@ -289,6 +329,38 @@ void read_yaml(const YAML::Node& node, std::chrono::duration<Rep, Period>& out)
     out = target{node.as<Rep>()};
   } catch (const YAML::BadConversion&) {
     out = std::chrono::duration_cast<target>(parse_duration(node.as<std::string>()));
+  }
+}
+
+/// Wrapper that rejects negative durations before casting to the target resolution.
+/// This avoids a negative sub-unit value (for example, -1us into milliseconds)
+/// truncating to zero before validation.
+template <typename Duration>
+struct non_negative_duration_value {
+  Duration& ref;
+};
+
+template <typename Rep, typename Period>
+non_negative_duration_value<std::chrono::duration<Rep, Period>> non_negative_duration(
+  std::chrono::duration<Rep, Period>& value)
+{
+  return {value};
+}
+
+template <typename Rep, typename Period>
+void read_yaml(const YAML::Node& node,
+               non_negative_duration_value<std::chrono::duration<Rep, Period>>& out)
+{
+  using target = std::chrono::duration<Rep, Period>;
+  try {
+    auto const count = node.as<Rep>();
+    if (count < Rep{0}) { throw std::runtime_error("duration must be non-negative"); }
+    out.ref = target{count};
+  } catch (const YAML::BadConversion&) {
+    auto const scalar = node.as<std::string>();
+    auto const parsed = parse_duration(scalar);
+    if (std::stod(scalar) < 0.0) { throw std::runtime_error("duration must be non-negative"); }
+    out.ref = std::chrono::duration_cast<target>(parsed);
   }
 }
 

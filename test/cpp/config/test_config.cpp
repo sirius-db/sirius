@@ -28,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 using namespace sirius;
@@ -53,6 +54,58 @@ TEST_CASE("yaml reader basic types", "[config_opt][basic]")
   REQUIRE(int_value == 100);
   REQUIRE(double_value == Approx(6.28));
   REQUIRE(string_value == "config setter test");
+}
+
+TEST_CASE("yaml reader rejects negative unsigned values without mutation",
+          "[config_opt][basic][unsigned]")
+{
+  SECTION("unvalidated size_t accepts zero and one but rejects negative input")
+  {
+    for (auto const& [input, expected] :
+         {std::pair{"0", std::size_t{0}}, std::pair{"1", std::size_t{1}}}) {
+      CAPTURE(input);
+      auto node         = YAML::Load("value: " + std::string{input});
+      std::size_t value = 17;
+      yaml::reader r(node, "unsigned_test");
+      REQUIRE_NOTHROW(r.optional("value", value));
+      CHECK(value == expected);
+    }
+
+    auto node         = YAML::Load("value: -1");
+    std::size_t value = 17;
+    yaml::reader r(node, "unsigned_test");
+    REQUIRE_THROWS_WITH(r.optional("value", value),
+                        Catch::Contains("unsigned_test.value") &&
+                          Catch::Contains("unsigned value must be non-negative"));
+    CHECK(value == 17);
+  }
+
+  SECTION("validated size_t preserves its stricter positive policy")
+  {
+    auto const positive = yaml::greater_than<std::size_t>{0};
+
+    auto zero_node         = YAML::Load("value: 0");
+    std::size_t zero_value = 17;
+    yaml::reader zero_reader(zero_node, "unsigned_test");
+    REQUIRE_THROWS_WITH(
+      zero_reader.optional("value", zero_value, positive),
+      Catch::Contains("unsigned_test.value") && Catch::Contains("value out of range"));
+    CHECK(zero_value == 17);
+
+    auto one_node         = YAML::Load("value: 1");
+    std::size_t one_value = 17;
+    yaml::reader one_reader(one_node, "unsigned_test");
+    REQUIRE_NOTHROW(one_reader.optional("value", one_value, positive));
+    CHECK(one_value == 1);
+
+    auto negative_node         = YAML::Load("value: -1");
+    std::size_t negative_value = 17;
+    yaml::reader negative_reader(negative_node, "unsigned_test");
+    REQUIRE_THROWS_WITH(negative_reader.optional("value", negative_value, positive),
+                        Catch::Contains("unsigned_test.value") &&
+                          Catch::Contains("unsigned value must be non-negative"));
+    CHECK(negative_value == 17);
+  }
 }
 
 TEST_CASE("yaml reader optional missing field uses default", "[config_opt][optional]")
@@ -231,6 +284,36 @@ bi: "1.5Gi")");
     yaml::reader r(node);
     REQUIRE_THROWS_AS(r.optional("size", size), std::runtime_error);
   }
+
+  SECTION("suffix trailing text is rejected without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "8GiBextra")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("unknown byte suffix"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("malformed numeric text is rejected without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "1.5.2GiB")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("invalid byte value"));
+    REQUIRE(size == 4096);
+  }
+
+  SECTION("byte values reject overflow without mutation")
+  {
+    auto node          = YAML::Load(R"(size: "18446744073709551616B")");
+    std::uint64_t size = 4096;
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("size", yaml::bytes(size)),
+                        Catch::Contains("byte value is too large"));
+    REQUIRE(size == 4096);
+  }
 }
 
 TEST_CASE("parse_duration time suffix parsing", "[config_opt][duration]")
@@ -289,6 +372,17 @@ TEST_CASE("parse_duration time suffix parsing", "[config_opt][duration]")
   {
     REQUIRE_THROWS_AS(yaml::parse_duration("10years"), std::runtime_error);
   }
+
+  SECTION("malformed numeric text is rejected")
+  {
+    REQUIRE_THROWS_WITH(yaml::parse_duration("1.5.2s"), Catch::Contains("invalid time value"));
+  }
+
+  SECTION("overflow is rejected")
+  {
+    REQUIRE_THROWS_WITH(yaml::parse_duration("1000000000000h"),
+                        Catch::Contains("time value is out of range"));
+  }
 }
 
 TEST_CASE("yaml reader duration parsing", "[config_opt][duration]")
@@ -342,6 +436,43 @@ TEST_CASE("yaml reader duration parsing", "[config_opt][duration]")
     yaml::reader r2(node);
     r2.optional("period", s_period);
     REQUIRE(s_period == 10s);
+  }
+
+  SECTION("malformed duration leaves the configured value untouched")
+  {
+    auto node = YAML::Load(R"(period: "1.5.2s")");
+    std::chrono::milliseconds period{10};
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("period", period), Catch::Contains("invalid time value"));
+    REQUIRE(period == 10ms);
+  }
+}
+
+TEST_CASE("yaml reader non-negative duration parsing", "[config_opt][duration]")
+{
+  using namespace std::chrono_literals;
+
+  SECTION("rejects a negative value before target-resolution truncation")
+  {
+    auto node = YAML::Load(R"(period: "-1us")");
+    std::chrono::milliseconds period{10};
+    yaml::reader r(node);
+    REQUIRE_THROWS_WITH(r.optional("period", yaml::non_negative_duration(period)),
+                        Catch::Contains("duration must be non-negative"));
+    REQUIRE(period == 10ms);
+  }
+
+  SECTION("preserves zero and positive duration semantics")
+  {
+    auto node = YAML::Load(R"(zero: 0
+positive: "25ms")");
+    std::chrono::milliseconds zero{10};
+    std::chrono::milliseconds positive{0};
+    yaml::reader r(node);
+    r.optional("zero", yaml::non_negative_duration(zero));
+    r.optional("positive", yaml::non_negative_duration(positive));
+    REQUIRE(zero == 0ms);
+    REQUIRE(positive == 25ms);
   }
 }
 
