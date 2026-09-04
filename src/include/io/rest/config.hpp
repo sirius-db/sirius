@@ -24,7 +24,9 @@
 namespace sirius::io::rest {
 
 struct config {
-  /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
+  /// Whole-request curl deadline (seconds, 0 = no limit). Also informs the
+  /// presigned-URL TTL with 60 seconds of headroom; zero uses a 300-second
+  /// fallback and positive values are capped at S3's seven-day maximum.
   long request_timeout_s{30};
 
   /// TLS: optional CA bundle path; when @c tls_verify is false, peer/host
@@ -101,7 +103,8 @@ struct config {
   /// one-time bind transfer (~10 ms on a high-bandwidth link).  The 512 KiB
   /// default covers files up to ~1.4 GB in one GET (the common range); raise it
   /// for multi-GB single files, lower it for many-tiny-file / low-bandwidth
-  /// workloads.
+  /// workloads.  Zero explicitly disables the suffix probe and uses the
+  /// ordinary HEAD-plus-read path.
   std::size_t footer_probe_bytes{512UL << 10};  // 512 KiB
 
   /// S3 LIST / glob safety caps (both throw "narrow the glob prefix", never

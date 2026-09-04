@@ -57,6 +57,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -283,8 +284,9 @@ class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer 
 
   sirius::io::s3::s3_authorized_request authorize(sirius::io::s3::s3_object_ref const& obj,
                                                   sirius::io::s3::s3_request_method /*method*/,
-                                                  std::chrono::seconds /*timeout*/) override
+                                                  std::chrono::seconds timeout) override
   {
+    _last_timeout_sec.store(timeout.count(), std::memory_order_relaxed);
     return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
   }
 
@@ -295,8 +297,14 @@ class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer 
     return {_endpoint + "/" + std::string{bucket} + "?" + std::string{canonical_query}, {}};
   }
 
+  [[nodiscard]] std::chrono::seconds last_timeout() const noexcept
+  {
+    return std::chrono::seconds{_last_timeout_sec.load(std::memory_order_relaxed)};
+  }
+
  private:
   std::string _endpoint;
+  std::atomic<std::chrono::seconds::rep> _last_timeout_sec{0};
 };
 
 class range_http_server {
@@ -1548,6 +1556,32 @@ TEST_CASE("footer probe open uses the configured suffix window",
   auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
   auto const footer_off = parquet.size() - 8 - footer_len;
 
+  SECTION("zero disables the suffix GET and keeps ordinary reads correct")
+  {
+    range_http_server server(parquet);
+    auto cfg               = direct_rest_test_config();
+    cfg.footer_probe_bytes = 0;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
+                                             sirius::io::open_hint::parquet_footer_probe);
+    auto const* rest_object =
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+
+    REQUIRE(rest_object != nullptr);
+    CHECK(datasource->size() == parquet.size());
+    CHECK(rest_object->stash() == nullptr);
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 0);
+
+    std::array<std::uint8_t, 8> trailer{};
+    REQUIRE(datasource->host_read(
+              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
+    require_bytes_equal(trailer,
+                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
+    CHECK(server.head_count() == 1);
+    CHECK(server.get_count() == 1);
+  }
+
   SECTION("tiny configured window misses the footer body and re-GETs it")
   {
     std::size_t constexpr suffix_bytes = 8;
@@ -2320,6 +2354,72 @@ TEST_CASE("rest_ioctx retries transient fake-server failures and reports termina
     std::array<std::uint8_t, 128> got{};
     CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
     CHECK(server.get_count() >= 2);
+  }
+}
+
+TEST_CASE("rest_ioctx applies the configured whole-request timeout",
+          "[s3][integration][rest][timeout]")
+{
+  auto payload = deterministic_payload(64 * 1024);
+
+  SECTION("a positive timeout aborts a slower response")
+  {
+    range_fault_policy fault{};
+    fault.response_delay = 1500ms;
+    range_http_server server(payload, fault);
+    auto cfg               = direct_rest_test_config();
+    cfg.request_timeout_s  = 1;
+    cfg.max_retry_attempts = 1;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://timeout-bucket/object.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+    std::array<std::uint8_t, 128> got{};
+    auto const started = std::chrono::steady_clock::now();
+    CHECK_THROWS(datasource->host_read(0, got.size(), got.data()));
+    auto const elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed < fault.response_delay);
+    CHECK(server.peak_active_gets() == 1);
+  }
+
+  SECTION("zero clears the whole-transfer deadline")
+  {
+    range_fault_policy fault{};
+    fault.response_delay = 1200ms;
+    range_http_server server(payload, fault);
+    auto cfg               = direct_rest_test_config();
+    cfg.request_timeout_s  = 0;
+    cfg.max_retry_attempts = 1;
+    auto ioctx             = make_direct_rest_ioctx(server.endpoint(), cfg);
+    auto datasource        = ioctx->open_datasource("s3://timeout-bucket/object.bin",
+                                             static_cast<std::uint64_t>(payload.size()));
+    std::array<std::uint8_t, 128> got{};
+    REQUIRE(datasource->host_read(0, got.size(), got.data()) == got.size());
+    require_bytes_equal(got, std::span<std::uint8_t const>(payload.data(), got.size()));
+  }
+}
+
+TEST_CASE("rest_reactor bounds the presigned URL lifetime", "[s3][integration][rest][timeout]")
+{
+  auto payload = deterministic_payload(64 * 1024);
+  range_http_server server(payload);
+
+  for (auto const [configured, expected] :
+       {std::pair{0L, 300L},
+        std::pair{1L, 61L},
+        std::pair{std::numeric_limits<long>::max(), 7L * 24 * 60 * 60}}) {
+    CAPTURE(configured, expected);
+    auto authorizer        = std::make_shared<fixed_url_authorizer>(server.endpoint());
+    auto cfg               = direct_rest_test_config();
+    cfg.request_timeout_s  = configured;
+    cfg.max_retry_attempts = 1;
+    auto ctx =
+      std::make_shared<sirius::io::rest::rest_reactor::reactor_context>(cfg, authorizer, nullptr);
+    sirius::io::rest::rest_reactor reactor(ctx, "presign-ttl-test");
+    reactor.start();
+
+    auto const head = reactor.head_object_size("timeout-bucket", "object.bin");
+    CHECK(head.object_size == payload.size());
+    CHECK(authorizer->last_timeout() == std::chrono::seconds{expected});
   }
 }
 

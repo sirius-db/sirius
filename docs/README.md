@@ -30,7 +30,7 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 - NVIDIA Turing or newer, with compute capability 7.5+.
 - CUDA 13.x (driver 580.65.06 or newer) or CUDA 12.x (driver 525.60.13 or newer).
 - `io_uring` enabled at runtime (`CONFIG_IO_URING`, `kernel.io_uring_disabled=0` recommended). Containers must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
-- Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`).
+- Local Parquet files should be on a filesystem/block device that supports direct I/O (`O_DIRECT`). This remains a requirement when `scan_manager.local.use_odirect` is `false`, because the local backend still opens an `O_DIRECT` handle even though requests use the buffered handle.
 
 ### Build Requirements
 

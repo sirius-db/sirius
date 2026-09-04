@@ -457,7 +457,7 @@ Both authorizers use path-style URLs and support temporary credentials. The sess
 
 **Configuration.** `object_store_config` supplies the endpoint, region, static credentials, optional session token, signing mode, and TLS settings. The built-in factory does not search environment variables, AWS profiles, or IMDS. A custom authorizer can implement those sources. If the endpoint, region, or static keys are missing, the factory returns no REST ioctx and the S3 read fails.
 
-Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` is also used as the lifetime of a presigned URL. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
+Connection limits, request sizing, footer-probe size, retry budgets, keepalive, and LIST caps live in `rest::config`; the defaults are defined in `io/rest/config.hpp`. `request_timeout_s` also informs the presigned-URL lifetime, with signing headroom and S3's seven-day cap applied separately. Async data requests retry transient curl and HTTP failures, with a separate bounded retry for HTTP 403. Control requests treat HTTP 403 as terminal.
 
 `rest_ioctx::perf_snapshot()` reports aggregate request, retry, byte, queue-wait, and H2D metrics across its reactors. Detailed timing is enabled with `perf_instrumentation`.
 
@@ -494,7 +494,7 @@ Separately from the prefetching cache, the ioctx always exposes a `metadata_stor
 | chunk size | `buffer_pool::chunk_size()` (FSMR block size) | Cache / bounce chunk granularity; sourced from the pinned `fixed_size_host_memory_resource`'s block size rather than a compile-time constant. |
 | `inflight_io_chunk_budget` (2048) | `io/cache/config.hpp` | In-flight prefetch IO budget, in chunks, enforced by `admission_control`. |
 | `eviction_threshold_fraction` / `min_prefetching_budget_fraction` | `io/cache/config.hpp` | When the pool starts evicting and the floor reserved for prefetching. |
-| `bounce_size` / `max_n_chunks` / `use_odirect` | `io/uring/config.hpp` | Per-reactor uring tunables: bounce-slot size, max contiguous segments fused into one `readv`, and the buffered-vs-`O_DIRECT` toggle. |
+| `bounce_size` / `max_n_chunks` / `use_odirect` | `io/uring/config.hpp` | Per-reactor uring tunables: bounce-slot size, max contiguous segments fused into one `readv`, and the request-mode selector (`false` forces buffered reads, but the backend still opens both buffered and `O_DIRECT` handles). |
 | `chunk_size` / `max_read_split` / `max_connections` / retry policy | `io/rest/config.hpp` | Per-reactor REST tunables (see [S3 / Object-Store Backend](#s3--object-store-backend)). |
 
 ## Complete Scan Flow

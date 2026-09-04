@@ -266,7 +266,13 @@ bool is_retriable_curl(CURLcode rc) noexcept
 /// window.
 std::chrono::seconds presign_ttl(const config& cfg) noexcept
 {
-  long const base = cfg.request_timeout_s > 0 ? cfg.request_timeout_s + 60 : 300;
+  constexpr long kFallbackSec      = 300;
+  constexpr long kHeadroomSec      = 60;
+  constexpr long kMaxPresignTtlSec = 7 * 24 * 60 * 60;
+  constexpr long kMaxBaseSec       = kMaxPresignTtlSec - kHeadroomSec;
+  long const base                  = cfg.request_timeout_s > 0
+                                       ? std::min(cfg.request_timeout_s, kMaxBaseSec) + kHeadroomSec
+                                       : kFallbackSec;
   return std::chrono::seconds{base};
 }
 
@@ -280,9 +286,9 @@ void apply_request_opts(CURL* h, const config& cfg)
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L));
   }
-  if (cfg.request_timeout_s > 0) {
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, cfg.request_timeout_s));
-  }
+  // libcurl defines zero as no whole-transfer deadline. Apply it explicitly so
+  // a reused handle cannot retain an earlier positive timeout.
+  SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, cfg.request_timeout_s));
 }
 
 /// Build a header list from the authorizer's headers (empty in presigned mode)
@@ -977,6 +983,8 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
                                                std::size_t n)
 {
   footer_probe probe;
+  // Zero is the explicit opt-out: issue no suffix GET and let the caller use
+  // the ordinary HEAD-plus-read path.
   if (n == 0) { return probe; }
 
   s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
