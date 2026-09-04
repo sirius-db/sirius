@@ -2330,6 +2330,8 @@ pub(crate) mod tests {
     }
 
     /// Polls `fetch_data` until the dispatched receiver's failure surfaces as a non-OK status.
+    /// "no buffered result" is not that failure but "not run yet": a non-result fragment has no
+    /// entry until the dispatch worker runs (and fails) it, so the poll continues through it.
     fn fetch_error_eventually(
         service: &SiriusComputeNodeService,
         hi: i64,
@@ -2344,10 +2346,16 @@ pub(crate) mod tests {
                 Vec::new(),
             );
             let result = PFetchDataResult::decode(response.body.as_slice()).unwrap();
-            if result.status.status_code != TStatusCode::OK.0 {
+            if result.status.status_code == TStatusCode::OK.0 {
+                assert!(response.attachment.is_empty());
+            } else if !result
+                .status
+                .error_msgs
+                .first()
+                .is_some_and(|message| message.contains("no buffered result"))
+            {
                 return result;
             }
-            assert!(response.attachment.is_empty());
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for receiver failure"
