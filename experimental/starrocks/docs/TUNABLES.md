@@ -15,7 +15,7 @@ Unset means the compiled default. Empty string is treated as unset.
 
 Everything else below is read outside that registry and follows its own rules,
 except where a row says otherwise (`SIRIUS_CN_FRAGMENT_FUSION` is a registry
-knob listed under "Dispatch", next to the dispatch switch it pairs with).
+knob listed under "Dispatch").
 
 ## Transport (validated registry)
 
