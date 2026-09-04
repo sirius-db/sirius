@@ -43,6 +43,7 @@
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/arrow_c_device.hpp"      // ArrowDeviceArray (cudf::to_arrow_host result)
 #include "helper/arrow_host_import.hpp"   // sirius::import_arrow_host_table
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
@@ -53,6 +54,7 @@
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
 #include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack
+#include <cudf/interop.hpp>                    // cudf::to_arrow_host, cudf::to_arrow_schema
 #include <cudf/table/table.hpp>                // cudf::table
 #include <cudf/utilities/default_stream.hpp>   // cudf::get_default_stream
 #include <cudf/utilities/span.hpp>             // cudf::device_span
@@ -783,6 +785,83 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
   offset = lease_offset;
   length = total;
   return metadata;
+}
+
+namespace {
+/// Nameless Arrow metadata for every column and nested child of `view`: `cudf::to_arrow_schema`
+/// requires one entry per column with the children spelled out, and the transport carries the
+/// names (as it does for export_packed's pack metadata, which has none either).
+cudf::column_metadata nameless_metadata(cudf::column_view const& column)
+{
+  cudf::column_metadata metadata;
+  for (cudf::size_type i = 0; i < column.num_children(); ++i) {
+    metadata.children_meta.push_back(nameless_metadata(column.child(i)));
+  }
+  return metadata;
+}
+}  // namespace
+
+bool Fragment::export_arrow(std::uint64_t stream_id,
+                            std::uintptr_t array_addr,
+                            std::uintptr_t schema_addr,
+                            std::uint64_t& rows)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before export_arrow()");
+  }
+  if (array_addr == 0 || schema_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: export_arrow() requires non-null ArrowArray and ArrowSchema addresses");
+  }
+
+  rows       = 0;
+  auto batch = impl_->session().pull(stream_id);
+  if (!batch) { return false; }
+
+  // The shared lock holds residency and immutability for the whole D2H copy; it releases when
+  // this scope ends, after the copy stream has been synchronized and the data lives on the host.
+  auto read_only = (*batch)->to_read_only();
+  if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception(
+      "Fragment: batch on output stream " + std::to_string(stream_id) +
+      " is not GPU-resident; exporting a spilled batch is not supported yet");
+  }
+  auto view   = sirius::get_cudf_table_view(read_only);
+  auto* space = read_only.get_memory_space();
+  if (space == nullptr) {
+    throw sirius::invalid_input_exception("Fragment: batch on output stream " +
+                                          std::to_string(stream_id) + " has no memory space");
+  }
+  rows = static_cast<std::uint64_t>(view.num_rows());
+
+  auto stream = cudf::get_default_stream();
+  // STREAM-LINEAGE: order the copy after the batch's writer.
+  if (cudaEvent_t writer = read_only.get_writer_event()) {
+    if (auto err = cudaStreamWaitEvent(stream.value(), writer, 0); err != cudaSuccess) {
+      throw sirius::internal_exception("Fragment: cudaStreamWaitEvent failed: {}",
+                                       cudaGetErrorString(err));
+    }
+  }
+
+  std::vector<cudf::column_metadata> metadata;
+  metadata.reserve(static_cast<std::size_t>(view.num_columns()));
+  for (auto const& column : view) {
+    metadata.push_back(nameless_metadata(column));
+  }
+  auto schema = cudf::to_arrow_schema(view, metadata);
+  // Temporary device allocations of the conversion come from the batch's own memory space; the
+  // host buffers are Arrow-owned and freed through the release callback the caller now holds.
+  auto host = cudf::to_arrow_host(view, stream, space->get_default_allocator());
+  // The caller may read (and release) the host buffers the moment this returns.
+  stream.synchronize();
+
+  // Move both structs into the caller's storage (Arrow C ABI move: copy the struct, then mark
+  // the source released so cudf's deleters free only their own allocations).
+  *reinterpret_cast<ArrowArray*>(array_addr)   = host->array;
+  host->array.release                          = nullptr;
+  *reinterpret_cast<ArrowSchema*>(schema_addr) = *schema;
+  schema->release                              = nullptr;
+  return true;
 }
 
 void Fragment::push_packed(std::uint64_t stream_id,

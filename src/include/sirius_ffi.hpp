@@ -251,6 +251,27 @@ class SIRIUS_FFI_EXPORT Fragment {
                                                            std::uint64_t& length,
                                                            std::uint64_t& rows);
 
+  /// The host-Arrow twin of `export_packed`: pop the next batch parked on output stream
+  /// `stream_id`, copy it to host memory as one Arrow record batch (Arrow C Data Interface,
+  /// `cudf::to_arrow_host`), and move the resulting `ArrowArray` (a struct array, one child per
+  /// output column) and `ArrowSchema` into the caller's structs at `array_addr` / `schema_addr`.
+  /// The caller owns both and frees them through their `release` callbacks; the engine keeps no
+  /// pointer into them and no staging lease is involved.
+  ///
+  /// Returns false, touching nothing, when no batch is parked right now (for a fragment that
+  /// finished `run()`, the stream is drained). On success writes the batch's exact row count to
+  /// `rows` and synchronizes the copy stream before returning, so the host buffers are complete.
+  /// The schema carries no column names (cudf emits the types only); the transport that moves the
+  /// batch carries the names, exactly as it does for `export_packed`. Decimal columns keep their
+  /// cudf width at cudf's widest precision for it (`cudf::to_arrow_schema`: a DECIMAL64 column is
+  /// `d:18,2,64`), which the receiving `push_arrow` reconciles against the declared precision.
+  /// @throws before `build()`, on an unknown output stream, on null addresses, or on a parked
+  /// batch that is not GPU-resident (same contract as `export_packed`).
+  bool export_arrow(std::uint64_t stream_id,
+                    std::uintptr_t array_addr,
+                    std::uintptr_t schema_addr,
+                    std::uint64_t& rows);
+
   /// The receive-side mirror of `export_packed`: unpack the `length` packed bytes at staging
   /// offset `offset` using the pack metadata at `metadata_addr` (`metadata_len` bytes, host
   /// memory), deep-copy the table out of the lease into ordinary pool memory, and push it into

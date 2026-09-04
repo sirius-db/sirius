@@ -35,6 +35,7 @@
 //    stream, is checked against the declared schema, and comes back out of result_to_arrow() with
 //    the same rows. The by-name refusals of helper/arrow_host_import.hpp are unit-tested directly.
 
+#include "helper/arrow_c_device.hpp"  // ArrowDeviceArray (cudf::to_arrow_host result)
 #include "helper/arrow_host_import.hpp"
 #include "sirius_ffi.hpp"
 
@@ -56,22 +57,6 @@
 #include <duckdb/common/arrow/arrow.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>
 #include <substrait/plan.pb.h>
-
-// cudf::to_arrow_host returns an ArrowDeviceArray (Arrow C Device Data Interface), which DuckDB's
-// header does not define and cudf/interop.hpp only forward-declares (it typedefs ArrowDeviceType).
-// The interface is meant to be vendored — arrow/c/abi.h says so in its preamble — so this is the
-// spec's definition under the spec's guard.
-#ifndef ARROW_C_DEVICE_DATA_INTERFACE
-#define ARROW_C_DEVICE_DATA_INTERFACE
-#define ARROW_DEVICE_CPU 1
-struct ArrowDeviceArray {
-  struct ArrowArray array;
-  int64_t device_id;
-  ArrowDeviceType device_type;
-  void* sync_event;
-  int64_t reserved[3];
-};
-#endif
 
 #include <algorithm>
 #include <chrono>
@@ -452,6 +437,36 @@ void require_fixture_schema(ArrowArrayStream& stream)
   }
 }
 
+// Appends every row of one fixture-schema struct array. The two producers this file reads spell
+// the decimal differently: DuckDB's result stream emits decimal128 (`d:15,2,128`, 16 bytes a
+// row) and cudf's to_arrow_host keeps the cudf width (`d:18,2,64`, 8 bytes a row); either way
+// the scaled value fits the low 64 bits for this fixture, so `decimal_words` (int64 words per
+// value: 2 or 1) is all the reader needs.
+void append_fixture_rows(const ArrowArray& array,
+                         std::vector<fixture_row>& rows,
+                         std::int64_t decimal_words)
+{
+  REQUIRE(array.n_children == 6);
+  for (std::int64_t r = 0; r < array.length; ++r) {
+    const auto& c   = array.children;
+    const auto* dec = static_cast<const std::int64_t*>(c[4]->buffers[1]);
+    rows.push_back({fixed_width_at<std::int64_t>(*c[0], r),
+                    fixed_width_at<double>(*c[1], r),
+                    bit_at(*c[2], r),
+                    string_at(*c[3], r),
+                    dec[(c[4]->offset + r) * decimal_words],
+                    fixed_width_at<std::int32_t>(*c[5], r)});
+  }
+}
+
+// int64 words per value of an Arrow decimal format: `d:p,s` and `d:p,s,128` are 128-bit, an
+// explicit `,64` is 64-bit.
+std::int64_t decimal_words_of(const char* format)
+{
+  const std::string spelled(format);
+  return spelled.ends_with(",64") ? 1 : 2;
+}
+
 // Drains a result stream of the fixture schema into rows sorted by id.
 std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
 {
@@ -462,18 +477,7 @@ std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
     arrow_array_guard array;
     REQUIRE(stream.get_next(&stream, &array.array) == 0);
     if (array.array.release == nullptr) { break; }
-    REQUIRE(array.array.n_children == 6);
-    for (std::int64_t r = 0; r < array.array.length; ++r) {
-      const auto& c = array.array.children;
-      // DuckDB emits decimal128; the scaled value fits the low 64 bits for this fixture.
-      const auto* dec = static_cast<const std::int64_t*>(c[4]->buffers[1]);
-      rows.push_back({fixed_width_at<std::int64_t>(*c[0], r),
-                      fixed_width_at<double>(*c[1], r),
-                      bit_at(*c[2], r),
-                      string_at(*c[3], r),
-                      dec[(c[4]->offset + r) * 2],
-                      fixed_width_at<std::int32_t>(*c[5], r)});
-    }
+    append_fixture_rows(array.array, rows, /*decimal_words=*/2);
   }
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
   return rows;
@@ -862,6 +866,112 @@ TEST_CASE("Fragment::push_arrow feeds a hash partition keyed on the pushed VARCH
   std::sort(
     drained.begin(), drained.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
   REQUIRE(drained == rows);
+}
+
+// The sender-side twin: an intermediate fragment's parked output, exported batch by batch as
+// host Arrow through export_arrow, carries exactly the rows the same output yields through
+// relay_from — read straight off the exported struct arrays, and again after push_arrow into a
+// receiver (the hop a transport makes: export_arrow on one CN, push_arrow on the other).
+TEST_CASE("Fragment::export_arrow exports a parked output batch equal to the relay_from rows",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto rows = fixture_rows(64);
+  const auto host = to_host_arrow(fixture_table(rows)->view(), fixture_columns());
+  const auto addr = [](auto& c_struct) { return reinterpret_cast<std::uintptr_t>(&c_struct); };
+
+  // An intermediate fragment over the fixture, its output parked on stream 10.
+  const auto make_sender = [&] {
+    auto sender = sirius::ffi::make_fragment(*context);
+    declare_columns(*sender, 0, fixture_columns());
+    sender->declare_output(10);
+    sender->build(stream_read_plan(0, fixture_columns()));
+    sender->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+    sender->close_input(0, 0);
+    sender->run();
+    return sender;
+  };
+
+  // Reference: the proven in-process relay into a result fragment.
+  std::vector<fixture_row> relayed;
+  {
+    auto sender   = make_sender();
+    auto receiver = build_result_fragment(*context, fixture_columns());
+    REQUIRE(receiver->relay_from(*sender, 10, 0, 0) > 0);
+    receiver->run();
+    arrow_stream_guard out;
+    receiver->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    relayed = read_fixture_result(out.stream);
+  }
+  REQUIRE(relayed == rows);
+
+  auto sender       = make_sender();
+  const auto parked = sender->output_batch_count(10);
+  REQUIRE(parked > 0);
+  REQUIRE(sender->output_row_count(10) == rows.size());
+
+  auto receiver = build_result_fragment(*context, fixture_columns());
+  std::vector<fixture_row> exported;
+  std::size_t batches      = 0;
+  std::uint64_t total_rows = 0;
+  while (true) {
+    arrow_array_guard array;
+    arrow_schema_guard schema;
+    std::uint64_t n = 0;
+    if (!sender->export_arrow(10, addr(array.array), addr(schema.schema), n)) { break; }
+    ++batches;
+    total_rows += n;
+    // The caller owns live structs: a struct array over the fixture columns, in cudf's Arrow
+    // spelling (the DECIMAL(15,2) column keeps its cudf width, decimal64 at cudf's widest
+    // precision for it; no column names).
+    REQUIRE(array.array.release != nullptr);
+    REQUIRE(schema.schema.release != nullptr);
+    REQUIRE(std::string(schema.schema.format) == "+s");
+    REQUIRE(schema.schema.n_children == 6);
+    const std::vector<std::string> expected_formats{"l", "g", "b", "u", "d:18,2,64", "tdD"};
+    for (std::int64_t i = 0; i < schema.schema.n_children; ++i) {
+      REQUIRE(std::string(schema.schema.children[i]->format) == expected_formats[i]);
+      REQUIRE(std::string(schema.schema.children[i]->name) == "");
+    }
+    REQUIRE(static_cast<std::uint64_t>(array.array.length) == n);
+    append_fixture_rows(array.array, exported, decimal_words_of(schema.schema.children[4]->format));
+    // The same structs feed the receive side; the guards release them after the push copied.
+    REQUIRE_NOTHROW(receiver->push_arrow(0, 0, addr(array.array), addr(schema.schema)));
+  }
+  REQUIRE(batches == parked);
+  REQUIRE(total_rows == rows.size());
+  REQUIRE(sender->output_batch_count(10) == 0);
+
+  // Drained: false, and the caller's structs and row count are left untouched.
+  {
+    arrow_array_guard array;
+    arrow_schema_guard schema;
+    std::uint64_t n = 7;
+    REQUIRE_FALSE(sender->export_arrow(10, addr(array.array), addr(schema.schema), n));
+    REQUIRE(n == 0);
+    REQUIRE(array.array.release == nullptr);
+    REQUIRE(schema.schema.release == nullptr);
+  }
+
+  std::sort(
+    exported.begin(), exported.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+  REQUIRE(exported == relayed);
+
+  receiver->close_input(0, 0);
+  receiver->run();
+  arrow_stream_guard out;
+  receiver->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+  REQUIRE(read_fixture_result(out.stream) == relayed);
+
+  // Refusals: an output stream the fragment never declared, and null addresses.
+  {
+    arrow_array_guard array;
+    arrow_schema_guard schema;
+    std::uint64_t n = 0;
+    REQUIRE_THROWS(sender->export_arrow(42, addr(array.array), addr(schema.schema), n));
+    REQUIRE_THROWS_WITH(sender->export_arrow(10, 0, addr(schema.schema), n),
+                        Catch::Matchers::Contains("non-null"));
+  }
 }
 
 // A producer that splits one big batch into pieces hands over arrays with a non-zero Arrow
