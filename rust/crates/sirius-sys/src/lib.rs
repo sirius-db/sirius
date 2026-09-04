@@ -213,6 +213,29 @@ mod ffi {
             rows: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
 
+        /// Pop the next batch parked on output stream `stream_id`, copy it to
+        /// host memory as one Arrow record batch, and move the resulting
+        /// `ArrowArray` (a struct array, one child per output column) and
+        /// `ArrowSchema` into the caller's structs at `array_addr` /
+        /// `schema_addr`: the host-Arrow twin of `export_packed`. Returns
+        /// `false`, touching nothing, when nothing is parked right now; on
+        /// success writes the exact row count to `rows` and the host buffers
+        /// are complete (the copy stream is synchronized). The caller owns
+        /// both structs and frees them through their `release` callbacks.
+        ///
+        /// # Safety
+        /// `array_addr` and `schema_addr` must be the addresses of writable,
+        /// released-or-zeroed `ArrowArray` / `ArrowSchema` values that outlive
+        /// this call. The safe [`sirius`](https://docs.rs/sirius) wrapper
+        /// upholds this.
+        unsafe fn export_arrow(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            array_addr: usize,
+            schema_addr: usize,
+            rows: &mut u64,
+        ) -> Result<bool>;
+
         /// Unpack `length` packed bytes at staging offset `offset` with the
         /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
         /// memory), deep-copy the table out of the lease into pool memory, and
