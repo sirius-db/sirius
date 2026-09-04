@@ -1,0 +1,9 @@
+sirius:
+  space:
+    disk:
+      - disk_id: 0
+        mount_path: /tmp/sirius-disk-0
+        memory_capacity: 1Gi
+      - disk_id: 0
+        mount_path: /tmp/sirius-disk-1
+        memory_capacity: 2Gi

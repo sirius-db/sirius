@@ -958,6 +958,66 @@ TEST_CASE("Sirius configuration rejects invalid downgrade hysteresis", "[sirius]
   }
 }
 
+TEST_CASE("Sirius configuration requires a non-empty low-level disk mount path", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* constraint;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_space_disk_mount_path_missing.yaml", "required but missing"},
+    {"invalid_space_disk_mount_path_null.yaml", "required but missing"},
+    {"invalid_space_disk_mount_path_empty.yaml", "must not be empty"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " constraint=" << invalid.constraint);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains("sirius.space.disk") && Catch::Contains("mount_path") &&
+                          Catch::Contains(invalid.constraint));
+  }
+}
+
+TEST_CASE("Sirius configuration requires a valid low-level GPU device id", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* constraint;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_space_gpu_device_id_missing.yaml", "required but missing"},
+    {"invalid_space_gpu_device_id_null.yaml", "required but missing"},
+    {"invalid_space_gpu_device_id_negative.yaml", "must be non-negative"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  fs::path data_dir        = fs::path(loc.file_name()).parent_path() / "data";
+
+  for (const auto& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " constraint=" << invalid.constraint);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains("sirius.space.gpu") && Catch::Contains("device_id") &&
+                          Catch::Contains(invalid.constraint));
+  }
+}
+
+TEST_CASE("Sirius configuration rejects invalid low-level host NUMA ids", "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_space_host_numa_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.space.host") && Catch::Contains("numa_id") &&
+                        Catch::Contains("-1 or non-negative"));
+}
+
 TEST_CASE("Sirius downgrade hysteresis accepts omitted, null, and one-sided defaults",
           "[sirius][config]")
 {
@@ -1381,6 +1441,44 @@ TEST_CASE("Sirius configuration loading from file with spaces",
   });
   REQUIRE(gpu != spaces.end());
   REQUIRE(std::get<cucascade::memory::gpu_memory_space_config>(*gpu).per_stream_reservation);
+}
+
+TEST_CASE("Sirius configuration rejects low-level GPU ids outside discovered topology",
+          "[sirius][config]")
+{
+  std::source_location loc = std::source_location::current();
+  auto const path =
+    fs::path(loc.file_name()).parent_path() / "data" / "invalid_space_gpu_unknown_device_id.yaml";
+  sirius::sirius_config config;
+  REQUIRE_THROWS_WITH(config.load_from_file(path),
+                      Catch::Contains("sirius.space.gpu") && Catch::Contains("device_id") &&
+                        Catch::Contains("not present in the discovered GPU topology"));
+}
+
+TEST_CASE("Sirius configuration rejects duplicate low-level memory-space ids", "[sirius][config]")
+{
+  struct invalid_config {
+    const char* fixture;
+    const char* scope;
+    const char* id_name;
+  };
+
+  const invalid_config cases[] = {
+    {"invalid_space_duplicate_gpu_id.yaml", "sirius.space.gpu", "device_id"},
+    {"invalid_space_duplicate_host_id.yaml", "sirius.space.host", "numa_id"},
+    {"invalid_space_duplicate_default_host_id.yaml", "sirius.space.host", "numa_id"},
+    {"invalid_space_duplicate_disk_id.yaml", "sirius.space.disk", "disk_id"},
+  };
+
+  std::source_location loc = std::source_location::current();
+  auto const data_dir      = fs::path(loc.file_name()).parent_path() / "data";
+  for (auto const& invalid : cases) {
+    INFO("fixture=" << invalid.fixture << " scope=" << invalid.scope);
+    sirius::sirius_config config;
+    REQUIRE_THROWS_WITH(config.load_from_file(data_dir / invalid.fixture),
+                        Catch::Contains(invalid.scope) && Catch::Contains("duplicate") &&
+                          Catch::Contains(invalid.id_name));
+  }
 }
 
 TEST_CASE("Sirius configuration rejects competing memory configuration paths", "[sirius][config]")

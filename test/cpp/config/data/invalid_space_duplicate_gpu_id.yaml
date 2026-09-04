@@ -1,0 +1,7 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 1Gi
+      - device_id: 0
+        memory_capacity: 2Gi
