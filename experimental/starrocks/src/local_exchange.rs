@@ -4,10 +4,17 @@
 //! A same-node sender's rows stay on the GPU, parked in the engine as native batches; a remote
 //! sender's batches arrive as staged packed bytes in this CN's arena (nixl tier).
 //! Either way, what is tracked here is which senders have finished and where their output sits.
+//!
+//! A third kind of sender never runs at all: a same-node leaf whose plan was deferred into its
+//! receiver ([`SenderSource::LocalPlan`], recorded by [`LocalExchange::offer_local_plan`]) is
+//! complete the moment it is recorded, and the receiver splices the plan over its exchange node
+//! before translating (`compute_node_service.rs`, `fold_deferred_plans`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::Mutex;
 
+use starrocks_plan_translator::FusionRefusal;
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
 use tracing::info;
 
@@ -45,6 +52,9 @@ pub(crate) enum SenderSource {
         /// The sender announced eos; no more frames may follow.
         closed: bool,
     },
+    /// A same-node sender whose plan was deferred into this receiver instead of running: the
+    /// receiver splices it over this exchange node before translating. Complete by construction.
+    LocalPlan(Box<LocalPlan>),
 }
 
 impl SenderSource {
@@ -52,20 +62,24 @@ impl SenderSource {
     pub(crate) fn names(&self) -> &[String] {
         match self {
             Self::LocalParked { names, .. } | Self::Remote { names, .. } => names,
+            // A deferred plan feeds no stream: the fold in `execute_ready_fragment` consumes
+            // every `LocalPlan` before `names()` is read for the inputs that still stream.
+            Self::LocalPlan(_) => &[],
         }
     }
 
-    /// Whether this sender has finished producing (a parked local sender always has).
+    /// Whether this sender has finished producing (a parked local sender always has, and a
+    /// deferred plan has nothing to produce).
     fn is_complete(&self) -> bool {
         match self {
-            Self::LocalParked { .. } => true,
+            Self::LocalParked { .. } | Self::LocalPlan(_) => true,
             Self::Remote { closed, .. } => *closed,
         }
     }
 }
 
 /// One exchange input of a receiver fragment whose sender set is complete.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReadyExchangeInput {
     pub(crate) node_id: i32,
     pub(crate) sources: Vec<SenderSource>,
@@ -76,6 +90,95 @@ pub(crate) struct ReadyExchangeInput {
 pub(crate) struct ReadyFragment {
     pub(crate) params: TExecPlanFragmentParams,
     pub(crate) inputs: Vec<ReadyExchangeInput>,
+}
+
+/// A same-node sender whose PLAN was deferred into its receiver instead of running. Holds thrift
+/// only: no GPU memory and no staging lease, so cancellation and lease release have nothing to
+/// do for it. `inputs` are the exchange inputs the deferred sender itself consumed (parked slots
+/// or staged remote batches, never another `LocalPlan`: the fold consumes deferred plans before
+/// anything is offered), relayed by the fused fragment under their own stream ids. Empty while
+/// only leaves are deferred.
+#[derive(Clone)]
+pub(crate) struct LocalPlan {
+    pub(crate) params: TExecPlanFragmentParams,
+    pub(crate) inputs: Vec<ReadyExchangeInput>,
+}
+
+/// By hand: the derived `Debug` of `TExecPlanFragmentParams` is the whole fragment dump (tens of
+/// thousands of lines), which must never reach a log line or an error string.
+impl fmt::Debug for LocalPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exec = self.params.params.as_ref();
+        f.debug_struct("LocalPlan")
+            .field(
+                "query_id",
+                &exec.map(|exec| FragmentInstanceId::from(&exec.query_id)),
+            )
+            .field(
+                "fragment_instance_id",
+                &exec.map(|exec| FragmentInstanceId::from(&exec.fragment_instance_id)),
+            )
+            .field(
+                "plan_nodes",
+                &self
+                    .params
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| fragment.plan.as_ref())
+                    .map_or(0, |plan| plan.nodes.len()),
+            )
+            .field("inputs", &self.inputs.len())
+            .finish()
+    }
+}
+
+/// Why an offered sender plan was not deferred. Logged by the caller, never an error: the sender
+/// then runs and parks as it would without fusion.
+#[derive(Debug)]
+pub(crate) enum FuseSkip {
+    /// No receiver of that fragment instance is pending: not registered yet, already released,
+    /// or retired.
+    NoPendingReceiver,
+    /// The receiver is pending but its `per_exch_num_senders` lacks this exchange node id (a
+    /// malformed dispatch).
+    ExchangeNotDeclared,
+    /// The exchange expects that many senders; only a single-sender exchange is the identity on
+    /// rows.
+    ReceiverExpectsMany(usize),
+    /// A source is already recorded for the exchange. Cannot happen with one expected sender
+    /// unless a frame was misrouted; kept as a guard.
+    ExchangeAlreadySourced,
+    /// The edge fails the translator's structural checks.
+    Structural(FusionRefusal),
+}
+
+/// The variant name, so `fragment fusion skipped reason=` lines group by reason; the structural
+/// variant carries the translator's one-line refusal.
+impl fmt::Display for FuseSkip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPendingReceiver => f.write_str("NoPendingReceiver"),
+            Self::ExchangeNotDeclared => f.write_str("ExchangeNotDeclared"),
+            Self::ReceiverExpectsMany(expected) => write!(f, "ReceiverExpectsMany({expected})"),
+            Self::ExchangeAlreadySourced => f.write_str("ExchangeAlreadySourced"),
+            Self::Structural(refusal) => write!(f, "Structural({refusal})"),
+        }
+    }
+}
+
+/// The outcome of [`LocalExchange::offer_local_plan`].
+pub(crate) enum FuseOffer {
+    /// The plan is recorded as the exchange's only source; `Some` when that completed the
+    /// receiver's sender set.
+    Fused(Option<ReadyFragment>),
+    /// Not deferred; the plan is handed back so the caller runs it. A leaf's caller still holds
+    /// the params it offered and reads nothing here; the hand-back is for an offer that carries
+    /// `inputs` (a middle fragment, the later `all` mode), which must run over them.
+    Declined {
+        #[cfg_attr(not(test), allow(dead_code))]
+        plan: LocalPlan,
+        skip: FuseSkip,
+    },
 }
 
 #[derive(Debug)]
@@ -162,6 +265,53 @@ impl LocalExchange {
         }
         senders.insert(sender_id, source);
         Self::take_ready(&mut state, key.fragment_instance_id)
+    }
+
+    /// Offers a sender's plan for fusion into the pending receiver `key.fragment_instance_id` at
+    /// exchange `key.node_id`, instead of running the sender.
+    ///
+    /// Under the lock: the receiver must be pending, declare the exchange, expect exactly one
+    /// sender there, have no source for it yet, and `verdict(&receiver.params)` (the
+    /// translator's structural checks against the registered, descriptor-resolved receiver) must
+    /// pass. On success the plan is recorded as [`SenderSource::LocalPlan`] and `take_ready`
+    /// decides whether the receiver is complete. A decline hands the plan back; nothing is
+    /// cloned but what the verdict reads.
+    ///
+    /// # Errors
+    /// A rendezvous inconsistency `take_ready` reports (more sources than expected).
+    pub(crate) fn offer_local_plan(
+        &self,
+        key: ExchangeKey,
+        sender_id: i32,
+        plan: LocalPlan,
+        verdict: impl FnOnce(&TExecPlanFragmentParams) -> Result<(), FusionRefusal>,
+    ) -> Result<FuseOffer, String> {
+        let mut state = self.lock();
+        let skip = match state.receivers.get(&key.fragment_instance_id) {
+            None => Some(FuseSkip::NoPendingReceiver),
+            Some(receiver) => match receiver.expected_senders.get(&key.node_id) {
+                None => Some(FuseSkip::ExchangeNotDeclared),
+                Some(&expected) if expected != 1 => Some(FuseSkip::ReceiverExpectsMany(expected)),
+                Some(_)
+                    if state
+                        .sources
+                        .get(&key)
+                        .is_some_and(|sources| !sources.is_empty()) =>
+                {
+                    Some(FuseSkip::ExchangeAlreadySourced)
+                }
+                Some(_) => verdict(&receiver.params).err().map(FuseSkip::Structural),
+            },
+        };
+        if let Some(skip) = skip {
+            return Ok(FuseOffer::Declined { plan, skip });
+        }
+        state
+            .sources
+            .entry(key)
+            .or_default()
+            .insert(sender_id, SenderSource::LocalPlan(Box::new(plan)));
+        Self::take_ready(&mut state, key.fragment_instance_id).map(FuseOffer::Fused)
     }
 
     /// Records one `transmit_packed` frame from a remote sender: a staged batch, eos, or both.
@@ -382,7 +532,10 @@ impl LocalExchange {
 
 #[cfg(test)]
 mod tests {
-    use starrocks_thrift::internal_service::InternalServiceVersion;
+    use std::collections::BTreeMap;
+
+    use starrocks_thrift::internal_service::{InternalServiceVersion, TPlanFragmentExecParams};
+    use starrocks_thrift::types::TUniqueId;
 
     use super::*;
 
@@ -906,5 +1059,325 @@ mod tests {
         assert!(!exchange.is_retired(FragmentInstanceId::from_halves(12, 0)));
         assert!(exchange.is_retired(FragmentInstanceId::from_halves(12, 1)));
         assert!(exchange.is_retired(FragmentInstanceId::from_halves(12, RETIRED_CAPACITY as i64)));
+    }
+
+    // Fragment fusion: a sender's PLAN offered as the exchange's source instead of its rows.
+
+    /// A deferred sender plan of instance `(7, instance)` in query `(7, 0)`, with no inputs.
+    fn local_plan(instance: i64) -> LocalPlan {
+        let mut params = params();
+        params.params = Some(TPlanFragmentExecParams::new(
+            TUniqueId::new(7, 0),
+            TUniqueId::new(7, instance),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        LocalPlan {
+            params,
+            inputs: Vec::new(),
+        }
+    }
+
+    fn instance_of(plan: &LocalPlan) -> FragmentInstanceId {
+        FragmentInstanceId::from(&plan.params.params.as_ref().unwrap().fragment_instance_id)
+    }
+
+    fn parked(key: ExchangeKey, sender_id: i32) -> SenderSource {
+        SenderSource::LocalParked {
+            names: names(),
+            slot: local_slot(key, sender_id),
+        }
+    }
+
+    fn declined(offer: FuseOffer) -> (LocalPlan, FuseSkip) {
+        match offer {
+            FuseOffer::Declined { plan, skip } => (plan, skip),
+            FuseOffer::Fused(_) => panic!("expected the offer to be declined"),
+        }
+    }
+
+    /// A receiver expecting one sender at exchange 7 becomes ready the moment that sender's plan
+    /// is deferred: the plan is the exchange's only source and the receiver has left the
+    /// rendezvous.
+    #[test]
+    fn offer_local_plan_completes_a_single_sender_receiver() {
+        let exchange = LocalExchange::default();
+        let key = key(20, 7);
+        assert!(
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+        let FuseOffer::Fused(ready) = exchange
+            .offer_local_plan(key, 0, local_plan(21), |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("expected the offer to be accepted");
+        };
+        let ready = ready.expect("the deferred plan completes the sender set");
+        assert_eq!(ready.inputs.len(), 1);
+        assert_eq!(ready.inputs[0].node_id, 7);
+        let [SenderSource::LocalPlan(plan)] = ready.inputs[0].sources.as_slice() else {
+            panic!("expected exactly one deferred plan source");
+        };
+        assert_eq!(instance_of(plan), FragmentInstanceId::from_halves(7, 21));
+        assert!(plan.inputs.is_empty());
+        // The receiver left the rendezvous: a second offer finds nothing pending.
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(key, 0, local_plan(22), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::NoPendingReceiver), "{skip}");
+    }
+
+    /// A leaf that arrives before its receiver is handed back to run and park as today, and
+    /// leaves nothing behind in the rendezvous.
+    #[test]
+    fn offer_local_plan_declines_without_pending_receiver() {
+        let exchange = LocalExchange::default();
+        let key = key(23, 7);
+        let (plan, skip) = declined(
+            exchange
+                .offer_local_plan(key, 0, local_plan(24), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::NoPendingReceiver), "{skip}");
+        assert_eq!(skip.to_string(), "NoPendingReceiver");
+        assert_eq!(
+            instance_of(&plan),
+            FragmentInstanceId::from_halves(7, 24),
+            "the plan offered is the plan handed back"
+        );
+        // Nothing was recorded: the receiver registering afterwards is not ready.
+        assert!(
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Only a single-sender exchange is the identity on rows; a fan-in declines and the parked
+    /// path still completes it.
+    #[test]
+    fn offer_local_plan_declines_when_receiver_expects_many() {
+        let exchange = LocalExchange::default();
+        let key = key(25, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 2)], params())
+            .unwrap();
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(key, 0, local_plan(26), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::ReceiverExpectsMany(2)), "{skip}");
+        assert_eq!(skip.to_string(), "ReceiverExpectsMany(2)");
+        assert!(
+            exchange
+                .push_sender(key, 0, parked(key, 0))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            exchange
+                .push_sender(key, 1, parked(key, 1))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The verdict sees the registered receiver's params; a refusal records nothing, so the
+    /// parked path readies the receiver exactly as today.
+    #[test]
+    fn offer_local_plan_declines_on_structural_verdict_and_leaves_receiver_untouched() {
+        let exchange = LocalExchange::default();
+        let key = key(27, 7);
+        let mut receiver = params();
+        receiver.backend_num = Some(42);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], receiver)
+            .unwrap();
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(key, 0, local_plan(28), |receiver| {
+                    assert_eq!(
+                        receiver.backend_num,
+                        Some(42),
+                        "verdict over the registered params"
+                    );
+                    Err(FusionRefusal::SortedExchange { node_id: 7 })
+                })
+                .unwrap(),
+        );
+        assert!(
+            matches!(
+                skip,
+                FuseSkip::Structural(FusionRefusal::SortedExchange { node_id: 7 })
+            ),
+            "{skip}"
+        );
+        assert_eq!(
+            skip.to_string(),
+            "Structural(exchange 7 merges sorted input)"
+        );
+        let ready = exchange
+            .push_sender(key, 0, parked(key, 0))
+            .unwrap()
+            .expect("the parked sender completes the set");
+        assert!(matches!(
+            ready.inputs[0].sources.as_slice(),
+            [SenderSource::LocalParked { .. }]
+        ));
+    }
+
+    /// A pending receiver that does not declare the addressed exchange is a malformed dispatch;
+    /// the offer declines rather than inventing an expectation.
+    #[test]
+    fn offer_local_plan_declines_an_undeclared_exchange() {
+        let exchange = LocalExchange::default();
+        let receiver = key(29, 7);
+        exchange
+            .register_receiver(receiver.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(key(29, 8), 0, local_plan(30), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::ExchangeNotDeclared), "{skip}");
+    }
+
+    /// The guard for a source that reached the exchange before the offer (with one expected
+    /// sender that is a misrouted frame, not a fan-in): the plan declines, the source stays.
+    #[test]
+    fn offer_local_plan_declines_an_already_sourced_exchange() {
+        let exchange = LocalExchange::default();
+        let key = key(31, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 0, false, names(), Some(staged(1)))
+                .unwrap()
+                .is_none()
+        );
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(key, 1, local_plan(32), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::ExchangeAlreadySourced), "{skip}");
+    }
+
+    /// A receiver over one deferred and one parked exchange becomes ready when the parked one
+    /// lands, with both inputs in node-id order.
+    #[test]
+    fn mixed_deferred_and_parked_inputs_become_ready_together() {
+        let exchange = LocalExchange::default();
+        let deferred = key(33, 7);
+        let parked_key = key(33, 8);
+        exchange
+            .register_receiver(
+                deferred.fragment_instance_id,
+                vec![(8, 1), (7, 1)],
+                params(),
+            )
+            .unwrap();
+        let FuseOffer::Fused(None) = exchange
+            .offer_local_plan(deferred, 0, local_plan(34), |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("exchange 8 is still pending, so the receiver is not ready");
+        };
+        let ready = exchange
+            .push_sender(parked_key, 0, parked(parked_key, 0))
+            .unwrap()
+            .expect("both inputs are complete");
+        let node_ids: Vec<i32> = ready.inputs.iter().map(|input| input.node_id).collect();
+        assert_eq!(node_ids, vec![7, 8]);
+        assert!(matches!(
+            ready.inputs[0].sources.as_slice(),
+            [SenderSource::LocalPlan(_)]
+        ));
+        assert!(matches!(
+            ready.inputs[1].sources.as_slice(),
+            [SenderSource::LocalParked { .. }]
+        ));
+    }
+
+    /// The cancel path: the cancelled receiver leaves with its deferred plan among the other
+    /// sources (a plan holds no GPU memory, so the caller releases nothing for it), is remembered
+    /// as retired, and a later offer for it declines instead of re-creating it.
+    #[test]
+    fn retire_receiver_returns_a_deferred_plan_with_the_other_sources() {
+        let exchange = LocalExchange::default();
+        let deferred = key(35, 7);
+        let parked_key = key(35, 8);
+        exchange
+            .register_receiver(
+                deferred.fragment_instance_id,
+                vec![(7, 1), (8, 2)],
+                params(),
+            )
+            .unwrap();
+        let FuseOffer::Fused(None) = exchange
+            .offer_local_plan(deferred, 0, local_plan(36), |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("exchange 8 is still pending, so the receiver is not ready");
+        };
+        assert!(
+            exchange
+                .push_sender(parked_key, 0, parked(parked_key, 0))
+                .unwrap()
+                .is_none()
+        );
+
+        let removed = exchange.retire_receiver(deferred.fragment_instance_id);
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        let SenderSource::LocalPlan(plan) = &removed[0] else {
+            panic!("exchange 7's source is the deferred plan: {removed:?}");
+        };
+        assert_eq!(instance_of(plan), FragmentInstanceId::from_halves(7, 36));
+        assert!(matches!(removed[1], SenderSource::LocalParked { .. }));
+        assert!(exchange.is_retired(deferred.fragment_instance_id));
+        let (_, skip) = declined(
+            exchange
+                .offer_local_plan(deferred, 0, local_plan(37), |_| Ok(()))
+                .unwrap(),
+        );
+        assert!(matches!(skip, FuseSkip::NoPendingReceiver), "{skip}");
+    }
+
+    /// The derived `Debug` of the params is the whole fragment dump; a plan's is a summary.
+    #[test]
+    fn local_plan_debug_is_a_summary_not_the_fragment_dump() {
+        let plan = local_plan(38);
+        let debug = format!("{plan:?}");
+        assert!(
+            debug.contains(&FragmentInstanceId::from_halves(7, 38).to_string()),
+            "{debug}"
+        );
+        assert!(debug.contains("plan_nodes: 0"), "{debug}");
+        assert!(debug.contains("inputs: 0"), "{debug}");
+        assert!(!debug.contains("protocol_version"), "{debug}");
+        assert!(debug.len() < 300, "{debug}");
     }
 }

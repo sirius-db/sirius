@@ -37,7 +37,13 @@ INFO sirius_starrocks_cn::engine: relayed native batches across a fragment bound
 ### What it does not exercise yet
 
 - **Sequential fragments.** The engine serializes queries, so a sender runs to completion before
-  its receiver starts. Concurrency needs per-query lifecycle isolation.
+  its receiver starts. Concurrency needs per-query lifecycle isolation. A same-node leaf whose
+  hash-partitioned sink has one local destination does not run at all: its plan is fused into
+  the receiver's before translation (`SIRIUS_CN_FRAGMENT_FUSION`, default `leaf`;
+  [`docs/TUNABLES.md`](docs/TUNABLES.md)), so such a query shows fewer `fragment run started`
+  lines than the FE has fragments. Q6's gather into a merge aggregation is not that shape, so
+  this demo still runs both fragments; `SIRIUS_CN_FRAGMENT_FUSION=off` restores run-and-park
+  everywhere without a rebuild.
 - **A pre-filled stream.** Senders finish before the receiver is built, so the live producer path
   — a push arriving while the receiver runs — is still untested here.
 - **Cancellation mid-run.** `cancel_plan_fragment` retires the query's parked output and

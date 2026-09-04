@@ -10,8 +10,11 @@
 //! (`ExchangeNode.java` `computeTupleIds`), shipped as `TExchangeNode.input_row_tuples`.
 //!
 //! Everything here is a pure function over the thrift structs: no I/O, no engine, no policy. The
-//! CN decides *which* senders to offer (mode knob, routing, rendezvous state); this module decides
-//! whether an offered edge is structurally sound and performs the splice.
+//! CN decides *which* senders to offer (the `SIRIUS_CN_FRAGMENT_FUSION` mode, destination
+//! routing, rendezvous state: `compute_node_service.rs` `try_defer_sender`, which parks the
+//! sender's plan as a `SenderSource::LocalPlan` and splices it in `fold_deferred_plans` when the
+//! receiver becomes ready); this module decides whether an offered edge is structurally sound and
+//! performs the splice.
 //!
 //! The invariants the rest of this crate relies on survive the splice by construction or by
 //! refusal: the exchange is a preorder leaf and the sender list a complete preorder subtree, so

@@ -8,7 +8,8 @@ use crate::fragment_executor::{
     StagedBatch,
 };
 use crate::local_exchange::{
-    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, SenderSource,
+    ExchangeKey, FuseOffer, LocalExchange, LocalPlan, ReadyExchangeInput, ReadyFragment,
+    SenderSource,
 };
 use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
@@ -21,13 +22,15 @@ use crate::proto::starrocks::{
 };
 use crate::result_encoder::{self, ThriftBinary};
 use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
-use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan};
+use crate::tunable::{FusionMode, Tunables};
+use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan, fusion};
 use starrocks_thrift::{
     data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
     descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
+    partitions::TPartitionType,
     plan_nodes::TFileFormatType,
     status_code::TStatusCode,
     types::TNetworkAddress,
@@ -36,7 +39,7 @@ use thrift::{
     protocol::{TBinaryInputProtocol, TSerializable},
     transport::TBufferChannel,
 };
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 /// Name of the engine view an exchange's input stream is read through.
 ///
@@ -155,6 +158,10 @@ struct ServiceCore {
     /// The executor serves every staging call from a thread-safe arena handle, never from the
     /// engine's request queue, so a lease request costs a mutex — not an engine wait.
     staging_info: Mutex<Option<(u64, u64)>>,
+    /// Which same-node senders are deferred into their receiver's plan instead of running, as a
+    /// [`FusionMode`] code. From `SIRIUS_CN_FRAGMENT_FUSION` at bring-up (or a test's setter);
+    /// see [`ServiceCore::try_defer_sender`].
+    fragment_fusion: std::sync::atomic::AtomicU8,
 }
 
 impl SiriusComputeNodeService {
@@ -196,6 +203,7 @@ impl SiriusComputeNodeService {
             identity,
             transport,
             staging_info: Mutex::new(None),
+            fragment_fusion: std::sync::atomic::AtomicU8::new(Tunables::get().fusion_mode.code()),
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -210,6 +218,15 @@ impl SiriusComputeNodeService {
             core,
             ready_fragments,
         }
+    }
+
+    /// Overrides the bring-up fusion mode for this service instance; tests use it to exercise
+    /// every mode without touching the process environment.
+    #[cfg(test)]
+    pub(crate) fn set_fragment_fusion(&self, mode: FusionMode) {
+        self.core
+            .fragment_fusion
+            .store(mode.code(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
@@ -759,6 +776,17 @@ fn release_leases<'a>(
     released
 }
 
+/// A ready receiver after its deferred sender plans were spliced in
+/// ([`ServiceCore::fold_deferred_plans`]).
+struct FoldedReceiver {
+    /// The plan the engine runs: the receiver's params with every deferred sender inline.
+    params: TExecPlanFragmentParams,
+    /// The exchanges that still read a stream, in node-id order.
+    streamed: Vec<ReadyExchangeInput>,
+    /// The absorbed senders' fragment instance ids.
+    fused: Vec<FragmentInstanceId>,
+}
+
 impl ServiceCore {
     /// Runs one dispatched receiver, parking a failure where `fetch_data` can see it. Returns
     /// the next receiver when this fragment's own sink completed another sender set.
@@ -920,9 +948,159 @@ impl ServiceCore {
                     .collect(),
             ));
         }
+        // A leaf whose only destination is a pending local receiver is spliced into that
+        // receiver's plan instead of running; the receiver it readies (if any) is the caller's
+        // to dispatch, exactly like one a parked sender completed.
+        if let Some(ready) = self.try_defer_sender(&params)? {
+            return Ok(FragmentOutcome::from_ready(ready));
+        }
 
         let translated = self.translate_fragment_logged(&params, dump_seq)?;
         self.execute_fragment(&params, translated)
+    }
+
+    /// The fusion mode in force for this service.
+    fn fragment_fusion(&self) -> FusionMode {
+        FusionMode::from_code(
+            self.fragment_fusion
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .expect("fragment_fusion only ever holds a FusionMode code")
+    }
+
+    /// Tries to defer a sender into its local receiver's plan instead of running it. Returns the
+    /// receivers this completed (for the caller to dispatch), or `None` when the sender must
+    /// take today's run-and-park path. Every check runs here, with both fragments' params in
+    /// hand, before anything is deferred: a decline is logged and never an error, so no shape
+    /// that runs today can fail because of fusion.
+    ///
+    /// Policy exclusions (mode off, a dead query, not a leaf, partition type, remote
+    /// destination, a sink the translator will not splice) log at debug: every broadcast leaf
+    /// hits one on every query. Rendezvous and structural declines log at info: those are the
+    /// arrival-order and plan-shape regressions the acceptance runs count.
+    fn try_defer_sender(
+        &self,
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<Option<Vec<ReadyFragment>>, String> {
+        let shown = |id: Option<FragmentInstanceId>| id.map(tracing::field::display);
+        let mode = self.fragment_fusion();
+        let query_id = Self::query_id(params);
+        let sender = Self::fragment_instance_id(params);
+        if mode == FusionMode::Off {
+            debug!(
+                query_id = shown(query_id),
+                sender_fragment_instance_id = shown(sender),
+                reason = %"off",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        }
+        // A leaf of a query this CN already failed is never deferred. `process_fragment`'s
+        // gate 4 refuses such a leaf before it reaches this hook; the check stays with the hook
+        // so a second call site (perf/profile-sf1000's queued sender path reaches it before
+        // gate 4) cannot defer a dead query's leaf. Declining sends the leaf down today's path,
+        // where gate 3 in `run_ready_fragment` skips it without translating.
+        if let Some(query_id) = query_id
+            && let Some(cause) = self.results.failure_of(query_id)
+        {
+            debug!(
+                %query_id,
+                sender_fragment_instance_id = shown(sender),
+                %cause,
+                reason = %"query already failed on this CN",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        }
+        let shape = match fusion::sender_shape(params) {
+            Ok(shape) => shape,
+            Err(refusal) => {
+                debug!(
+                    query_id = shown(query_id),
+                    sender_fragment_instance_id = shown(sender),
+                    reason = %refusal,
+                    "fragment fusion skipped"
+                );
+                return Ok(None);
+            }
+        };
+        // `sender_shape` read the exec params, so both ids are present from here on.
+        let (Some(query_id), Some(sender)) = (query_id, sender) else {
+            debug!(
+                reason = %"sender carries no exec params",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        };
+        // Policy: leaves only (a middle fragment is the later `all` mode), and in `leaf`
+        // mode only the shuffle shape, which is the one that parks a fact table whole at 1 CN.
+        if !shape.is_leaf {
+            debug!(
+                %query_id,
+                sender_fragment_instance_id = %sender,
+                reason = %"sender has exchange inputs",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        }
+        if mode == FusionMode::Leaf && shape.partition != TPartitionType::HASH_PARTITIONED {
+            debug!(
+                %query_id,
+                sender_fragment_instance_id = %sender,
+                reason = %"leaf mode fuses HASH_PARTITIONED sinks only",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        }
+        if !matches!(
+            self.route_destination(shape.destination)?,
+            DestinationRoute::Local
+        ) {
+            debug!(
+                %query_id,
+                sender_fragment_instance_id = %sender,
+                reason = %"remote destination",
+                "fragment fusion skipped"
+            );
+            return Ok(None);
+        }
+        let key = ExchangeKey {
+            fragment_instance_id: FragmentInstanceId::from(&shape.destination.fragment_instance_id),
+            node_id: shape.dest_node_id,
+        };
+        let plan = LocalPlan {
+            params: params.clone(),
+            inputs: Vec::new(),
+        };
+        let offer = self
+            .exchanges
+            .offer_local_plan(key, shape.sender_id, plan, |receiver| {
+                fusion::fusable_edge(receiver, key.node_id, params)
+            })?;
+        match offer {
+            FuseOffer::Fused(ready) => {
+                info!(
+                    %query_id,
+                    sender_fragment_instance_id = %sender,
+                    receiver_fragment_instance_id = %key.fragment_instance_id,
+                    exchange = key.node_id,
+                    mode = ?mode,
+                    "fused sender fragment into its local receiver"
+                );
+                Ok(Some(ready.into_iter().collect()))
+            }
+            FuseOffer::Declined { skip, .. } => {
+                info!(
+                    %query_id,
+                    sender_fragment_instance_id = %sender,
+                    receiver_fragment_instance_id = %key.fragment_instance_id,
+                    exchange = key.node_id,
+                    reason = %skip,
+                    "fragment fusion skipped"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Restores descriptor tables omitted by StarRocks's per-query descriptor cache protocol.
@@ -1088,7 +1266,6 @@ impl ServiceCore {
         // (each destination drains its own copy from its own output stream). Hash-partitioned
         // fan-out is the second half of #838 and still refuses.
         if destinations.len() > 1 {
-            use starrocks_thrift::partitions::TPartitionType;
             match stream_sink.output_partition.type_ {
                 TPartitionType::UNPARTITIONED => {}
                 TPartitionType::HASH_PARTITIONED => {
@@ -1282,18 +1459,33 @@ impl ServiceCore {
         Ok(info)
     }
 
-    /// Translates a receiver whose sender set is complete, binding each exchange to the input
-    /// stream its senders parked into (or staged, for remote senders), and runs it. Returns the
-    /// next receiver when this one's own sink completed another sender set.
+    /// Translates a receiver whose sender set is complete -- deferred sender plans spliced in
+    /// first, then each remaining exchange bound to the input stream its senders parked into (or
+    /// staged, for remote senders) -- and runs it. Returns the next receiver when this one's own
+    /// sink completed another sender set.
     fn execute_ready_fragment(
         &self,
         ready: ReadyFragment,
     ) -> std::result::Result<FragmentOutcome, String> {
-        let exchange_inputs = match Self::exchange_inputs(&ready.inputs) {
+        let FoldedReceiver {
+            params,
+            streamed,
+            fused,
+        } = self.fold_deferred_plans(ready)?;
+        if !fused.is_empty() {
+            info!(
+                query_id = Self::query_id(&params).map(tracing::field::display),
+                fragment_instance_id = Self::fragment_instance_id(&params).map(tracing::field::display),
+                fused = fused.len(),
+                senders = ?fused,
+                "fused deferred sender plans into receiver"
+            );
+        }
+        let exchange_inputs = match Self::exchange_inputs(&streamed) {
             Ok(exchange_inputs) => exchange_inputs,
             Err(err) => {
                 // Nothing extracted yet: hand the staged leases back before failing.
-                self.release_staged(ready.inputs);
+                self.release_staged(streamed);
                 return Err(err);
             }
         };
@@ -1301,7 +1493,7 @@ impl ServiceCore {
         // releases them on every error path from here to the engine call.
         let mut inputs: Vec<(i32, Vec<SenderSlot>)> = Vec::new();
         let mut leases = StagedLeases::new(self.executor.as_ref());
-        for input in ready.inputs {
+        for input in streamed {
             let mut slots = Vec::new();
             for source in input.sources {
                 match source {
@@ -1324,6 +1516,14 @@ impl ServiceCore {
                             ));
                         }
                     }
+                    // The fold consumed every deferred plan; one left here is a bug.
+                    SenderSource::LocalPlan(plan) => {
+                        return Err(format!(
+                            "exchange node {} still carries deferred sender plan {plan:?} after \
+                             the fold",
+                            input.node_id
+                        ));
+                    }
                 }
             }
             if !slots.is_empty() {
@@ -1331,11 +1531,93 @@ impl ServiceCore {
             }
         }
         // A receiver translates when its sender set completes, not at arrival, so pair its plan
-        // dump with a fresh params dump here (the arrival-time dump carried no plan yet).
-        let dump_seq = Self::dump_fragment(&ready.params);
+        // dump with a fresh params dump here (the arrival-time dump carried no plan yet). With
+        // deferred senders this is the FUSED plan, the one the substrait dump next to it runs.
+        let dump_seq = Self::dump_fragment(&params);
         let translated =
-            self.translate_fragment_logged_with_inputs(&ready.params, &exchange_inputs, dump_seq)?;
-        self.execute_fragment_with_inputs(&ready.params, translated, inputs, leases)
+            self.translate_fragment_logged_with_inputs(&params, &exchange_inputs, dump_seq)?;
+        self.execute_fragment_with_inputs(&params, translated, inputs, leases)
+    }
+
+    /// Splices every deferred sender plan into the receiver's params.
+    ///
+    /// A splice refusal here is a bug -- the same checks passed at defer time on the same two
+    /// params -- and fails the receiver; the staged leases of the other inputs go back to the
+    /// arena first, as on every pre-run error path.
+    fn fold_deferred_plans(
+        &self,
+        ready: ReadyFragment,
+    ) -> std::result::Result<FoldedReceiver, String> {
+        let receiver = Self::fragment_context(&ready.params);
+        let mut worklist = ready.inputs;
+        let mut streamed = Vec::new();
+        let mut fused = Vec::new();
+        match Self::splice_deferred(
+            ready.params,
+            &receiver,
+            &mut worklist,
+            &mut streamed,
+            &mut fused,
+        ) {
+            Ok(params) => {
+                // The worklist is drained; keep `take_ready`'s deterministic order.
+                streamed.sort_by_key(|input| input.node_id);
+                Ok(FoldedReceiver {
+                    params,
+                    streamed,
+                    fused,
+                })
+            }
+            Err(err) => {
+                streamed.append(&mut worklist);
+                self.release_staged(streamed);
+                Err(err)
+            }
+        }
+    }
+
+    /// The fold itself: pops inputs off `worklist`, splicing each lone deferred plan into
+    /// `params` (and queueing that plan's own inputs, empty while only leaves are deferred) and
+    /// moving every other input to `streamed`.
+    fn splice_deferred(
+        mut params: TExecPlanFragmentParams,
+        receiver: &str,
+        worklist: &mut Vec<ReadyExchangeInput>,
+        streamed: &mut Vec<ReadyExchangeInput>,
+        fused: &mut Vec<FragmentInstanceId>,
+    ) -> std::result::Result<TExecPlanFragmentParams, String> {
+        while let Some(input) = worklist.pop() {
+            let deferred = input
+                .sources
+                .iter()
+                .filter(|source| matches!(source, SenderSource::LocalPlan(_)))
+                .count();
+            if deferred == 0 {
+                streamed.push(input);
+                continue;
+            }
+            let node_id = input.node_id;
+            let total = input.sources.len();
+            let plan = match input.sources.into_iter().next() {
+                Some(SenderSource::LocalPlan(plan)) if total == 1 => *plan,
+                _ => {
+                    return Err(format!(
+                        "exchange node {node_id} has {deferred} deferred sender plan(s) among \
+                         {total} source(s); a deferred plan must be an exchange's only source"
+                    ));
+                }
+            };
+            params = fusion::splice(params, node_id, &plan.params).map_err(|refusal| {
+                format!(
+                    "fragment fusion: splicing deferred {} into {receiver} at exchange {node_id} \
+                     failed after passing the defer-time checks: {refusal}",
+                    Self::fragment_context(&plan.params)
+                )
+            })?;
+            fused.extend(Self::fragment_instance_id(&plan.params));
+            worklist.extend(plan.inputs);
+        }
+        Ok(params)
     }
 
     /// The exchange inputs a ready receiver's plan binds its stream reads to. Local and remote
@@ -1737,8 +2019,10 @@ impl SiriusComputeNodeService {
     }
 }
 
+/// `pub(crate)` so the engine-linked test in `engine.rs` can borrow
+/// [`users_shuffle_pair`](tests::users_shuffle_pair) instead of duplicating the thrift fixtures.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1747,11 +2031,14 @@ mod tests {
         data::TResultBatch,
         data_sinks::{TDataSink, TDataStreamSink, TPlanFragmentDestination, TResultSink},
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
-        internal_service::{InternalServiceVersion, TPlanFragmentExecParams},
+        exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef},
+        internal_service::{InternalServiceVersion, TPlanFragmentExecParams, TScanRangeParams},
+        opcodes::TExprOpcode,
         partitions::{TDataPartition, TPartitionType},
         plan_nodes::{
-            TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TExchangeNode,
-            TFileScanNode, TPlan, TPlanNode, TPlanNodeType, TScanRange,
+            TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
+            TExchangeNode, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TPlan, TPlanNode,
+            TPlanNodeType, TScanRange,
         },
         planner::TPlanFragment,
         types::{
@@ -1766,6 +2053,7 @@ mod tests {
     use crate::{
         file_schema::test_support::write_parquet,
         fragment_executor::{FragmentResult, StubExecutor},
+        local_exchange::FuseSkip,
         proto::starrocks::{
             PFetchDataRequest, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
@@ -3376,6 +3664,868 @@ mod tests {
         );
     }
 
+    // Same-node fragment fusion: a hash-partitioned single-destination local leaf is spliced into
+    // its receiver's plan instead of running (`try_defer_sender`, `fold_deferred_plans`).
+
+    /// Every `tracing` line this test binary emits, from every thread (the RPC blocking pool and
+    /// the dispatch worker included), so a test can assert the fusion log contract. One
+    /// process-wide subscriber installed once; tests pick their own lines out by query id.
+    static CAPTURED_LOGS: Mutex<String> = Mutex::new(String::new());
+
+    struct CaptureLogs;
+
+    impl std::io::Write for CaptureLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOGS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureLogs {
+        type Writer = CaptureLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureLogs
+        }
+    }
+
+    fn capture_logs() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(CaptureLogs)
+                .finish();
+            // Nothing else in this binary installs a subscriber; if something ever does, the
+            // capture stays empty and the log assertions fail loudly rather than pass vacuously.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// The captured lines that name `query_id`.
+    fn logs_of(query_id: &TUniqueId) -> Vec<String> {
+        let id = FragmentInstanceId::from(query_id).to_string();
+        CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lines()
+            .filter(|line| line.contains(&id))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// How many captured lines of `query_id` carry `needle`.
+    fn log_count(query_id: &TUniqueId, needle: &str) -> usize {
+        logs_of(query_id)
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// Whether some captured line of `query_id` carries every needle.
+    fn logged(query_id: &TUniqueId, needles: &[&str]) -> bool {
+        logs_of(query_id)
+            .iter()
+            .any(|line| needles.iter().all(|needle| line.contains(needle)))
+    }
+
+    /// The shape of every run as `(inputs, remote_inputs, outputs, stream_inputs)` counts: a
+    /// fused receiver runs with no exchange input at all, a parked one with one stream.
+    #[derive(Debug, Default)]
+    struct RecordingRunExecutor {
+        runs: Mutex<Vec<(usize, usize, usize, usize)>>,
+    }
+
+    impl RecordingRunExecutor {
+        fn runs(&self) -> Vec<(usize, usize, usize, usize)> {
+            self.runs.lock().unwrap().clone()
+        }
+    }
+
+    impl FragmentExecutor for RecordingRunExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            self.runs.lock().unwrap().push((
+                run.inputs.len(),
+                run.remote_inputs.len(),
+                run.outputs.len(),
+                run.plan.stream_inputs.len(),
+            ));
+            StubExecutor.run(run)
+        }
+    }
+
+    /// Fails every run, so a fused receiver's failure path can be watched.
+    #[derive(Debug)]
+    struct FailingExecutor;
+
+    impl FragmentExecutor for FailingExecutor {
+        fn run(&self, _run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            Err("fused receiver exploded on the GPU".to_string())
+        }
+    }
+
+    /// A leaf's run: parks one output, reads nothing. A receiver's over one parked stream:
+    /// reads one exchange input through one declared stream.
+    const LEAF_RUN: (usize, usize, usize, usize) = (0, 0, 1, 0);
+    const PARKED_RECEIVER_RUN: (usize, usize, usize, usize) = (1, 0, 0, 1);
+    /// A fused receiver's run (or a fused middle fragment's, which parks one output).
+    const FUSED_RESULT_RUN: (usize, usize, usize, usize) = (0, 0, 0, 0);
+    const FUSED_SENDER_RUN: (usize, usize, usize, usize) = (0, 0, 1, 0);
+
+    /// A result-sink receiver `[EXCHANGE(exchange, tuple 0)]` expecting `senders` senders.
+    fn result_receiver(
+        query_id: &TUniqueId,
+        instance_id: &TUniqueId,
+        exchange: i32,
+        senders: i32,
+    ) -> TExecPlanFragmentParams {
+        let mut receiver = fragment_params(Some(exchange_plan(exchange, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut exec = exec_params(query_id.clone(), instance_id.clone());
+        exec.per_exch_num_senders.insert(exchange, senders);
+        receiver.params = Some(exec);
+        receiver
+    }
+
+    /// A leaf `[FILE_SCAN(0, tuple 0)]` whose HASH_PARTITIONED sink's only destination is
+    /// exchange `dest_node_id` of `receiver_id` on this CN: the shape `leaf` mode fuses.
+    fn hash_leaf(
+        query_id: &TUniqueId,
+        instance_id: &TUniqueId,
+        sender_id: i32,
+        dest_node_id: i32,
+        receiver_id: TUniqueId,
+    ) -> TExecPlanFragmentParams {
+        let mut leaf = sender_only(query_id, instance_id, dest_node_id, receiver_id);
+        leaf.fragment.as_mut().unwrap().output_sink =
+            Some(hash_partitioned_data_stream_sink(dest_node_id, 1, 0));
+        leaf.params.as_mut().unwrap().sender_id = Some(sender_id);
+        leaf
+    }
+
+    /// The measured 1-CN shuffle pair over the users descriptor, for the fused-plan tests here
+    /// and the engine-linked one in `engine.rs`: query `(hi, 1)`, a result-sink receiver
+    /// `(hi, 2)` = `[EXCHANGE(7)]` expecting one sender, and a leaf `(hi, 3)` = `[FILE_SCAN(0)]`
+    /// reading the parquet file at `path` (`file_size` bytes) through a HASH_PARTITIONED sink
+    /// whose only destination is that receiver on this CN.
+    pub(crate) fn users_shuffle_pair(
+        hi: i64,
+        path: &str,
+        file_size: i64,
+    ) -> (TExecPlanFragmentParams, TExecPlanFragmentParams) {
+        let query_id = TUniqueId::new(hi, 1);
+        let receiver_id = TUniqueId::new(hi, 2);
+        let receiver = result_receiver(&query_id, &receiver_id, 7, 1);
+        let mut leaf = hash_leaf(&query_id, &TUniqueId::new(hi, 3), 0, 7, receiver_id);
+        leaf.params
+            .as_mut()
+            .unwrap()
+            .per_node_scan_ranges
+            .insert(0, vec![parquet_scan_range(path, file_size)]);
+        (receiver, leaf)
+    }
+
+    /// A join receiver over two exchanges on `tpch_desc_table()`:
+    /// `[HASH_JOIN(l_orderkey = o_orderkey), EXCHANGE(7, tuple 0), EXCHANGE(8, tuple 1)]`, the
+    /// shape whose one exchange can fuse while the other keeps its stream.
+    fn join_receiver_plan() -> TPlan {
+        let bigint = || scalar_type(TPrimitiveType::BIGINT);
+        let mut join = scan_node(2, 0);
+        join.node_type = TPlanNodeType::HASH_JOIN_NODE;
+        join.num_children = 2;
+        join.row_tuples = vec![0, 1];
+        join.file_scan_node = None;
+        join.hash_join_node = Some(THashJoinNode::new(
+            TJoinOp::INNER_JOIN,
+            vec![TEqJoinCondition::new(
+                slot_ref(1, 0, bigint()),
+                slot_ref(3, 1, bigint()),
+                Some(TExprOpcode::EQ),
+            )],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut plan = TPlan::new(vec![join]);
+        plan.nodes.extend(exchange_plan(7, 0).nodes);
+        plan.nodes.extend(exchange_plan(8, 1).nodes);
+        plan
+    }
+
+    /// A join receiver `(hi, 2)` of query `(hi, 1)` over exchanges 7 and 8, one sender each.
+    fn join_receiver(hi: i64) -> TExecPlanFragmentParams {
+        let mut receiver = fragment_params(Some(join_receiver_plan()), Some(tpch_desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut exec = exec_params(TUniqueId::new(hi, 1), TUniqueId::new(hi, 2));
+        exec.per_exch_num_senders.insert(7, 1);
+        exec.per_exch_num_senders.insert(8, 1);
+        receiver.params = Some(exec);
+        receiver
+    }
+
+    /// The broadcast leaf `(hi, 4)` of query `(hi, 1)` feeding exchange 8 of the join receiver:
+    /// `[FILE_SCAN(1, tuple 1)]` (orders) into an UNPARTITIONED sink, which `leaf` mode parks.
+    fn orders_broadcast_leaf(hi: i64) -> TExecPlanFragmentParams {
+        let mut leaf = sender_only(
+            &TUniqueId::new(hi, 1),
+            &TUniqueId::new(hi, 4),
+            8,
+            TUniqueId::new(hi, 2),
+        );
+        leaf.fragment.as_mut().unwrap().plan = Some(scan_plan(1, 1));
+        leaf.desc_tbl = Some(tpch_desc_table());
+        leaf
+    }
+
+    #[test]
+    fn hash_partitioned_single_destination_leaf_fuses_into_its_receiver() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(200, 1);
+        let receiver_id = TUniqueId::new(200, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(200, 3),
+                0,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        // One run, the receiver's, reading no exchange input: the leaf never ran on its own.
+        assert_eq!(executor.runs(), vec![FUSED_RESULT_RUN]);
+        let logs = logs_of(&query_id);
+        assert!(
+            logged(
+                &query_id,
+                &[
+                    "fused sender fragment into its local receiver",
+                    "exchange=7",
+                    "mode=Leaf"
+                ]
+            ),
+            "{logs:#?}"
+        );
+        assert!(
+            logged(
+                &query_id,
+                &["fused deferred sender plans into receiver", "fused=1"]
+            ),
+            "{logs:#?}"
+        );
+        assert_eq!(
+            log_count(&query_id, "fragment fusion skipped"),
+            0,
+            "{logs:#?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_leaf_still_parks_in_leaf_mode() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(201, 1);
+        let receiver_id = TUniqueId::new(201, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+        assert_exec_ok(
+            &service,
+            &sender_only(&query_id, &TUniqueId::new(201, 3), 7, receiver_id.clone()),
+        );
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![LEAF_RUN, PARKED_RECEIVER_RUN]);
+        let logs = logs_of(&query_id);
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment"),
+            0,
+            "{logs:#?}"
+        );
+        assert!(
+            logged(
+                &query_id,
+                &[
+                    "fragment fusion skipped",
+                    "leaf mode fuses HASH_PARTITIONED sinks only"
+                ]
+            ),
+            "{logs:#?}"
+        );
+    }
+
+    #[test]
+    fn broadcast_leaf_fuses_in_leaf_any_mode() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_fragment_fusion(FusionMode::LeafAny);
+        let query_id = TUniqueId::new(202, 1);
+        let receiver_id = TUniqueId::new(202, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+        assert_exec_ok(
+            &service,
+            &sender_only(&query_id, &TUniqueId::new(202, 3), 7, receiver_id.clone()),
+        );
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![FUSED_RESULT_RUN]);
+        assert!(
+            logged(
+                &query_id,
+                &[
+                    "fused sender fragment into its local receiver",
+                    "mode=LeafAny"
+                ]
+            ),
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    #[test]
+    fn fusion_off_restores_two_runs() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        service.set_fragment_fusion(FusionMode::Off);
+        let query_id = TUniqueId::new(203, 1);
+        let receiver_id = TUniqueId::new(203, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(203, 3),
+                0,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![LEAF_RUN, PARKED_RECEIVER_RUN]);
+        assert!(
+            logged(&query_id, &["fragment fusion skipped", "reason=off"]),
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    /// Fusion needs the receiver registered first (the FE deploys stage by stage from the root);
+    /// a leaf that races ahead takes today's path and the query still completes.
+    #[test]
+    fn leaf_arriving_before_its_receiver_falls_back_to_parking() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(204, 1);
+        let receiver_id = TUniqueId::new(204, 2);
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(204, 3),
+                0,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![LEAF_RUN, PARKED_RECEIVER_RUN]);
+        assert!(
+            logged(
+                &query_id,
+                &["fragment fusion skipped", "reason=NoPendingReceiver"]
+            ),
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    #[test]
+    fn receiver_expecting_two_senders_keeps_the_parked_path() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(205, 1);
+        let receiver_id = TUniqueId::new(205, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 2));
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(205, 3),
+                0,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(205, 4),
+                1,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(
+            executor.runs(),
+            vec![LEAF_RUN, LEAF_RUN, PARKED_RECEIVER_RUN]
+        );
+        assert_eq!(
+            log_count(&query_id, "reason=ReceiverExpectsMany(2)"),
+            2,
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    /// One exchange of a join receiver absorbs its hash-partitioned leaf while the other keeps
+    /// streaming its broadcast leaf's parked rows.
+    #[test]
+    fn partial_fusion_keeps_the_other_exchange_as_a_stream() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(206, 1);
+        let receiver_id = TUniqueId::new(206, 2);
+        assert_exec_ok(&service, &join_receiver(206));
+        let mut lineitem = hash_leaf(
+            &query_id,
+            &TUniqueId::new(206, 3),
+            0,
+            7,
+            receiver_id.clone(),
+        );
+        lineitem.desc_tbl = Some(tpch_desc_table());
+        assert_exec_ok(&service, &lineitem);
+        assert!(
+            executor.runs().is_empty(),
+            "the deferred leaf did not run and the receiver still waits for exchange 8"
+        );
+        assert_exec_ok(&service, &orders_broadcast_leaf(206));
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![LEAF_RUN, PARKED_RECEIVER_RUN]);
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment into its local receiver"),
+            1,
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    /// The root <- middle <- leaf chain with cached descriptor references: the leaf fuses into
+    /// the middle (whose registered params carry the resolved descriptor table), the middle is a
+    /// sender with an exchange of its own and so parks as today, and the root streams it.
+    #[test]
+    fn middle_fragment_is_not_deferred_in_leaf_mode() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(207, 1);
+        let root_id = TUniqueId::new(207, 2);
+        let middle_id = TUniqueId::new(207, 3);
+        assert_exec_ok(&service, &result_receiver(&query_id, &root_id, 9, 1));
+
+        let cached_desc = TDescriptorTable::new(None, Vec::new(), None, Some(true));
+        let mut middle = fragment_params(Some(exchange_plan(7, 0)), Some(cached_desc.clone()));
+        middle.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(9));
+        let mut middle_exec = exec_params(query_id.clone(), middle_id.clone());
+        middle_exec.per_exch_num_senders.insert(7, 1);
+        middle_exec.sender_id = Some(0);
+        middle_exec.destinations = Some(vec![local_destination(root_id.clone())]);
+        middle.params = Some(middle_exec);
+        assert_exec_ok(&service, &middle);
+
+        let mut leaf = hash_leaf(&query_id, &TUniqueId::new(207, 4), 0, 7, middle_id);
+        leaf.desc_tbl = Some(cached_desc);
+        assert_exec_ok(&service, &leaf);
+
+        fetch_rows_eventually(&service, root_id.hi, root_id.lo);
+        assert_eq!(executor.runs(), vec![FUSED_SENDER_RUN, PARKED_RECEIVER_RUN]);
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment into its local receiver"),
+            1,
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    #[test]
+    fn fusion_applies_on_the_batch_path() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(209, 1);
+        let receiver_id = TUniqueId::new(209, 2);
+        let mut receiver = result_receiver(&query_id, &receiver_id, 7, 1);
+        receiver.desc_tbl = None;
+        let mut leaf = hash_leaf(
+            &query_id,
+            &TUniqueId::new(209, 3),
+            0,
+            7,
+            receiver_id.clone(),
+        );
+        leaf.desc_tbl = None;
+        let batch = TExecBatchPlanFragmentsParams::new(
+            Some(fragment_params(None, Some(desc_table()))),
+            Some(vec![receiver, leaf]),
+        );
+        let response = route(
+            &service,
+            methods::EXEC_BATCH_PLAN_FRAGMENTS,
+            PExecBatchPlanFragmentsRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&batch),
+        );
+        let result = PExecBatchPlanFragmentsResult::decode(response.body.as_slice()).unwrap();
+        let status = result.status.expect("status is always set");
+        assert_eq!(status.status_code, TStatusCode::OK.0, "{status:?}");
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(executor.runs(), vec![FUSED_RESULT_RUN]);
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment into its local receiver"),
+            1,
+            "{:#?}",
+            logs_of(&query_id)
+        );
+    }
+
+    /// A hash-partitioned leaf with a remote destination behaves exactly as before fusion:
+    /// refused before any run without a transport, run and handed to the transport with one.
+    #[test]
+    fn remote_single_destination_is_never_fused() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(210, 1);
+        let receiver_id = TUniqueId::new(210, 2);
+        let mut leaf = hash_leaf(
+            &query_id,
+            &TUniqueId::new(210, 3),
+            0,
+            7,
+            receiver_id.clone(),
+        );
+        leaf.params.as_mut().unwrap().destinations =
+            Some(vec![remote_destination(receiver_id.clone(), 8061)]);
+
+        let status = exec_status(&service, &leaf);
+        assert_eq!(
+            status.status_code,
+            TStatusCode::INTERNAL_ERROR.0,
+            "{status:?}"
+        );
+        assert!(
+            status.error_msgs[0]
+                .contains("cross-node exchange to 127.0.0.1:8061 needs the nixl transport tier"),
+            "{:?}",
+            status.error_msgs
+        );
+        assert!(executor.runs().is_empty());
+        assert!(
+            logged(
+                &query_id,
+                &["fragment fusion skipped", "reason=remote destination"]
+            ),
+            "{:#?}",
+            logs_of(&query_id)
+        );
+
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let fake_transport = std::thread::spawn(move || {
+            match requests_rx
+                .recv()
+                .expect("the sender flow sends one request")
+            {
+                crate::nixl_transport::TransportRequest::SendFragment { spec, respond } => {
+                    respond.send(Ok(())).unwrap();
+                    spec
+                }
+                crate::nixl_transport::TransportRequest::ExchangeMd { .. }
+                | crate::nixl_transport::TransportRequest::WarmSession { .. } => {
+                    panic!("the sender flow never exchanges metadata itself")
+                }
+            }
+        });
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_transport(
+            executor.clone(),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+        assert_exec_ok(&service, &leaf);
+        assert_eq!(executor.runs(), vec![LEAF_RUN]);
+        let spec = fake_transport.join().unwrap();
+        assert_eq!(spec.brpc_port, 8061);
+        assert_eq!(spec.slot.node_id, 7);
+        assert_eq!(
+            spec.slot.fragment_instance_id,
+            FragmentInstanceId::from(&receiver_id)
+        );
+    }
+
+    /// A fused receiver fails under the receiver's ids like any receiver: the FE's poll on the
+    /// result id reports the cause.
+    #[test]
+    fn fused_receiver_failure_fails_the_fe_polled_result() {
+        let service =
+            SiriusComputeNodeService::with_executor(Arc::new(FailingExecutor), test_identity());
+        let query_id = TUniqueId::new(211, 1);
+        let receiver_id = TUniqueId::new(211, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &receiver_id, 7, 1));
+        assert_exec_ok(
+            &service,
+            &hash_leaf(
+                &query_id,
+                &TUniqueId::new(211, 3),
+                0,
+                7,
+                receiver_id.clone(),
+            ),
+        );
+
+        let result = fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            result.status.error_msgs[0].contains("fused receiver exploded on the GPU"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        assert_eq!(result.eos, Some(true));
+        assert!(
+            service
+                .core
+                .results
+                .failure_of(FragmentInstanceId::from(&query_id))
+                .is_some(),
+            "the failure is recorded at query level"
+        );
+    }
+
+    /// The receiver's ready-time dump is the fused params (the plan the engine runs), not the
+    /// registered ones: no exchange 7, the leaf's scan and its scan range inline.
+    #[test]
+    fn fused_receiver_dump_is_the_fused_plan() {
+        // Serializes the tests that mutate the process environment (`tunable.rs` pattern); this
+        // is the only test that touches `SIRIUS_CN_DUMP_FRAGMENTS`.
+        static DUMP_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _env = DUMP_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: DUMP_ENV_LOCK is held, so no other test sets or removes this variable.
+        unsafe { std::env::set_var("SIRIUS_CN_DUMP_FRAGMENTS", dir.path()) };
+
+        let (receiver, leaf) = users_shuffle_pair(212, "file:///data/users.parquet", 1024);
+        // The CN registers what it deserialized from the RPC attachment, and the thrift round
+        // trip normalizes an absent optional list (`destinations: None` arrives as `Some([])`),
+        // so the expectation is the splice of the wire forms.
+        let wire = |params: &TExecPlanFragmentParams| {
+            SiriusComputeNodeService::deserialize_binary::<TExecPlanFragmentParams>(
+                &serialize_binary(params),
+            )
+            .unwrap()
+        };
+        let expected =
+            fusion::splice(wire(&receiver), 7, &wire(&leaf)).expect("the pair is fusable");
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        assert_exec_ok(&service, &receiver);
+        assert_exec_ok(&service, &leaf);
+        fetch_rows_eventually(&service, 212, 2);
+        // SAFETY: DUMP_ENV_LOCK is still held.
+        unsafe { std::env::remove_var("SIRIUS_CN_DUMP_FRAGMENTS") };
+        let query_id = TUniqueId::new(212, 1);
+        assert_eq!(
+            executor.runs(),
+            vec![FUSED_RESULT_RUN],
+            "{:#?}",
+            logs_of(&query_id)
+        );
+
+        // Other tests may dump into the same directory while the variable is set; the fused
+        // receiver's dump is the one that equals the spliced params exactly.
+        let dumps: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("fragment-"))
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        let expected_text = format!("{expected:#?}");
+        assert!(
+            dumps.contains(&expected_text),
+            "none of the {} fragment dump(s) is the fused params; {:#?}",
+            dumps.len(),
+            logs_of(&query_id)
+        );
+        // What that dump says in plan terms.
+        let nodes = &expected
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes;
+        assert!(
+            nodes
+                .iter()
+                .all(|node| node.node_type != TPlanNodeType::EXCHANGE_NODE)
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.node_type == TPlanNodeType::FILE_SCAN_NODE && node.node_id == 0)
+        );
+        let exec = expected.params.as_ref().unwrap();
+        assert!(exec.per_exch_num_senders.is_empty());
+        assert!(exec.per_node_scan_ranges.contains_key(&0));
+        assert_eq!(exec.fragment_instance_id, TUniqueId::new(212, 2));
+    }
+
+    /// Cancellation is `cancel_plan_fragment`'s teardown: the deferred plan leaves the rendezvous with the
+    /// cancelled receiver, the receiver is retired, and a late leaf of the query is refused on
+    /// arrival; nothing of the query ever ran.
+    #[test]
+    fn cancel_drops_deferred_plans() {
+        capture_logs();
+        let executor = Arc::new(Retiring::new(RecordingRunExecutor::default()));
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(213, 1);
+        let receiver_id = TUniqueId::new(213, 2);
+        assert_exec_ok(&service, &join_receiver(213));
+        let mut lineitem = hash_leaf(
+            &query_id,
+            &TUniqueId::new(213, 3),
+            0,
+            7,
+            receiver_id.clone(),
+        );
+        lineitem.desc_tbl = Some(tpch_desc_table());
+        assert_exec_ok(&service, &lineitem);
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment into its local receiver"),
+            1,
+            "{:#?}",
+            logs_of(&query_id)
+        );
+        assert!(executor.inner.runs().is_empty());
+
+        cancel_ok(
+            &service,
+            cancel_request(
+                &receiver_id,
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                Some("peer failed"),
+            ),
+        );
+        assert!(
+            logged(
+                &query_id,
+                &["cancel_plan_fragment retired the query on this CN"]
+            ),
+            "{:#?}",
+            logs_of(&query_id)
+        );
+        let receiver = FragmentInstanceId::from(&receiver_id);
+        assert!(service.core.exchanges.is_retired(receiver));
+        // The deferred plan left with the receiver: a second leaf 7 finds nothing pending.
+        let offer = service
+            .core
+            .exchanges
+            .offer_local_plan(
+                ExchangeKey {
+                    fragment_instance_id: receiver,
+                    node_id: 7,
+                },
+                0,
+                LocalPlan {
+                    params: lineitem.clone(),
+                    inputs: Vec::new(),
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let FuseOffer::Declined { skip, .. } = offer else {
+            panic!("a retired receiver must not accept a plan");
+        };
+        assert!(matches!(skip, FuseSkip::NoPendingReceiver), "{skip}");
+
+        // A late leaf 8 is refused by gate 4 on arrival.
+        let status = exec_status(&service, &orders_broadcast_leaf(213));
+        assert_eq!(
+            status.status_code,
+            TStatusCode::INTERNAL_ERROR.0,
+            "{status:?}"
+        );
+        assert!(
+            status.error_msgs[0].contains("already failed on this CN"),
+            "{:?}",
+            status.error_msgs
+        );
+        assert!(executor.inner.runs().is_empty(), "nothing of the query ran");
+        let result = fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(
+            result.status.error_msgs[0].contains("cancelled by the FE"),
+            "{:?}",
+            result.status.error_msgs
+        );
+        // The cancel retired the query; the refused late leaf's RPC error is recorded at query
+        // level too (an idempotent second retire), as for any inline failure.
+        let retired = executor.retired();
+        assert_eq!(
+            retired[0].1,
+            RetireTrigger::Cancel("INTERNAL_ERROR".to_string()),
+            "{retired:?}"
+        );
+        assert!(
+            retired
+                .iter()
+                .all(|(query, ..)| *query == FragmentInstanceId::from(&query_id)),
+            "{retired:?}"
+        );
+    }
+
     /// A `cancel_plan_fragment` request body as the FE builds it.
     fn cancel_request(
         instance: &TUniqueId,
@@ -4150,6 +5300,142 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// The 1-CN shuffle shape: a HASH_PARTITIONED stream sink into `dest_node_id` whose one
+    /// partition expression is a bare reference to slot `slot_id` of tuple `tuple_id`. When such
+    /// a leaf does run (fusion off, or declined) the translator resolves that slot as the
+    /// partition key, so the reference must be a real one.
+    fn hash_partitioned_data_stream_sink(
+        dest_node_id: i32,
+        slot_id: i32,
+        tuple_id: i32,
+    ) -> TDataSink {
+        let mut sink = data_stream_sink(dest_node_id);
+        sink.stream_sink.as_mut().unwrap().output_partition = TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(vec![slot_ref(
+                slot_id,
+                tuple_id,
+                scalar_type(TPrimitiveType::BIGINT),
+            )]),
+            None,
+            None,
+        );
+        sink
+    }
+
+    /// A bare slot reference (one expression node), the shape the FE ships for partition keys
+    /// and join equalities.
+    fn slot_ref(slot_id: i32, tuple_id: i32, ty: TTypeDesc) -> TExpr {
+        TExpr::new(vec![TExprNode {
+            node_type: TExprNodeType::SLOT_REF,
+            type_: ty,
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: Some(TSlotRef::new(slot_id, tuple_id)),
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: -1,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+            cast_struct_by_name: None,
+        }])
+    }
+
+    /// A whole-file `FILES()` parquet range for `path` (`file_size` bytes) in the one shape the
+    /// translator accepts: a broker file descriptor read with direct (non-broker) access.
+    fn parquet_scan_range(path: &str, file_size: i64) -> TScanRangeParams {
+        let range = TBrokerRangeDesc::new(
+            TFileType::FILE_BROKER,
+            TFileFormatType::FORMAT_PARQUET,
+            false,
+            path.to_string(),
+            0,
+            -1,
+            None,
+            Some(file_size),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut params = TBrokerScanRangeParams::new(
+            b'\t' as i8,
+            b'\n' as i8,
+            0,
+            Vec::new(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        params.file_scan_type = Some(TFileScanType::FILES_QUERY);
+        params.use_broker = Some(false);
+        let broker = TBrokerScanRange::new(vec![range], params, Vec::new(), None, None, None, None);
+        TScanRangeParams::new(
+            TScanRange::new(None, None, Some(broker), None, None, None),
             None,
             None,
             None,

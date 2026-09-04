@@ -1314,6 +1314,88 @@ mod tests {
         assert_eq!(id_col.value(0), 1);
     }
 
+    /// Fusion on a real engine: the users fixture read once as the sender + receiver pair the CN
+    /// runs today (the leaf parks, the receiver relays stream 7) and once as the fused fragment
+    /// `fold_deferred_plans` hands the translator instead (the leaf's scan spliced over the
+    /// receiver's exchange, translated with no stream input) returns the same rows. Pins "fused
+    /// plan == single-fragment plan" on the GPU without touching engine code.
+    #[test]
+    fn engine_executes_a_fused_leaf_like_the_sender_receiver_pair() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let path_str = path.to_str().unwrap();
+        let engine = SiriusEngine::start(test_settings()).expect("bring up sirius engine");
+
+        // The pair: the leaf parks under stream 7 of receiver (300, 2), which reads it back.
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(300, 2),
+            node_id: 7,
+            sender_id: 0,
+        };
+        park(
+            &engine,
+            &local_files_plan(path_str, vec!["id".to_string(), "name".to_string()]),
+            slot,
+            labelled(300, 3),
+        );
+        let paired = users_rows(
+            receive(&engine, slot, labelled(300, 2))
+                .expect("receive the parked rows")
+                .expect("a result fragment returns rows"),
+        );
+
+        // The fused fragment: what the CN translates once the leaf's plan was deferred.
+        let file_size = std::fs::metadata(&path).unwrap().len() as i64;
+        let (receiver, leaf) =
+            crate::compute_node_service::tests::users_shuffle_pair(300, path_str, file_size);
+        let fused = starrocks_plan_translator::fusion::splice(receiver, 7, &leaf)
+            .expect("the pair is fusable");
+        let translated = starrocks_plan_translator::PlanTranslator::new()
+            .translate_fragment(&fused)
+            .expect("the fused plan translates");
+        assert!(
+            translated.stream_inputs.is_empty(),
+            "a fused leaf leaves no stream to declare"
+        );
+        let fused_rows = users_rows(run_result(&engine, &translated));
+
+        assert_eq!(fused_rows, paired);
+        assert_eq!(
+            fused_rows,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string())
+            ]
+        );
+    }
+
+    /// The `(id, name)` rows of a users-fixture result, sorted by id.
+    fn users_rows(result: FragmentResult) -> Vec<(i64, String)> {
+        let mut rows = Vec::new();
+        for batch in &result.batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("the id column is int64");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("the name column is utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), names.value(row).to_string()));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
     /// A run labelled with query `hi` and instance `(hi, instance)`.
     fn labelled(hi: i64, instance: i64) -> FragmentLabel {
         FragmentLabel {

@@ -1,8 +1,9 @@
-//! One registry for the CN's data-transport tunables.
+//! One registry for the CN's data-transport and dispatch tunables.
 //!
 //! Every knob the exchange path has is declared here with its environment name, its default,
-//! and its valid range, and the whole set is resolved ONCE at bring-up ([`Tunables::resolve`])
-//! so a bad value fails the CN before it accepts a query rather than mid-sweep.
+//! and its valid range (or accepted set, for [`FusionMode`]), and the whole set is resolved ONCE
+//! at bring-up ([`Tunables::resolve`]) so a bad value fails the CN before it accepts a query
+//! rather than mid-sweep.
 //!
 //! Three rules, each of which the previous ad-hoc parsing broke somewhere:
 //!
@@ -276,6 +277,72 @@ fn env_value(name: &str) -> Option<String> {
     }
 }
 
+/// Which same-node senders are fused into their receiver's plan instead of running and parking
+/// their rows (`compute_node_service.rs`, `try_defer_sender`).
+///
+/// Not a [`Knob`]: the value is a word, not a number in a range, so it has its own reader with
+/// the same three rules (reject, log, unset means the default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum FusionMode {
+    /// Every sender runs and parks (the behaviour before fusion existed).
+    Off = 0,
+    /// Leaf senders (no exchange input) with a `HASH_PARTITIONED` single local destination whose
+    /// receiving exchange is plain and not under an aggregation. The shipped default: the
+    /// shuffle shape that parks a fact table whole at 1 CN, and nothing else.
+    Leaf = 1,
+    /// Every single-local-destination leaf, any partition type. Removes the broadcast parking of
+    /// dimension tables at the price of estimated instead of exact cardinalities for them.
+    LeafAny = 2,
+}
+
+/// Environment name of the fusion mode.
+const FUSION_MODE_NAME: &str = "SIRIUS_CN_FRAGMENT_FUSION";
+
+impl FusionMode {
+    /// The mode when the variable is unset.
+    pub(crate) const DEFAULT: Self = Self::Leaf;
+
+    /// The accepted spellings, for the rejection message.
+    const ACCEPTED: &'static str = "off, leaf, leaf-any";
+
+    /// The configured mode, or the default when unset. Trimmed and case-insensitive; `off`, `0`
+    /// and `false` all turn fusion off.
+    ///
+    /// # Errors
+    /// Any other value, naming the variable, the value and the accepted set.
+    fn read() -> Result<Self, String> {
+        let Some(raw) = env_value(FUSION_MODE_NAME) else {
+            return Ok(Self::DEFAULT);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" => Ok(Self::Off),
+            "leaf" => Ok(Self::Leaf),
+            "leaf-any" => Ok(Self::LeafAny),
+            _ => Err(format!(
+                "{FUSION_MODE_NAME}: expected one of {}, got \"{raw}\" (unset means the default, \
+                 leaf)",
+                Self::ACCEPTED
+            )),
+        }
+    }
+
+    /// The mode as the byte an `AtomicU8` holds; [`from_code`](Self::from_code) inverts it.
+    pub(crate) const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`code`](Self::code); `None` for a byte no mode produces.
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Off),
+            1 => Some(Self::Leaf),
+            2 => Some(Self::LeafAny),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved transport tunables. Clone so call sites can hold one cheaply: the peer list is
 /// the one heap field, and it is `None` in every configuration but an explicit
 /// `SIRIUS_CN_NIXL_WARMUP_PEERS`.
@@ -301,10 +368,13 @@ pub struct Tunables {
     pub warmup: bool,
     /// See [`WARMUP_PEERS`]; `None` means discover the peers from the FE.
     pub warmup_peers: Option<Vec<(String, u16)>>,
+    /// See [`FusionMode`].
+    pub(crate) fusion_mode: FusionMode,
 }
 
 impl Tunables {
-    /// Exactly the values these knobs had as hardcoded constants.
+    /// Exactly the values these knobs had as hardcoded constants (and, for the fusion mode, the
+    /// shipped default).
     const DEFAULTS: Self = Self {
         rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.default),
         xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.default),
@@ -314,6 +384,7 @@ impl Tunables {
         warmup_expect_peers: None,
         warmup: WARMUP.default,
         warmup_peers: None,
+        fusion_mode: FusionMode::DEFAULT,
     };
 
     /// Reads and validates every knob without touching the global.
@@ -337,6 +408,7 @@ impl Tunables {
             },
             warmup: WARMUP.read()?,
             warmup_peers: WARMUP_PEERS.read()?,
+            fusion_mode: FusionMode::read()?,
         })
     }
 
@@ -373,6 +445,7 @@ impl Tunables {
             warmup_expect_peers = published.warmup_expect_peers,
             warmup = published.warmup,
             warmup_peers = ?published.warmup_peers,
+            fusion_mode = ?published.fusion_mode,
             "resolved CN transport tunables"
         );
         Ok(published)
@@ -443,6 +516,7 @@ mod tests {
                 (WARMUP_EXPECT_PEERS.name, None),
                 (WARMUP.name, None),
                 (WARMUP_PEERS.name, None),
+                (FUSION_MODE_NAME, None),
             ],
             Tunables::from_env,
         )
@@ -457,6 +531,59 @@ mod tests {
         assert_eq!(resolved.warmup_expect_peers, None);
         assert!(resolved.warmup);
         assert_eq!(resolved.warmup_peers, None);
+        assert_eq!(resolved.fusion_mode, FusionMode::Leaf);
+    }
+
+    /// The fusion knob: unset is `leaf`; the off spellings, case and whitespace are tolerated;
+    /// anything else fails the whole resolution naming the variable, the value and the accepted
+    /// set (so `all`, a future value for middle fragments, is a bring-up error today, not a silent `leaf`).
+    #[test]
+    fn fusion_mode_parses_off_leaf_leaf_any_and_rejects_others() {
+        assert_eq!(
+            with_env(&[(FUSION_MODE_NAME, None)], FusionMode::read),
+            Ok(FusionMode::Leaf)
+        );
+        for off in ["off", "0", "false", " OFF "] {
+            assert_eq!(
+                with_env(&[(FUSION_MODE_NAME, Some(off))], FusionMode::read),
+                Ok(FusionMode::Off),
+                "{off:?}"
+            );
+        }
+        assert_eq!(
+            with_env(&[(FUSION_MODE_NAME, Some("LEAF"))], FusionMode::read),
+            Ok(FusionMode::Leaf)
+        );
+        assert_eq!(
+            with_env(&[(FUSION_MODE_NAME, Some("leaf-any"))], FusionMode::read),
+            Ok(FusionMode::LeafAny)
+        );
+        for bad in ["all", "on"] {
+            let error = with_env(&[(FUSION_MODE_NAME, Some(bad))], FusionMode::read)
+                .expect_err("not an accepted mode");
+            assert!(
+                error.contains(FUSION_MODE_NAME)
+                    && error.contains(bad)
+                    && error.contains("off, leaf, leaf-any"),
+                "{error}"
+            );
+        }
+
+        let resolved = with_env(&[(FUSION_MODE_NAME, Some("leaf-any"))], Tunables::from_env)
+            .expect("leaf-any resolves");
+        assert_eq!(resolved.fusion_mode, FusionMode::LeafAny);
+        let error = with_env(&[(FUSION_MODE_NAME, Some("all"))], Tunables::from_env)
+            .expect_err("a bad mode fails the whole resolution");
+        assert!(error.contains(FUSION_MODE_NAME), "{error}");
+    }
+
+    /// The byte an `AtomicU8` holds round-trips; a byte no mode produces decodes to nothing.
+    #[test]
+    fn fusion_mode_codes_round_trip() {
+        for mode in [FusionMode::Off, FusionMode::Leaf, FusionMode::LeafAny] {
+            assert_eq!(FusionMode::from_code(mode.code()), Some(mode));
+        }
+        assert_eq!(FusionMode::from_code(3), None);
     }
 
     #[test]
