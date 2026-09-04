@@ -16,12 +16,14 @@
 
 #pragma once
 
+#include "exec/cpu_affinity.hpp"
+#include "exec/thread_pool_startup.hpp"
 #include "log/logging.hpp"
 
 #include <absl/functional/any_invocable.h>
 
 #include <condition_variable>
-#include <latch>
+#include <exception>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -96,37 +98,20 @@ class bounded_thread_pool {
                                absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
     : capacity_(capacity)
   {
+    validated_cpu_affinity const affinity(cpu_ids);
     threads_.reserve(capacity);
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    for (int id : cpu_ids) {
-      CPU_SET(id, &cpuset);
-    }
-
-    std::unique_ptr<std::latch> init_latch;
-    if (per_thread_init) { init_latch = std::make_unique<std::latch>(capacity); }
-
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
-    auto* latch_ptr   = init_latch.get();
-
-    for (int i = 0; i < capacity; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-        if (init_fn_ptr) {
-          (*init_fn_ptr)();
-          latch_ptr->count_down();
-        }
-        work_loop();
-      });
-      if (!name.empty()) {
-        pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
-      }
-      if (!cpu_ids.empty()) {
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
-      }
-    }
-
-    if (init_latch) { init_latch->wait(); }
+    detail::start_thread_pool_workers(
+      threads_,
+      capacity,
+      name,
+      [affinity, init_fn_ptr] {
+        affinity.apply_to_current_thread();
+        if (init_fn_ptr) { (*init_fn_ptr)(); }
+      },
+      [this] { work_loop(); },
+      [this] { request_stop(); });
   }
 
   ~bounded_thread_pool() { stop(); }
@@ -183,14 +168,7 @@ class bounded_thread_pool {
    */
   void stop() noexcept
   {
-    {
-      std::lock_guard lock(mu_);
-      if (stop_requested_) { return; }
-      stop_requested_ = true;
-      interrupted_    = true;
-      cv_capacity_.notify_all();
-      cv_work_.notify_all();
-    }
+    request_stop();
     for (auto& t : threads_) {
       if (t.joinable()) { t.join(); }
     }
@@ -225,6 +203,16 @@ class bounded_thread_pool {
   }
 
  private:
+  void request_stop() noexcept
+  {
+    std::lock_guard lock(mu_);
+    if (stop_requested_) { return; }
+    stop_requested_ = true;
+    interrupted_    = true;
+    cv_capacity_.notify_all();
+    cv_work_.notify_all();
+  }
+
   // Called exclusively by the slot destructor — covers both the drop-without-dispatch
   // and post-task-completion cases.
   void release_slot()

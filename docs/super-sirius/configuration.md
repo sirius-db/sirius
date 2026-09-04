@@ -272,6 +272,13 @@ hardware-derived exception described below:
 | `num_threads` | int (**> 0**) | per pool (below) | Worker threads in the pool. |
 | `cpu_affinity` | list of int | — | Cores to pin task-creator and downgrade threads. GPU pipeline affinity is derived from the selected GPU's CPU topology. |
 
+For the task-creator, downgrade, and scan-manager pools, `cpu_affinity` is one shared eligibility
+mask applied to every worker; entries are Linux logical CPU IDs, not a one-core-per-worker
+assignment. The list must be a subset of the process's currently allowed CPUs, including
+cgroup/cpuset restrictions. An omitted or empty list inherits the process mask. Sirius rejects
+invalid, unavailable, or unapplied masks rather than silently running with a different affinity.
+GPU pipeline affinity is replaced at execution with the selected GPU's topology-derived CPU mask.
+
 ### `sirius.executor.task_creator`
 
 Thread pool (default `num_threads: 1`). Task creation

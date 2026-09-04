@@ -293,17 +293,31 @@ void task_creator::start_thread_pool()
   // a paired reactivate() here, subsequent schedule() pushes silently no-op
   // and the next query's manager_loop sees an empty/inactive queue forever.
   _task_creation_queue.reactivate();
-  _bounded_pool =
-    std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
-                                                _config.thread_pool.thread_name_prefix,
-                                                _config.thread_pool.cpu_affinity_list);
-  _manager_thread = std::thread(&task_creator::manager_loop, this);
+  try {
+    _bounded_pool =
+      std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
+                                                  _config.thread_pool.thread_name_prefix,
+                                                  _config.thread_pool.cpu_affinity_list);
+    _manager_thread = std::thread(&task_creator::manager_loop, this);
+  } catch (...) {
+    _running = false;
+    if (_bounded_pool) { _bounded_pool->interrupt(); }
+    _task_creation_queue.interrupt();
+    if (_manager_thread.joinable()) { _manager_thread.join(); }
+    if (_bounded_pool) {
+      _bounded_pool->wait_all();
+      _bounded_pool->stop();
+      _bounded_pool.reset();
+    }
+    throw;
+  }
 }
 
 void task_creator::do_stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  if (!_bounded_pool) { return; }
   _bounded_pool->interrupt();
   _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
