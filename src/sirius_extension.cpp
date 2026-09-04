@@ -3231,11 +3231,17 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     Value::UBIGINT(operator_defaults.concat_batch_bytes),
                     SetConcatBatchBytes);
 
-  // Add in config options for special JIT implementation for regex
+#ifdef SIRIUS_ENABLE_LEGACY
+  constexpr auto regex_jit_visibility = option_visibility::user;
+#else
+  constexpr auto regex_jit_visibility = option_visibility::internal;
+#endif
+  // The legacy executor retains this compatibility setting. Super Sirius keeps it available only
+  // to the explicitly opted-in differential tests that compare both implementations.
   add_sirius_option(config,
-                    option_visibility::user,
+                    regex_jit_visibility,
                     "enable_regex_jit_impl",
-                    "Whether to use special JIT implementation for particular regex evaluation",
+                    "select the specialized implementation for supported regex evaluation",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL),
                     SetEnableRegexJitImpl);
