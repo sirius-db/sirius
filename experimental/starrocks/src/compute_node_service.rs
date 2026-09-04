@@ -1542,8 +1542,8 @@ impl ServiceCore {
     /// Splices every deferred sender plan into the receiver's params.
     ///
     /// A splice refusal here is a bug -- the same checks passed at defer time on the same two
-    /// params -- and fails the receiver; the staged leases of the other inputs go back to the
-    /// arena first, as on every pre-run error path.
+    /// params -- and fails the receiver; the staged leases of every input, the refused one
+    /// included, go back to the arena first, as on every pre-run error path.
     fn fold_deferred_plans(
         &self,
         ready: ReadyFragment,
@@ -1586,7 +1586,7 @@ impl ServiceCore {
         streamed: &mut Vec<ReadyExchangeInput>,
         fused: &mut Vec<FragmentInstanceId>,
     ) -> std::result::Result<TExecPlanFragmentParams, String> {
-        while let Some(input) = worklist.pop() {
+        while let Some(mut input) = worklist.pop() {
             let deferred = input
                 .sources
                 .iter()
@@ -1598,24 +1598,38 @@ impl ServiceCore {
             }
             let node_id = input.node_id;
             let total = input.sources.len();
-            let plan = match input.sources.into_iter().next() {
+            let plan = match input.sources.pop() {
                 Some(SenderSource::LocalPlan(plan)) if total == 1 => *plan,
-                _ => {
+                popped => {
+                    // Cannot happen (`offer_local_plan` admits a plan only as an exchange's
+                    // first and only source). The input goes back whole so the caller's
+                    // release still sees any staged batch it carries.
+                    input.sources.extend(popped);
+                    streamed.push(input);
                     return Err(format!(
                         "exchange node {node_id} has {deferred} deferred sender plan(s) among \
                          {total} source(s); a deferred plan must be an exchange's only source"
                     ));
                 }
             };
-            params = fusion::splice(params, node_id, &plan.params).map_err(|refusal| {
-                format!(
-                    "fragment fusion: splicing deferred {} into {receiver} at exchange {node_id} \
-                     failed after passing the defer-time checks: {refusal}",
-                    Self::fragment_context(&plan.params)
-                )
-            })?;
-            fused.extend(Self::fragment_instance_id(&plan.params));
-            worklist.extend(plan.inputs);
+            let LocalPlan {
+                params: sender,
+                inputs,
+            } = plan;
+            params = match fusion::splice(params, node_id, &sender) {
+                Ok(spliced) => spliced,
+                Err(refusal) => {
+                    // The plan's own inputs (empty while only leaves defer) stay releasable.
+                    worklist.extend(inputs);
+                    return Err(format!(
+                        "fragment fusion: splicing deferred {} into {receiver} at exchange \
+                         {node_id} failed after passing the defer-time checks: {refusal}",
+                        Self::fragment_context(&sender)
+                    ));
+                }
+            };
+            fused.extend(Self::fragment_instance_id(&sender));
+            worklist.extend(inputs);
         }
         Ok(params)
     }
