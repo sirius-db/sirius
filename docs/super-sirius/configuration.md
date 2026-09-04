@@ -597,10 +597,7 @@ SET enable_compressed_materialization = false;
 |----------|---------|-------------|
 | `max_sort_partition_bytes` | 0 (auto) | Max sort partition bytes |
 | `max_sort_partition_memory_fraction` | 0.33 | Auto sort-partition fraction when `max_sort_partition_bytes` is 0 |
-| `hash_partition_bytes` | Shared physical/effective GPU batch default | Hash partition target size; must be greater than zero |
 | `sort_sample_bytes` | Shared physical/effective GPU batch default | Bytes sampled before computing sort boundaries |
-| `max_build_hash_table_bytes` | 2× batch default | Max build-side hash table bytes |
-| `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
 
@@ -632,6 +629,19 @@ is YAML-only — it is read once when the GPU memory spaces are configured.
 ```sql
 SET admission_bytes_per_gpu = 34359738368;  -- 32 GiB
 ```
+
+The BUILD_PROBE admission threshold is derived as twice the effective-capacity
+batch default. Advanced diagnostic and benchmark envelopes may still override
+`max_build_hash_table_bytes` in YAML under `sirius.operator_params`, but it is
+not a normal session setting.
+
+Hash partition sizing uses the shared physical/effective GPU batch default.
+Its YAML operator parameter remains an expert benchmark envelope; the direct
+DuckDB session override is test-only.
+
+The multi-GPU broadcast-join size threshold defaults to 256 MiB. Its YAML
+operator parameter remains an expert multi-GPU calibration envelope; the
+direct DuckDB session override is test-only.
 
 ### Dynamic Filters
 
