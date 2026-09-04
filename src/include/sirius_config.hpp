@@ -308,6 +308,11 @@ struct sirius_config {
   /// the override takes effect. Called from the end of @ref load_from_file.
   void enforce_sirius_datasource_for_multi_gpu();
 
+  /// Reject the prefetch cache when more than one GPU memory space is configured.
+  /// The cache's current read path is only correct for single-GPU execution.
+  /// Called from the end of @ref load_from_file after memory spaces are resolved.
+  void validate_prefetch_cache_for_gpu_count() const;
+
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   int _gpus_per_query = 0;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
