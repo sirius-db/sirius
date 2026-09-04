@@ -460,11 +460,12 @@ impl Tunables {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Serializes the tests that mutate the process environment. `cargo test` runs a module's
-    /// tests on multiple threads, and `set_var` is process-wide.
+    /// tests on multiple threads, and `set_var` is process-wide -- so this is the test binary's
+    /// only such lock, and every module that writes the environment goes through [`with_env`].
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Sets `name` to `value`, or removes it for `None`.
@@ -485,7 +486,7 @@ mod tests {
     ///
     /// Takes the whole set at once rather than one variable per call: [`ENV_LOCK`] is a plain
     /// non-reentrant `Mutex`, so a nested `with_env` would deadlock against itself.
-    fn with_env<T>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_env<T>(vars: &[(&str, Option<&str>)], body: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let restore: Vec<_> = vars
             .iter()

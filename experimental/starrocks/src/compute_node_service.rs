@@ -3921,6 +3921,15 @@ pub(crate) mod tests {
         leaf
     }
 
+    /// The orders leaf `(hi, 4)` as `leaf` mode fuses it: [`orders_broadcast_leaf`]'s scan
+    /// behind a HASH_PARTITIONED sink on `o_orderkey` into exchange 8.
+    fn orders_hash_leaf(hi: i64) -> TExecPlanFragmentParams {
+        let mut leaf = orders_broadcast_leaf(hi);
+        leaf.fragment.as_mut().unwrap().output_sink =
+            Some(hash_partitioned_data_stream_sink(8, 3, 1));
+        leaf
+    }
+
     #[test]
     fn hash_partitioned_single_destination_leaf_fuses_into_its_receiver() {
         capture_logs();
@@ -4171,6 +4180,64 @@ pub(crate) mod tests {
         );
     }
 
+    /// The dominant SF1000 shape (q05's join under two shuffled exchanges): both hash leaves of
+    /// a join receiver fuse. The fold pops the ready inputs last-first, so the second splice
+    /// checks its edge against the receiver the first one already rewrote; the one run reads no
+    /// exchange input at all.
+    #[test]
+    fn two_hash_leaves_fuse_into_one_join_receiver() {
+        capture_logs();
+        let executor = Arc::new(RecordingRunExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(215, 1);
+        let receiver_id = TUniqueId::new(215, 2);
+        assert_exec_ok(&service, &join_receiver(215));
+        let mut lineitem = hash_leaf(
+            &query_id,
+            &TUniqueId::new(215, 3),
+            0,
+            7,
+            receiver_id.clone(),
+        );
+        lineitem.desc_tbl = Some(tpch_desc_table());
+        assert_exec_ok(&service, &lineitem);
+        assert!(
+            executor.runs().is_empty(),
+            "the receiver still waits for exchange 8"
+        );
+        assert_exec_ok(&service, &orders_hash_leaf(215));
+
+        fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        let logs = logs_of(&query_id);
+        assert_eq!(executor.runs(), vec![FUSED_RESULT_RUN], "{logs:#?}");
+        assert_eq!(
+            log_count(&query_id, "fused sender fragment into its local receiver"),
+            2,
+            "{logs:#?}"
+        );
+        for exchange in ["exchange=7", "exchange=8"] {
+            assert!(
+                logged(
+                    &query_id,
+                    &["fused sender fragment into its local receiver", exchange]
+                ),
+                "{logs:#?}"
+            );
+        }
+        assert!(
+            logged(
+                &query_id,
+                &["fused deferred sender plans into receiver", "fused=2"]
+            ),
+            "{logs:#?}"
+        );
+        assert_eq!(
+            log_count(&query_id, "fragment fusion skipped"),
+            0,
+            "{logs:#?}"
+        );
+    }
+
     /// The root <- middle <- leaf chain with cached descriptor references: the leaf fuses into
     /// the middle (whose registered params carry the resolved descriptor table), the middle is a
     /// sender with an exchange of its own and so parks as today, and the root streams it.
@@ -4368,15 +4435,8 @@ pub(crate) mod tests {
     /// registered ones: no exchange 7, the leaf's scan and its scan range inline.
     #[test]
     fn fused_receiver_dump_is_the_fused_plan() {
-        // Serializes the tests that mutate the process environment (`tunable.rs` pattern); this
-        // is the only test that touches `SIRIUS_CN_DUMP_FRAGMENTS`.
-        static DUMP_ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _env = DUMP_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         capture_logs();
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: DUMP_ENV_LOCK is held, so no other test sets or removes this variable.
-        unsafe { std::env::set_var("SIRIUS_CN_DUMP_FRAGMENTS", dir.path()) };
-
         let (receiver, leaf) = users_shuffle_pair(212, "file:///data/users.parquet", 1024);
         // The CN registers what it deserialized from the RPC attachment, and the thrift round
         // trip normalizes an absent optional list (`destinations: None` arrives as `Some([])`),
@@ -4391,11 +4451,19 @@ pub(crate) mod tests {
             fusion::splice(wire(&receiver), 7, &wire(&leaf)).expect("the pair is fusable");
         let executor = Arc::new(RecordingRunExecutor::default());
         let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
-        assert_exec_ok(&service, &receiver);
-        assert_exec_ok(&service, &leaf);
-        fetch_rows_eventually(&service, 212, 2);
-        // SAFETY: DUMP_ENV_LOCK is still held.
-        unsafe { std::env::remove_var("SIRIUS_CN_DUMP_FRAGMENTS") };
+        // The test binary's one environment lock (`tunable::tests::with_env`) guards the write
+        // and restores the variable once the fused receiver has run and dumped.
+        crate::tunable::tests::with_env(
+            &[(
+                "SIRIUS_CN_DUMP_FRAGMENTS",
+                Some(dir.path().to_str().unwrap()),
+            )],
+            || {
+                assert_exec_ok(&service, &receiver);
+                assert_exec_ok(&service, &leaf);
+                fetch_rows_eventually(&service, 212, 2);
+            },
+        );
         let query_id = TUniqueId::new(212, 1);
         assert_eq!(
             executor.runs(),
