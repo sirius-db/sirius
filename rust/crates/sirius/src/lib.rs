@@ -582,7 +582,11 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::types::Int32Type;
+    use arrow_array::{
+        Array, ArrayRef, Decimal128Array, DictionaryArray, Float64Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use prost::Message;
@@ -1717,8 +1721,10 @@ mod tests {
 
     /// The Arrow leg of the same guard: a host batch whose Arrow types disagree with the
     /// receiver's declared stream schema must be refused by `push_arrow`, naming the column and the
-    /// declared type. (Only the by-name shape refusals and the column count are checked before the
-    /// buffers are copied; a plain type mismatch is found on the imported table.) Requires a GPU.
+    /// declared type; so must the shapes the engine refuses by name, here produced the way a host
+    /// produces them, through arrow-rs's own C Data Interface export (`LargeUtf8`, a dictionary
+    /// column). The by-name refusals, the column count and, for the scalar formats, the type
+    /// itself are checked before any buffer is copied. Requires a GPU.
     #[test]
     fn push_arrow_rejects_a_mismatched_schema() {
         let _guard = GPU_CONTEXT_LOCK
@@ -1761,6 +1767,53 @@ mod tests {
             .to_string();
         assert!(
             what.contains("carries 1 columns") && what.contains("declares 2"),
+            "unexpected error: {what}"
+        );
+
+        // The by-name refusals reached through arrow-rs's export. LargeUtf8 (format "U") is what
+        // a host renders readily; the engine's string kernels take 32-bit offsets.
+        let id_f64: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let large_utf8 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Float64, false),
+                Field::new("name", DataType::LargeUtf8, false),
+            ])),
+            vec![
+                id_f64.clone(),
+                Arc::new(LargeStringArray::from(vec!["a", "b"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let what = receiver
+            .push_arrow(0, 0, &large_utf8)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            what.contains("column 1 (name)") && what.contains("large_utf8"),
+            "unexpected error: {what}"
+        );
+
+        // A dictionary-encoded string column: the export carries the dictionary in the child
+        // schema, and the engine consumes plain columns only.
+        let dictionary: DictionaryArray<Int32Type> = ["a", "b"].into_iter().collect();
+        let dictionary_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Float64, false),
+                Field::new(
+                    "name",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    false,
+                ),
+            ])),
+            vec![id_f64, Arc::new(dictionary) as ArrayRef],
+        )
+        .unwrap();
+        let what = receiver
+            .push_arrow(0, 0, &dictionary_batch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            what.contains("column 1 (name)") && what.contains("dictionary"),
             "unexpected error: {what}"
         );
     }

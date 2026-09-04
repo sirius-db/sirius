@@ -52,6 +52,13 @@ namespace sirius {
  *   and list kernels take 32-bit offsets), timezone-aware timestamps (no timezone carrier on the
  *   GPU), `decimal256`, and a column declared `HUGEINT`/`UHUGEINT` (cudf has no 128-bit integer;
  *   `get_cudf_type` would narrow it to 64 bits). Only top-level columns are inspected;
+ * - refuses a plain type mismatch from the child's format string, before any buffer is copied,
+ *   for the scalar formats it knows (integers, floats, bool, utf8, date32, naive timestamps,
+ *   decimal128); the check on the imported table is the backstop for every other format;
+ * - honours the struct's own `offset`/`length` window — Arrow C++ `StructArray::Slice`, or
+ *   children longer than the struct — by pushing it into shallow copies of the children before
+ *   the import, since `cudf::from_arrow` reads each child by its own offset and ignores the
+ *   struct's. A child shorter than the window is refused naming the column;
  * - picks the decimal storage width from the **declared** precision (DECIMAL32/64/128 with cudf's
  *   negated scale) and narrows an arriving decimal128 to it, since Arrow producers emit
  *   decimal128 whatever the precision. Values that overflow the declared precision are the
@@ -60,7 +67,9 @@ namespace sirius {
  *   becomes BOOL8, `utf8` becomes STRING with 32-bit offsets, `date32` becomes TIMESTAMP_DAYS.
  *
  * The buffers are copied to the device on `stream`; the caller synchronizes before it lets the
- * producer release the Arrow structs. The input is never released by this function.
+ * producer release the Arrow structs. On every error path after the copy has started the helper
+ * synchronizes `stream` itself before it throws, so the producer's buffers are quiescent whenever
+ * control returns. The input is never released by this function.
  *
  * @param schema Arrow schema of the struct array (`+s`), one child per declared column.
  * @param array  Arrow array in host memory whose children are the columns.
@@ -72,8 +81,9 @@ namespace sirius {
  * @return The imported table, column types equal to `get_cudf_type(types[i])` for every `i`.
  * @throws sirius::invalid_input_exception on null pointers, on structs that were already
  *         released (`release == NULL`), a non-struct top-level array, a column-count mismatch,
- *         a refused shape, or a type mismatch (a fixed-point scale mismatch names both scales);
- *         every per-column message names the column by index and declared name.
+ *         a struct window that runs past a child, a refused shape, or a type mismatch (a
+ *         fixed-point scale mismatch names both scales); every per-column message names the
+ *         column by index and declared name.
  */
 std::unique_ptr<cudf::table> import_arrow_host_table(const ArrowSchema* schema,
                                                      const ArrowArray* array,

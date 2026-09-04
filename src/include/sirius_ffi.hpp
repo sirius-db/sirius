@@ -278,19 +278,24 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// needs no Arrow headers. The batch is reconciled against the declared stream schema column by
   /// column (see `helper/arrow_host_import.hpp` for the exact rules: decimal width from the
   /// declared precision, bool bitmap to BOOL8, and by-name refusal of dictionary, large_list,
-  /// large_utf8, large_binary, timezone-aware timestamps, decimal256 and HUGEINT columns).
+  /// large_utf8, large_binary, timezone-aware timestamps, decimal256 and HUGEINT columns). A
+  /// slice taken on the struct itself (its `offset`/`length`, Arrow C++ `StructArray::Slice`) is
+  /// honoured: only that window of every child is imported.
   /// `sender_id` must be one of the stream's declared senders (declare_input_sender); that is
   /// a membership check only — the batch carries no sender identity past this call, so a push
   /// from a sender that already called close_input() is refused only once every sender has
   /// closed and the stream ended.
   ///
   /// Contract in this milestone: legal between `build()` and `run()`, exactly where `push_packed`
-  /// sits. It touches only the stream session (mutex-protected) and immutable post-`build()`
-  /// state — the declared schemas and senders — never the DuckDB connection or the query
-  /// lifecycle, so a producer thread other than the one that owns the `Context` may call it in
-  /// that window today, and widening it to "any thread, including while `run()` blocks on
-  /// another thread" needs no redesign of this entry point. There is no backpressure: the queue
-  /// is unbounded.
+  /// sits. Besides the stream session (mutex-protected) and immutable post-`build()` state — the
+  /// declared schemas and senders — it touches two engine-shared resources: it allocates from the
+  /// GPU memory space's default allocator, and it copies, casts and synchronizes on
+  /// `cudf::get_default_stream()`, which is a device-wide barrier when that is the legacy default
+  /// stream. It never touches the DuckDB connection or the query lifecycle, so a producer thread
+  /// other than the one that owns the `Context` may call it in that window today. Widening it to
+  /// "any thread, including while `run()` blocks on another thread" keeps this signature but needs
+  /// a dedicated stream for the H2D copy (`memory_space::acquire_stream()`), so that synchronize
+  /// stops stalling the pipelines' streams. There is no backpressure: the queue is unbounded.
   /// @throws before `build()`, on an unknown input stream, on a sender not declared for the
   /// stream, on null addresses or already-released structs, on schema mismatch, or when the
   /// stream already ended (a push after EOS never disappears silently).

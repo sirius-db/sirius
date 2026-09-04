@@ -359,15 +359,23 @@ cuCascade-owned and spillable), reconciles it against the declared schema with t
 `sirius::get_cudf_type` column guard `push_packed()` uses — narrowing an Arrow `decimal128` to the
 width the declared precision picks — and refuses by name what the engine cannot consume: dictionary
 encoding, `large_list` / `large_utf8` / `large_binary` (64-bit offsets), timezone-aware timestamps,
-`decimal256`, and `HUGEINT` columns. The copy is synchronized before the call returns, so the caller
-may release its Arrow structs at once. `sender_id` must be a declared sender of the stream; the
-call does not close it (`close_input()` is the EOS mirror) and a push after the stream ended throws.
+`decimal256`, and `HUGEINT` columns. For the scalar formats a plain type mismatch is refused from the
+format string, before the copy; the imported table is the backstop for the rest. A slice taken on
+the struct itself (Arrow C++ `StructArray::Slice`: offset and length on the struct, children whole)
+is honoured — the window is pushed into the children before the import, since `cudf::from_arrow`
+reads each child by its own offset and would import every child row. The copy is synchronized
+before the call returns (on the error paths too), so the caller may release its Arrow structs at
+once. `sender_id` must be a declared sender of the stream; the call does not close it
+(`close_input()` is the EOS mirror) and a push after the stream ended throws.
 
-Legal exactly where `push_packed()` is, between `build()` and `run()`. It touches only the stream
-session and immutable post-`build()` state (the declared schemas and senders), never the DuckDB
-connection or the query lifecycle, so a producer thread other than the context's may call it in
-that window today; widening it to "any thread, including while `run()` blocks" needs no redesign of
-the entry point. There is no backpressure: the queue is unbounded.
+Legal exactly where `push_packed()` is, between `build()` and `run()`. Besides the stream session
+and immutable post-`build()` state (the declared schemas and senders) it touches two engine-shared
+resources: the GPU memory space's default allocator, and `cudf::get_default_stream()`, on which it
+copies, casts and synchronizes (a device-wide barrier when that is the legacy default stream). It
+never touches the DuckDB connection or the query lifecycle, so a producer thread other than the
+context's may call it in that window today. Widening it to "any thread, including while `run()`
+blocks" keeps the signature but needs a dedicated stream for the H2D copy
+(`memory_space::acquire_stream()`). There is no backpressure: the queue is unbounded.
 
 `Context::staging_arena_handle()` returns a `StagingArena` sharing ownership of the same allocator
 that the thread-affine `Context::staging_*` methods drive; its `lease`/`release` serialize on the
@@ -395,7 +403,7 @@ inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + S
 |---|---|
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
-| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]`, `[sirius_ffi][arrow_host_import]`, `[.][sirius_ffi_bench]` |
+| `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]`, `[sirius_ffi][arrow_host_import]`, `[.][sirius_ffi_bench][isolated_context]` |
 | `test/cpp/exec/test_exchange_staging_arena.cpp` | `[staging_arena]` |
 
 The packed hop itself is covered from the Rust side, in `rust/crates/sirius/src/lib.rs`:
@@ -409,17 +417,22 @@ The Arrow input is covered on both sides. C++ (`test_sirius_ffi_fragment.cpp`): 
 `cudf::to_arrow_host` → `push_arrow` → `run` → `result_to_arrow` round trip over BIGINT, DOUBLE,
 BOOLEAN, VARCHAR, DECIMAL(15,2) and DATE; several batches and senders on one stream; a hash
 partition keyed on the pushed VARCHAR column (the string kernel that requires 32-bit offsets); a
-batch pushed as two slices with non-zero Arrow offsets; schema, column count, decimal scale, unknown
-stream, undeclared sender, null-pointer and post-EOS refusals; a push from a second `std::thread`
-between `build()` and `run()`; the helper's by-name refusals (and its released-struct refusal)
-without an engine context; and a hidden `[sirius_ffi_bench]` case that prints H2D/D2H GB/s for a
-512 MiB batch. Rust: `arrow_hop_matches_relay_hop` (the Arrow hop equals the `relay_from` hop),
-`push_arrow_carries_nulls_and_sliced_batches` and `push_arrow_rejects_a_mismatched_schema`.
+batch pushed as two slices with non-zero Arrow offsets on the children, and one sliced on the struct
+itself (plus the refusal of a window that runs past the children); nulls in every fixture column,
+whole and struct-sliced; a push that names an already-closed sender while another is open (the
+membership-only rule); schema, column count, decimal scale, unknown stream, undeclared sender,
+null-pointer and post-EOS refusals; a push from a second `std::thread` between `build()` and
+`run()`; the helper's by-name refusals, its released-struct refusal and its pre-copy type refusals
+with hand-built Arrow C structs, no engine context; and a hidden `[sirius_ffi_bench]` case that
+prints H2D/D2H GB/s for 128 MiB, 512 MiB and 2 GiB batches plus a zero-row `run()`. Rust:
+`arrow_hop_matches_relay_hop` (the Arrow hop equals the `relay_from` hop),
+`push_arrow_carries_nulls_and_sliced_batches` and `push_arrow_rejects_a_mismatched_schema` (which
+also drives the `LargeUtf8` and dictionary refusals through arrow-rs's own export).
 
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
-the shared test environments around any test with that tag so it doesn't contend with them for GPU
-memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
+the shared test environments around any test tagged neither `[shared_context]` nor `[integration]`,
+so these do not contend with them for GPU memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
 FFI-level tests are necessarily built around observable, public-API behavior (a failed `build()`
 throws, and a subsequent independent `Fragment` on the same `Context` can attempt its own `build()`
 right after) rather than inspecting DuckDB catalog state directly.

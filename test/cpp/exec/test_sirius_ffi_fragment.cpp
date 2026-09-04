@@ -40,6 +40,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -78,6 +79,7 @@ struct ArrowDeviceArray {
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <source_location>
 #include <string>
 #include <thread>
@@ -326,6 +328,60 @@ void slice_host_arrow(host_arrow_batch& host, std::int64_t offset, std::int64_t 
   }
 }
 
+// Nullable twin of the fixture: row i is null in column c when (i + c) % 4 == 0, so every column
+// carries nulls, each in different rows.
+struct nullable_fixture_row {
+  std::optional<std::int64_t> id;
+  std::optional<double> x;
+  std::optional<bool> flag;
+  std::optional<std::string> name;
+  std::optional<std::int64_t> price_scaled;
+  std::optional<std::int32_t> days;
+  auto operator<=>(const nullable_fixture_row&) const = default;
+};
+
+bool fixture_cell_is_null(std::int64_t row, int column) { return (row + column) % 4 == 0; }
+
+std::vector<nullable_fixture_row> nullable_fixture_rows(std::int64_t n)
+{
+  std::vector<nullable_fixture_row> rows;
+  for (const auto& r : fixture_rows(n)) {
+    nullable_fixture_row row;
+    if (!fixture_cell_is_null(r.id, 0)) { row.id = r.id; }
+    if (!fixture_cell_is_null(r.id, 1)) { row.x = r.x; }
+    if (!fixture_cell_is_null(r.id, 2)) { row.flag = r.flag; }
+    if (!fixture_cell_is_null(r.id, 3)) { row.name = r.name; }
+    if (!fixture_cell_is_null(r.id, 4)) { row.price_scaled = r.price_scaled; }
+    if (!fixture_cell_is_null(r.id, 5)) { row.days = r.days; }
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+// The fixture table with a validity mask on every column (cudf layout, one bit per row).
+std::unique_ptr<cudf::table> nullable_fixture_table(std::int64_t n)
+{
+  auto columns = fixture_table(fixture_rows(n))->release();
+  auto stream  = cudf::get_default_stream();
+  for (int c = 0; c < static_cast<int>(columns.size()); ++c) {
+    const auto size = static_cast<cudf::size_type>(n);
+    std::vector<cudf::bitmask_type> bits(
+      cudf::bitmask_allocation_size_bytes(size) / sizeof(cudf::bitmask_type), 0);
+    cudf::size_type null_count = 0;
+    for (std::int64_t i = 0; i < n; ++i) {
+      if (fixture_cell_is_null(i, c)) {
+        ++null_count;
+        continue;
+      }
+      bits[i / 32] |= cudf::bitmask_type{1} << (i % 32);
+    }
+    rmm::device_buffer mask(bits.data(), bits.size() * sizeof(cudf::bitmask_type), stream);
+    stream.synchronize();
+    columns[c]->set_null_mask(std::move(mask), null_count);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 // ---------------------------------------------------------------------------
 // Reading the result back out of result_to_arrow()'s ArrowArrayStream.
 // ---------------------------------------------------------------------------
@@ -375,9 +431,16 @@ std::string string_at(const ArrowArray& column, std::int64_t row)
   return std::string(chars + begin, chars + end);
 }
 
-// Drains a result stream of the fixture schema into sorted rows. Checks the Arrow formats DuckDB
-// produces for the declared types on the way, so a type drift shows up here and not as garbage.
-std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
+bool is_valid(const ArrowArray& column, std::int64_t row)
+{
+  if (column.buffers[0] == nullptr) { return true; }
+  const auto bit = column.offset + row;
+  return (static_cast<const std::uint8_t*>(column.buffers[0])[bit / 8] >> (bit % 8)) & 1;
+}
+
+// Checks the Arrow formats DuckDB produces for the fixture's declared types, so a type drift
+// shows up here and not as garbage.
+void require_fixture_schema(ArrowArrayStream& stream)
 {
   arrow_schema_guard schema;
   REQUIRE(stream.get_schema(&stream, &schema.schema) == 0);
@@ -387,6 +450,12 @@ std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
   for (std::int64_t i = 0; i < schema.schema.n_children; ++i) {
     REQUIRE(std::string(schema.schema.children[i]->format) == expected_formats[i]);
   }
+}
+
+// Drains a result stream of the fixture schema into rows sorted by id.
+std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
+{
+  require_fixture_schema(stream);
 
   std::vector<fixture_row> rows;
   while (true) {
@@ -407,6 +476,37 @@ std::vector<fixture_row> read_fixture_result(ArrowArrayStream& stream)
     }
   }
   std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+  return rows;
+}
+
+// The nullable reader: a cell is read only where DuckDB's validity bitmap says so. Sorted on the
+// whole row, since the id itself may be null.
+std::vector<nullable_fixture_row> read_nullable_fixture_result(ArrowArrayStream& stream)
+{
+  require_fixture_schema(stream);
+
+  std::vector<nullable_fixture_row> rows;
+  while (true) {
+    arrow_array_guard array;
+    REQUIRE(stream.get_next(&stream, &array.array) == 0);
+    if (array.array.release == nullptr) { break; }
+    REQUIRE(array.array.n_children == 6);
+    for (std::int64_t r = 0; r < array.array.length; ++r) {
+      const auto& c = array.array.children;
+      nullable_fixture_row row;
+      if (is_valid(*c[0], r)) { row.id = fixed_width_at<std::int64_t>(*c[0], r); }
+      if (is_valid(*c[1], r)) { row.x = fixed_width_at<double>(*c[1], r); }
+      if (is_valid(*c[2], r)) { row.flag = bit_at(*c[2], r); }
+      if (is_valid(*c[3], r)) { row.name = string_at(*c[3], r); }
+      if (is_valid(*c[4], r)) {
+        const auto* dec  = static_cast<const std::int64_t*>(c[4]->buffers[1]);
+        row.price_scaled = dec[(c[4]->offset + r) * 2];
+      }
+      if (is_valid(*c[5], r)) { row.days = fixed_width_at<std::int32_t>(*c[5], r); }
+      rows.push_back(row);
+    }
+  }
+  std::sort(rows.begin(), rows.end());
   return rows;
 }
 
@@ -634,15 +734,19 @@ TEST_CASE("Fragment::push_arrow accepts several batches and senders on one strea
   fragment->push_arrow(0, 1, host_first.array_addr(), host_first.schema_addr());
   fragment->push_arrow(0, 2, host_second.array_addr(), host_second.schema_addr());
   fragment->close_input(0, 1);
-  // Sender 2 is still open: the stream has not ended, so a late batch from it is still legal.
+  // Sender 2 is still open: the stream has not ended, so a late batch from it is still legal,
+  // and so is one that names the already-closed sender 1. sender_id is a membership check only
+  // (sirius_ffi.hpp, push_arrow: the batch carries no sender identity past the call), so a push
+  // from a closed sender is refused only once every sender has closed and the stream ended.
   fragment->push_arrow(0, 2, host_first.array_addr(), host_first.schema_addr());
+  fragment->push_arrow(0, 1, host_second.array_addr(), host_second.schema_addr());
   fragment->close_input(0, 2);
   fragment->run();
 
   arrow_stream_guard out;
   fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
   auto expected = all;
-  expected.insert(expected.end(), first.begin(), first.end());
+  expected.insert(expected.end(), all.begin(), all.end());
   std::sort(
     expected.begin(), expected.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
   REQUIRE(read_fixture_result(out.stream) == expected);
@@ -783,6 +887,92 @@ TEST_CASE("Fragment::push_arrow honours Arrow offsets on a sliced host batch",
   REQUIRE(read_fixture_result(out.stream) == rows);
 }
 
+// The other way to slice: Arrow C++'s StructArray::Slice() (or any producer that windows the
+// batch rather than its columns) puts the offset and length on the struct and leaves the children
+// whole; a struct shorter than its children is the same shape with offset 0. cudf::from_arrow
+// imports each child by the child's own offset and length, so the helper pushes the struct's
+// window into the children first; without that, every child row came back (10 for a 6-row slice).
+TEST_CASE("Fragment::push_arrow honours a slice taken on the struct itself",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto rows = fixture_rows(10);
+  auto host       = to_host_arrow(fixture_table(rows)->view(), fixture_columns());
+  auto& top       = host.array->array;
+  REQUIRE(top.length == 10);
+
+  auto fragment = build_result_fragment(*context, fixture_columns());
+  // Rows [4, 10): the offset sits on the struct; the children keep offset 0 and length 10.
+  top.offset = 4;
+  top.length = 6;
+  fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  // Rows [0, 6): a struct shorter than its children.
+  top.offset = 0;
+  top.length = 6;
+  fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+  fragment->close_input(0, 0);
+  REQUIRE_NOTHROW(fragment->run());
+
+  std::vector<fixture_row> expected(rows.begin() + 4, rows.end());
+  expected.insert(expected.end(), rows.begin(), rows.begin() + 6);
+  std::sort(
+    expected.begin(), expected.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+  arrow_stream_guard out;
+  fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+  REQUIRE(read_fixture_result(out.stream) == expected);
+
+  // A window that runs past the children is malformed Arrow: refused naming the column.
+  top.offset    = 8;
+  top.length    = 6;
+  auto refusing = build_result_fragment(*context, fixture_columns());
+  REQUIRE_THROWS_WITH(refusing->push_arrow(0, 0, host.array_addr(), host.schema_addr()),
+                      Catch::Matchers::Contains("column 0 (id)") &&
+                        Catch::Matchers::Contains("10 rows") &&
+                        Catch::Matchers::Contains("[8, 14)"));
+  top.offset = 0;
+  top.length = 10;
+}
+
+// Nulls in every column: the decimal (the one column the helper rebuilds itself, decimal128 ->
+// DECIMAL64 through cudf::cast), the bool bitmap and date32 included, which the Rust null test
+// (Int64, Utf8) never reaches. The second push windows the struct over the nullable batch, so the
+// per-child null count the helper recounts for the window is checked as well.
+TEST_CASE("Fragment::push_arrow carries nulls in every fixture column, whole and struct-sliced",
+          "[isolated_context][sirius_ffi]")
+{
+  auto context    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  const auto rows = nullable_fixture_rows(12);
+  auto host       = to_host_arrow(nullable_fixture_table(12)->view(), fixture_columns());
+
+  {
+    auto fragment = build_result_fragment(*context, fixture_columns());
+    fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+    fragment->close_input(0, 0);
+    REQUIRE_NOTHROW(fragment->run());
+    auto expected = rows;
+    std::sort(expected.begin(), expected.end());
+    arrow_stream_guard out;
+    fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    REQUIRE(read_nullable_fixture_result(out.stream) == expected);
+  }
+  {
+    auto& top     = host.array->array;
+    top.offset    = 3;
+    top.length    = 5;
+    auto fragment = build_result_fragment(*context, fixture_columns());
+    fragment->push_arrow(0, 0, host.array_addr(), host.schema_addr());
+    fragment->close_input(0, 0);
+    REQUIRE_NOTHROW(fragment->run());
+    std::vector<nullable_fixture_row> expected(rows.begin() + 3, rows.begin() + 8);
+    std::sort(expected.begin(), expected.end());
+    arrow_stream_guard out;
+    fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    REQUIRE(read_nullable_fixture_result(out.stream) == expected);
+    top.offset = 0;
+    top.length = 12;
+  }
+}
+
 TEST_CASE("Fragment::push_arrow before build() and after close_input() both throw",
           "[isolated_context][sirius_ffi]")
 {
@@ -911,6 +1101,30 @@ TEST_CASE("arrow_host_import refuses the shapes the engine cannot consume, by na
     CHECK_THAT(what, Catch::Matchers::Contains("decimal256"));
   }
 
+  SECTION("a scalar type mismatch is refused from the format alone, before any buffer is read")
+  {
+    // Three rows and no buffers at all: an import would read through null pointers, so this
+    // message can only come from the format string.
+    handmade_arrow_column column("l");
+    column.array.length       = 3;
+    column.child_array.length = 3;
+    const auto what           = import_error(column, logical_type::make(type_id::DOUBLE));
+    CHECK_THAT(what, Catch::Matchers::Contains("column 0 (c)"));
+    CHECK_THAT(what, Catch::Matchers::Contains("declared DOUBLE"));
+    CHECK_THAT(what, Catch::Matchers::Contains("int64"));
+  }
+
+  SECTION("a decimal scale mismatch is refused from the format alone, naming both scales")
+  {
+    handmade_arrow_column column("d:18,3");
+    column.array.length       = 3;
+    column.child_array.length = 3;
+    const auto what           = import_error(column, logical_type::make_decimal(15, 2));
+    CHECK_THAT(what, Catch::Matchers::Contains("column 0 (c)"));
+    CHECK_THAT(what, Catch::Matchers::Contains("declared scale 2"));
+    CHECK_THAT(what, Catch::Matchers::Contains("carries scale 3"));
+  }
+
   SECTION("a non-struct top-level array")
   {
     handmade_arrow_column column("l");
@@ -921,10 +1135,11 @@ TEST_CASE("arrow_host_import refuses the shapes the engine cannot consume, by na
 }
 
 // Bandwidth measurement (hidden; run with the [sirius_ffi_bench] tag on a free GPU): H2D bandwidth
-// of push_arrow for a ~512 MiB int64/double batch in pageable host memory, against a plain
-// cudaMemcpy of the same bytes; and D2H bandwidth of the result_to_arrow path (run() + drain,
-// the four-copy collector) against cudf::to_arrow_host of the same table.
-TEST_CASE("push_arrow / result_to_arrow bandwidth on a 512 MiB batch",
+// of push_arrow for int64/double batches in pageable host memory, against a plain cudaMemcpy of
+// the same bytes; and D2H bandwidth of the result_to_arrow path (run() + drain, the four-copy
+// collector) against cudf::to_arrow_host of the same table. Three sizes (128 MiB, 512 MiB, 2 GiB)
+// and a zero-row run() separate the per-byte cost from the per-query fixed cost.
+TEST_CASE("push_arrow / result_to_arrow bandwidth on 128 MiB, 512 MiB and 2 GiB batches",
           "[.][sirius_ffi_bench][isolated_context]")
 {
   using clock        = std::chrono::steady_clock;
@@ -936,96 +1151,111 @@ TEST_CASE("push_arrow / result_to_arrow bandwidth on a 512 MiB batch",
   auto context = sirius::ffi::make_context();
   const std::vector<plan_column> columns{
     {"a", col_kind::I64}, {"b", col_kind::F64}, {"c", col_kind::I64}, {"d", col_kind::F64}};
-  constexpr std::int64_t rows   = std::int64_t{1} << 24;  // 16 Mi rows x 4 x 8 B = 512 MiB
-  const std::size_t total_bytes = static_cast<std::size_t>(rows) * columns.size() * 8;
 
-  std::vector<std::int64_t> ints(rows);
-  std::vector<double> doubles(rows);
-  for (std::int64_t i = 0; i < rows; ++i) {
-    ints[i]    = i;
-    doubles[i] = static_cast<double>(i) * 0.25;
-  }
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::INT64}, ints));
-  cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::FLOAT64}, doubles));
-  cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::INT64}, ints));
-  cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::FLOAT64}, doubles));
-  auto table = std::make_unique<cudf::table>(std::move(cols));
-
-  // D2H reference: cudf::to_arrow_host of the 512 MiB table.
-  std::vector<cudf::column_metadata> metadata;
-  for (const auto& column : columns) {
-    metadata.emplace_back(column.name);
-  }
-  auto schema                  = cudf::to_arrow_schema(table->view(), metadata);
-  const auto t0                = clock::now();
-  auto host                    = cudf::to_arrow_host(table->view());
-  const auto t1                = clock::now();
-  const double to_arrow_host_s = seconds(t0, t1);
-  table.reset();
-
-  // H2D reference: one pageable cudaMemcpy of the same byte count.
-  double memcpy_s = 0;
+  // The per-query fixed cost of run(): plan lowering, pipeline setup and scheduling over an input
+  // that ended with no batches.
   {
-    std::vector<std::uint8_t> pageable(total_bytes, 1);
-    rmm::device_buffer device(total_bytes, cudf::get_default_stream());
-    const auto m0 = clock::now();
-    REQUIRE(cudaMemcpy(device.data(), pageable.data(), total_bytes, cudaMemcpyHostToDevice) ==
-            cudaSuccess);
-    const auto m1 = clock::now();
-    memcpy_s      = seconds(m0, m1);
+    auto fragment = build_result_fragment(*context, columns);
+    fragment->close_input(0, 0);
+    const auto z0 = clock::now();
+    fragment->run();
+    const auto z1 = clock::now();
+    std::fprintf(
+      stderr, "[sirius_ffi_bench] run() with zero rows (fixed cost)  %.3f s\n", seconds(z0, z1));
   }
 
-  auto fragment = build_result_fragment(*context, columns);
-  const auto p0 = clock::now();
-  fragment->push_arrow(0,
-                       0,
-                       reinterpret_cast<std::uintptr_t>(&host->array),
-                       reinterpret_cast<std::uintptr_t>(schema.get()));
-  const auto p1       = clock::now();
-  const double push_s = seconds(p0, p1);
-  host.reset();
-  fragment->close_input(0, 0);
+  for (const int shift : {22, 24, 26}) {
+    const std::int64_t rows       = std::int64_t{1} << shift;  // x 4 columns x 8 B
+    const std::size_t total_bytes = static_cast<std::size_t>(rows) * columns.size() * 8;
 
-  const auto r0 = clock::now();
-  fragment->run();
-  const auto r1 = clock::now();
-  arrow_stream_guard out;
-  fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
-  std::int64_t drained = 0;
-  while (true) {
-    arrow_array_guard array;
-    REQUIRE(out.stream.get_next(&out.stream, &array.array) == 0);
-    if (array.array.release == nullptr) { break; }
-    drained += array.array.length;
+    std::vector<std::int64_t> ints(rows);
+    std::vector<double> doubles(rows);
+    for (std::int64_t i = 0; i < rows; ++i) {
+      ints[i]    = i;
+      doubles[i] = static_cast<double>(i) * 0.25;
+    }
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::INT64}, ints));
+    cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::FLOAT64}, doubles));
+    cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::INT64}, ints));
+    cols.push_back(fixed_width_column(cudf::data_type{cudf::type_id::FLOAT64}, doubles));
+    auto table = std::make_unique<cudf::table>(std::move(cols));
+
+    // D2H reference: cudf::to_arrow_host of the table.
+    std::vector<cudf::column_metadata> metadata;
+    for (const auto& column : columns) {
+      metadata.emplace_back(column.name);
+    }
+    auto schema                  = cudf::to_arrow_schema(table->view(), metadata);
+    const auto t0                = clock::now();
+    auto host                    = cudf::to_arrow_host(table->view());
+    const auto t1                = clock::now();
+    const double to_arrow_host_s = seconds(t0, t1);
+    table.reset();
+
+    // H2D reference: one pageable cudaMemcpy of the same byte count.
+    double memcpy_s = 0;
+    {
+      std::vector<std::uint8_t> pageable(total_bytes, 1);
+      rmm::device_buffer device(total_bytes, cudf::get_default_stream());
+      const auto m0 = clock::now();
+      REQUIRE(cudaMemcpy(device.data(), pageable.data(), total_bytes, cudaMemcpyHostToDevice) ==
+              cudaSuccess);
+      const auto m1 = clock::now();
+      memcpy_s      = seconds(m0, m1);
+    }
+
+    auto fragment = build_result_fragment(*context, columns);
+    const auto p0 = clock::now();
+    fragment->push_arrow(0,
+                         0,
+                         reinterpret_cast<std::uintptr_t>(&host->array),
+                         reinterpret_cast<std::uintptr_t>(schema.get()));
+    const auto p1       = clock::now();
+    const double push_s = seconds(p0, p1);
+    host.reset();
+    fragment->close_input(0, 0);
+
+    const auto r0 = clock::now();
+    fragment->run();
+    const auto r1 = clock::now();
+    arrow_stream_guard out;
+    fragment->result_to_arrow(reinterpret_cast<std::uintptr_t>(&out.stream));
+    std::int64_t drained = 0;
+    while (true) {
+      arrow_array_guard array;
+      REQUIRE(out.stream.get_next(&out.stream, &array.array) == 0);
+      if (array.array.release == nullptr) { break; }
+      drained += array.array.length;
+    }
+    const auto r2 = clock::now();
+    REQUIRE(drained == rows);
+    const double run_s   = seconds(r0, r1);
+    const double drain_s = seconds(r1, r2);
+
+    std::fprintf(stderr,
+                 "[sirius_ffi_bench] bytes=%zu (%.0f MiB), rows=%lld x %zu columns\n"
+                 "[sirius_ffi_bench] H2D  push_arrow           %.3f s  %.2f GB/s\n"
+                 "[sirius_ffi_bench] H2D  cudaMemcpy pageable  %.3f s  %.2f GB/s\n"
+                 "[sirius_ffi_bench] D2H  cudf::to_arrow_host  %.3f s  %.2f GB/s\n"
+                 "[sirius_ffi_bench] D2H  run() [collector]    %.3f s  %.2f GB/s\n"
+                 "[sirius_ffi_bench] D2H  result_to_arrow drain %.3f s  %.2f GB/s\n"
+                 "[sirius_ffi_bench] D2H  run()+drain          %.3f s  %.2f GB/s\n",
+                 total_bytes,
+                 total_bytes / 1048576.0,
+                 static_cast<long long>(rows),
+                 columns.size(),
+                 push_s,
+                 gbps(total_bytes, push_s),
+                 memcpy_s,
+                 gbps(total_bytes, memcpy_s),
+                 to_arrow_host_s,
+                 gbps(total_bytes, to_arrow_host_s),
+                 run_s,
+                 gbps(total_bytes, run_s),
+                 drain_s,
+                 gbps(total_bytes, drain_s),
+                 run_s + drain_s,
+                 gbps(total_bytes, run_s + drain_s));
   }
-  const auto r2 = clock::now();
-  REQUIRE(drained == rows);
-  const double run_s   = seconds(r0, r1);
-  const double drain_s = seconds(r1, r2);
-
-  std::fprintf(stderr,
-               "[sirius_ffi_bench] bytes=%zu (%.0f MiB), rows=%lld x %zu columns\n"
-               "[sirius_ffi_bench] H2D  push_arrow           %.3f s  %.2f GB/s\n"
-               "[sirius_ffi_bench] H2D  cudaMemcpy pageable  %.3f s  %.2f GB/s\n"
-               "[sirius_ffi_bench] D2H  cudf::to_arrow_host  %.3f s  %.2f GB/s\n"
-               "[sirius_ffi_bench] D2H  run() [collector]    %.3f s  %.2f GB/s\n"
-               "[sirius_ffi_bench] D2H  result_to_arrow drain %.3f s  %.2f GB/s\n"
-               "[sirius_ffi_bench] D2H  run()+drain          %.3f s  %.2f GB/s\n",
-               total_bytes,
-               total_bytes / 1048576.0,
-               static_cast<long long>(rows),
-               columns.size(),
-               push_s,
-               gbps(total_bytes, push_s),
-               memcpy_s,
-               gbps(total_bytes, memcpy_s),
-               to_arrow_host_s,
-               gbps(total_bytes, to_arrow_host_s),
-               run_s,
-               gbps(total_bytes, run_s),
-               drain_s,
-               gbps(total_bytes, drain_s),
-               run_s + drain_s,
-               gbps(total_bytes, run_s + drain_s));
 }
