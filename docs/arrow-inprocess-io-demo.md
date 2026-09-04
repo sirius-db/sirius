@@ -293,6 +293,14 @@ reply's test (start `run()` on one thread, push the first batch only after execu
 close, compare with the pre-materialized run), and lands the `start()/join()` split with a bounded or blocking push. A
 hole in the source is fixed in the engine, not by narrowing the contract.
 
+Sequencing against T5b (the proposal's second question). The proposal asks that `push_arrow` go on top of T5b (the
+`push_packed` FFI layer from sirius-db/sirius#1644) or the `stream/*` stack rather than race the reshaping of
+`sirius_ffi.{hpp,cpp}`. This tree already carries that layer (`export_packed`, `push_packed`, the staging arena and
+`declare_input_cardinality`, section 1.1), so `push_arrow` here is additive: a new helper file, one new method declared
+next to `push_packed`, one new cxx bridge entry, and no edit to `stream_session`, `streaming_source` or cuCascade. When
+this lands upstream it should be rebased onto whatever T5b settles as the final `Fragment` surface; the only shared
+lines are the method declaration order in the header and the schema guard, which the helper now owns for both hops.
+
 ## 4. Plan for the demo branch: M1 to M5
 
 M1 and M2 are delivered (`e354d5d1`, `0d873ac3`, `e51943af`, `d39f72a0`). M3 to M5 are planned.
