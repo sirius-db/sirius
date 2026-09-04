@@ -3509,10 +3509,7 @@ static void LoadInternal(ExtensionLoader& loader)
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
   // extension binary itself may still be loaded).
-  bool const sirius_disabled = [] {
-    auto* val = std::getenv("SIRIUS_DISABLE");
-    return val != nullptr && std::string(val) != "0";
-  }();
+  bool const sirius_disabled = sirius_disabled_from_environment();
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 

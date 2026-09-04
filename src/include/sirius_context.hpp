@@ -746,6 +746,11 @@ class SiriusContext : public ClientContextState {
 /// null (best-effort) path never throws.
 void install_configured_log_sink(DatabaseInstance* db);
 
+/// True only when `SIRIUS_DISABLE` is exactly `1`; unset and exactly `0` enable
+/// Sirius, while every other set value is rejected before runtime
+/// initialization and optimizer-mask publication.
+bool sirius_disabled_from_environment();
+
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
 /// extensions
 class SiriusContextExtensionCallback : public ExtensionCallback {

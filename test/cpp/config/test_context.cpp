@@ -420,6 +420,33 @@ TEST_CASE("Sirius configuration keeps runtime distinct-build probing internal", 
       Catch::Contains("removed") && Catch::Contains("remove this key"));
 }
 
+TEST_CASE("SIRIUS_DISABLE accepts only explicit boolean values", "[sirius][config]")
+{
+  std::optional<std::string> previous;
+  if (auto const* value = std::getenv("SIRIUS_DISABLE")) { previous = value; }
+  finally restore_env{[previous]() {
+    if (previous) {
+      setenv("SIRIUS_DISABLE", previous->c_str(), 1);
+    } else {
+      unsetenv("SIRIUS_DISABLE");
+    }
+  }};
+
+  unsetenv("SIRIUS_DISABLE");
+  REQUIRE_FALSE(duckdb::sirius_disabled_from_environment());
+  setenv("SIRIUS_DISABLE", "0", 1);
+  REQUIRE_FALSE(duckdb::sirius_disabled_from_environment());
+  setenv("SIRIUS_DISABLE", "1", 1);
+  REQUIRE(duckdb::sirius_disabled_from_environment());
+
+  for (auto const* invalid : {"", "false", "true", "2", "yes"}) {
+    CAPTURE(invalid);
+    setenv("SIRIUS_DISABLE", invalid, 1);
+    REQUIRE_THROWS_WITH(duckdb::sirius_disabled_from_environment(),
+                        Catch::Contains("SIRIUS_DISABLE") && Catch::Contains("0 or 1"));
+  }
+}
+
 TEST_CASE("Sirius configuration loading from file with configurator",
           "[sirius][context][isolated_context]")
 {
