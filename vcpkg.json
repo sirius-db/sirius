@@ -20,7 +20,8 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    "curl",
+    "roaring"
   ],
   "overrides": [
     {

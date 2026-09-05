@@ -75,4 +75,20 @@ struct parsed_uri {
  */
 parsed_uri parse(std::string_view uri);
 
+/**
+ * @brief Strip a leading `file://` scheme (case-insensitive) so @p path can be
+ *        handed to a local-file backend.
+ *
+ * Anything else — bare absolute paths, `s3://`, `gs://`, ... — is returned
+ * unchanged, so this is safe to apply unconditionally at an I/O boundary.
+ *
+ * Iceberg manifests written by the Apache implementations record fully-qualified
+ * URIs (`file:///abs/path/x.parquet`), while DuckDB's multi-file binder and our
+ * own fixtures generally carry bare paths. The local reactors only open bare
+ * paths, so an un-stripped URI reaches `create_io_object` and throws
+ * "unsupported path" — which surfaces as a RUNTIME GPU fallback, not a clean
+ * plan-time decline.
+ */
+[[nodiscard]] std::string strip_file_scheme(std::string_view path);
+
 }  // namespace sirius::io

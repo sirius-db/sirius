@@ -92,6 +92,10 @@ find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
+# CRoaring decodes Iceberg Puffin deletion vectors (portable Roaring). Host-side
+# only; the same library duckdb-iceberg uses for the same blob, so the two
+# readers agree by construction.
+find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -346,6 +350,12 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/puffin_reader.cpp
+    src/op/scan/positional_delete_filter.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
@@ -455,6 +465,7 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
+    src/op/scan/equality_delete_mask.cu
     src/cuda/dense_count_join_impl.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
@@ -597,6 +608,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
+    roaring::roaring
     telemetry_bridge
     core_functions_extension
     parquet_extension
@@ -867,6 +879,9 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_iceberg_batch_layout.cpp
+    test/cpp/scan/test_iceberg_equality_delete.cpp
+    test/cpp/scan/test_puffin_reader.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp

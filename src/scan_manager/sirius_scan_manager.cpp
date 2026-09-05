@@ -28,12 +28,14 @@
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
@@ -592,22 +594,10 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend.
-std::string normalize_path(std::string const& p)
-{
-  static constexpr std::string_view kFile = "file://";
-  if (p.size() > kFile.size()) {
-    bool is_file_uri = true;
-    for (std::size_t i = 0; i < kFile.size(); ++i) {
-      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
-        is_file_uri = false;
-        break;
-      }
-    }
-    if (is_file_uri) { return p.substr(kFile.size()); }
-  }
-  return p;
-}
+/// resolved by a local-file backend. Thin alias for the shared helper — kept so
+/// the cache-key and routing call sites below read as they did, while there is
+/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
+std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -1914,6 +1904,14 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // serves a duckdb scan over the same catalog.schema.table. A cache of one format
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
+  // An iceberg scan carrying deletes is NOT a parquet scan over the same files, even though its
+  // bind data derives from parquet's and its file set matches exactly. A pinned entry holds the
+  // data files' rows as written; the deletes live in manifests the pin never saw. Serving that
+  // cache would return rows the table logically deleted, and would look like a cache hit rather
+  // than a correctness bug — so an iceberg scan with deletes always reads from disk.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
+    if (ice->delete_data && !ice->delete_data->empty()) { return {}; }
+  }
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);

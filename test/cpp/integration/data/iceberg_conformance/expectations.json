@@ -1,0 +1,130 @@
+{
+  "cases": [
+    {
+      "name": "append_only",
+      "table_dir": "test/cpp/integration/data/iceberg_conformance/append_only/conf/append_only",
+      "columns": [
+        "id",
+        "name"
+      ],
+      "field_ids": {
+        "id": 1,
+        "name": 2
+      },
+      "expected_rows": [
+        [
+          1,
+          "a"
+        ],
+        [
+          2,
+          "b"
+        ],
+        [
+          3,
+          "c"
+        ]
+      ],
+      "expect_gpu": true,
+      "why": "no schema evolution, no deletes - the GPU path's happy case"
+    },
+    {
+      "name": "drop_readd",
+      "table_dir": "test/cpp/integration/data/iceberg_conformance/drop_readd/conf/drop_readd",
+      "columns": [
+        "id",
+        "x",
+        "y"
+      ],
+      "field_ids": {
+        "id": 1,
+        "x": 2,
+        "y": 4
+      },
+      "expected_rows": [
+        [
+          1,
+          10,
+          null
+        ],
+        [
+          2,
+          20,
+          null
+        ]
+      ],
+      "expect_gpu": false,
+      "why": "dropped and re-added column: old file's y is a DIFFERENT field id, must read NULL"
+    },
+    {
+      "name": "rename_col",
+      "table_dir": "test/cpp/integration/data/iceberg_conformance/rename_col/conf/rename_col",
+      "columns": [
+        "id",
+        "value"
+      ],
+      "field_ids": {
+        "id": 1,
+        "value": 2
+      },
+      "expected_rows": [
+        [
+          3,
+          "new_c"
+        ],
+        [
+          4,
+          "new_d"
+        ],
+        [
+          1,
+          "old_a"
+        ],
+        [
+          2,
+          "old_b"
+        ]
+      ],
+      "expect_gpu": false,
+      "why": "renamed column: same field id, old file carries the original name"
+    },
+    {
+      "name": "add_column",
+      "table_dir": "test/cpp/integration/data/iceberg_conformance/add_column/conf/add_column",
+      "columns": [
+        "id",
+        "a",
+        "b"
+      ],
+      "field_ids": {
+        "id": 1,
+        "a": 2,
+        "b": 3
+      },
+      "expected_rows": [
+        [
+          3,
+          30,
+          300
+        ],
+        [
+          4,
+          40,
+          400
+        ],
+        [
+          1,
+          10,
+          null
+        ],
+        [
+          2,
+          20,
+          null
+        ]
+      ],
+      "expect_gpu": false,
+      "why": "column added after the first data file: absent from that file, must read NULL"
+    }
+  ]
+}
