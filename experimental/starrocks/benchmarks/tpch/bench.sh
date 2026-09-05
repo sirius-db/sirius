@@ -28,6 +28,8 @@
 # Environment:
 #   TPCH_DATA          directory holding <table>/*.parquet (substituted into the
 #                      queries' FILES() paths; required)
+#   TPCH_SF            scale factor of TPCH_DATA (default 1); substituted for
+#                      __TPCH_SF__, which q11 uses to scale its 0.0001 fraction
 #   FE_PORT            FE MySQL port (default 9030)
 #   QUERY_TIMEOUT      per-run client timeout in seconds for warm runs (default 30;
 #                      SF1 passes finish in well under 2s, so anything near this is
@@ -81,6 +83,7 @@ QUERIES=("$@")
 [ ${#QUERIES[@]} -eq 0 ] && QUERIES=($(cd "$HERE/queries" && ls q*.sql | sed 's/\.sql$//'))
 
 TPCH_DATA=${TPCH_DATA:?set TPCH_DATA to the directory holding <table>/*.parquet}
+TPCH_SF=${TPCH_SF:-1}
 FE_PORT=${FE_PORT:-9030}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-30}
 COLD_TIMEOUT=${COLD_TIMEOUT:-180}
@@ -170,7 +173,7 @@ echo "cluster: $ALIVE_CN alive compute nodes + $ALIVE_BE alive backends (MIN_BAC
 echo "query,run,phase,status,ms,rows" > "$OUT_CSV"
 
 for q in "${QUERIES[@]}"; do
-  Q=$(sed "s|__TPCH_DATA__|$TPCH_DATA|g" "$HERE/queries/$q.sql")
+  Q=$(sed -e "s|__TPCH_DATA__|$TPCH_DATA|g" -e "s|__TPCH_SF__|$TPCH_SF|g" "$HERE/queries/$q.sql")
   if [ "$COLD_RESTART" = 1 ]; then
     restart_cluster || { echo "cluster did not recover"; exit 1; }
   fi

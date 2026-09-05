@@ -4,14 +4,18 @@ Times TPC-H queries over external parquet against whatever FE answers on port 90
 checks the answers against DuckDB. The queries scan the files through `FILES()` CTEs — no
 data loading step; the FE byte-splits large tables across the compute nodes.
 
-This tree ships q01 and q06, the two queries the one-CN-per-GPU proof runs. The harness
-takes any `queries/qNN.sql` written in the same shape.
+This tree ships all 22 queries. Every departure from the stock TPC-H text is recorded in
+[`QUERY-DEVIATIONS.md`](QUERY-DEVIATIONS.md) (never as `--` comments inside the `.sql`
+files, which `mysql -e` would swallow). q11 keeps its `0.0001` fraction spec-correct at any
+scale through `__TPCH_SF__`, substituted with `$TPCH_SF` (default 1) by `bench.sh` and
+`oracle.py`; at SF1000 without it the query returns zero rows on every engine.
 
 ## Layout
 
 - `queries/qNN.sql` — the queries with `FILES()` preludes; `__TPCH_DATA__` is substituted
   with `$TPCH_DATA` at run time (a directory holding `<table>/*.parquet`, the layout
-  [`bench/common/gen-tpch.sh`](../../../../bench/common/gen-tpch.sh) writes).
+  [`bench/common/gen-tpch.sh`](../../../../bench/common/gen-tpch.sh) writes) and
+  `__TPCH_SF__` with `$TPCH_SF`.
 - `bench.sh` — per-query sweep: 1 discarded warm-up + N timed runs, wall-clock ms
   around `mysql -e`, medians taken later. Refusals (ERROR) are recorded once; hangs
   are cut at `$QUERY_TIMEOUT` (default 30 s) and recorded as wedges. After either,
@@ -24,11 +28,12 @@ takes any `queries/qNN.sql` written in the same shape.
 - [`../../tools/oracle.py`](../../tools/oracle.py) — runs the same SQL through DuckDB on
   the CPU over the same parquet and writes one `<q>.tsv` per query, formatted like
   `mysql --batch`. Needs the `duckdb` Python package (the repo's pixi env has it).
-- [`../../tools/compare.py`](../../tools/compare.py) — diffs the sweep's `<q>.rN.out`
-  files against the oracle's TSVs: row count first, then cell by cell (relative
-  tolerance for numerics, exact match otherwise), and exits non-zero unless every
-  query matches. This is the harness's correctness gate; `bench.sh` alone times and
-  counts rows.
+- [`../../tools/compare.py`](../../tools/compare.py) — diffs EVERY `<q>.rN.out` of the
+  sweep against the oracle's TSVs: row count first, then cell by cell (relative
+  tolerance for numerics, exact match otherwise). A query's verdict is the worst of its
+  runs, so a cold run that returned zero rows next to two matching warm runs is reported
+  as the flake it is; it exits non-zero unless every run of every query matches. This is
+  the harness's correctness gate; `bench.sh` alone times and counts rows.
 - [`../cluster8.sh`](../cluster8.sh) — 1 FE + N Sirius CNs, one CN per GPU, cross-CN
   exchange over nixl.
 
