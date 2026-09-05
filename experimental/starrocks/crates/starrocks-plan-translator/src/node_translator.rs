@@ -1781,6 +1781,10 @@ fn translate_hash_join(
         TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, JoinOutput::Both),
         TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, JoinOutput::Both),
         TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, JoinOutput::Left),
+        // The FE commutes a semi join to RIGHT_SEMI when it decides the probe side should be
+        // built (cardinality-driven once FILES() scans carry row counts). Substrait's RightSemi
+        // keeps the right (build) row layout, which the consumer lowers to DuckDB RIGHT_SEMI.
+        TJoinOp::RIGHT_SEMI_JOIN => (join_rel::JoinType::RightSemi, JoinOutput::Right),
         TJoinOp::LEFT_ANTI_JOIN => (join_rel::JoinType::Left, JoinOutput::LeftAnti),
         TJoinOp::RIGHT_ANTI_JOIN => (join_rel::JoinType::Right, JoinOutput::RightAnti),
         TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
@@ -1872,6 +1876,7 @@ fn translate_hash_join(
 
     let (row_tuples, output_width) = match output {
         JoinOutput::Left => (left.row_tuples.clone(), left.output_width),
+        JoinOutput::Right => (right.row_tuples.clone(), right.output_width),
         JoinOutput::NullAwareLeftAnti => (left.row_tuples.clone(), left.output_width + 1),
         _ => (
             combined_tuples.clone(),
@@ -1940,6 +1945,8 @@ fn translate_hash_join(
 enum JoinOutput {
     Both,
     Left,
+    /// Only the right (build) side's columns survive: a RIGHT_SEMI join.
+    Right,
     LeftAnti,
     RightAnti,
     NullAwareLeftAnti,
