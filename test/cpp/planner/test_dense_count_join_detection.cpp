@@ -34,7 +34,10 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_aggregate.hpp>
+#include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <fcntl.h>
 #include <signal.h>
@@ -424,6 +427,111 @@ TEST_CASE_METHOD(dense_count_join_fixture,
   REQUIRE(has_dense_count_join(query));
   auto plan = generate_sirius_plan(*con, query);
   REQUIRE(collect(plan.get(), sirius::op::SiriusPhysicalOperatorType::HASH_GROUP_BY).empty());
+}
+
+// Wraps the join under the first COUNT aggregate in a column-only projection that reverses the
+// join's output order, and rewrites the aggregate's references through it: the shape the
+// StarRocks translator emits (AGGREGATION_NODE over a PROJECT emit over a HASH_JOIN), which the
+// planner must look through.
+bool interpose_reversing_projection(duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+      op.children[0]->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    auto& aggregate  = op.Cast<duckdb::LogicalAggregate>();
+    auto& join       = *op.children[0];
+    auto const width = join.types.size();
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+    duckdb::vector<duckdb::LogicalType> types;
+    for (duckdb::idx_t i = 0; i < width; ++i) {
+      auto const source = width - 1 - i;
+      select_list.push_back(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(join.types[source], source));
+      types.push_back(join.types[source]);
+    }
+    auto projection   = duckdb::make_uniq<duckdb::LogicalProjection>(9000, std::move(select_list));
+    projection->types = std::move(types);
+    projection->children.push_back(std::move(op.children[0]));
+    op.children[0] = std::move(projection);
+    auto remap     = [width](duckdb::Expression& expression) {
+      if (expression.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+        auto& ref = expression.Cast<duckdb::BoundReferenceExpression>();
+        ref.index = width - 1 - ref.index;
+      }
+    };
+    for (auto& group : aggregate.groups) {
+      remap(*group);
+    }
+    for (auto& expression : aggregate.expressions) {
+      for (auto& child : expression->Cast<duckdb::BoundAggregateExpression>().children) {
+        remap(*child);
+      }
+    }
+    return true;
+  }
+  for (auto& child : op.children) {
+    if (interpose_reversing_projection(*child)) { return true; }
+  }
+  return false;
+}
+
+// A projection that computes a column between the aggregate and the join: the aggregate would
+// count a derived value, so the fusion must decline.
+bool interpose_computing_projection(duckdb::LogicalOperator& op)
+{
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+      op.children[0]->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+    auto& join = *op.children[0];
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
+    duckdb::vector<duckdb::LogicalType> types;
+    for (duckdb::idx_t i = 0; i < join.types.size(); ++i) {
+      duckdb::unique_ptr<duckdb::Expression> column =
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(join.types[i], i);
+      if (i == 0) {
+        // COALESCE(col, col): same type, same value, but no longer a bare reference.
+        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> args;
+        args.push_back(std::move(column));
+        args.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(join.types[i], i));
+        column = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+          duckdb::ExpressionType::OPERATOR_COALESCE, join.types[i]);
+        for (auto& arg : args) {
+          column->Cast<duckdb::BoundOperatorExpression>().children.push_back(std::move(arg));
+        }
+      }
+      types.push_back(join.types[i]);
+      select_list.push_back(std::move(column));
+    }
+    auto projection   = duckdb::make_uniq<duckdb::LogicalProjection>(9001, std::move(select_list));
+    projection->types = std::move(types);
+    projection->children.push_back(std::move(op.children[0]));
+    op.children[0] = std::move(projection);
+    return true;
+  }
+  for (auto& child : op.children) {
+    if (interpose_computing_projection(*child)) { return true; }
+  }
+  return false;
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join looks through column-only projections and maps the refs",
+                 "[dense_count_join][plan]")
+{
+  auto const query =
+    "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
+  REQUIRE(has_dense_count_join(query, {.mutate = interpose_reversing_projection}));
+  auto plan = generate_sirius_plan(*con, query, {.mutate = interpose_reversing_projection});
+  using T   = sirius::op::SiriusPhysicalOperatorType;
+  REQUIRE(collect(plan.get(), T::HASH_GROUP_BY).empty());
+  REQUIRE(collect(plan.get(), T::PROJECTION).empty());
+}
+
+TEST_CASE_METHOD(dense_count_join_fixture,
+                 "dense_count_join declines a projection that computes a column",
+                 "[dense_count_join][plan]")
+{
+  auto const query =
+    "SELECT c_id, count(o_id) FROM cust LEFT JOIN ord ON c_id = o_cust GROUP BY c_id";
+  REQUIRE_FALSE(has_dense_count_join(query, {.mutate = interpose_computing_projection}));
 }
 
 TEST_CASE_METHOD(dense_count_join_fixture,

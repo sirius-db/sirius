@@ -26,6 +26,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
@@ -255,6 +256,59 @@ static bool is_host_builtin_count(duckdb::ClientContext& context,
   return canonical != overloads.end() && function == *canonical;
 }
 
+// The join an aggregate counts over, looking through the column-only projections between them,
+// plus the map from the aggregate's input columns to the join's output columns. A projection of
+// bare references only renames and reorders; the StarRocks translator emits one under every
+// AGGREGATION_NODE whose child is an exchange or a join (its PROJECT emit), so q13's
+// COUNT-join arrives as AGGREGATE -> PROJECT -> JOIN and never fused. A projection that computes
+// anything ends the search: the aggregate would then count a derived column.
+struct counted_join {
+  duckdb::LogicalComparisonJoin const* join;
+  // aggregate input column -> join output column
+  std::vector<duckdb::idx_t> to_join_column;
+};
+
+static std::optional<counted_join> join_under_pure_projections(duckdb::LogicalOperator const& child)
+{
+  auto const* node = &child;
+  std::vector<duckdb::idx_t> map;
+  bool identity = true;
+  while (node->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    auto const& projection = node->Cast<duckdb::LogicalProjection>();
+    std::vector<duckdb::idx_t> layer;
+    layer.reserve(projection.expressions.size());
+    for (auto const& expression : projection.expressions) {
+      if (expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+        return std::nullopt;
+      }
+      layer.push_back(expression->Cast<duckdb::BoundReferenceExpression>().index);
+    }
+    if (identity) {
+      map      = std::move(layer);
+      identity = false;
+    } else {
+      for (auto& column : map) {
+        if (column >= layer.size()) { return std::nullopt; }
+        column = layer[column];
+      }
+    }
+    node = node->children[0].get();
+  }
+  if (node->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return std::nullopt; }
+  auto const& join = node->Cast<duckdb::LogicalComparisonJoin>();
+  if (identity) {
+    map.resize(join.types.size());
+    for (duckdb::idx_t i = 0; i < map.size(); ++i) {
+      map[i] = i;
+    }
+  } else {
+    for (auto column : map) {
+      if (column >= join.types.size()) { return std::nullopt; }
+    }
+  }
+  return counted_join{&join, std::move(map)};
+}
+
 static std::optional<dense_count_join_detection> detect_dense_count_join(
   duckdb::ClientContext& context, duckdb::LogicalAggregate const& op)
 {
@@ -274,10 +328,10 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
     return std::nullopt;
   }
 
-  if (op.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-    return std::nullopt;
-  }
-  auto const& join = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  auto const counted = join_under_pure_projections(*op.children[0]);
+  if (!counted) { return std::nullopt; }
+  auto const& join           = *counted->join;
+  auto const& to_join_column = counted->to_join_column;
   D_ASSERT(join.children.size() == 2);
   if (join.join_type != duckdb::JoinType::LEFT && join.join_type != duckdb::JoinType::RIGHT) {
     return std::nullopt;
@@ -311,8 +365,10 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   D_ASSERT(join.types.size() == layout.left_output_count + layout.right_output_count);
 
   auto const& group_ref = op.groups[0]->Cast<duckdb::BoundReferenceExpression>();
-  D_ASSERT(ref_matches(group_ref, join.types));
-  auto const [group_child, group_col] = resolve_join_output_column(join, layout, group_ref.index);
+  if (group_ref.index >= to_join_column.size()) { return std::nullopt; }
+  auto const group_join_column = to_join_column[group_ref.index];
+  D_ASSERT(group_join_column < join.types.size());
+  auto const [group_child, group_col] = resolve_join_output_column(join, layout, group_join_column);
   if (group_child != preserved_child || group_col != preserved_ref.index) { return std::nullopt; }
 
   // COUNT(col): the argument must come from the counted side (a preserved-side or computed
@@ -320,8 +376,11 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
   std::optional<std::size_t> counted_value_idx;
   if (is_count) {
     auto const& count_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
-    D_ASSERT(ref_matches(count_ref, join.types));
-    auto const [count_child, count_col] = resolve_join_output_column(join, layout, count_ref.index);
+    if (count_ref.index >= to_join_column.size()) { return std::nullopt; }
+    auto const count_join_column = to_join_column[count_ref.index];
+    D_ASSERT(count_join_column < join.types.size());
+    auto const [count_child, count_col] =
+      resolve_join_output_column(join, layout, count_join_column);
     if (count_child != counted_child) { return std::nullopt; }
     counted_value_idx = count_col;
   }
@@ -345,7 +404,13 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
 
   auto const detection = detect_dense_count_join(context, op);
   if (!detection) { return nullptr; }
-  auto& join = op.children[0]->Cast<duckdb::LogicalComparisonJoin>();
+  // The projections between the aggregate and the join only renamed and reordered columns the
+  // fused operator addresses by join-child index, so they are skipped along with the join.
+  duckdb::LogicalOperator* under = op.children[0].get();
+  while (under->type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    under = under->children[0].get();
+  }
+  auto& join = under->Cast<duckdb::LogicalComparisonJoin>();
 
   // Mirror plan_comparison_join: capture cardinalities before create_plan drains the nodes.
   auto const preserved_cardinality =
