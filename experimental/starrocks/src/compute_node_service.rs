@@ -8,8 +8,8 @@ use crate::fragment_executor::{
     StagedBatch,
 };
 use crate::local_exchange::{
-    ExchangeKey, FuseOffer, LocalExchange, LocalPlan, ReadyExchangeInput, ReadyFragment,
-    SenderSource,
+    ExchangeKey, FuseOffer, LocalExchange, LocalPlan, PushedFrame, ReadyExchangeInput,
+    ReadyFragment, RemoteFrameClaim, SenderSource,
 };
 use crate::nixl_transport::{NixlTransport, RemoteSendSpec};
 use crate::proto::starrocks::{
@@ -794,24 +794,49 @@ impl SiriusComputeNodeService {
                 ticket: None,
             })
         };
-        // A frame for a receiver the FE already cancelled here: the peer's drain is still
-        // running and must complete quietly (it gets OK, and its own drop_parked frees the
-        // sender side), but nothing may re-enter the rendezvous. Release the lease it landed in.
-        if self.core.exchanges.is_retired(key.fragment_instance_id) {
-            if let Some(batch) = &batch
-                && batch.len > 0
-            {
-                self.core.executor.staging_release(batch.offset)?;
+        // Claim the frame's sequence number BEFORE touching its payload. A brpc reconnect-retry
+        // replays a frame this CN already processed under the same lease offset; the first
+        // delivery copied that lease out and released it, so staging or releasing it again would
+        // read an offset that may by now belong to another frame in flight and double-release
+        // it. A lost frame fails the sender, its lease going back first.
+        let claim = match self.core.exchanges.claim_remote_frame(key, sender_id, seq) {
+            Ok(claim) => claim,
+            Err(err) => {
+                if let Some(batch) = &batch
+                    && batch.len > 0
+                    && let Err(release_err) = self.core.executor.staging_release(batch.offset)
+                {
+                    tracing::warn!(offset = batch.offset, error = %release_err, "failed to release the lease of a refused remote frame");
+                }
+                return Err(err);
             }
-            info!(
-                receiver_fragment_instance_id = %key.fragment_instance_id,
-                stream_id = key.node_id,
-                sender_id,
-                seq,
-                eos,
-                "released a remote frame for a retired receiver"
-            );
-            return Ok(());
+        };
+        match claim {
+            RemoteFrameClaim::Fresh => {}
+            RemoteFrameClaim::Duplicate => {
+                // The first delivery owns (or already returned) this frame's lease.
+                return Ok(());
+            }
+            // A frame for a receiver the FE already cancelled here: the peer's drain is still
+            // running and must complete quietly (it gets OK, and its own drop_parked frees the
+            // sender side), but nothing may re-enter the rendezvous. Release the lease it landed
+            // in.
+            RemoteFrameClaim::Retired => {
+                if let Some(batch) = &batch
+                    && batch.len > 0
+                {
+                    self.core.executor.staging_release(batch.offset)?;
+                }
+                info!(
+                    receiver_fragment_instance_id = %key.fragment_instance_id,
+                    stream_id = key.node_id,
+                    sender_id,
+                    seq,
+                    eos,
+                    "released a remote frame for a retired receiver"
+                );
+                return Ok(());
+            }
         }
         // Copy-out-on-arrival: the payload moves into pool memory now and its lease goes back
         // before the receiver fragment exists, so the arena only ever holds frames in flight.
@@ -838,6 +863,11 @@ impl SiriusComputeNodeService {
             other => other,
         };
         let ticket = batch.as_ref().and_then(|staged| staged.ticket);
+        // A batch still in its lease (no inbound store): the lease is what a refusal must return.
+        let lease = batch
+            .as_ref()
+            .filter(|staged| staged.ticket.is_none() && staged.len > 0)
+            .map(|staged| staged.offset);
         tracing::debug!(
             exchange = ?key,
             sender_id,
@@ -847,7 +877,7 @@ impl SiriusComputeNodeService {
             ticket,
             "received remote exchange frame"
         );
-        let ready = match self.core.exchanges.push_remote_frame(
+        let pushed = match self.core.exchanges.push_claimed_frame(
             key,
             sender_id,
             seq,
@@ -855,21 +885,50 @@ impl SiriusComputeNodeService {
             params.column_names.clone(),
             batch,
         ) {
-            Ok(ready) => ready,
+            Ok(pushed) => pushed,
             Err(err) => {
                 // The rendezvous refused the frame; its staged copy has no owner now.
-                if let Some(ticket) = ticket
-                    && let Err(drop_err) = self.core.executor.drop_inbound(ticket)
-                {
-                    tracing::warn!(ticket, error = %drop_err, "failed to drop the staged frame the rendezvous refused");
-                }
+                self.disown_frame(ticket, lease, "the rendezvous refused");
                 return Err(err);
+            }
+        };
+        let ready = match pushed {
+            PushedFrame::Recorded(ready) => ready,
+            PushedFrame::Retired => {
+                // The FE cancelled the receiver between the claim and the record: nothing holds
+                // the frame's copy now, and the peer's drain still completes quietly.
+                self.disown_frame(ticket, lease, "its receiver was retired");
+                info!(
+                    receiver_fragment_instance_id = %key.fragment_instance_id,
+                    stream_id = key.node_id,
+                    sender_id,
+                    seq,
+                    eos,
+                    "released a remote frame for a receiver retired while it was being staged"
+                );
+                return Ok(());
             }
         };
         if let Some(ready) = ready {
             self.dispatch(ready)?;
         }
         Ok(())
+    }
+
+    /// Returns a frame nothing will consume: drops its inbound-store ticket, or releases the
+    /// lease it still sits in. Failures are logged, not propagated -- the caller is already on
+    /// an error or cancellation path and the frame's owner is gone either way.
+    fn disown_frame(&self, ticket: Option<u64>, lease: Option<u64>, why: &str) {
+        if let Some(ticket) = ticket
+            && let Err(err) = self.core.executor.drop_inbound(ticket)
+        {
+            tracing::warn!(ticket, error = %err, "failed to drop a staged frame after {why} it");
+        }
+        if let Some(offset) = lease
+            && let Err(err) = self.core.executor.staging_release(offset)
+        {
+            tracing::warn!(offset, error = %err, "failed to release a frame's lease after {why} it");
+        }
     }
 }
 
@@ -1431,17 +1490,22 @@ impl ServiceCore {
             if stream_sink.limit.is_some_and(|limit| limit >= 0) {
                 return Err("data stream sink limits are not supported".to_string());
             }
+            // A multicast sink's `output_columns` lists, as slot ids, the producer output
+            // columns its consumer reads (FE `MultiCastPlanFragment`: the consumer's receive
+            // columns; StarRocks BEs ship only those slots, keyed by id). This CN ships the full
+            // row: the consumer's exchange declares the producer's whole tuple and binds the
+            // stream by position, and its own project node reads the slots it needs. Pruning on
+            // the wire is a bandwidth optimisation, not a correctness requirement.
             if let Some(columns) = stream_sink
                 .output_columns
                 .as_ref()
                 .filter(|columns| !columns.is_empty())
-                && columns
-                    .iter()
-                    .copied()
-                    .ne(0..translated.output_names.len() as i32)
             {
-                return Err(
-                    "non-identity data stream sink output_columns are not supported".to_string(),
+                tracing::debug!(
+                    exchange = stream_sink.dest_node_id,
+                    receive_slots = ?columns,
+                    width = translated.output_names.len(),
+                    "data stream sink prunes columns at the FE; shipping the full row"
                 );
             }
         }
@@ -3118,6 +3182,45 @@ pub(crate) mod tests {
             ],
             "one output stream per consumer exchange, local destinations only"
         );
+    }
+
+    /// The FE prunes a reused CTE per consumer through the sink's `output_columns`, which are
+    /// SLOT IDS of the producer's output tuple (q15's `max(total_revenue)` consumer lists the one
+    /// slot it reads), never positions. The CN ships the full row to every consumer regardless,
+    /// so such a sink is accepted and both consumers fetch rows; refusing it broke every
+    /// materialised-CTE plan (q02, q07, q08, q11, q15, q17, q18 with `cbo_cte_reuse_rate = 0`).
+    #[test]
+    fn multicast_sink_with_pruned_output_columns_ships_the_full_row() {
+        let executor = Arc::new(FanOutRecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(72, 1);
+        let consumer_a = TUniqueId::new(72, 2);
+        let consumer_b = TUniqueId::new(72, 3);
+        assert_exec_ok(&service, &result_receiver(&query_id, &consumer_a, 7, 1));
+        assert_exec_ok(&service, &result_receiver(&query_id, &consumer_b, 9, 1));
+
+        let mut sink = multicast_sink(vec![
+            (7, vec![local_destination(consumer_a.clone())]),
+            (9, vec![local_destination(consumer_b.clone())]),
+        ]);
+        // Slot ids as the FE assigns them: query-global, unrelated to output positions, and one
+        // consumer reads a single column of the two the producer emits.
+        let sinks = &mut sink.multi_cast_stream_sink.as_mut().unwrap().sinks;
+        sinks[0].output_columns = Some(vec![14, 15]);
+        sinks[1].output_columns = Some(vec![15]);
+        let mut producer = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        producer.fragment.as_mut().unwrap().output_sink = Some(sink);
+        let mut exec = exec_params(query_id, TUniqueId::new(72, 4));
+        exec.sender_id = Some(0);
+        producer.params = Some(exec);
+        assert_exec_ok(&service, &producer);
+
+        let a = fetch_rows_eventually(&service, consumer_a.hi, consumer_a.lo);
+        let b = fetch_rows_eventually(&service, consumer_b.hi, consumer_b.lo);
+        assert!(!a.attachment.is_empty() && !b.attachment.is_empty());
+        let outputs = executor.outputs.lock().unwrap();
+        assert_eq!(outputs.len(), 1, "the producer runs and parks once");
+        assert!(outputs[0].broadcast, "every consumer receives the full output");
     }
 
     /// A multicast sink whose consumer has no instance on this CN is refused before any GPU

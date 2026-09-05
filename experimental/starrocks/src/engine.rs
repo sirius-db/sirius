@@ -598,13 +598,16 @@ fn run_fragment_inner<'ctx>(
             .map_err(|_| format!("negative remote sender id {sender_id}"))?;
         for batch in batches {
             if let Some(ticket) = batch.ticket {
+                // The engine takes the ticket out of the store before it checks the batch, so a
+                // failed push has consumed it too: mark it before the call, or the error sweep
+                // would try to drop a ticket that is already gone and report a phantom leak.
+                taken.insert(ticket);
                 fragment.push_inbound(stream_id, ticket).map_err(|err| {
                     format!(
                         "failed to take staged remote batch {ticket} from sender {sender_id} \
                          into stream {stream_id}: {err}"
                     )
                 })?;
-                taken.insert(ticket);
                 continue;
             }
             let staged = sirius::PackedBatch {

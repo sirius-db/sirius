@@ -85,6 +85,31 @@ pub(crate) struct ReadyExchangeInput {
     pub(crate) sources: Vec<SenderSource>,
 }
 
+/// Outcome of claiming a remote frame's sequence number ahead of its payload
+/// ([`LocalExchange::claim_remote_frame`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteFrameClaim {
+    /// First sight of this sequence number; the caller stages and records the frame.
+    Fresh,
+    /// A brpc reconnect-retry replay of a frame this CN already processed; its lease was handled
+    /// by the first delivery and must not be touched again.
+    Duplicate,
+    /// The receiver was retired (the FE cancelled it here); release the lease and reply OK.
+    Retired,
+}
+
+/// Outcome of recording a claimed remote frame ([`LocalExchange::push_claimed_frame`]).
+// Transient: returned and matched at once, never stored, so the variant size gap is moot.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(crate) enum PushedFrame {
+    /// The frame is in the rendezvous; `Some` when it completed the receiver's sender set.
+    Recorded(Option<ReadyFragment>),
+    /// The receiver was retired between the claim and the record; the frame's ticket or lease
+    /// is the caller's to release.
+    Retired,
+}
+
 /// A receiver fragment whose exchange inputs are all ready for sequential execution.
 #[derive(Debug)]
 pub(crate) struct ReadyFragment {
@@ -316,6 +341,13 @@ impl LocalExchange {
 
     /// Records one `transmit_packed` frame from a remote sender: a staged batch, eos, or both.
     /// Returns the receiver when the eos completes its sender set.
+    ///
+    /// Claims the frame's sequence number and records it in one go. A caller that copies the
+    /// payload out of its lease before recording it (the CN's RPC handler) must instead claim
+    /// through [`claim_remote_frame`](Self::claim_remote_frame) ahead of the copy and record
+    /// with [`push_claimed_frame`](Self::push_claimed_frame): a replayed frame has to be
+    /// recognised before anything touches the lease its first delivery already released.
+    #[cfg(test)]
     pub(crate) fn push_remote_frame(
         &self,
         key: ExchangeKey,
@@ -325,6 +357,28 @@ impl LocalExchange {
         names: Vec<String>,
         batch: Option<StagedBatch>,
     ) -> Result<Option<ReadyFragment>, String> {
+        Self::validate_frame_shape(key, sender_id, seq, eos, &names, batch.as_ref())?;
+        match self.claim_remote_frame(key, sender_id, seq)? {
+            RemoteFrameClaim::Duplicate | RemoteFrameClaim::Retired => Ok(None),
+            RemoteFrameClaim::Fresh => {
+                match self.push_claimed_frame(key, sender_id, seq, eos, names, batch)? {
+                    PushedFrame::Recorded(ready) => Ok(ready),
+                    PushedFrame::Retired => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// A frame must carry column names (the receiver binds its stream schema by them) and a
+    /// batch, eos, or both.
+    fn validate_frame_shape(
+        key: ExchangeKey,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        names: &[String],
+        batch: Option<&StagedBatch>,
+    ) -> Result<(), String> {
         if names.is_empty() {
             return Err(format!(
                 "remote sender {sender_id} for exchange {key:?} sent a frame without column \
@@ -337,18 +391,34 @@ impl LocalExchange {
                  neither a batch nor eos"
             ));
         }
-        let mut state = self.lock();
+        Ok(())
+    }
 
+    /// Claims frame `seq` of a remote sender before its payload is touched.
+    ///
+    /// `Fresh` advances the sender's expected sequence. `Duplicate` is a brpc reconnect-retry
+    /// replaying a frame this CN already processed: it names the same lease offset as the first
+    /// delivery, which already copied that lease out and released it (or still holds it, without
+    /// an inbound store), so the caller must neither stage nor release it again; by now the
+    /// offset may belong to another frame in flight. `Retired` is a receiver the FE already
+    /// cancelled here. A gap is a lost frame and fails the sender.
+    pub(crate) fn claim_remote_frame(
+        &self,
+        key: ExchangeKey,
+        sender_id: i32,
+        seq: i64,
+    ) -> Result<RemoteFrameClaim, String> {
+        let mut state = self.lock();
+        if state.retired.contains(&key.fragment_instance_id) {
+            return Ok(RemoteFrameClaim::Retired);
+        }
         let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
         if seq < *expected_seq {
-            // brpc reconnect-retry can replay a frame the peer already processed; its batch (if
-            // any) landed in the same lease the first delivery recorded, so dropping the replay
-            // loses nothing and leaks nothing.
             info!(
                 exchange = ?key,
                 sender_id, seq, "dropping duplicate remote exchange frame"
             );
-            return Ok(None);
+            return Ok(RemoteFrameClaim::Duplicate);
         }
         if seq > *expected_seq {
             return Err(format!(
@@ -357,6 +427,28 @@ impl LocalExchange {
             ));
         }
         *expected_seq += 1;
+        Ok(RemoteFrameClaim::Fresh)
+    }
+
+    /// Records a frame whose sequence number [`claim_remote_frame`](Self::claim_remote_frame)
+    /// accepted as `Fresh`. `Retired` means the FE cancelled the receiver between the claim and
+    /// this call: nothing was recorded, and the batch (its ticket or lease) is the caller's to
+    /// release. Without this check the frame would re-create the retired receiver's source
+    /// entry, and a ticketed batch in it would never be dropped.
+    pub(crate) fn push_claimed_frame(
+        &self,
+        key: ExchangeKey,
+        sender_id: i32,
+        seq: i64,
+        eos: bool,
+        names: Vec<String>,
+        batch: Option<StagedBatch>,
+    ) -> Result<PushedFrame, String> {
+        Self::validate_frame_shape(key, sender_id, seq, eos, &names, batch.as_ref())?;
+        let mut state = self.lock();
+        if state.retired.contains(&key.fragment_instance_id) {
+            return Ok(PushedFrame::Retired);
+        }
 
         let senders = state.sources.entry(key).or_default();
         let source = senders
@@ -402,7 +494,7 @@ impl LocalExchange {
         if eos {
             *closed = true;
         }
-        Self::take_ready(&mut state, key.fragment_instance_id)
+        Self::take_ready(&mut state, key.fragment_instance_id).map(PushedFrame::Recorded)
     }
 
     fn take_ready(
@@ -518,7 +610,9 @@ impl LocalExchange {
         removed
     }
 
-    /// Whether `retire_receiver` was called for this receiver (O(1)).
+    /// Whether `retire_receiver` was called for this receiver (O(1)). Production code learns
+    /// this from [`claim_remote_frame`](Self::claim_remote_frame) under the same lock.
+    #[cfg(test)]
     pub(crate) fn is_retired(&self, fragment_instance_id: FragmentInstanceId) -> bool {
         self.lock().retired.contains(&fragment_instance_id)
     }
@@ -827,6 +921,88 @@ mod tests {
         assert_eq!(batches.len(), 1);
     }
 
+    /// The RPC handler copies a frame out of its lease before recording it, so the replay check
+    /// has to run first: a claim recognises the replay of a frame already processed (and of one
+    /// merely claimed) without any payload having been touched, and the record step then takes
+    /// only frames the claim accepted.
+    #[test]
+    fn claim_recognises_a_replay_before_the_payload_is_staged() {
+        let exchange = LocalExchange::default();
+        let key = key(21, 7);
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 0).unwrap(),
+            RemoteFrameClaim::Fresh
+        );
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 0).unwrap(),
+            RemoteFrameClaim::Duplicate,
+            "a replay arriving while the first delivery is still staging is a duplicate too"
+        );
+        assert!(matches!(
+            exchange
+                .push_claimed_frame(key, 0, 0, false, names(), Some(staged(1)))
+                .unwrap(),
+            PushedFrame::Recorded(None)
+        ));
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 0).unwrap(),
+            RemoteFrameClaim::Duplicate
+        );
+        let err = exchange.claim_remote_frame(key, 0, 2).unwrap_err();
+        assert!(err.contains("skipped from frame seq 1 to 2"), "{err}");
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 1).unwrap(),
+            RemoteFrameClaim::Fresh
+        );
+        let ready = exchange
+            .push_claimed_frame(key, 0, 1, true, names(), None)
+            .unwrap();
+        assert!(matches!(ready, PushedFrame::Recorded(None)));
+        let ready = exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap()
+            .expect("sender already complete");
+        let SenderSource::Remote { batches, .. } = &ready.inputs[0].sources[0] else {
+            panic!("expected a remote source");
+        };
+        assert_eq!(batches.len(), 1, "the one staged batch, recorded once");
+    }
+
+    /// A cancel landing between the claim and the record must not re-create the retired
+    /// receiver's source entry: the frame is handed back to the caller (who owns its ticket or
+    /// lease) and nothing is recorded, so a later retire has nothing to return.
+    #[test]
+    fn frame_claimed_before_a_retire_is_handed_back_not_recorded() {
+        let exchange = LocalExchange::default();
+        let key = key(22, 7);
+        assert!(
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 0).unwrap(),
+            RemoteFrameClaim::Fresh
+        );
+        assert!(exchange.retire_receiver(key.fragment_instance_id).is_empty());
+        assert!(matches!(
+            exchange
+                .push_claimed_frame(key, 0, 0, false, names(), Some(staged(1)))
+                .unwrap(),
+            PushedFrame::Retired
+        ));
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 1).unwrap(),
+            RemoteFrameClaim::Retired,
+            "later frames of the retired receiver are refused at the claim"
+        );
+        assert!(
+            exchange.retire_receiver(key.fragment_instance_id).is_empty(),
+            "the handed-back frame was never recorded"
+        );
+    }
+
     /// A sequence gap means a frame was lost; the query must fail rather than lose rows.
     #[test]
     fn remote_seq_gap_is_a_loud_error() {
@@ -1020,12 +1196,18 @@ mod tests {
                 .retire_receiver(key.fragment_instance_id)
                 .is_empty()
         );
-        // The sequence tracking went with it: a frame for the retired receiver is judged from
-        // seq 0 again (the service refuses such frames before they get here; this pins the state).
-        let err = exchange
-            .push_remote_frame(key, 1, 5, false, names(), Some(staged(2)))
-            .unwrap_err();
-        assert!(err.contains("skipped from frame seq 0 to 5"), "{err}");
+        // A later frame for the retired receiver is refused at the claim, before its sequence is
+        // even judged (the service releases its lease and answers the peer OK).
+        assert_eq!(
+            exchange.claim_remote_frame(key, 1, 5).unwrap(),
+            RemoteFrameClaim::Retired
+        );
+        assert!(
+            exchange
+                .push_remote_frame(key, 1, 5, false, names(), Some(staged(2)))
+                .unwrap()
+                .is_none()
+        );
 
         // Another receiver is unaffected.
         assert!(

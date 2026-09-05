@@ -43,7 +43,9 @@ sender drain), not a shuffle's whole inbound share, and the shuffle inputs of a
 query count against `--gpu-memory-limit`, where the pool's admission and
 downgrade already apply. A frame whose receiver never runs (a failed or
 cancelled query) is dropped from the store when the CN releases the receiver's
-inputs; the CN logs the store's outstanding count with the arena's at quiesce.
+inputs: when the rendezvous refuses the frame, when the receiver is retired,
+or in the engine's sweep after a failed run. A replayed frame (brpc
+reconnect-retry) is recognised by sequence number before its lease is touched.
 
 ## Dispatch
 
