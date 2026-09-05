@@ -4681,6 +4681,59 @@ fn left_semi_join_keeps_probe_layout() {
     );
 }
 
+/// Verifies a right semi join keeps only the build-side row layout, the mirror of the left
+/// semi case: the FE emits RIGHT_SEMI_JOIN when it swaps the sides of a semi join, and the
+/// Substrait consumer lowers `RightSemi` to DuckDB's RIGHT_SEMI, which yields the right input's
+/// rows.
+#[test]
+fn right_semi_join_keeps_build_layout() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::RIGHT_SEMI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::RightSemi as i32
+    );
+}
+
+/// A right semi join over sides of different width: the surviving row is the build side's,
+/// so a post-join conjunct on the build column resolves to field 0 of the join output, not
+/// to its position in the concatenated probe-then-build row.
+#[test]
+fn right_semi_join_conjunct_indexes_the_build_row() {
+    let mut join = hash_join_node(TJoinOp::RIGHT_SEMI_JOIN);
+    join.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(100),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(wide_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["c"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected a filter over the join");
+    };
+    let greater = scalar_fn(filter.condition.as_deref().unwrap());
+    let substrait::proto::function_argument::ArgType::Value(probed) =
+        greater.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(field_index(probed), 0);
+}
+
 /// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
 fn nestloop_join_node(join_op: TJoinOp, conjuncts: Vec<TExpr>) -> TPlanNode {
     let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
