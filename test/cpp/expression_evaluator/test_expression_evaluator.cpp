@@ -213,6 +213,30 @@ std::shared_ptr<data_batch> make_decimal64_batch(memory_space& space,
   return data_batch::make(batch_id, std::move(gpu_repr));
 }
 
+std::shared_ptr<data_batch> make_double_batch(memory_space& space,
+                                              const std::vector<double>& values)
+{
+  auto mr     = get_resource_ref(space);
+  auto stream = cudf::get_default_stream();
+  auto size   = static_cast<cudf::size_type>(values.size());
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::FLOAT64}, size, cudf::mask_state::UNALLOCATED, stream, mr);
+  cudaMemcpy(col->mutable_view().data<double>(),
+             values.data(),
+             sizeof(double) * values.size(),
+             cudaMemcpyHostToDevice);
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  auto gpu_repr =
+    std::make_unique<gpu_table_representation>(std::move(table), space, cudf::get_default_stream());
+  auto batch_id = ::sirius::get_next_batch_id();
+  return data_batch::make(batch_id, std::move(gpu_repr));
+}
+
 std::shared_ptr<data_batch> make_decimal64_two_col_batch(memory_space& space,
                                                          int8_t scale,
                                                          const std::vector<int64_t>& values_a,
@@ -1590,6 +1614,58 @@ TEMPLATE_TEST_CASE("evaluate decimal TPC-H Q1 shape price * (1 - discount)",
     expected.push_back(raw_price[i] * (100 - raw_discount[i]));
   }
   REQUIRE(out0 == expected);
+}
+
+TEMPLATE_TEST_CASE("cast DOUBLE -> DECIMAL rounds half away from zero like DuckDB",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  // The StarRocks path lowers decimal arithmetic to FP64 and the FE casts the result back to
+  // DECIMAL: `1 - l_discount` arrives as cast(subtract(1.0, 0.07) as DECIMAL(16,2)). In FP64
+  // that is 0.9299999999999999; DuckDB's cast scales by 10^2 and rounds half away from zero
+  // (0.93), cuDF's fixed_point conversion truncates (0.92). The expected values below are
+  // DuckDB's own answers for these inputs (duckdb 1.x, `CAST(x::DOUBLE AS DECIMAL(16,2))`).
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<double> values    = {1.0 - 0.07,  // 0.9299999999999999
+                                   -(1.0 - 0.07),
+                                   0.125,  // exactly representable half: away from zero
+                                   -0.125,
+                                   2.675,  // 267.5 after scaling in double
+                                   1.005,  // 100.49999999999999 after scaling in double
+                                   0.001,
+                                   -0.001,
+                                   1234.0};
+  std::vector<int64_t> expected = {93, -93, 13, -13, 268, 100, 0, 0, 123400};
+
+  auto input     = make_double_batch(*space, values);
+  auto cast_expr = make_cast(make_ref(0), logical_type::make_decimal(16, 2), /*try_cast=*/false);
+
+  auto [in_batch, out_batch, iv, ov] =
+    run_execute(*space, input, one(std::move(cast_expr)), strategy);
+  REQUIRE(ov.num_columns() == 1);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(ov.column(0).type().scale() == -2);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) == expected);
+}
+
+TEST_CASE("cast DOUBLE -> DECIMAL(16,0) rounds to the integer DuckDB gives",
+          "[expression_evaluator]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  std::vector<double> values    = {0.5, -0.5, 1234.5, 2.4999};
+  std::vector<int64_t> expected = {1, -1, 1235, 2};
+
+  auto input     = make_double_batch(*space, values);
+  auto cast_expr = make_cast(make_ref(0), logical_type::make_decimal(16, 0), /*try_cast=*/false);
+  auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(cast_expr)), MAT);
+  REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
+  REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) == expected);
 }
 
 // ---------------------------------------------------------------------------

@@ -464,6 +464,7 @@ set(CUDA_SOURCES
     src/cuda/sirius_dynamic_in_list_filter.cu
     src/cuda/sirius_dynamic_small_in_list_filter.cu
     src/cuda/sirius_like_multiliteral.cu
+    src/expression_evaluator/specializations/round_to_scale.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
