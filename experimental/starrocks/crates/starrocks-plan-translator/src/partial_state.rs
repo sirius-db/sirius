@@ -19,7 +19,11 @@
 //! - decimal `sum` is lowered to FP64 by the argument cast in `expr_translator`;
 //! - integer `sum` binds to DuckDB HUGEINT and the Sirius planner downcasts it to BIGINT;
 //! - `count` is BIGINT;
-//! - `min`/`max` keep their input type (identity), including decimals.
+//! - `min`/`max` keep their input type (identity), including decimals;
+//! - `multi_distinct_count` ships the distinct column itself: the partial node groups by its
+//!   argument as an extra key and emits that column, the merge node counts DISTINCT over it. The
+//!   FE's opaque intermediate slot is replaced by a column of the argument's type, and both
+//!   halves are this translator's own, so they agree by construction.
 //!
 //! avg is the one state that is not a single column: StarRocks allocates one opaque VARBINARY
 //! slot for it, while Sirius keeps it as a DOUBLE sum plus a BIGINT count. The model is a
@@ -77,6 +81,15 @@ pub(crate) fn wire_columns(function: &TFunction) -> Result<Vec<WireColumn>> {
         }
         "count" => Ok(one(type_mapper::i64_type(true))),
         "min" | "max" => Ok(one(type_mapper::map_type_desc(&function.ret_type, true)?)),
+        "multi_distinct_count" => {
+            let argument = function.arg_types.first().ok_or_else(|| {
+                TranslateError::malformed(
+                    "multi_distinct_count carries no argument type; its partial state is the \
+                     distinct column itself",
+                )
+            })?;
+            Ok(one(type_mapper::map_type_desc(argument, true)?))
+        }
         "avg" => Ok(vec![
             WireColumn {
                 suffix: "",
@@ -268,10 +281,32 @@ mod tests {
     #[test]
     fn unmodeled_functions_are_refused() {
         let err = wire_columns(&function(
-            "multi_distinct_count",
+            "multi_distinct_sum",
             scalar_type(TPrimitiveType::BIGINT, None, None),
         ))
         .unwrap_err();
         assert!(err.to_string().contains("sum/count/min/max/avg"), "{err}");
+    }
+
+    /// The distinct count's state is the distinct column: its type is the argument's, whatever
+    /// the FE declares for the intermediate slot, and an argument-less function is refused.
+    #[test]
+    fn distinct_count_state_is_the_argument_column() {
+        let mut f = function(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT, None, None),
+        );
+        f.arg_types = vec![scalar_type(TPrimitiveType::INT, None, None)];
+        let columns = wire_columns(&f).unwrap();
+        assert_eq!(columns.len(), 1);
+        assert!(matches!(kind(&columns[0]), r#type::Kind::I32(_)));
+        assert_eq!(columns[0].suffix, "");
+
+        let err = wire_columns(&function(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT, None, None),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("no argument type"), "{err}");
     }
 }

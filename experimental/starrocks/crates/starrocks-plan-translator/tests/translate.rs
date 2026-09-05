@@ -3226,6 +3226,216 @@ fn two_phase_wire_types_agree_end_to_end() {
     assert_eq!(partial_kinds, merge_types);
 }
 
+/// A `multi_distinct_count` expression as the FE serializes it: `AGG_EXPR` root, the argument
+/// type on the function (the wire model reads it), `is_merge_agg` per phase.
+fn distinct_count_expr(argument: TExpr, argument_type: TTypeDesc, merge: bool) -> TExpr {
+    let mut expr = aggregate_expr(
+        "multi_distinct_count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(argument),
+    );
+    expr.nodes[0].agg_expr = Some(TAggregateExpr::new(merge));
+    expr.nodes[0].fn_.as_mut().unwrap().arg_types = vec![argument_type];
+    expr
+}
+
+/// The partial half of a two-phase `count(DISTINCT id) GROUP BY name`: the engine has no
+/// partial state for a distinct count, so the node groups by `id` as a second key, emits no
+/// measure, and a projection puts the row back in the FE's `(name, state)` order. The state
+/// column is `id` itself, typed BIGINT like the argument.
+#[test]
+fn two_phase_distinct_count_partial_groups_by_the_argument() {
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![distinct_count_expr(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            scalar_type(TPrimitiveType::BIGINT),
+            false,
+        )],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            // The FE's opaque intermediate slot for the distinct state.
+            slot(3, 1, "st", scalar_type(TPrimitiveType::VARBINARY)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "st"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the reordering projection over the aggregate");
+    };
+    let fields: Vec<_> = project.expressions.iter().map(field_index).collect();
+    assert_eq!(fields, vec![0, 1]);
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(
+        aggregate.grouping_expressions.len(),
+        2,
+        "name and the distinct argument are both keys"
+    );
+    assert!(
+        aggregate.measures.is_empty(),
+        "a distinct count ships no measure"
+    );
+    assert_eq!(aggregate.groupings[0].expression_references, vec![0, 1]);
+}
+
+/// With an ordinary measure ahead of the distinct count, the extra key is still emitted among
+/// the grouping columns and the projection restores the FE order `(name, sum, distinct state)`.
+#[test]
+fn two_phase_distinct_count_partial_restores_measure_order() {
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            sum,
+            distinct_count_expr(
+                slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+                scalar_type(TPrimitiveType::BIGINT),
+                false,
+            ),
+        ],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "s", scalar_type(TPrimitiveType::BIGINT)),
+            slot(4, 1, "st", scalar_type(TPrimitiveType::VARBINARY)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "s", "st"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the reordering projection over the aggregate");
+    };
+    // Aggregate row: [name, id (distinct key), sum]; FE row: [name, sum, st].
+    let fields: Vec<_> = project.expressions.iter().map(field_index).collect();
+    assert_eq!(fields, vec![0, 2, 1]);
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 2);
+    assert_eq!(aggregate.measures.len(), 1);
+}
+
+/// The merge half: the exchange stream's state column is declared with the argument's type
+/// (not the FE's VARBINARY), the measure is `count` with a DISTINCT invocation over that column
+/// (never the sum a plain count merges into), and the fragment leaves through the finalizing
+/// projection that casts to the FE's BIGINT output slot.
+#[test]
+fn two_phase_distinct_count_merge_counts_distinct_over_the_wire_column() {
+    let exchange = exchange_node_with(7, vec![2], None, None);
+    let aggregate = {
+        let mut node = aggregation_node(
+            8,
+            3,
+            vec![slot_ref(10, 2, scalar_type(TPrimitiveType::VARCHAR))],
+            vec![distinct_count_expr(
+                slot_ref(11, 2, scalar_type(TPrimitiveType::VARBINARY)),
+                scalar_type(TPrimitiveType::BIGINT),
+                true,
+            )],
+        );
+        node.agg_node.as_mut().unwrap().need_finalize = true;
+        node
+    };
+    let desc = desc_table(
+        vec![(2, None), (3, None)],
+        vec![
+            slot(10, 2, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(11, 2, "st", scalar_type(TPrimitiveType::VARBINARY)),
+            slot(12, 3, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(13, 3, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let merge = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![aggregate, exchange])),
+                Some(desc),
+                None,
+            ),
+            &[stream_input(7, &["name", "st"])],
+        )
+        .unwrap();
+
+    let types: Vec<_> = merge.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| column.ty.as_str())
+        .collect();
+    assert_eq!(types, vec!["VARCHAR", "BIGINT"]);
+
+    let root = root(&merge.plan);
+    assert_eq!(root.names, vec!["name", "cnt"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the finalizing projection");
+    };
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    let (_, name) = resolved_function(&merge.plan, measure.function_reference);
+    assert_eq!(name, "count");
+    assert_eq!(
+        measure.invocation,
+        substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+    );
+    let substrait::proto::function_argument::ArgType::Value(argument) =
+        measure.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(
+        field_index(argument),
+        1,
+        "counts the wire column, not the key"
+    );
+}
+
 /// Verifies a partial-phase ("update serialize") aggregation translates to a plain aggregate
 /// whose measure carries the InitialToIntermediate phase and the modeled partial-state type
 /// (I64 for an integer sum), not the FE's declared slot type.
