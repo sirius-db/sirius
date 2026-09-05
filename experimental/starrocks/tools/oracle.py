@@ -6,7 +6,8 @@ SAME SQL through DuckDB over the same parquet and writes one TSV per query, form
 match the mysql --batch output so the two can be diffed directly.
 
 Usage: oracle.py <queries_dir> <tpch_data> <out_dir> [qNN ...]
-Env:   ORACLE_THREADS, ORACLE_MEM (DuckDB memory_limit), ORACLE_TMP (spill directory;
+Env:   TPCH_SF (scale factor substituted for __TPCH_SF__, which q11 needs; default 1),
+       ORACLE_THREADS, ORACLE_MEM (DuckDB memory_limit), ORACLE_TMP (spill directory;
        defaults to a duckdb-oracle/ directory under the system temp dir, $TMPDIR if set)
 """
 import decimal
@@ -61,7 +62,12 @@ os.makedirs(_tmp, exist_ok=True)
 con.execute("SET temp_directory='%s'" % _tmp)
 
 for n in names:
-    sql = open(os.path.join(qdir, f"{n}.sql")).read().replace("__TPCH_DATA__", data)
+    sql = (
+        open(os.path.join(qdir, f"{n}.sql"))
+        .read()
+        .replace("__TPCH_DATA__", data)
+        .replace("__TPCH_SF__", os.environ.get("TPCH_SF", "1"))
+    )
     sql = FILES.sub(lambda m: f"read_parquet('{m.group(1)}')", sql).strip().rstrip(";")
     t0 = time.time()
     try:
