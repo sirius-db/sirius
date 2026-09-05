@@ -18,6 +18,7 @@
 #include <expression/ast/node.hpp>
 #include <expression_evaluator/ast_supported_types.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
+#include <expression_evaluator/round_to_scale.hpp>
 #include <helper/logical_type.hpp>
 #include <helper/numeric_narrowing.hpp>
 #include <sirius/exception.hpp>
@@ -25,6 +26,7 @@
 // cudf
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 // standard library
 #include <algorithm>
@@ -46,6 +48,25 @@ cudf::ast::ast_operator cast_op_to_ast(sirius::type_id id)
         "UBIGINT, BIGINT, DOUBLE.",
         static_cast<int>(id));
   }
+}
+
+/// A semantic cast with DuckDB's conversion rules. cuDF's floating -> fixed_point conversion
+/// truncates toward zero, DuckDB's rounds half away from zero after scaling (`1 - 0.07` in FP64
+/// is 0.9299999999999999: DuckDB casts it to DECIMAL(16,2) 0.93, cuDF to 0.92, and every
+/// discounted TPC-H revenue then differs by up to one cent per row). Round the floating column
+/// to the target scale first, with DuckDB's arithmetic, so the cast that follows is exact:
+/// cuDF converts a double that is the nearest representation of an s-digit decimal to exactly
+/// that decimal.
+std::unique_ptr<cudf::column> cast_like_duckdb(cudf::column_view const& input,
+                                               cudf::data_type target,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  if (!cudf::is_floating_point(input.type()) || !cudf::is_fixed_point(target)) {
+    return cudf::cast(input, target, stream, mr);
+  }
+  auto rounded = sirius::round_to_scale_like_duckdb(input, -target.scale(), stream, mr);
+  return cudf::cast(rounded->view(), target, stream, mr);
 }
 
 }  // namespace
@@ -88,7 +109,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   auto result_column =
     alt.kind == sirius::ast::cast_kind::carrier_restore
       ? sirius::cast_through_rep(child.get_column_view(), return_type, _stream, _mr)
-      : cudf::cast(child.get_column_view(), return_type, _stream, _mr);
+      : cast_like_duckdb(child.get_column_view(), return_type, _stream, _mr);
   if (mode == evaluation_mode::AST) {
     // The parent is executing in AST mode, so add the materialized result to the AST tree.
     return materialize_as_ast_column(std::move(result_column));
