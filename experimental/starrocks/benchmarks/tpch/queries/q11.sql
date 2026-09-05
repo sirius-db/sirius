@@ -33,4 +33,5 @@ HAVING
             AND s_nationkey = n_nationkey
             AND n_name = 'GERMANY')
 ORDER BY
-    value DESC;
+    value DESC,
+    ps_partkey;
