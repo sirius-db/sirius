@@ -177,6 +177,13 @@ class downgrade_executor {
   void cancel_pending_requests();
 
   /**
+   * @brief A ready future carrying the queue-inactive error.
+   *
+   * Replaces the broken-promise error produced when a rejected request is destroyed.
+   */
+  static std::future<size_t> rejected_request_future();
+
+  /**
    * @brief Whether a downgrade from this executor's source tier could plausibly free memory.
    *
    * DISK is an effectively unbounded sink, so if it is configured a downgrade can always make

@@ -79,6 +79,8 @@ void downgrade_executor::start()
   }
 
   _request_queue.reactivate();
+  // A cancelled request must not leave monitoring disabled after restart.
+  _monitor_request_enqueued.store(false, std::memory_order_relaxed);
 
   absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
   if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
@@ -471,8 +473,10 @@ void downgrade_executor::monitor_loop()
           };
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
-          // Fire-and-forget: monitor does not wait for the result
-          _request_queue.push(std::move(req));
+          // A rejected request will not reach either path that normally clears the flag.
+          if (!_request_queue.push(std::move(req))) {
+            _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+          }
         }
       } else if (!backed_off) {
         SIRIUS_LOG_WARN(
@@ -496,6 +500,10 @@ void downgrade_executor::monitor_loop()
 void downgrade_executor::cancel_pending_requests()
 {
   while (auto req = _request_queue.try_pop()) {
+    // Cancelled requests do not reach the processing loop that normally clears this flag.
+    if (req->is_monitor_request) {
+      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
     try {
       req->result.set_exception(
         std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
@@ -523,6 +531,8 @@ std::future<size_t> downgrade_executor::request_free_memory(size_t bytes)
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN(
       "[downgrade] request_free_memory: queue inactive, dropping request for {} bytes", bytes);
+    // Return the queue error rather than the destroyed promise's broken-promise error.
+    return rejected_request_future();
   }
   return future;
 }
@@ -539,9 +549,17 @@ std::future<size_t> downgrade_executor::request_downgrade(std::function<bool()> 
   auto future    = req->result.get_future();
   if (!_request_queue.push(std::move(req))) {
     SIRIUS_LOG_WARN("[downgrade] request_downgrade: queue inactive, dropping request");
-    return future;
+    return rejected_request_future();
   }
   return future;
+}
+
+std::future<size_t> downgrade_executor::rejected_request_future()
+{
+  std::promise<size_t> rejected;
+  rejected.set_exception(std::make_exception_ptr(
+    std::runtime_error("downgrade executor is not accepting requests (shutting down)")));
+  return rejected.get_future();
 }
 
 }  // namespace parallel

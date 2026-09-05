@@ -35,6 +35,7 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -44,6 +45,11 @@
 
 namespace sirius {
 namespace pipeline {
+
+namespace {
+// Covers normal stragglers, including OOM retry backoff.
+constexpr auto k_ledger_drain_timeout = std::chrono::seconds(60);
+}  // namespace
 
 task_scheduler::task_scheduler(
   const exec::thread_pool_config& gpu_executor_config,
@@ -80,6 +86,7 @@ task_scheduler::task_scheduler(
     }),
     _telemetry_context(std::move(telemetry_context))
 {
+  _downgrade_executors  = downgrade_executors;
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
 
@@ -196,12 +203,16 @@ void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  // Terminal pipelines keep weak references so replacing the handler retires the previous query.
+  // The creator may still be parked from the previous query.
+  if (_task_creator) {
+    _task_creator->set_completion_handler(_completion_handler);
+    _task_creator->start_thread_pool();
+  }
+
+  // Pipelines hold the handler weakly so they cannot extend the query lifetime.
   if (_query) {
     for (auto& pipeline : _query->get_pipelines()) {
-      if (pipeline && pipeline->is_query_terminal()) {
-        pipeline->set_completion_handler(_completion_handler);
-      }
+      if (pipeline) { pipeline->set_completion_handler(_completion_handler); }
     }
   }
 }
@@ -229,34 +240,53 @@ void task_scheduler::terminate_query(std::exception_ptr error)
     std::scoped_lock lock(_query_mutex);
     completion = _completion_handler;
   }
-  if (completion) { completion->report_error(std::move(error)); }
-  stop();
+  // Teardown belongs to drain_after_error(); stop() is terminal and cannot be restarted.
+  if (completion) { (void)completion->report_error(std::move(error)); }
+}
+
+void task_scheduler::interrupt_query_scan_sources()
+{
+  duckdb::shared_ptr<planner::query> query;
+  {
+    std::lock_guard<std::mutex> query_lock(_query_mutex);
+    query = _query;
+  }
+  if (!query) { return; }
+  for (auto* scan : query->get_scan_operators()) {
+    if (scan) { scan->interrupt_source(); }
+  }
 }
 
 void task_scheduler::drain_after_error()
 {
   SIRIUS_LOG_INFO("task_scheduler: draining after error");
-  // Teardown ordering is load-bearing. The scan/gpu executor drains below run
-  // in-flight tasks to completion, and a completing task schedules its
-  // downstream consumers via task_creator::schedule() (gpu_pipeline_executor and
-  // duckdb_scan_executor both do this). Each such request holds a raw
-  // sirius_physical_operator* owned by the engine, which is destroyed the moment
-  // execute() returns. If the task_creator is live (or restarted) while those
-  // requests are still in flight, its manager_loop dereferences a freed operator
-  // in get_operator_for_next_task() — a use-after-free that crashes intermittently
-  // under multi-partition sort with many in-flight pipeline tasks.
-  //
-  // So: stop the task_creator FIRST and keep its queue interrupted across the
-  // executor drains. With the queue interrupted, schedule() pushes from
-  // completion callbacks return false and the requests (and their dangling
-  // operator pointers) are dropped instead of processed. Only AFTER every
-  // executor has quiesced do we drain the creation queue and restart the
-  // creator for the next query.
+  // Reject new producer work before joining and draining existing work.
+  if (_completion_handler) { _completion_handler->close_work(); }
+
+  // Wake creator workers parked in a scan source's blocking split wait before joining them:
+  // their producers may be dead, and the closes that would wake them only run in query cleanup
+  // after this returns.
+  interrupt_query_scan_sources();
+
+  // Stop the creator before draining executors: completion callbacks may otherwise enqueue
+  // requests containing plan-owned operator pointers. Keep it parked until the next query.
   if (_task_creator) { _task_creator->stop_thread_pool(); }
+
+  // Downgrade workers can return borrowed tasks, so join them before draining queues.
+  if (_downgrade_executors) {
+    for (auto& downgrade_exec : *_downgrade_executors) {
+      if (downgrade_exec) { downgrade_exec->stop(); }
+    }
+  }
 
   // Drain the top-level task queue so management_eventloop doesn't dispatch
   // stale tasks from the failed query.
   _task_queue.drain();
+
+  // Flush any task currently between the scheduler queue and an executor queue.
+  {
+    std::lock_guard<std::mutex> dispatch_lock(_dispatch_mutex);
+  }
 
   // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
   // tasks to finish, then restart the manager for the next query.
@@ -264,62 +294,93 @@ void task_scheduler::drain_after_error()
     gpu_exec->drain_and_wait();
   }
 
-  // Now that no executor can generate further task_creation_requests, discard
-  // any that accumulated (and release the shared_ptr<data_batch> references they
-  // hold, which would otherwise survive clear_all_repositories at QueryEnd and
-  // show up as inter-iteration "memory leak" warnings). drain_pending_tasks()
-  // reactivates the queue when done.
-  if (_task_creator) { _task_creator->drain_pending_tasks(); }
+  // No executor can now create requests. Discard any queued requests and their data references
+  // while leaving the creator parked.
+  if (_task_creator) { _task_creator->drain_pending_tasks(/*reactivate=*/false); }
 
-  // Belt-and-suspenders: the executor restarts above emit device_ready signals,
-  // and the management loop may have dispatched a leftover task into an executor
-  // queue between the two drains. Clear the top-level queue once more so the
-  // next query starts from empty.
+  // Executor restarts emit readiness signals, so clear anything dispatched between drains.
   _task_queue.drain();
 
-  if (_task_creator) { _task_creator->start_thread_pool(); }
+  // QueryEnd destroys the plan after this returns, so wait indefinitely rather than risk
+  // teardown while a producer callback still holds a slot.
+  if (_completion_handler) {
+    std::size_t waited_s = 0;
+    while (!_completion_handler->wait_quiescent(k_ledger_drain_timeout)) {
+      waited_s += std::chrono::duration_cast<std::chrono::seconds>(k_ledger_drain_timeout).count();
+      SIRIUS_LOG_ERROR(
+        "task_scheduler::drain_after_error: {} unit(s) of work still outstanding after {}s; "
+        "teardown fail-stopped until they drain (only a mid-flight producer callback can hold "
+        "one here, so this indicates a wedged thread)",
+        _completion_handler->outstanding_work(),
+        waited_s);
+    }
+  }
+
+  // Restart downgrade workers only after every borrowed task has been returned and drained.
+  if (_downgrade_executors) {
+    for (auto& downgrade_exec : *_downgrade_executors) {
+      if (downgrade_exec) { downgrade_exec->start(); }
+    }
+  }
   SIRIUS_LOG_INFO("task_scheduler: DONE draining after error");
 }
 
 void task_scheduler::wait_for_completion()
 {
-  // Once the query has signaled completion, NOTHING should still be queued. Rather
-  // than drain (which would hide the bug), validate that every queue is empty and
-  // throw if not — a non-empty queue means tasks were still being scheduled when we
-  // declared the query done.
-  //
-  // Halt the producer (task_creator) first so the checks are not racing new task
-  // creation. The task_creator is always restarted afterwards (even on throw) so the
-  // next query can run.
-  if (_task_creator) { _task_creator->stop_thread_pool(); }
-  try {
-    // The task_scheduler's pipeline task queue must be empty.
-    if (const std::size_t remaining = _task_queue.size(); remaining != 0) {
-      SIRIUS_LOG_ERROR(
-        "task_scheduler::wait_for_completion: pipeline _task_queue NOT empty at query "
-        "completion — {} task(s) still queued; work was still scheduled when the query was "
-        "marked complete",
-        remaining);
-      throw std::runtime_error(
-        "task_scheduler: pipeline task queue not empty at query completion (" +
-        std::to_string(remaining) + " task(s) remaining)");
-    }
+  // Keep execution active while work that outlived the completion signal drains normally.
+  if (!_completion_handler) { return; }
 
-    // Each executor must finish its in-flight tasks and then have an empty queue.
-    for (auto& [device_id, gpu_exec] : _gpu_executors) {
-      gpu_exec->wait_and_validate_empty();
-    }
-  } catch (...) {
-    if (_task_creator) {
-      _task_creator->drain_pending_tasks();
-      _task_creator->start_thread_pool();
-    }
-    throw;
+  // An early-LIMIT finish leaves scan connectors open, and a creator worker can be parked in
+  // one's split wait, holding its request slot. Interrupt sources first: the ledger cannot
+  // drain past a parked worker, and the creator join below would never return. On a normal
+  // finish every connector is already closed, so this is a no-op.
+  interrupt_query_scan_sources();
+
+  const auto deadline  = std::chrono::steady_clock::now() + k_ledger_drain_timeout;
+  const auto time_left = [&deadline]() {
+    return std::max(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      deadline - std::chrono::steady_clock::now()),
+                    std::chrono::milliseconds(0));
+  };
+
+  bool quiescent = _completion_handler->wait_quiescent(time_left());
+
+  // Park the creator so lookahead cannot create work after the first zero.
+  if (_task_creator) { _task_creator->stop_thread_pool(); }
+
+  // Drain requests that raced the first zero and creator shutdown.
+  while (quiescent && _completion_handler->outstanding_work() != 0) {
+    if (_task_creator) { _task_creator->drain_pending_tasks(/*reactivate=*/false); }
+    quiescent = _completion_handler->wait_quiescent(time_left());
   }
-  if (_task_creator) {
-    _task_creator->drain_pending_tasks();
-    _task_creator->start_thread_pool();
+
+  // Closing rejects new slots; the final wait covers acquisitions that won the race.
+  _completion_handler->close_work();
+  if (quiescent) { quiescent = _completion_handler->wait_quiescent(time_left()); }
+
+  // Surface an error that lost the race with the completion signal.
+  if (auto late_error = _completion_handler->take_late_error()) {
+    std::rethrow_exception(late_error);
   }
+  if (!quiescent) {
+    const std::size_t remaining = _completion_handler->outstanding_work();
+    SIRIUS_LOG_ERROR(
+      "task_scheduler::wait_for_completion: {} unit(s) of work still outstanding {}s after the "
+      "query signalled completion; work was still in flight when the query was marked complete",
+      remaining,
+      std::chrono::duration_cast<std::chrono::seconds>(k_ledger_drain_timeout).count());
+    throw premature_completion_error(
+      "task_scheduler: work still outstanding at query completion (" + std::to_string(remaining) +
+      " unit(s) after " +
+      std::to_string(
+        std::chrono::duration_cast<std::chrono::seconds>(k_ledger_drain_timeout).count()) +
+      "s) — the query was marked complete while work was still in flight");
+  }
+}
+
+std::exception_ptr task_scheduler::take_preserved_error() noexcept
+{
+  return _completion_handler ? _completion_handler->take_late_error() : nullptr;
 }
 
 void task_scheduler::management_eventloop()
@@ -346,7 +407,12 @@ void task_scheduler::management_eventloop()
     }
     while (evt) {
       if (evt->kind == task_request_kind::device_ready) {
-        _ready_devices.emplace_back(evt->device_id);
+        // A restarted manager may re-announce while its old credit is still pending.
+        // Deduplication preserves one reserved worker per dispatch credit.
+        if (std::find(_ready_devices.begin(), _ready_devices.end(), evt->device_id) ==
+            _ready_devices.end()) {
+          _ready_devices.emplace_back(evt->device_id);
+        }
       }
       evt = _task_request_channel.try_get();
     }
@@ -372,6 +438,9 @@ void task_scheduler::management_eventloop()
     // is only valid on the preferred device. Step (ii) will introduce an
     // explicit strict-vs-prefer bit; for now, all preferences are treated as
     // binding to guarantee correctness.
+    // Every step in the pass is non-blocking; drain_after_error() cycles this lock to flush
+    // an in-flight pass before it drains the executor queues.
+    std::lock_guard<std::mutex> dispatch_lock(_dispatch_mutex);
     for (auto it = _ready_devices.begin(); it != _ready_devices.end();) {
       const int device_id = *it;
       std::unique_ptr<sirius::parallel::itask> task;

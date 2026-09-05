@@ -203,9 +203,17 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
 
-  //! Install a query-terminal pipeline's weak completion reference.
-  //! Weak ownership prevents retired pipelines from keeping a query alive.
+  //! Install the query handler used for completion signals and producer work slots.
+  //! It is weak so a pipeline cannot outlive the query through this reference.
   void set_completion_handler(std::weak_ptr<completion_handler> handler);
+
+  //! Snapshot used by producer callbacks. `installed` distinguishes an ungated standalone
+  //! pipeline from a query pipeline whose handler expired.
+  struct completion_gate {
+    std::shared_ptr<completion_handler> handler;
+    bool installed{false};
+  };
+  [[nodiscard]] completion_gate lock_completion_gate();
 
   //! task_creator for schedule(), or nullptr when unwired. Streaming sources use this to
   //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
@@ -285,8 +293,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Task creator pointer for scheduling downstream consumers when this pipeline finishes
   sirius::creator::task_creator* _task_creator{nullptr};
 
-  //! Per-query completion reference for terminal pipelines. Guarded by _status_mutex.
+  //! Query completion and work accounting, guarded by _status_mutex.
   std::weak_ptr<completion_handler> _completion_handler;
+  //! Distinguishes standalone pipelines from query pipelines with expired handlers.
+  bool _completion_handler_installed{false};
 
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;

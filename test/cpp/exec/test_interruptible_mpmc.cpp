@@ -520,3 +520,39 @@ TEST_CASE("interruptible_mpmc blocking pop receives pushed items", "[interruptib
   consumer.join();
   REQUIRE(received_value.load() == 999);
 }
+
+// Concurrent pushers must not refill the queue after interrupt() returns.
+TEST_CASE("interruptible_mpmc pushes cannot land after interrupt returns",
+          "[interruptible_mpmc][race]")
+{
+  constexpr int rounds    = 200;
+  constexpr int pushers_n = 4;
+
+  for (int round = 0; round < rounds; ++round) {
+    interruptible_mpmc<std::unique_ptr<int>> queue;
+    std::atomic<bool> go{false};
+    std::atomic<bool> stop{false};
+
+    std::vector<std::thread> pushers;
+    pushers.reserve(pushers_n);
+    for (int t = 0; t < pushers_n; ++t) {
+      pushers.emplace_back([&queue, &go, &stop] {
+        while (!go.load(std::memory_order_acquire)) {}
+        while (!stop.load(std::memory_order_acquire)) {
+          (void)queue.push(std::make_unique<int>(1));
+        }
+      });
+    }
+
+    go.store(true, std::memory_order_release);
+    std::this_thread::yield();
+    queue.interrupt();
+    queue.drain();
+    stop.store(true, std::memory_order_release);
+    for (auto& pusher : pushers) {
+      pusher.join();
+    }
+
+    REQUIRE(queue.is_empty());
+  }
+}

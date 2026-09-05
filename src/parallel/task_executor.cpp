@@ -128,36 +128,5 @@ void itask_executor::drain_and_wait()
   _manager_thread = std::thread([this] { manager_loop(); });
 }
 
-void itask_executor::wait_and_validate_empty()
-{
-  // Same quiescing as drain_and_wait(): interrupt the pool + queue so the manager
-  // exits, join it, and wait for all in-flight thread-pool tasks to finish.
-  _bounded_pool->interrupt();
-  _task_queue.interrupt();
-  if (_manager_thread.joinable()) { _manager_thread.join(); }
-  _bounded_pool->wait_all();
-
-  // Instead of draining, VALIDATE the queue is empty. A non-empty queue here means
-  // tasks were still scheduled on this executor when the query was declared complete.
-  const std::size_t remaining = _task_queue.size();
-
-  // Re-enable the pool/queue and restart the manager so the executor is left in a
-  // usable state for the next query, whether or not validation passes.
-  _bounded_pool->resume();
-  _task_queue.reactivate();
-  _manager_thread = std::thread([this] { manager_loop(); });
-
-  if (remaining != 0) {
-    SIRIUS_LOG_ERROR(
-      "itask_executor::wait_and_validate_empty: task queue NOT empty at query completion — "
-      "{} task(s) still queued; tasks were still being scheduled when the query was marked "
-      "complete",
-      remaining);
-    throw std::runtime_error(
-      "task_executor: task queue not empty at query completion (" + std::to_string(remaining) +
-      " task(s) remaining) — premature completion while work was still scheduled");
-  }
-}
-
 }  // namespace parallel
 }  // namespace sirius

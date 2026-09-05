@@ -31,7 +31,9 @@
 #include <atomic>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace sirius::parallel {
@@ -58,6 +60,14 @@ namespace pipeline {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
+/// Thrown by wait_for_completion() when the work ledger fails to drain in time. Typed so the
+/// engine can, after teardown joins every reporter, replace it with the real error a straggler
+/// recorded meanwhile — the generic timeout must never mask a root cause.
+class premature_completion_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 class task_scheduler {
  public:
   /**
@@ -185,16 +195,25 @@ class task_scheduler {
   void drain_after_error();
 
   /**
-   * @brief This function interrupts executors and waits for all in-flight tasks to complete.
-   * If any tasks are still in flight, an error is logged and an exception is thrown.
-   * This is used to ensure that all tasks have completed before the query returns and tears down
-   * the plan.
-   * @throws std::runtime_error if any tasks are still in flight.
+   * @brief Wait for the query's work ledger to drain after the completion future resolves.
+   *
+   * Execution remains active while existing work drains. The creator is then parked and the
+   * ledger closed so no new work can race plan teardown.
+   *
+   * @throws A late execution error, or std::runtime_error if work does not drain in time.
    */
   void wait_for_completion();
 
+  /// The error preserved after losing the completion race, if any; stable once teardown has
+  /// joined every reporter. Delivered once.
+  [[nodiscard]] std::exception_ptr take_preserved_error() noexcept;
+
  private:
   void management_eventloop();
+
+  /// Wake creator workers parked in a scan source's blocking split wait; both completion paths
+  /// call this before joining the creator.
+  void interrupt_query_scan_sources();
 
   std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
@@ -217,6 +236,13 @@ class task_scheduler {
 
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
+
+  /// Lets error teardown flush an in-progress pop-to-schedule pass before draining queues.
+  std::mutex _dispatch_mutex;
+
+  /// Non-owning access used to stop downgrade workers before task queues are drained.
+  const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* _downgrade_executors{
+    nullptr};
 
   sirius::creator::task_creator* _task_creator{nullptr};
   /// Strong owner for the weak completion references held by terminal pipelines.

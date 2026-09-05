@@ -127,13 +127,13 @@ A query through Super Sirius follows these steps:
    - Converts each TABLE_SCAN source into a unified GPU scan source with a per-table `gpu_ingestible`
    - Injects PARTITION, CONCAT, MERGE operators at pipeline boundaries
    - Wires data repositories between pipelines with barrier types
-4. **Query Preparation** — `task_scheduler::prepare_for_query()` drains leftover state, creates the `completion_handler`, and installs it on the GPU executors and query-terminal pipelines; `sirius_scan_manager::prepare_for_query()` builds each scan's split provider, installs its split connector, and matches any pinned-cache entries
-5. **Query Start** — `task_scheduler::start_query()` schedules the initial scan operator and returns the completion future
+4. **Query Preparation** — `task_scheduler::prepare_for_query()` drains leftover state, resets scheduler state, and distributes a new `completion_handler` to the executors, task creator, and pipelines. `sirius_scan_manager::prepare_for_query()` builds each scan's split provider, installs its split connector, and matches pinned-cache entries
+5. **Query Start** — `task_scheduler::start_query()` schedules the first scan operator and returns the completion future
 6. **Scan Phase** — The scan manager drives split providers that pull bytes through the `io_context` (io_uring locally, or REST/kvikio backends) and the prefetching cache; the unified GPU scan source consumes splits and materializes GPU-ready batches into data repositories
 7. **Pipeline Execution** — GPU executor threads pull tasks from the queue, acquire memory reservations, and call `execute()` on every operator in the pipeline (source through sink) on CUDA streams, then call the sink's `sink()` to push results downstream
 8. **Task Creation** — After each task completes, the task creator is notified to schedule downstream consumers based on data availability in ports
 9. **Memory Management** — Downgrade executors monitor GPU memory pressure and spill data to host memory when thresholds are exceeded
-10. **Completion** — A query-terminal pipeline signals the completion future when it transitions to finished; the GPU task epilogue may also signal it safely
+10. **Completion** — A terminal pipeline signals from its finish transition; the GPU epilogue may also signal. See the [Completion Contract](pipeline-execution.md#completion-contract)
 11. **Result Extraction** — The main thread extracts the `MaterializedQueryResult` from the result collector and returns it to DuckDB
 
 ## Key Source Files

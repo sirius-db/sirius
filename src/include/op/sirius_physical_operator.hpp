@@ -777,6 +777,10 @@ class sirius_physical_operator {
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
 
+  //! Wake any blocked wait inside get_next_task_input_data(); it then returns null. Error
+  //! teardown calls this before joining creator workers, whose producers may already be dead.
+  virtual void interrupt_source() {}
+
   //! Check if all ports are empty
   [[nodiscard]] virtual bool all_ports_empty();
   //! Check if the pipeline is finished

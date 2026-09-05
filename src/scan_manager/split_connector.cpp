@@ -61,9 +61,11 @@ void split_connector::close(std::exception_ptr const& exception)
 std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_split()
 {
   std::unique_lock<std::mutex> lock(_mutex);
-  _cv.wait(lock, [this] { return !_splits.empty() || _closed; });
-  // if there is an exception, propagate it to the consumer instead of returning more splits
+  _cv.wait(lock, [this] { return !_splits.empty() || _closed || _interrupted; });
+  // A recorded producer error outranks a quiet interrupt exit: completion interrupts every
+  // source, and swallowing the error here would let a failed query report success.
   if (_exception) { std::rethrow_exception(_exception); }
+  if (_interrupted) { return std::nullopt; }
   if (!_splits.empty()) {
     auto split = std::move(_splits.front());
     _splits.pop_front();
@@ -74,6 +76,15 @@ std::optional<std::unique_ptr<op::operator_data>> split_connector::get_next_spli
     return std::optional<std::unique_ptr<op::operator_data>>{std::move(split)};
   }
   return std::nullopt;
+}
+
+void split_connector::interrupt()
+{
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _interrupted = true;
+  }
+  _cv.notify_all();
 }
 
 bool split_connector::is_draining(std::size_t quiet_ms) const

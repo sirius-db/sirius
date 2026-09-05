@@ -201,6 +201,32 @@ void wait_or_fail(Pred done, std::chrono::seconds timeout, const char* what)
 
 }  // namespace
 
+// Engine shutdown may stop the scheduler before completion cleanup reaches it.
+TEST_CASE("wait_for_completion tolerates executors that were already stopped",
+          "[task_scheduler][completion-race]")
+{
+  auto manager = initialize_memory_manager(1);
+  sirius::exec::thread_pool_config gpu_config{2};
+
+  SECTION("no query was ever prepared: the null-handler guard returns")
+  {
+    task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+    sched.start();
+    sched.stop();
+    REQUIRE_NOTHROW(sched.wait_for_completion());
+  }
+
+  SECTION("a prepared query drains and closes its ledger without touching stopped executors")
+  {
+    task_scheduler sched(gpu_config, *manager, sirius::test::make_test_telemetry_context());
+    sched.prepare_for_query(nullptr);
+    sched.start();
+    sched.stop();  // out from under the engine, as engine shutdown would
+    REQUIRE_NOTHROW(sched.wait_for_completion());
+    REQUIRE_NOTHROW(sched.wait_for_completion());  // idempotent on a closed ledger
+  }
+}
+
 // Regression test for the #1467 deadlock: the downgrade executor extracts
 // queued tasks and returns them via convertible_gpu_pipeline_task's RAII
 // destructor — a direct queue push with no task_available event. With every

@@ -85,7 +85,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   ~convertible_gpu_pipeline_task() override
   {
-    if (_task) { (void)_queue.push(std::move(_task)); }
+    if (_task) { _queue.push(std::move(_task)); }
   }
 
   /**
