@@ -92,9 +92,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use prost::Message;
+use starrocks_thrift::data_sinks::TDataSinkType;
 use starrocks_thrift::exprs::{TExpr, TExprNodeType};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
 use starrocks_thrift::partitions::TPartitionType;
+use starrocks_thrift::planner::TPlanFragment;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
 use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
@@ -310,6 +312,9 @@ impl PlanTranslator {
             .output_exprs
             .as_ref()
             .filter(|output_exprs| !output_exprs.is_empty())
+            .filter(|output_exprs| {
+                !multicast_reorders_root_row(fragment, output_exprs, &translated.row_tuples, &desc)
+            })
         {
             if partial_expansion.is_some() {
                 return Err(TranslateError::malformed(
@@ -534,6 +539,54 @@ impl ExtensionRegistry {
 /// Translates a StarRocks execution fragment using the default reusable translator.
 pub fn translate_fragment(params: &TExecPlanFragmentParams) -> Result<TranslatedPlan> {
     PlanTranslator::new().translate_fragment(params)
+}
+
+/// Whether a multicast (reused CTE) producer's `output_exprs` merely reorder its root row.
+///
+/// The FE fills a CTE producer's output expressions from a `ColumnRefSet` (slot-id order), while
+/// every consumer's exchange node declares the producer root's tuple in descriptor order and the
+/// CN binds the stream by position (`translate_exchange`). Shipping the expression order sent
+/// q02's `INTEGER` where the consumer declared `VARCHAR` (MEASURED 2026-09-05, forced CTE reuse).
+/// StarRocks BEs never see the difference because their chunks carry slot ids. When the
+/// expressions are bare slot references covering exactly the root's materialized slots, the row
+/// is emitted in descriptor order instead and the exprs are dropped; anything else (a computed
+/// column, a subset) keeps the expression path and its width guard.
+fn multicast_reorders_root_row(
+    fragment: &TPlanFragment,
+    output_exprs: &[TExpr],
+    row_tuples: &[i32],
+    desc: &DescriptorTable,
+) -> bool {
+    let multicast = fragment
+        .output_sink
+        .as_ref()
+        .is_some_and(|sink| sink.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK);
+    if !multicast {
+        return false;
+    }
+    let Ok(root_slots) = desc.output_slot_ids_for_tuples(row_tuples) else {
+        return false;
+    };
+    if root_slots.len() != output_exprs.len() {
+        return false;
+    }
+    let mut referenced = output_exprs
+        .iter()
+        .map(|expr| match expr.nodes.as_slice() {
+            [node] if node.node_type == TExprNodeType::SLOT_REF => node
+                .slot_ref
+                .as_ref()
+                .map(|slot_ref| (slot_ref.tuple_id, slot_ref.slot_id)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(referenced) = referenced.as_mut() else {
+        return false;
+    };
+    let mut expected = root_slots;
+    referenced.sort_unstable();
+    expected.sort_unstable();
+    *referenced == expected
 }
 
 /// Uses a simple slot-reference output expression as its root output name.

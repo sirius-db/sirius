@@ -6,7 +6,7 @@ use starrocks_plan_translator::{
     URN_COMPARISON, URN_DATETIME, URN_STRING, translate_fragment,
 };
 use starrocks_thrift::data_sinks::{
-    TDataSink, TDataSinkType, TDataStreamSink, TPlanFragmentDestination,
+    TDataSink, TDataSinkType, TDataStreamSink, TMultiCastDataStreamSink, TPlanFragmentDestination,
 };
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
@@ -1945,6 +1945,99 @@ fn fragment_output_exprs_add_root_projection() {
         rel::RelType::Project(project) => assert_eq!(project.expressions.len(), 2),
         other => panic!("expected root project rel, got {other:?}"),
     }
+}
+
+/// A reused CTE's producer gets its `output_exprs` from the FE in slot-id order, but every
+/// consumer's exchange declares the producer root's tuple in descriptor order and binds the stream
+/// by position. When the exprs are bare slot refs covering the root row, the producer emits the
+/// row in descriptor order and skips the reprojection; a plain stream sink keeps the expr order.
+#[test]
+fn multicast_producer_emits_its_root_row_in_descriptor_order() {
+    let reversed = || {
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ]
+    };
+    let multicast_sink = || {
+        let stream_sink = TDataStreamSink::new(
+            9,
+            TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        TDataSink::new(
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TMultiCastDataStreamSink::new(
+                vec![stream_sink],
+                vec![Vec::<TPlanFragmentDestination>::new()],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+
+    let mut multicast = params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(reversed()),
+    );
+    multicast.fragment.as_mut().unwrap().output_sink = Some(multicast_sink());
+    let translated = translate_fragment(&multicast).unwrap();
+    assert_eq!(
+        translated.output_names,
+        vec!["id", "name"],
+        "descriptor order, the order every consumer exchange declares"
+    );
+    assert!(
+        !matches!(
+            root(&translated.plan)
+                .input
+                .as_ref()
+                .unwrap()
+                .rel_type
+                .as_ref()
+                .unwrap(),
+            rel::RelType::Project(_)
+        ),
+        "no reprojection: the root row already has the right layout"
+    );
+
+    // A computed output column is not a reorder: the expression path (and its width guard) stays.
+    let mut computed = params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))]),
+    );
+    computed.fragment.as_mut().unwrap().output_sink = Some(multicast_sink());
+    assert_eq!(
+        translate_fragment(&computed).unwrap().output_names,
+        vec!["name"],
+        "a subset of the root row keeps the expression path"
+    );
+
+    let plain = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(reversed()),
+    ))
+    .unwrap();
+    assert_eq!(plain.output_names, vec!["name", "id"]);
 }
 
 /// Verifies unsupported plan nodes return a structured unsupported-plan-node error.

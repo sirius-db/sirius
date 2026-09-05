@@ -246,13 +246,30 @@ static bool is_host_builtin_count(duckdb::ClientContext& context,
                                   duckdb::AggregateFunction const& function,
                                   std::size_t arity)
 {
-  auto const& overloads =
-    duckdb::Catalog::GetSystemCatalog(context)
-      .GetEntry<duckdb::AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "count")
-      .functions.functions;
-  auto const canonical = std::ranges::find_if(
-    overloads, [arity](auto const& candidate) { return candidate.arguments.size() == arity; });
-  return canonical != overloads.end() && function == *canonical;
+  // The catalog lookup needs an active transaction. The transparent path inherits the query's;
+  // the StarRocks CN generates the physical plan after lower_substrait() committed the one it
+  // opened for binding, so open one here when none is active. Without this the first fusion
+  // attempt on a fresh CN threw "TransactionContext::ActiveTransaction called without active
+  // transaction" and failed the fragment (MEASURED 2026-09-05: TPC-H q13 r0 once the COUNT-join
+  // fusion looked through the translator's projection; later runs found the entry cached).
+  auto& transaction            = context.transaction;
+  const bool owned_transaction = !transaction.HasActiveTransaction();
+  if (owned_transaction) { transaction.BeginTransaction(); }
+  bool builtin = false;
+  try {
+    auto const& overloads =
+      duckdb::Catalog::GetSystemCatalog(context)
+        .GetEntry<duckdb::AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "count")
+        .functions.functions;
+    auto const canonical = std::ranges::find_if(
+      overloads, [arity](auto const& candidate) { return candidate.arguments.size() == arity; });
+    builtin = canonical != overloads.end() && function == *canonical;
+    if (owned_transaction) { transaction.Commit(); }
+  } catch (...) {
+    if (owned_transaction) { transaction.Rollback(nullptr); }
+    throw;
+  }
+  return builtin;
 }
 
 static std::optional<dense_count_join_detection> detect_dense_count_join(

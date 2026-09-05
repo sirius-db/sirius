@@ -221,6 +221,20 @@ impl DescriptorTable {
             .collect())
     }
 
+    /// The `(tuple id, slot id)` of every column of a row layout described by tuple ids, in the
+    /// order [`output_names_for_tuples`](Self::output_names_for_tuples) names them.
+    pub fn output_slot_ids_for_tuples(&self, row_tuples: &[i32]) -> Result<Vec<(i32, i32)>> {
+        let mut slots = Vec::new();
+        for &tuple_id in row_tuples {
+            slots.extend(
+                self.materialized_slot_ids(tuple_id)?
+                    .into_iter()
+                    .map(|slot_id| (tuple_id, slot_id)),
+            );
+        }
+        Ok(slots)
+    }
+
     /// Builds output names for a row layout described by tuple ids.
     pub fn output_names_for_tuples(&self, row_tuples: &[i32]) -> Result<Vec<String>> {
         row_tuples
