@@ -597,6 +597,12 @@ fn translate_exchange(
 /// materialized slots are the grouping keys followed by the aggregate results (StarRocks
 /// allocates them in that order).
 ///
+/// The grouping keys are emitted in the output tuple's materialized-slot order, not GROUP BY
+/// order (see [`grouping_materialization_order`]): every consumer of the tuple — slot refs
+/// above this node, the next hop's declared stream schema, output names, hash-partition
+/// indices — resolves its columns through the descriptor's order, so the sender reorders to
+/// it, exactly as [`translate_sort`] does for its sort tuple.
+///
 /// A two-phase measure's partial state is typed by [`partial_state::wire_columns`], the same
 /// model the exchange feeding the merge half declares its stream from, so the two ends of the
 /// hop agree by construction. A state wider than one column (avg) is refused by
@@ -642,10 +648,25 @@ fn translate_aggregation(
         )));
     }
 
-    // A count check alone cannot see a permuted output tuple, so also require each grouping
-    // key's type to match the slot it is paired with. Compare only the type kind: the slot's
-    // nullability and decimal width are allowed to differ from the key expression's.
-    for (index, (expr, slot_id)) in grouping_exprs.iter().zip(&output_slots).enumerate() {
+    // The FE lists the grouping expressions in GROUP BY order, but the output tuple's
+    // materialized slots -- the order every consumer above this node resolves the row
+    // through -- are sorted by slot id (the FE serializes every aggregation-output slot with
+    // column_pos -1). Emitting the keys in GROUP BY order would make the engine row and the
+    // descriptor view permutations of each other whenever the GROUP BY list is not in
+    // ascending ref-id order, so the keys are emitted in the tuple's order instead. One key
+    // needs no pairing: a single grouping expression can only fill the single key slot.
+    let key_order: Vec<usize> = if keys > 1 {
+        grouping_materialization_order(node, grouping_exprs, &output_slots[..keys])?
+    } else {
+        (0..keys).collect()
+    };
+    // The slot pairing above cannot see a mistyped key (nor does it run for a single key), so
+    // also require each grouping key's type to match the slot it is paired with. Compare only
+    // the type kind: the slot's nullability and decimal width are allowed to differ from the
+    // key expression's.
+    for (slot_index, &grouping_index) in key_order.iter().enumerate() {
+        let expr = &grouping_exprs[grouping_index];
+        let slot_id = output_slots[slot_index];
         let Some(key_type) = expr
             .nodes
             .first()
@@ -654,7 +675,7 @@ fn translate_aggregation(
         else {
             continue;
         };
-        let slot = ctx.desc.slot(output_tuple, *slot_id)?;
+        let slot = ctx.desc.slot(output_tuple, slot_id)?;
         let Some(slot_type) = slot.substrait_type.as_ref() else {
             continue;
         };
@@ -662,7 +683,7 @@ fn translate_aggregation(
         if kind_of(&key_type) != kind_of(slot_type) {
             return Err(TranslateError::descriptor(format!(
                 "AGGREGATION_NODE {} output tuple {} slot {} does not match grouping key {}",
-                node.node_id, output_tuple, slot_id, index
+                node.node_id, output_tuple, slot_id, grouping_index
             )));
         }
     }
@@ -688,12 +709,12 @@ fn translate_aggregation(
     };
 
     let mut grouping_expressions = Vec::with_capacity(keys);
-    for expr in grouping_exprs {
+    for &grouping_index in &key_order {
         let mut expr_ctx = match &merge_slots {
             Some(slots) => ctx.expr_context_with_slots(&child.row_tuples, &slots.columns),
             None => ctx.expr_context(&child.row_tuples),
         };
-        grouping_expressions.push(expr.translate(&mut expr_ctx)?);
+        grouping_expressions.push(grouping_exprs[grouping_index].translate(&mut expr_ctx)?);
     }
 
     let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
@@ -980,6 +1001,62 @@ fn declared_measure_types(
         .collect()
 }
 
+/// The FE allocates one output slot per grouping expression, reusing the expression's own
+/// column-ref id (verified against FE fragment dumps: grouping refs [18, 13, 16] over the
+/// input tuple pair with output key slots 18/13/16), and serializes every aggregation-output
+/// slot with column_pos -1 -- so `key_slots` lists the keys in ascending slot id, not GROUP BY
+/// order. Each grouping expression must be a bare slot ref and the pairing must be a
+/// bijection; anything else means the FE laid the tuple out differently than this model
+/// (including a measure slot sorted in among the keys, which would also mis-type every
+/// declared measure), and reordering on a wrong model would ship wrong columns -- silently.
+fn grouping_materialization_order(
+    node: &TPlanNode,
+    grouping_exprs: &[TExpr],
+    key_slots: &[i32],
+) -> Result<Vec<usize>> {
+    let mut by_slot = std::collections::HashMap::with_capacity(grouping_exprs.len());
+    for (index, expr) in grouping_exprs.iter().enumerate() {
+        let slot_id = grouping_slot_id(expr).ok_or(TranslateError::UnsupportedPlanNode {
+            node_id: node.node_id,
+            node_type: node.node_type,
+            reason: "a grouping expression that is not a bare slot ref leaves the output key \
+                     column order unrecoverable",
+        })?;
+        if by_slot.insert(slot_id, index).is_some() {
+            return Err(TranslateError::descriptor(format!(
+                "AGGREGATION_NODE {} lists grouping slot {slot_id} twice",
+                node.node_id
+            )));
+        }
+    }
+    key_slots
+        .iter()
+        .map(|slot_id| {
+            by_slot.remove(slot_id).ok_or_else(|| {
+                TranslateError::descriptor(format!(
+                    "AGGREGATION_NODE {} output key slot {slot_id} pairs with no grouping \
+                     expression",
+                    node.node_id
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Returns the slot id a grouping expression names, if it is a bare slot ref.
+///
+/// The ref's tuple is the aggregation's input row, not the output tuple, so only the slot id
+/// is read: the FE gives one column the same ref id in both tuples.
+fn grouping_slot_id(expr: &TExpr) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != starrocks_thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    Some(node.slot_ref.as_ref()?.slot_id)
+}
+
 /// Returns the FE's serialized function for one aggregate measure.
 fn measure_function(expr: &TExpr) -> Result<&starrocks_thrift::types::TFunction> {
     expr.nodes
@@ -1082,21 +1159,48 @@ fn translate_sort(
         .as_ref()
         .or(sort.sort_tuple_slot_exprs.as_ref());
     let input = if let Some(slot_exprs) = sort_tuple_slot_exprs.filter(|exprs| !exprs.is_empty()) {
-        let expected = ctx.desc.materialized_slot_ids(sort_tuple)?.len();
-        if slot_exprs.len() != expected {
+        let materialized = ctx.desc.materialized_slot_ids(sort_tuple)?;
+        if slot_exprs.len() != materialized.len() {
             return Err(TranslateError::descriptor(format!(
                 "SORT_NODE {} materializes {} exprs for sort tuple {} with {} slots",
                 node.node_id,
                 slot_exprs.len(),
                 sort_tuple,
-                expected
+                materialized.len()
             )));
         }
-        let mut expressions = Vec::with_capacity(slot_exprs.len());
-        for expr in slot_exprs {
+        // The FE lists the materialization expressions with the ordering keys first, but every
+        // consumer of the sort tuple resolves its columns through the descriptor's materialized
+        // slot order: the ordering slot refs below, this fragment's output names and sink row,
+        // and the receiving fragment's exchange schema on the other side of the wire. So the
+        // projection is emitted in materialized-slot order -- the sender is reordered to the
+        // one order all consumers already use. The alternative (overriding the receiver's
+        // declared stream schema to the FE list order) would satisfy the wire-schema guard and
+        // then feed every downstream slot reference, which still resolves through the
+        // descriptor order, the wrong column -- silently. The same invariant governs the
+        // aggregation node's grouping keys (see grouping_materialization_order): every node
+        // that materializes a new tuple must ship it in the tuple's materialized-slot order.
+        let fe_slot_order = sort_materialization_order(
+            node,
+            &sort.sort_info.ordering_exprs,
+            sort_tuple,
+            &materialized,
+        )?;
+        let mut translated_by_slot = std::collections::HashMap::with_capacity(slot_exprs.len());
+        for (slot_id, expr) in fe_slot_order.iter().zip(slot_exprs) {
             let mut expr_ctx = ctx.expr_context(&child.row_tuples);
-            expressions.push(expr.translate(&mut expr_ctx)?);
+            translated_by_slot.insert(*slot_id, expr.translate(&mut expr_ctx)?);
         }
+        let expressions = materialized
+            .iter()
+            .map(|slot_id| {
+                translated_by_slot.remove(slot_id).ok_or_else(|| {
+                    TranslateError::descriptor(format!(
+                        "sort tuple {sort_tuple} slot {slot_id} has no materialization expression"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         project_rel(child, expressions, vec![sort_tuple])
     } else {
         child
@@ -1117,6 +1221,65 @@ fn translate_sort(
         output_width,
     };
     apply_conjuncts(sorted, node, ctx)
+}
+
+/// Pairs each `sort_tuple_slot_exprs` entry with the sort-tuple slot it materializes,
+/// returning the slot ids in the FE's expression-list order.
+///
+/// The FE builds the sort tuple in two passes (`PlanFragmentBuilder.buildPartialTopNFragment`):
+/// one slot per ordering key first, then one slot per remaining output column in ascending
+/// slot-id order; `sort_tuple_slot_exprs` is appended in the same two passes. Each ordering
+/// expression is a bare slot ref naming the sort-tuple slot its key fills, and the payload
+/// slots are exactly the materialized slots left over -- which `materialized` already lists in
+/// ascending slot-id order, because the FE serializes every sort-tuple slot with column_pos -1.
+fn sort_materialization_order(
+    node: &TPlanNode,
+    ordering_exprs: &[TExpr],
+    sort_tuple: i32,
+    materialized: &[i32],
+) -> Result<Vec<i32>> {
+    let mut order = Vec::with_capacity(materialized.len());
+    for expr in ordering_exprs {
+        let slot_id =
+            sort_tuple_slot_id(expr, sort_tuple).ok_or(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "a sort ordering expression that is not a slot ref into the sort tuple \
+                         leaves the materialized column order unrecoverable",
+            })?;
+        order.push(slot_id);
+    }
+    let payload_slots = materialized
+        .iter()
+        .copied()
+        .filter(|slot_id| !order.contains(slot_id))
+        .collect::<Vec<_>>();
+    order.extend(payload_slots);
+    // Equal lengths make `order` a permutation of `materialized`: a duplicate ordering key or a
+    // key outside the tuple both inflate it. Anything but a permutation means the FE laid the
+    // tuple out differently than the two-pass model above, and reordering on a wrong model
+    // would ship wrong columns.
+    if order.len() != materialized.len() {
+        return Err(TranslateError::descriptor(format!(
+            "SORT_NODE {} ordering keys pair with slots {order:?}, but sort tuple {sort_tuple} \
+             materializes slots {materialized:?}",
+            node.node_id
+        )));
+    }
+    Ok(order)
+}
+
+/// Returns the sort-tuple slot a sort ordering expression names, if it is a bare slot ref into
+/// that tuple.
+fn sort_tuple_slot_id(expr: &TExpr, sort_tuple: i32) -> Option<i32> {
+    let [node] = expr.nodes.as_slice() else {
+        return None;
+    };
+    if node.node_type != starrocks_thrift::exprs::TExprNodeType::SLOT_REF {
+        return None;
+    }
+    let slot_ref = node.slot_ref.as_ref()?;
+    (slot_ref.tuple_id == sort_tuple).then_some(slot_ref.slot_id)
 }
 
 /// Builds Substrait sort fields from a StarRocks sort-info payload against `input`'s row layout.
