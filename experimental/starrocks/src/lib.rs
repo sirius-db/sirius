@@ -64,7 +64,7 @@ mod result_store;
 mod tunable;
 
 pub use brpc::BrpcServer;
-pub use compute_node_service::ExchangeIdentity;
+pub use compute_node_service::{ExchangeIdentity, FragmentFailureReporter};
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use engine_settings::{
@@ -73,6 +73,7 @@ pub use engine_settings::{
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
 pub use gpu_affinity::{GpuSocket, cpu_affinity_for_gpu, gpu_socket};
 pub use nixl_transport::NixlTransport;
+use result_store::FragmentInstanceId;
 pub use tunable::Tunables;
 
 /// Serializes tests that bring up a GPU engine context: the engine keeps process-global GPU
@@ -1225,9 +1226,171 @@ pub fn report_to_frontend_once(
     };
 
     // FE thrift address comes from TMasterInfo.network_address in heartbeat.
-    let frontend = report.frontend_address.clone();
-    // Resolve and connect with bounded timeouts so an unreachable or accept-but-never-reply FE
-    // cannot wedge this blocking call — and therefore the whole report loop — indefinitely.
+    let mut client = connect_frontend(&report.frontend_address)?;
+
+    let result = client
+        .report(report.request)
+        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
+    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
+    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
+    // being silently logged as success by the caller.
+    if result.status.status_code != TStatusCode::OK {
+        bail!(
+            "FE rejected compute node report (status {:?}): {}",
+            result.status.status_code,
+            result
+                .status
+                .error_msgs
+                .as_ref()
+                .map(|messages| messages.join("; "))
+                .unwrap_or_default()
+        );
+    }
+    Ok(Some(result))
+}
+
+/// The production [`FragmentFailureReporter`]: reports through `FrontendService.reportExecStatus`
+/// to the FE the heartbeat announced, on its own thread so the dispatch worker never waits on
+/// the FE. Before the first heartbeat there is no FE address; the failure is then only logged
+/// (the FE will not find this CN either).
+#[derive(Debug)]
+pub struct FeFailureReporter {
+    state: SharedHeartbeatState,
+}
+
+impl FeFailureReporter {
+    /// A reporter that learns the FE address from `state` at report time.
+    pub fn new(state: SharedHeartbeatState) -> Self {
+        Self { state }
+    }
+}
+
+impl FragmentFailureReporter for FeFailureReporter {
+    fn report_failure(
+        &self,
+        query_id: FragmentInstanceId,
+        fragment_instance_id: FragmentInstanceId,
+        backend_num: Option<i32>,
+        error: &str,
+    ) {
+        let Some(frontend) = self.state.snapshot().frontend_address else {
+            tracing::warn!(
+                %query_id,
+                %fragment_instance_id,
+                "fragment failed before any FE heartbeat; nowhere to report it"
+            );
+            return;
+        };
+        let error = error.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("fe-failure-report".to_string())
+            .spawn(move || {
+                let (query_hi, query_lo) = query_id.as_halves();
+                let (instance_hi, instance_lo) = fragment_instance_id.as_halves();
+                let query = types::TUniqueId::new(query_hi, query_lo);
+                let instance = types::TUniqueId::new(instance_hi, instance_lo);
+                match report_fragment_failure(&frontend, query, instance, backend_num, &error) {
+                    Ok(()) => tracing::info!(
+                        %query_id,
+                        %fragment_instance_id,
+                        backend_num,
+                        "reported the fragment failure to the FE"
+                    ),
+                    Err(err) => tracing::warn!(
+                        %query_id,
+                        %fragment_instance_id,
+                        error = %err,
+                        "could not report the fragment failure to the FE; it will learn of it \
+                         from a result poll or its query timeout"
+                    ),
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(error = %err, "could not spawn the FE failure report thread");
+        }
+    }
+}
+
+/// Tells the FE that one fragment instance of a query failed here, through
+/// `FrontendService.reportExecStatus`, the RPC every BE uses for the same purpose. The FE's
+/// coordinator (`QeProcessorImpl.reportExecStatus` -> `Coordinator.updateFragmentExecStatus`)
+/// cancels the query's other fragments and returns the error to the client.
+///
+/// Why the CN needs it: a fragment that fails on the dispatch worker (an OOM'd receiver, a
+/// refused plan shape) is recorded only in this CN's result store, which reaches the FE only when
+/// the FE polls a result fragment reserved on THIS node. When the result fragment lives on
+/// another CN the FE learns nothing until its query timeout (q17 at SF1000, 2 CNs: 600 s of
+/// nothing after a 30 s failure). This report closes that gap on every failure path.
+///
+/// Bounded like `report_to_frontend_once`: connect and I/O timeouts of a few seconds, so a slow
+/// FE can never wedge the caller (the dispatch worker runs it on its own thread anyway).
+pub fn report_fragment_failure(
+    frontend: &types::TNetworkAddress,
+    query_id: types::TUniqueId,
+    fragment_instance_id: types::TUniqueId,
+    backend_num: Option<i32>,
+    error: &str,
+) -> Result<()> {
+    let mut client = connect_frontend(frontend)?;
+    let params = starrocks_thrift::frontend_service::TReportExecStatusParams::new(
+        starrocks_thrift::frontend_service::FrontendServiceVersion::V1,
+        query_id,
+        backend_num,
+        fragment_instance_id,
+        TStatus::new(TStatusCode::INTERNAL_ERROR, vec![error.to_string()]),
+        true, // done: this instance will not report again
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let result = client
+        .report_exec_status(params)
+        .map_err(|err| anyhow!("failed to report the fragment failure to the FE: {err}"))?;
+    // The FE fills `status` on every reply; a reply without one is treated as a rejection.
+    match result.status {
+        Some(status) if status.status_code == TStatusCode::OK => Ok(()),
+        Some(status) => bail!(
+            "FE rejected the fragment failure report (status {:?}): {}",
+            status.status_code,
+            status
+                .error_msgs
+                .as_ref()
+                .map(|messages| messages.join("; "))
+                .unwrap_or_default()
+        ),
+        None => bail!("FE replied to the fragment failure report without a status"),
+    }
+}
+
+/// Opens a bounded-timeout binary-thrift connection to the FE's `FrontendService`.
+///
+/// Resolve and connect with bounded timeouts so an unreachable or accept-but-never-reply FE
+/// cannot wedge the blocking caller — and therefore a report loop — indefinitely.
+/// The FE client shape `connect_frontend` hands out: buffered binary thrift over one TCP stream.
+type FrontendClient = FrontendServiceSyncClient<
+    TBinaryInputProtocol<TBufferedReadTransport<thrift::transport::ReadHalf<TTcpChannel>>>,
+    TBinaryOutputProtocol<TBufferedWriteTransport<thrift::transport::WriteHalf<TTcpChannel>>>,
+>;
+
+fn connect_frontend(frontend: &types::TNetworkAddress) -> Result<FrontendClient> {
     let socket_addrs: Vec<SocketAddr> = (frontend.hostname.as_str(), frontend.port as u16)
         .to_socket_addrs()
         .with_context(|| {
@@ -1277,27 +1440,10 @@ pub fn report_to_frontend_once(
     let write_transport = TBufferedWriteTransport::new(write_channel);
     let input_protocol = TBinaryInputProtocol::new(read_transport, true);
     let output_protocol = TBinaryOutputProtocol::new(write_transport, true);
-    let mut client = FrontendServiceSyncClient::new(input_protocol, output_protocol);
-
-    let result = client
-        .report(report.request)
-        .map_err(|err| anyhow!("failed to report compute node inventory to FE: {err}"))?;
-    // The Thrift round-trip succeeding does not mean the FE accepted the report; a non-OK
-    // status (e.g. unrecognized node or malformed payload) must surface as an error instead of
-    // being silently logged as success by the caller.
-    if result.status.status_code != TStatusCode::OK {
-        bail!(
-            "FE rejected compute node report (status {:?}): {}",
-            result.status.status_code,
-            result
-                .status
-                .error_msgs
-                .as_ref()
-                .map(|messages| messages.join("; "))
-                .unwrap_or_default()
-        );
-    }
-    Ok(Some(result))
+    Ok(FrontendServiceSyncClient::new(
+        input_protocol,
+        output_protocol,
+    ))
 }
 
 /// Builds the truthful "empty CN" report payload expected by `FrontendService.report`.

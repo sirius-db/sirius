@@ -7,9 +7,9 @@ use clap::Parser;
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, EngineReadiness, ExchangeIdentity, FeConfig,
-    FragmentExecutor, HeartbeatServer, HttpServer, NixlTransport, SharedHeartbeatState, Tunables,
-    register_node, report_to_frontend_once, start_backend_server, start_heartbeat_server,
-    start_http_server,
+    FeFailureReporter, FragmentExecutor, FragmentFailureReporter, HeartbeatServer, HttpServer,
+    NixlTransport, SharedHeartbeatState, Tunables, register_node, report_to_frontend_once,
+    start_backend_server, start_heartbeat_server, start_http_server,
 };
 #[cfg(feature = "sirius-engine")]
 use sirius_starrocks_cn::{
@@ -204,7 +204,16 @@ impl Args {
         // configured; a remote exchange destination stays a loud error otherwise.
         let transport = build_nixl_transport(&self.fe, &self.compute_node, executor.clone())?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone(), transport)?;
+        // Fragment failures go to the FE through reportExecStatus, so a failure on this CN ends
+        // the query on the client even when the result fragment runs on another CN.
+        let failure_reporter: Option<Arc<dyn FragmentFailureReporter>> =
+            Some(Arc::new(FeFailureReporter::new(state.clone())));
+        let brpc_runtime = BrpcRuntime::start(
+            &self.compute_node,
+            executor.clone(),
+            transport,
+            failure_reporter,
+        )?;
 
         // Everything that can execute a fragment is now up, so start answering heartbeats OK and
         // let the FE schedule onto this node. Opening the gate before brpc bound would advertise a
@@ -563,6 +572,7 @@ impl BrpcRuntime {
         compute_node: &ComputeNodeConfig,
         executor: Arc<dyn FragmentExecutor>,
         transport: Option<NixlTransport>,
+        failure_reporter: Option<Arc<dyn FragmentFailureReporter>>,
     ) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
         // The identity the FE routes exchanges by: the advertised host plus this brpc port.
@@ -576,7 +586,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor, identity, transport)
+                BrpcServer::with_executor(executor, identity, transport, failure_reporter)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

@@ -132,6 +132,26 @@ pub(crate) struct SiriusComputeNodeService {
     ready_fragments: mpsc::Sender<ReadyFragment>,
 }
 
+/// Tells the FE that a fragment instance failed on this CN, so the coordinator cancels the query
+/// and returns the error to the client without waiting for a result-fragment poll or its timeout.
+///
+/// A dispatched fragment's failure is otherwise recorded only in this CN's result store, which
+/// the FE reads only through a result fragment reserved HERE. When the result fragment lives on
+/// another CN, nothing tells the FE (q17 at SF1000 with 2 CNs sat 600 s on a 30 s failure). The
+/// production reporter sends `FrontendService.reportExecStatus` to the FE learned from the
+/// heartbeat; tests inject a recorder.
+pub trait FragmentFailureReporter: std::fmt::Debug + Send + Sync {
+    /// Reports `error` for `fragment_instance_id` of `query_id`; `backend_num` is the FE's index
+    /// for this instance (from the exec params). Must not block the caller on the FE.
+    fn report_failure(
+        &self,
+        query_id: FragmentInstanceId,
+        fragment_instance_id: FragmentInstanceId,
+        backend_num: Option<i32>,
+        error: &str,
+    );
+}
+
 /// Shared state behind every clone of [`SiriusComputeNodeService`].
 ///
 /// One `Arc` so a `fetch_data` poll on one BRPC connection sees what an `exec_plan_fragment` on
@@ -168,6 +188,9 @@ struct ServiceCore {
     /// their exec_plan_fragment RPC. Off unless `SIRIUS_CN_ASYNC_SENDER_DISPATCH` is set at
     /// bring-up (or a test flips it); see [`SiriusComputeNodeService::try_dispatch_sender`].
     async_sender_dispatch: std::sync::atomic::AtomicBool,
+    /// Where a fragment failure is reported beyond this CN's result store (`None`: nowhere, the
+    /// pre-report behaviour every unit test without a recorder keeps).
+    failure_reporter: Option<Arc<dyn FragmentFailureReporter>>,
 }
 
 impl SiriusComputeNodeService {
@@ -195,10 +218,22 @@ impl SiriusComputeNodeService {
     /// `SiriusEngine`), this CN's advertised exchange identity, and an optional nixl transport
     /// for remote destinations, shared across BRPC connections via the `Arc`. Also spawns the
     /// fragment dispatch worker.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_transport(
         executor: Arc<dyn FragmentExecutor>,
         identity: ExchangeIdentity,
         transport: Option<NixlTransport>,
+    ) -> Self {
+        Self::with_transport_and_reporter(executor, identity, transport, None)
+    }
+
+    /// [`with_transport`](Self::with_transport) plus the reporter that tells the FE about a
+    /// fragment failure (see [`FragmentFailureReporter`]).
+    pub(crate) fn with_transport_and_reporter(
+        executor: Arc<dyn FragmentExecutor>,
+        identity: ExchangeIdentity,
+        transport: Option<NixlTransport>,
+        failure_reporter: Option<Arc<dyn FragmentFailureReporter>>,
     ) -> Self {
         let core = Arc::new(ServiceCore {
             translator: PlanTranslator::new(),
@@ -213,6 +248,7 @@ impl SiriusComputeNodeService {
             async_sender_dispatch: std::sync::atomic::AtomicBool::new(
                 Self::async_sender_dispatch_from_env(),
             ),
+            failure_reporter,
         });
         // A dedicated thread with a std channel (not a tokio task): fragment execution is
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
@@ -699,7 +735,8 @@ impl SiriusComputeNodeService {
                 ServiceCore::query_id(params),
             )
         {
-            self.core.fail_fragment(id, query_id, err.clone());
+            self.core
+                .fail_fragment(id, query_id, ServiceCore::backend_num(params), err.clone());
         }
         outcome
     }
@@ -919,6 +956,7 @@ impl ServiceCore {
     fn run_ready_fragment(&self, ready: ReadyFragment) -> Vec<ReadyFragment> {
         let id = Self::fragment_instance_id(&ready.params);
         let query_id = Self::query_id(&ready.params);
+        let backend_num = Self::backend_num(&ready.params);
         // Gate 3: a queued fragment of a query this CN already failed is skipped before
         // translation -- no `fragment run started`, no GPU work, no follow-on receivers. Its
         // staged remote leases go back to the arena; its local senders' parked output is
@@ -958,9 +996,9 @@ impl ServiceCore {
                             );
                         }
                         // Fails this id, every reserved result instance of the query, records
-                        // the failure so a later fragment of the query is refused, and retires
-                        // the query's parked output on the executor.
-                        self.fail_fragment(id, query_id, error);
+                        // the failure so a later fragment of the query is refused, retires the
+                        // query's parked output on the executor, and tells the FE.
+                        self.fail_fragment(id, query_id, backend_num, error);
                     }
                     (Some(id), None) => {
                         // Defensive: exec params carry both ids or neither, so this arm should
@@ -983,8 +1021,17 @@ impl ServiceCore {
     /// sender outputs and refuses its later runs. Idempotent against the engine's own retire, so
     /// it doubles as the belt for an engine `Err` and is the whole fix for a failure the engine
     /// never sees (a receiver whose translation fails after its senders parked).
-    fn fail_fragment(&self, id: FragmentInstanceId, query_id: FragmentInstanceId, error: String) {
+    fn fail_fragment(
+        &self,
+        id: FragmentInstanceId,
+        query_id: FragmentInstanceId,
+        backend_num: Option<i32>,
+        error: String,
+    ) {
         self.results.fail_query(query_id, id, error.clone());
+        if let Some(reporter) = &self.failure_reporter {
+            reporter.report_failure(query_id, id, backend_num, &error);
+        }
         if let Err(err) = self
             .executor
             .retire_query(query_id, RetireTrigger::CnErr, &error)
@@ -2079,6 +2126,12 @@ impl ServiceCore {
             (None, Some(query)) => format!("an unidentified instance of query {query}"),
             (None, None) => "an unidentified fragment instance".to_string(),
         }
+    }
+
+    /// The FE's backend index for this fragment instance, echoed back in a status report so the
+    /// coordinator matches the report to the instance it dispatched.
+    fn backend_num(params: &TExecPlanFragmentParams) -> Option<i32> {
+        params.backend_num
     }
 
     /// Extracts the fragment instance id the FE later passes to `fetch_data`.
@@ -3928,6 +3981,114 @@ pub(crate) mod tests {
             result.status.error_msgs
         );
         assert_eq!(result.eos, Some(true));
+    }
+
+    /// One failure the service reported to "the FE".
+    #[derive(Debug)]
+    struct Reported {
+        query_id: FragmentInstanceId,
+        fragment_instance_id: FragmentInstanceId,
+        backend_num: Option<i32>,
+        error: String,
+    }
+
+    /// Records every failure the service reported to "the FE".
+    #[derive(Debug, Default)]
+    struct RecordingReporter {
+        reports: Mutex<Vec<Reported>>,
+    }
+
+    impl FragmentFailureReporter for RecordingReporter {
+        fn report_failure(
+            &self,
+            query_id: FragmentInstanceId,
+            fragment_instance_id: FragmentInstanceId,
+            backend_num: Option<i32>,
+            error: &str,
+        ) {
+            self.reports.lock().unwrap().push(Reported {
+                query_id,
+                fragment_instance_id,
+                backend_num,
+                error: error.to_string(),
+            });
+        }
+    }
+
+    /// A receiver that fails on the dispatch worker is reported to the FE with its query id,
+    /// instance id, the FE's backend_num and the cause: when the query's result fragment lives on
+    /// another CN, this report is the only way the FE learns of the failure before its timeout.
+    #[test]
+    fn dispatched_receiver_failure_is_reported_to_the_fe() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let service = SiriusComputeNodeService::with_transport_and_reporter(
+            Arc::new(FailingReceiverExecutor),
+            test_identity(),
+            None,
+            Some(reporter.clone()),
+        );
+        let query_id = TUniqueId::new(51, 1);
+        let receiver_id = TUniqueId::new(51, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        receiver.backend_num = Some(3);
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut sender_exec = exec_params(query_id.clone(), TUniqueId::new(51, 3));
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![local_destination(receiver_id.clone())]);
+        sender.params = Some(sender_exec);
+        assert_exec_ok(&service, &sender);
+
+        fetch_error_eventually(&service, receiver_id.hi, receiver_id.lo);
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let reported = &reports[0];
+        assert_eq!(reported.query_id, FragmentInstanceId::from(&query_id));
+        assert_eq!(
+            reported.fragment_instance_id,
+            FragmentInstanceId::from(&receiver_id)
+        );
+        assert_eq!(reported.backend_num, Some(3));
+        assert!(
+            reported.error.contains("receiver exploded on the GPU"),
+            "{}",
+            reported.error
+        );
+    }
+
+    /// A fragment refused on its own RPC is reported too: the RPC error already reaches the FE,
+    /// and the duplicate report is harmless, so the reporter needs no path-specific rule.
+    #[test]
+    fn inline_fragment_failure_is_reported_to_the_fe() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let service = SiriusComputeNodeService::with_transport_and_reporter(
+            Arc::new(StubExecutor),
+            test_identity(),
+            None,
+            Some(reporter.clone()),
+        );
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink =
+            Some(sink_of_type(TDataSinkType::MEMORY_SCRATCH_SINK));
+        params.backend_num = Some(1);
+        params.params = Some(exec_params(TUniqueId::new(52, 1), TUniqueId::new(52, 2)));
+        let status = exec_status(&service, &params);
+        assert_ne!(status.status_code, TStatusCode::OK.0);
+        let reports = reporter.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].backend_num, Some(1));
+        assert!(
+            reports[0].error.contains("MEMORY_SCRATCH_SINK"),
+            "{}",
+            reports[0].error
+        );
     }
 
     /// Builds the three-fragment chain used by the failure-propagation tests: a result-sink root

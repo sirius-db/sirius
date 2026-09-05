@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    compute_node_service::{ExchangeIdentity, SiriusComputeNodeService},
+    compute_node_service::{ExchangeIdentity, FragmentFailureReporter, SiriusComputeNodeService},
     fragment_executor::FragmentExecutor,
     nixl_transport::NixlTransport,
     proto::starrocks::p_internal_service_brpc::PInternalServiceRouter,
@@ -41,10 +41,15 @@ impl BrpcServer {
         executor: Arc<dyn FragmentExecutor>,
         identity: ExchangeIdentity,
         transport: Option<NixlTransport>,
+        failure_reporter: Option<Arc<dyn FragmentFailureReporter>>,
     ) -> Self {
-        let service = PInternalServiceRouter::new(SiriusComputeNodeService::with_transport(
-            executor, identity, transport,
-        ));
+        let service =
+            PInternalServiceRouter::new(SiriusComputeNodeService::with_transport_and_reporter(
+                executor,
+                identity,
+                transport,
+                failure_reporter,
+            ));
         Self {
             inner: BrpcServiceServer::with_service(service),
         }
