@@ -183,13 +183,19 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
+    auto const input_strings = cudf::strings_column_view(input.get_column_view());
+#if CUDF_VERSION_NUM >= 2610
     auto result_column =
-      cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
+      cudf::strings::slice_strings(input_strings, start_val, stop_val, 1, _stream, _mr);
+#else
+    auto result_column =
+      cudf::strings::slice_strings(input_strings,
                                    cudf::numeric_scalar(start_val, true, _stream, _mr),
                                    cudf::numeric_scalar(stop_val, true, _stream, _mr),
                                    cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
                                    _stream,
                                    _mr);
+#endif
     return evaluate_result(std::move(result_column));
   }
 
