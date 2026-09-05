@@ -8,6 +8,19 @@ entire statement and the query fails with a syntax error. Verified the hard way.
 
 ---
 
+## q11 — fraction scaled by SF, `ORDER BY value DESC, ps_partkey` (2026-09-05)
+
+The HAVING fraction is `0.0001 / __TPCH_SF__` (substituted from `$TPCH_SF`, default 1), which is
+the spec's `0.0001 / SF`; the stock constant returns zero rows at SF1000 on every engine.
+
+The spec orders by `value DESC` only. At SF1000 the query returns 936,989 rows and thousands of
+them share a `value`, so two correct engines order the ties differently and a row-order-sensitive
+compare (`tools/compare.py`) reports `VALUES-DIFFER` with a huge `maxreldiff` on nothing but tie
+order (arm W1-1cn: 12,790 mismatched cells, every one a swapped tie). `ps_partkey` is unique per
+output row, so appending it makes the order total. Same text on both engines, same result set.
+
+---
+
 ## q08, q09 — `FROM` clause reordered (2026-08-19)
 
 ```diff
