@@ -54,9 +54,12 @@
 #include <cuda_runtime_api.h>
 
 // standard library
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 
 using namespace cucascade;
 using namespace cucascade::memory;
@@ -1666,6 +1669,94 @@ TEST_CASE("cast DOUBLE -> DECIMAL(16,0) rounds to the integer DuckDB gives",
   auto [in_batch, out_batch, iv, ov] = run_execute(*space, input, one(std::move(cast_expr)), MAT);
   REQUIRE(ov.column(0).type().id() == cudf::type_id::DECIMAL64);
   REQUIRE(copy_column_to_host<int64_t>(ov.column(0)) == expected);
+}
+
+namespace {
+
+std::unique_ptr<ast_node> make_round(std::unique_ptr<ast_node> input, std::optional<int32_t> places)
+{
+  std::vector<std::unique_ptr<ast_node>> args;
+  args.push_back(std::move(input));
+  if (places) { args.push_back(make_int_const(*places)); }
+  return std::make_unique<ast_node>(sirius::ast::function_call{
+    sirius::function_id::round, std::move(args), logical_type::make(type_id::DOUBLE)});
+}
+
+}  // namespace
+
+TEMPLATE_TEST_CASE("round(DOUBLE [, places]) rounds half away from zero like DuckDB",
+                   "[expression_evaluator]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  // The StarRocks translator finalizes every FE-declared DECIMAL aggregate it lowered to FP64
+  // with round(x, scale), so two independent FP64 sums of the same decimals become the same
+  // double: the first two values are TPC-H q15's SF1000 top total_revenue as two runs summed it,
+  // one ULP apart, and `total_revenue = (select max(total_revenue) ...)` dropped the row whenever
+  // the two evaluations of the CTE disagreed. Expected values are DuckDB's own answers for
+  // `round(x::DOUBLE, places)`.
+  constexpr auto strategy = TestType::value;
+  auto* space             = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<double> values = {
+    3351778.0989000006, 3351778.0988999996, 2.675, 1.005, -0.125, 0.5, -0.5, 1234.0};
+  auto input = make_double_batch(*space, values);
+
+  SECTION("four places: the two ULP-apart sums collapse to one double")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), 4)), strategy);
+    REQUIRE(ov.num_columns() == 1);
+    REQUIRE(ov.column(0).type().id() == cudf::type_id::FLOAT64);
+    std::vector<double> expected = {
+      3351778.0989, 3351778.0989, 2.675, 1.005, -0.125, 0.5, -0.5, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("two places: 2.675 scales to 267.5 in double and rounds up, as in DuckDB")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), 2)), strategy);
+    std::vector<double> expected = {3351778.1, 3351778.1, 2.68, 1.0, -0.13, 0.5, -0.5, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("no places argument is DuckDB's unary round")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), std::nullopt)), strategy);
+    std::vector<double> expected = {3351778.0, 3351778.0, 3.0, 1.0, -0.0, 1.0, -1.0, 1234.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+  SECTION("negative places round to hundreds")
+  {
+    auto [in_batch, out_batch, iv, ov] =
+      run_execute(*space, input, one(make_round(make_ref(0), -2)), strategy);
+    std::vector<double> expected = {3351800.0, 3351800.0, 0.0, 0.0, -0.0, 0.0, -0.0, 1200.0};
+    REQUIRE(copy_column_to_host<double>(ov.column(0)) == expected);
+  }
+}
+
+TEST_CASE("round(DOUBLE, places) keeps nulls and passes NaN and infinities through",
+          "[expression_evaluator]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const nan             = std::numeric_limits<double>::quiet_NaN();
+  auto const inf             = std::numeric_limits<double>::infinity();
+  std::vector<double> values = {nan, inf, -inf, 1e308, 0.0049};
+  auto input                 = make_double_batch(*space, values);
+
+  auto [in_batch, out_batch, iv, ov] =
+    run_execute(*space, input, one(make_round(make_ref(0), 2)), MAT);
+  auto out = copy_column_to_host<double>(ov.column(0));
+  REQUIRE(out.size() == 5);
+  REQUIRE(std::isnan(out[0]));
+  REQUIRE(out[1] == inf);
+  REQUIRE(out[2] == -inf);
+  // 1e308 * 100 overflows: DuckDB returns the input unchanged.
+  REQUIRE(out[3] == 1e308);
+  REQUIRE(out[4] == 0.0);
 }
 
 // ---------------------------------------------------------------------------

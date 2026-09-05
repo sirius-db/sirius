@@ -31,16 +31,17 @@ namespace sirius {
  * test_function_id.cpp). The order is grouped by category for human
  * readability; integer values are part of the public ABI — new entries go
  * at the end of their category, never in the middle. Cardinality is
- * exactly 29 (D-01).
+ * exactly 30 (D-01).
  */
 enum class function_id : uint16_t {
-  // Arithmetic — 6 entries (also the contents of supported_ast_functions)
+  // Arithmetic — 7 entries (the first six are the contents of supported_ast_functions)
   add = 0,
   sub,
   mul,
   div,
   int_div,
   mod,
+  round,  // round(x [, places]) over FLOAT/DOUBLE with DuckDB's arithmetic; materialize-only
 
   // String — 11 entries
   substring,

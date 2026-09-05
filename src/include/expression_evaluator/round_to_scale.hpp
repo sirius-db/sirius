@@ -28,8 +28,14 @@
 namespace sirius {
 
 /// Rounds a FLOAT32/FLOAT64 column to `decimal_places` fractional digits the way DuckDB's
-/// floating -> DECIMAL cast does: `round(x * 10^decimal_places) / 10^decimal_places` with
-/// `round` half away from zero, on the whole value in one step.
+/// floating -> DECIMAL cast and its `round(x, places)` do: `round(x * 10^decimal_places) /
+/// 10^decimal_places` with `round` half away from zero, on the whole value in one step. A
+/// negative `decimal_places` rounds to tens, hundreds, ...: `round(x / 10^-places) * 10^-places`.
+///
+/// Two callers: the semantic FP64 -> DECIMAL cast (`cast.cpp`) and the `round` scalar function
+/// (`function.cpp`). The StarRocks translator emits the latter over every FE-declared DECIMAL
+/// aggregate it lowered to FP64, so two independent FP64 sums of the same decimals finalize to
+/// the same double.
 ///
 /// This is deliberately not `cudf::round`: cuDF splits the value into integer and fractional
 /// parts before scaling (`modf`), so 2.675 (stored as 2.67499999999999982) scales its fraction
@@ -37,8 +43,9 @@ namespace sirius {
 /// (the nearest double) and rounds up to 2.68. A cast that must agree with DuckDB's answer to
 /// the last digit has to reproduce its arithmetic, not just its rounding mode.
 ///
-/// Nulls are preserved; NaN and infinities pass through unchanged (they are out of range for
-/// any decimal and the cast that follows is what reports them).
+/// Nulls are preserved. For `decimal_places >= 0`, NaN, infinities and values whose scaling
+/// overflows pass through unchanged (they are out of range for any decimal and the cast that
+/// follows is what reports them); for negative places DuckDB answers 0 there, and so does this.
 /// @throws sirius::invalid_input_exception when `input` is not a floating column.
 std::unique_ptr<cudf::column> round_to_scale_like_duckdb(cudf::column_view const& input,
                                                          std::int32_t decimal_places,

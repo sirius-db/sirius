@@ -23,6 +23,7 @@
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <expression_evaluator/like_multiliteral.hpp>
 #include <expression_evaluator/regex/regex_playground.hpp>
+#include <expression_evaluator/round_to_scale.hpp>
 #include <helper/logical_type.hpp>
 #include <sirius/exception.hpp>
 
@@ -163,6 +164,27 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
   }
   if (resolved_id == function_id::mod) {
     return execute_numeric_binary_func(cudf::binary_operator::MOD);
+  }
+
+  //----------Round to Decimal Places----------//
+  if (resolved_id == function_id::round) {
+    // Only DuckDB's floating overload reaches the GPU (from_duckdb.cpp admits
+    // round(FLOAT | DOUBLE [, INTEGER places]) with a constant `places`), so the payload variant
+    // holds int32_t. One argument is DuckDB's unary round: zero places.
+    D_ASSERT(args.size() == 1 || args.size() == 2);
+    int32_t places = 0;
+    if (args.size() == 2) {
+      D_ASSERT(args[1]->holds<sirius::ast::constant>());
+      places = std::get<int32_t>(args[1]->get<sirius::ast::constant>().payload);
+    }
+    auto input = evaluate(*args[0], evaluation_mode::MATERIALIZE);
+    if (input.is_scalar()) {
+      auto column =
+        cudf::make_column_from_scalar(input.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      return evaluate_result(round_to_scale_like_duckdb(column->view(), places, _stream, _mr));
+    }
+    return evaluate_result(
+      round_to_scale_like_duckdb(input.get_column_view(), places, _stream, _mr));
   }
 
   //----------Substring Function----------//

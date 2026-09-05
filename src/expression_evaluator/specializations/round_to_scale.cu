@@ -27,20 +27,32 @@
 #include <sirius/exception.hpp>
 
 #include <cmath>
+#include <cstdlib>
 
 namespace sirius {
 namespace {
 
 /// `round(x * p) / p` on the whole value, `round` half away from zero: DuckDB's
 /// `CAST(double AS DECIMAL)` arithmetic (duckdb/src/common/operator/cast_operators.cpp,
-/// DoubleToDecimalCast), so the two engines round the same doubles the same way.
+/// DoubleToDecimalCast) and its `round(x, places)` for places >= 0
+/// (duckdb/extension/core_functions/scalar/math/numeric.cpp, RoundOperatorPrecision), so the
+/// two engines round the same doubles the same way. Negative places scale the other way,
+/// `round(x / p) * p`, as DuckDB does. The arithmetic is always double, FLOAT included, which is
+/// what DuckDB's operator does before narrowing the result back.
+///
+/// A result that is not finite means the scaling overflowed (or the input was NaN/inf); DuckDB
+/// then returns the input for places >= 0 and 0 for places < 0.
 template <typename T>
 struct round_scaled {
-  T scale;
+  double modifier;
+  bool negative_places;
   __device__ T operator()(T value) const
   {
-    if (!isfinite(value)) { return value; }
-    return round(value * scale) / scale;
+    auto const x = static_cast<double>(value);
+    auto const rounded =
+      negative_places ? round(x / modifier) * modifier : round(x * modifier) / modifier;
+    if (!isfinite(rounded)) { return negative_places ? T{0} : value; }
+    return static_cast<T>(rounded);
   }
 };
 
@@ -58,12 +70,12 @@ struct dispatch_round {
                                             stream,
                                             mr);
     // Powers of ten are exact in double up to 10^22, far beyond any decimal scale.
-    auto const scale = static_cast<T>(std::pow(10.0, static_cast<double>(decimal_places)));
+    auto const modifier = std::pow(10.0, static_cast<double>(std::abs(decimal_places)));
     thrust::transform(rmm::exec_policy(stream),
                       input.begin<T>(),
                       input.end<T>(),
                       output->mutable_view().begin<T>(),
-                      round_scaled<T>{scale});
+                      round_scaled<T>{modifier, decimal_places < 0});
     return output;
   }
 
