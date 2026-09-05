@@ -59,6 +59,13 @@ with double-precision summation order — that is what the relative tolerance is
 line runs the compare step at the end of the sweep instead of as a separate command, and
 the sweep then exits with compare.py's status; the oracle still has to be produced first.
 
+**CTE reuse.** The FE inlines a CTE once per reference unless its cost model prefers reuse
+(`cbo_cte_reuse_rate`, default 1.15). q15's `revenue` CTE is referenced twice, so by default
+lineitem is scanned twice and the join compares two independent evaluations of the same sum.
+`SET GLOBAL cbo_cte_reuse_rate = 0` forces reuse: the FE computes the CTE once and fans it out
+through a `MULTI_CAST_DATA_STREAM_SINK`, which the CN runs as one parked output with one local
+consumer per sink. Run it once after the FE is up (the SF1000 arms pass it as `FE_SETUP_SQL`).
+
 A two-CN smoke test on one GPU is `pixi run cluster2` with `MIN_BACKENDS=2`;
 [`DEMO.md`](../../DEMO.md) walks through a Q6-shaped query on that cluster (different date
 and discount bounds, so its `61567694.9502` is not q06's answer).
