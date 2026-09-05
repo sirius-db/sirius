@@ -39,8 +39,10 @@
 #include <duckdb/main/client_data.hpp>
 #include <duckdb/main/pending_query_result.hpp>
 #include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/child_process_environment.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
@@ -2094,7 +2096,7 @@ slot_watchdog_result run_scenario(std::string const& variant,
 
 }  // namespace
 
-// Hidden child-runner: re-entered via execl by the watchdog below. Not part of any
+// Hidden child-runner: re-entered by the watchdog below. Not part of any
 // standard gate; runs only when selected by its exact name.
 TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
 {
@@ -2107,6 +2109,8 @@ TEST_CASE(kChildRunnerCase, "[.][query_lifecycle][watchdog_child]")
   if (config_raw == nullptr) {
     out.error = "watchdog child missing config path";
   } else {
+    // Shared test-environment startup resets these values after exec, so restore the
+    // watchdog's isolated-context environment before running the scenario.
     ::setenv("SIRIUS_CONFIG_FILE", config_raw, 1);
     ::unsetenv("SIRIUS_DISABLE");
     auto const output_path = fs::path(output_raw);
@@ -2144,22 +2148,30 @@ class QueryLifecycleSlotFixture {
     auto const log_dir = variant_log_dir(output_path);
     if (variant_requires_file_log(variant)) { fs::create_directories(log_dir); }
 
-    auto const pid = ::fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-      ::setenv(kEnvVariant, variant.c_str(), 1);
-      ::setenv(kEnvOutput, output_path.string().c_str(), 1);
-      ::setenv(kEnvConfig, config_path.string().c_str(), 1);
-      if (variant_requires_file_log(variant)) {
-        ::setenv("SIRIUS_LOG_BACKEND", "spdlog", 1);
-        ::setenv("SIRIUS_LOG_DIR", log_dir.string().c_str(), 1);
-        ::setenv("SIRIUS_LOG_LEVEL", "debug", 1);
-      }
-      // A child that inherited a live CUDA context must re-exec before running an
-      // engine query, so re-invoke the unit-test binary for the child-runner case.
-      ::execl("/proc/self/exe", "sirius_unittest", kChildRunnerCase, static_cast<char*>(nullptr));
-      ::_exit(127);
+    std::vector<std::string> child_arguments{"sirius_unittest", kChildRunnerCase};
+    std::vector<char*> child_argv;
+    child_argv.reserve(child_arguments.size() + 1);
+    for (auto& argument : child_arguments) {
+      child_argv.push_back(argument.data());
     }
+    child_argv.push_back(nullptr);
+
+    std::vector<sirius::test::child_process_environment::override> environment_overrides{
+      {kEnvVariant, variant},
+      {kEnvOutput, output_path.string()},
+      {kEnvConfig, config_path.string()}};
+    if (variant_requires_file_log(variant)) {
+      environment_overrides.emplace_back("SIRIUS_LOG_BACKEND", "spdlog");
+      environment_overrides.emplace_back("SIRIUS_LOG_DIR", log_dir.string());
+      environment_overrides.emplace_back("SIRIUS_LOG_LEVEL", "debug");
+    }
+    sirius::test::child_process_environment child_environment{std::move(environment_overrides)};
+
+    // Re-exec before running an engine query so no live CUDA context is inherited.
+    pid_t pid{};
+    auto const spawn_result = ::posix_spawn(
+      &pid, "/proc/self/exe", nullptr, nullptr, child_argv.data(), child_environment.data());
+    REQUIRE(spawn_result == 0);
 
     int status      = 0;
     auto const stop = std::chrono::steady_clock::now() + deadline;
