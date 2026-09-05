@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 
+use crate::exchange_protocol::{self, Admission, Publication, ReceiveLedger};
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
 use crate::fragment_executor::{
@@ -110,12 +111,60 @@ enum DestinationRoute {
 #[derive(Debug, Default)]
 struct FragmentOutcome {
     ready: Vec<ReadyFragment>,
+    drains: Option<PendingDrains>,
 }
 
 impl FragmentOutcome {
     /// A fragment that readied `ready` receivers.
     fn from_ready(ready: Vec<ReadyFragment>) -> Self {
-        Self { ready }
+        Self {
+            ready,
+            drains: None,
+        }
+    }
+}
+
+/// Completion ownership of accepted remote drains. A leaf RPC waits after dispatching its
+/// local receivers; an intermediate hands this to the bounded completion supervisor.
+#[derive(Debug)]
+struct PendingDrains {
+    label: FragmentLabel,
+    backend_num: Option<i32>,
+    tickets: Vec<mpsc::Receiver<std::result::Result<(), String>>>,
+}
+
+impl PendingDrains {
+    fn poll(&mut self) -> std::result::Result<bool, String> {
+        let mut pending = Vec::new();
+        for ticket in self.tickets.drain(..) {
+            match ticket.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err("transport exited before remote drain completion".to_string());
+                }
+                Err(mpsc::TryRecvError::Empty) => pending.push(ticket),
+            }
+        }
+        self.tickets = pending;
+        Ok(self.tickets.is_empty())
+    }
+
+    fn wait(mut self) -> std::result::Result<(), String> {
+        loop {
+            if self.poll()? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn fail(self, core: &ServiceCore, error: String) {
+        if let (Some(id), Some(query_id)) = (self.label.fragment_instance_id, self.label.query_id) {
+            core.fail_fragment(id, query_id, self.backend_num, error);
+        } else {
+            tracing::error!(%error, "remote drain without query identity failed");
+        }
     }
 }
 
@@ -180,6 +229,8 @@ struct ServiceCore {
     /// The executor serves every staging call from a thread-safe arena handle, never from the
     /// engine's request queue, so a lease request costs a mutex — not an engine wait.
     staging_info: Mutex<Option<(u64, u64)>>,
+    /// Distributed ownership and bounded receive admission, independent of engine execution.
+    receive_ledger: ReceiveLedger,
     /// Which same-node senders are deferred into their receiver's plan instead of running, as a
     /// [`FusionMode`] code. From `SIRIUS_CN_FRAGMENT_FUSION` at bring-up (or a test's setter);
     /// see [`ServiceCore::try_defer_sender`].
@@ -188,6 +239,7 @@ struct ServiceCore {
     /// their exec_plan_fragment RPC. Off unless `SIRIUS_CN_ASYNC_SENDER_DISPATCH` is set at
     /// bring-up (or a test flips it); see [`SiriusComputeNodeService::try_dispatch_sender`].
     async_sender_dispatch: std::sync::atomic::AtomicBool,
+    overlap_drains: std::sync::atomic::AtomicBool,
     /// Where a fragment failure is reported beyond this CN's result store (`None`: nowhere, the
     /// pre-report behaviour every unit test without a recorder keeps).
     failure_reporter: Option<Arc<dyn FragmentFailureReporter>>,
@@ -244,9 +296,13 @@ impl SiriusComputeNodeService {
             identity,
             transport,
             staging_info: Mutex::new(None),
+            receive_ledger: ReceiveLedger::default(),
             fragment_fusion: std::sync::atomic::AtomicU8::new(Tunables::get().fusion_mode.code()),
             async_sender_dispatch: std::sync::atomic::AtomicBool::new(
                 Self::async_sender_dispatch_from_env(),
+            ),
+            overlap_drains: std::sync::atomic::AtomicBool::new(
+                exchange_protocol::optimized_enabled(),
             ),
             failure_reporter,
         });
@@ -254,10 +310,16 @@ impl SiriusComputeNodeService {
         // synchronous and blocking, so it gets the same dedicated-thread shape as the engine
         // itself, and the BRPC current-thread runtime is never involved.
         let (ready_fragments, worker_inbox) = mpsc::channel();
+        let (drains, drain_inbox) = mpsc::sync_channel(128);
+        let drain_core = Arc::clone(&core);
+        std::thread::Builder::new()
+            .name("fragment-drains".to_string())
+            .spawn(move || drain_supervisor(drain_core, drain_inbox))
+            .expect("failed to spawn drain completion supervisor");
         let worker_core = Arc::clone(&core);
         std::thread::Builder::new()
             .name("fragment-dispatch".to_string())
-            .spawn(move || dispatch_worker(worker_core, worker_inbox))
+            .spawn(move || dispatch_worker(worker_core, worker_inbox, drains))
             .expect("failed to spawn fragment dispatch worker");
         Self {
             core,
@@ -287,11 +349,12 @@ impl SiriusComputeNodeService {
     /// batches via nixl`; q06 at 4 CNs was 1.22 s against 0.85 s with the queue. Returning as
     /// soon as the fragment is queued lets every scan start in the same wave.
     ///
-    /// Why it is off by default: a queued sender's failure (a malformed sink, an untranslatable
-    /// plan, a failed remote drain) is attributed through `results.fail_query`, which only reaches
-    /// result instances reserved on this node. When the result fragment lives on another node the
-    /// FE learns of the failure through its query timeout instead of this RPC's status. Flip the
-    /// default once a sender failure is forwarded to the receiver's node.
+    /// The switch remains off by default, independently of `SIRIUS_EXCHANGE_OPTIMIZED`.
+    /// Production CNs install `FeFailureReporter`: `fail_fragment` reports queued execution or
+    /// drain failures through `FrontendService.reportExecStatus`, so the FE can cancel the query
+    /// even when its result fragment lives on another CN. It also records the local result error
+    /// and retires query state. Test/library embeddings that omit the reporter have only that
+    /// local result-store error path; they must install a reporter for cross-node notification.
     fn async_sender_dispatch_from_env() -> bool {
         matches!(
             std::env::var("SIRIUS_CN_ASYNC_SENDER_DISPATCH").as_deref(),
@@ -316,8 +379,8 @@ impl SiriusComputeNodeService {
     /// way, so the FE's per-query descriptor cache protocol sees the same order as before.
     ///
     /// A queued sender runs through [`ServiceCore::run_ready_fragment`] like a readied receiver:
-    /// gate 3 skips it when its query already failed on this CN, its remote drains run inside
-    /// that call, and a failure is recorded with `fail_fragment`.
+    /// gate 3 skips it when its query already failed on this CN. Execution and remote-drain
+    /// failures are recorded with `fail_fragment`, including FE notification when configured.
     fn try_dispatch_sender(
         &self,
         params: &TExecPlanFragmentParams,
@@ -347,7 +410,9 @@ impl SiriusComputeNodeService {
     /// Hands a ready receiver to the dispatch worker so this RPC thread returns immediately
     /// instead of blocking on the receiver's whole execution.
     fn dispatch(&self, ready: ReadyFragment) -> std::result::Result<(), String> {
-        self.ready_fragments.send(ready).map_err(|_| {
+        self.ready_fragments.send(ready).map_err(|error| {
+            // A rejected handoff still owns every managed input; no engine run will sweep it.
+            self.core.release_staged(error.0.inputs);
             "fragment dispatch worker has exited; cannot execute receiver fragment".to_string()
         })
     }
@@ -358,6 +423,11 @@ impl SiriusComputeNodeService {
         for ready in outcome.ready {
             self.dispatch(ready)?;
         }
+        if let Some(drains) = outcome.drains {
+            // Preserve the leaf FE acknowledgement: local receivers are now runnable, but
+            // the RPC still reports success only when every remote destination completed.
+            drains.wait()?;
+        }
         Ok(())
     }
 }
@@ -366,14 +436,66 @@ impl SiriusComputeNodeService {
 ///
 /// Exits when every service clone has dropped its sender; the worker then releases its core
 /// handle (and with it the executor), keeping engine teardown ordered.
-fn dispatch_worker(core: Arc<ServiceCore>, inbox: mpsc::Receiver<ReadyFragment>) {
+fn dispatch_worker(
+    core: Arc<ServiceCore>,
+    inbox: mpsc::Receiver<ReadyFragment>,
+    drains: mpsc::SyncSender<PendingDrains>,
+) {
     while let Ok(ready) = inbox.recv() {
         // A receiver can itself be a sender whose completion readies further receivers (a
         // middle fragment, possibly fanning out); chase the whole set inline — this thread is
         // already off the RPC path.
         let mut queue = vec![ready];
         while let Some(ready) = queue.pop() {
-            queue.extend(core.run_ready_fragment(ready));
+            let outcome = core.run_ready_fragment(ready);
+            queue.extend(outcome.ready);
+            if let Some(pending) = outcome.drains {
+                if let Err(err) = drains.try_send(pending) {
+                    let pending = match err {
+                        mpsc::TrySendError::Full(pending)
+                        | mpsc::TrySendError::Disconnected(pending) => pending,
+                    };
+                    pending.fail(
+                        &core,
+                        "remote drain completion supervisor unavailable or full".to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Poll all live fragment tickets independently: one slow destination cannot hide another
+/// query's error. Admission is bounded, and shutdown drains accepted owners before teardown.
+fn drain_supervisor(core: Arc<ServiceCore>, inbox: mpsc::Receiver<PendingDrains>) {
+    let mut pending: Vec<PendingDrains> = Vec::new();
+    let mut closed = false;
+    loop {
+        if !closed && pending.is_empty() {
+            match inbox.recv() {
+                Ok(ticket) => pending.push(ticket),
+                Err(_) => closed = true,
+            }
+        } else if !closed && pending.len() < 128 {
+            match inbox.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(ticket) => pending.push(ticket),
+                Err(mpsc::RecvTimeoutError::Disconnected) => closed = true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else if !pending.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut retained = Vec::new();
+        for mut ticket in pending {
+            match ticket.poll() {
+                Ok(true) => {}
+                Ok(false) => retained.push(ticket),
+                Err(error) => ticket.fail(&core, error),
+            }
+        }
+        pending = retained;
+        if closed && pending.is_empty() {
+            break;
         }
     }
 }
@@ -486,6 +608,7 @@ impl PInternalService for SiriusComputeNodeService {
                 self.core
                     .release_sources(self.core.exchanges.retire_receiver(id))
             };
+            self.core.receive_ledger.retire_query(query_id);
             if let Err(err) = self.core.executor.retire_query(
                 query_id,
                 RetireTrigger::Cancel(reason_name.to_string()),
@@ -605,16 +728,24 @@ impl PInternalService for SiriusComputeNodeService {
                 status: Self::ok_status(),
                 agent_name: Some(reply.agent_name),
                 agent_metadata: Some(reply.metadata),
+                lease_protocol: Some(if exchange_protocol::optimized_enabled() {
+                    exchange_protocol::PROTOCOL_VERSION
+                } else {
+                    0
+                }),
+                process_epoch: Some(exchange_protocol::process_epoch()),
             },
             Ok(Err(err)) => PExchangeNixlMdResult {
                 status: Self::internal_error(err),
                 agent_name: None,
                 agent_metadata: None,
+                ..Default::default()
             },
             Err(join_err) => PExchangeNixlMdResult {
                 status: Self::internal_error(format!("exchange_nixl_md task panicked: {join_err}")),
                 agent_name: None,
                 agent_metadata: None,
+                ..Default::default()
             },
         };
         Ok(result.into())
@@ -630,26 +761,61 @@ impl PInternalService for SiriusComputeNodeService {
         _attachment: Vec<u8>,
     ) -> Result<crate::prpc::Reply<PStagingLeaseResult>, crate::prpc::Error> {
         let service = self.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || service.core.handle_staging_lease(request.length))
-                .await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            if exchange_protocol::optimized_enabled() {
+                service
+                    .core
+                    .receive_ledger
+                    .request(service.core.executor.as_ref(), &request)
+                    .map(|admission| match admission {
+                        Admission::Granted(grant) => PStagingLeaseResult {
+                            status: Self::ok_status(),
+                            remote_addr: Some(grant.address),
+                            offset: Some(grant.offset),
+                            lease_token: Some(grant.token),
+                            receiver_epoch: Some(exchange_protocol::process_epoch()),
+                            max_batch_bytes: Some(grant.max_batch),
+                            ..Default::default()
+                        },
+                        Admission::Unavailable { max_batch } => PStagingLeaseResult {
+                            status: Self::ok_status(),
+                            retryable_unavailable: Some(true),
+                            receiver_epoch: Some(exchange_protocol::process_epoch()),
+                            max_batch_bytes: Some(max_batch),
+                            ..Default::default()
+                        },
+                        Admission::Released => PStagingLeaseResult {
+                            status: Self::ok_status(),
+                            receiver_epoch: Some(exchange_protocol::process_epoch()),
+                            ..Default::default()
+                        },
+                    })
+            } else if request.identity.is_some() {
+                Err("optimized owned leases are not enabled on this receiver".to_string())
+            } else {
+                service
+                    .core
+                    .handle_staging_lease(request.length)
+                    .map(|(remote_addr, offset)| PStagingLeaseResult {
+                        status: Self::ok_status(),
+                        remote_addr: Some(remote_addr),
+                        offset: Some(offset),
+                        ..Default::default()
+                    })
+            }
+        })
+        .await;
         let result = match outcome {
-            Ok(Ok((remote_addr, offset))) => PStagingLeaseResult {
-                status: Self::ok_status(),
-                remote_addr: Some(remote_addr),
-                offset: Some(offset),
-            },
+            Ok(Ok(result)) => result,
             Ok(Err(err)) => PStagingLeaseResult {
                 status: Self::internal_error(err),
-                remote_addr: None,
-                offset: None,
+                ..Default::default()
             },
             Err(join_err) => PStagingLeaseResult {
                 status: Self::internal_error(format!(
                     "request_staging_lease task panicked: {join_err}"
                 )),
-                remote_addr: None,
-                offset: None,
+                ..Default::default()
             },
         };
         Ok(result.into())
@@ -667,17 +833,30 @@ impl PInternalService for SiriusComputeNodeService {
         // set dispatches (cheaply) to the fragment worker.
         let service = self.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            service.handle_transmit_packed(&request, attachment)
+            if exchange_protocol::optimized_enabled() {
+                service.handle_owned_transmit(&request, attachment)
+            } else if request.identity.is_some() {
+                Err("optimized owned publication is not enabled on this receiver".to_string())
+            } else {
+                service
+                    .handle_transmit_packed(&request, attachment)
+                    .map(|()| false)
+            }
         })
         .await;
-        let status = match outcome {
-            Ok(Ok(())) => Self::ok_status(),
-            Ok(Err(err)) => Self::internal_error(err),
-            Err(join_err) => {
-                Self::internal_error(format!("transmit_packed task panicked: {join_err}"))
-            }
+        let (status, pending) = match outcome {
+            Ok(Ok(pending)) => (Self::ok_status(), pending),
+            Ok(Err(err)) => (Self::internal_error(err), false),
+            Err(join_err) => (
+                Self::internal_error(format!("transmit_packed task panicked: {join_err}")),
+                false,
+            ),
         };
-        Ok(PTransmitPackedResult { status }.into())
+        Ok(PTransmitPackedResult {
+            status,
+            retryable_pending: Some(pending),
+        }
+        .into())
     }
 
     /// Infers the schema of the FILES() target so the FE can resolve the table function.
@@ -702,6 +881,157 @@ impl PInternalService for SiriusComputeNodeService {
 }
 
 impl SiriusComputeNodeService {
+    /// Owned publication keeps admission, copy completion, and sequence completion distinct.
+    /// The RPC worker may copy, but the engine and transport owner threads never wait for it.
+    /// Byte and frame credits bound how many workers can hold ingress resources concurrently.
+    fn handle_owned_transmit(
+        &self,
+        params: &PTransmitPackedParams,
+        attachment: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        exchange_protocol::validate_frame_identity(params)?;
+        if !params.canary.unwrap_or(false)
+            && !attachment.is_empty()
+            && (params.column_names.is_empty() || params.rows.is_none())
+        {
+            return Err(
+                "owned data publication requires column names and an exact row count".to_string(),
+            );
+        }
+        if params.lease_token.is_none() {
+            if params.length.unwrap_or(0) != 0 || params.canary.unwrap_or(false) {
+                return Err(
+                    "owned payload or canary publication requires its lease token".to_string(),
+                );
+            }
+            if params
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.query_id.as_ref())
+                .map(FragmentInstanceId::from)
+                .is_some_and(|query| self.core.receive_ledger.query_retired(query))
+            {
+                return Ok(false);
+            }
+            // Metadata-only empty tables and EOS have no GPU lease or evacuation allocation.
+            return self
+                .handle_transmit_packed(params, attachment)
+                .map(|()| false);
+        }
+        if attachment.is_empty() && !params.canary.unwrap_or(false) {
+            return Err("owned payload publication requires pack metadata".to_string());
+        }
+        let (reservation, offset, retired) = match self
+            .core
+            .receive_ledger
+            .begin_publication(params, &attachment)?
+        {
+            Publication::Pending => return Ok(true),
+            Publication::Complete(result) => return result.map(|()| false),
+            Publication::Fresh {
+                reservation,
+                offset,
+                retired,
+            } => (reservation, offset, retired),
+        };
+        let token = params.lease_token.expect("publication admitted a token");
+        let mut ownership = IngressOwnership {
+            executor: self.core.executor.as_ref(),
+            reservation: Some(reservation),
+            offset: Some(offset),
+        };
+        let started = std::time::Instant::now();
+        let result = (|| {
+            if params.canary.unwrap_or(false) || retired {
+                return Ok(());
+            }
+            let key = ExchangeKey {
+                fragment_instance_id: FragmentInstanceId::from(
+                    params.finst_id.as_ref().expect("identity validated"),
+                ),
+                node_id: params.node_id.expect("identity validated"),
+            };
+            let sender = params.sender_id.expect("identity validated");
+            let seq = params.seq.expect("identity validated");
+            match self.core.exchanges.claim_remote_frame(key, sender, seq)? {
+                RemoteFrameClaim::Retired | RemoteFrameClaim::Duplicate => return Ok(()),
+                RemoteFrameClaim::Fresh => {}
+            }
+            let mut batch = StagedBatch {
+                metadata: attachment,
+                offset,
+                len: params.length.expect("grant validated"),
+                rows: params.rows,
+                ticket: None,
+            };
+            // The C++ call ALWAYS consumes this reservation, including on validation/copy
+            // failure, and returns only once GPU reads of the arena are quiescent.
+            let reservation = ownership
+                .reservation
+                .take()
+                .expect("owned evacuation storage");
+            let ticket = self
+                .core
+                .executor
+                .stage_reserved_inbound(&batch, reservation)?;
+            batch.ticket = Some(ticket);
+            batch.offset = 0;
+            // Return staging before rendezvous completion or EOS. The managed input ticket
+            // now owns the payload; its lifetime is independent of this transport grant.
+            if let Err(error) = ownership.release_arena() {
+                let _ = self.core.executor.drop_inbound(ticket);
+                return Err(error);
+            }
+            if params
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.query_id.as_ref())
+                .map(FragmentInstanceId::from)
+                .is_some_and(|query| self.core.receive_ledger.query_retired(query))
+            {
+                self.core.executor.drop_inbound(ticket)?;
+                return Ok(());
+            }
+            let pushed = self.core.exchanges.push_claimed_frame(
+                key,
+                sender,
+                seq,
+                params.eos.unwrap_or(false),
+                params.column_names.clone(),
+                Some(batch),
+            );
+            match pushed {
+                Ok(PushedFrame::Recorded(Some(ready))) => {
+                    if let Err(error) = self.dispatch(ready) {
+                        return Err(error);
+                    }
+                }
+                Ok(PushedFrame::Recorded(None)) => {}
+                Ok(PushedFrame::Retired) => self.core.executor.drop_inbound(ticket)?,
+                Err(error) => {
+                    let _ = self.core.executor.drop_inbound(ticket);
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })();
+        // This also returns unused grants for duplicates, canaries, and cancelled receivers.
+        let cleanup = ownership.cleanup();
+        if cleanup.is_ok() {
+            self.core.receive_ledger.complete(token, result.clone());
+        } else {
+            tracing::error!(token, error = ?cleanup, "owned ingress cleanup failed; credit remains quarantined");
+        }
+        tracing::debug!(
+            token,
+            bytes = params.length,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            success = result.is_ok() && cleanup.is_ok(),
+            "owned ingress publication completed"
+        );
+        result.and(cleanup).map(|()| false)
+    }
+
     /// Deserializes one binary-thrift TExecPlanFragmentParams attachment and processes it,
     /// handing any completed receiver to the dispatch worker.
     fn exec_single_attachment(
@@ -932,6 +1262,41 @@ impl SiriusComputeNodeService {
     }
 }
 
+/// A publication worker owns both resources until the copy consumes evacuation storage and
+/// all device reads complete. Drop is an error/panic guard; normal completion checks cleanup.
+struct IngressOwnership<'e> {
+    executor: &'e dyn FragmentExecutor,
+    reservation: Option<u64>,
+    offset: Option<u64>,
+}
+
+impl IngressOwnership<'_> {
+    fn release_arena(&mut self) -> std::result::Result<(), String> {
+        if let Some(offset) = self.offset {
+            self.executor.staging_release(offset)?;
+            self.offset = None;
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> std::result::Result<(), String> {
+        let cancel = self
+            .reservation
+            .take()
+            .map(|reservation| self.executor.cancel_ingress(reservation));
+        let release = self.release_arena();
+        cancel.unwrap_or(Ok(())).and(release)
+    }
+}
+
+impl Drop for IngressOwnership<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            tracing::error!(%error, "could not clean up owned ingress resources");
+        }
+    }
+}
+
 /// Staged remote batches this CN holds for one fragment, as `(node id, sender id, batches)`.
 ///
 /// Released on drop unless handed to the engine with [`take`](Self::take): the engine releases
@@ -1012,7 +1377,7 @@ struct FoldedReceiver {
 impl ServiceCore {
     /// Runs one dispatched receiver, parking a failure where `fetch_data` can see it. Returns
     /// the next receiver when this fragment's own sink completed another sender set.
-    fn run_ready_fragment(&self, ready: ReadyFragment) -> Vec<ReadyFragment> {
+    fn run_ready_fragment(&self, ready: ReadyFragment) -> FragmentOutcome {
         let id = Self::fragment_instance_id(&ready.params);
         let query_id = Self::query_id(&ready.params);
         let backend_num = Self::backend_num(&ready.params);
@@ -1031,11 +1396,11 @@ impl ServiceCore {
                 released_leases,
                 "skipping fragment of a retired query"
             );
-            return Vec::new();
+            return FragmentOutcome::default();
         }
         let is_result_fragment = matches!(Self::is_mysql_result_sink(&ready.params), Ok(true));
         match self.execute_ready_fragment(ready) {
-            Ok(outcome) => outcome.ready,
+            Ok(outcome) => outcome,
             Err(error) => {
                 match (id, query_id) {
                     (Some(id), Some(query_id)) => {
@@ -1069,7 +1434,7 @@ impl ServiceCore {
                         tracing::error!(error = %error, "dispatched receiver fragment without a fragment_instance_id failed");
                     }
                 }
-                Vec::new()
+                FragmentOutcome::default()
             }
         }
     }
@@ -1091,6 +1456,7 @@ impl ServiceCore {
         if let Some(reporter) = &self.failure_reporter {
             reporter.report_failure(query_id, id, backend_num, &error);
         }
+        self.receive_ledger.retire_query(query_id);
         if let Err(err) = self
             .executor
             .retire_query(query_id, RetireTrigger::CnErr, &error)
@@ -1631,18 +1997,35 @@ impl ServiceCore {
         // receiver's per-(exchange, sender) gap check relies on. A failure fails the sender's
         // RPC — the FE sees the error, never a receiver that waits forever — and the
         // destinations after it are not drained; their claims go with the engine's next wipe.
+        let mut tickets = Vec::new();
+        let overlap = self
+            .overlap_drains
+            .load(std::sync::atomic::Ordering::Relaxed);
         for (slot, route) in slots.iter().zip(&routes) {
             if let DestinationRoute::Remote { host, brpc_port } = route {
                 let transport = self.transport.as_ref().expect("routed before running");
-                transport.send_fragment(RemoteSendSpec {
+                let spec = RemoteSendSpec {
                     host: host.clone(),
                     brpc_port: *brpc_port,
                     slot: *slot,
+                    query_id: Self::query_id(params),
                     names: translated.output_names.clone(),
-                })?;
+                };
+                if overlap {
+                    tickets.push(transport.submit_fragment(spec)?);
+                } else {
+                    transport.send_fragment(spec)?;
+                }
             }
         }
-        Ok(FragmentOutcome::from_ready(ready_receivers))
+        Ok(FragmentOutcome {
+            ready: ready_receivers,
+            drains: (!tickets.is_empty()).then(|| PendingDrains {
+                label: Self::fragment_label(params),
+                backend_num: Self::backend_num(params),
+                tickets,
+            }),
+        })
     }
 
     /// The per-consumer stream sinks of a MULTI_CAST_DATA_STREAM_SINK (a CTE the FE computes
@@ -2545,6 +2928,22 @@ pub(crate) mod tests {
             self.inner.stage_inbound(batch)
         }
 
+        fn reserve_ingress(&self, length: u64) -> Result<u64, String> {
+            self.inner.reserve_ingress(length)
+        }
+
+        fn cancel_ingress(&self, reservation: u64) -> Result<(), String> {
+            self.inner.cancel_ingress(reservation)
+        }
+
+        fn stage_reserved_inbound(
+            &self,
+            batch: &StagedBatch,
+            reservation: u64,
+        ) -> Result<u64, String> {
+            self.inner.stage_reserved_inbound(batch, reservation)
+        }
+
         fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
             self.inner.drop_inbound(ticket)
         }
@@ -3220,7 +3619,10 @@ pub(crate) mod tests {
         assert!(!a.attachment.is_empty() && !b.attachment.is_empty());
         let outputs = executor.outputs.lock().unwrap();
         assert_eq!(outputs.len(), 1, "the producer runs and parks once");
-        assert!(outputs[0].broadcast, "every consumer receives the full output");
+        assert!(
+            outputs[0].broadcast,
+            "every consumer receives the full output"
+        );
     }
 
     /// A multicast sink whose consumer has no instance on this CN is refused before any GPU
@@ -3393,6 +3795,120 @@ pub(crate) mod tests {
         );
     }
 
+    /// Local work becomes runnable before remote completion, while the sender's FE RPC still
+    /// waits for the remote acknowledgement. The delayed transport is deterministic and uses
+    /// no GPU or timing-dependent throughput assumptions.
+    #[test]
+    fn optimized_sender_dispatches_local_receiver_before_remote_drain_completes() {
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let remote = std::thread::spawn(move || {
+            let request = requests_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            if let crate::nixl_transport::TransportRequest::SendFragment { respond, .. } = request {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                respond.send(Ok(())).unwrap();
+            } else {
+                panic!("expected drain");
+            }
+        });
+        let service = SiriusComputeNodeService::with_transport(
+            Arc::new(CountingExecutor::default()),
+            test_identity(),
+            Some(crate::nixl_transport::NixlTransport::for_test(requests_tx)),
+        );
+        service.core.overlap_drains.store(true, Ordering::Relaxed);
+        let query_id = TUniqueId::new(833, 1);
+        let local_id = TUniqueId::new(833, 3);
+        assert_exec_ok(&service, &result_receiver(&query_id, &local_id, 7, 1));
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(data_stream_sink(7));
+        let mut exec = exec_params(query_id, TUniqueId::new(833, 2));
+        exec.sender_id = Some(0);
+        exec.destinations = Some(vec![
+            local_destination(local_id.clone()),
+            remote_destination(TUniqueId::new(833, 4), 8061),
+        ]);
+        sender.params = Some(exec);
+        let caller_service = service.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let status = exec_status(&caller_service, &sender);
+            done_tx.send(status).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let rows = fetch_rows_eventually(&service, local_id.hi, local_id.lo);
+        assert!(
+            !rows.attachment.is_empty(),
+            "local receiver ran while the remote was blocked"
+        );
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "leaf RPC must not acknowledge an unfinished remote drain"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .status_code,
+            TStatusCode::OK.0
+        );
+        caller.join().unwrap();
+        remote.join().unwrap();
+    }
+
+    /// Completion supervision polls every query, so a held first ticket cannot mask an
+    /// immediately failed later query. The error reaches FE-visible state and no other query.
+    #[test]
+    fn drain_supervisor_reports_another_query_error_while_first_drain_is_pending() {
+        let service = SiriusComputeNodeService::new();
+        let (pending_tx, pending_rx) = mpsc::channel();
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let (inbox_tx, inbox_rx) = mpsc::sync_channel(2);
+        let core = Arc::clone(&service.core);
+        let supervisor = std::thread::spawn(move || drain_supervisor(core, inbox_rx));
+        let first = FragmentInstanceId::from_halves(834, 1);
+        let second = FragmentInstanceId::from_halves(835, 1);
+        for (query_id, ticket) in [(first, pending_rx), (second, failed_rx)] {
+            inbox_tx
+                .send(PendingDrains {
+                    label: FragmentLabel {
+                        query_id: Some(query_id),
+                        fragment_instance_id: Some(query_id),
+                    },
+                    backend_num: None,
+                    tickets: vec![ticket],
+                })
+                .unwrap();
+        }
+        failed_tx
+            .send(Err("deliberate delayed-drain failure".to_string()))
+            .unwrap();
+        wait_until("second query failure", || {
+            service.core.results.failure_of(second).is_some()
+        });
+        assert!(service.core.results.failure_of(first).is_none());
+        assert!(
+            service
+                .core
+                .results
+                .failure_of(second)
+                .unwrap()
+                .contains("deliberate delayed-drain")
+        );
+        pending_tx.send(Ok(())).unwrap();
+        drop(inbox_tx);
+        supervisor.join().unwrap();
+    }
+
     /// A destination on another CN: same host, a different brpc port.
     fn remote_destination(receiver_id: TUniqueId, brpc_port: i32) -> TPlanFragmentDestination {
         TPlanFragmentDestination::new(
@@ -3526,6 +4042,7 @@ pub(crate) mod tests {
             // A fixed per-batch row count on batch frames, so the receiver-side test can assert
             // the count rode the wire into the staged batch; EOS frames carry none.
             rows: if eos { None } else { Some(3) },
+            ..Default::default()
         }
         .encode_to_vec()
     }
@@ -3605,6 +4122,8 @@ pub(crate) mod tests {
         staged: Mutex<Vec<StagedBatch>>,
         released: Mutex<Vec<u64>>,
         dropped: Mutex<Vec<u64>>,
+        next_owned: AtomicUsize,
+        evacuation: Mutex<std::collections::HashSet<u64>>,
     }
 
     impl FragmentExecutor for PoolStagingExecutor {
@@ -3635,6 +4154,133 @@ pub(crate) mod tests {
             self.dropped.lock().unwrap().push(ticket);
             Ok(())
         }
+
+        fn staging_info(&self) -> Result<(u64, u64), String> {
+            Ok((1 << 20, 16 << 20))
+        }
+        fn staging_lease(&self, _: u64) -> Result<u64, String> {
+            Ok(self.next_owned.fetch_add(1, Ordering::Relaxed) as u64 * 4096)
+        }
+        fn reserve_ingress(&self, _: u64) -> Result<u64, String> {
+            let reservation = self.next_owned.fetch_add(1, Ordering::Relaxed) as u64;
+            self.evacuation.lock().unwrap().insert(reservation);
+            Ok(reservation)
+        }
+        fn cancel_ingress(&self, reservation: u64) -> Result<(), String> {
+            self.evacuation.lock().unwrap().remove(&reservation);
+            Ok(())
+        }
+        fn stage_reserved_inbound(
+            &self,
+            batch: &StagedBatch,
+            reservation: u64,
+        ) -> Result<u64, String> {
+            assert!(self.evacuation.lock().unwrap().remove(&reservation));
+            self.stage_inbound(batch)
+        }
+    }
+
+    #[test]
+    fn owned_ingress_returns_credit_before_eos_and_replays_after_dispatch() {
+        use crate::proto::starrocks::{PExchangeLeaseIdentity, PUniqueId};
+        let executor = Arc::new(PoolStagingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(906, 1);
+        let receiver_id = TUniqueId::new(906, 2);
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut exec = exec_params(query_id.clone(), receiver_id.clone());
+        exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(exec);
+        assert_exec_ok(&service, &receiver);
+        let identity = PExchangeLeaseIdentity {
+            sender_epoch: 10,
+            request_id: 1,
+            query_id: Some(PUniqueId { hi: 906, lo: 1 }),
+            finst_id: Some(PUniqueId { hi: 906, lo: 2 }),
+            node_id: Some(7),
+            sender_id: Some(0),
+            seq: Some(0),
+            canary: Some(false),
+        };
+        let request = PStagingLeaseRequest {
+            length: 512,
+            identity: Some(identity.clone()),
+            receiver_epoch: Some(exchange_protocol::process_epoch()),
+            ..Default::default()
+        };
+        let Admission::Granted(grant) = service
+            .core
+            .receive_ledger
+            .request(executor.as_ref(), &request)
+            .unwrap()
+        else {
+            panic!("ingress grant expected");
+        };
+        let params = PTransmitPackedParams {
+            finst_id: identity.finst_id,
+            node_id: Some(7),
+            sender_id: Some(0),
+            seq: Some(0),
+            eos: Some(false),
+            offset: Some(grant.offset),
+            length: Some(512),
+            rows: Some(3),
+            identity: Some(identity.clone()),
+            receiver_epoch: request.receiver_epoch,
+            lease_token: Some(grant.token),
+            column_names: vec!["id".into(), "name".into()],
+            ..Default::default()
+        };
+        assert!(
+            !service
+                .handle_owned_transmit(&params, vec![1, 2, 3])
+                .unwrap()
+        );
+        assert!(executor.evacuation.lock().unwrap().is_empty());
+        assert_eq!(
+            executor.released.lock().unwrap().as_slice(),
+            &[grant.offset]
+        );
+        assert!(
+            executor.remote_inputs.lock().unwrap().is_empty(),
+            "no receiver before EOS"
+        );
+        assert!(
+            !service
+                .handle_owned_transmit(&params, vec![1, 2, 3])
+                .unwrap()
+        );
+        assert_eq!(
+            executor.staged.lock().unwrap().len(),
+            1,
+            "duplicate never rereads a reused lease"
+        );
+        let mut eos_identity = identity;
+        eos_identity.request_id = 2;
+        eos_identity.seq = Some(1);
+        let eos = PTransmitPackedParams {
+            finst_id: params.finst_id,
+            node_id: Some(7),
+            sender_id: Some(0),
+            seq: Some(1),
+            eos: Some(true),
+            column_names: params.column_names.clone(),
+            identity: Some(eos_identity),
+            receiver_epoch: request.receiver_epoch,
+            ..Default::default()
+        };
+        assert!(!service.handle_owned_transmit(&eos, Vec::new()).unwrap());
+        fetch_rows_eventually(&service, 906, 2);
+        assert!(!service.handle_owned_transmit(&eos, Vec::new()).unwrap());
+        assert!(
+            !service
+                .handle_owned_transmit(&params, vec![1, 2, 3])
+                .unwrap()
+        );
+        assert_eq!(executor.staged.lock().unwrap().len(), 1);
+        assert_eq!(executor.remote_inputs.lock().unwrap()[0].2.len(), 1);
+        assert_eq!(executor.released.lock().unwrap().len(), 1);
     }
 
     /// With an inbound store, a data frame is copied out of its lease the moment it arrives: the
@@ -3896,6 +4542,7 @@ pub(crate) mod tests {
         let request = PExchangeNixlMd {
             agent_name: Some("127.0.0.1:8062".to_string()),
             agent_metadata: Some(vec![1, 2, 3]),
+            ..Default::default()
         };
         let response = route(
             &service,
@@ -3919,7 +4566,11 @@ pub(crate) mod tests {
         let response = route(
             &service,
             methods::REQUEST_STAGING_LEASE,
-            PStagingLeaseRequest { length: 1024 }.encode_to_vec(),
+            PStagingLeaseRequest {
+                length: 1024,
+                ..Default::default()
+            }
+            .encode_to_vec(),
             Vec::new(),
         );
         let result = PStagingLeaseResult::decode(response.body.as_slice()).unwrap();

@@ -114,6 +114,27 @@ class data_repository_manager_registry {
     return result;
   }
 
+  /// Exchange repositories outlive individual execution windows. Weak registration exposes
+  /// idle batches to spilling without extending their query/destination ownership. A sweep
+  /// takes an owning snapshot, so retirement cannot invalidate a borrowed repository.
+  void register_exchange(const std::shared_ptr<cucascade::shared_data_repository>& repository)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::erase_if(_exchange, [](const auto& entry) { return entry.expired(); });
+    _exchange.emplace_back(repository);
+  }
+
+  [[nodiscard]] std::vector<std::shared_ptr<cucascade::shared_data_repository>>
+  get_exchange_repositories() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>> result;
+    for (const auto& entry : _exchange) {
+      if (auto repository = entry.lock()) { result.push_back(std::move(repository)); }
+    }
+    return result;
+  }
+
   /**
    * @brief Drop @p query_id's manager and report any repositories that still held batches.
    *
@@ -148,6 +169,7 @@ class data_repository_manager_registry {
     {
       std::lock_guard<std::mutex> lock(_mutex);
       drained.swap(_managers);
+      _exchange.clear();
     }
     // Destroyed outside the lock: manager destruction releases data batches, which can run
     // arbitrary deallocation work that must not happen with the registry mutex held.
@@ -164,6 +186,7 @@ class data_repository_manager_registry {
   mutable std::mutex _mutex;
   /// std::map (not unordered_map) so get_all() iteration is ascending by query id.
   std::map<sirius::query_id_t, manager_ptr> _managers;
+  std::vector<std::weak_ptr<cucascade::shared_data_repository>> _exchange;
 };
 
 }  // namespace sirius::data

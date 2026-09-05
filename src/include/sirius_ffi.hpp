@@ -47,6 +47,7 @@ namespace sirius::ffi {
 class Fragment;
 class StagingArena;
 class InboundStore;
+class ExportProvider;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -202,6 +203,17 @@ class SIRIUS_FFI_EXPORT InboundStore {
                       std::uint64_t offset,
                       std::uint64_t length) const;
 
+  /// Reserve physically accounted host evacuation storage before granting remote staging.
+  /// Throws INGRESS_CAPACITY_UNAVAILABLE on pressure; never waits for the engine actor.
+  std::uint64_t reserve(std::uint64_t length) const;
+  void cancel_reservation(std::uint64_t reservation) const;
+  /// Always consumes the reservation, including on error. Copy completion precedes return.
+  std::uint64_t stage_reserved(std::uintptr_t metadata_addr,
+                               std::size_t metadata_len,
+                               std::uint64_t offset,
+                               std::uint64_t length,
+                               std::uint64_t reservation) const;
+
   /// Drop the staged batch under `ticket`, freeing its pool memory: the release path for a
   /// frame whose receiver will never run (a failed or cancelled query).
   /// @throws on a ticket that is not staged (double drop).
@@ -216,6 +228,25 @@ class SIRIUS_FFI_EXPORT InboundStore {
  private:
   std::shared_ptr<State> state_;
   friend class Fragment;
+};
+
+/// Buffer-only output ownership. No Fragment, connection or session is accessed off-thread.
+/// Calls serialize on a dedicated nonblocking CUDA stream, and context teardown fences active
+/// calls before freeing resource owners. cancel prevents new claims; active copies complete.
+class SIRIUS_FFI_EXPORT ExportProvider {
+ public:
+  struct State;
+  explicit ExportProvider(std::shared_ptr<State> state);
+  ~ExportProvider();
+  ExportProvider(const ExportProvider&)            = delete;
+  ExportProvider& operator=(const ExportProvider&) = delete;
+  std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t& offset,
+                                                           std::uint64_t& length,
+                                                           std::uint64_t& rows) const;
+  void cancel() const;
+
+ private:
+  std::shared_ptr<State> state_;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -233,6 +264,9 @@ class SIRIUS_FFI_EXPORT InboundStore {
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
+
+  /// Create one destructive provider per output stream after run() has completed.
+  std::unique_ptr<ExportProvider> export_provider(std::uint64_t stream_id);
 
   Fragment(const Fragment&)            = delete;
   Fragment& operator=(const Fragment&) = delete;

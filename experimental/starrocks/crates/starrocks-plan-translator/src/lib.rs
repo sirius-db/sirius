@@ -314,8 +314,7 @@ impl PlanTranslator {
             .filter(|output_exprs| !output_exprs.is_empty())
             .filter(|output_exprs| {
                 !multicast_reorders_root_row(fragment, output_exprs, &translated.row_tuples, &desc)
-            })
-        {
+            }) {
             if partial_expansion.is_some() {
                 return Err(TranslateError::malformed(
                     "a partial aggregation with an avg state cannot be reprojected by fragment \

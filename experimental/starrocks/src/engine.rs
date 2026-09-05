@@ -23,6 +23,7 @@
 //! Parked output is owned per query; a query is retired (dropped, later runs refused) by its own
 //! engine error or by the CN's `retire_query`, never by another query's failure.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,12 +41,51 @@ use crate::fragment_executor::{
 };
 use crate::parked_registry::{ParkedRegistry, QueryId, Release, RetireTrigger, RetiredQueries};
 
+/// Published only after a producer completes. Cloning a provider never borrows the actor's
+/// Fragment, so an unrelated Run cannot block acquisition or packing of these batches.
+#[derive(Debug)]
+struct PublishedExport {
+    query_id: Option<QueryId>,
+    provider: Arc<sirius::ExportProvider>,
+}
+
+#[derive(Debug, Default)]
+struct PublishedExports {
+    slots: Mutex<HashMap<SenderSlot, PublishedExport>>,
+}
+
+impl PublishedExports {
+    fn remove(&self, slot: &SenderSlot) {
+        let removed = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(slot);
+        if let Some(entry) = removed {
+            entry.provider.cancel();
+        }
+    }
+
+    fn retire(&self, query_id: Option<QueryId>) {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        slots.retain(|_, entry| {
+            if entry.query_id == query_id {
+                entry.provider.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
 /// One fragment execution handed to the engine thread.
 ///
 /// Owned data only: the `sirius::Fragment`s themselves never leave that thread, so what crosses
 /// the channel is the plan, the schema of each declared stream, and the slots naming which parked
 /// sender outputs to relay in.
 struct ExecuteRequest {
+    queued_at: std::time::Instant,
     /// Serialized Substrait plan bytes.
     plan: Vec<u8>,
     /// Schema of every exchange this plan reads as a stream.
@@ -142,6 +182,8 @@ pub struct SiriusEngine {
     /// here BEFORE queueing its `RetireQuery`, so a `Run` already sitting in the FIFO ahead of it
     /// is refused when the thread dequeues it (the same off-thread shape as `staging`).
     retired: Arc<Mutex<RetiredQueries>>,
+    exports: Arc<PublishedExports>,
+    independent_packing: bool,
 }
 
 impl SiriusEngine {
@@ -162,9 +204,21 @@ impl SiriusEngine {
         >();
         let retired: Arc<Mutex<RetiredQueries>> = Arc::default();
         let thread_retired = Arc::clone(&retired);
+        let exports = Arc::new(PublishedExports::default());
+        let thread_exports = Arc::clone(&exports);
+        let independent_packing = std::env::var("SIRIUS_EXCHANGE_OPTIMIZED").as_deref() == Ok("1");
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
-            .spawn(move || engine_thread(settings.config, request_rx, ready_tx, thread_retired))
+            .spawn(move || {
+                engine_thread(
+                    settings.config,
+                    request_rx,
+                    ready_tx,
+                    thread_retired,
+                    thread_exports,
+                    independent_packing,
+                )
+            })
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
             Ok(Ok((staging, inbound))) => Ok(Self {
@@ -173,6 +227,8 @@ impl SiriusEngine {
                 staging,
                 inbound,
                 retired,
+                exports,
+                independent_packing,
             }),
             Ok(Err(err)) => Err(err),
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
@@ -217,6 +273,8 @@ fn engine_thread(
     requests: Receiver<EngineRequest>,
     ready: Sender<Result<(Option<sirius::StagingArena>, Option<sirius::InboundStore>), String>>,
     retired: Arc<Mutex<RetiredQueries>>,
+    exports: Arc<PublishedExports>,
+    independent_packing: bool,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
@@ -249,7 +307,16 @@ fn engine_thread(
     while let Ok(request) = requests.recv() {
         match request {
             EngineRequest::Run(request) => {
-                let result = run_fragment(&context, &mut registry, &retired, &request);
+                info!(label = ?request.label,
+                    queue_wait_us = request.queued_at.elapsed().as_micros() as u64,
+                    "engine fragment dequeued");
+                let result = run_fragment(
+                    &context,
+                    &mut registry,
+                    &retired,
+                    &request,
+                    independent_packing.then_some(exports.as_ref()),
+                );
                 if let Err(err) = &result {
                     // The failed query's parked senders are unreachable now — the receiver that
                     // would have consumed them is the thing that just failed — and a run of it
@@ -262,6 +329,7 @@ fn engine_thread(
                         &RetireTrigger::EngineErr,
                         err,
                     );
+                    exports.retire(request.label.query_id);
                 }
                 let _ = request.respond.send(result);
             }
@@ -271,17 +339,26 @@ fn engine_thread(
                 let _ = respond.send(export_next(&mut registry, &slot));
             }
             EngineRequest::DropParked { slot, respond } => {
+                exports.remove(&slot);
                 let _ = respond.send(drop_parked(&mut registry, &slot));
             }
             EngineRequest::RetireQuery {
                 query_id,
                 trigger,
                 cause,
-            } => retire(&mut registry, &retired, Some(query_id), &trigger, &cause),
+            } => {
+                exports.retire(Some(query_id));
+                retire(&mut registry, &retired, Some(query_id), &trigger, &cause);
+            }
         }
     }
     // Fragments must be gone before the context they borrow.
     drop(registry);
+    exports
+        .slots
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     info!("sirius-engine thread shutting down");
 }
 
@@ -365,6 +442,7 @@ fn run_fragment<'ctx>(
     registry: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
     retired: &Mutex<RetiredQueries>,
     request: &ExecuteRequest,
+    exports: Option<&PublishedExports>,
 ) -> Result<Option<FragmentResult>, String> {
     let mut released = std::collections::HashSet::new();
     let mut taken = std::collections::HashSet::new();
@@ -375,6 +453,7 @@ fn run_fragment<'ctx>(
         request,
         &mut released,
         &mut taken,
+        exports,
     );
     if result.is_err() {
         let store = context.inbound_store();
@@ -438,6 +517,7 @@ fn run_fragment_inner<'ctx>(
     request: &ExecuteRequest,
     released: &mut std::collections::HashSet<u64>,
     taken: &mut std::collections::HashSet<u64>,
+    exports: Option<&PublishedExports>,
 ) -> Result<Option<FragmentResult>, String> {
     // Gate 1: a run of a query this CN already retired is refused before it touches the engine.
     // Here, not at the dequeue, so `run_fragment`'s sweep still releases every remote-input
@@ -576,6 +656,9 @@ fn run_fragment_inner<'ctx>(
             let moved = fragment
                 .relay_from(sender, sender_stream, stream_id, sender_id)
                 .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
+            if let Some(exports) = exports {
+                exports.remove(slot);
+            }
             // This destination's stream is drained; release its claim (the fragment drops with
             // the last claim, freeing the GPU batches).
             registry.release(slot)?;
@@ -664,7 +747,45 @@ fn run_fragment_inner<'ctx>(
         }
         // Park ONCE; each destination claims (park id, its stream). A duplicate slot would let
         // two claims race over one stream — the registry refuses before inserting anything.
+        let providers = if exports.is_some() && context.staging_arena().is_some() {
+            (0..request.outputs.len())
+                .map(|stream| {
+                    fragment
+                        .export_provider(stream as u64)
+                        .map(Arc::new)
+                        .map_err(|err| format!("failed to publish export stream {stream}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         registry.park(request.label.query_id, &request.outputs, fragment)?;
+        if let Some(exports) = exports {
+            // Publish under the retirement gate: a cancellation racing producer completion
+            // either sees these providers and cancels them, or prevents their publication.
+            let retired_guard = lock(retired);
+            if request
+                .label
+                .query_id
+                .and_then(|id| retired_guard.cause(id))
+                .is_some()
+            {
+                for provider in providers {
+                    provider.cancel();
+                }
+                return Err("query retired before its export providers were published".to_string());
+            }
+            let mut slots = exports.slots.lock().unwrap_or_else(PoisonError::into_inner);
+            for (slot, provider) in request.outputs.iter().zip(providers) {
+                slots.insert(
+                    *slot,
+                    PublishedExport {
+                        query_id: request.label.query_id,
+                        provider,
+                    },
+                );
+            }
+        }
         return Ok(None);
     }
     // `result_to_arrow` drains the stream and drops the context-referencing wrapper here, on the
@@ -731,6 +852,7 @@ impl FragmentExecutor for SiriusEngine {
     fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
         self.engine_call(|respond| {
             EngineRequest::Run(ExecuteRequest {
+                queued_at: std::time::Instant::now(),
                 plan: run.plan.to_substrait_bytes(),
                 stream_inputs: run.plan.stream_inputs.clone(),
                 inputs: run.inputs,
@@ -767,6 +889,32 @@ impl FragmentExecutor for SiriusEngine {
     }
 
     fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
+        if self.independent_packing {
+            let provider = self
+                .exports
+                .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&slot)
+                .map(|entry| Arc::clone(&entry.provider))
+                .ok_or_else(|| format!("no live export provider for {slot:?}"))?;
+            let started = std::time::Instant::now();
+            let batch = provider
+                .export_packed()
+                .map_err(|err| format!("failed independent pack for {slot:?}: {err}"))?;
+            debug!(
+                ?slot,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "independent export pack completed"
+            );
+            return Ok(batch.map(|batch| StagedBatch {
+                metadata: batch.metadata,
+                offset: batch.offset,
+                len: batch.len,
+                rows: Some(batch.rows),
+                ticket: None,
+            }));
+        }
         self.engine_call(|respond| EngineRequest::ExportNext { slot, respond })
     }
 
@@ -794,6 +942,36 @@ impl FragmentExecutor for SiriusEngine {
             .map_err(|err| format!("failed to stage a {} byte inbound frame: {err}", batch.len))
     }
 
+    fn reserve_ingress(&self, length: u64) -> Result<u64, String> {
+        self.inbound
+            .as_ref()
+            .ok_or_else(|| "no inbound store".to_string())?
+            .reserve(length)
+            .map_err(|err| format!("receive capacity reservation failed: {err}"))
+    }
+
+    fn cancel_ingress(&self, reservation: u64) -> Result<(), String> {
+        self.inbound
+            .as_ref()
+            .ok_or_else(|| "no inbound store".to_string())?
+            .cancel_reservation(reservation)
+            .map_err(|err| err.to_string())
+    }
+
+    fn stage_reserved_inbound(&self, batch: &StagedBatch, reservation: u64) -> Result<u64, String> {
+        let packed = sirius::PackedBatch {
+            metadata: batch.metadata.clone(),
+            offset: batch.offset,
+            len: batch.len,
+            rows: batch.rows.unwrap_or(0),
+        };
+        self.inbound
+            .as_ref()
+            .ok_or_else(|| "no inbound store".to_string())?
+            .stage_reserved(&packed, reservation)
+            .map_err(|err| format!("failed reserved ingress of {} bytes: {err}", batch.len))
+    }
+
     fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
         let store = self
             .inbound
@@ -812,6 +990,7 @@ impl FragmentExecutor for SiriusEngine {
     ) -> Result<(), String> {
         // Mark first: a Run already queued ahead of the RetireQuery is refused at its dequeue.
         lock(&self.retired).mark(query_id, cause);
+        self.exports.retire(Some(query_id));
         self.engine_send(EngineRequest::RetireQuery {
             query_id,
             trigger,
@@ -858,6 +1037,21 @@ mod tests {
         EngineSettings {
             config: None,
             engine_dir: std::env::temp_dir().join("sirius-engine-test"),
+            gpu_device: None,
+        }
+    }
+
+    /// Explicit small pools also fit devices whose GPU and CPU share physical memory.
+    fn bounded_exchange_test_settings(dir: &std::path::Path) -> EngineSettings {
+        let config = dir.join("sirius.yaml");
+        std::fs::write(
+            &config,
+            "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 4 GiB\n      reservation_limit_fraction: 1.0\n    host:\n      capacity_bytes: 1 GiB\n      initial_number_pools: 2\n      pool_size: 64\n      block_size: 1048576\n",
+        )
+        .unwrap();
+        EngineSettings {
+            config: Some(config),
+            engine_dir: dir.join("engine"),
             gpu_device: None,
         }
     }
@@ -1079,6 +1273,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .send(EngineRequest::Run(ExecuteRequest {
+                queued_at: std::time::Instant::now(),
                 plan,
                 stream_inputs: Vec::new(),
                 inputs: Vec::new(),
@@ -1253,6 +1448,166 @@ mod tests {
         // joins the engine thread, which finishes its sleep first — ordered teardown holds.
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// Completed producer packing must make progress while an unrelated actor Run is busy.
+    /// The packed hop then verifies the values, not just completion timing, and cancellation
+    /// removes future claims without waiting for the actor's current request.
+    #[test]
+    fn independent_pack_does_not_queue_behind_engine_work() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        unsafe {
+            std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB");
+            std::env::set_var("SIRIUS_EXCHANGE_OPTIMIZED", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(path.to_str().unwrap(), vec!["id".into(), "name".into()]);
+        let engine =
+            SiriusEngine::start(bounded_exchange_test_settings(dir.path())).expect("engine");
+        let slot = SenderSlot {
+            fragment_instance_id: FragmentInstanceId::from_halves(777, 1),
+            node_id: 9,
+            sender_id: 0,
+        };
+        engine
+            .run(FragmentRun {
+                plan: &plan,
+                inputs: Vec::new(),
+                remote_inputs: Vec::new(),
+                outputs: vec![slot],
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
+            })
+            .expect("producer");
+        engine
+            .engine_send(EngineRequest::Sleep(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut staged = Vec::new();
+        while let Some(batch) = engine.export_packed_next(slot).expect("independent pack") {
+            staged.push(batch);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "completed producer export waited behind the actor"
+        );
+        assert!(!staged.is_empty());
+        engine.drop_parked(slot).unwrap();
+        let receiver = stream_plan(9, &[("id", false), ("name", true)]);
+        let result = engine
+            .run(FragmentRun {
+                plan: &receiver,
+                inputs: Vec::new(),
+                remote_inputs: vec![(9, 0, staged)],
+                outputs: Vec::new(),
+                broadcast: false,
+                hash_keys: Vec::new(),
+                label: FragmentLabel::default(),
+            })
+            .expect("receiver")
+            .expect("rows");
+        let mut actual = Vec::new();
+        for batch in result.batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((ids.value(row), names.value(row).to_owned()));
+            }
+        }
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
+        );
+        assert_eq!(engine.staging.as_ref().unwrap().outstanding().unwrap(), 0);
+        drop(engine);
+        unsafe {
+            std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES");
+            std::env::remove_var("SIRIUS_EXCHANGE_OPTIMIZED");
+        }
+    }
+
+    #[test]
+    fn optimized_export_retirement_preserves_another_query_provider() {
+        let _guard = crate::GPU_ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        unsafe {
+            std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB");
+            std::env::set_var("SIRIUS_EXCHANGE_OPTIMIZED", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let plan = local_files_plan(path.to_str().unwrap(), vec!["id".into(), "name".into()]);
+        let engine = SiriusEngine::start(bounded_exchange_test_settings(dir.path())).unwrap();
+        let query_a = FragmentInstanceId::from_halves(778, 1);
+        let query_b = FragmentInstanceId::from_halves(779, 1);
+        let a = SenderSlot {
+            fragment_instance_id: query_a,
+            node_id: 9,
+            sender_id: 0,
+        };
+        let b = SenderSlot {
+            fragment_instance_id: query_b,
+            node_id: 9,
+            sender_id: 0,
+        };
+        for (query_id, slot) in [(query_a, a), (query_b, b)] {
+            engine
+                .run(FragmentRun {
+                    plan: &plan,
+                    inputs: Vec::new(),
+                    remote_inputs: Vec::new(),
+                    outputs: vec![slot],
+                    broadcast: false,
+                    hash_keys: Vec::new(),
+                    label: FragmentLabel {
+                        query_id: Some(query_id),
+                        fragment_instance_id: Some(query_id),
+                    },
+                })
+                .unwrap();
+        }
+        engine
+            .engine_send(EngineRequest::Sleep(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        engine
+            .retire_query(query_a, RetireTrigger::CnErr, "deliberate retirement")
+            .unwrap();
+        assert!(engine.export_packed_next(a).is_err());
+        let mut rows = 0;
+        while let Some(batch) = engine.export_packed_next(b).unwrap() {
+            rows += batch.rows.unwrap();
+            if batch.len > 0 {
+                engine.staging_release(batch.offset).unwrap();
+            }
+        }
+        assert_eq!(rows, 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "retirement or unaffected query export waited for actor"
+        );
+        engine.drop_parked(b).unwrap();
+        drop(engine);
+        unsafe {
+            std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES");
+            std::env::remove_var("SIRIUS_EXCHANGE_OPTIMIZED");
+        }
     }
 
     /// End-to-end: drive a `local_files` parquet plan through the engine actor and read the rows
@@ -1754,6 +2109,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .send(EngineRequest::Run(ExecuteRequest {
+                queued_at: std::time::Instant::now(),
                 plan: plan.to_substrait_bytes(),
                 stream_inputs: Vec::new(),
                 inputs: Vec::new(),

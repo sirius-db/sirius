@@ -407,6 +407,15 @@ impl Fragment<'_> {
         }))
     }
 
+    /// Publish independently owned access to one completed output stream. Create this on
+    /// the fragment's owner thread after `run`; packing can then bypass that thread entirely.
+    /// Exactly one destination may destructively consume a stream, by relay or export.
+    pub fn export_provider(&mut self, stream_id: u64) -> Result<ExportProvider, Exception> {
+        Ok(ExportProvider {
+            inner: self.inner.pin_mut().export_provider(stream_id)?,
+        })
+    }
+
     /// Push a packed batch sitting in the staging arena into input stream `stream_id`: the
     /// receive-side mirror of [`export_packed`](Fragment::export_packed).
     ///
@@ -465,6 +474,48 @@ pub struct PackedBatch {
     /// [`declare_input_cardinality`](Fragment::declare_input_cardinality). Ignored by
     /// [`push_packed`](Fragment::push_packed).
     pub rows: u64,
+}
+
+/// Buffer-only packing access to one completed output repository. The C++ provider keeps
+/// its repository and packing state alive, serializes its stream, and rejects new work after
+/// cancellation/context teardown. Neither `Fragment` nor `SiriusContext` crosses threads.
+pub struct ExportProvider {
+    inner: UniquePtr<sirius_sys::ExportProvider>,
+}
+
+// SAFETY: C++ owns the repository and a context-lifetime fence, with no borrowed Fragment,
+// DuckDB connection, or session pointers. Packs serialize their own device stream; context
+// destruction waits for active work and clears buffers before releasing the memory manager.
+unsafe impl Send for ExportProvider {}
+unsafe impl Sync for ExportProvider {}
+
+impl ExportProvider {
+    /// Pack one batch on the independent CUDA stream. On return the source read guard has
+    /// completed, while the staging lease remains valid until the transport releases it.
+    pub fn export_packed(&self) -> Result<Option<PackedBatch>, Exception> {
+        let (mut offset, mut len, mut rows) = (0, 0, 0);
+        let metadata = self.inner.export_packed(&mut offset, &mut len, &mut rows)?;
+        if metadata.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(PackedBatch {
+            metadata: metadata.as_slice().to_vec(),
+            offset,
+            len,
+            rows,
+        }))
+    }
+
+    /// Stop future claims without invalidating an active pack's buffers.
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+}
+
+impl std::fmt::Debug for ExportProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportProvider").finish_non_exhaustive()
+    }
 }
 
 /// Thread-safe handle to a context's exchange staging arena, from
@@ -546,6 +597,31 @@ unsafe impl Send for InboundStore {}
 unsafe impl Sync for InboundStore {}
 
 impl InboundStore {
+    /// Reserve physical host payload capacity before accepting a receive frame.
+    pub fn reserve(&self, length: u64) -> Result<u64, Exception> {
+        self.inner.reserve(length)
+    }
+
+    /// Cancel a reservation that was never passed to `stage_reserved` (idempotent).
+    pub fn cancel_reservation(&self, reservation: u64) -> Result<(), Exception> {
+        self.inner.cancel_reservation(reservation)
+    }
+
+    /// Stage a frame with guaranteed copy-out capacity. The reservation is consumed even
+    /// when the call fails, so callers must not reuse it for another frame.
+    pub fn stage_reserved(&self, batch: &PackedBatch, reservation: u64) -> Result<u64, Exception> {
+        // SAFETY: batch owns the metadata throughout the synchronous C++ call.
+        unsafe {
+            self.inner.stage_reserved(
+                batch.metadata.as_ptr() as usize,
+                batch.metadata.len(),
+                batch.offset,
+                batch.len,
+                reservation,
+            )
+        }
+    }
+
     /// Copy `batch`'s packed bytes out of the staging arena into pool memory; returns the ticket
     /// the receiver names the batch by. The lease at `batch.offset` is still the caller's to
     /// release, immediately after this returns. A metadata-only zero-row batch stages an empty
@@ -621,7 +697,7 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
-    use arrow_array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
+    use arrow_array::{Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
     use prost::Message;
@@ -631,6 +707,17 @@ mod tests {
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
     static GPU_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Exchange fixtures need only small pools, including on systems with unified memory.
+    fn bounded_exchange_test_context(dir: &Path) -> SiriusContext {
+        let config = dir.join("sirius.yaml");
+        std::fs::write(
+            &config,
+            "sirius:\n  memory:\n    gpu:\n      usage_limit_bytes: 4 GiB\n      reservation_limit_fraction: 1.0\n    host:\n      capacity_bytes: 1 GiB\n      initial_number_pools: 2\n      pool_size: 64\n      block_size: 1048576\n",
+        )
+        .unwrap();
+        SiriusContext::from_config_file(&config).expect("bounded exchange context")
+    }
 
     /// Proof-of-life: bring up a real Sirius engine context and drop it. This
     /// links the real Sirius library and exercises the full cxx round-trip +
@@ -1486,6 +1573,179 @@ mod tests {
 
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// Reserve host evacuation before admitting a frame, release staging before a receiver
+    /// exists, then execute directly from the retained HOST representation. Nullable strings,
+    /// empty strings and a value crossing the packer's 8 MiB chunk boundary are checked exactly.
+    #[test]
+    fn reserved_ingress_preserves_null_strings_and_releases_staging_before_receiver() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        unsafe {
+            std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "128MiB");
+            std::env::set_var("SIRIUS_EXCHANGE_OPTIMIZED", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nullable-users.parquet");
+        let long = "x".repeat((9 << 20) + 13);
+        let expected = vec![
+            (Some(1i64), Some("alpha".to_owned())),
+            (Some(2), None),
+            (None, Some(String::new())),
+            (Some(4), Some("snowman: ☃".to_owned())),
+            (Some(5), Some("embedded\0nul".to_owned())),
+            (Some(6), Some(long)),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    expected.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    expected
+                        .iter()
+                        .map(|row| row.1.as_deref())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let plan = local_files_plan(path.to_str().unwrap(), vec!["id".into(), "name".into()]);
+        let ctx = bounded_exchange_test_context(dir.path());
+        let arena = ctx.staging_arena().unwrap();
+        let store = ctx.inbound_store().unwrap();
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&plan).unwrap();
+        sender.run().unwrap();
+        let provider = sender.export_provider(0).unwrap();
+        let tickets = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut tickets = Vec::new();
+                    while let Some(batch) = provider.export_packed().unwrap() {
+                        let abandoned = store.reserve(batch.len).unwrap();
+                        store.cancel_reservation(abandoned).unwrap();
+                        store.cancel_reservation(abandoned).unwrap();
+                        let reservation = store.reserve(batch.len).unwrap();
+                        tickets.push(store.stage_reserved(&batch, reservation).unwrap());
+                        if batch.len > 0 {
+                            arena.release(batch.offset).unwrap();
+                        }
+                    }
+                    tickets
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(!tickets.is_empty());
+        assert_eq!(arena.outstanding().unwrap(), 0);
+        assert!(store.outstanding_bytes().unwrap() > (8 << 20));
+        drop(provider);
+        drop(sender);
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver
+            .declare_input_cardinality(0, expected.len() as u64)
+            .unwrap();
+        receiver.build(&stream_read_plan(0)).unwrap();
+        for ticket in tickets {
+            receiver.push_inbound(0, ticket).unwrap();
+        }
+        assert_eq!(store.outstanding().unwrap(), 0);
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.result_to_arrow().unwrap();
+        let mut actual = Vec::new();
+        for batch in result.batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((
+                    (!ids.is_null(row)).then(|| ids.value(row)),
+                    (!names.is_null(row)).then(|| names.value(row).to_owned()),
+                ));
+            }
+        }
+        actual.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(actual.0, expected.0, "id mismatch at row {index}");
+            assert!(
+                actual.1 == expected.1,
+                "nullable string mismatch at row {index}"
+            );
+        }
+        drop(receiver);
+        drop(ctx);
+        // The store handle can outlive its context, but cannot accept another reservation.
+        assert!(store.reserve(1024).is_err());
+        unsafe {
+            std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES");
+            std::env::remove_var("SIRIUS_EXCHANGE_OPTIMIZED");
+        }
+    }
+
+    /// A provider owns buffers independently of Fragment, but context destruction fences and
+    /// closes it. Subsequent calls from another thread fail before accessing freed resources.
+    #[test]
+    fn export_provider_rejects_work_after_context_teardown() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        unsafe {
+            std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB");
+            std::env::set_var("SIRIUS_EXCHANGE_OPTIMIZED", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let ctx = bounded_exchange_test_context(dir.path());
+        let provider = {
+            let mut sender = ctx.fragment().unwrap();
+            sender.declare_output(0).unwrap();
+            sender
+                .build(&local_files_plan(
+                    path.to_str().unwrap(),
+                    vec!["id".into(), "name".into()],
+                ))
+                .unwrap();
+            sender.run().unwrap();
+            sender.export_provider(0).unwrap()
+        };
+        drop(ctx);
+        std::thread::spawn(move || {
+            assert!(provider.export_packed().is_err());
+            provider.cancel();
+        })
+        .join()
+        .unwrap();
+        unsafe {
+            std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES");
+            std::env::remove_var("SIRIUS_EXCHANGE_OPTIMIZED");
+        }
     }
 
     /// The zero-row export contract: a zero-row batch leaves `export_packed` as a metadata-only

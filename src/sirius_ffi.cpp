@@ -38,32 +38,38 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
-#include "exec/exchange_staging_arena.hpp"                 // sirius::exec::exchange_staging_arena
-#include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
-#include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
-#include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
-#include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
-#include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "log/logging.hpp"                // SIRIUS_LOG_WARN (inbound store)
-#include "parquet_extension.hpp"          // duckdb::ParquetExtension
+#include "exec/exchange_memory.hpp"
+#include "exec/exchange_staging_arena.hpp"  // sirius::exec::exchange_staging_arena
+#include "exec/stream_bind_catalog.hpp"     // sirius::exec::stream_bind_catalog
+#include "exec/stream_plan_bindings.hpp"    // sirius::exec::register_stream_source_function
+#include "exec/streaming_fragment.hpp"      // sirius::exec::streaming_fragment, fragment_spec
+#include "from_substrait.hpp"               // duckdb::SubstraitToDuckDB (compiled into libsirius)
+#include "helper/type_conversions.hpp"      // sirius::from_duckdb
+#include "log/logging.hpp"                  // SIRIUS_LOG_WARN (inbound store)
+#include "parquet_extension.hpp"            // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
-#include <cudf/contiguous_split.hpp>           // cudf::chunked_pack, cudf::unpack
+#include <cudf/contiguous_split.hpp>  // cudf::chunked_pack, cudf::unpack
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>                // cudf::table
 #include <cudf/utilities/default_stream.hpp>   // cudf::get_default_stream
 #include <cudf/utilities/span.hpp>             // cudf::device_span
 #include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>  // rmm::cuda_stream (inbound copies)
 
 #include <cuda_runtime_api.h>  // cudaStreamWaitEvent
 
 #include <algorithm>  // std::find
-#include <cstdlib>    // std::getenv
+#include <atomic>
+#include <chrono>
+#include <cstdlib>  // std::getenv
 #include <map>
 #include <mutex>  // std::mutex (inbound store)
 #include <optional>
@@ -156,25 +162,39 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
 /// when the context tears down so a straggling handle throws instead of dereferencing it.
 struct InboundStore::State {
   State(std::shared_ptr<sirius::exec::exchange_staging_arena> arena_in,
-        cucascade::memory::memory_space* gpu_space_in)
+        cucascade::memory::memory_space* gpu_space_in,
+        cucascade::memory::memory_space* host_space_in)
     : arena(std::move(arena_in)),
       gpu_space(gpu_space_in),
+      host_space(host_space_in),
       stream(rmm::cuda_stream::flags::non_blocking)
   {
   }
 
   std::shared_ptr<sirius::exec::exchange_staging_arena> arena;
   cucascade::memory::memory_space* gpu_space;
+  cucascade::memory::memory_space* host_space;
   // Own stream so an arriving frame's copy never queues behind the engine thread's work on the
   // default stream (a receiver blocked behind a multi-minute stage was the whole problem).
   rmm::cuda_stream stream;
   std::mutex mutex;
+  // Fence CUDA/resource access against Context destruction. This lock is independent of
+  // the engine actor and is never held while waiting for an RPC or a fragment run.
+  std::mutex operation_mutex;
   std::uint64_t next_ticket{1};
   std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> staged;
   std::unordered_map<std::uint64_t, std::uint64_t> staged_bytes;
+  struct reservation_record {
+    std::uint64_t length;
+    cucascade::memory::fixed_multiple_blocks_allocation allocation;
+  };
+  std::unordered_map<std::uint64_t, reservation_record> reservations;
+  std::shared_ptr<cucascade::shared_data_repository> repository =
+    std::make_shared<cucascade::shared_data_repository>();
 
   void close()
   {
+    std::lock_guard operation_lock(operation_mutex);
     std::lock_guard<std::mutex> lock(mutex);
     if (!staged.empty()) {
       SIRIUS_LOG_WARN("inbound store: {} staged batch(es) ({} bytes) dropped at context teardown",
@@ -183,7 +203,10 @@ struct InboundStore::State {
     }
     staged.clear();
     staged_bytes.clear();
-    gpu_space = nullptr;
+    reservations.clear();
+    repository.reset();
+    gpu_space  = nullptr;
+    host_space = nullptr;
   }
 
   std::uint64_t total_bytes_locked() const
@@ -204,10 +227,46 @@ struct InboundStore::State {
         "inbound store: ticket {} is not staged (already pushed or dropped?)", ticket);
     }
     auto batch = std::move(it->second);
+    if (repository) { repository->pop_data_batch_by_id(batch->get_batch_id()); }
     staged.erase(it);
     staged_bytes.erase(ticket);
     return batch;
   }
+};
+
+struct ExportProvider::State {
+  State(duckdb::shared_ptr<duckdb::SiriusContext> context_in,
+        std::shared_ptr<sirius::exec::exchange_staging_arena> arena_in,
+        std::shared_ptr<cucascade::shared_data_repository> repository_in)
+    : context(std::move(context_in)),
+      arena(std::move(arena_in)),
+      repository(std::move(repository_in))
+  {
+    auto* gpu = context->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+    if (!gpu) { throw sirius::internal_exception("export provider: missing GPU space"); }
+    device = gpu->get_device_id();
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    stream = std::make_unique<rmm::cuda_stream>(rmm::cuda_stream::flags::non_blocking);
+  }
+  ~State() { close(); }
+  void close()
+  {
+    cancelled.store(true);
+    std::lock_guard lock(mutex);
+    rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device}};
+    pending.reset();
+    repository.reset();
+    stream.reset();
+    context.reset();
+  }
+  std::atomic<bool> cancelled{false};
+  std::mutex mutex;
+  duckdb::shared_ptr<duckdb::SiriusContext> context;
+  std::shared_ptr<sirius::exec::exchange_staging_arena> arena;
+  std::shared_ptr<cucascade::shared_data_repository> repository;
+  std::shared_ptr<cucascade::data_batch> pending;
+  int device{0};
+  std::unique_ptr<rmm::cuda_stream> stream;
 };
 
 // (duckdb::shared_ptr, so the SiriusContext can register as a ClientContextState).
@@ -227,6 +286,7 @@ struct Context::Impl {
   //! Created with the arena; shared with every `InboundStore` handle. Closed in ~Impl so a handle
   //! that outlives the context fails loudly instead of touching a dead memory space.
   std::shared_ptr<InboundStore::State> inbound;
+  std::vector<std::weak_ptr<ExportProvider::State>> exporters;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -280,7 +340,12 @@ struct Context::Impl {
       if (gpu_space == nullptr) {
         throw sirius::internal_exception("Context: no GPU memory space for the inbound store");
       }
-      inbound = std::make_shared<InboundStore::State>(staging_arena, gpu_space);
+      auto* host_space =
+        context->get_memory_manager().get_memory_space(cucascade::memory::Tier::HOST, 0);
+      inbound = std::make_shared<InboundStore::State>(staging_arena, gpu_space, host_space);
+      if (sirius::exec::optimized_exchange_enabled()) {
+        context->get_data_repository_registry().register_exchange(inbound->repository);
+      }
     }
 
     client.config.enable_optimizer = true;
@@ -315,6 +380,11 @@ Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>(
 // the embedded DuckDB and the initialized engine.
 Context::~Context()
 {
+  if (impl_ != nullptr) {
+    for (const auto& exporter : impl_->exporters) {
+      if (auto state = exporter.lock()) { state->close(); }
+    }
+  }
   if (impl_ != nullptr && impl_->inbound != nullptr) { impl_->inbound->close(); }
 }
 
@@ -421,6 +491,7 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
                                   std::uint64_t length) const
 {
   auto& st = *state_;
+  std::lock_guard operation_lock(st.operation_mutex);
   if (metadata_addr == 0 || metadata_len == 0) {
     throw sirius::invalid_input_exception("InboundStore: stage() requires pack metadata");
   }
@@ -442,6 +513,7 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
   if (gpu_space == nullptr) {
     throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
   }
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_space->get_device_id()}};
 
   const auto* metadata = reinterpret_cast<const std::uint8_t*>(metadata_addr);
   const auto* payload  = reinterpret_cast<const std::uint8_t*>(st.arena->base()) + offset;
@@ -464,12 +536,173 @@ std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
     throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
   }
   auto const ticket = st.next_ticket++;
+  if (sirius::exec::optimized_exchange_enabled()) { st.repository->add_data_batch(data_batch); }
   st.staged.emplace(ticket, std::move(data_batch));
   st.staged_bytes.emplace(ticket, bytes);
   return ticket;
 }
 
-void InboundStore::drop(std::uint64_t ticket) const { (void)state_->take(ticket); }
+std::uint64_t InboundStore::reserve(std::uint64_t length) const
+{
+  auto& st = *state_;
+  std::lock_guard operation_lock(st.operation_mutex);
+  std::lock_guard lock(st.mutex);
+  if (!st.host_space) {
+    throw sirius::invalid_input_exception("INGRESS_CAPACITY_EXCEEDED: no live host tier");
+  }
+  auto* allocator =
+    st.host_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+  if (length > st.arena->capacity() / 2 || length > st.host_space->get_max_memory()) {
+    throw sirius::invalid_input_exception(
+      "INGRESS_CAPACITY_EXCEEDED: frame exceeds evacuation capacity");
+  }
+  // Allocate from the configured host pool, including block rounding. The allocation itself is
+  // the reservation: it remains live until publication consumes it or cancellation releases it.
+  cucascade::memory::fixed_multiple_blocks_allocation allocation;
+  try {
+    allocation =
+      length == 0
+        ? cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation::empty()
+        : allocator->allocate_multiple_blocks(length);
+  } catch (const rmm::out_of_memory& error) {
+    throw sirius::invalid_input_exception("INGRESS_CAPACITY_UNAVAILABLE: {}", error.what());
+  }
+  auto const ticket = st.next_ticket++;
+  st.reservations.emplace(ticket, State::reservation_record{length, std::move(allocation)});
+  return ticket;
+}
+
+void InboundStore::cancel_reservation(std::uint64_t reservation) const
+{
+  std::lock_guard operation_lock(state_->operation_mutex);
+  std::lock_guard lock(state_->mutex);
+  state_->reservations.erase(reservation);
+}
+
+namespace {
+
+// Describe column buffers relative to the received packed payload. The same exact bytes are
+// copied into the reserved host blocks; standard cuCascade HOST/DISK converters can then read
+// this layout without keeping a packed GPU temporary or materializing the whole receiver.
+cucascade::memory::column_metadata ingress_column(const cudf::column_view& column,
+                                                  const std::uint8_t* payload,
+                                                  std::uint64_t length,
+                                                  rmm::cuda_stream_view stream)
+{
+  if (column.offset() != 0) {
+    throw sirius::invalid_input_exception("ingress: packed column has nonzero offset");
+  }
+  cucascade::memory::column_metadata meta{};
+  meta.type_id    = static_cast<std::int32_t>(column.type().id());
+  meta.num_rows   = column.size();
+  meta.null_count = column.null_count();
+  auto id         = column.type().id();
+  if (id == cudf::type_id::DECIMAL32 || id == cudf::type_id::DECIMAL64 ||
+      id == cudf::type_id::DECIMAL128) {
+    meta.scale = static_cast<std::int32_t>(column.type().scale());
+  }
+  auto checked_offset = [&](const void* address, std::size_t size) {
+    const auto base  = reinterpret_cast<std::uintptr_t>(payload);
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    if (value < base || value - base > length || size > length - (value - base)) {
+      throw sirius::invalid_input_exception("ingress: column buffer lies outside granted payload");
+    }
+    return static_cast<std::size_t>(value - base);
+  };
+  if (column.nullable() && column.size() > 0) {
+    meta.has_null_mask    = true;
+    meta.null_mask_size   = cudf::bitmask_allocation_size_bytes(column.size());
+    meta.null_mask_offset = checked_offset(column.null_mask(), meta.null_mask_size);
+  }
+  if (column.size() > 0 && id == cudf::type_id::STRING && column.num_children() > 0) {
+    meta.data_size = cudf::strings_column_view(column).chars_size(stream);
+  } else if (column.size() > 0 && cudf::is_fixed_width(column.type())) {
+    meta.data_size = static_cast<std::size_t>(column.size()) * cudf::size_of(column.type());
+  }
+  if (meta.data_size > 0) {
+    meta.has_data    = true;
+    meta.data_offset = checked_offset(column.head<std::uint8_t>(), meta.data_size);
+  }
+  for (cudf::size_type i = 0; i < column.num_children(); ++i) {
+    meta.children.push_back(ingress_column(column.child(i), payload, length, stream));
+  }
+  return meta;
+}
+
+}  // namespace
+
+std::uint64_t InboundStore::stage_reserved(std::uintptr_t metadata_addr,
+                                           std::size_t metadata_len,
+                                           std::uint64_t offset,
+                                           std::uint64_t length,
+                                           std::uint64_t reservation) const
+{
+  auto& st = *state_;
+  std::lock_guard operation_lock(st.operation_mutex);
+  State::reservation_record reserved;
+  {
+    std::lock_guard lock(st.mutex);
+    auto node = st.reservations.extract(reservation);
+    if (node.empty()) {
+      throw sirius::invalid_input_exception("ingress: unknown evacuation reservation");
+    }
+    reserved = std::move(node.mapped());
+  }
+  if (!st.gpu_space || !st.host_space) {
+    throw sirius::invalid_input_exception("ingress: context closed");
+  }
+  if (reserved.length != length || metadata_addr == 0 || metadata_len == 0 ||
+      offset > st.arena->capacity() || length > st.arena->capacity() - offset) {
+    throw sirius::invalid_input_exception(
+      "ingress: invalid reserved frame identity/range/metadata");
+  }
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{st.gpu_space->get_device_id()}};
+  auto stream         = st.stream.view();
+  const auto* payload = reinterpret_cast<const std::uint8_t*>(st.arena->base()) + offset;
+  auto view           = cudf::unpack(reinterpret_cast<const std::uint8_t*>(metadata_addr), payload);
+  std::vector<cucascade::memory::column_metadata> columns;
+  for (const auto& column : view) {
+    columns.push_back(ingress_column(column, payload, length, stream));
+  }
+  try {
+    const auto block_size = reserved.allocation->block_size();
+    for (std::size_t copied = 0, block = 0; copied < length; ++block) {
+      auto bytes = std::min<std::size_t>(block_size, length - copied);
+      auto error = cudaMemcpyAsync(reserved.allocation->at(block).data(),
+                                   payload + copied,
+                                   bytes,
+                                   cudaMemcpyDeviceToHost,
+                                   stream.value());
+      if (error != cudaSuccess) {
+        throw sirius::internal_exception("ingress copy failed: {}", cudaGetErrorString(error));
+      }
+      copied += bytes;
+    }
+    stream.synchronize();
+  } catch (...) {
+    stream.synchronize_no_throw();
+    throw;
+  }
+  auto table = cucascade::memory::host_table_allocation::create(
+    std::move(reserved.allocation), std::move(columns), length);
+  auto representation =
+    std::make_unique<cucascade::host_data_representation>(std::move(table), st.host_space);
+  auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+  std::lock_guard lock(st.mutex);
+  auto ticket = st.next_ticket++;
+  st.repository->add_data_batch(batch);
+  st.staged.emplace(ticket, std::move(batch));
+  st.staged_bytes.emplace(ticket, length);
+  SIRIUS_LOG_INFO(
+    "[exchange_ingress] bytes={} rows={} tier=HOST ticket={}", length, view.num_rows(), ticket);
+  return ticket;
+}
+
+void InboundStore::drop(std::uint64_t ticket) const
+{
+  std::lock_guard operation_lock(state_->operation_mutex);
+  (void)state_->take(ticket);
+}
 
 std::size_t InboundStore::outstanding() const
 {
@@ -608,7 +841,12 @@ struct Fragment::Impl {
     auto& catalog = *ctx.stream_catalog;
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();
-      if (is_result()) { result_input_repos[id] = repository; }
+      if (is_result()) {
+        result_input_repos[id] = repository;
+        if (sirius::exec::optimized_exchange_enabled()) {
+          ctx.context->get_data_repository_registry().register_exchange(repository);
+        }
+      }
       catalog.declare(
         id,
         sirius::exec::stream_input_binding{
@@ -864,43 +1102,61 @@ namespace {
 /// chunked_pack gather granularity. Every `next()` span must be exactly this long, so a lease is
 /// the payload plus one chunk of slack for the final span. 1 MiB is cudf's minimum.
 constexpr std::size_t kPackChunkBytes = 8u << 20;
-}  // namespace
 
-std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t stream_id,
-                                                                   std::uint64_t& offset,
-                                                                   std::uint64_t& length,
-                                                                   std::uint64_t& rows)
+std::unique_ptr<std::vector<std::uint8_t>> pack_exchange_batch(
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  sirius::exec::exchange_staging_arena& arena,
+  duckdb::SiriusContext& context,
+  rmm::cuda_stream_view stream,
+  bool optimized,
+  std::uint64_t& offset,
+  std::uint64_t& length,
+  std::uint64_t& rows)
 {
-  if (!impl_->built) {
-    throw sirius::invalid_input_exception("Fragment: build() must run before export_packed()");
-  }
-  auto& arena = sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get());
-
-  offset     = 0;
-  length     = 0;
-  rows       = 0;
-  auto batch = impl_->session().pull(stream_id);
+  offset = 0;
+  length = 0;
+  rows   = 0;
   if (!batch) { return nullptr; }
-
-  // The shared lock holds residency and immutability for the whole pack; it releases when this
-  // scope ends, after the packing stream has been synchronized and the data lives in the lease.
-  auto read_only = (*batch)->to_read_only();
-  if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
-    throw sirius::invalid_input_exception(
-      "Fragment: batch on output stream " + std::to_string(stream_id) +
-      " is not GPU-resident; exporting a spilled batch is not supported yet");
+  // Keep one exclusive residency guard from reload through pack completion. cuCascade's
+  // mutable_to_readonly transition releases its lock; downgrading there could race the pack.
+  auto access = batch->to_mutable();
+  if (optimized) {
+    if (access.get_current_tier() != cucascade::memory::Tier::GPU) {
+      auto* gpu  = context.get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+      auto bytes = access.get_data()->get_uncompressed_data_size_in_bytes();
+      auto reservation = gpu->make_reservation_or_null(bytes + kPackChunkBytes);
+      if (!reservation) {
+        throw sirius::invalid_input_exception(
+          "EXPORT_CAPACITY_UNAVAILABLE: cannot reserve {} reload bytes", bytes);
+      }
+      auto* allocator = gpu->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+      allocator->attach_reservation_to_tracker(stream, std::move(reservation));
+      try {
+        access.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), gpu, stream);
+        stream.synchronize();
+      } catch (...) {
+        stream.synchronize_no_throw();
+        allocator->reset_stream_reservation(stream);
+        throw;
+      }
+      allocator->reset_stream_reservation(stream);
+      SIRIUS_LOG_INFO("[exchange_reload] bytes={} batch={}", bytes, access.get_batch_id());
+    }
   }
-  auto view   = sirius::get_cudf_table_view(read_only);
-  auto* space = read_only.get_memory_space();
+  if (access.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception(
+      "exchange: batch is not GPU-resident; enable managed exchange for reload");
+  }
+  auto view   = access.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
+  auto* space = access.get_memory_space();
   if (space == nullptr) {
-    throw sirius::invalid_input_exception("Fragment: batch on output stream " +
-                                          std::to_string(stream_id) + " has no memory space");
+    throw sirius::invalid_input_exception("exchange: batch has no memory space");
   }
   rows = static_cast<std::uint64_t>(view.num_rows());
 
-  auto stream = cudf::get_default_stream();
   // STREAM-LINEAGE: order the pack's gather after the batch's writer.
-  if (cudaEvent_t writer = read_only.get_writer_event()) {
+  if (cudaEvent_t writer = access.get_data()->get_writer_event()) {
     if (auto err = cudaStreamWaitEvent(stream.value(), writer, 0); err != cudaSuccess) {
       throw sirius::internal_exception("Fragment: cudaStreamWaitEvent failed: {}",
                                        cudaGetErrorString(err));
@@ -917,6 +1173,15 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
   // orphaned lease pins staging space for the process lifetime.
   if (total == 0) { return packer->build_metadata(); }
 
+  if (optimized &&
+      (arena.capacity() / 4 < kPackChunkBytes || total > arena.capacity() / 4 - kPackChunkBytes)) {
+    throw sirius::invalid_input_exception(
+      "EXPORT_CAPACITY_EXCEEDED: {} packed bytes plus {} slack exceeds per-frame budget {}",
+      total,
+      kPackChunkBytes,
+      arena.capacity() / 4);
+  }
+
   // Each next() span is a full chunk long and starts where the previous copy ended, so the
   // final span can reach up to one chunk past the payload — hence the slack.
   const auto lease_offset = arena.lease(total + kPackChunkBytes);
@@ -929,21 +1194,85 @@ std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t
     }
     if (written != total) {
       throw sirius::internal_exception(
-        "Fragment: chunked_pack wrote {} of {} bytes for output stream {}",
-        written,
-        total,
-        stream_id);
+        "exchange: chunked_pack wrote {} of {} bytes", written, total);
     }
     metadata = packer->build_metadata();
     // The caller transmits from the lease the moment this returns.
     stream.synchronize();
   } catch (...) {
+    stream.synchronize_no_throw();
     arena.release(lease_offset);
     throw;
   }
   offset = lease_offset;
   length = total;
   return metadata;
+}
+
+}  // namespace
+
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t stream_id,
+                                                                   std::uint64_t& offset,
+                                                                   std::uint64_t& length,
+                                                                   std::uint64_t& rows)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before export_packed()");
+  }
+  auto batch = impl_->session().pull(stream_id);
+  return pack_exchange_batch(
+    batch ? *batch : nullptr,
+    sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get()),
+    *impl_->ctx.context,
+    cudf::get_default_stream(),
+    sirius::exec::optimized_exchange_enabled(),
+    offset,
+    length,
+    rows);
+}
+
+ExportProvider::ExportProvider(std::shared_ptr<State> state) : state_(std::move(state)) {}
+ExportProvider::~ExportProvider() = default;
+void ExportProvider::cancel() const { state_->cancelled.store(true); }
+
+std::unique_ptr<std::vector<std::uint8_t>> ExportProvider::export_packed(std::uint64_t& offset,
+                                                                         std::uint64_t& length,
+                                                                         std::uint64_t& rows) const
+{
+  auto& st = *state_;
+  if (st.cancelled.load()) { throw sirius::invalid_input_exception("export provider: retired"); }
+  std::lock_guard lock(st.mutex);
+  if (st.cancelled.load() || !st.context || !st.repository) {
+    throw sirius::invalid_input_exception("export provider: retired");
+  }
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{st.device}};
+  const auto start = std::chrono::steady_clock::now();
+  if (!st.pending) { st.pending = st.repository->pop_next_data_batch(); }
+  auto result = pack_exchange_batch(
+    st.pending, *st.arena, *st.context, st.stream->view(), true, offset, length, rows);
+  st.pending.reset();
+  if (result) {
+    auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count();
+    SIRIUS_LOG_INFO(
+      "[exchange_pack] bytes={} rows={} elapsed_us={} independent=1", length, rows, micros);
+  }
+  return result;
+}
+
+std::unique_ptr<ExportProvider> Fragment::export_provider(std::uint64_t stream_id)
+{
+  if (!impl_->ran || !impl_->fragment) {
+    throw sirius::invalid_input_exception(
+      "Fragment: export_provider requires a completed intermediate fragment");
+  }
+  auto state = std::make_shared<ExportProvider::State>(
+    impl_->ctx.context, impl_->ctx.staging_arena, impl_->fragment->output_repository(stream_id));
+  if (!state->arena) { throw sirius::invalid_input_exception("export provider: no staging arena"); }
+  std::erase_if(impl_->ctx.exporters, [](const auto& entry) { return entry.expired(); });
+  impl_->ctx.exporters.emplace_back(state);
+  return std::make_unique<ExportProvider>(std::move(state));
 }
 
 void Fragment::push_packed(std::uint64_t stream_id,
@@ -1047,18 +1376,18 @@ void Fragment::push_inbound(std::uint64_t stream_id, std::uint64_t ticket)
   if (auto it = impl_->resolved_inputs.find(stream_id); it != impl_->resolved_inputs.end()) {
     const auto& declared = it->second;
     auto read_only       = batch->to_read_only();
-    auto view            = sirius::get_cudf_table_view(read_only);
-    if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    auto description     = sirius::exec::describe_exchange_batch(read_only);
+    if (description.types.size() != declared.types.size()) {
       throw sirius::invalid_input_exception(
         "Fragment: staged batch {} for stream {} carries {} columns but the stream declares {}",
         ticket,
         stream_id,
-        view.num_columns(),
+        description.types.size(),
         declared.types.size());
     }
     for (std::size_t i = 0; i < declared.types.size(); ++i) {
       const auto expected = sirius::get_cudf_type(declared.types[i]);
-      const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+      const auto actual   = description.types[i];
       if (actual != expected) {
         throw sirius::invalid_input_exception(
           "Fragment: staged batch {} for stream {} column {} ({}) is declared {} ({}) but "
@@ -1151,12 +1480,7 @@ std::uint64_t Fragment::output_row_count(std::uint64_t stream_id) const
       auto batch = repository->get_data_batch_by_id(batch_id, partition);
       if (!batch) { continue; }  // popped concurrently; parked outputs are quiescent in practice
       auto read_only = batch->to_read_only();
-      if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
-        throw sirius::invalid_input_exception(
-          "Fragment: batch on output stream " + std::to_string(stream_id) +
-          " is not GPU-resident; counting a spilled batch's rows is not supported yet");
-      }
-      rows += static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
+      rows += sirius::exec::describe_exchange_batch(read_only).rows;
     }
   }
   return rows;

@@ -194,6 +194,27 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
             .to_string())
     }
 
+    /// Reserve the exact packed payload's evacuation storage before granting a remote lease.
+    /// The reservation remains owned by the caller until cancelled or passed to
+    /// `stage_reserved_inbound`; no unbudgeted GPU unpack allocation is permitted here.
+    fn reserve_ingress(&self, length: u64) -> Result<u64, String> {
+        let _ = length;
+        Err("this fragment executor cannot reserve owned ingress storage".to_string())
+    }
+
+    /// Cancel an unused evacuation reservation. Implementations make this idempotent.
+    fn cancel_ingress(&self, reservation: u64) -> Result<(), String> {
+        let _ = reservation;
+        Err("this fragment executor cannot cancel owned ingress storage".to_string())
+    }
+
+    /// Consume a previously reserved evacuation allocation, including on failure. The caller
+    /// still owns the arena lease and may return it only after this call finishes all GPU reads.
+    fn stage_reserved_inbound(&self, batch: &StagedBatch, reservation: u64) -> Result<u64, String> {
+        let _ = (batch, reservation);
+        Err("this fragment executor cannot ingest into reserved storage".to_string())
+    }
+
     /// Drops the staged batch under `ticket`, freeing its pool memory: the release path for a
     /// frame whose receiver will never run.
     fn drop_inbound(&self, ticket: u64) -> Result<(), String> {

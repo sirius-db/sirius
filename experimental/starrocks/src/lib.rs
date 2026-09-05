@@ -50,6 +50,7 @@ mod compute_node_service;
 #[cfg(feature = "sirius-engine")]
 mod engine;
 mod engine_settings;
+mod exchange_protocol;
 mod file_schema;
 mod fragment_executor;
 mod gpu_affinity;

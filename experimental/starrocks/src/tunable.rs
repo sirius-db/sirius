@@ -120,6 +120,33 @@ const WARMUP_PEERS: PeerList = PeerList {
     name: "SIRIUS_CN_NIXL_WARMUP_PEERS",
 };
 
+/// Frames admitted per peer by the optimized transport. Byte reservations are enforced in
+/// addition to this count; a handle slot never grants permission to overfill the TX arena.
+const TRANSFER_WINDOW: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_TRANSFER_WINDOW",
+    default: 1,
+    min: 1,
+    max: 8,
+};
+
+/// Homogeneous protocol/ownership mode shared by the Rust wrapper and C++ engine. Unlike the
+/// older on/off switches this deliberately accepts only 0 and 1, matching the C++ gate.
+const OPTIMIZED_EXCHANGE: Knob<u64> = Knob {
+    name: "SIRIUS_EXCHANGE_OPTIMIZED",
+    default: 0,
+    min: 0,
+    max: 1,
+};
+
+/// Bound on independently serviced control peers. One unresponsive peer can occupy only its
+/// own worker, leaving every other admitted peer's RPCs and the NIXL owner free to progress.
+const TRANSFER_PEERS: Knob<u64> = Knob {
+    name: "SIRIUS_CN_NIXL_TRANSFER_PEERS",
+    default: 32,
+    min: 1,
+    max: 128,
+};
+
 /// One environment-backed knob: where it is read from, what it is when unset, and the range
 /// outside which a value is an error rather than a clamp.
 struct Knob<T> {
@@ -352,6 +379,12 @@ impl FusionMode {
 /// library crate's public API, so the fields are `pub` rather than `pub(crate)`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tunables {
+    /// Whether the owned, early-ingress exchange protocol is enabled for this process.
+    pub optimized_exchange: bool,
+    /// Maximum optimized in-flight frame count per peer.
+    pub transfer_window: usize,
+    /// Maximum optimized control peers (one bounded worker per peer).
+    pub transfer_peers: usize,
     /// See [`RPC_TIMEOUT_SECS`].
     pub rpc_timeout: Duration,
     /// See [`XFER_TIMEOUT_SECS`].
@@ -376,6 +409,9 @@ impl Tunables {
     /// Exactly the values these knobs had as hardcoded constants (and, for the fusion mode, the
     /// shipped default).
     const DEFAULTS: Self = Self {
+        optimized_exchange: false,
+        transfer_window: TRANSFER_WINDOW.default as usize,
+        transfer_peers: TRANSFER_PEERS.default as usize,
         rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.default),
         xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.default),
         canary_bytes: CANARY_BYTES.default,
@@ -395,6 +431,9 @@ impl Tunables {
     /// operator fixes one line at a time.
     fn from_env() -> Result<Self, String> {
         Ok(Self {
+            optimized_exchange: OPTIMIZED_EXCHANGE.read()? == 1,
+            transfer_window: TRANSFER_WINDOW.read()? as usize,
+            transfer_peers: TRANSFER_PEERS.read()? as usize,
             rpc_timeout: Duration::from_secs(RPC_TIMEOUT_SECS.read()?),
             xfer_timeout: Duration::from_secs(XFER_TIMEOUT_SECS.read()?),
             canary_bytes: CANARY_BYTES.read()?,
@@ -437,6 +476,9 @@ impl Tunables {
             );
         }
         tracing::info!(
+            optimized_exchange = published.optimized_exchange,
+            transfer_window = published.transfer_window,
+            transfer_peers = published.transfer_peers,
             rpc_timeout_secs = published.rpc_timeout.as_secs(),
             xfer_timeout_secs = published.xfer_timeout.as_secs(),
             canary_bytes = published.canary_bytes,
@@ -509,6 +551,9 @@ pub(crate) mod tests {
     fn an_empty_environment_reproduces_the_previously_hardcoded_constants() {
         let resolved = with_env(
             &[
+                (OPTIMIZED_EXCHANGE.name, None),
+                (TRANSFER_WINDOW.name, None),
+                (TRANSFER_PEERS.name, None),
                 (RPC_TIMEOUT_SECS.name, None),
                 (XFER_TIMEOUT_SECS.name, None),
                 (CANARY_BYTES.name, None),

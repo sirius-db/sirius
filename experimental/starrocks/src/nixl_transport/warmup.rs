@@ -55,13 +55,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use super::agent_tier::rpc_exchange_md;
-use super::{SessionWarmup, TransportRequest, retry_backoff};
+use super::{RequestSender, SessionWarmup, TransportRequest, retry_backoff};
 use crate::FeConfig;
 use crate::prpc_client::PrpcClient;
 use crate::tunable::Tunables;
@@ -110,7 +110,7 @@ impl Settings {
 pub(super) fn spawn(
     agent_name: String,
     local_md: Vec<u8>,
-    requests: Sender<TransportRequest>,
+    requests: RequestSender,
     fe: FeConfig,
 ) -> Option<SessionWarmup> {
     let Some(settings) = Settings::from_tunables() else {
@@ -150,7 +150,7 @@ pub(super) fn spawn(
 fn run(
     agent_name: &str,
     local_md: &[u8],
-    requests: &Sender<TransportRequest>,
+    requests: &RequestSender,
     fe: &FeConfig,
     settings: &Settings,
     stop: &AtomicBool,
@@ -313,14 +313,18 @@ fn discover(
 /// comment — this is the call that must stay off the transport thread), the agent-local install
 /// and the bandwidth canary run on the transport thread.
 fn warm_one(
-    requests: &Sender<TransportRequest>,
+    requests: &RequestSender,
     agent_name: &str,
     local_md: &[u8],
     host: &str,
     brpc_port: u16,
 ) -> Result<(), String> {
     let mut client = PrpcClient::new(host, brpc_port);
-    let peer = rpc_exchange_md(&mut client, agent_name, local_md)?;
+    let peer = if crate::exchange_protocol::optimized_enabled() {
+        None
+    } else {
+        Some(rpc_exchange_md(&mut client, agent_name, local_md)?)
+    };
     let (respond_tx, respond_rx) = channel();
     requests
         .send(TransportRequest::WarmSession {

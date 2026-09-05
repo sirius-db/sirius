@@ -64,20 +64,44 @@ impl PrpcClient {
     }
 
     /// Sends one framed `PInternalService` request and returns the peer's response body and
-    /// attachment. A transport failure on a previously-used connection is retried once over a
-    /// fresh connection — the peer may simply have closed an idle socket; a duplicate delivery
-    /// of an already-processed frame is idempotent receiver-side by design (sequence numbers).
+    /// attachment. Only explicitly read/session methods retry a failed cached connection.
+    /// Owned mutation callers use `call_idempotent` after supplying a stable request identity.
     pub(crate) fn call(
         &mut self,
         method_name: &str,
         body: Vec<u8>,
         attachment: Vec<u8>,
     ) -> Result<prpc::Response, String> {
+        // Only read/session methods have unconditional retry semantics. In particular a legacy
+        // staging grant may have allocated before its reply was lost. Optimized callers opt in
+        // below only after supplying the stable owned-lease identity required by the receiver.
+        let retry_safe = matches!(method_name, "fetch_data" | "exchange_nixl_md");
+        self.call_with_retry(method_name, body, attachment, retry_safe)
+    }
+
+    /// Retries a method whose caller supplied a stable idempotent protocol identity. A retry
+    /// repeats exactly the same body and attachment; only the connection correlation ID changes.
+    pub(crate) fn call_idempotent(
+        &mut self,
+        method_name: &str,
+        body: Vec<u8>,
+        attachment: Vec<u8>,
+    ) -> Result<prpc::Response, String> {
+        self.call_with_retry(method_name, body, attachment, true)
+    }
+
+    fn call_with_retry(
+        &mut self,
+        method_name: &str,
+        body: Vec<u8>,
+        attachment: Vec<u8>,
+        retry_safe: bool,
+    ) -> Result<prpc::Response, String> {
         let had_cached_connection = self.connection.is_some();
         match self.try_call(method_name, body.clone(), attachment.clone()) {
             Ok(response) => Ok(response),
             Err(CallError::Rpc(err)) => Err(format!("{method_name} to {}: {err}", self.peer)),
-            Err(CallError::Transport(err)) if had_cached_connection => {
+            Err(CallError::Transport(err)) if had_cached_connection && retry_safe => {
                 warn!(
                     peer = %self.peer,
                     method = method_name,
@@ -354,5 +378,91 @@ mod tests {
         client
             .call(methods::FETCH_DATA, body, Vec::new())
             .expect("call after peer restart must reconnect");
+    }
+
+    #[test]
+    fn lost_legacy_grant_reply_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let warm = prpc::Frame::read(&mut socket).unwrap().unwrap();
+            let response = prpc::Frame::response_frame(
+                warm.correlation_id(),
+                Ok(prpc::Response::with_attachment(Vec::new(), Vec::new())),
+            );
+            socket.write_all(&response.encode()).unwrap();
+            // The allocation happened, but its reply is lost. Refuse any subsequent dial so
+            // even the old unsafe retry behavior would finish rather than stall this test.
+            let request = prpc::Frame::read(&mut socket).unwrap().unwrap();
+            assert_eq!(
+                request.into_request().unwrap().method_name,
+                methods::REQUEST_STAGING_LEASE
+            );
+            drop(listener);
+            drop(socket);
+        });
+        let mut client = PrpcClient::new("127.0.0.1", port);
+        client
+            .call(methods::EXCHANGE_NIXL_MD, Vec::new(), Vec::new())
+            .unwrap();
+        assert!(
+            client
+                .call(methods::REQUEST_STAGING_LEASE, vec![1], Vec::new())
+                .is_err()
+        );
+        assert_eq!(
+            client.next_correlation_id, 3,
+            "the unsafe mutation was attempted exactly once"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn owned_retry_preserves_body_and_attachment_across_reconnect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let warm = prpc::Frame::read(&mut socket).unwrap().unwrap();
+            socket
+                .write_all(
+                    &prpc::Frame::response_frame(
+                        warm.correlation_id(),
+                        Ok(prpc::Response::with_attachment(Vec::new(), Vec::new())),
+                    )
+                    .encode(),
+                )
+                .unwrap();
+            let first = prpc::Frame::read(&mut socket).unwrap().unwrap();
+            let first_correlation = first.correlation_id();
+            let first = first.into_request().unwrap();
+            drop(socket);
+            let (mut socket, _) = listener.accept().unwrap();
+            let repeated = prpc::Frame::read(&mut socket).unwrap().unwrap();
+            let correlation = repeated.correlation_id();
+            let repeated = repeated.into_request().unwrap();
+            assert_ne!(first_correlation, correlation);
+            assert_eq!(first.body, repeated.body);
+            assert_eq!(first.attachment, repeated.attachment);
+            socket
+                .write_all(
+                    &prpc::Frame::response_frame(
+                        correlation,
+                        Ok(prpc::Response::with_attachment(vec![9], Vec::new())),
+                    )
+                    .encode(),
+                )
+                .unwrap();
+        });
+        let mut client = PrpcClient::new("127.0.0.1", port);
+        client
+            .call(methods::EXCHANGE_NIXL_MD, Vec::new(), Vec::new())
+            .unwrap();
+        let response = client
+            .call_idempotent(methods::REQUEST_STAGING_LEASE, vec![1, 2, 3], vec![4, 5])
+            .unwrap();
+        assert_eq!(response.body, vec![9]);
+        server.join().unwrap();
     }
 }

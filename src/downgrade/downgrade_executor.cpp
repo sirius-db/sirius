@@ -221,9 +221,18 @@ void downgrade_executor::processing_loop()
     // sweep, so a query ending concurrently cannot pull one out from under this loop.
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.get_all();
-    for (auto const& manager : std::views::reverse(managers)) {
-      if (req->satisfied.load() || pool_interrupted) break;
-      auto repos = manager->get_repositories();
+    auto const exchange   = _data_repo_registry.get_exchange_repositories();
+    {
+      std::vector<cucascade::shared_data_repository*> repos;
+      // Idle exchange data is independent of the active execution window. Prefer spilling it
+      // before the active fragment's working set; the snapshot owns every external repository.
+      for (const auto& repository : exchange) {
+        repos.push_back(repository.get());
+      }
+      for (auto const& manager : std::views::reverse(managers)) {
+        auto current = manager->get_repositories();
+        repos.insert(repos.end(), current.begin(), current.end());
+      }
       for (auto* repo : repos) {
         if (req->satisfied.load()) break;
 

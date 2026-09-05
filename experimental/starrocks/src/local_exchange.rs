@@ -225,6 +225,16 @@ struct ExchangeState {
     /// dropped idempotently — brpc reconnect-retry can replay a frame — and a gap (above) is a
     /// lost frame, which must fail the query rather than silently drop rows.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
+    /// Claimed frames whose ingress copy has not yet been recorded. EOS cannot dispatch a
+    /// receiver while any of these still own an in-flight copy.
+    remote_pending: HashMap<(ExchangeKey, i32), HashSet<i64>>,
+    /// Arrival sequence corresponding to each stored batch, preserving order when copies
+    /// finish in a different order from their admission.
+    remote_batch_seq: HashMap<(ExchangeKey, i32), Vec<i64>>,
+    remote_eos: HashMap<(ExchangeKey, i32), i64>,
+    /// Keep completion tombstones through the process session, including after EOS dispatch.
+    /// Admission fails at the explicit bound rather than evicting a live retry identity.
+    completed: HashSet<FragmentInstanceId>,
     /// Receivers the FE cancelled (`retire_receiver`), so a frame from a peer's still-draining
     /// sender is refused instead of re-creating the entry. `HashSet` twin of the FIFO so the
     /// per-frame check is O(1).
@@ -261,6 +271,11 @@ impl LocalExchange {
             }
         }
         let mut state = self.lock();
+        if state.completed.len() >= 262_144 {
+            return Err(
+                "completed receiver replay ledger reached its bounded session capacity".to_string(),
+            );
+        }
         if state.receivers.contains_key(&fragment_instance_id) {
             return Err(format!(
                 "duplicate receiver registration for fragment {fragment_instance_id}"
@@ -412,6 +427,25 @@ impl LocalExchange {
         if state.retired.contains(&key.fragment_instance_id) {
             return Ok(RemoteFrameClaim::Retired);
         }
+        if state.completed.contains(&key.fragment_instance_id) {
+            return if state
+                .remote_seq
+                .get(&(key, sender_id))
+                .is_some_and(|expected| seq < *expected)
+            {
+                Ok(RemoteFrameClaim::Duplicate)
+            } else {
+                Err(format!(
+                    "remote frame for completed receiver {} after eos",
+                    key.fragment_instance_id
+                ))
+            };
+        }
+        if state.remote_seq.len() >= 262_144 && !state.remote_seq.contains_key(&(key, sender_id)) {
+            return Err(
+                "remote sender replay ledger reached its bounded session capacity".to_string(),
+            );
+        }
         let expected_seq = state.remote_seq.entry((key, sender_id)).or_insert(0);
         if seq < *expected_seq {
             info!(
@@ -427,6 +461,11 @@ impl LocalExchange {
             ));
         }
         *expected_seq += 1;
+        state
+            .remote_pending
+            .entry((key, sender_id))
+            .or_default()
+            .insert(seq);
         Ok(RemoteFrameClaim::Fresh)
     }
 
@@ -450,6 +489,29 @@ impl LocalExchange {
             return Ok(PushedFrame::Retired);
         }
 
+        if !state
+            .remote_pending
+            .get(&(key, sender_id))
+            .is_some_and(|pending| pending.contains(&seq))
+        {
+            return Err("remote frame was not claimed or was already recorded".to_string());
+        }
+        let after_eos = state
+            .remote_eos
+            .get(&(key, sender_id))
+            .is_some_and(|eos| seq > *eos);
+        if after_eos {
+            return Err(format!(
+                "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} after eos"
+            ));
+        }
+        let insertion = state
+            .remote_batch_seq
+            .entry((key, sender_id))
+            .or_default()
+            .binary_search(&seq)
+            .unwrap_or_else(|index| index);
+
         let senders = state.sources.entry(key).or_default();
         let source = senders
             .entry(sender_id)
@@ -471,17 +533,13 @@ impl LocalExchange {
                  parked sender of the same id"
             ));
         };
-        if *closed {
-            return Err(format!(
-                "remote sender {sender_id} for exchange {key:?} sent frame seq {seq} after eos"
-            ));
-        }
         if known_names != &names {
             return Err(format!(
                 "remote sender {sender_id} for exchange {key:?} changed its column names from \
                  {known_names:?} to {names:?}"
             ));
         }
+        let has_batch = batch.is_some();
         if let Some(batch) = batch {
             if batch.metadata.is_empty() {
                 return Err(format!(
@@ -489,11 +547,26 @@ impl LocalExchange {
                      empty pack metadata"
                 ));
             }
-            batches.push(batch);
+            batches.insert(insertion, batch);
         }
         if eos {
             *closed = true;
         }
+        if has_batch {
+            state
+                .remote_batch_seq
+                .get_mut(&(key, sender_id))
+                .expect("batch sequence created")
+                .insert(insertion, seq);
+        }
+        if eos {
+            state.remote_eos.insert((key, sender_id), seq);
+        }
+        state
+            .remote_pending
+            .get_mut(&(key, sender_id))
+            .expect("frame claimed")
+            .remove(&seq);
         Self::take_ready(&mut state, key.fragment_instance_id).map(PushedFrame::Recorded)
     }
 
@@ -510,6 +583,13 @@ impl LocalExchange {
                 node_id,
             };
             let sources = state.sources.get(&key);
+            if state
+                .remote_pending
+                .iter()
+                .any(|((pending_key, _), pending)| *pending_key == key && !pending.is_empty())
+            {
+                return Ok(None);
+            }
             let total = sources.map(HashMap::len).unwrap_or(0);
             if total > expected {
                 return Err(format!(
@@ -554,9 +634,14 @@ impl LocalExchange {
                 ReadyExchangeInput { node_id, sources }
             })
             .collect();
-        // The receiver is leaving the rendezvous; drop its remote-sender sequence tracking too.
+        // Retry safety survives dispatch: replayed final data/EOS must not touch a reused
+        // arena range or fabricate a second receiver. Keep the sequence tombstone.
+        state.completed.insert(fragment_instance_id);
         state
-            .remote_seq
+            .remote_pending
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state
+            .remote_batch_seq
             .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
         Ok(Some(ReadyFragment {
             params: receiver.params,
@@ -596,6 +681,15 @@ impl LocalExchange {
         state
             .remote_seq
             .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state
+            .remote_pending
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state
+            .remote_batch_seq
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
+        state
+            .remote_eos
+            .retain(|(key, _), _| key.fragment_instance_id != fragment_instance_id);
         if state.retired.insert(fragment_instance_id) {
             state.retired_order.push_back(fragment_instance_id);
             while state.retired.len() > RETIRED_CAPACITY {
@@ -632,6 +726,105 @@ mod tests {
     use starrocks_thrift::types::TUniqueId;
 
     use super::*;
+
+    #[test]
+    fn eos_waits_for_all_ingress_copies_and_preserves_admitted_batch_order() {
+        let exchange = LocalExchange::default();
+        let key = key(900, 7);
+        assert!(
+            exchange
+                .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+                .unwrap()
+                .is_none()
+        );
+        for seq in 0..3 {
+            assert_eq!(
+                exchange.claim_remote_frame(key, 0, seq).unwrap(),
+                RemoteFrameClaim::Fresh
+            );
+        }
+        // Both later copies and EOS finish before the first copy. No receiver may run yet.
+        assert!(matches!(
+            exchange
+                .push_claimed_frame(key, 0, 2, true, names(), None)
+                .unwrap(),
+            PushedFrame::Recorded(None)
+        ));
+        assert!(matches!(
+            exchange
+                .push_claimed_frame(key, 0, 1, false, names(), Some(staged(2)))
+                .unwrap(),
+            PushedFrame::Recorded(None)
+        ));
+        let PushedFrame::Recorded(Some(ready)) = exchange
+            .push_claimed_frame(key, 0, 0, false, names(), Some(staged(1)))
+            .unwrap()
+        else {
+            panic!("last outstanding copy must make the EOS receiver ready");
+        };
+        let SenderSource::Remote { batches, .. } = &ready.inputs[0].sources[0] else {
+            panic!("remote source");
+        };
+        assert_eq!(batches, &[staged(1), staged(2)]);
+    }
+
+    #[test]
+    fn final_data_and_eos_replays_after_dispatch_do_not_recreate_sources() {
+        let exchange = LocalExchange::default();
+        let key = key(901, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        exchange
+            .push_remote_frame(key, 0, 0, false, names(), Some(staged(1)))
+            .unwrap();
+        assert!(
+            exchange
+                .push_remote_frame(key, 0, 1, true, names(), None)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 0).unwrap(),
+            RemoteFrameClaim::Duplicate
+        );
+        assert_eq!(
+            exchange.claim_remote_frame(key, 0, 1).unwrap(),
+            RemoteFrameClaim::Duplicate
+        );
+        assert!(
+            exchange
+                .claim_remote_frame(key, 0, 2)
+                .unwrap_err()
+                .contains("after eos")
+        );
+        assert!(exchange.lock().sources.is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_copy_returns_already_completed_handles_only() {
+        let exchange = LocalExchange::default();
+        let key = key(902, 7);
+        exchange
+            .register_receiver(key.fragment_instance_id, vec![(7, 1)], params())
+            .unwrap();
+        exchange.claim_remote_frame(key, 0, 0).unwrap();
+        exchange.claim_remote_frame(key, 0, 1).unwrap();
+        exchange
+            .push_claimed_frame(key, 0, 1, false, names(), Some(staged(2)))
+            .unwrap();
+        let retired = exchange.retire_receiver(key.fragment_instance_id);
+        let SenderSource::Remote { batches, .. } = &retired[0] else {
+            panic!("remote source");
+        };
+        assert_eq!(batches, &[staged(2)]);
+        assert!(matches!(
+            exchange
+                .push_claimed_frame(key, 0, 0, false, names(), Some(staged(1)))
+                .unwrap(),
+            PushedFrame::Retired
+        ));
+    }
 
     fn key(instance: u64, node_id: i32) -> ExchangeKey {
         ExchangeKey {
@@ -985,7 +1178,11 @@ mod tests {
             exchange.claim_remote_frame(key, 0, 0).unwrap(),
             RemoteFrameClaim::Fresh
         );
-        assert!(exchange.retire_receiver(key.fragment_instance_id).is_empty());
+        assert!(
+            exchange
+                .retire_receiver(key.fragment_instance_id)
+                .is_empty()
+        );
         assert!(matches!(
             exchange
                 .push_claimed_frame(key, 0, 0, false, names(), Some(staged(1)))
@@ -998,7 +1195,9 @@ mod tests {
             "later frames of the retired receiver are refused at the claim"
         );
         assert!(
-            exchange.retire_receiver(key.fragment_instance_id).is_empty(),
+            exchange
+                .retire_receiver(key.fragment_instance_id)
+                .is_empty(),
             "the handed-back frame was never recorded"
         );
     }

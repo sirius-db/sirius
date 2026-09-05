@@ -361,6 +361,46 @@ inside `Fragment::run()` — may call them. The Rust `StagingArena` is `Send + S
   `streaming_fragment` caller (a unit test, or any future caller that bypasses the FFI) gets the
   same protection a `Fragment` caller does.
 
+## Owned early ingress for the optimized StarRocks exchange
+
+With `SIRIUS_EXCHANGE_OPTIMIZED=1`, the CN reserves an evacuation allocation
+through `InboundStore::reserve(length)` before issuing a remote arena grant.
+The reservation physically owns space in the configured cuCascade host pool;
+temporary pressure returns a capacity-unavailable result before any GPU lease
+is allocated. The caller passes that reservation to `stage_reserved`, which
+consumes it on success or error, or calls the idempotent `cancel_reservation`
+when publication will not read it.
+
+`stage_reserved` copies packed payload bytes from the arena into that host
+allocation and describes their columns with the existing host representation.
+The normal host/GPU/disk converters can then manage the batch. The call must
+finish all GPU reads before returning; only then may the CN return the arena
+lease and receive credit. The input ticket survives independently of the
+producing RPC and attaches to the receiver without a second full ingress
+copy. Exact row counts and schema remain available while the data is spilled.
+
+This changes buffer ownership, not the fragment execution barrier. The
+rendezvous waits for every sender's EOS **and** every admitted ingress copy;
+copy completion order cannot reorder stream batches. A cancelled query drops
+its managed tickets, while a not-yet-published remote WRITE is quarantined
+until the sender proves quiescence. A timeout alone cannot prove that an arena
+range is safe to reuse.
+
+The Rust receive ledger separates grant replay, pending publication, completed
+publication, and quarantine. It reserves global/per-peer bytes and job slots
+before copy work. The source and receive budgets share the existing arena;
+host reservations share the configured host pool. Concrete limits and the
+session-restart requirement at the bounded replay ledger limit are documented
+in [CN tunables](../../experimental/starrocks/docs/TUNABLES.md#optimized-exchange-protocol-opt-in).
+
+The pure tests `publication_ack_waits_for_copy_and_replays_terminal_result`,
+`grant_reply_loss_can_abort_by_stable_identity_without_a_token`,
+`eos_waits_for_all_ingress_copies_and_preserves_admitted_batch_order`, and
+`owned_ingress_returns_credit_before_eos_and_replays_after_dispatch` exercise
+these contracts. GPU pressure, host/disk reload, and benchmark acceptance need
+their own recorded evidence; test names and this contract are not a claim
+that those experiments have passed.
+
 ## Tests
 
 | File | Catch2 tags |

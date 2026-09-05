@@ -43,6 +43,42 @@ TEST_CASE("registry: create_for_query registers a retrievable manager", "[reposi
   CHECK(registry.get(kQueryA).get() == manager.get());
 }
 
+TEST_CASE("registry: exchange ownership survives query cleanup and fences a spill snapshot",
+          "[repository_registry][exchange_memory]")
+{
+  data_repository_manager_registry registry;
+  registry.create_for_query(kQueryA);
+  auto repository = std::make_shared<cucascade::shared_data_repository>();
+  std::weak_ptr<cucascade::shared_data_repository> lifetime = repository;
+  registry.register_exchange(repository);
+  registry.erase(kQueryA);
+  auto snapshot = registry.get_exchange_repositories();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot.front() == repository);
+  repository.reset();
+  CHECK_FALSE(lifetime.expired());
+  snapshot.clear();
+  CHECK(lifetime.expired());
+  CHECK(registry.get_exchange_repositories().empty());
+}
+
+TEST_CASE("registry: retiring one exchange leaves other query ownership intact",
+          "[repository_registry][exchange_memory]")
+{
+  data_repository_manager_registry registry;
+  auto first  = std::make_shared<cucascade::shared_data_repository>();
+  auto second = std::make_shared<cucascade::shared_data_repository>();
+  registry.register_exchange(first);
+  registry.register_exchange(second);
+  first.reset();
+  auto snapshot = registry.get_exchange_repositories();
+  REQUIRE(snapshot.size() == 1);
+  CHECK(snapshot.front() == second);
+  registry.clear();
+  CHECK(registry.get_exchange_repositories().empty());
+  CHECK(snapshot.front() == second);
+}
+
 TEST_CASE("registry: get of an unregistered query returns nullptr", "[repository_registry]")
 {
   data_repository_manager_registry registry;

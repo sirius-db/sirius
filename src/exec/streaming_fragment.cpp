@@ -16,6 +16,7 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "exec/exchange_memory.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius/exception.hpp"
 #include "sirius_context.hpp"
@@ -107,6 +108,17 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
                                             std::to_string(id));
     }
     _output_repos[id] = std::make_shared<cucascade::shared_data_repository>();
+  }
+  if (optimized_exchange_enabled()) {
+    auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!state) { throw sirius::internal_exception("exchange: missing Sirius context"); }
+    auto& registry = state->get_data_repository_registry();
+    for (const auto& [id, repository] : _input_repos) {
+      registry.register_exchange(repository);
+    }
+    for (const auto& [id, repository] : _output_repos) {
+      registry.register_exchange(repository);
+    }
   }
 }
 

@@ -132,6 +132,22 @@ mod ffi {
             length: u64,
         ) -> Result<u64>;
 
+        /// Reserve host copy-out capacity before a receive lease is granted.
+        fn reserve(self: &InboundStore, length: u64) -> Result<u64>;
+        fn cancel_reservation(self: &InboundStore, reservation: u64) -> Result<()>;
+
+        /// Stage using a prior reservation; consumes it on success and failure.
+        /// # Safety
+        /// Metadata must remain readable for this call, as for `stage`.
+        unsafe fn stage_reserved(
+            self: &InboundStore,
+            metadata_addr: usize,
+            metadata_len: usize,
+            offset: u64,
+            length: u64,
+            reservation: u64,
+        ) -> Result<u64>;
+
         /// Drop the staged batch under `ticket`, freeing its pool memory.
         #[cxx_name = "drop"]
         fn drop_ticket(self: &InboundStore, ticket: u64) -> Result<()>;
@@ -248,6 +264,27 @@ mod ffi {
             rows: &mut u64,
         ) -> Result<UniquePtr<CxxVector<u8>>>;
 
+        /// Independently owned, thread-safe provider of a completed output repository.
+        /// It borrows no Fragment/connection state; context teardown fences active packs.
+        type ExportProvider;
+
+        fn export_provider(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+        ) -> Result<UniquePtr<ExportProvider>>;
+
+        /// Pack on the provider's dedicated stream, returning only after its device bytes
+        /// are ready. The resulting staging lease remains the transport's responsibility.
+        fn export_packed(
+            self: &ExportProvider,
+            offset: &mut u64,
+            length: &mut u64,
+            rows: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
+
+        /// Refuse new claims; a pack already owning a batch completes safely.
+        fn cancel(self: &ExportProvider);
+
         /// Unpack `length` packed bytes at staging offset `offset` with the
         /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
         /// memory), deep-copy the table out of the lease into pool memory, and
@@ -313,6 +350,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, InboundStore, StagingArena, make_context, make_context_from_config,
-    make_fragment, stream_view_name,
+    Context, ExportProvider, Fragment, InboundStore, StagingArena, make_context,
+    make_context_from_config, make_fragment, stream_view_name,
 };

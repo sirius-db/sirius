@@ -28,6 +28,39 @@ use std::time::Duration;
 use crate::fragment_executor::SenderSlot;
 use crate::prpc_client::PrpcClient;
 
+mod fair;
+
+#[cfg(feature = "nixl-transport")]
+mod pipeline;
+
+/// The production admission queue is bounded independently of active frame byte credits.
+/// Tests keep their existing observable channel seam.
+#[derive(Clone, Debug)]
+pub(super) enum RequestSender {
+    Bounded(std::sync::mpsc::SyncSender<TransportRequest>),
+    #[cfg(test)]
+    Test(Sender<TransportRequest>),
+}
+
+impl RequestSender {
+    fn send(&self, request: TransportRequest) -> Result<(), String> {
+        match self {
+            Self::Bounded(tx) => tx.try_send(request).map_err(|err| match err {
+                std::sync::mpsc::TrySendError::Full(_) => {
+                    "nixl transport admission queue is full (128 requests)".to_string()
+                }
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    "nixl transport thread is not running".to_string()
+                }
+            }),
+            #[cfg(test)]
+            Self::Test(tx) => tx
+                .send(request)
+                .map_err(|_| "test transport closed".to_string()),
+        }
+    }
+}
+
 /// Bring-up pre-establishment of the peer sessions; see the module for why it exists.
 #[cfg(feature = "nixl-transport")]
 mod warmup;
@@ -45,12 +78,16 @@ pub(crate) struct MdReply {
     pub(crate) agent_name: String,
     /// This CN's serialized agent metadata (getLocalMD blob).
     pub(crate) metadata: Vec<u8>,
+    pub(crate) lease_protocol: Option<u32>,
+    pub(crate) process_epoch: Option<u64>,
 }
 
 /// One parked sender output to transmit to a remote receiver.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 pub(crate) struct RemoteSendSpec {
+    /// Owning FE query, carried on every optimized grant before any remote bytes are leased.
+    pub(crate) query_id: Option<crate::result_store::FragmentInstanceId>,
     /// Peer CN advertised host.
     pub(crate) host: String,
     /// Peer CN brpc port.
@@ -78,13 +115,13 @@ pub(crate) enum TransportRequest {
         spec: RemoteSendSpec,
         respond: Sender<Result<(), String>>,
     },
-    /// Install one peer session whose metadata handshake the [`warmup`] thread already ran off
-    /// this thread; only the agent-local load and the bandwidth canary happen here. Idempotent.
+    /// Request a peer session. Optimized warmup passes no metadata and coalesces with lazy
+    /// query setup; the compatibility path supplies its completed handshake.
     WarmSession {
         host: String,
         brpc_port: u16,
         client: PrpcClient,
-        peer: MdReply,
+        peer: Option<MdReply>,
         respond: Sender<Result<(), String>>,
     },
 }
@@ -127,7 +164,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 pub struct NixlTransport {
     /// Sender to the transport thread. `Mutex<Option<..>>` makes the `!Sync` sender shareable
     /// and lets `Drop` close the channel before joining; sends are brief.
-    requests: Mutex<Option<Sender<TransportRequest>>>,
+    requests: Mutex<Option<RequestSender>>,
     /// Transport thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Bring-up peer-session warmup; `None` when it is disabled or this build has no nixl.
@@ -175,14 +212,33 @@ impl NixlTransport {
     /// frame of a destination — the counter and the eos frame live inside the thread's
     /// `send_fragment` — is issued by that single thread.
     pub(crate) fn send_fragment(&self, spec: RemoteSendSpec) -> Result<(), String> {
-        self.transport_call(|respond| TransportRequest::SendFragment { spec, respond })
+        self.submit_fragment(spec)?
+            .recv()
+            .map_err(|_| "nixl transport thread dropped the response".to_string())?
+    }
+
+    /// Enqueues a destination without waiting for the engine, peer RPCs, or its final EOS.
+    /// The owner bounds admitted streams and resolves every rejected ticket explicitly.
+    pub(crate) fn submit_fragment(
+        &self,
+        spec: RemoteSendSpec,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        let (respond, answer) = channel();
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "nixl transport is shutting down".to_string())?
+            .send(TransportRequest::SendFragment { spec, respond })
+            .map_err(|_| "nixl transport thread is not running".to_string())?;
+        Ok(answer)
     }
 
     /// Test seam: a handle whose requests land on `requests` instead of a real transport thread.
     #[cfg(test)]
     pub(crate) fn for_test(requests: Sender<TransportRequest>) -> Self {
         Self {
-            requests: Mutex::new(Some(requests)),
+            requests: Mutex::new(Some(RequestSender::Test(requests))),
             thread: Mutex::new(None),
             warmup: Mutex::new(None),
         }
@@ -309,7 +365,8 @@ mod agent_tier {
             agent_name: String,
             fe: FeConfig,
         ) -> Result<Self, String> {
-            let (request_tx, request_rx) = channel::<TransportRequest>();
+            let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<TransportRequest>(128);
+            let request_tx = RequestSender::Bounded(request_tx);
             // The agent's serialized metadata comes back out of bring-up because the warmup
             // thread sends it to peers itself, without borrowing the transport thread.
             let (ready_tx, ready_rx) = channel::<Result<Vec<u8>, String>>();
@@ -358,6 +415,11 @@ mod agent_tier {
             }
         };
 
+        if crate::exchange_protocol::optimized_enabled() {
+            super::pipeline::run(state, requests);
+            return;
+        }
+
         while let Ok(request) = requests.recv() {
             // Respond-send errors are ignored: the waiting caller may have been dropped.
             match request {
@@ -392,7 +454,10 @@ mod agent_tier {
                     respond,
                 } => {
                     let key = format!("{host}:{brpc_port}");
-                    let _ = respond.send(state.install_session(key, client, peer));
+                    let result = peer
+                        .ok_or_else(|| "legacy warmup omitted peer metadata".to_string())
+                        .and_then(|peer| state.install_session(key, client, peer));
+                    let _ = respond.send(result);
                 }
             }
         }
@@ -436,14 +501,15 @@ mod agent_tier {
 
     /// Thread-local transport state; the agent never leaves this thread.
     pub(super) struct TransportState {
-        pub(super) executor: Arc<dyn FragmentExecutor>,
+        /// Fields drop in declaration order: deregister while the agent and engine arena are
+        /// alive, then destroy the agent, and release the engine owner last.
+        _arena_registration: RegistrationHandle,
         pub(super) agent: Agent,
         pub(super) agent_name: String,
         pub(super) local_md: Vec<u8>,
         pub(super) staging_base: u64,
-        /// Keeps the arena registered with the agent for the thread's lifetime.
-        _arena_registration: RegistrationHandle,
         peers: HashMap<String, PeerSession>,
+        pub(super) executor: Arc<dyn FragmentExecutor>,
     }
 
     /// Creates one nixl agent with a UCX backend and the staging arena registered as VRAM.
@@ -523,7 +589,7 @@ mod agent_tier {
         }
 
         /// Receiver side of first contact: load the peer's metadata, reply with ours.
-        fn exchange_md(
+        pub(super) fn exchange_md(
             &mut self,
             peer_agent_name: &str,
             peer_metadata: &[u8],
@@ -540,6 +606,8 @@ mod agent_tier {
             Ok(MdReply {
                 agent_name: self.agent_name.clone(),
                 metadata: self.local_md.clone(),
+                lease_protocol: Some(crate::exchange_protocol::PROTOCOL_VERSION),
+                process_epoch: Some(crate::exchange_protocol::process_epoch()),
             })
         }
 
@@ -712,6 +780,7 @@ mod agent_tier {
                             // Exact per-batch count from export_packed; the receiver sums the
                             // frames into declare_input_cardinality before it builds its plan.
                             rows: batch.rows,
+                            ..Default::default()
                         },
                         metadata,
                     )
@@ -751,6 +820,7 @@ mod agent_tier {
                     column_names: spec.names.clone(),
                     canary: None,
                     rows: None,
+                    ..Default::default()
                 },
                 Vec::new(),
             )?;
@@ -833,6 +903,10 @@ mod agent_tier {
         let body = PExchangeNixlMd {
             agent_name: Some(agent_name.to_string()),
             agent_metadata: Some(local_md.to_vec()),
+            lease_protocol: crate::exchange_protocol::optimized_enabled()
+                .then_some(crate::exchange_protocol::PROTOCOL_VERSION),
+            process_epoch: crate::exchange_protocol::optimized_enabled()
+                .then_some(crate::exchange_protocol::process_epoch()),
         }
         .encode_to_vec();
         let response = client.call(methods::EXCHANGE_NIXL_MD, body, Vec::new())?;
@@ -850,6 +924,8 @@ mod agent_tier {
         Ok(MdReply {
             agent_name,
             metadata,
+            lease_protocol: result.lease_protocol,
+            process_epoch: result.process_epoch,
         })
     }
 
@@ -861,7 +937,11 @@ mod agent_tier {
 
     /// `request_staging_lease` over brpc.
     fn rpc_request_lease(client: &mut PrpcClient, length: u64) -> Result<RemoteLease, String> {
-        let body = PStagingLeaseRequest { length }.encode_to_vec();
+        let body = PStagingLeaseRequest {
+            length,
+            ..Default::default()
+        }
+        .encode_to_vec();
         let response = client.call(methods::REQUEST_STAGING_LEASE, body, Vec::new())?;
         let result = PStagingLeaseResult::decode(response.body.as_slice())
             .map_err(|err| format!("undecodable request_staging_lease reply: {err}"))?;
