@@ -3077,7 +3077,9 @@ fn merge_fragment_params() -> TExecPlanFragmentParams {
 /// DECIMAL128 intermediate slot type, and that the fragment leaves through the finalizing
 /// projection that casts every measure to its FE-declared output-slot type. The engine binds
 /// the merged count (a sum over BIGINT) as HUGEINT, so without the cast this fragment's output
-/// feeding a further downstream fragment would be refused by the hop's schema guard.
+/// feeding a further downstream fragment would be refused by the hop's schema guard. The
+/// DECIMAL128(38,2) sum, an FP64 sum in the engine, is rounded back to its two places first so
+/// two evaluations of it agree to the last bit (TPC-H q15).
 #[test]
 fn merge_aggregation_translates_with_substituted_functions() {
     let translated = PlanTranslator::new()
@@ -3103,7 +3105,7 @@ fn merge_aggregation_translates_with_substituted_functions() {
         matches!(sum_type, substrait::proto::r#type::Kind::Fp64(_)),
         "{sum_type:?}"
     );
-    assert_eq!(field_index(sum_input), 0);
+    assert_eq!(round_parts(&translated.plan, sum_input), (0, 2));
     let (count_type, count_input) = cast_parts(&project.expressions[1]);
     assert!(
         matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
@@ -3135,6 +3137,138 @@ fn merge_aggregation_translates_with_substituted_functions() {
             .collect::<Vec<_>>(),
         vec![("s", "DOUBLE"), ("c", "BIGINT")]
     );
+}
+
+/// Takes apart the finalizing `round(field, places)` of an FP64-lowered decimal measure and
+/// returns `(field index, places)`, asserting the function is the arithmetic extension's
+/// `round` over an I32 literal.
+fn round_parts(plan: &substrait::proto::Plan, expr: &substrait::proto::Expression) -> (i32, i32) {
+    let call = scalar_fn(expr);
+    let (urn, name) = resolved_function(plan, call.function_reference);
+    assert_eq!(name, "round");
+    assert!(urn.contains("functions_arithmetic"), "{urn}");
+    assert!(
+        matches!(
+            call.output_type.as_ref().unwrap().kind,
+            Some(substrait::proto::r#type::Kind::Fp64(_))
+        ),
+        "{:?}",
+        call.output_type
+    );
+    assert_eq!(call.arguments.len(), 2);
+    let value_of = |index: usize| match call.arguments[index].arg_type.as_ref().unwrap() {
+        substrait::proto::function_argument::ArgType::Value(value) => value,
+        other => panic!("expected a value argument, got {other:?}"),
+    };
+    let Some(expression::RexType::Literal(literal)) = value_of(1).rex_type.as_ref() else {
+        panic!("expected a literal places argument, got {:?}", value_of(1));
+    };
+    let Some(expression::literal::LiteralType::I32(places)) = literal.literal_type else {
+        panic!("expected an I32 places literal, got {literal:?}");
+    };
+    (field_index(value_of(0)), places)
+}
+
+/// One-phase `sum(price)` over a DECIMAL64(15,2) column, declared DECIMAL128(38, `scale`) by
+/// the FE, grouped by `name`.
+fn one_phase_decimal_sum_params(ret_type: TTypeDesc) -> TExecPlanFragmentParams {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            ret_type.clone(),
+            Some(slot_ref(
+                1,
+                0,
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            )),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(
+                1,
+                0,
+                "price",
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            ),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "revenue", ret_type),
+        ],
+    );
+    params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    )
+}
+
+/// Verifies a one-phase aggregation whose FE-declared DECIMAL128(38,4) sum lowers to FP64
+/// leaves through a projection that rounds the sum to its four places, keys passing through.
+/// This is TPC-H q15's `revenue` at one CN: without the rounding, the join's `total_revenue`
+/// and the scalar subquery's `max(total_revenue)` are two FP64 sums of the same rows that can
+/// differ in the last bit, and the equality between them drops the answer.
+#[test]
+fn one_phase_lowered_decimal_sum_is_rounded_to_its_scale() {
+    let translated = translate_fragment(&one_phase_decimal_sum_params(scalar_type_with(
+        TPrimitiveType::DECIMAL128,
+        None,
+        Some(38),
+        Some(4),
+    )))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "revenue"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the rounding projection over the aggregate");
+    };
+    assert_eq!(project.expressions.len(), 2);
+    assert_eq!(field_index(&project.expressions[0]), 0);
+    assert_eq!(
+        round_parts(&translated.plan, &project.expressions[1]),
+        (1, 4)
+    );
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the aggregate under the projection");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToResult as i32
+    );
+}
+
+/// Verifies a decimal sum whose FE-declared type stays DECIMAL (precision 18) is not rounded by
+/// the translator: the engine's FP64 -> DECIMAL cast rounds it, and the plan keeps its shape.
+#[test]
+fn one_phase_decimal_sum_kept_as_decimal_is_not_rounded() {
+    let translated = translate_fragment(&one_phase_decimal_sum_params(scalar_type_with(
+        TPrimitiveType::DECIMAL64,
+        None,
+        Some(18),
+        Some(2),
+    )))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert!(
+        matches!(
+            root.input.as_ref().unwrap().rel_type.as_ref().unwrap(),
+            rel::RelType::Aggregate(_)
+        ),
+        "expected the aggregate at the root, got {:?}",
+        root.input
+    );
+    let names = extension_function_names(&translated.plan);
+    assert!(!names.contains(&"round".to_string()), "{names:?}");
 }
 
 /// Verifies both fragments of one two-phase query derive the same wire types: the partial
@@ -6349,16 +6483,8 @@ fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto:
         None,
     ))
     .unwrap();
-    let rel::RelType::Aggregate(aggregate) = root(&translated.plan)
-        .input
-        .as_ref()
-        .unwrap()
-        .rel_type
-        .as_ref()
-        .unwrap()
-    else {
-        panic!("expected aggregate");
-    };
+    // A lowered decimal measure leaves through the rounding projection; look under it.
+    let aggregate = root_aggregate(&translated.plan);
     let substrait::proto::function_argument::ArgType::Value(value) =
         aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
             .arg_type

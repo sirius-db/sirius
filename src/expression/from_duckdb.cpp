@@ -185,10 +185,33 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
   });
 }
 
+// The GPU round is DuckDB's floating overload only: round(FLOAT | DOUBLE [, places]) with a
+// constant INTEGER `places`. DuckDB also binds round over DECIMAL (an exact fixed-point
+// algorithm) and over integers (a no-op, or scaling by powers of ten for negative places);
+// those keep the CPU path.
+bool is_gpu_round(duckdb::BoundFunctionExpression const& expr)
+{
+  if (expr.children.empty() || expr.children.size() > 2) { return false; }
+  auto const source = expr.children[0]->return_type.id();
+  if (source != duckdb::LogicalTypeId::FLOAT && source != duckdb::LogicalTypeId::DOUBLE) {
+    return false;
+  }
+  if (expr.children.size() == 2) {
+    auto const& places = *expr.children[1];
+    if (places.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) { return false; }
+    auto const& constant = places.Cast<duckdb::BoundConstantExpression>();
+    if (constant.value.IsNull() || constant.return_type.id() != duckdb::LogicalTypeId::INTEGER) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::unique_ptr<node> translate_function(duckdb::BoundFunctionExpression const& expr)
 {
   auto func_id_opt = sirius::from_duckdb_function_name(expr.function.name);
   if (!func_id_opt.has_value()) { return nullptr; }
+  if (*func_id_opt == sirius::function_id::round && !is_gpu_round(expr)) { return nullptr; }
   auto arguments = translate_children(expr.children);
   if (!arguments) { return nullptr; }
   auto return_type = sirius::from_duckdb(expr.return_type);

@@ -30,7 +30,7 @@ namespace {
 // Forward table: DuckDB function name -> Sirius function id.
 // Symbolic SQL operators and their Substrait spellings resolve to the same ids.
 // Linear scan; called once per BoundFunctionExpression at executor entry.
-constexpr std::array<std::pair<std::string_view, function_id>, 35> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, function_id>, 36> kForwardTable = {{
   {"+", function_id::add},
   {"add", function_id::add},
   {"-", function_id::sub},
@@ -42,6 +42,7 @@ constexpr std::array<std::pair<std::string_view, function_id>, 35> kForwardTable
   {"//", function_id::int_div},
   {"%", function_id::mod},
   {"modulus", function_id::mod},
+  {"round", function_id::round},
   {"substring", function_id::substring},  // canonical name
   {"substr", function_id::substring},     // alias
   {"~~", function_id::like},
@@ -70,20 +71,22 @@ constexpr std::array<std::pair<std::string_view, function_id>, 35> kForwardTable
 
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
-constexpr std::array<std::string_view, 29> kReverseTable = {
-  "+",          "-",         "*",           "/",           "//",
-  "%",          "substring", "~~",          "!~~",         "contains",
-  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
-  "concat",     "||",        "year",        "month",       "day",
-  "hour",       "minute",    "second",      "millisecond", "microsecond",
-  "date_trunc", "row",       "struct_pack", "error",
+constexpr std::array<std::string_view, 30> kReverseTable = {
+  "+",           "-",           "*",          "/",
+  "//",          "%",           "round",      "substring",
+  "~~",          "!~~",         "contains",   "prefix",
+  "suffix",      "strlen",      "length",     "regexp_replace",
+  "concat",      "||",          "year",       "month",
+  "day",         "hour",        "minute",     "second",
+  "millisecond", "microsecond", "date_trunc", "row",
+  "struct_pack", "error",
 };
 
-static_assert(static_cast<std::size_t>(function_id::error) + 1 == 29,
-              "function_id::error must be the last entry; cardinality locked at 29.");
-static_assert(kReverseTable.size() == 29,
+static_assert(static_cast<std::size_t>(function_id::error) + 1 == 30,
+              "function_id::error must be the last entry; cardinality locked at 30.");
+static_assert(kReverseTable.size() == 30,
               "kReverseTable must have one slot per function_id value.");
-static_assert(kForwardTable.size() == 35,
+static_assert(kForwardTable.size() == 36,
               "kForwardTable includes SQL and Substrait aliases for supported function ids.");
 
 // Walks both tables to ensure every enum value has exactly one canonical

@@ -109,6 +109,34 @@ pub(crate) fn scalar_primitive(type_desc: &TTypeDesc) -> Result<TPrimitiveType> 
         .type_)
 }
 
+/// The scale an FP64-lowered decimal is rounded back to where its value is finalized.
+///
+/// `Some(scale)` when the descriptor is a decimal that [`map_scalar_type`] lowers to FP64
+/// (precision above 18) and states its scale; `None` for every other type, including the
+/// decimals that stay DECIMAL -- the engine's FP64 -> DECIMAL cast rounds those itself.
+pub(crate) fn lowered_decimal_scale(type_desc: &TTypeDesc) -> Result<Option<i32>> {
+    let node = scalar_node(type_desc)?;
+    let Some(scalar) = node.scalar_type.as_ref() else {
+        return Ok(None);
+    };
+    let decimal = matches!(
+        scalar.type_,
+        TPrimitiveType::DECIMAL
+            | TPrimitiveType::DECIMALV2
+            | TPrimitiveType::DECIMAL32
+            | TPrimitiveType::DECIMAL64
+            | TPrimitiveType::DECIMAL128
+    );
+    if node.type_ != TTypeNodeType::SCALAR || !decimal {
+        return Ok(None);
+    }
+    let lowered = matches!(
+        map_scalar_type(scalar, true)?.kind,
+        Some(r#type::Kind::Fp64(_))
+    );
+    Ok(scalar.scale.filter(|_| lowered))
+}
+
 /// Returns the first scalar node in a StarRocks type descriptor.
 fn scalar_node(type_desc: &TTypeDesc) -> Result<&TTypeNode> {
     let types = type_desc
@@ -278,6 +306,53 @@ mod tests {
 
     fn decimal(precision: i32) -> TScalarType {
         TScalarType::new(TPrimitiveType::DECIMAL128, None, Some(precision), Some(2))
+    }
+
+    /// Only the decimals that lower to FP64 report a scale to round back to; a decimal that
+    /// stays DECIMAL, a non-decimal, and a lowered decimal without a stated scale do not.
+    #[test]
+    fn lowered_decimal_scale_follows_the_precision_boundary() {
+        let desc = |scalar: TScalarType| {
+            starrocks_thrift::types::TTypeDesc::new(Some(vec![
+                starrocks_thrift::types::TTypeNode::new(
+                    TTypeNodeType::SCALAR,
+                    Some(scalar),
+                    None,
+                    None,
+                ),
+            ]))
+        };
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DECIMAL128,
+                None,
+                Some(38),
+                Some(4)
+            )))
+            .unwrap(),
+            Some(4)
+        );
+        assert_eq!(lowered_decimal_scale(&desc(decimal(18))).unwrap(), None);
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DECIMAL128,
+                None,
+                Some(38),
+                None
+            )))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            lowered_decimal_scale(&desc(TScalarType::new(
+                TPrimitiveType::DOUBLE,
+                None,
+                None,
+                None
+            )))
+            .unwrap(),
+            None
+        );
     }
 
     /// Precision 18 is the last width kept as DECIMAL; 19 and up lower to FP64.

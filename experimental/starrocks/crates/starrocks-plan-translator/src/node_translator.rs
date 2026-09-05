@@ -910,6 +910,16 @@ fn translate_aggregation(
             .collect::<Result<Vec<_>>>()?,
     };
     let expanded = wire_columns.iter().any(|columns| columns.len() > 1);
+    // Where the aggregate finalizes, every FE-declared decimal measure the type mapper lowered
+    // to FP64 is rounded back to its scale (see `round_to_scale`); a partial state ships raw.
+    let finalize_scales: Vec<Option<i32>> = match phase {
+        AggPhase::Partial => vec![None; agg.aggregate_functions.len()],
+        _ => agg
+            .aggregate_functions
+            .iter()
+            .map(|expr| type_mapper::lowered_decimal_scale(&measure_function(expr)?.ret_type))
+            .collect::<Result<_>>()?,
+    };
     // A merge measure reads the exchange row, which is wider than the FE's intermediate tuple
     // wherever a state expanded, so every slot's column is resolved explicitly instead of
     // through the descriptor's one-slot-per-column view.
@@ -1101,9 +1111,11 @@ fn translate_aggregation(
                 &measure_starts,
                 &wire_columns,
                 &measure_types,
+                &finalize_scales,
                 ctx,
             )
         }
+        AggPhase::OneShot => round_lowered_decimals(aggregated, keys, &finalize_scales, ctx),
         // The emitted row is wider than the FE's output tuple, so the fragment's output names
         // are built here: the descriptor table has no slot to name the extra column from.
         AggPhase::Partial if expanded => {
@@ -1362,12 +1374,16 @@ fn merge_state_columns(
 /// downcast happens at the aggregate's own sink, which this projection now sits in front of.
 /// Without the cast a merged count leaves this fragment as a HUGEINT the receiver declared
 /// BIGINT, and the hop refuses it.
+///
+/// A measure with a `finalize_scales` entry is a decimal the type mapper lowered to FP64; it is
+/// rounded back to that scale before the cast (see [`round_to_scale`]).
 fn merge_projection(
     input: TranslatedRel,
     keys: usize,
     measure_starts: &[usize],
     wire_columns: &[Vec<WireColumn>],
     measure_types: &[substrait::proto::Type],
+    finalize_scales: &[Option<i32>],
     ctx: &mut PlanContext<'_>,
 ) -> TranslatedRel {
     let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
@@ -1378,6 +1394,10 @@ fn merge_projection(
         } else {
             field_selection(field)
         };
+        let value = match finalize_scales[index] {
+            Some(scale) => round_to_scale(value, scale, ctx),
+            None => value,
+        };
         expressions.push(expr_translator::cast_to(
             value,
             measure_types[index].clone(),
@@ -1385,6 +1405,52 @@ fn merge_projection(
     }
     let row_tuples = input.row_tuples.clone();
     project_rel(input, expressions, row_tuples, Vec::new())
+}
+
+/// Adds the projection that rounds a one-phase aggregation's FP64-lowered decimal measures to
+/// their declared scale (see [`round_to_scale`]); keys and every other measure pass through in
+/// place. A plan with nothing to round keeps its shape.
+fn round_lowered_decimals(
+    input: TranslatedRel,
+    keys: usize,
+    finalize_scales: &[Option<i32>],
+    ctx: &mut PlanContext<'_>,
+) -> TranslatedRel {
+    if finalize_scales.iter().all(Option::is_none) {
+        return input;
+    }
+    let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
+    for (index, scale) in finalize_scales.iter().enumerate() {
+        let value = field_selection((keys + index) as i32);
+        expressions.push(match scale {
+            Some(scale) => round_to_scale(value, *scale, ctx),
+            None => value,
+        });
+    }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples, Vec::new())
+}
+
+/// Rounds a finalized FP64 measure back to the scale the FE declared for it.
+///
+/// The FE types a decimal sum or avg DECIMAL128(38, s); the type mapper lowers that to FP64,
+/// so the aggregate is an FP64 sum whose last bits depend on the order the rows were added in
+/// (partial states arrive from several CNs, and the GPU hash aggregate itself is unordered).
+/// StarRocks inlines a CTE once per reference, so a query that compares two evaluations of the
+/// same aggregate -- TPC-H q15 joins `revenue` against `max(total_revenue)` taken from a second
+/// copy of it -- saw them differ by one ULP often enough to return no rows (one run in three at
+/// SF1000 with 2 CNs). Rounding both to the declared scale with DuckDB's arithmetic makes each
+/// the one double nearest the exact decimal the FE promised: the FP64 error of a money sum is
+/// ~1e-9, the nearest rounding boundary 0.5 * 10^-s away. The engine evaluates `round` on the
+/// GPU (`function_id::round`); the value count here is the aggregate's output, so the kernel is
+/// negligible.
+fn round_to_scale(value: Expression, scale: i32, ctx: &mut PlanContext<'_>) -> Expression {
+    let anchor = ctx.registry.register_function(URN_ARITHMETIC, "round");
+    expr_translator::scalar_function(
+        anchor,
+        vec![value, i32_literal(scale)],
+        type_mapper::fp64_type(true),
+    )
 }
 
 /// Divides a merged avg state back into an average, with SQL's empty-input NULL.
