@@ -31,7 +31,7 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
-//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or either half of a two-phase plan) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
 //! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
@@ -58,7 +58,8 @@
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
-//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
+//! `AggregateRel` measures. A two-phase plan's partial and merge halves are translated per
+//! phase (`agg_phase`), with the partial state each measure ships modeled by `partial_state`.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -99,10 +100,12 @@ use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 // commits to is intentionally small: `PlanTranslator`, `translate_fragment`,
 // `TranslatedPlan`, `TranslateError`, and the extension registry. Widen a module
 // to `pub` only when a real consumer needs it.
+pub(crate) mod agg_phase;
 pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
 mod node_translator;
+pub(crate) mod partial_state;
 mod scan_paths;
 pub(crate) mod type_mapper;
 
