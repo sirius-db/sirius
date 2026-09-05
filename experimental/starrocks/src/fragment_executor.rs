@@ -92,6 +92,14 @@ pub struct StagedBatch {
     /// optimizer can size the stream. `None` when the frame predates the wire field: the
     /// receiver then declares nothing for the stream and keeps the legacy blind planning.
     pub rows: Option<u64>,
+    /// `Some` once the payload was copied out of its arena lease into pool memory on arrival
+    /// ([`FragmentExecutor::stage_inbound`]): the batch lives in the executor's inbound store
+    /// under this ticket and `offset` is 0 and holds no lease (`len` keeps the payload size for
+    /// accounting, `metadata` stays for the rendezvous' frame checks). The receiver takes it by
+    /// ticket; a query that ends before
+    /// its receiver runs drops it by ticket. `None` is the legacy shape: the payload still sits
+    /// in the lease at `offset` until the receiver pushes it.
+    pub ticket: Option<u64>,
 }
 
 /// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
@@ -101,9 +109,10 @@ pub struct FragmentRun<'a> {
     pub plan: &'a TranslatedPlan,
     /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
     pub inputs: Vec<(i32, Vec<SenderSlot>)>,
-    /// Remote sender outputs already staged in this CN's arena, as
-    /// `(exchange node id, sender id, batches)`: pushed via `push_packed` + `close_input`
-    /// before the fragment runs, with each lease released the moment its push returns.
+    /// Remote sender outputs already on this CN, as `(exchange node id, sender id, batches)`:
+    /// a ticketed batch is taken from the inbound store with `push_inbound`, a legacy one is
+    /// pushed from its lease via `push_packed` (the lease released the moment the push returns);
+    /// then `close_input`, all before the fragment runs.
     pub remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Non-empty for a sender fragment: the fragment parks ONCE and output stream i belongs to
     /// destination `outputs[i]` (the FE's destination order). Each destination drains its own
@@ -164,6 +173,32 @@ pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
     fn export_packed_next(&self, slot: SenderSlot) -> Result<Option<StagedBatch>, String> {
         let _ = slot;
         Err("this fragment executor cannot export packed batches \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Whether this executor copies inbound frames out of their arena lease into pool memory on
+    /// arrival (an engine with a staging arena). `false` keeps frames in their leases until the
+    /// receiver runs, which is what every executor without a GPU does.
+    fn inbound_store_available(&self) -> bool {
+        false
+    }
+
+    /// Copies `batch`'s payload out of its staging lease into pool memory and returns the ticket
+    /// it is now held under. The lease at `batch.offset` is still the caller's to release,
+    /// immediately after this returns.
+    fn stage_inbound(&self, batch: &StagedBatch) -> Result<u64, String> {
+        let _ = batch;
+        Err("this fragment executor has no inbound store \
+             (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
+            .to_string())
+    }
+
+    /// Drops the staged batch under `ticket`, freeing its pool memory: the release path for a
+    /// frame whose receiver will never run.
+    fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
+        let _ = ticket;
+        Err("this fragment executor has no inbound store \
              (engine build with SIRIUS_EXCHANGE_STAGING_BYTES required)"
             .to_string())
     }

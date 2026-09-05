@@ -585,6 +585,7 @@ mod tests {
 
     fn staged(fill: u8) -> StagedBatch {
         StagedBatch {
+            ticket: None,
             metadata: vec![fill; 4],
             offset: u64::from(fill) * 1024,
             len: 512,

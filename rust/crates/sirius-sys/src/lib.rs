@@ -107,6 +107,41 @@ mod ffi {
         /// the C++ side takes the arena mutex and is therefore not `noexcept`.
         fn outstanding(self: &StagingArena) -> Result<usize>;
 
+        /// Thread-safe handle to the context's inbound store: exchange frames
+        /// copied out of the staging arena into pool memory on arrival, held
+        /// under a ticket until the receiver fragment takes them with
+        /// `push_inbound`. Every method may be called from any thread.
+        type InboundStore;
+
+        /// The context's inbound store handle, or a null `UniquePtr` when no
+        /// staging arena is configured.
+        fn inbound_store_handle(self: &Context) -> UniquePtr<InboundStore>;
+
+        /// Copy the `length` packed bytes at arena offset `offset` (pack
+        /// metadata at `metadata_addr`) into pool memory; returns the ticket.
+        /// The arena lease is the caller's to release, immediately after.
+        ///
+        /// # Safety
+        /// `metadata_addr` must point at `metadata_len` readable bytes of pack
+        /// metadata that outlive this call. The safe wrapper upholds this.
+        unsafe fn stage(
+            self: &InboundStore,
+            metadata_addr: usize,
+            metadata_len: usize,
+            offset: u64,
+            length: u64,
+        ) -> Result<u64>;
+
+        /// Drop the staged batch under `ticket`, freeing its pool memory.
+        #[cxx_name = "drop"]
+        fn drop_ticket(self: &InboundStore, ticket: u64) -> Result<()>;
+
+        /// Batches currently staged.
+        fn outstanding(self: &InboundStore) -> Result<usize>;
+
+        /// Bytes currently staged.
+        fn outstanding_bytes(self: &InboundStore) -> Result<u64>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment, which
@@ -239,6 +274,11 @@ mod ffi {
         /// once every expected sender has closed.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
+        /// Move the batch staged under `ticket` (see `InboundStore::stage`)
+        /// into input stream `stream_id`, without a copy. Same schema guard and
+        /// lifecycle rules as `push_packed`.
+        fn push_inbound(self: Pin<&mut Fragment>, stream_id: u64, ticket: u64) -> Result<()>;
+
         /// Execute the fragment and close its query lifecycle. Blocks until its
         /// pipelines finish.
         fn run(self: Pin<&mut Fragment>) -> Result<()>;
@@ -273,6 +313,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, StagingArena, make_context, make_context_from_config, make_fragment,
-    stream_view_name,
+    Context, Fragment, InboundStore, StagingArena, make_context, make_context_from_config,
+    make_fragment, stream_view_name,
 };

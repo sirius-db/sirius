@@ -52,9 +52,10 @@ struct ExecuteRequest {
     stream_inputs: Vec<StreamInputSchema>,
     /// Parked sender outputs to relay in, keyed by receiver exchange node id.
     inputs: Vec<(i32, Vec<SenderSlot>)>,
-    /// Remote sender batches staged in this CN's arena, as `(node id, sender id, batches)`:
-    /// pushed via `push_packed` + `close_input` before `run()`, each lease released the moment
-    /// its push returns (copy-out-on-arrival makes that safe).
+    /// Remote sender batches on this CN, as `(node id, sender id, batches)`: ticketed ones are
+    /// taken from the inbound store with `push_inbound`, legacy ones pushed from their arena
+    /// lease via `push_packed` (lease released the moment the push returns); then `close_input`,
+    /// all before `run()`.
     remote_inputs: Vec<(i32, i32, Vec<StagedBatch>)>,
     /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
     outputs: Vec<SenderSlot>,
@@ -132,6 +133,11 @@ pub struct SiriusEngine {
     /// direct arena access (`Context::staging_release` for remote-input leases, and
     /// `export_packed` leasing internally) — one shared C++ allocator, two entry points.
     staging: Option<sirius::StagingArena>,
+    /// Thread-safe inbound-store handle (`None` without an arena): `stage_inbound` copies an
+    /// arriving frame out of its lease into pool memory on the caller's thread, so the lease goes
+    /// back while the receiver is still being assembled. Same off-thread shape as `staging`, for
+    /// the same reason: a frame must never wait for the engine thread to be free.
+    inbound: Option<sirius::InboundStore>,
     /// Queries retired on this CN, shared with the engine thread. The CN's `retire_query` marks
     /// here BEFORE queueing its `RetireQuery`, so a `Run` already sitting in the FIFO ahead of it
     /// is refused when the thread dequeues it (the same off-thread shape as `staging`).
@@ -151,7 +157,9 @@ impl SiriusEngine {
         // Readiness carries the staging-arena handle out of the engine thread: the context
         // itself never leaves that thread, but the handle is `Send + Sync` by design so
         // staging calls can bypass the request channel (see the module doc).
-        let (ready_tx, ready_rx) = channel::<Result<Option<sirius::StagingArena>, String>>();
+        let (ready_tx, ready_rx) = channel::<
+            Result<(Option<sirius::StagingArena>, Option<sirius::InboundStore>), String>,
+        >();
         let retired: Arc<Mutex<RetiredQueries>> = Arc::default();
         let thread_retired = Arc::clone(&retired);
         let thread = std::thread::Builder::new()
@@ -159,10 +167,11 @@ impl SiriusEngine {
             .spawn(move || engine_thread(settings.config, request_rx, ready_tx, thread_retired))
             .map_err(|err| format!("failed to spawn sirius-engine thread: {err}"))?;
         match ready_rx.recv() {
-            Ok(Ok(staging)) => Ok(Self {
+            Ok(Ok((staging, inbound))) => Ok(Self {
                 requests: Mutex::new(Some(request_tx)),
                 thread: Mutex::new(Some(thread)),
                 staging,
+                inbound,
                 retired,
             }),
             Ok(Err(err)) => Err(err),
@@ -206,14 +215,18 @@ impl SiriusEngine {
 fn engine_thread(
     config: Option<PathBuf>,
     requests: Receiver<EngineRequest>,
-    ready: Sender<Result<Option<sirius::StagingArena>, String>>,
+    ready: Sender<Result<(Option<sirius::StagingArena>, Option<sirius::InboundStore>), String>>,
     retired: Arc<Mutex<RetiredQueries>>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
-            // A send error means the caller is already gone; nothing to serve. The staging
-            // handle crosses to the caller so leases are served off this thread.
-            if ready.send(Ok(context.staging_arena())).is_err() {
+            // A send error means the caller is already gone; nothing to serve. The staging and
+            // inbound-store handles cross to the caller so leases and arrivals are served off
+            // this thread.
+            if ready
+                .send(Ok((context.staging_arena(), context.inbound_store())))
+                .is_err()
+            {
                 return;
             }
             context
@@ -325,6 +338,7 @@ fn export_next(
         offset: batch.offset,
         len: batch.len,
         rows: Some(batch.rows),
+        ticket: None,
     }))
 }
 
@@ -353,10 +367,39 @@ fn run_fragment<'ctx>(
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
     let mut released = std::collections::HashSet::new();
-    let result = run_fragment_inner(context, registry, retired, request, &mut released);
+    let mut taken = std::collections::HashSet::new();
+    let result = run_fragment_inner(
+        context,
+        registry,
+        retired,
+        request,
+        &mut released,
+        &mut taken,
+    );
     if result.is_err() {
+        let store = context.inbound_store();
         for (_, _, batches) in &request.remote_inputs {
             for batch in batches {
+                if let Some(ticket) = batch.ticket {
+                    // A ticketed batch sits in the inbound store, not in a lease; one the push
+                    // loop already took belongs to the (now dropped) fragment.
+                    if taken.contains(&ticket) {
+                        continue;
+                    }
+                    match &store {
+                        Some(store) => {
+                            if let Err(err) = store.drop(ticket) {
+                                warn!(
+                                    ticket,
+                                    error = %err,
+                                    "failed to drop a staged remote input after a fragment error"
+                                );
+                            }
+                        }
+                        None => warn!(ticket, "ticketed remote input but no inbound store"),
+                    }
+                    continue;
+                }
                 // `len == 0` batches never held a lease (metadata-only), and offsets in
                 // `released` already went back in the push loop.
                 if batch.len == 0 || released.contains(&batch.offset) {
@@ -394,6 +437,7 @@ fn run_fragment_inner<'ctx>(
     retired: &Mutex<RetiredQueries>,
     request: &ExecuteRequest,
     released: &mut std::collections::HashSet<u64>,
+    taken: &mut std::collections::HashSet<u64>,
 ) -> Result<Option<FragmentResult>, String> {
     // Gate 1: a run of a query this CN already retired is refused before it touches the engine.
     // Here, not at the dequeue, so `run_fragment`'s sweep still releases every remote-input
@@ -544,14 +588,25 @@ fn run_fragment_inner<'ctx>(
         }
     }
 
-    // Remote senders: their packed batches already sit in this CN's staging arena. Push each
-    // (deep copy into pool memory), release its lease immediately — copy-out-on-arrival makes
-    // that safe — then close the sender.
+    // Remote senders: a ticketed batch was copied into pool memory when its frame arrived and
+    // moves into the stream without another copy; a legacy batch still sits in this CN's
+    // staging arena, so push it (deep copy into pool memory) and release its lease at once.
+    // Then close the sender.
     for (node_id, sender_id, batches) in &request.remote_inputs {
         let stream_id = stream_id_of(*node_id)?;
         let sender = u32::try_from(*sender_id)
             .map_err(|_| format!("negative remote sender id {sender_id}"))?;
         for batch in batches {
+            if let Some(ticket) = batch.ticket {
+                fragment.push_inbound(stream_id, ticket).map_err(|err| {
+                    format!(
+                        "failed to take staged remote batch {ticket} from sender {sender_id} \
+                         into stream {stream_id}: {err}"
+                    )
+                })?;
+                taken.insert(ticket);
+                continue;
+            }
             let staged = sirius::PackedBatch {
                 metadata: batch.metadata.clone(),
                 offset: batch.offset,
@@ -714,6 +769,36 @@ impl FragmentExecutor for SiriusEngine {
 
     fn drop_parked(&self, slot: SenderSlot) -> Result<(), String> {
         self.engine_call(|respond| EngineRequest::DropParked { slot, respond })
+    }
+
+    fn inbound_store_available(&self) -> bool {
+        self.inbound.is_some()
+    }
+
+    fn stage_inbound(&self, batch: &StagedBatch) -> Result<u64, String> {
+        let store = self
+            .inbound
+            .as_ref()
+            .ok_or_else(|| "no inbound store (SIRIUS_EXCHANGE_STAGING_BYTES unset)".to_string())?;
+        let packed = sirius::PackedBatch {
+            metadata: batch.metadata.clone(),
+            offset: batch.offset,
+            len: batch.len,
+            rows: batch.rows.unwrap_or(0),
+        };
+        store
+            .stage(&packed)
+            .map_err(|err| format!("failed to stage a {} byte inbound frame: {err}", batch.len))
+    }
+
+    fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
+        let store = self
+            .inbound
+            .as_ref()
+            .ok_or_else(|| "no inbound store (SIRIUS_EXCHANGE_STAGING_BYTES unset)".to_string())?;
+        store
+            .drop(ticket)
+            .map_err(|err| format!("failed to drop staged inbound batch {ticket}: {err}"))
     }
 
     fn retire_query(
@@ -1543,6 +1628,7 @@ mod tests {
                         offset: lease,
                         len: 4096,
                         rows: Some(1),
+                        ticket: None,
                     }],
                 )],
                 outputs: Vec::new(),

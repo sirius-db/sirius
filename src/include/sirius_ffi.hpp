@@ -46,6 +46,7 @@ namespace sirius::ffi {
 
 class Fragment;
 class StagingArena;
+class InboundStore;
 
 /// RAII handle to a Sirius engine context.
 ///
@@ -105,11 +106,18 @@ class SIRIUS_FFI_EXPORT Context {
   /// lease request) holds this instead of funneling through the `staging_*` methods above.
   std::unique_ptr<StagingArena> staging_arena_handle() const;
 
+  /// Thread-safe handle to this context's inbound store — or null when no staging arena is
+  /// configured (an inbound frame always arrives through the arena). A transport/RPC thread
+  /// hands every arriving frame to `InboundStore::stage` and releases the arena lease at once;
+  /// the receiver fragment later takes the staged batch with `Fragment::push_inbound`.
+  std::unique_ptr<InboundStore> inbound_store_handle() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 
   friend class Fragment;
+  friend class InboundStore;
   friend SIRIUS_FFI_EXPORT std::unique_ptr<Fragment> make_fragment(Context& context);
 };
 
@@ -156,6 +164,58 @@ class SIRIUS_FFI_EXPORT StagingArena {
 
  private:
   std::shared_ptr<sirius::exec::exchange_staging_arena> arena_;
+};
+
+/// Thread-safe handle to a [`Context`]'s inbound store: packed exchange frames copied out of the
+/// staging arena into ordinary pool memory the moment they arrive, before the receiver fragment
+/// that will consume them exists.
+///
+/// Why this exists: the receive side of the cross-node exchange is receiver-first and
+/// park-then-export, so with `push_packed` alone every inbound frame sits in its arena lease until
+/// the receiver fragment is dispatched, which happens only after every sender closed. At 4 CNs and
+/// SF1000 the six shuffle-heavy TPC-H queries held 31 to 47 leases of 420 to 660 MB each and the
+/// 16 GiB arena threw. Copying out on arrival puts the frame under the pool's accounting instead
+/// and returns the lease immediately, so the arena only ever holds frames in flight.
+///
+/// Every method may be called from any thread, concurrently with the context thread: the copy
+/// runs on the store's own non-blocking CUDA stream and is synchronized before `stage` returns,
+/// allocations come from the pool's thread-safe resource, and the store's map sits behind its
+/// own mutex. The handle keeps the store alive; `stage` fails loudly once the owning context is
+/// gone.
+class SIRIUS_FFI_EXPORT InboundStore {
+ public:
+  struct State;
+  explicit InboundStore(std::shared_ptr<State> state);
+  ~InboundStore();
+
+  InboundStore(const InboundStore&)            = delete;
+  InboundStore& operator=(const InboundStore&) = delete;
+
+  /// Copy the `length` packed bytes at staging offset `offset` (with the `metadata_len` bytes of
+  /// cudf pack metadata at `metadata_addr`) into pool memory and keep the resulting table under
+  /// a fresh ticket. The arena lease is NOT released here; the caller releases it as soon as
+  /// this returns. A metadata-only frame (`length == 0`) stages an empty table.
+  /// @return the ticket `Fragment::push_inbound` and `drop` name the batch by.
+  /// @throws on a range outside the arena, missing metadata, or a torn-down context.
+  std::uint64_t stage(std::uintptr_t metadata_addr,
+                      std::size_t metadata_len,
+                      std::uint64_t offset,
+                      std::uint64_t length) const;
+
+  /// Drop the staged batch under `ticket`, freeing its pool memory: the release path for a
+  /// frame whose receiver will never run (a failed or cancelled query).
+  /// @throws on a ticket that is not staged (double drop).
+  void drop(std::uint64_t ticket) const;
+
+  /// Batches currently staged. Nonzero once every query has quiesced means a leak.
+  std::size_t outstanding() const;
+
+  /// Bytes currently staged, summed over the batches' device buffers.
+  std::uint64_t outstanding_bytes() const;
+
+ private:
+  std::shared_ptr<State> state_;
+  friend class Fragment;
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
@@ -272,6 +332,13 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// stream ends once every expected sender has closed.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
+
+  /// Move the batch staged under `ticket` (see `InboundStore::stage`) into input stream
+  /// `stream_id`: the receive-side entry point once frames are copied out on arrival. No copy
+  /// happens here; the batch already lives in pool memory. Same schema guard and lifecycle rules
+  /// as `push_packed`.
+  /// @throws on an unknown ticket, a schema mismatch, or a stream that already ended.
+  void push_inbound(std::uint64_t stream_id, std::uint64_t ticket);
 
   /// Execute the fragment and close the query lifecycle. Blocks until pipelines finish.
   /// @throws before build() or on execution failure.

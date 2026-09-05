@@ -34,6 +34,17 @@ knob listed under "Dispatch").
 **no arena**: the CN boots and serves local work, then every remote exchange
 fails. There is no engine default — launchers pick a size per box.
 
+The arena only holds frames in flight. An inbound frame is copied out of its
+lease into ordinary pool memory the moment its `transmit_packed` arrives (the
+engine's inbound store, on the RPC thread) and the lease is released on that
+RPC; the receiver fragment later takes the batch by ticket. So the arena has to
+cover the frames a peer can have in the air at once (one lease per batch per
+sender drain), not a shuffle's whole inbound share, and the shuffle inputs of a
+query count against `--gpu-memory-limit`, where the pool's admission and
+downgrade already apply. A frame whose receiver never runs (a failed or
+cancelled query) is dropped from the store when the CN releases the receiver's
+inputs; the CN logs the store's outstanding count with the arena's at quiesce.
+
 ## Dispatch
 
 | Knob | Role |

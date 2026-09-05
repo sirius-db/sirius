@@ -163,6 +163,18 @@ impl SiriusContext {
         let handle = self.inner.borrow().staging_arena_handle();
         (!handle.is_null()).then(|| StagingArena { inner: handle })
     }
+
+    /// Thread-safe handle to the inbound store, or `None` when no staging arena is configured
+    /// (an inbound frame always arrives through the arena).
+    ///
+    /// A transport/RPC thread stages every arriving frame with [`InboundStore::stage`] and
+    /// releases the arena lease at once; the receiver fragment takes the staged batch later
+    /// with [`Fragment::push_inbound`]. Callable from any thread, concurrently with the context
+    /// thread, like [`staging_arena`](Self::staging_arena).
+    pub fn inbound_store(&self) -> Option<InboundStore> {
+        let handle = self.inner.borrow().inbound_store_handle();
+        (!handle.is_null()).then(|| InboundStore { inner: handle })
+    }
 }
 
 /// Drains a filled Arrow C Data Interface stream into owned batches, retaining the schema.
@@ -417,6 +429,14 @@ impl Fragment<'_> {
         }
     }
 
+    /// Move the batch staged under `ticket` (see [`InboundStore::stage`]) into input stream
+    /// `stream_id`. No copy: the batch already lives in pool memory. Same schema guard and
+    /// lifecycle rules as [`push_packed`](Fragment::push_packed); an unknown or already taken
+    /// ticket is an error.
+    pub fn push_inbound(&mut self, stream_id: u64, ticket: u64) -> Result<(), Exception> {
+        self.inner.pin_mut().push_inbound(stream_id, ticket)
+    }
+
     /// Record that `sender_id` finished producing into input stream `stream_id` — the EOS mirror
     /// of [`push_packed`](Fragment::push_packed) for remote senders
     /// ([`relay_from`](Fragment::relay_from) closes its own sender). Idempotent per sender; the
@@ -502,6 +522,68 @@ impl std::fmt::Debug for StagingArena {
         f.debug_struct("StagingArena")
             .field("base", &self.base())
             .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+/// Thread-safe handle to a context's inbound store, from [`SiriusContext::inbound_store`].
+///
+/// Exchange frames are copied out of their staging-arena lease into ordinary pool memory the
+/// moment they arrive ([`stage`](Self::stage)), so the lease goes back to the arena at once and
+/// the arena only ever holds frames in flight. The staged batch waits under its ticket until the
+/// receiver fragment takes it with [`Fragment::push_inbound`], or a failed query drops it with
+/// [`drop`](Self::drop).
+pub struct InboundStore {
+    inner: UniquePtr<sirius_sys::InboundStore>,
+}
+
+// SAFETY: the C++ `InboundStore` is a `shared_ptr` to the context's store state. `stage` copies on
+// the store's own non-blocking CUDA stream and synchronizes it before returning; allocations come
+// from the pool's thread-safe resource; the ticket map sits behind the store's own mutex. There
+// is no thread-affine state behind any operation, and the `shared_ptr` keeps the store alive
+// independently of the `SiriusContext` (which closes it at teardown, so a late call errors).
+unsafe impl Send for InboundStore {}
+unsafe impl Sync for InboundStore {}
+
+impl InboundStore {
+    /// Copy `batch`'s packed bytes out of the staging arena into pool memory; returns the ticket
+    /// the receiver names the batch by. The lease at `batch.offset` is still the caller's to
+    /// release, immediately after this returns. A metadata-only zero-row batch stages an empty
+    /// table.
+    pub fn stage(&self, batch: &PackedBatch) -> Result<u64, Exception> {
+        // SAFETY: the metadata pointer/length name `batch.metadata`'s buffer, which this borrow
+        // keeps alive and readable for the duration of the call.
+        unsafe {
+            self.inner.stage(
+                batch.metadata.as_ptr() as usize,
+                batch.metadata.len(),
+                batch.offset,
+                batch.len,
+            )
+        }
+    }
+
+    /// Drop the staged batch under `ticket`, freeing its pool memory: the release path for a
+    /// frame whose receiver will never run. An unknown ticket is an error (double drop).
+    pub fn drop(&self, ticket: u64) -> Result<(), Exception> {
+        self.inner.drop_ticket(ticket)
+    }
+
+    /// Batches currently staged. Nonzero once every query has quiesced means a leak.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+
+    /// Bytes currently staged.
+    pub fn outstanding_bytes(&self) -> Result<u64, Exception> {
+        self.inner.outstanding_bytes()
+    }
+}
+
+impl std::fmt::Debug for InboundStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundStore")
+            .field("outstanding", &self.outstanding().ok())
             .finish()
     }
 }
@@ -1291,6 +1373,117 @@ mod tests {
         );
 
         // Keep the arena out of the other tests' context bring-ups.
+        // SAFETY: the GPU lock is still held.
+        unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
+    }
+
+    /// Copy-out-on-arrival through the inbound store: frames exported into the arena are staged
+    /// into pool memory FROM ANOTHER THREAD and their leases released before the receiver
+    /// fragment exists; the receiver then takes them by ticket and produces the same rows as the
+    /// `push_packed` hop. Also pins: a taken ticket cannot be pushed or dropped twice, and the
+    /// store is empty once the receiver holds everything. Requires a GPU.
+    #[test]
+    fn inbound_store_hop_matches_packed_hop() {
+        let _guard = GPU_CONTEXT_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        // SAFETY: the GPU lock is held, so no other thread touches the environment here.
+        unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.parquet");
+        write_users_parquet(&path);
+        let sender_plan = local_files_plan(
+            path.to_str().unwrap(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let receiver_plan = stream_read_plan(0);
+
+        let ctx = SiriusContext::new().expect("bring up sirius context");
+        let arena = ctx.staging_arena().expect("arena configured");
+        let store = ctx
+            .inbound_store()
+            .expect("inbound store follows the arena");
+        assert_eq!(store.outstanding().unwrap(), 0);
+
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+        let mut staged = Vec::new();
+        while let Some(batch) = sender.export_packed(0).unwrap() {
+            staged.push(batch);
+        }
+        assert!(!staged.is_empty());
+        assert!(arena.outstanding().unwrap() >= staged.len());
+
+        // Another thread stages every frame and hands the leases back, the way an RPC thread
+        // does while the engine thread is busy elsewhere.
+        let rows_total: u64 = staged.iter().map(|batch| batch.rows).sum();
+        let tickets = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    staged
+                        .iter()
+                        .map(|batch| {
+                            let ticket = store.stage(batch).unwrap();
+                            if batch.len > 0 {
+                                arena.release(batch.offset).unwrap();
+                            }
+                            ticket
+                        })
+                        .collect::<Vec<u64>>()
+                })
+                .join()
+                .unwrap()
+        });
+        // Nothing is left in the arena before any receiver exists: the free list coalesced back
+        // to one block, so the next lease lands at the base.
+        assert_eq!(arena.outstanding().unwrap(), 0);
+        let probe = arena.lease(1024).unwrap();
+        assert_eq!(probe, 0);
+        arena.release(probe).unwrap();
+        assert_eq!(store.outstanding().unwrap(), tickets.len());
+        assert!(store.outstanding_bytes().unwrap() > 0);
+
+        let mut receiver = ctx.fragment().unwrap();
+        receiver.declare_input_column(0, "id", "BIGINT").unwrap();
+        receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
+        receiver.declare_input_cardinality(0, rows_total).unwrap();
+        receiver.build(&receiver_plan).unwrap();
+        for &ticket in &tickets {
+            receiver.push_inbound(0, ticket).unwrap();
+        }
+        assert_eq!(store.outstanding().unwrap(), 0);
+        // A ticket is taken exactly once, whichever way.
+        let again = receiver.push_inbound(0, tickets[0]);
+        assert!(again.is_err());
+        assert!(again.unwrap_err().what().contains("not staged"));
+        assert!(store.drop(tickets[0]).is_err());
+        receiver.close_input(0, 0).unwrap();
+        receiver.run().unwrap();
+        let result = receiver.result_to_arrow().unwrap();
+        assert_eq!(
+            rows(&result),
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "c".to_string()),
+            ]
+        );
+
+        // A staged frame whose receiver never comes is dropped by ticket and frees the store.
+        let mut sender = ctx.fragment().unwrap();
+        sender.declare_output(0).unwrap();
+        sender.build(&sender_plan).unwrap();
+        sender.run().unwrap();
+        let batch = sender.export_packed(0).unwrap().expect("one batch");
+        let ticket = store.stage(&batch).unwrap();
+        arena.release(batch.offset).unwrap();
+        assert_eq!(store.outstanding().unwrap(), 1);
+        store.drop(ticket).unwrap();
+        assert_eq!(store.outstanding().unwrap(), 0);
+
         // SAFETY: the GPU lock is still held.
         unsafe { std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES") };
     }

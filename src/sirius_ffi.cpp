@@ -44,6 +44,7 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
+#include "log/logging.hpp"                // SIRIUS_LOG_WARN (inbound store)
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "planner/substrait_scan_ranges.hpp"           // sirius::planner::scan_byte_ranges_state
@@ -57,13 +58,17 @@
 #include <cudf/utilities/span.hpp>             // cudf::device_span
 #include <cudf/utilities/type_dispatcher.hpp>  // cudf::type_to_name
 
+#include <rmm/cuda_stream.hpp>  // rmm::cuda_stream (inbound copies)
+
 #include <cuda_runtime_api.h>  // cudaStreamWaitEvent
 
 #include <algorithm>  // std::find
 #include <cstdlib>    // std::getenv
 #include <map>
+#include <mutex>  // std::mutex (inbound store)
 #include <optional>
 #include <set>
+#include <unordered_map>  // std::unordered_map (inbound store)
 #include <vector>
 
 namespace sirius::ffi {
@@ -147,6 +152,64 @@ lowered_plan lower_substrait(duckdb::Connection& conn, const std::string& substr
 }  // namespace
 
 // PIMPL: holds the engine + embedded DuckDB using DuckDB's own smart pointers
+/// The store proper. `gpu_space` is owned by the context's memory manager; `close()` nulls it
+/// when the context tears down so a straggling handle throws instead of dereferencing it.
+struct InboundStore::State {
+  State(std::shared_ptr<sirius::exec::exchange_staging_arena> arena_in,
+        cucascade::memory::memory_space* gpu_space_in)
+    : arena(std::move(arena_in)),
+      gpu_space(gpu_space_in),
+      stream(rmm::cuda_stream::flags::non_blocking)
+  {
+  }
+
+  std::shared_ptr<sirius::exec::exchange_staging_arena> arena;
+  cucascade::memory::memory_space* gpu_space;
+  // Own stream so an arriving frame's copy never queues behind the engine thread's work on the
+  // default stream (a receiver blocked behind a multi-minute stage was the whole problem).
+  rmm::cuda_stream stream;
+  std::mutex mutex;
+  std::uint64_t next_ticket{1};
+  std::unordered_map<std::uint64_t, std::shared_ptr<cucascade::data_batch>> staged;
+  std::unordered_map<std::uint64_t, std::uint64_t> staged_bytes;
+
+  void close()
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!staged.empty()) {
+      SIRIUS_LOG_WARN("inbound store: {} staged batch(es) ({} bytes) dropped at context teardown",
+                      staged.size(),
+                      total_bytes_locked());
+    }
+    staged.clear();
+    staged_bytes.clear();
+    gpu_space = nullptr;
+  }
+
+  std::uint64_t total_bytes_locked() const
+  {
+    std::uint64_t total = 0;
+    for (const auto& [_, bytes] : staged_bytes) {
+      total += bytes;
+    }
+    return total;
+  }
+
+  std::shared_ptr<cucascade::data_batch> take(std::uint64_t ticket)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = staged.find(ticket);
+    if (it == staged.end()) {
+      throw sirius::invalid_input_exception(
+        "inbound store: ticket {} is not staged (already pushed or dropped?)", ticket);
+    }
+    auto batch = std::move(it->second);
+    staged.erase(it);
+    staged_bytes.erase(ticket);
+    return batch;
+  }
+};
+
 // (duckdb::shared_ptr, so the SiriusContext can register as a ClientContextState).
 struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
@@ -160,6 +223,10 @@ struct Context::Impl {
   //! internal mutex makes that safe) and outlive this context; there is still exactly ONE
   //! allocator — the handle shares it, never mirrors it.
   std::shared_ptr<sirius::exec::exchange_staging_arena> staging_arena;
+  //! Inbound frames copied out of the arena on arrival, waiting for their receiver fragment.
+  //! Created with the arena; shared with every `InboundStore` handle. Closed in ~Impl so a handle
+  //! that outlives the context fails loudly instead of touching a dead memory space.
+  std::shared_ptr<InboundStore::State> inbound;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -207,6 +274,14 @@ struct Context::Impl {
     // After engine bring-up so the arena's cudaMalloc comes out of the headroom the operator
     // left beside the pool budget, not out of memory the pool then misses.
     staging_arena = sirius::exec::exchange_staging_arena::from_env();
+    if (staging_arena != nullptr) {
+      auto* gpu_space =
+        context->get_memory_manager().get_memory_space(cucascade::memory::Tier::GPU, 0);
+      if (gpu_space == nullptr) {
+        throw sirius::internal_exception("Context: no GPU memory space for the inbound store");
+      }
+      inbound = std::make_shared<InboundStore::State>(staging_arena, gpu_space);
+    }
 
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
@@ -238,7 +313,10 @@ Context::Context(const std::string& config_path) : impl_(std::make_unique<Impl>(
 
 // Defined here, where the heavy types are complete: destroying `impl_` tears down
 // the embedded DuckDB and the initialized engine.
-Context::~Context() = default;
+Context::~Context()
+{
+  if (impl_ != nullptr && impl_->inbound != nullptr) { impl_->inbound->close(); }
+}
 
 void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stream_addr)
 {
@@ -318,6 +396,91 @@ std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
 {
   return std::make_unique<Context>(config_path);
+}
+
+std::unique_ptr<InboundStore> Context::inbound_store_handle() const
+{
+  if (impl_->inbound == nullptr) { return nullptr; }
+  return std::make_unique<InboundStore>(impl_->inbound);
+}
+
+// ---------------------------------------------------------------------------
+// InboundStore
+// ---------------------------------------------------------------------------
+
+InboundStore::InboundStore(std::shared_ptr<State> state) : state_(std::move(state))
+{
+  if (state_ == nullptr) { throw sirius::internal_exception("InboundStore: null state"); }
+}
+
+InboundStore::~InboundStore() = default;
+
+std::uint64_t InboundStore::stage(std::uintptr_t metadata_addr,
+                                  std::size_t metadata_len,
+                                  std::uint64_t offset,
+                                  std::uint64_t length) const
+{
+  auto& st = *state_;
+  if (metadata_addr == 0 || metadata_len == 0) {
+    throw sirius::invalid_input_exception("InboundStore: stage() requires pack metadata");
+  }
+  auto const capacity = st.arena->capacity();
+  if (offset > capacity || length > capacity - offset) {
+    throw sirius::invalid_input_exception(
+      "InboundStore: stage() range [{}, +{}) exceeds the staging arena capacity {}",
+      offset,
+      length,
+      capacity);
+  }
+  // The memory space pointer is read under the lock, the copy runs outside it: the copy is the
+  // expensive part and the other threads' stage/drop must not wait behind it.
+  cucascade::memory::memory_space* gpu_space = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    gpu_space = st.gpu_space;
+  }
+  if (gpu_space == nullptr) {
+    throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
+  }
+
+  const auto* metadata = reinterpret_cast<const std::uint8_t*>(metadata_addr);
+  const auto* payload  = reinterpret_cast<const std::uint8_t*>(st.arena->base()) + offset;
+  // Allocates no device memory: the view aliases the lease until the deep copy below.
+  auto unpacked = cudf::unpack(metadata, payload);
+  auto stream   = st.stream.view();
+  auto table = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+  // The lease is reusable the moment this returns, so the copy must be complete, not queued.
+  stream.synchronize();
+  // The packed payload is the table's device bytes to within pack padding; good enough for
+  // the store's accounting line.
+  auto const bytes = length;
+
+  // A wire batch has no local producing operator, so there is no telemetry lineage to thread.
+  auto data_batch = sirius::make_data_batch(
+    std::move(*table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+
+  std::lock_guard<std::mutex> lock(st.mutex);
+  if (st.gpu_space == nullptr) {
+    throw sirius::invalid_input_exception("InboundStore: the owning context is gone");
+  }
+  auto const ticket = st.next_ticket++;
+  st.staged.emplace(ticket, std::move(data_batch));
+  st.staged_bytes.emplace(ticket, bytes);
+  return ticket;
+}
+
+void InboundStore::drop(std::uint64_t ticket) const { (void)state_->take(ticket); }
+
+std::size_t InboundStore::outstanding() const
+{
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->staged.size();
+}
+
+std::uint64_t InboundStore::outstanding_bytes() const
+{
+  std::lock_guard<std::mutex> lock(state_->mutex);
+  return state_->total_bytes_locked();
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1029,54 @@ void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
     throw sirius::invalid_input_exception("Fragment: build() must run before close_input()");
   }
   impl_->session().close_input(stream_id, sender_id);
+}
+
+void Fragment::push_inbound(std::uint64_t stream_id, std::uint64_t ticket)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_inbound()");
+  }
+  if (impl_->ctx.inbound == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_inbound() needs a staging arena (SIRIUS_EXCHANGE_STAGING_BYTES unset)");
+  }
+  auto batch = impl_->ctx.inbound->take(ticket);
+
+  // Same guard as push_packed: the engine reads these columns through the declared schema, so
+  // a disagreement must fail here. Checked on the staged table; a bad batch is dropped with it.
+  if (auto it = impl_->resolved_inputs.find(stream_id); it != impl_->resolved_inputs.end()) {
+    const auto& declared = it->second;
+    auto read_only       = batch->to_read_only();
+    auto view            = sirius::get_cudf_table_view(read_only);
+    if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+      throw sirius::invalid_input_exception(
+        "Fragment: staged batch {} for stream {} carries {} columns but the stream declares {}",
+        ticket,
+        stream_id,
+        view.num_columns(),
+        declared.types.size());
+    }
+    for (std::size_t i = 0; i < declared.types.size(); ++i) {
+      const auto expected = sirius::get_cudf_type(declared.types[i]);
+      const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+      if (actual != expected) {
+        throw sirius::invalid_input_exception(
+          "Fragment: staged batch {} for stream {} column {} ({}) is declared {} ({}) but "
+          "carries {}",
+          ticket,
+          stream_id,
+          i,
+          declared.names[i],
+          declared.types[i].to_string(),
+          cudf::type_to_name(expected),
+          cudf::type_to_name(actual));
+      }
+    }
+  }
+  if (!impl_->session().push(stream_id, std::move(batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused a staged batch; it had already ended");
+  }
 }
 
 void Fragment::run()

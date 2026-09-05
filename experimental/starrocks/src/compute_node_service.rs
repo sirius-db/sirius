@@ -752,6 +752,7 @@ impl SiriusComputeNodeService {
                 // None from a sender that predates the wire field: the receiver then skips the
                 // stream's cardinality declaration instead of failing the frame.
                 rows: params.rows,
+                ticket: None,
             })
         };
         // A frame for a receiver the FE already cancelled here: the peer's drain is still
@@ -773,22 +774,60 @@ impl SiriusComputeNodeService {
             );
             return Ok(());
         }
+        // Copy-out-on-arrival: the payload moves into pool memory now and its lease goes back
+        // before the receiver fragment exists, so the arena only ever holds frames in flight.
+        // Without this every inbound frame of a shuffle sat in its lease until the receiver was
+        // dispatched (after every sender closed), and the six shuffle-heavy TPC-H queries
+        // exhausted a 16 GiB arena at 4 CNs.
+        let batch = match batch {
+            Some(mut staged) if staged.len > 0 && self.core.executor.inbound_store_available() => {
+                let ticket = self.core.executor.stage_inbound(&staged);
+                // The lease goes back whether the copy succeeded or not: a failed frame fails the
+                // query, and a lease left outstanding would pin the arena for every later one.
+                let released = self.core.executor.staging_release(staged.offset);
+                let ticket = ticket?;
+                if let Err(err) = released {
+                    if let Err(drop_err) = self.core.executor.drop_inbound(ticket) {
+                        tracing::warn!(ticket, error = %drop_err, "failed to drop the staged frame after a lease release error");
+                    }
+                    return Err(err);
+                }
+                staged.ticket = Some(ticket);
+                staged.offset = 0;
+                Some(staged)
+            }
+            other => other,
+        };
+        let ticket = batch.as_ref().and_then(|staged| staged.ticket);
         tracing::debug!(
             exchange = ?key,
             sender_id,
             seq,
             eos,
             batch_bytes = batch.as_ref().map(|batch| batch.len),
+            ticket,
             "received remote exchange frame"
         );
-        if let Some(ready) = self.core.exchanges.push_remote_frame(
+        let ready = match self.core.exchanges.push_remote_frame(
             key,
             sender_id,
             seq,
             eos,
             params.column_names.clone(),
             batch,
-        )? {
+        ) {
+            Ok(ready) => ready,
+            Err(err) => {
+                // The rendezvous refused the frame; its staged copy has no owner now.
+                if let Some(ticket) = ticket
+                    && let Err(drop_err) = self.core.executor.drop_inbound(ticket)
+                {
+                    tracing::warn!(ticket, error = %drop_err, "failed to drop the staged frame the rendezvous refused");
+                }
+                return Err(err);
+            }
+        };
+        if let Some(ready) = ready {
             self.dispatch(ready)?;
         }
         Ok(())
@@ -833,23 +872,28 @@ impl Drop for StagedLeases<'_> {
     }
 }
 
-/// Returns every lease among `batches` to the arena, warning on failure; returns the count
-/// released. `len == 0` batches never held a lease (metadata-only, `StagedBatch` contract).
+/// Releases every batch among `batches` that will not reach a receiver: a ticketed batch is
+/// dropped from the inbound store, a legacy one returns its lease to the arena. Warns on failure;
+/// returns the count released. `len == 0` batches never held anything (metadata-only,
+/// `StagedBatch` contract).
 fn release_leases<'a>(
     executor: &dyn FragmentExecutor,
     batches: impl IntoIterator<Item = &'a StagedBatch>,
 ) -> usize {
     let mut released = 0;
     for batch in batches {
-        if batch.len == 0 {
-            continue;
-        }
-        match executor.staging_release(batch.offset) {
+        let result = match batch.ticket {
+            Some(ticket) => executor.drop_inbound(ticket),
+            None if batch.len == 0 => continue,
+            None => executor.staging_release(batch.offset),
+        };
+        match result {
             Ok(()) => released += 1,
             Err(err) => tracing::warn!(
                 offset = batch.offset,
+                ticket = batch.ticket,
                 error = %err,
-                "failed to release a staged lease of a retired query"
+                "failed to release a staged batch of a retired query"
             ),
         }
     }
@@ -2290,6 +2334,18 @@ pub(crate) mod tests {
             self.inner.drop_parked(slot)
         }
 
+        fn inbound_store_available(&self) -> bool {
+            self.inner.inbound_store_available()
+        }
+
+        fn stage_inbound(&self, batch: &StagedBatch) -> Result<u64, String> {
+            self.inner.stage_inbound(batch)
+        }
+
+        fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
+            self.inner.drop_inbound(ticket)
+        }
+
         fn retire_query(
             &self,
             query_id: FragmentInstanceId,
@@ -3156,10 +3212,221 @@ pub(crate) mod tests {
                     offset: 4096,
                     len: 256,
                     rows: Some(3),
+                    ticket: None,
                 }],
             )],
             "the dispatched receiver consumed exactly the staged batch, row count included"
         );
+    }
+
+    /// Records the copy-out-on-arrival calls: what was staged, which leases went back, which
+    /// tickets were dropped, and what the dispatched receiver finally consumed.
+    #[derive(Debug, Default)]
+    struct PoolStagingExecutor {
+        remote_inputs: Mutex<Vec<(i32, i32, Vec<StagedBatch>)>>,
+        staged: Mutex<Vec<StagedBatch>>,
+        released: Mutex<Vec<u64>>,
+        dropped: Mutex<Vec<u64>>,
+    }
+
+    impl FragmentExecutor for PoolStagingExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            self.remote_inputs
+                .lock()
+                .unwrap()
+                .extend(run.remote_inputs.iter().cloned());
+            StubExecutor.run(run)
+        }
+
+        fn staging_release(&self, offset: u64) -> Result<(), String> {
+            self.released.lock().unwrap().push(offset);
+            Ok(())
+        }
+
+        fn inbound_store_available(&self) -> bool {
+            true
+        }
+
+        fn stage_inbound(&self, batch: &StagedBatch) -> Result<u64, String> {
+            let mut staged = self.staged.lock().unwrap();
+            staged.push(batch.clone());
+            Ok(staged.len() as u64)
+        }
+
+        fn drop_inbound(&self, ticket: u64) -> Result<(), String> {
+            self.dropped.lock().unwrap().push(ticket);
+            Ok(())
+        }
+    }
+
+    /// With an inbound store, a data frame is copied out of its lease the moment it arrives: the
+    /// lease is released on the RPC, before the eos frame and before the receiver is dispatched,
+    /// and the receiver consumes the batch by ticket with no metadata and no lease left on it.
+    #[test]
+    fn transmit_packed_frames_are_staged_into_the_pool_on_arrival() {
+        let executor = Arc::new(PoolStagingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(62, 1);
+        let receiver_id = TUniqueId::new(62, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id, receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let metadata = vec![0xCD; 16];
+        let data = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 0, false, 4096, 256, &["id", "name"]),
+            metadata.clone(),
+        );
+        let data = PTransmitPackedResult::decode(data.body.as_slice()).unwrap();
+        assert_eq!(
+            data.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            data.status.error_msgs
+        );
+        // Staged with its metadata and lease location, and the lease is already back.
+        assert_eq!(
+            executor.staged.lock().unwrap().as_slice(),
+            &[StagedBatch {
+                metadata: metadata.clone(),
+                offset: 4096,
+                len: 256,
+                rows: Some(3),
+                ticket: None,
+            }]
+        );
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[4096]);
+        assert!(executor.dropped.lock().unwrap().is_empty());
+
+        let eos = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 1, true, 0, 0, &["id", "name"]),
+            Vec::new(),
+        );
+        let eos = PTransmitPackedResult::decode(eos.body.as_slice()).unwrap();
+        assert_eq!(
+            eos.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            eos.status.error_msgs
+        );
+
+        let fetched = fetch_rows_eventually(&service, receiver_id.hi, receiver_id.lo);
+        assert!(!fetched.attachment.is_empty());
+        assert_eq!(
+            executor.remote_inputs.lock().unwrap().as_slice(),
+            &[(
+                7,
+                0,
+                vec![StagedBatch {
+                    metadata,
+                    offset: 0,
+                    len: 256,
+                    rows: Some(3),
+                    ticket: Some(1),
+                }],
+            )],
+            "the receiver takes the batch by ticket; nothing is left in the arena"
+        );
+        // The receiver ran, so nothing was dropped and the one lease was released exactly once.
+        assert!(executor.dropped.lock().unwrap().is_empty());
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[4096]);
+    }
+
+    /// A frame for a receiver the FE already cancelled here is neither staged nor recorded: its
+    /// lease is released and the peer's drain completes quietly, as before.
+    #[test]
+    fn transmit_packed_frame_for_a_retired_receiver_is_released_not_staged() {
+        let executor = Arc::new(PoolStagingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(63, 1);
+        let receiver_id = TUniqueId::new(63, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+        cancel_ok(
+            &service,
+            cancel_request(
+                &receiver_id,
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                Some("peer failed"),
+            ),
+        );
+
+        let data = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 0, false, 8192, 128, &["id", "name"]),
+            vec![0xEE; 16],
+        );
+        let data = PTransmitPackedResult::decode(data.body.as_slice()).unwrap();
+        assert_eq!(
+            data.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            data.status.error_msgs
+        );
+        assert!(executor.staged.lock().unwrap().is_empty());
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[8192]);
+    }
+
+    /// A staged frame whose query fails before the receiver runs is dropped by ticket when the
+    /// receiver's inputs are released, never returned to the arena as a lease it no longer holds.
+    #[test]
+    fn staged_frames_of_a_failed_query_are_dropped_by_ticket() {
+        let executor = Arc::new(PoolStagingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(64, 1);
+        let receiver_id = TUniqueId::new(64, 2);
+
+        let mut receiver = fragment_params(Some(exchange_plan(7, 0)), Some(desc_table()));
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query_id.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(7, 1);
+        receiver.params = Some(receiver_exec);
+        assert_exec_ok(&service, &receiver);
+
+        let data = route(
+            &service,
+            methods::TRANSMIT_PACKED,
+            transmit_params(&receiver_id, 7, 0, 0, false, 4096, 256, &["id", "name"]),
+            vec![0xCD; 16],
+        );
+        let data = PTransmitPackedResult::decode(data.body.as_slice()).unwrap();
+        assert_eq!(
+            data.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            data.status.error_msgs
+        );
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[4096]);
+
+        // The FE cancels the receiver while its sender set is still open: the staged frame has
+        // no receiver left to take it.
+        cancel_ok(
+            &service,
+            cancel_request(
+                &receiver_id,
+                Some(&query_id),
+                Some(PPlanFragmentCancelReason::InternalError),
+                Some("peer failed"),
+            ),
+        );
+        assert_eq!(executor.dropped.lock().unwrap().as_slice(), &[1]);
+        // No second release of the lease that already went back on arrival.
+        assert_eq!(executor.released.lock().unwrap().as_slice(), &[4096]);
     }
 
     /// A lost frame must fail the exchange loudly — silently dropping rows is this subsystem's
