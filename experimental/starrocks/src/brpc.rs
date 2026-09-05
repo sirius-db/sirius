@@ -14,6 +14,7 @@ use crate::{
 use anyhow::{Context, Result};
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Mutex,
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -151,45 +152,79 @@ where
 
     /// Reads PRPC frames from one connection and writes one response per request. Read, decode,
     /// and write failures are logged and close only this connection, never the whole server.
+    ///
+    /// Requests are served concurrently: the FE multiplexes every RPC to this CN over one
+    /// connection (correlation ids pair responses with requests), and a `fetch_data` long-poll
+    /// or a blocking `exec_plan_fragment` served in line held every request queued behind it.
+    /// The FE's `cancel_plan_fragment` for a query the CN had just reported failed then timed
+    /// out behind the result fragment's own pending fetch, the fetch never learned of the cancel,
+    /// and the client waited out the query timeout (MEASURED 2026-09-05, TPC-H q18 at 2 CNs:
+    /// eight `RpcTimerTask` timeouts on the one FE channel, 4 min 20 s until `getNext` saw
+    /// CANCELLED). Responses go out in completion order under one writer lock.
     #[instrument(skip_all, fields(peer = %peer))]
     async fn handle_connection(
-        mut service: S,
-        mut stream: TcpStream,
+        service: S,
+        stream: TcpStream,
         peer: SocketAddr,
         shutdown: CancellationToken,
     ) {
+        let (mut reader, writer) = stream.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let mut in_flight: JoinSet<()> = JoinSet::new();
         loop {
             let frame = tokio::select! {
                 _ = shutdown.cancelled() => return,
-                frame = prpc::Frame::read_async(&mut stream) => frame,
+                frame = prpc::Frame::read_async(&mut reader) => frame,
+                // Reap finished requests as they complete so the set does not grow with the
+                // connection's lifetime.
+                Some(_joined) = in_flight.join_next(), if !in_flight.is_empty() => continue,
             };
             let frame = match frame {
                 Ok(Some(frame)) => frame,
-                // A clean connection close ends this task.
-                Ok(None) => return,
+                // A clean connection close ends the read side; requests already in flight
+                // still finish and answer (the peer may only have half-closed).
+                Ok(None) => break,
                 // A malformed/unsupported frame or transport error closes only this connection.
                 Err(err) => {
                     warn!(error = %err, "failed to read PRPC frame; closing connection");
-                    return;
+                    break;
                 }
             };
 
             let correlation_id = frame.correlation_id();
-            let response = match frame.into_request() {
-                Ok(request) => {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        response = Self::call_service(&mut service, request) => response,
+            let request = frame.into_request();
+            let mut service = service.clone();
+            let writer = Arc::clone(&writer);
+            let shutdown = shutdown.clone();
+            in_flight.spawn(async move {
+                let response = match request {
+                    Ok(request) => {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            response = Self::call_service(&mut service, request) => response,
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                let response_frame = prpc::Frame::response_frame(correlation_id, response);
+                let mut writer = writer.lock().await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    result = response_frame.write_async(&mut *writer) => {
+                        if let Err(err) = result {
+                            warn!(error = %err, "failed to write PRPC response");
+                        }
                     }
                 }
-                Err(err) => Err(err),
-            };
-            let response_frame = prpc::Frame::response_frame(correlation_id, response);
+            });
+        }
+        // Let in-flight requests finish (their responses may still be deliverable) unless the
+        // server is shutting down.
+        loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                result = response_frame.write_async(&mut stream) => {
-                    if let Err(err) = result {
-                        warn!(error = %err, "failed to write PRPC response; closing connection");
+                joined = in_flight.join_next() => {
+                    if joined.is_none() {
                         return;
                     }
                 }
@@ -296,6 +331,89 @@ mod tests {
         shutdown.cancel();
         join.join().unwrap().unwrap();
         drop(stream);
+    }
+
+    /// The FE multiplexes its RPCs to one CN over one connection: a slow request (a `fetch_data`
+    /// long-poll, here a sleep) must not hold the answer to a later one (the `cancel_plan_fragment`
+    /// that would end it). The fast request's response arrives first, then the slow one's.
+    #[test]
+    fn slow_request_does_not_block_later_requests_on_the_same_connection() {
+        let listener = match BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                BrpcServiceServer::with_service(SlowFetchService)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        let slow = prpc::Frame::for_request(
+            "PInternalService",
+            "fetch_data",
+            b"body".to_vec(),
+            Vec::new(),
+            Some(1),
+        );
+        let fast = prpc::Frame::for_request(
+            "PInternalService",
+            "cancel_plan_fragment",
+            b"body".to_vec(),
+            Vec::new(),
+            Some(2),
+        );
+        stream.write_all(&slow.encode()).unwrap();
+        stream.write_all(&fast.encode()).unwrap();
+        let first = prpc::Frame::read(&mut stream).unwrap().expect("a response");
+        assert_eq!(
+            first.correlation_id(),
+            Some(2),
+            "the fast request is answered while the slow one is still being served"
+        );
+        let second = prpc::Frame::read(&mut stream).unwrap().expect("a response");
+        assert_eq!(second.correlation_id(), Some(1));
+
+        shutdown.cancel();
+        join.join().unwrap().unwrap();
+    }
+
+    /// Answers `fetch_data` after a delay and everything else at once.
+    #[derive(Clone)]
+    struct SlowFetchService;
+
+    impl Service<prpc::Request> for SlowFetchService {
+        type Response = prpc::Response;
+        type Error = prpc::Error;
+        type Future = std::pin::Pin<
+            Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: prpc::Request) -> Self::Future {
+            let slow = request.method_name == "fetch_data";
+            Box::pin(async move {
+                if slow {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                Ok(prpc::Response::with_attachment(Vec::new(), Vec::new()))
+            })
+        }
     }
 
     /// Minimal Tower service used only to exercise transport shutdown.
