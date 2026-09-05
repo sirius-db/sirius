@@ -39,10 +39,12 @@ fails. There is no engine default — launchers pick a size per box.
 | Knob | Role |
 |---|---|
 | `SIRIUS_CN_FRAGMENT_FUSION` | Which same-node senders are spliced into their receiver's plan instead of running and parking their rows. `leaf` (default): a leaf fragment (file scans only) whose `HASH_PARTITIONED` stream sink has exactly one destination, on this CN, into a plain exchange that expects one sender and does not feed an aggregation — the shuffle shape that parks a fact table whole at 1 CN. `leaf-any`: every single-destination local leaf whatever its partition type (broadcast dimension tables too; the engine then plans them from footer estimates instead of exact parked counts). `off`: every sender runs and parks, the pre-fusion path, without a rebuild. Validated at bring-up in the registry above (any other value fails CN startup) and logged as `fusion_mode=` in the `resolved CN transport tunables` line. |
+| `SIRIUS_CN_ASYNC_SENDER_DISPATCH` | `1`, `true` or `on` queues sender-only fragments (no exchange input, no RESULT_SINK) on the dispatch worker so their `exec_plan_fragment` RPC returns before the scan runs. The FE deploys the first fragment instance of every node in one wave and waits for those RPCs, so an inline sender holds every other node's second-wave instance back for its whole scan (q06 at 4 CNs, SF1000: 1.22 s inline, 0.85 s queued). Off by default: a queued sender's failure only reaches result instances reserved on this node. Read outside the registry. |
 
 A fused sender has no `fragment run started` line of its own. The CN logs
 `fused sender fragment into its local receiver` per absorbed sender,
 `fused deferred sender plans into receiver` (with `fused=`) per receiver that
 absorbed some, and `fragment fusion skipped` (with `reason=`) per sender that
 was offered and declined. Fusion is decided when the sender arrives, on the
-inline and batch paths alike.
+inline, batch and queued (`SIRIUS_CN_ASYNC_SENDER_DISPATCH`) paths alike; a
+fused leaf never reaches the dispatch queue.
