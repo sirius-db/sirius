@@ -948,6 +948,15 @@ fn translate_aggregation(
     let mut measures = Vec::with_capacity(agg.aggregate_functions.len());
     // Where each StarRocks measure's own state starts among the emitted measures.
     let mut measure_starts = Vec::with_capacity(agg.aggregate_functions.len());
+    // Two-phase DISTINCT counts. The engine has no partial state for a distinct count, so the
+    // partial node groups by the distinct argument as an extra key (after the FE's keys) and
+    // ships that column as the measure's state; the merge node then counts DISTINCT over it.
+    // Grouping the other measures' partial states per (keys, argument) instead of per keys is
+    // harmless: their merges (sum/min/max/sum-of-counts) are associative over the finer groups.
+    // `distinct_keys` are the appended grouping expressions, `distinct_state[i]` names which of
+    // them is FE measure i's state (None for a measure with an ordinary state).
+    let mut distinct_keys: Vec<Expression> = Vec::new();
+    let mut distinct_state: Vec<Option<usize>> = Vec::with_capacity(agg.aggregate_functions.len());
     for (index, expr) in agg.aggregate_functions.iter().enumerate() {
         measure_starts.push(measures.len());
         let call = {
@@ -960,21 +969,20 @@ fn translate_aggregation(
         };
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
-        if call.distinct && grouping_expressions.is_empty() {
+        if call.distinct && keys == 0 {
             return Err(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
                 node_type: node.node_type,
                 reason: "distinct aggregates without grouping keys are not supported",
             });
         }
-        if phase != AggPhase::OneShot && call.distinct {
-            return Err(TranslateError::UnsupportedPlanNode {
-                node_id: node.node_id,
-                node_type: node.node_type,
-                reason: "DISTINCT aggregates are not supported in two-phase plans \
-                         (SET new_planner_agg_stage = 1)",
-            });
+        if call.distinct && phase == AggPhase::Partial {
+            let argument = sole_argument(node, &call.raw_arguments)?.clone();
+            distinct_state.push(Some(distinct_keys.len()));
+            distinct_keys.push(argument);
+            continue;
         }
+        distinct_state.push(None);
         if let Some(state) = wire_columns.get(index).filter(|columns| columns.len() > 1) {
             let state_column = merge_slots.as_ref().map(|slots| slots.measures[index]);
             expand_avg(node, phase, &call, state, state_column, &mut measures, ctx)?;
@@ -988,6 +996,9 @@ fn translate_aggregation(
         let function_name = if phase == AggPhase::Merge {
             match call.name.as_str() {
                 "sum" | "min" | "max" => call.name.clone(),
+                // A distinct count's state is the distinct column itself (see partial_state), so
+                // the merge counts DISTINCT over it; a plain count's state is a partial count.
+                "count" if call.distinct => call.name.clone(),
                 "count" => "sum".to_string(),
                 _ => {
                     return Err(TranslateError::UnsupportedPlanNode {
@@ -1027,6 +1038,8 @@ fn translate_aggregation(
         ));
     }
 
+    let distinct_key_count = distinct_keys.len();
+    grouping_expressions.extend(distinct_keys);
     let groupings = if grouping_expressions.is_empty() {
         Vec::new()
     } else {
@@ -1038,7 +1051,7 @@ fn translate_aggregation(
         vec![grouping]
     };
 
-    let output_width = keys + measures.len();
+    let output_width = keys + distinct_key_count + measures.len();
     let aggregated = TranslatedRel {
         rel: Rel {
             rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
@@ -1054,6 +1067,21 @@ fn translate_aggregation(
         // The child's carried columns were consumed by the key/measure contexts above; the
         // aggregate materializes a fresh tuple, so nothing is carried past it.
         carried_slots: Vec::new(),
+    };
+
+    // A distinct key sits among the grouping columns, ahead of every measure; put the row back
+    // in the FE's order (keys, then one state per measure) before anything reads it by position.
+    let aggregated = if distinct_key_count > 0 {
+        distinct_partial_projection(
+            aggregated,
+            keys,
+            distinct_key_count,
+            &distinct_state,
+            &measure_starts,
+            &wire_columns,
+        )
+    } else {
+        aggregated
     };
 
     let aggregated = match phase {
@@ -1107,6 +1135,34 @@ fn translate_aggregation(
     };
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(aggregated, node, ctx)
+}
+
+/// Reorders a partial aggregation whose distinct counts were emitted as extra grouping keys
+/// into the FE's row: the `keys` grouping columns, then each FE measure's state in measure
+/// order (a distinct key where `distinct_state` names one, the measure's wire columns
+/// otherwise). Same width as the aggregate; only positions move.
+fn distinct_partial_projection(
+    input: TranslatedRel,
+    keys: usize,
+    distinct_key_count: usize,
+    distinct_state: &[Option<usize>],
+    measure_starts: &[usize],
+    wire_columns: &[Vec<WireColumn>],
+) -> TranslatedRel {
+    let mut expressions: Vec<Expression> = (0..keys as i32).map(field_selection).collect();
+    for (index, state) in distinct_state.iter().enumerate() {
+        match state {
+            Some(distinct) => expressions.push(field_selection((keys + distinct) as i32)),
+            None => {
+                let start = keys + distinct_key_count + measure_starts[index];
+                let width = wire_columns.get(index).map_or(1, Vec::len);
+                expressions
+                    .extend((start..start + width).map(|field| field_selection(field as i32)));
+            }
+        }
+    }
+    let row_tuples = input.row_tuples.clone();
+    project_rel(input, expressions, row_tuples, Vec::new())
 }
 
 /// Emits the two Sirius measures one StarRocks avg becomes in a two-phase plan.
