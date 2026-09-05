@@ -1919,7 +1919,10 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     // A byte-range split scan reads a subset of each file's row groups, so it can neither be
     // served by a whole-file pin (extra rows) nor produce a pin that serves anyone else.
     if (has_byte_ranges || p->has_byte_ranges()) { return {}; }
-    if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
+    // Exact match or strict file subset both pass here; the serve path
+    // (try_match_cached_entry) additionally requires chunk provenance before it
+    // serves a subset, because only provenance says which chunks hold which files.
+    if (matches_parquet_file_set(p->resolved_file_paths) == parquet_file_match::miss) { return {}; }
     return column_projection_for(p->column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
@@ -1945,8 +1948,14 @@ bool cache_entry_info::matches_duckdb_table(std::string_view catalog,
 
 bool cache_entry_info::matches_parquet_files(std::span<std::string const> files) const
 {
-  if (files.empty() || resolved_file_paths.empty()) { return false; }
-  if (files.size() != resolved_file_paths.size()) { return false; }
+  return matches_parquet_file_set(files) == parquet_file_match::exact;
+}
+
+cache_entry_info::parquet_file_match cache_entry_info::matches_parquet_file_set(
+  std::span<std::string const> files, std::vector<std::string>* canonical_scan_files) const
+{
+  if (files.empty() || resolved_file_paths.empty()) { return parquet_file_match::miss; }
+  if (files.size() > resolved_file_paths.size()) { return parquet_file_match::miss; }
   // `this` is a stored entry (already canonical via cache_entry_info::from);
   // `files` arrives from a fresh bind whose paths are still as-bound, so
   // canonicalize the comparison copy to match. Every parquet identity check —
@@ -1957,7 +1966,26 @@ bool cache_entry_info::matches_parquet_files(std::span<std::string const> files)
   op::scan::canonicalize_scan_file_paths(those_files);
   std::ranges::sort(these_files);
   std::ranges::sort(those_files);
-  return these_files == those_files;
+  auto const record_scan_files = [&]() {
+    if (canonical_scan_files != nullptr) { *canonical_scan_files = std::move(those_files); }
+  };
+  if (these_files.size() == those_files.size()) {
+    if (these_files != those_files) { return parquet_file_match::miss; }
+    record_scan_files();
+    return parquet_file_match::exact;
+  }
+  // Strict subset. Duplicates poison it on either side: a duplicated pinned path
+  // means that file's rows were materialized into chunks twice (serving them to a
+  // scan that lists the file once doubles its rows), and a duplicated scan path
+  // expects the file's rows twice while the chunk filter serves them once. Exact
+  // matching above stays duplicate-symmetric, preserving today's behavior.
+  auto const has_dup = [](std::vector<std::string> const& sorted) {
+    return std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end();
+  };
+  if (has_dup(these_files) || has_dup(those_files)) { return parquet_file_match::miss; }
+  if (!std::ranges::includes(these_files, those_files)) { return parquet_file_match::miss; }
+  record_scan_files();
+  return parquet_file_match::subset;
 }
 
 std::vector<std::size_t> cache_entry_info::column_projection_for(
@@ -1981,7 +2009,8 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   std::vector<cucascade::memory::memory_space*> chunk_memory_spaces,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::vector<std::string>> chunk_file_paths)
 {
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
@@ -1992,6 +2021,14 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
     throw std::invalid_argument(
       "[sirius_scan_manager::insert_pinned_entry] chunk_memory_spaces.size() (" +
       std::to_string(chunk_memory_spaces.size()) + ") must equal data_tables.size() (" +
+      std::to_string(data_tables.size()) + ")");
+  }
+  // Provenance is empty (unknown — exact-match-only serving) or parallel to the
+  // chunks, like column_storage's allow_empty contract.
+  if (!chunk_file_paths.empty() && chunk_file_paths.size() != data_tables.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry] chunk_file_paths.size() (" +
+      std::to_string(chunk_file_paths.size()) + ") must be empty or equal data_tables.size() (" +
       std::to_string(data_tables.size()) + ")");
   }
 
@@ -2112,6 +2149,20 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
                                     entry.cache_info.column_ids.size(),
                                     "[sirius_scan_manager::insert_pinned_entry existing entry]",
                                     /*allow_empty=*/false);
+      // Chunk provenance rides the same boundaries the guards above just proved
+      // identical: adopt it when the entry has none (re-pin recovery, mirroring
+      // the statless zone-map adoption below), and reject a disagreement loudly —
+      // same-boundary chunks naming different files means one side's recorder is
+      // wrong, and serving on it would return the wrong files' rows.
+      if (!chunk_file_paths.empty()) {
+        if (entry.chunk_file_paths.empty()) {
+          entry.chunk_file_paths = std::move(chunk_file_paths);
+        } else if (entry.chunk_file_paths != chunk_file_paths) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] merge mismatch — per-chunk file "
+            "provenance differs between the existing entry and the new materialization");
+        }
+      }
       // Same row count → merge unique columns into the existing entry.
       // Decide which column INDICES are new BEFORE iterating chunks. Doing
       // the contains() check per-chunk would let chunk 0 install a new
@@ -2211,6 +2262,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   pinned_entry entry;
   entry.cache_info          = std::move(cache_info);
   entry.chunk_memory_spaces = std::move(chunk_memory_spaces);
+  entry.chunk_file_paths    = std::move(chunk_file_paths);
   entry.tier                = cucascade::memory::Tier::GPU;
   entry.column_storage      = std::move(column_storage);
   entry.num_rows            = new_num_rows;
@@ -2266,12 +2318,18 @@ void sirius_scan_manager::insert_pinned_entry_host(
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::vector<std::string>> chunk_file_paths)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
   // are flipped.
+  if (!chunk_file_paths.empty() && chunk_file_paths.size() != host_chunks.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry_host] chunk_file_paths must be empty or "
+      "parallel to host_chunks");
+  }
   std::size_t new_num_rows = 0;
   for (auto const& chunk : host_chunks) {
     if (!chunk) { continue; }
@@ -2326,13 +2384,14 @@ void sirius_scan_manager::insert_pinned_entry_host(
   }
 
   pinned_entry entry;
-  entry.cache_info     = std::move(cache_info);
-  entry.tier           = cucascade::memory::Tier::HOST;
-  entry.memory_space   = &memory_space;
-  entry.num_rows       = new_num_rows;
-  entry.host_chunks    = std::move(host_chunks);
-  entry.column_storage = std::move(column_storage);
-  entry.zone_maps      = std::move(pin_zone_maps);
+  entry.cache_info       = std::move(cache_info);
+  entry.tier             = cucascade::memory::Tier::HOST;
+  entry.memory_space     = &memory_space;
+  entry.num_rows         = new_num_rows;
+  entry.host_chunks      = std::move(host_chunks);
+  entry.chunk_file_paths = std::move(chunk_file_paths);
+  entry.column_storage   = std::move(column_storage);
+  entry.zone_maps        = std::move(pin_zone_maps);
 
   // Assigning over an existing name destroys that entry in place, so its
   // handle has to be invalidated FIRST — afterwards the entry is gone but the
@@ -2348,8 +2407,14 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cache_entry_info cache_info,
   std::vector<sirius::device_pin_chunk> chunks,
   cucascade::memory::memory_space& memory_space,
-  sirius::pinned_column_storage_matrix column_storage)
+  sirius::pinned_column_storage_matrix column_storage,
+  std::vector<std::vector<std::string>> chunk_file_paths)
 {
+  if (!chunk_file_paths.empty() && chunk_file_paths.size() != chunks.size()) {
+    throw std::invalid_argument(
+      "[sirius_scan_manager::insert_pinned_entry_device] chunk_file_paths must be empty or "
+      "parallel to chunks");
+  }
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
     if (chunk.compressed) {
@@ -2379,12 +2444,13 @@ void sirius_scan_manager::insert_pinned_entry_device(
     });
 
   pinned_entry entry;
-  entry.cache_info     = std::move(cache_info);
-  entry.tier           = cucascade::memory::Tier::GPU;
-  entry.memory_space   = &memory_space;
-  entry.num_rows       = new_num_rows;
-  entry.device_chunks  = std::move(chunks);
-  entry.column_storage = std::move(column_storage);
+  entry.cache_info       = std::move(cache_info);
+  entry.tier             = cucascade::memory::Tier::GPU;
+  entry.memory_space     = &memory_space;
+  entry.num_rows         = new_num_rows;
+  entry.device_chunks    = std::move(chunks);
+  entry.chunk_file_paths = std::move(chunk_file_paths);
+  entry.column_storage   = std::move(column_storage);
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::insert_pinned_entry_device] '{}' chunks={} rows={}",
                    name,
@@ -2527,7 +2593,16 @@ pinned_entry const* sirius_scan_manager::find_pinned_entry_for_parquet_files(
   std::span<std::string const> resolved_file_paths) const
 {
   for (auto const& [name, entry] : _pinned_entries) {
-    if (entry.cache_info.matches_parquet_files(resolved_file_paths)) { return &entry; }
+    switch (entry.cache_info.matches_parquet_file_set(resolved_file_paths)) {
+      case cache_entry_info::parquet_file_match::exact: return &entry;
+      case cache_entry_info::parquet_file_match::subset:
+        // Mirror the serve path's condition: a subset scan is only served from
+        // an entry with chunk provenance (one matcher — the plan-time residency
+        // gate must see the same hits serving will).
+        if (!entry.chunk_file_paths.empty()) { return &entry; }
+        break;
+      case cache_entry_info::parquet_file_match::miss: break;
+    }
   }
   return nullptr;
 }
@@ -2702,7 +2777,8 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
 
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
                                         duckdb::TableFilterSet const* table_filters,
-                                        duckdb::vector<duckdb::ColumnIndex> const* column_ids)
+                                        duckdb::vector<duckdb::ColumnIndex> const* column_ids,
+                                        std::vector<std::size_t> const* allowed_chunks)
 {
   std::size_t n_chunks = 0;
   if (entry.tier == cucascade::memory::Tier::GPU) {
@@ -2720,13 +2796,27 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     n_chunks = entry.host_chunks.size();
   }
 
-  // Identity plan (serve everything) until proven otherwise.
-  cached_scan_plan plan;
-  plan.survivor_chunk_indices.reserve(n_chunks);
-  for (std::size_t c = 0; c < n_chunks; ++c) {
-    plan.survivor_chunk_indices.push_back(c);
+  // The chunks this plan may serve: everything, or the caller's file-subset
+  // selection. The restriction applies BEFORE zone-map pruning so the all-pruned
+  // sentinel below can only pick an allowed chunk — a disallowed sentinel would
+  // return another file's rows.
+  std::vector<std::size_t> candidates;
+  if (allowed_chunks != nullptr) {
+    candidates.reserve(allowed_chunks->size());
+    for (auto const c : *allowed_chunks) {
+      if (c < n_chunks) { candidates.push_back(c); }
+    }
+  } else {
+    candidates.reserve(n_chunks);
+    for (std::size_t c = 0; c < n_chunks; ++c) {
+      candidates.push_back(c);
+    }
   }
-  if (n_chunks == 0 || !entry.zone_maps.has_stats() || table_filters == nullptr ||
+
+  // Identity plan (serve every candidate) until proven otherwise.
+  cached_scan_plan plan;
+  plan.survivor_chunk_indices = candidates;
+  if (candidates.empty() || !entry.zone_maps.has_stats() || table_filters == nullptr ||
       table_filters->filters.empty() || column_ids == nullptr) {
     return plan;
   }
@@ -2764,7 +2854,7 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   if (usable.empty()) { return plan; }
 
   plan.survivor_chunk_indices.clear();
-  for (std::size_t c = 0; c < n_chunks; ++c) {
+  for (auto const c : candidates) {
     bool pruned = false;
     for (auto const& uf : usable) {
       auto const* cell = entry.zone_maps.cell(uf.entry_pos, c);
@@ -2775,14 +2865,16 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     }
     if (!pruned) { plan.survivor_chunk_indices.push_back(c); }
   }
-  plan.pruned = n_chunks - plan.survivor_chunk_indices.size();
+  plan.pruned = candidates.size() - plan.survivor_chunk_indices.size();
 
   // Sentinel chunk: an all-pruned scan must not become a zero-batch scan (zero
   // splits => zero tasks => pipeline completion never fires — the hazard both
-  // disk paths guard against). Keep chunk 0; the GPU filter empties it.
+  // disk paths guard against). Keep the first ALLOWED chunk; the GPU filter
+  // empties it. (A chunk outside the candidate set would return another file's
+  // rows on the file-subset serve path.)
   if (plan.survivor_chunk_indices.empty()) {
-    plan.survivor_chunk_indices.push_back(0);
-    plan.pruned = n_chunks - 1;
+    plan.survivor_chunk_indices.push_back(candidates.front());
+    plan.pruned = candidates.size() - 1;
   }
   return plan;
 }
@@ -2831,6 +2923,64 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
     // Identity + serviceability gate: empty when this cache cannot serve the scan
     // (wrong format / file-set / table, or missing a requested column).
     if (entry.cache_info.can_serve_with_columns(table_info).empty()) { continue; }
+    // File-subset serving (parquet only): when the scan's file set is a strict
+    // subset of the pinned set, serve only the chunks whose recorded provenance
+    // the scan covers. Entries without provenance (pre-provenance or duckdb
+    // pins) keep exact-set-only semantics.
+    std::vector<std::size_t> subset_chunks;
+    std::vector<std::size_t> const* allowed_chunks = nullptr;
+    if (auto const* parquet_info =
+          dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&table_info)) {
+      std::vector<std::string> scan_files;
+      auto const match =
+        entry.cache_info.matches_parquet_file_set(parquet_info->resolved_file_paths, &scan_files);
+      if (match == cache_entry_info::parquet_file_match::subset) {
+        if (entry.chunk_file_paths.empty()) {
+          SIRIUS_LOG_DEBUG(
+            "[sirius_scan_manager] pinned entry '{}' covers a superset of operator '{}''s files "
+            "but records no chunk provenance; treating as a cache miss",
+            pinned_name,
+            op->get_operator_id());
+          continue;
+        }
+        // scan_files is canonical + sorted; a chunk serves iff every one of its
+        // files is in the scan set. A chunk with unknown provenance (empty inner
+        // vector) can never be proven covered, so it is excluded.
+        for (std::size_t c = 0; c < entry.chunk_file_paths.size(); ++c) {
+          auto const& chunk_files = entry.chunk_file_paths[c];
+          if (chunk_files.empty()) { continue; }
+          bool covered = true;
+          for (auto const& file : chunk_files) {
+            if (!std::ranges::binary_search(scan_files, file)) {
+              covered = false;
+              break;
+            }
+          }
+          if (covered) { subset_chunks.push_back(c); }
+        }
+        if (subset_chunks.empty()) {
+          // Every scan file landed in no chunk (e.g. zero-row files produce no
+          // chunk at pin time). Legal to fall through — parquet pins are never
+          // mvcc-strict — and the disk read stays correct.
+          SIRIUS_LOG_INFO(
+            "[sirius_scan_manager] pinned entry '{}' covers operator '{}''s file subset but no "
+            "pinned chunk is covered by it; falling back to the disk read",
+            pinned_name,
+            op->get_operator_id());
+          continue;
+        }
+        allowed_chunks = &subset_chunks;
+        SIRIUS_LOG_INFO(
+          "[sirius_scan_manager] pinned entry '{}' serves operator '{}' as a file subset: {}/{} "
+          "files, {}/{} chunks",
+          pinned_name,
+          op->get_operator_id(),
+          scan_files.size(),
+          entry.cache_info.resolved_file_paths.size(),
+          subset_chunks.size(),
+          entry.chunk_file_paths.size());
+      }
+    }
     // Check native types before strict MVCC handling so a type-mismatched pin is a clean cache
     // miss rather than an MVCC error or a hit under the wrong type.
     if (auto const* native_info =
@@ -2863,7 +3013,8 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
       // Zone-map survivor plan
       auto const filter_view =
         _pruning_enabled ? extract_scan_filters(table_info) : scan_filter_view{};
-      auto plan = build_cached_scan_plan(entry, filter_view.table_filters, filter_view.column_ids);
+      auto plan = build_cached_scan_plan(
+        entry, filter_view.table_filters, filter_view.column_ids, allowed_chunks);
       auto const total_chunks = plan.survivor_chunk_indices.size() + plan.pruned;
       if (plan.pruned > 0) {
         SIRIUS_LOG_INFO(

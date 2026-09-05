@@ -60,8 +60,10 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <memory/topology_index.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/load_balancing_scan_batch_coalescer.hpp>
@@ -81,9 +83,12 @@
 #include <vector>
 
 using sirius::scan_manager::build_cached_scan_plan;
+using sirius::scan_manager::cache_entry_info;
 using sirius::scan_manager::databatch_provider;
 using sirius::scan_manager::load_balancing_scan_batch_coalescer;
 using sirius::scan_manager::pinned_entry;
+using sirius::scan_manager::scan_manager_config;
+using sirius::scan_manager::sirius_scan_manager;
 using sirius::scan_manager::split_connector;
 using sirius::scan_manager::validate_pinned_entry_for_serving;
 
@@ -1213,6 +1218,171 @@ TEST_CASE("build_cached_scan_plan counts device_chunks for a compression-enabled
   auto entry = make_device_chunks_entry(*e.gpu_space, 5, 4);
   auto plan  = build_cached_scan_plan(entry, /*table_filters=*/nullptr, /*column_ids=*/nullptr);
   REQUIRE(plan.survivor_chunk_indices.size() == 5);
+}
+
+// File-subset serving restricts the plan to the chunks whose provenance the scan
+// covers; the restriction applies before zone-map pruning so the all-pruned
+// sentinel can only pick an allowed chunk.
+TEST_CASE("build_cached_scan_plan honors an allowed-chunks restriction",
+          "[cached_serving][scan_manager]")
+{
+  auto& e    = env();
+  auto entry = make_device_chunks_entry(*e.gpu_space, 5, 4);
+
+  SECTION("identity plan over the allowed set only")
+  {
+    std::vector<std::size_t> const allowed{1, 3};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices == allowed);
+    REQUIRE(plan.pruned == 0);
+  }
+
+  SECTION("out-of-range allowed indices are dropped, not served")
+  {
+    std::vector<std::size_t> const allowed{2, 99};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices == std::vector<std::size_t>{2});
+  }
+
+  SECTION("empty allowed set yields an empty plan (caller must treat as a miss)")
+  {
+    std::vector<std::size_t> const allowed{};
+    auto plan = build_cached_scan_plan(entry, nullptr, nullptr, &allowed);
+    REQUIRE(plan.survivor_chunk_indices.empty());
+    REQUIRE(plan.pruned == 0);
+  }
+}
+
+namespace {
+
+std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
+{
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.numa_node = 0;
+  topology.gpus.push_back(std::move(gpu));
+  return std::make_shared<sirius::memory::topology_index>(std::move(topology), std::vector<int>{0});
+}
+
+/// Parquet identity over {a, b} with one cached INT32 column 'k'. Paths are
+/// relative and nonexistent so canonicalization leaves them as spelled.
+cache_entry_info two_file_cache_info()
+{
+  cache_entry_info info;
+  info.resolved_file_paths = {"a.parquet", "b.parquet"};
+  info.column_ids.emplace_back(0);
+  info.names = {"k"};
+  return info;
+}
+
+/// @p n_chunks single-column INT32 tables of 4 rows each, owned outright so
+/// insert_pinned_entry can release them.
+std::vector<std::unique_ptr<cudf::table>> int32_chunks(test_env& e, std::size_t n_chunks)
+{
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    auto shared = make_gpu_column(*e.gpu_space, {1, 2, 3, 4});
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::make_unique<cudf::column>(
+      shared->view(), e.stream(), e.gpu_space->get_default_allocator()));
+    tables.push_back(std::make_unique<cudf::table>(std::move(cols)));
+  }
+  e.stream().synchronize();
+  return tables;
+}
+
+sirius::pinned_column_storage_matrix int32_storage(std::size_t n_chunks)
+{
+  return sirius::pinned_column_storage_matrix(n_chunks,
+                                              {native_meta(cudf::data_type{cudf::type_id::INT32})});
+}
+
+/// Two-chunk GPU pin of 'k' under @p name; a repeat with the same name takes the
+/// same-row-count merge path (identical boundaries and placement).
+void insert_two_chunk_pin(sirius_scan_manager& manager,
+                          test_env& e,
+                          std::string const& name,
+                          std::vector<std::vector<std::string>> provenance)
+{
+  auto const stored = manager.insert_pinned_entry(name,
+                                                  two_file_cache_info(),
+                                                  int32_chunks(e, 2),
+                                                  {e.gpu_space, e.gpu_space},
+                                                  {},
+                                                  {},
+                                                  int32_storage(2),
+                                                  std::move(provenance));
+  (void)stored;
+}
+
+}  // namespace
+
+// Provenance rides the chunk vector: every insert path rejects a length that is
+// neither empty nor parallel, and the GPU merge path adopts provenance an
+// existing entry lacks but refuses one that disagrees.
+TEST_CASE("insert_pinned_entry validates and merges per-chunk file provenance",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  sirius_scan_manager manager{scan_manager_config{}, *e.mgr, single_gpu_index()};
+
+  std::vector<std::vector<std::string>> const one_chunk{std::vector<std::string>{"a.parquet"}};
+  std::vector<std::vector<std::string>> const two_chunks{std::vector<std::string>{"a.parquet"},
+                                                         std::vector<std::string>{"b.parquet"}};
+  std::vector<std::string> const probe_a{"a.parquet"};
+  std::vector<std::string> const probe_ab{"a.parquet", "b.parquet"};
+
+  SECTION("provenance must be empty or parallel to the chunks")
+  {
+    REQUIRE_THROWS_AS(insert_two_chunk_pin(manager, e, "arity", one_chunk), std::invalid_argument);
+
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.columns.push_back(make_gpu_column(*e.gpu_space, {1, 2, 3, 4}));
+    std::vector<sirius::device_pin_chunk> chunks;
+    chunks.push_back(std::move(chunk));
+    REQUIRE_THROWS_AS(manager.insert_pinned_entry_device("arity_device",
+                                                         two_file_cache_info(),
+                                                         std::move(chunks),
+                                                         *e.gpu_space,
+                                                         int32_storage(1),
+                                                         two_chunks),
+                      std::invalid_argument);
+
+    REQUIRE_THROWS_AS(
+      manager.insert_pinned_entry_host(
+        "arity_host", two_file_cache_info(), {}, *e.host_space, {}, {}, {}, one_chunk),
+      std::invalid_argument);
+
+    REQUIRE(manager.find_pinned_entry_for_parquet_files(probe_ab) == nullptr);
+  }
+
+  SECTION("a merge adopts provenance the existing entry lacks")
+  {
+    insert_two_chunk_pin(manager, e, "adopt", {});
+    // Without provenance the entry is an exact-set hit only: the plan-time
+    // residency gate must not report a subset scan as resident.
+    REQUIRE(manager.find_pinned_entry_for_parquet_files(probe_ab) != nullptr);
+    REQUIRE(manager.find_pinned_entry_for_parquet_files(probe_a) == nullptr);
+
+    insert_two_chunk_pin(manager, e, "adopt", two_chunks);
+    auto const* entry = manager.find_pinned_entry_for_parquet_files(probe_a);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->chunk_file_paths == two_chunks);
+  }
+
+  SECTION("a merge whose provenance disagrees throws and leaves the entry intact")
+  {
+    insert_two_chunk_pin(manager, e, "mismatch", two_chunks);
+    std::vector<std::vector<std::string>> const swapped{std::vector<std::string>{"b.parquet"},
+                                                        std::vector<std::string>{"a.parquet"}};
+    REQUIRE_THROWS_AS(insert_two_chunk_pin(manager, e, "mismatch", swapped), std::runtime_error);
+    auto const* entry = manager.find_pinned_entry_for_parquet_files(probe_a);
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->chunk_file_paths == two_chunks);
+  }
 }
 
 TEST_CASE("validate_pinned_entry_for_serving refuses malformed entries",
