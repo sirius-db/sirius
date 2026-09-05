@@ -74,3 +74,7 @@ test/tpch_performance/log/
 
 PR_digests/
 plans/
+
+# Local multi-CN benchmark logs, telemetry, result rows and binary provenance.
+/results/multi-cn-throughput-*/
+/scripts/local-gb10/__pycache__/
