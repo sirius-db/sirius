@@ -25,7 +25,9 @@ use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
 use crate::tunable::{FusionMode, Tunables};
 use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan, fusion};
 use starrocks_thrift::{
-    data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
+    data_sinks::{
+        TDataSink, TDataSinkType, TDataStreamSink, TPlanFragmentDestination, TResultSinkType,
+    },
     descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
@@ -1343,90 +1345,113 @@ impl ServiceCore {
             );
             return Ok(FragmentOutcome::default());
         };
-        // Accepting an unhandled sink discards the fragment's whole output: its consumers wait
-        // forever, the FE's fetch_data long-poll times out, and its serial channel wedges
-        // cluster-wide. Refuse by name so the FE error says which plan shape is unsupported.
-        if sink.type_ != TDataSinkType::DATA_STREAM_SINK {
-            return Err(format!(
-                "{} carries a {} output sink, which this CN does not support",
-                Self::fragment_context(params),
-                Self::data_sink_type_name(sink.type_)
-            ));
-        }
-        let stream_sink = sink.stream_sink.as_ref().ok_or_else(|| {
-            format!(
-                "{} carries a DATA_STREAM_SINK with no stream_sink payload",
-                Self::fragment_context(params)
-            )
-        })?;
-        if stream_sink.limit.is_some_and(|limit| limit >= 0) {
-            return Err("data stream sink limits are not supported".to_string());
-        }
-        if let Some(columns) = stream_sink
-            .output_columns
-            .as_ref()
-            .filter(|columns| !columns.is_empty())
-            && columns
-                .iter()
-                .copied()
-                .ne(0..translated.output_names.len() as i32)
-        {
-            return Err(
-                "non-identity data stream sink output_columns are not supported".to_string(),
-            );
-        }
         let exec = params
             .params
             .as_ref()
             .ok_or_else(|| "DATA_STREAM_SINK fragment is missing execution params".to_string())?;
-        let destinations = exec
-            .destinations
-            .as_ref()
-            .filter(|destinations| !destinations.is_empty())
-            .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
         let sender_id = exec.sender_id.unwrap_or(0);
-        // Fan-out shape: one destination is a gather regardless of the partition label;
-        // UNPARTITIONED with N destinations broadcasts the full output to every receiver
-        // (each destination drains its own copy from its own output stream). Hash-partitioned
-        // fan-out is the second half of #838 and still refuses.
-        if destinations.len() > 1 {
-            match stream_sink.output_partition.type_ {
-                TPartitionType::UNPARTITIONED => {}
-                TPartitionType::HASH_PARTITIONED => {
-                    if translated.output_partition_columns.is_none() {
-                        return Err(
-                            "a hash-partitioned data stream sink translated without partition \
-                             key columns"
-                                .to_string(),
-                        );
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "a data stream sink with {} destinations carries partition type {:?}, \
-                         which this CN does not support",
-                        destinations.len(),
-                        other
-                    ));
-                }
+        // The stream sinks this fragment feeds, each with the destinations that drain it: one
+        // sink for a DATA_STREAM_SINK, one per CTE consumer for a MULTI_CAST_DATA_STREAM_SINK.
+        // Accepting an unhandled sink discards the fragment's whole output: its consumers wait
+        // forever, the FE's fetch_data long-poll times out, and its serial channel wedges
+        // cluster-wide. Refuse by name so the FE error says which plan shape is unsupported.
+        let sinks: Vec<(&TDataStreamSink, Vec<&TPlanFragmentDestination>)> = match sink.type_ {
+            TDataSinkType::DATA_STREAM_SINK => {
+                let stream_sink = sink.stream_sink.as_ref().ok_or_else(|| {
+                    format!(
+                        "{} carries a DATA_STREAM_SINK with no stream_sink payload",
+                        Self::fragment_context(params)
+                    )
+                })?;
+                let destinations = exec
+                    .destinations
+                    .as_ref()
+                    .filter(|destinations| !destinations.is_empty())
+                    .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
+                vec![(stream_sink, destinations.iter().collect())]
+            }
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => self.multicast_sinks(params, sink)?,
+            other => {
+                return Err(format!(
+                    "{} carries a {} output sink, which this CN does not support",
+                    Self::fragment_context(params),
+                    Self::data_sink_type_name(other)
+                ));
+            }
+        };
+        let multicast = sink.type_ == TDataSinkType::MULTI_CAST_DATA_STREAM_SINK;
+        for (stream_sink, _) in &sinks {
+            if stream_sink.limit.is_some_and(|limit| limit >= 0) {
+                return Err("data stream sink limits are not supported".to_string());
+            }
+            if let Some(columns) = stream_sink
+                .output_columns
+                .as_ref()
+                .filter(|columns| !columns.is_empty())
+                && columns
+                    .iter()
+                    .copied()
+                    .ne(0..translated.output_names.len() as i32)
+            {
+                return Err(
+                    "non-identity data stream sink output_columns are not supported".to_string(),
+                );
             }
         }
-        let hash_keys = if destinations.len() > 1 {
-            translated
-                .output_partition_columns
-                .clone()
-                .unwrap_or_default()
+        // Fan-out shape. A multicast feeds every consumer the full output (one gather per
+        // sink, each a full copy from its own output stream), so it is a broadcast over the
+        // sinks whatever partition label each sink carries. For a single stream sink: one
+        // destination is a gather regardless of the partition label; UNPARTITIONED with N
+        // destinations broadcasts the full output to every receiver (each destination drains
+        // its own copy from its own output stream); HASH_PARTITIONED with N destinations routes
+        // rows by the translated key columns.
+        let (hash_keys, broadcast) = if multicast {
+            (Vec::new(), sinks.len() > 1)
         } else {
-            Vec::new()
+            let (stream_sink, destinations) = &sinks[0];
+            if destinations.len() > 1 {
+                match stream_sink.output_partition.type_ {
+                    TPartitionType::UNPARTITIONED => {}
+                    TPartitionType::HASH_PARTITIONED => {
+                        if translated.output_partition_columns.is_none() {
+                            return Err("a hash-partitioned data stream sink translated without \
+                                 partition key columns"
+                                .to_string());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "a data stream sink with {} destinations carries partition type \
+                             {:?}, which this CN does not support",
+                            destinations.len(),
+                            other
+                        ));
+                    }
+                }
+            }
+            let hash_keys = if destinations.len() > 1 {
+                translated
+                    .output_partition_columns
+                    .clone()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let broadcast = destinations.len() > 1 && hash_keys.is_empty();
+            (hash_keys, broadcast)
         };
-        let broadcast = destinations.len() > 1 && hash_keys.is_empty();
+        let destination_count: usize = sinks.iter().map(|(_, dests)| dests.len()).sum();
 
         // Route every destination BEFORE running: a remote destination without a transport (or
         // a duplicate) must fail before any GPU work happens. Destination i then drains the
-        // sender's output stream i -- the FE's destination order, positionally.
-        let mut slots: Vec<SenderSlot> = Vec::with_capacity(destinations.len());
-        let mut routes = Vec::with_capacity(destinations.len());
-        for destination in destinations {
+        // sender's output stream i -- the FE's destination order, positionally (sink by sink
+        // for a multicast).
+        let mut slots: Vec<SenderSlot> = Vec::with_capacity(destination_count);
+        let mut routes = Vec::with_capacity(destination_count);
+        for (stream_sink, destination) in sinks
+            .iter()
+            .flat_map(|(stream_sink, dests)| dests.iter().map(move |dest| (*stream_sink, *dest)))
+        {
             let slot = SenderSlot {
                 fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
                 node_id: stream_sink.dest_node_id,
@@ -1507,6 +1532,64 @@ impl ServiceCore {
             }
         }
         Ok(FragmentOutcome::from_ready(ready_receivers))
+    }
+
+    /// The per-consumer stream sinks of a MULTI_CAST_DATA_STREAM_SINK (a CTE the FE computes
+    /// once, `cbo_cte_reuse`), each with the one destination this CN feeds.
+    ///
+    /// The FE lists every instance of consumer `i` under `destinations[i]` and sets that
+    /// consumer's exchange to expect exactly one sender (ExecutionDAG
+    /// .connectMultiCastFragmentToDestFragments: "MultiCastSink only send to itself"): the
+    /// producer instance on each node feeds the consumer instance on the same node, the way the
+    /// BE's multicast is a node-local exchange. So this CN keeps, per sink, the destination that
+    /// routes to itself and refuses any other count, which would silently starve or double-feed
+    /// a consumer.
+    fn multicast_sinks<'p>(
+        &self,
+        params: &TExecPlanFragmentParams,
+        sink: &'p TDataSink,
+    ) -> std::result::Result<Vec<(&'p TDataStreamSink, Vec<&'p TPlanFragmentDestination>)>, String>
+    {
+        let multi = sink.multi_cast_stream_sink.as_ref().ok_or_else(|| {
+            format!(
+                "{} carries a MULTI_CAST_DATA_STREAM_SINK with no multi_cast_stream_sink payload",
+                Self::fragment_context(params)
+            )
+        })?;
+        if multi.sinks.is_empty() || multi.sinks.len() != multi.destinations.len() {
+            return Err(format!(
+                "{} carries a multicast sink with {} stream sinks and {} destination lists",
+                Self::fragment_context(params),
+                multi.sinks.len(),
+                multi.destinations.len()
+            ));
+        }
+        let mut sinks = Vec::with_capacity(multi.sinks.len());
+        for (index, (stream_sink, destinations)) in
+            multi.sinks.iter().zip(&multi.destinations).enumerate()
+        {
+            let mut local = Vec::new();
+            for destination in destinations {
+                if matches!(
+                    self.route_destination(destination)?,
+                    DestinationRoute::Local
+                ) {
+                    local.push(destination);
+                }
+            }
+            if local.len() != 1 {
+                return Err(format!(
+                    "{} multicast sink {index} (exchange {}) has {} destinations on this CN out \
+                     of {}; a CTE consumer exchange expects exactly one local sender",
+                    Self::fragment_context(params),
+                    stream_sink.dest_node_id,
+                    local.len(),
+                    destinations.len()
+                ));
+            }
+            sinks.push((stream_sink, local));
+        }
+        Ok(sinks)
     }
 
     /// Classifies a data-stream sink destination against this CN's advertised exchange
@@ -2167,7 +2250,10 @@ pub(crate) mod tests {
     use prost::Message;
     use starrocks_thrift::{
         data::TResultBatch,
-        data_sinks::{TDataSink, TDataStreamSink, TPlanFragmentDestination, TResultSink},
+        data_sinks::{
+            TDataSink, TDataStreamSink, TMultiCastDataStreamSink, TPlanFragmentDestination,
+            TResultSink,
+        },
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
         exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef},
         internal_service::{InternalServiceVersion, TPlanFragmentExecParams, TScanRangeParams},
@@ -2868,6 +2954,142 @@ pub(crate) mod tests {
         // Two CNs on one host differ only by port and must see each other as remote.
         assert!(!identity.matches(&TNetworkAddress::new("cn-a.example".to_string(), 8061)));
         assert!(!identity.matches(&TNetworkAddress::new("cn-b.example".to_string(), 8060)));
+    }
+
+    /// A MULTI_CAST_DATA_STREAM_SINK as the FE ships it for a reused CTE: one stream sink per
+    /// consumer exchange, and per sink every instance of that consumer (here: one local instance
+    /// each, plus a remote one on the first sink that this CN must ignore).
+    fn multicast_sink(sinks: Vec<(i32, Vec<TPlanFragmentDestination>)>) -> TDataSink {
+        let (stream_sinks, destinations): (Vec<_>, Vec<_>) = sinks
+            .into_iter()
+            .map(|(dest_node_id, dests)| {
+                (data_stream_sink(dest_node_id).stream_sink.unwrap(), dests)
+            })
+            .unzip();
+        TDataSink::new(
+            TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TMultiCastDataStreamSink::new(stream_sinks, destinations)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// The fan-out shape one sender run parked with.
+    #[derive(Debug)]
+    struct FanOut {
+        slots: Vec<SenderSlot>,
+        broadcast: bool,
+        hash_keys: Vec<usize>,
+    }
+
+    /// Records the fan-out shape the executor was asked to park with.
+    #[derive(Debug, Default)]
+    struct FanOutRecordingExecutor {
+        outputs: Mutex<Vec<FanOut>>,
+    }
+
+    impl FragmentExecutor for FanOutRecordingExecutor {
+        fn run(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+            if !run.outputs.is_empty() {
+                self.outputs.lock().unwrap().push(FanOut {
+                    slots: run.outputs.clone(),
+                    broadcast: run.broadcast,
+                    hash_keys: run.hash_keys.clone(),
+                });
+            }
+            StubExecutor.run(run)
+        }
+    }
+
+    /// A reused CTE: the producer's multicast sink feeds two consumer exchanges (7 and 9), each
+    /// with its own result fragment on this CN. The producer parks once with one full-copy output
+    /// stream per consumer (a broadcast over the sinks), both consumers are readied and fetch
+    /// rows, and the remote instance listed under the first sink is not a destination of this
+    /// CN's producer.
+    #[test]
+    fn multicast_sink_feeds_every_local_consumer_from_one_parked_output() {
+        let executor = Arc::new(FanOutRecordingExecutor::default());
+        let service = SiriusComputeNodeService::with_executor(executor.clone(), test_identity());
+        let query_id = TUniqueId::new(70, 1);
+        let consumer_a = TUniqueId::new(70, 2);
+        let consumer_b = TUniqueId::new(70, 3);
+        assert_exec_ok(&service, &result_receiver(&query_id, &consumer_a, 7, 1));
+        assert_exec_ok(&service, &result_receiver(&query_id, &consumer_b, 9, 1));
+
+        let mut producer = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        producer.fragment.as_mut().unwrap().output_sink = Some(multicast_sink(vec![
+            (
+                7,
+                vec![
+                    remote_destination(TUniqueId::new(70, 12), 8061),
+                    local_destination(consumer_a.clone()),
+                ],
+            ),
+            (9, vec![local_destination(consumer_b.clone())]),
+        ]));
+        let mut exec = exec_params(query_id, TUniqueId::new(70, 4));
+        exec.sender_id = Some(0);
+        producer.params = Some(exec);
+        assert_exec_ok(&service, &producer);
+
+        let a = fetch_rows_eventually(&service, consumer_a.hi, consumer_a.lo);
+        let b = fetch_rows_eventually(&service, consumer_b.hi, consumer_b.lo);
+        assert!(!a.attachment.is_empty() && !b.attachment.is_empty());
+
+        let outputs = executor.outputs.lock().unwrap();
+        assert_eq!(outputs.len(), 1, "the producer runs and parks once");
+        let fan_out = &outputs[0];
+        assert!(fan_out.broadcast, "every consumer receives the full output");
+        assert!(fan_out.hash_keys.is_empty());
+        assert_eq!(
+            fan_out
+                .slots
+                .iter()
+                .map(|slot| (slot.fragment_instance_id, slot.node_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (FragmentInstanceId::from(&consumer_a), 7),
+                (FragmentInstanceId::from(&consumer_b), 9),
+            ],
+            "one output stream per consumer exchange, local destinations only"
+        );
+    }
+
+    /// A multicast sink whose consumer has no instance on this CN is refused before any GPU
+    /// work: the FE schedules CTE consumers with their producer, so this is a broken dispatch,
+    /// and silently skipping the sink would leave that consumer waiting forever.
+    #[test]
+    fn multicast_sink_without_a_local_consumer_is_a_loud_error() {
+        let service = SiriusComputeNodeService::new();
+        let query_id = TUniqueId::new(71, 1);
+        let consumer_a = TUniqueId::new(71, 2);
+        assert_exec_ok(&service, &result_receiver(&query_id, &consumer_a, 7, 1));
+
+        let mut producer = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        producer.fragment.as_mut().unwrap().output_sink = Some(multicast_sink(vec![
+            (7, vec![local_destination(consumer_a)]),
+            (9, vec![remote_destination(TUniqueId::new(71, 13), 8061)]),
+        ]));
+        let mut exec = exec_params(query_id, TUniqueId::new(71, 4));
+        exec.sender_id = Some(0);
+        producer.params = Some(exec);
+        let status = exec_status(&service, &producer);
+        assert_ne!(status.status_code, TStatusCode::OK.0);
+        let message = status.error_msgs.join(" ");
+        assert!(message.contains("multicast sink 1"), "{message}");
+        assert!(message.contains("0 destinations on this CN"), "{message}");
     }
 
     #[test]
@@ -5572,12 +5794,13 @@ pub(crate) mod tests {
     #[test]
     fn exec_plan_fragment_rejects_unhandled_output_sink() {
         // Accepting a sink this CN does not implement would discard the fragment's output and
-        // hang every consumer; the dispatch must fail and name the sink. MULTI_CAST_DATA_STREAM_
-        // SINK is the real case (CTE reuse), so it stands in for the whole class here.
+        // hang every consumer; the dispatch must fail and name the sink. MEMORY_SCRATCH_SINK
+        // stands in for the whole class here (MULTI_CAST_DATA_STREAM_SINK, the CTE-reuse sink,
+        // is handled now and has its own tests).
         let service = SiriusComputeNodeService::new();
         let mut params = supported_fragment();
         params.fragment.as_mut().unwrap().output_sink =
-            Some(sink_of_type(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK));
+            Some(sink_of_type(TDataSinkType::MEMORY_SCRATCH_SINK));
         params.params = Some(exec_params(TUniqueId::new(0, 11), TUniqueId::new(0, 12)));
 
         let response = route(
@@ -5592,10 +5815,23 @@ pub(crate) mod tests {
         let result = PExecPlanFragmentResult::decode(response.body.as_slice()).unwrap();
         assert_eq!(result.status.status_code, TStatusCode::INTERNAL_ERROR.0);
         assert!(
-            result.status.error_msgs[0].contains("MULTI_CAST_DATA_STREAM_SINK")
+            result.status.error_msgs[0].contains("MEMORY_SCRATCH_SINK")
                 && result.status.error_msgs[0].contains("does not support"),
             "{:?}",
             result.status.error_msgs
+        );
+
+        // A multicast sink without its payload is malformed, not unsupported.
+        let mut params = supported_fragment();
+        params.fragment.as_mut().unwrap().output_sink =
+            Some(sink_of_type(TDataSinkType::MULTI_CAST_DATA_STREAM_SINK));
+        params.params = Some(exec_params(TUniqueId::new(0, 13), TUniqueId::new(0, 14)));
+        let status = exec_status(&service, &params);
+        assert_eq!(status.status_code, TStatusCode::INTERNAL_ERROR.0);
+        assert!(
+            status.error_msgs[0].contains("no multi_cast_stream_sink payload"),
+            "{:?}",
+            status.error_msgs
         );
     }
 
