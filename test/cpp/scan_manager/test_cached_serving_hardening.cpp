@@ -358,7 +358,7 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
   {
     throw std::logic_error("stub_ingestible::materialize_metadata_to_table is unreachable");
   }
-  std::unique_ptr<cudf::table> post_filter_and_project(
+  sirius::op::scan::owning_table_view post_filter_and_project(
     sirius::op::scan::filtered_table&& /*input*/,
     const cucascade::memory::memory_space& /*mem_space*/,
     rmm::cuda_stream_view /*stream*/,

@@ -1150,7 +1150,7 @@ std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t
 
 }  // namespace
 
-std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
+owning_table_view parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
@@ -1213,8 +1213,8 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
 
   // Project / reorder the reader's D-order batch to the plan's output layout
   // (non-owning select_columns, no GPU copy). No partitions reach this path, so
-  // partition_values is unused. The release below moves the surviving column
-  // buffers out.
+  // partition_values is unused. The handle keeps its natural state; the operator
+  // decides whether to forward the selection as a view or materialize it.
   auto assembled =
     assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
@@ -1224,7 +1224,7 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
       !kept.empty()) {
     assembled.select_columns(kept);
   }
-  return assembled.release(stream, mr_ref);
+  return assembled;
 }
 
 bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept

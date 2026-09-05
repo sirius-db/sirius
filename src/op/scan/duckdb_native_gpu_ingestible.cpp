@@ -342,7 +342,7 @@ std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t
 
 }  // namespace
 
-std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_project(
+owning_table_view duckdb_native_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
@@ -402,7 +402,7 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
       !kept.empty()) {
     final_table.select_columns(kept);
   }
-  return final_table.release(stream, mr_ref);
+  return final_table;
 }
 
 //===----------------------------------------------------------------------===//

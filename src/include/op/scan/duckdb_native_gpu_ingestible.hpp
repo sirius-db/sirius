@@ -172,7 +172,7 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
-  std::unique_ptr<cudf::table> post_filter_and_project(
+  owning_table_view post_filter_and_project(
     filtered_table&& input,
     ::cucascade::memory::memory_space const& mem_space,
     rmm::cuda_stream_view stream,

@@ -641,7 +641,15 @@ class sirius_scan_manager {
   void attach_proven_unique_columns(const std::string& name,
                                     std::span<std::string const> unique_column_names);
 
-  /// \brief Remove the pinned entry for @p name. No-op if absent.
+  /**
+   * @brief Remove the pinned entry for a table
+   *
+   * The caller must ensure that no in-flight cached provider still refers to the entry. GPU-pinned
+   * view batches that were already emitted keep their selected columns alive independently and may
+   * outlive this removal.
+   *
+   * @param name Pinned-table key; an absent key is ignored
+   */
   void remove_pinned_entry(const std::string& name);
 
   void visit_pinned_entries(

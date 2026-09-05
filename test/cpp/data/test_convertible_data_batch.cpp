@@ -17,7 +17,13 @@
 #include "catch.hpp"
 #include "operator/operator_test_utils.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/table/table_view.hpp>
+
 #include <rmm/cuda_stream.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -26,8 +32,11 @@
 #include <cucascade/memory/memory_space.hpp>
 #include <data/convertible_data_batch.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/reclaim_ledger.hpp>
+#include <telemetry/data_batch_probe.hpp>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -80,6 +89,42 @@ inline bool batch_in_space(cucascade::data_batch& batch,
   return ro.get_memory_space() == space;
 }
 
+/// Helper: owned device column wrapped in a shared_ptr, the storage form of a pinned cache entry.
+std::shared_ptr<cudf::column> make_shared_gpu_column(test_env& e,
+                                                     std::vector<int32_t> const& values)
+{
+  auto owned =
+    cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                              static_cast<cudf::size_type>(values.size()),
+                              cudf::mask_state::UNALLOCATED,
+                              sirius::test::operator_utils::default_stream(),
+                              sirius::test::operator_utils::get_resource_ref(*e.gpu_space));
+  cudaMemcpy(owned->mutable_view().head<int32_t>(),
+             values.data(),
+             sizeof(int32_t) * values.size(),
+             cudaMemcpyHostToDevice);
+  return std::shared_ptr<cudf::column>(std::move(owned));
+}
+
+/// Helper: view-backed batch over shared column storage (the scan's view-forward output shape),
+/// with a creator-declared reclaimable size.
+std::shared_ptr<cucascade::data_batch> make_alias_batch(
+  test_env& e,
+  std::shared_ptr<cudf::column> column,
+  std::optional<std::size_t> reclaimable_size = std::nullopt)
+{
+  std::vector<cudf::column_view> views{column->view()};
+  auto const alloc_size = column->alloc_size();
+  return sirius::make_data_batch_from_view(
+    cudf::table_view{views},
+    std::vector<std::shared_ptr<cudf::column>>{std::move(column)},
+    alloc_size,
+    *e.gpu_space,
+    e.stream(),
+    sirius::telemetry::batch_telemetry_info{},
+    reclaimable_size);
+}
+
 }  // anonymous namespace
 
 TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_data_batch]")
@@ -100,6 +145,34 @@ TEST_CASE("convertible_data_batch converts GPU batch to HOST", "[convertible_dat
   REQUIRE((*result)[0] > 0);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+}
+
+TEST_CASE("convertible_data_batch downgrades a view-backed GPU batch by copy-out",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  std::vector<int32_t> const values{1, 2, 3, 4, 5};
+  auto column = make_shared_gpu_column(e, values);
+  auto batch  = make_alias_batch(e, column);
+
+  sirius::convertible_data_batch wrapper(batch);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
+  REQUIRE(result.has_value());
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  // The downgrade copied out of the view: the source column is intact and now solely ours.
+  REQUIRE(column.use_count() == 1);
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(column->view()) == values);
+
+  // Round-trip the host bytes back to the GPU to check them.
+  sirius::convertible_data_batch upgrade(batch);
+  auto restored = upgrade.convert({e.gpu_space}, e.stream(), *e.mgr, true);
+  REQUIRE(restored.has_value());
+  e.stream().synchronize();
+  auto ro   = batch->to_read_only();
+  auto view = sirius::get_cudf_table_view(ro);
+  REQUIRE(sirius::test::operator_utils::copy_column_to_host<int32_t>(view.column(0)) == values);
 }
 
 TEST_CASE("convertible_data_batch returns nullopt with empty target_spaces",
@@ -150,7 +223,7 @@ TEST_CASE("convertible_data_batch_provider get_next_convertible returns last idl
 
   REQUIRE(cd != nullptr);
   // Last-to-first: batch3 is locked (non-idle) so skipped, batch2 is the last idle batch
-  REQUIRE(cd->bytes_in_space(e.gpu_space) == batch2_size);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) == batch2_size);
 }
 
 TEST_CASE("convertible_data_batch_provider get_all_convertible returns all idle batches",
@@ -244,7 +317,7 @@ TEST_CASE("convertible_data_batch_provider iterates multi-partition last-to-firs
   auto cd = provider.get_next_convertible(e.gpu_space, false);
 
   REQUIRE(cd != nullptr);
-  REQUIRE(cd->bytes_in_space(e.gpu_space) == batch_p1_size);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) == batch_p1_size);
 }
 
 TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
@@ -270,7 +343,8 @@ TEST_CASE("convertible_data_batch convert fails when batch exclusively locked",
   }
 }
 
-TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[convertible_data_batch]")
+TEST_CASE("convertible_data_batch reclaimable_bytes_in_space returns correct size",
+          "[convertible_data_batch]")
 {
   auto& e = env();
 
@@ -279,10 +353,10 @@ TEST_CASE("convertible_data_batch bytes_in_space returns correct size", "[conver
 
   sirius::convertible_data_batch wrapper(batch);
 
-  auto size = wrapper.bytes_in_space(e.gpu_space);
+  auto size = wrapper.reclaimable_bytes_in_space(e.gpu_space);
   REQUIRE(size > 0);
   REQUIRE(size == get_batch_size(*batch));
-  REQUIRE(wrapper.bytes_in_space(e.host_space) == 0);
+  REQUIRE(wrapper.reclaimable_bytes_in_space(e.host_space) == 0);
 }
 
 TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
@@ -308,4 +382,92 @@ TEST_CASE("convertible_data_batch_provider get_bytes_in_space sums batch sizes",
   auto total = provider.get_bytes_in_space(e.gpu_space);
   REQUIRE(total == batch1_size + batch2_size);
   REQUIRE(provider.get_bytes_in_space(e.host_space) == 0);
+}
+
+TEST_CASE("zero-reclaimable view batch is excluded from downgrade candidacy",
+          "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  cucascade::shared_data_repository repo;
+
+  auto owning = sirius::test::operator_utils::make_numeric_batch(
+    *e.gpu_space, std::vector<int32_t>{1, 2, 3, 4, 5}, cudf::type_id::INT32);
+  auto column = make_shared_gpu_column(e, {6, 7, 8, 9});
+  auto alias  = make_alias_batch(e, column, /*reclaimable_size=*/std::size_t{0});
+
+  REQUIRE(sirius::convertible_data_batch(alias).reclaimable_bytes_in_space(e.gpu_space) == 0);
+
+  repo.add_data_batch(owning);
+  repo.add_data_batch(alias);
+
+  sirius::convertible_data_batch_provider provider(&repo);
+  auto all = provider.get_all_convertible(e.gpu_space, false);
+
+  REQUIRE(all.size() == 1);
+  REQUIRE(all[0]->reclaimable_bytes_in_space(e.gpu_space) == get_batch_size(*owning));
+  REQUIRE(provider.get_next_convertible(e.gpu_space, true) != nullptr);
+
+  // Residency accounting still charges the alias its attributed size.
+  REQUIRE(provider.get_bytes_in_space(e.gpu_space) ==
+          get_batch_size(*owning) + get_batch_size(*alias));
+}
+
+TEST_CASE("mixed view batch credits only its exclusively owned bytes", "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  cucascade::shared_data_repository repo;
+
+  auto column                 = make_shared_gpu_column(e, {10, 20, 30, 40});
+  auto const exclusive_bytes  = column->alloc_size() / 2;
+  auto mixed                  = make_alias_batch(e, column, exclusive_bytes);
+  auto const mixed_attributed = get_batch_size(*mixed);
+
+  repo.add_data_batch(mixed);
+
+  sirius::convertible_data_batch_provider provider(&repo);
+  auto cd = provider.get_next_convertible(e.gpu_space, false);
+
+  REQUIRE(cd != nullptr);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) == exclusive_bytes);
+  REQUIRE(cd->reclaimable_bytes_in_space(e.gpu_space) < mixed_attributed);
+}
+
+TEST_CASE("conversion retires a declared reclaimable size", "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto column                = make_shared_gpu_column(e, {1, 2, 3, 4, 5, 6});
+  auto const exclusive_bytes = column->alloc_size() / 2;
+  auto batch                 = make_alias_batch(e, column, exclusive_bytes);
+  auto const batch_id        = batch->get_batch_id();
+
+  REQUIRE(sirius::reclaim_ledger::instance().declared_bytes(batch_id) == exclusive_bytes);
+
+  sirius::convertible_data_batch wrapper(batch);
+  auto result = wrapper.convert({e.host_space}, e.stream(), *e.mgr, true);
+  REQUIRE(result.has_value());
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  // Self-healing in ledger terms: the token died with the GPU representation, so the owned host
+  // representation reports full reclaimability again.
+  REQUIRE(sirius::reclaim_ledger::instance().declared_bytes(batch_id) == std::nullopt);
+  REQUIRE(get_batch_size(*batch) > 0);
+  REQUIRE(wrapper.reclaimable_bytes_in_space(e.host_space) == get_batch_size(*batch));
+}
+
+TEST_CASE("ledger entry dies with the batch", "[convertible_data_batch]")
+{
+  auto& e = env();
+
+  auto column         = make_shared_gpu_column(e, {7, 8, 9});
+  auto batch          = make_alias_batch(e, column, /*reclaimable_size=*/std::size_t{0});
+  auto const batch_id = batch->get_batch_id();
+
+  REQUIRE(sirius::reclaim_ledger::instance().declared_bytes(batch_id).has_value());
+
+  batch.reset();
+
+  REQUIRE(sirius::reclaim_ledger::instance().declared_bytes(batch_id) == std::nullopt);
 }

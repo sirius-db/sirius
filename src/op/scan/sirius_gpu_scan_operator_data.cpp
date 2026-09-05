@@ -467,8 +467,9 @@ std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
     // projected column is >= 4 B/row).
     return 2 * batch_bytes;
   }
-  // An unmasked, unfiltered chunk serves a zero-copy view whose output copy is
-  // at most batch-sized, so plain batch_bytes stays accurate.
+  // An unmasked, unfiltered chunk is served as a zero-copy view; batch_bytes stays a valid bound
+  // because matched columns are referenced without copy while a carrier-normalized column
+  // allocates only its cast destination, which the conversion reservation covers separately.
   return batch_bytes;
 }
 
