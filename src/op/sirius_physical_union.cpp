@@ -173,8 +173,11 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, starved_producer};
   }
 
-  // Readiness is ANY, not ALL: one arm with a queued batch is enough to fire a task. An arm that
-  // finished without producing is not starved, which is what lets an empty arm through.
+  // Reached only when nothing is starved, so the aggregate rule is: READY iff every *live* arm has
+  // a queued batch and at least one port is poppable. That is the base's ALL weakened by exactly
+  // one clause -- a finished arm is excused instead of blocking forever -- which is what lets an
+  // empty arm through and what stops a drained short arm from stranding a long one. Arms still
+  // producing rendezvous; `any_ready` alone decides only once every arm has finished.
   if (any_ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
 
   return std::nullopt;

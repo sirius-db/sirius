@@ -87,7 +87,8 @@ TEST_CASE_METHOD(UnionAllFixture,
   // An empty arm's pipeline finishes without pushing a batch, so the operator must fall through
   // to the other arm rather than reporting exhausted. The base's all-ports readiness test can
   // never hold here, which makes these the only cases in the file that would fail if UNION's
-  // ANY-readiness override were reverted.
+  // readiness override -- excusing a finished arm rather than waiting on every port -- were
+  // reverted.
   compare_gpu_vs_cpu("SELECT k, v FROM ua UNION ALL SELECT k, v FROM uempty");
   compare_gpu_vs_cpu("SELECT k, v FROM uempty UNION ALL SELECT k, v FROM ua");
   compare_gpu_vs_cpu("SELECT k FROM uempty UNION ALL SELECT k FROM uempty");

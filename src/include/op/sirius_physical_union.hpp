@@ -95,10 +95,12 @@ class sirius_physical_union : public sirius_physical_operator {
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 
-  //! READY when *any* arm has a batch, popping one batch from one arm. The base is lockstep —
-  //! READY only when every port has data, then one batch from every port — which strands a long
-  //! arm's remaining batches once a short arm drains and its pipeline finishes. One arm per task
-  //! also keeps each batch on the GPU that produced it, since a task runs on one device.
+  //! READY when every *live* arm has a batch, popping one batch from one arm. The base is lockstep
+  //! — READY only when every port has data, then one batch from every port — which strands a long
+  //! arm's remaining batches once a short arm drains and its pipeline finishes. Excusing a finished
+  //! arm is the whole difference; arms still producing rendezvous. A starved arm (live producer,
+  //! empty port) outranks a ready one, because nothing else will start it. One arm per task also
+  //! keeps each batch on the GPU that produced it, since a task runs on one device.
   std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
