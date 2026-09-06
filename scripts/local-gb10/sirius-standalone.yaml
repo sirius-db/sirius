@@ -1,0 +1,30 @@
+# One standalone process on GB10: same aggregate GPU/host budgets as two CNs.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 48Gi
+    host:
+      capacity_bytes: 16Gi
+      block_size: 1Mi
+      pool_size: 64
+      initial_number_pools: 1
+    disk:
+      disk_id: 0
+      capacity_bytes: 1Ti
+      downgrade_root_dirs: spill
+  executor:
+    pipeline:
+      num_threads: 2
+    task_creator:
+      num_threads: 1
+    downgrade:
+      num_threads: 1
+    scan_manager:
+      num_threads: 4
+  operator_params:
+    scan_task_batch_size: 64Mi
+    hash_partition_bytes: 64Mi
+    concat_batch_bytes: 64Mi
+    max_build_hash_table_bytes: 64Mi

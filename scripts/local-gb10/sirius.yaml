@@ -1,0 +1,26 @@
+# Small bring-up budget for GB10's shared CPU/GPU physical memory.
+sirius:
+  topology:
+    num_gpus: 1
+  memory:
+    gpu:
+      usage_limit_bytes: 8Gi
+    host:
+      capacity_bytes: 2Gi
+      block_size: 1Mi
+      pool_size: 64
+      initial_number_pools: 1
+  executor:
+    pipeline:
+      num_threads: 2
+    task_creator:
+      num_threads: 1
+    downgrade:
+      num_threads: 1
+    scan_manager:
+      num_threads: 4
+  operator_params:
+    scan_task_batch_size: 64Mi
+    hash_partition_bytes: 64Mi
+    concat_batch_bytes: 64Mi
+    max_build_hash_table_bytes: 64Mi

@@ -6,6 +6,8 @@ This plan set was recovered from `0515ff75ad364a7c7b754b5addd154c6f2adae0b` for 
 
 **How to use these plans**
 
+The [SF1000 Q8/Q5 memory and staging analysis](sf1000-q08-memory-staging-analysis.md) reviews the supplied 2026-09-06 two-GPU results, ranks three next improvements and defines controlled validation arms. It distinguishes the remote measurements from local source evidence and the earlier shared-GB10 benchmarks; its proposed changes have not been implemented by that analysis.
+
 Start with path 00 so baseline outcomes are trustworthy. Choose subsequent work from the measured bottleneck and the dependency table. Each document provides source touchpoints, proposed ownership/interfaces, implementation slices, tests, benchmarks, acceptance criteria, and rollout or fallback rules. Proposed API/type names and configuration switches are not existing interfaces unless explicitly identified as current.
 
 Dependencies below are prerequisites for the planned production integration, not a requirement to postpone all design or isolated experiments. Transitive prerequisites also apply. The size labels indicate relative engineering scope, not calendar estimates: S is a contained tool change, M crosses a few components, L changes ownership/operator/runtime contracts, and XL changes query execution architecture.
