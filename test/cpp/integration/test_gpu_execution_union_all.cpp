@@ -30,7 +30,9 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/transparent_execution_test_utils.hpp>
 
 #include <string>
 
@@ -148,6 +150,18 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL composes with downstream operators",
                  "[integration][gpu_execution][union_all]")
 {
+  // DuckDB's COMPRESSED_MATERIALIZATION rewrites these narrow keys into
+  // __internal_compress_integral_* inside a projection, which the expression translator declines,
+  // so the query runs on the CPU and the fixture's GPU-execution assertion fails. It keys on
+  // statistics earlier tests warm, so this passes alone and fails in a full run. Guarded so the
+  // case asserts UNION's shape, not that.
+  //
+  // This guard appends to the live mask rather than replacing it. Sirius publishes in_clause,
+  // compressed_materialization and late_materialization at extension load
+  // (publish_transparent_optimizer_mask, sirius_extension.cpp:3438), so a plain
+  // `SET disabled_optimizers = '...'` would drop the other two for the duration of this case.
+  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
+
   // Aggregate downstream: UNION becomes a pipeline sink under the group-by's hash PARTITION,
   // which is the is_sink() == true shape.
   compare_gpu_vs_cpu(
@@ -177,6 +191,9 @@ TEST_CASE_METHOD(UnionAllFixture,
                  "gpu_execution UNION ALL nested inside another UNION ALL arm",
                  "[integration][gpu_execution][union_all]")
 {
+  // Same COMPRESSED_MATERIALIZATION guard as the case above.
+  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
+
   // An arm whose own subtree is a UNION: the inner and outer passthrough sinks must not collide,
   // since port names are per-operator.
   compare_gpu_vs_cpu(
@@ -197,9 +214,28 @@ TEST_CASE_METHOD(UnionAllFixture,
   // The compressed-schema pass treats UNION as a native carrier boundary and restores every arm
   // before the wrap pass, stopping two arms presenting different carriers for one logical column.
   // uwide.k is BIGINT with small values (a narrowing candidate) unioned against an INTEGER arm.
+  // uwide must be pinned for any of that to happen -- a sidecar is installed only for a resident
+  // table (sirius_plan_get.cpp:633) -- and without it this case narrowed nothing and proved none
+  // of the above.
+  // Same COMPRESSED_MATERIALIZATION guard as the case above.
+  sirius::test::disabled_optimizers_guard no_cm{*con, "compressed_materialization"};
+  auto pin = con->Query("CALL pin_table(format='duckdb', name='uwide', tier='gpu');");
+  REQUIRE(pin);
+  REQUIRE_FALSE(pin->HasError());
+
+  auto const before = sirius::test::get_compressed_materialization_stats(*con);
+
   compare_gpu_vs_cpu("SELECT k FROM uwide UNION ALL SELECT k FROM ua");
   compare_gpu_vs_cpu(
     "SELECT k, count(*) FROM (SELECT k FROM uwide UNION ALL SELECT k FROM ua) t GROUP BY k");
+
+  auto const after = sirius::test::get_compressed_materialization_stats(*con);
+  // Both halves of the claim: the arm scans narrow, the boundary restores. scan_columns_narrowed
+  // stays 0 by design -- nothing survives narrow past the boundary.
+  REQUIRE(after.scan_sidecars_installed > before.scan_sidecars_installed);
+  REQUIRE(after.scan_columns_restored > before.scan_columns_restored);
+
+  REQUIRE_FALSE(con->Query("CALL unpin_table('uwide');")->HasError());
 }
 
 TEST_CASE_METHOD(UnionAllFixture,
