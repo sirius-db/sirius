@@ -2,10 +2,11 @@ use std::{net::ToSocketAddrs, path::PathBuf};
 
 use clap::Parser;
 use instrumentation_model::{Sirius, SiriusContext};
+use nvtx_server::{import_context_events, routes as nvtx_routes};
 use quent_io::ExporterOptions;
 use quent_io::filesystem::{self, Format};
 use quent_query_engine_server::{
-    analyzer_cache::index_query_engines, analyzer_service_router, collector_service,
+    analyzer_cache::index_query_engines, analyzer_service_router_with_routes, collector_service,
     initialize_tracing,
 };
 use sirius_telemetry_analyzer::SiriusUiAnalyzer;
@@ -69,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let importer_output_dir = output_dir.clone();
     let lister_output_dir = output_dir.clone();
+    let nvtx_output_dir = output_dir.clone();
 
     let format = match exporter.as_str() {
         "ndjson" => Format::Ndjson,
@@ -85,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // remote source's events under that source's own context id.
     let collector = async {
         collector_service::<SiriusContext, _>(move |id| {
-            SiriusContext::try_with_id(id, Some(exporter_kind.clone())).map_err(|e| e.to_string())
+            SiriusContext::try_with_id(id, exporter_kind.clone()).map_err(|e| e.to_string())
         })?
         .serve(collector_addr)
         .await
@@ -101,16 +103,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // make up an engine instance.
     let importer = move |context_id| {
         let dir = importer_output_dir.join(format!("{context_id}"));
-        Ok(Sirius::import_events(&dir)?)
+        let events = Sirius::import_events(&dir)?.collect::<quent_io::ImporterResult<Vec<_>>>()?;
+        Ok(Box::new(events.into_iter()) as Box<dyn Iterator<Item = _>>)
     };
 
     let analyzer = async {
         axum::serve(
             TcpListener::bind(analyzer_addr).await?,
-            analyzer_service_router::<SiriusUiAnalyzer>(
+            analyzer_service_router_with_routes::<SiriusUiAnalyzer>(
                 Box::new(importer),
                 Box::new(lister),
                 cors_address,
+                nvtx_routes(Box::new(move |context_id| {
+                    import_context_events(&nvtx_output_dir, context_id)
+                })),
             )?
             .into_make_service(),
         )

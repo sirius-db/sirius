@@ -10,8 +10,10 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1"
 instrumentation-model = { path = "../model" }
+nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "7b31409cde06d855bc2d0fb937aafcb6c479f60f" }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "7b31409cde06d855bc2d0fb937aafcb6c479f60f", features = ["static-injection"] }
 
 [build-dependencies]
 cxx-build = "1"
 instrumentation-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "2a5ca83442953cbea1c9c53560808104f6b59127" }
+quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "7b31409cde06d855bc2d0fb937aafcb6c479f60f" }
