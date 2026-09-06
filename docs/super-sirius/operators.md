@@ -309,6 +309,34 @@ Fallback for joins not supported by cuDF hash join (pure inequality conditions).
 
 Conditional MARK joins produce the same three-valued mark as the hash join, via a two-semi-join scheme in its own `resolve_mark_join_result`: one `conditional_left_semi_join` on the predicate itself yields the *matched* set, and a second on `predicate IS NOT FALSE` — each comparison rewritten as `cᵢ OR IS_NULL(left) OR IS_NULL(right)` with Kleene `NULL_LOGICAL_OR` — yields the *maybe* set. A row's mark is true if matched, NULL if in the maybe set but not matched, false otherwise. Null-safe (`IS [NOT] DISTINCT FROM`) conjuncts skip the `IS_NULL` tainting since they are never NULL-valued; `distinct_from` is lowered as `NOT(NULL_EQUAL(l, r))`.
 
+### `sirius_physical_union` — `UNION`
+**File:** `src/include/op/sirius_physical_union.hpp`
+
+`UNION ALL` only — bag concatenation, so the operator computes nothing and `execute` is the
+identity. N-ary: `a UNION ALL b UNION ALL c` binds to one `LogicalSetOperation`, so every path loops
+over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the plan builder
+(`src/planner/sirius_plan_set_operation.cpp`), as is `allow_out_of_order = false`.
+
+- **One port per arm.** `wrap_union` wraps each arm `child -> PASSTHROUGH_SINK`, feeding a distinct
+  `"union_{i}"` port. The distinct names are required: `add_port` is last-writer-wins and the
+  repository manager keys by `(operator_id, port_id)`, so a shared name would orphan an arm's
+  repository and finish the pipeline while that arm still had rows.
+- **`PASSTHROUGH_SINK -> UNION` is `PARTIAL`**, not the base's `FULL` default, which
+  would hold every arm's output in repositories until all arms finished.
+- **Overrides both task-driver methods.** Ready when every *live* arm has a batch, popping one batch
+  from one arm; the base is lockstep and strands the long arm once a short one drains, so a finished
+  arm is excused while arms still producing rendezvous. A starved arm — live producer, empty port —
+  outranks a ready one, since `task_scheduler::start_query` starts one scan for the whole query and
+  an arm is named in this hint or never runs. One arm per task also keeps each batch on the GPU that
+  produced it.
+- **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
+  operator, so this answer decides the whole plan's.
+- **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
+  the operator, and resolving a `"union_{i}"` name costs two `std::string` allocations, so the
+  names are resolved to `port*` once on first use.
+- **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
+  arms presenting different physical carriers for the same logical column.
+
 ### `sirius_physical_order` — `ORDER_BY`
 **File:** `src/include/op/sirius_physical_order.hpp`
 
@@ -387,6 +415,23 @@ Reassembles partitioned data back into a linear stream. Behavior depends on join
 
 - `_concat_all = true` (LEFT/ANTI/OUTER joins): waits for all data before emitting
 - `_concat_all = false` (INNER joins): emits tasks when byte threshold (`_concat_batch_bytes`) is met
+
+### `sirius_physical_passthrough_sink` — `PASSTHROUGH_SINK`
+**File:** `src/include/op/sirius_physical_passthrough_sink.hpp`
+
+Terminates one arm of a `UNION`, forwarding every batch unchanged into the downstream `UNION`'s
+`"union_{i}"` port. It replaces the join arm's `PARTITION -> CONCAT` chain, which a bag union needs
+neither half of.
+
+- **Emits `pipelineable_operator_data`, not `partitioned_operator_data`.** With no `partition_idx`
+  the task creator selects a device by data locality instead of `partition_idx % num_gpus`, so each
+  batch is consumed on the GPU its scan produced it on. A single-partition `CONCAT` would pin every
+  UNION task to GPU 0.
+- **Owns its port name.** `sirius_physical_union::input_port_for` returns a `string_view` into
+  `_union_port_label`, which the wiring descriptor and `next_port_info` retain for the life of the
+  query.
+- Inherits the base task-driver methods: it is single-input, so `UNION`'s fan-in hazards cannot
+  arise.
 
 ### `sirius_physical_sort_sample` — `SORT_SAMPLE`
 **File:** `src/include/op/sirius_physical_sort_sample.hpp`
@@ -490,8 +535,10 @@ After pipeline finalization, `source` and `sink` are just aliases for the first 
 | NESTED_LOOP_JOIN | Join | Fallback nested loops |
 | LEFT_DELIM_JOIN | Join | Correlated subquery wrapper |
 | RIGHT_DELIM_JOIN | Join | Correlated subquery wrapper |
+| UNION | Set op | `UNION ALL` only; N-ary identity fan-in, no data touched |
 | PARTITION | Pipeline | Hash/range partitioning |
 | CONCAT | Pipeline | Partition reassembly |
+| PASSTHROUGH_SINK | Pipeline | UNION arm terminator; forwards batches unpartitioned |
 | MERGE_TOP_N | Pipeline | Merge per-partition top-N |
 | CTE | CTE | Materialize to ColumnDataCollection |
 | RESULT_COLLECTOR | Result | Final result materialization |

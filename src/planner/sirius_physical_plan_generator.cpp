@@ -50,6 +50,7 @@
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_passthrough_sink.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -59,6 +60,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+#include "op/sirius_physical_union.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -634,6 +636,44 @@ void wrap_join(sirius::op::sirius_physical_operator& join_op,
   }
 }
 
+//! Terminate one UNION arm with a `PASSTHROUGH_SINK`. Where a join arm needs `PARTITION -> CONCAT`
+//! (a shuffle plus a coalesce), a bag union needs neither, so one operator does the whole job: it
+//! forwards each batch unchanged and unpartitioned into UNION's `"union_{child_idx}"` port, which
+//! keeps every batch on the GPU its scan produced it on. The sink owns that port name — the wiring
+//! descriptor and the upstream `next_port_info` both retain a `string_view` into it.
+void wrap_union_child(sirius::op::sirius_physical_operator& union_op, std::size_t child_idx)
+{
+  D_ASSERT(union_op.type == sirius::op::SiriusPhysicalOperatorType::UNION);
+  wrap_child(
+    union_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
+      // Capture types/cardinality before the child is moved into the sink.
+      auto child_types    = child_orig->types;
+      auto est_card       = child_orig->estimated_cardinality;
+      auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
+                                                                 : std::vector<cudf::data_type>{};
+
+      auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+        std::move(child_types), est_card, sirius::op::sirius_physical_union::port_label(child_idx));
+      // Expected to be empty: the compressed-schema pass treats UNION as a native boundary and
+      // restores every arm before this runs. Carried anyway so the sink never silently declares a
+      // different carrier than the batches flowing through it, mirroring wrap_join_child.
+      if (!child_physical.empty()) { sink->set_physical_types(std::move(child_physical)); }
+      sink->children.push_back(std::move(child_orig));
+      return sink;
+    });
+}
+
+//! Wrap every UNION arm. `wrap_child` replaces the slot in place rather than resizing `children`,
+//! so indexing over the original size is safe.
+void wrap_union(sirius::op::sirius_physical_operator& union_op)
+{
+  D_ASSERT(union_op.children.size() >= 2);
+  const auto num_children = union_op.children.size();
+  for (std::size_t i = 0; i < num_children; i++) {
+    wrap_union_child(union_op, i);
+  }
+}
+
 // Forward declaration: wrap_delim_join recurses into a DELIM JOIN's internal `join`/`distinct`
 // subtrees, which live outside `children[]`.
 void insert_gpu_pipeline_operators_recursive(
@@ -778,6 +818,7 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::DENSE_COUNT_JOIN:
       wrap_dense_count_join(*slot, compressed_materialization_observer);
       break;
+    case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
       wrap_delim_join(slot, op_params, context, compressed_materialization_observer);
@@ -1156,10 +1197,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalPositionalJoin>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_UNION:
+      // UNION ALL only; the builder rejects distinct UNION and ordered arms.
+      plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_EXCEPT:
     case duckdb::LogicalOperatorType::LOGICAL_INTERSECT:
-      throw duckdb::NotImplementedException("Set operation not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalSetOperation>());
+      throw duckdb::NotImplementedException("Set operation (EXCEPT/INTERSECT) not supported");
       break;
     case duckdb::LogicalOperatorType::LOGICAL_INSERT:
       throw duckdb::NotImplementedException("Insert not supported");
