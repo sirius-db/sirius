@@ -78,16 +78,13 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                                                stream,
                                                memory_space.get_default_allocator());
 
-  // Build a column-index list for the original (non-cast) columns.
-  std::vector<cudf::size_type> orig_col_indices;
-  orig_col_indices.reserve(orig_num_cols);
-  for (int i = 0; i < orig_num_cols; i++) {
-    orig_col_indices.push_back(i);
-  }
+  // Drop the appended cast columns before slicing. Releasing them here frees their reordered
+  // copies; keeping them in the parent would hold that memory for as long as any output batch
+  // lives, because the outputs are views into this table.
+  auto reordered_columns = partition_result.first->release();
+  reordered_columns.resize(orig_num_cols);
+  auto reordered = std::make_shared<cudf::table>(std::move(reordered_columns));
 
-  // Slice from the reordered table to create separate table partitions.
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
-  output_batches.reserve(num_partitions);
   std::vector<cudf::size_type> slice_indices;
   slice_indices.reserve(num_partitions * 2);
   for (int i = 0; i < num_partitions; ++i) {
@@ -95,15 +92,38 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
     slice_indices.push_back(i == num_partitions - 1 ? input_table.num_rows()
                                                     : partition_result.second[i + 1]);
   }
-  auto sliced_partition_views = cudf::slice(partition_result.first->view(), slice_indices, stream);
+  auto sliced_partition_views = cudf::slice(reordered->view(), slice_indices, stream);
+
+  // The reordered rows already sit one partition after another, so each partition is a view into
+  // that table rather than an allocation of its own. A shared_ptr to the reordered table is the
+  // owner: the last surviving partition batch releases it. Memory is therefore reclaimed per
+  // reordered table, not per partition, so a single long-lived partition holds all of it.
+  auto const reordered_bytes = reordered->alloc_size();
+  auto const reordered_rows  = static_cast<std::size_t>(reordered->num_rows());
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(num_partitions);
   for (int i = 0; i < num_partitions; ++i) {
-    // Drop any appended cast columns from the output.
-    auto output_partition =
-      std::make_unique<cudf::table>(sliced_partition_views[i].select(orig_col_indices),
-                                    stream,
-                                    memory_space.get_default_allocator());
-    output_batches.push_back(
-      make_data_batch(std::move(output_partition), memory_space, stream, telemetry_info));
+    auto const& partition_view = sliced_partition_views[i];
+    auto const partition_rows  = static_cast<std::size_t>(partition_view.num_rows());
+    if (partition_rows == 0) {
+      // An empty partition owns an empty table instead: it allocates nothing, and a view would
+      // pin the whole reordered table for a batch that carries no rows.
+      output_batches.push_back(make_data_batch(
+        std::make_unique<cudf::table>(partition_view, stream, memory_space.get_default_allocator()),
+        memory_space,
+        stream,
+        telemetry_info));
+      continue;
+    }
+    // Row-proportional share of the reordered table, so the partitions together are charged for
+    // it exactly once. Exact for fixed-width columns, an estimate for variable-width ones.
+    auto const partition_bytes = reordered_bytes * partition_rows / reordered_rows;
+    output_batches.push_back(make_data_batch_from_view(partition_view,
+                                                       std::shared_ptr<cudf::table>(reordered),
+                                                       partition_bytes,
+                                                       memory_space,
+                                                       stream,
+                                                       telemetry_info));
   }
 
   return output_batches;
