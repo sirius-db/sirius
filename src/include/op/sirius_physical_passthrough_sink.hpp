@@ -27,24 +27,11 @@ namespace op {
 //! unchanged into the downstream UNION's per-arm input port. It replaces the join's
 //! `PARTITION -> CONCAT` feeder chain, which a bag union needs neither half of.
 //!
-//! Two properties are load-bearing, and both come from *not* being a CONCAT. It emits plain
-//! `pipelineable_operator_data`, so the batch carries no `partition_idx` and
+//! Emitting plain `pipelineable_operator_data` is the load-bearing part: with no `partition_idx`,
 //! `task_creator::create_task` selects a device by data locality rather than
-//! `partition_idx % num_gpus` — each batch is consumed on the GPU its scan produced it on. A
-//! single-partition CONCAT would instead pin every UNION task to GPU 0. And it pushes through the
-//! base `sink()` rather than `push_data_batch_partitioned`, so the receiving UNION need not be a
+//! `partition_idx % num_gpus`, so each batch is consumed on the GPU its scan produced it on.
+//! Pushing through the base `sink()` also means the receiving UNION need not be a
 //! `sirius_physical_partition_consumer_operator`.
-//!
-//! Each arm's sink owns the `"union_{i}"` port name it feeds: the consuming UNION's
-//! `input_port_for` hands back a `string_view` into that member which the wiring descriptor and
-//! `next_port_info` retain for the life of the query, so the storage has to live on a plan-tree
-//! node.
-//!
-//! Deliberately *not* overridden, in both cases because the base is already right. `sink()` pushes
-//! every batch of a `pipelineable_operator_data` to each `next_port_after_sink` via
-//! `push_data_batch`, which is this operator's whole contract; CONCAT overrides it only to thread a
-//! `partition_idx`. `get_next_task_hint` / `get_next_task_input_data` degenerate at arity 1 to the
-//! right behavior, so the fan-in hazards that force UNION to override them cannot arise here.
 class sirius_physical_passthrough_sink : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
@@ -58,9 +45,8 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
 
   std::string get_name() const override;
 
-  //! Both, as CONCAT is: this operator produces its arm's tasks and terminates the arm pipeline.
-  //! `is_source()` also satisfies `sirius_pipeline::reset_source` for an arm whose root is itself
-  //! an unconditional sink, where this operator ends up alone in its pipeline.
+  //! Both, as CONCAT is. `is_source()` also satisfies `sirius_pipeline::reset_source` for an arm
+  //! whose root is itself an unconditional sink, leaving this operator alone in its pipeline.
   bool is_source() const override;
   bool is_sink() const override;
 
@@ -68,7 +54,7 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  //! The `"union_{i}"` label this arm feeds; read by `sirius_physical_union::input_port_for`.
+  //! Read by `sirius_physical_union::input_port_for`.
   [[nodiscard]] const std::string& union_port_label() const noexcept { return _union_port_label; }
 
   //! Pure forwarder: no device allocation beyond the batches already resident.

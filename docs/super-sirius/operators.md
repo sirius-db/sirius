@@ -332,8 +332,7 @@ over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the 
 - **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
   operator, so this answer decides the whole plan's.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
-  the operator, and resolving a `"union_{i}"` name costs two `std::string` allocations, so the
-  names are resolved to `port*` once on first use.
+  the operator, so the `"union_{i}"` names are resolved to `port*` once on first use.
 - **Carriers.** The compressed-schema pass treats `UNION` as a native boundary, which prevents two
   arms presenting different physical carriers for the same logical column.
 
@@ -425,8 +424,7 @@ neither half of.
 
 - **Emits `pipelineable_operator_data`, not `partitioned_operator_data`.** With no `partition_idx`
   the task creator selects a device by data locality instead of `partition_idx % num_gpus`, so each
-  batch is consumed on the GPU its scan produced it on. A single-partition `CONCAT` would pin every
-  UNION task to GPU 0.
+  batch is consumed on the GPU its scan produced it on.
 - **Owns its port name.** `sirius_physical_union::input_port_for` returns a `string_view` into
   `_union_port_label`, which the wiring descriptor and `next_port_info` retain for the life of the
   query.
