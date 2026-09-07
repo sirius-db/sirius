@@ -71,6 +71,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -265,15 +266,18 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
                          : std::shared_ptr<io::sirius_datasource>{},
         file->partition_values,
-        file->disable_filter_pushdown};
+        file->disable_filter_pushdown,
+        file->reader_options};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
-                             _disable_pushdown != file->disable_filter_pushdown)) {
+                             _disable_pushdown != file->disable_filter_pushdown ||
+                             _run_reader_options != file->reader_options)) {
       emitted.push_back(emit_current());
     }
-    _partition_values = file->partition_values;
-    _disable_pushdown = file->disable_filter_pushdown;
+    _run_reader_options = file->reader_options;
+    _partition_values   = file->partition_values;
+    _disable_pushdown   = file->disable_filter_pushdown;
 
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_output  = 0;
@@ -346,9 +350,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
                            _empty_split_fallback->datasource);
-      _partition_values = _empty_split_fallback->partition_values;
-      _disable_pushdown = _empty_split_fallback->disable_filter_pushdown;
-      _produced_any     = true;
+      _partition_values   = _empty_split_fallback->partition_values;
+      _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
+      _run_reader_options = _empty_split_fallback->reader_options;
+      _produced_any       = true;
       out.push_back(emit_current());
     }
     return out;
@@ -359,7 +364,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   {
     auto split                     = std::make_unique<parquet_split_info>();
     split->rg_slices               = std::move(_slices);
-    split->reader_options          = _reader_options;
+    split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
@@ -381,6 +386,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
+  /// Reader options of the current run. Projected and natural reads cannot share
+  /// a split.
+  std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
 
   /// First fully-pruned file, kept as the source for flush()'s empty-split
   /// fallback when the whole scan produced no slice.
@@ -390,6 +398,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::shared_ptr<io::sirius_datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
+    std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -586,8 +595,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // Shared reader options — column projection only. set_filter is never applied
   // here: it is a per-split decision (FLBA files disable it) made in
   // materialize_table on a copy of these options.
-  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
+  _natural_reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
+  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(*_natural_reader_options);
   // Never hand cuDF an empty column list — a zero-column read over live row groups
   // hangs. is_projected() already excludes it; this pins the invariant here.
   if (_plan->is_projected() && !_plan->data_columns.empty()) {
@@ -686,8 +696,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   if (!file_metadata) {
     auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
     auto const footer_len = footer->size();
+    // The carrier projection is only known to match this file after the footer
+    // is parsed, so the parse itself runs without a column selection.
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-                                     opts);
+                                     _plan->carrier_batch_index ? *_natural_reader_options : opts);
     file_metadata =
       std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
     // Park the parse in the ioctx metadata store so a later scan of the same
@@ -698,11 +710,21 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
   auto const& metadata = *file_metadata;
 
+  // The carrier is chosen from the bind schema; a file that lacks it (schema
+  // evolution) or has no row groups to resolve it against reads its natural
+  // batch.
+  bool const carrier_unavailable =
+    _plan->carrier_batch_index.has_value() &&
+    detail::leaf_indices_for_column(metadata, _plan->data_columns[*_plan->carrier_batch_index].name)
+      .empty();
+  if (carrier_unavailable) { opts = *_natural_reader_options; }
+  bool const file_projected = _plan->is_projected() && !carrier_unavailable;
+
   // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
   // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
   // reader-side pushdown is disabled when such a decimal is among the columns
   // this scan reads (the filter still applies post-decode).
-  bool const restrict_to_scanned = _plan->is_projected();
+  bool const restrict_to_scanned = file_projected;
   std::unordered_set<std::string> scanned_column_names;
   if (restrict_to_scanned) {
     auto const names = _plan->data_column_names();
@@ -748,13 +770,24 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // column when partitioning row groups into batches — see rg_contribution.
   auto const& returned_types   = _info->returned_types;
   auto const data_column_names = _plan->data_column_names();
+  // A file read without its carrier keeps every file column. rg_contribution
+  // uses bind-type widths for known, non-partition top-level columns and
+  // metadata estimates for the rest; a partition name's bind type is the
+  // partition's, not the file column's.
+  std::unordered_map<std::string, std::size_t> primary_by_name;
+  if (carrier_unavailable) {
+    for (std::size_t p = 0; p < _info->names.size() && p < returned_types.size(); ++p) {
+      if (_plan->partition_primary_indices.count(p) > 0) { continue; }
+      primary_by_name.emplace(_info->names[p], p);
+    }
+  }
   std::vector<std::size_t> selected_chunk_indices;
   // Parallel to selected_chunk_indices: the decoded (GPU) byte width of each
   // selected leaf chunk's column, or 0 for VARCHAR / nested / unknown types
   // (which fall back to the parquet encoded-uncompressed size in rg_contribution).
   std::vector<std::size_t> selected_chunk_decoded_width;
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
-  if (_plan->is_projected()) {
+  if (file_projected) {
     auto const pure_filter_positions = _plan->pure_filter_batch_positions();
     bool has_data_output             = false;
     for (auto const& output : _plan->output_layout) {
@@ -925,12 +958,28 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       if (!is_pure_filter) { estimate.output_bytes += decoded_bytes; }
       estimate.compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
     };
-    if (_plan->is_projected()) {
+    if (file_projected) {
       for (std::size_t i = 0; i < selected_chunk_indices.size(); ++i) {
         auto const chunk_idx = selected_chunk_indices[i];
         add_chunk(row_group.columns[chunk_idx],
                   pure_filter_chunk_indices.contains(chunk_idx),
                   selected_chunk_decoded_width[i]);
+      }
+    } else if (carrier_unavailable) {
+      for (auto const& chunk : row_group.columns) {
+        std::size_t decoded_width = 0;
+        auto const& path          = chunk.meta_data.path_in_schema;
+        if (path.size() == 1) {
+          auto const it = primary_by_name.find(path.front());
+          if (it != primary_by_name.end()) {
+            try {
+              decoded_width = returned_types[it->second].fixed_width_byte_size();
+            } catch (...) {
+              decoded_width = 0;
+            }
+          }
+        }
+        add_chunk(chunk, /*is_pure_filter=*/false, decoded_width);
       }
     } else if (returned_types.size() == row_group.columns.size()) {
       // Unprojected (identity) scan: the reader materializes every file column
@@ -964,7 +1013,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->file_metadata           = file_metadata;
   out->file_path               = file_path;
   out->datasource              = std::move(sirius_ds);
-  out->reader_options          = _reader_options;
+  out->reader_options          = carrier_unavailable ? _natural_reader_options : _reader_options;
+  out->carrier_unavailable     = carrier_unavailable;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
