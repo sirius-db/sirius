@@ -801,14 +801,19 @@ it is nearly free to build (1.7× the capture W2 already pays, ~0.20 s for all o
 `DECODE_PUSHDOWN_PLAN.md:722-723` records that "a chunk is all-or-nothing today". Three pieces, in
 dependency order:
 
-**2a. Capture (self-contained, testable in isolation).**
-`compute_pinned_group_stats(chunk, column_types, group_rows, …)` alongside the existing per-chunk
-function, using `cudf::segmented_reduce` over a fixed-stride offsets column (the exact shape
-benchmarked in §4.3.0). Extend `pinned_zone_maps` from `cell(pos, chunk)` to
-`cell(pos, chunk, group)` plus a `group_rows` field, keeping the existing all-or-nothing
-normalization and merge-degradation invariants. `group_rows = G * 1024` with G configurable,
-default 8; a short final group per chunk must be legal (the parquet pin path does not pack whole
-122,880-row units).
+**2a. Capture — DONE (`b672cb62`).**
+`compute_pinned_group_stats(chunk, column_types, group_rows, …)` landed alongside the per-chunk
+function, using one `cudf::segmented_reduce` per column over a fixed-stride offsets column (the
+exact shape benchmarked in §4.3.0), returning a group-major `chunk_group_stats`. Same allowlist,
+same "null cell never prunes" contract, and deliberately the same null precision as the coarse
+capture. 25 cases / 243 assertions cover the edge cases that matter: short final group, all-null
+group, partly-null group, off-allowlist type, `group_rows == 0`, shape mismatch, and
+"one group per chunk reproduces the whole-chunk capture".
+
+Still to do in 2a: extend `pinned_zone_maps` from `cell(pos, chunk)` to `cell(pos, chunk, group)`
+plus a `group_rows` field, keeping the all-or-nothing normalization and merge-degradation
+invariants; and make G configurable (default 8). Deferred until 2b needs it, so the storage shape
+is driven by a real consumer.
 
 **2b. Plan (mechanical).** `build_cached_scan_plan` gains a per-surviving-chunk list of surviving
 *group* ids. A chunk with every group pruned drops out exactly as today; a chunk with every group
