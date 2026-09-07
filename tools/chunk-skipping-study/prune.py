@@ -1,6 +1,9 @@
 import os
 import duckdb, json, re, os, collections
 SP=os.environ.get('SCRATCH','/tmp/sirius-chunk-skipping')
+TAG=os.environ.get('DATASET','/datasets/tpch_sf1000').rstrip('/').split('/')[-1]
+SP=SP+'/'+TAG
+os.makedirs(SP, exist_ok=True)
 c=duckdb.connect()
 
 PREFIX=[('ps_','partsupp'),('l_','lineitem'),('o_','orders'),('c_','customer'),
@@ -188,6 +191,13 @@ for q,per in rep.items():
         if r['filters'] and has_supported:
             cov+=r['read_bytes']; per_t[t][0]+=r['read_bytes']
         per_t[t][1]+=r['read_bytes']
+TOTR=sum(r['rows'] for per in rep.values() for r in per.values())
+PRR=sum(r['pruned_rows'] for per in rep.values() for r in per.values())
+print(f"TOTAL rows scanned across 22 queries: {TOTR/1e9:.2f}e9, prunable {PRR/1e9:.2f}e9 = {100*PRR/TOTR:.2f}%")
+print(f"\nPer-query rows pruned (%):")
+for q in sorted(rep,key=lambda x:int(x[1:])):
+    parts=[f"{t}:{100*r['pruned_rows']/max(r['rows'],1):.0f}%" for t,r in rep[q].items() if r['pruned_rows']>0]
+    if parts: print(f"  {q:<5}"+"  ".join(parts))
 print(f"\nScan volume under >=1 min/max-evaluable predicate: {cov/1e9:.1f} / {tot/1e9:.1f} GB = {100*cov/tot:.1f}%")
 for t,(a,b) in sorted(per_t.items(), key=lambda x:-x[1][1]):
     print(f"  {t:<10} {b/1e9:8.1f} GB scanned, {100*a/max(b,1):5.1f}% under a supported predicate")
