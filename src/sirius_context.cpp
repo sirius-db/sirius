@@ -450,15 +450,25 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
-  // The ctrack aggregate goes to the log every query -- a couple of dozen lines,
-  // and what makes a slow query readable after the fact.  The census and reactor
-  // counters stay on stderr behind SIRIUS_IO_PROFILE: they are benchmark
-  // instruments, and reading them resets them.
+  // Gated, because aggregating the ctrack tables is not free: it walks every
+  // recorded sample across all call sites, and ds::device_read_async alone
+  // records ~17k calls while pinning a TPC-H SF1000 table. Measured on this
+  // branch it added a FLAT ~100 ms to every query end -- +138% on q6 (73 ms ->
+  // 174 ms) and +2% on q21 (1.315 s -> 1.337 s), i.e. the same constant, which
+  // is what identified it. Under SIRIUS_CTRACK_REPORT the aggregate goes to the
+  // log as before; the census and reactor counters keep their own
+  // SIRIUS_IO_PROFILE gate. Reading either resets the samples.
   try {
-    auto const ctrack_report = ctrack_aggregate_report();
-    if (!ctrack_report.empty()) { SIRIUS_LOG_INFO("{}", ctrack_report); }
+    static bool const ctrack_report_enabled = std::getenv("SIRIUS_CTRACK_REPORT") != nullptr;
+    static bool const io_profile            = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
+    std::string ctrack_report;
+    if (ctrack_report_enabled || io_profile) {
+      ctrack_report = ctrack_aggregate_report();
+      if (ctrack_report_enabled && !ctrack_report.empty()) {
+        SIRIUS_LOG_INFO("{}", ctrack_report);
+      }
+    }
 
-    static bool const io_profile = std::getenv("SIRIUS_IO_PROFILE") != nullptr;
     if (io_profile) {
       std::cerr << "\n"
                 << sirius::io::prefetch_census::instance().to_string() << "\n"
