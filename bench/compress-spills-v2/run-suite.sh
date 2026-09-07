@@ -55,11 +55,16 @@ for q in $QLIST; do
   done
 
   log="$REPO/test/tpch_performance/output/${ARM}_${STAMP}_q${q}.log"
+  wd="$REPO/test/tpch_performance/output/watchdog_${ARM}_${STAMP}.log"
+  # Trip count either side of the query, so a kill is attributed to the query it
+  # happened during rather than to every later failure.
+  trips_before=$( { grep -c TRIPPED "$wd" 2>/dev/null || true; } | head -1 ); trips_before=${trips_before:-0}
   echo "=== $ARM q$q ==="
   QUERIES="$q" ITERS="$ITERS" NAME="${ARM}_${STAMP}_q${q}" \
     timeout -s KILL 3600 bash "$SCRIPT" > "$log" 2>&1
   rc=$?
 
+  trips_after=$( { grep -c TRIPPED "$wd" 2>/dev/null || true; } | head -1 ); trips_after=${trips_after:-0}
   dir=$(ls -dt "$REPO"/test/tpch_performance/output/tpch_*_"${ARM}_${STAMP}_q${q}" 2>/dev/null | head -1)
   best=$(awk -F, 'NR>1 && $4!="" {if (b=="" || $4+0<b) b=$4+0} END {if (b!="") printf "%.4f", b}' \
            "$dir/csv/runtimes.csv" 2>/dev/null)
@@ -70,9 +75,8 @@ for q in $QLIST; do
     status=pin_oom          # pinned column set larger than the GPU tier
   elif grep -q "exceeded maximum retry limit\|Sirius GPU execution failed" "$log"; then
     status=gpu_oom          # GPU ran out mid-query; no CPU fallback (by design)
-  elif grep -q "TRIPPED" "$REPO/test/tpch_performance/output/watchdog_${ARM}_${STAMP}.log" 2>/dev/null \
-       && [ $rc -ne 0 ]; then
-    status=watchdog_killed  # host memory floor hit; see the watchdog log
+  elif [ "$trips_after" -gt "$trips_before" ]; then
+    status=watchdog_killed  # host memory floor hit DURING this query; see the watchdog log
   elif [ $rc -eq 137 ]; then
     status=timeout
   else

@@ -483,6 +483,35 @@ def derive_execution_config(overrides, config_path, benchmark_dir):
     return effective_path
 
 
+def fadvise_dontneed_input(source, data_source="parquet"):
+    """Evict input dataset pages from the OS page cache via posix_fadvise(DONTNEED).
+
+    Unlike drop_os_cache(), which writes /proc/sys/vm/drop_caches and needs
+    passwordless sudo, this requires no privileges — it only evicts the pages
+    belonging to the benchmark's own input files, which is why the default
+    (no --execution) path uses it. os.sync() runs first so dirty pages are
+    flushed before eviction.
+    """
+    if data_source == "duckdb":
+        files = [source]
+    else:
+        files = []
+        for table in TPCH_TABLES:
+            files.extend(_resolve_parquet_files(source, table))
+
+    os.sync()
+    evicted = 0
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                os.posix_fadvise(f.fileno(), 0, size, os.POSIX_FADV_DONTNEED)
+                evicted += 1
+        except OSError as e:
+            log(f"WARNING: fadvise({path}): {e}")
+    log(f"posix_fadvise(DONTNEED) applied to {evicted} file(s)")
+
+
 def can_drop_os_cache():
     """Whether drop_os_cache() would work, without dropping anything.
 
@@ -511,22 +540,6 @@ def drop_os_cache():
             "Failed to drop OS cache. Set up passwordless sudo as described "
             f"in test/tpch_performance/CLAUDE.md (stderr: {proc.stderr.strip()})"
         )
-    else:
-        files = []
-        for table in TPCH_TABLES:
-            files.extend(_resolve_parquet_files(source, table))
-
-    os.sync()
-    evicted = 0
-    for path in files:
-        try:
-            with open(path, "rb") as f:
-                size = os.fstat(f.fileno()).st_size
-                os.posix_fadvise(f.fileno(), 0, size, os.POSIX_FADV_DONTNEED)
-                evicted += 1
-        except OSError as e:
-            log(f"WARNING: fadvise({path}): {e}")
-    log(f"posix_fadvise(DONTNEED) applied to {evicted} file(s)")
 
 
 def _resolve_parquet_files(parquet_dir, table):
@@ -609,6 +622,20 @@ def open_connection(source, gpu_execution=False, data_source="parquet"):
         log(f"Loading Sirius extension from {EXTENSION_PATH}")
         con.execute(f"LOAD '{EXTENSION_PATH}'")
         log("Sirius extension loaded")
+        # Applied for every run, not only the nsys path in _build_nsys_temp_sql.
+        if PIN_COMPRESSION_PLAN_DIR:
+            log(f"Enabling Simpatico pin compression (plans: {PIN_COMPRESSION_PLAN_DIR})")
+            con.execute("SET pin_table_compression = true;")
+            con.execute(
+                "SET pin_table_input_compression_plan_dir = "
+                f"'{PIN_COMPRESSION_PLAN_DIR}';"
+            )
+        # Likewise for SIRIUS_PRE_SQL, which carries settings such as
+        # enable_duckdb_fallback.
+        pre_sql = os.environ.get("SIRIUS_PRE_SQL", "").strip()
+        if pre_sql:
+            log(f"Executing SIRIUS_PRE_SQL: {pre_sql}")
+            _execute_multi(con, pre_sql)
 
     if data_source != "duckdb":
         log("Registering TPC-H parquet views")
@@ -1671,7 +1698,7 @@ def main():
     log(f"Runtime CSV:   {runtime_csv}")
     log(f"Log dir:       {log_dir}")
 
-    drop_os_cache(source, args.data_source)
+    fadvise_dontneed_input(source, args.data_source)
     with open(runtime_csv, "w", newline="") as f:
         writer = RuntimeCsv(csv.writer(f), len(queries))
         writer.writerow(["engine", "query", "iteration", "runtime_s"])

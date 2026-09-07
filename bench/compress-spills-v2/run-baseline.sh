@@ -29,7 +29,10 @@ PIN="${PIN:-gpu}"
 PIN_HOST_TABLES="${PIN_HOST_TABLES:-PART CUSTOMER SUPPLIER NATION REGION PARTSUPP}"
 
 
-[ -d "$DATA" ] || { echo "ERROR: dataset not found at $DATA"; exit 1; }
+case "$DATA" in
+  s3://*) : ;;  # remote: resolved by sirius_httpfs at bind time, not on this fs
+  *) [ -d "$DATA" ] || { echo "ERROR: dataset not found at $DATA"; exit 1; } ;;
+esac
 [ -d "$PLANS" ] || { echo "ERROR: compression plans not found at $PLANS"; exit 1; }
 [ -f "$CFG" ]  || { echo "ERROR: config not found at $CFG"; exit 1; }
 mkdir -p /mnt/datasets/sirius_spill
@@ -55,18 +58,25 @@ export SIRIUS_EXP_FUSED_SCAN_FILTER=1
 export SIRIUS_PRE_SQL="SET expression_evaluator_strategy = 'ast_jit'; SET enable_duckdb_fallback = false"
 
 # Pin all TPC-H tables into the GPU tier.
-for t in LINEITEM ORDERS PART CUSTOMER SUPPLIER NATION REGION PARTSUPP; do
-  if [ "$PIN" = "mixed" ]; then
-    case " $PIN_HOST_TABLES " in *" $t "*) tier=host ;; *) tier=gpu ;; esac
-  else
-    tier="$PIN"
-  fi
-  export "SIRIUS_PIN_TIER_$t=$tier"
-done
+# PIN=none leaves the per-table tier vars unset: pin_table is never called, and
+# an s3:// input cannot be pinned at all (pin_table globs local files).
+if [ "$PIN" != "none" ]; then
+  for t in LINEITEM ORDERS PART CUSTOMER SUPPLIER NATION REGION PARTSUPP; do
+    if [ "$PIN" = "mixed" ]; then
+      case " $PIN_HOST_TABLES " in *" $t "*) tier=host ;; *) tier=gpu ;; esac
+    else
+      tier="$PIN"
+    fi
+    export "SIRIUS_PIN_TIER_$t=$tier"
+  done
+fi
 
 echo "data      : $DATA"
 echo "config    : $CFG"
 HARNESS_PIN="$PIN"
+# Compression happens at pin time, so the flag needs a pinned tier.
+PIN_COMPRESSION_ARGS="--pin-compression --compression-plan-dir $PLANS"
+[ "$PIN" = "none" ] && PIN_COMPRESSION_ARGS=""
 [ "$PIN" = "mixed" ] && HARNESS_PIN=gpu
 echo "pin tier  : $PIN"
 [ "$PIN" = "mixed" ] && echo "host tables: $PIN_HOST_TABLES"
@@ -85,8 +95,10 @@ cd "$REPO"
 # (OVERRIDE_GIT_DESCRIBE is required -- duckdb-python is tagged v1.5.4 and the
 # extension refuses to load into a mismatched engine version. --config-settings
 # is also required: their build backend asserts config_settings is not None.)
+# No --execution flag: the named profiles override the config given here, and
+# `--execution hot` additionally drops the OS cache at start.
 pixi run -e duckdb-python python test/tpch_performance/performance_test.py \
   --input "$DATA" \
-  --mode grouped --iterations "$ITERS" --engine gpu --pin "$HARNESS_PIN" \
-  --pin-compression --compression-plan-dir "$PLANS" \
+  --iterations "$ITERS" --engine gpu --pin "$HARNESS_PIN" \
+  $PIN_COMPRESSION_ARGS \
   --queries "$QUERIES" --name "$NAME"

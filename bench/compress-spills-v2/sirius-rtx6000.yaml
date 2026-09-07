@@ -66,9 +66,11 @@ sirius:
             enable: true
             num_threads: 3
           num_threads: 4
-          use_sirius_datasource: true
+          # sirius backend: uring for local paths, REST for s3:// URLs.
+          # The cache sub-node is omitted so it defaults to mode "none"
+          # (O_DIRECT, no cache anywhere).
+          backend: sirius
           uring_n_reactors: 2
-          enable_prefetch_cache: false
         pipeline:
             num_threads: 6
         downgrade:
