@@ -47,6 +47,48 @@ namespace sirius::scan_manager {
   rmm::device_async_resource_ref mr);
 
 /**
+ * @brief Per-group zone-map statistics for ONE pinned chunk.
+ *
+ * A group is @c group_rows consecutive rows of the chunk — by construction a whole number of
+ * simpatico 1024-row decode chunks, so group g covers decode chunks [g*G, (g+1)*G) and a
+ * surviving group expands into a chunk-id list with a shift. The final group of a chunk may be
+ * short; the parquet pin path does not pack whole 122,880-row units.
+ *
+ * @c groups is group-major: groups[g][i] = statistics of chunk column i over group g, with the
+ * same "null cell never prunes" contract as @ref compute_pinned_chunk_stats. Empty @c groups
+ * means capture did not run or produced nothing usable.
+ */
+struct chunk_group_stats {
+  std::size_t group_rows{0};
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> groups;
+
+  [[nodiscard]] bool empty() const noexcept { return groups.empty(); }
+  [[nodiscard]] std::size_t group_count() const noexcept { return groups.size(); }
+};
+
+/**
+ * @brief Compute per-group min/max (zone-map) statistics for a pinned chunk.
+ *
+ * Same type allowlist and same soundness contract as @ref compute_pinned_chunk_stats, but at
+ * @p group_rows granularity instead of one cell per chunk. Uses a single segmented reduction per
+ * column rather than one reduction per group: measured at 1.7x the cost of the whole-chunk
+ * capture for a 189M-row chunk at group_rows=8192 (see CHUNK_SKIPPING_PLAN.md §4.3.0).
+ *
+ * Null handling matches the coarse capture's precision deliberately: a column with no nulls marks
+ * every group CANNOT_HAVE_NULL_VALUES, otherwise every group is marked "may have nulls". Per-group
+ * exact null counts would need a second segmented reduction and nothing consumes them yet.
+ *
+ * @p group_rows must be non-zero; a zero or out-of-range value yields an empty result (no stats,
+ * never prunes) rather than throwing.
+ */
+[[nodiscard]] chunk_group_stats compute_pinned_group_stats(
+  cudf::table_view const& chunk,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::size_t group_rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
  * @brief Zone-map sidecar of a pinned entry: pin-time DuckDB types plus per-chunk BaseStatistics
  * for each cached column, positional with the entry's cache_info.column_ids.
  *

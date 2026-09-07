@@ -997,3 +997,141 @@ TEST_CASE("build_cached_scan_plan - duplicate column names never alias (position
   REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
   REQUIRE(plan.pruned == 2);
 }
+
+// ---------------------------------------------------------------------------
+// compute_pinned_group_stats — the per-group (G * 1024 rows) capture.
+// Same allowlist and same "null cell never prunes" contract as the whole-chunk
+// capture; the difference is one segmented reduction per column instead of one
+// reduction per group. See CHUNK_SKIPPING_PLAN.md §4.3.0.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// Run the group capture over a single-column chunk with @p type declared for it.
+sirius::scan_manager::chunk_group_stats capture_groups(cudf::column_view const& col,
+                                                       LogicalType const& type,
+                                                       std::size_t group_rows)
+{
+  auto& e     = genv();
+  auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+  auto stream = sirius::test::operator_utils::default_stream();
+  return sirius::scan_manager::compute_pinned_group_stats(
+    cudf::table_view{{col}}, duckdb::vector<LogicalType>{type}, group_rows, stream, mr);
+}
+
+/// [min, max] of a group cell, as ints.
+std::pair<int32_t, int32_t> int_bounds(duckdb::BaseStatistics const& s)
+{
+  return {duckdb::NumericStats::Min(s).GetValue<int32_t>(),
+          duckdb::NumericStats::Max(s).GetValue<int32_t>()};
+}
+}  // namespace
+
+TEST_CASE("compute_pinned_group_stats - exact per-group bounds", "[pinned_chunk_stats]")
+{
+  SECTION("groups divide the chunk evenly")
+  {
+    // 8 rows, 2 groups of 4: [5,1,9,3] -> [1,9]; [40,42,41,44] -> [40,44].
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3, 40, 42, 41, 44});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 4);
+    REQUIRE(gs.group_rows == 4);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] != nullptr);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+    REQUIRE(int_bounds(*gs.groups[1][0]) == std::pair<int32_t, int32_t>{40, 44});
+  }
+
+  SECTION("a short final group is captured, not dropped")
+  {
+    // 7 rows, group_rows 3 -> groups of 3, 3, 1. The parquet pin path does not
+    // pack whole 122,880-row units, so a short tail group must be legal.
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 30, 33, 31, 77});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 3);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+    REQUIRE(int_bounds(*gs.groups[1][0]) == std::pair<int32_t, int32_t>{30, 33});
+    REQUIRE(int_bounds(*gs.groups[2][0]) == std::pair<int32_t, int32_t>{77, 77});
+  }
+
+  SECTION("one group per chunk reproduces the whole-chunk capture")
+  {
+    auto col    = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto coarse = capture_one(col->view(), LogicalType::INTEGER);
+    auto gs     = capture_groups(col->view(), LogicalType::INTEGER, 4);
+    REQUIRE(gs.group_count() == 1);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == int_bounds(*coarse));
+  }
+
+  SECTION("group_rows larger than the chunk yields a single group")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 1024);
+    REQUIRE(gs.group_count() == 1);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+  }
+
+  SECTION("DATE reduces in the date domain")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::TIMESTAMP_DAYS, {100, 90, 5000, 4000});
+    auto gs  = capture_groups(col->view(), LogicalType::DATE, 2);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(duckdb::NumericStats::Min(*gs.groups[0][0]) == Value::DATE(duckdb::date_t{90}));
+    REQUIRE(duckdb::NumericStats::Max(*gs.groups[1][0]) == Value::DATE(duckdb::date_t{5000}));
+  }
+}
+
+TEST_CASE("compute_pinned_group_stats - nulls and degenerate input", "[pinned_chunk_stats]")
+{
+  SECTION("a partly-null group reduces over its valid rows")
+  {
+    // Group 0 = [5, NULL, 9]; min/max must ignore the null, and the cell must
+    // advertise that nulls are possible.
+    auto col = make_gpu_col<int32_t>(
+      cudf::type_id::INT32, {5, 7, 9, 30, 33, 31}, {true, false, true, true, true, true});
+    auto gs = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{5, 9});
+    REQUIRE(gs.groups[0][0]->CanHaveNull());
+  }
+
+  SECTION("an all-null group leaves its cell absent, which never prunes")
+  {
+    auto col = make_gpu_col<int32_t>(
+      cudf::type_id::INT32, {5, 7, 9, 30, 33, 31}, {true, true, true, false, false, false});
+    auto gs = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] != nullptr);
+    REQUIRE(gs.groups[1][0] == nullptr);
+  }
+
+  SECTION("a type outside the allowlist leaves every cell absent")
+  {
+    auto col = make_gpu_col<float>(cudf::type_id::FLOAT32, {1.0f, 2.0f, 3.0f, 4.0f});
+    auto gs  = capture_groups(col->view(), LogicalType::FLOAT, 2);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] == nullptr);
+    REQUIRE(gs.groups[1][0] == nullptr);
+  }
+
+  SECTION("group_rows == 0 yields no statistics rather than throwing")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 0);
+    REQUIRE(gs.empty());
+  }
+
+  SECTION("a column count that disagrees with column_types captures nothing")
+  {
+    auto& e     = genv();
+    auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+    auto stream = sirius::test::operator_utils::default_stream();
+    auto a      = make_gpu_col<int32_t>(cudf::type_id::INT32, {1, 2, 3, 4});
+    auto b      = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 6, 7, 8});
+    auto gs     = sirius::scan_manager::compute_pinned_group_stats(
+      cudf::table_view{{a->view(), b->view()}},
+      duckdb::vector<LogicalType>{LogicalType::INTEGER},
+      2,
+      stream,
+      mr);
+    REQUIRE(gs.empty());
+  }
+}
