@@ -26,6 +26,8 @@
 #include "spill_context.hpp"
 
 #include <cudf/column/column.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -363,6 +365,101 @@ std::vector<std::string> synthetic_column_names(int n)
 /// round-trips through both the in-memory and the file path.
 constexpr auto kPassthroughDsl = "input -> identity\n";
 
+/// Dictionary cascade for a STRING column: the distinct values are stored once
+/// and each row becomes a bitpacked index into them.
+constexpr auto kDictionaryDsl =
+  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+  "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+
+/// Windows of this many rows are sketched to estimate a STRING column's
+/// cardinality. A window is a `cudf::slice` view, so sampling itself allocates
+/// nothing.
+constexpr cudf::size_type kCardinalityWindowRows = 128 * 1024;
+/// Number of windows spread across the column. Several windows rather than one
+/// prefix because a spilled column is often clustered by a partition key, and a
+/// single window of a clustered column looks far less distinct than the whole.
+constexpr int kCardinalityWindows = 8;
+/// Below this the column is cheap to spill either way; skip the probe.
+constexpr cudf::size_type kMinRowsForCardinalityProbe = 4096;
+/// HyperLogLog precision: 2^12 registers = 16 KiB, ~1.6% standard error. The
+/// decision below is an order-of-magnitude one, so 1.6% is far more than enough,
+/// and 16 KiB is affordable on a path that runs *because* memory ran out.
+constexpr std::int32_t kCardinalityPrecision = 12;
+/// Take the dictionary only while distinct values stay well under the row count.
+///
+/// A dictionary stores the key set once plus ceil(log2(D)) bits per row, against
+/// raw's bytes-per-value plus a 4-byte offset. With D far below the row count the
+/// index is much narrower than the string, so the cascade wins by a wide margin;
+/// as D approaches the row count the key set converges on the whole column and
+/// the indices become pure overhead. TPC-H shows both ends: the offline SF1000
+/// plans pick dictionary for l_returnflag (19.3x), l_linestatus (37.4x) and
+/// l_shipinstruct (61.8x), and reject it for the near-unique l_comment. A tenth
+/// sits far enough below the crossover to keep that separation without needing a
+/// precise estimate.
+constexpr double kMaxDistinctFraction = 0.1;
+
+/// Choose between the dictionary cascade and a raw spill for a STRING column.
+///
+/// Strings were previously always stored raw, which on TPC-H q9/SF3000 left the
+/// single largest column in the batch (40.9% of its bytes) uncompressed while
+/// `simpatico explore` found 17.5x on it with exactly this cascade.
+///
+/// Sampling, not a full pass: the sketch is fed a few `cudf::slice` windows, so
+/// the probe costs a bounded amount of work and no allocation beyond the 16 KiB
+/// sketch, whatever the column's size. The statistic that comes back — distinct
+/// values per sampled row — is the one that matters, because it is what sets the
+/// index width. Misjudging it is not a correctness risk either way: an
+/// over-optimistic dictionary still round-trips, and the batch's compression gate
+/// declines it if it fails to pay.
+std::string default_string_plan(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  if (col.size() < kMinRowsForCardinalityProbe) { return kPassthroughDsl; }
+
+  try {
+    const auto rows   = col.size();
+    const auto window = std::min(kCardinalityWindowRows, rows);
+    const auto stride =
+      std::max(window, rows / kCardinalityWindows);  // no overlap between windows
+
+    std::optional<cudf::approx_distinct_count> sketch;
+    cudf::size_type sampled = 0;
+    for (cudf::size_type begin = 0; begin < rows; begin += stride) {
+      const auto end = std::min(begin + window, rows);
+      if (end <= begin) { break; }
+      const auto slice = cudf::slice(col, {begin, end}).front();
+      const cudf::table_view one{{slice}};
+      if (sketch.has_value()) {
+        sketch->add(one, stream);
+      } else {
+        sketch.emplace(one,
+                       kCardinalityPrecision,
+                       cudf::null_policy::EXCLUDE,
+                       cudf::nan_policy::NAN_IS_NULL,
+                       stream);
+      }
+      sampled += end - begin;
+    }
+    if (!sketch.has_value() || sampled == 0) { return kPassthroughDsl; }
+
+    const auto distinct = sketch->estimate(stream);
+    const bool use_dict =
+      static_cast<double>(distinct) <= kMaxDistinctFraction * static_cast<double>(sampled);
+    SIRIUS_LOG_DEBUG(
+      "[compression_converters] string cardinality probe: ~{} distinct in {} sampled rows "
+      "(of {}) -> {}",
+      distinct,
+      sampled,
+      rows,
+      use_dict ? "dictionary" : "raw");
+    if (use_dict) { return kDictionaryDsl; }
+  } catch (const std::exception& e) {
+    // The probe is an optimisation; never let it fail a spill.
+    SIRIUS_LOG_DEBUG("[compression_converters] string cardinality probe failed ({}); storing raw",
+                     e.what());
+  }
+  return kPassthroughDsl;
+}
+
 /// Default plan for a column with no offline plan to seed from.
 ///
 /// A fixed choice costs nothing to make, so an edge can start compressing on its
@@ -383,12 +480,12 @@ constexpr auto kPassthroughDsl = "input -> identity\n";
 /// recovers, because partitioning has already narrowed TPC-H's key columns before
 /// they spill.
 ///
-/// Non-fixed-width columns (STRING, nested) are stored raw. A str_split cascade
-/// was tried for STRING and is not obviously worth the risk as a blind default:
-/// its cost profile on real data is unmeasured, and getting it wrong is expensive
-/// on exactly the heavily-spilling queries this is meant to help.
-std::string default_plan_for(cudf::data_type type)
+/// STRING columns choose between dictionary and raw on an estimated cardinality;
+/// see default_string_plan. Nested types are still stored raw.
+std::string default_plan_for(cudf::column_view const& col, rmm::cuda_stream_view stream)
 {
+  const auto type = col.type();
+  if (type.id() == cudf::type_id::STRING) { return default_string_plan(col, stream); }
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
   // DECIMAL128 gets `ans`, not bitpack: bitpack encodes a decimal column as its
   // integer storage, but the codegen dtype vocabulary stops at 64 bits, so a
@@ -445,7 +542,7 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
     std::vector<column_state> defaults;
     defaults.reserve(static_cast<std::size_t>(view.num_columns()));
     for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-      defaults.push_back(column_state{.dsl    = default_plan_for(view.column(i).type()),
+      defaults.push_back(column_state{.dsl    = default_plan_for(view.column(i), stream),
                                       .viable = true});
     }
     return defaults;
@@ -494,7 +591,7 @@ std::vector<column_state> resolve_or_explore_spill_plan(cudf::table_view view,
         initial.push_back({std::move(*(*seeds)[i]), /*ratio=*/1.0, /*c=*/0.0, /*d=*/0.0});
       } else {
         initial.push_back(
-          {default_plan_for(view.column(static_cast<cudf::size_type>(i)).type()), 1.0, 0.0, 0.0});
+          {default_plan_for(view.column(static_cast<cudf::size_type>(i)), stream), 1.0, 0.0, 0.0});
       }
     }
     SIRIUS_LOG_DEBUG(
@@ -672,7 +769,7 @@ staged_compression compress_for_spill(
 
     // A column with no plan of its own falls back to its dtype's default
     // carrier; default_plan_for has one for every dtype.
-    const std::string fallback_plan = default_plan_for(col.type());
+    const std::string fallback_plan = default_plan_for(col, stream);
     const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
     try {
       auto encoded = encode(plan);
@@ -1030,7 +1127,7 @@ std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column
     // Same dtype-aware carrier as the whole-table path: default_plan_for picks a
     // plan that can round-trip the column's dtype.
     const std::string fallback_plan =
-      default_plan_for(view.column(static_cast<cudf::size_type>(i)).type());
+      default_plan_for(view.column(static_cast<cudf::size_type>(i)), stream);
     const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
     try {
       encoded = encode(plan);
@@ -1350,7 +1447,7 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_device(
   std::vector<std::uint64_t> original_bytes(num_columns, 0);
   for (std::size_t i = 0; i < num_columns; ++i) {
     const auto col = view.column(static_cast<cudf::size_type>(i));
-    dsls.push_back((*plans)[i].has_value() ? *(*plans)[i] : default_plan_for(col.type()));
+    dsls.push_back((*plans)[i].has_value() ? *(*plans)[i] : default_plan_for(col, stream));
     original_bytes[i] = simpatico::column_size_bytes_ex(col, stream);
   }
   simpatico::compressed_table ct = compress_columns_with_plans(
