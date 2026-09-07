@@ -198,8 +198,10 @@ statistics read from the parquet footers.
 Every one of lineitem's 5,640 row groups has `l_shipdate` min/max = `1992-01-02 … 1998-12-01`. The
 data is generated in `orderkey` order and every date column is effectively uniform-random within
 each ~1M-row group, so no date, quantity or discount predicate excludes anything. String columns
-(`l_returnflag`, `l_shipmode`, `l_shipinstruct`, `c_mktsegment`, `p_brand`, …) carry **no min/max
-statistics at all** in these files and there are **zero bloom filters**.
+(`l_returnflag`, `l_shipmode`, `l_shipinstruct`, …) *do* carry min/max statistics — verified,
+0 of 94 row groups missing them — but a 1M-row group of a 3-to-7-value column contains every
+value, so `[min, max]` spans the whole domain and excludes nothing either. There are **zero bloom
+filters**, which is the only structural gap in the footers.
 
 This is not a Sirius bug — Sirius's cuDF stats pruning
 (`src/op/scan/parquet_gpu_ingestible.cpp:801-810`) is doing exactly the right thing and finding
@@ -259,8 +261,12 @@ turns those into exact tests. In the sweep, the `minmax+bitset` mode is identica
 *except* it makes those queries prunable whenever the column is a sort prefix — which is why
 `sort:(shipmode, shipdate)` reaches 73% where `sort:shipdate` reaches 60%.
 
-This is W4, and it is the piece with no parquet equivalent: these columns have no parquet
-statistics at all (§3.1), so Simpatico can prune where the parquet reader structurally cannot.
+This is W4. Note the reason min/max fails here is *distributional*, not a missing-statistics
+problem — the footers do carry string min/max (§3.1); they just span the whole domain. What
+parquet lacks is the *shape* of metadata that can answer set membership. Parquet's own answer is
+the bloom filter, which these files do not have and which DuckDB only consults as a fallback
+(`parquet_reader.cpp:1243-1249`); a per-chunk present-values bitmap is both smaller and exact for
+the cardinalities involved.
 
 ### 3.5 How this translates to Simpatico
 
@@ -288,9 +294,33 @@ statistics at all (§3.1), so Simpatico can prune where the parquet reader struc
 (`tools/chunk-skipping-study/mksorted.py`). Row-group spans went from **2,525 days to 4.4 days**
 (lineitem) and 2,405 → 20.7 days (orders); the six lineitem files are non-overlapping in date.
 
-*Methodology note:* DuckDB's `FILE_SIZE_BYTES` rotation writes files in parallel and does **not**
+*Methodology note 1:* DuckDB's `FILE_SIZE_BYTES` rotation writes files in parallel and does **not**
 preserve a global `ORDER BY` across them — the first attempt produced overlapping files and only a
 197-day average span. The dataset must be written to one file and then split by `LIMIT`/`OFFSET`.
+
+*Methodology note 2 — writer provenance.* Every other tree under `/datasets/` was written by
+**parquet-rs 57.3.1**; the clustered tree is written by **DuckDB 1.5.5**, and the two writers do not
+agree on encoding:
+
+| | parquet-rs | DuckDB |
+|---|---|---|
+| `l_orderkey`, `l_partkey`, `l_suppkey`, `l_extendedprice` | `DELTA_BINARY_PACKED` | `PLAIN` |
+| `l_comment` | `DELTA_LENGTH_BYTE_ARRAY` | `PLAIN` |
+| dates, decimals, low-card strings | `RLE_DICTIONARY`, several **uncompressed** | `PLAIN_DICTIONARY`, all snappy |
+| `l_orderkey` type | `INT64` | `INT64` + `converted_type=INT_64` |
+
+Decimals are INT64-backed on both, so the FLBA-decimal probe that disables pushdown
+(`src/op/scan/parquet_gpu_ingestible.cpp:700-724`) does not fire either way. But the encodings
+drive different cuDF decode paths, so **absolute scan times are not comparable across the two
+trees.** Consequences:
+
+- The **pruning** figures above are safe: they are computed from footer statistics, which both
+  writers emit correctly, and the headline is row-weighted (row counts are identical at 12.69e9).
+  The byte figures are not comparable, which is why they are reported separately.
+- A sorted-vs-unsorted **timing** comparison is not safe against `/datasets/tpch_sf100`. For that,
+  use `/datasets/tpch_sf100_duckdb_natural` — the same tables through the same DuckDB writer with
+  the `ORDER BY` removed (`SORT=0 python mksorted.py`), so the only variable is row order.
+- Phase 1's primary experiment (pruning on vs off on one dataset) is unaffected by any of this.
 
 Row-group pruning, same 22 queries, same script, both datasets at SF100 (identical row counts, so
 the row-weighted figure is a clean comparison; byte figures are not, because the two datasets were
@@ -711,7 +741,7 @@ Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
 
 1. W1 in-kernel early-out — free, no storage, applies to the `input -> bitpack` columns.
 2. W4 dictionary present-value bitmaps — the only path to pruning on `l_shipmode`-style
-   predicates (§3.4), and a capability parquet structurally cannot match.
+   predicates (§3.4), where min/max spans the whole domain regardless of granularity.
 3. W4 per-group null counts — unblocks compressed late-materialization, a separate win.
 4. **Clustering as a first-class pin option.** None of the above pays on TPC-H as it sits (§3.1);
    this is what converts 0% into ~34–38%. Arguably the real project, with the metadata as what
