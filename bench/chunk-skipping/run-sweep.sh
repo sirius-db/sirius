@@ -41,8 +41,14 @@ for batch in $BATCHES; do
     # 'off' is a statless pin — a clean "feature absent" arm. The pinned DATA is identical
     # either way (narrowing is driven by pinned_column_types, not by this flag); only the
     # sidecar differs.
-    sed "s|^    operator_params:|    operator_params:\n        scan_task_batch_size: $batch\n        enable_pinned_zone_map_pruning: $([ "$prune" = on ] \&\& echo true || echo false)|" \
+    # Compute the flag BEFORE the sed. Do not inline a $( ... && ... ) here: '&' is special in
+    # sed's replacement text, escaping it as '\&\&' breaks the shell's AND operator, and the
+    # substitution then silently yields "false" for BOTH arms — which is exactly how the first
+    # run of this sweep produced a meaningless result.
+    if [ "$prune" = on ]; then flag=true; else flag=false; fi
+    sed "s|^    operator_params:|    operator_params:\n        scan_task_batch_size: $batch\n        enable_pinned_zone_map_pruning: $flag|" \
       "$HERE/sirius-sf100.yaml" > "$cfg"
+    grep -q "enable_pinned_zone_map_pruning: $flag" "$cfg" || { echo "ERROR: config injection failed"; exit 1; }
     export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
 SET pin_table_input_compression_plan_dir = '$PLANS'; \
 SET expression_evaluator_strategy = 'ast_jit'"
@@ -52,6 +58,16 @@ SET expression_evaluator_strategy = 'ast_jit'"
       --input "$DATA" --data-source parquet \
       --mode grouped --iterations "$ITERS" --engine gpu --pin gpu \
       --queries 1-22 --config "$cfg" --name "$name" --output "$OUT"
+
+    # Guard: the ON arm MUST show pruning. A silently-misconfigured arm would otherwise be
+    # reported as "the feature does not help", which is the one wrong answer this sweep can give.
+    if [ "$prune" = on ]; then
+      run_dir=$(ls -dt "$OUT"/tpch_*"$name" 2>/dev/null | head -1)
+      if ! grep -rq "zone-map pruning for pinned entry" "$run_dir/log_dir" 2>/dev/null; then
+        echo "ERROR: prune-on arm at $batch pruned nothing — check the config and the pin tier"
+        exit 1
+      fi
+    fi
   done
 done
 echo "results under $OUT"
