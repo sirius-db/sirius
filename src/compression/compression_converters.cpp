@@ -390,30 +390,15 @@ constexpr auto kPassthroughDsl = "input -> identity\n";
 std::string default_plan_for(cudf::data_type type)
 {
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
+  // DECIMAL128 gets `ans`, not bitpack: bitpack encodes a decimal column as its
+  // integer storage, but the codegen dtype vocabulary stops at 64 bits, so a
+  // __int128_t storage type is not fusable and the plan fails outright. `ans` is
+  // not a codegen op and has no such width limit. It also compresses these
+  // columns better -- `simpatico explore` on a TPC-H q18/SF3000 spill batch
+  // measured 5.1x for `ans` on its DECIMAL(38,2) column against 2.1x for bitpack
+  // on the int64 beside it.
+  if (type.id() == cudf::type_id::DECIMAL128) { return "input -> ans\n"; }
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
-}
-
-/// Whether a column of @p type can be carried without a plan of its own.
-///
-/// Two carriers exist for a column the planner has nothing for: `identity`,
-/// which stores the values as a single leaf, and `bitpack`, which stores integral
-/// leaves. Neither covers every dtype:
-///
-///  * `identity` leaves are reconstructed with `cudf::make_numeric_column`
-///    (compressed_table_io.cpp), which accepts only cudf's *numeric* types —
-///    DECIMAL and TIMESTAMP fault with "Invalid, non-numeric type" on the way
-///    back in, long after the spill reported success;
-///  * `bitpack` refuses non-fusable dtypes, DECIMAL128 among them.
-///
-/// So a fixed-width non-numeric column (decimal, timestamp, duration) can only be
-/// spilled compressed when it has a real plan. Without one the batch must decline
-/// to an uncompressed spill — measured on TPC-H q18, where a DECIMAL128 column
-/// took the raw fallback and the query then died in cudf on restore.
-///
-/// STRING and nested types are safe: their passthrough leaves are INT32/INT8.
-bool can_carry_without_plan(cudf::data_type type)
-{
-  return !cudf::is_fixed_width(type) || cudf::is_numeric(type);
 }
 
 // Compress every column of `view` with its own plan, one column per pool stream.
@@ -685,16 +670,10 @@ staged_compression compress_for_spill(
       return compress_columns_with_plans(one_col, {dsl}, one_name, stream, mr);
     };
 
-    // The carrier for a column with no plan of its own depends on its dtype:
-    // `identity` cannot round-trip a decimal or timestamp. default_plan_for picks
-    // the one that can, and can_carry_without_plan says when neither does.
+    // A column with no plan of its own falls back to its dtype's default
+    // carrier; default_plan_for has one for every dtype.
     const std::string fallback_plan = default_plan_for(col.type());
     const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
-    if (!column_plans[i].viable && !can_carry_without_plan(col.type())) {
-      throw std::runtime_error(
-        "[compression_converters] column " + std::to_string(i) +
-        " has no plan and no safe raw carrier for its dtype; spilling uncompressed");
-    }
     try {
       auto encoded = encode(plan);
       if (encoded.columns.empty()) {
@@ -707,7 +686,7 @@ staged_compression compress_for_spill(
       // so it survives the memory pressure that sank the real plan. If the dtype
       // has no safe carrier, or even this throws, the batch genuinely cannot be
       // staged and the caller falls back to an uncompressed spill.
-      if (plan == fallback_plan || !can_carry_without_plan(col.type())) { throw; }
+      if (plan == fallback_plan) { throw; }
       SIRIUS_LOG_DEBUG(
         "[compression_converters] repo={} column {} encode failed ({}); storing it raw",
         static_cast<const void*>(ctx.repo),
@@ -1048,10 +1027,8 @@ std::vector<std::shared_ptr<pinned_compressed_blob>> encode_and_stage_per_column
     };
 
     simpatico::compressed_table encoded;
-    // Same dtype-aware carrier as the whole-table path: `identity` cannot
-    // round-trip a decimal or timestamp. Callers check can_carry_without_plan for
-    // every column *before* releasing the source, so a column reaching here
-    // without a plan always has a usable fallback.
+    // Same dtype-aware carrier as the whole-table path: default_plan_for picks a
+    // plan that can round-trip the column's dtype.
     const std::string fallback_plan =
       default_plan_for(view.column(static_cast<cudf::size_type>(i)).type());
     const std::string& plan = column_plans[i].viable ? column_plans[i].dsl : fallback_plan;
@@ -1189,18 +1166,9 @@ std::unique_ptr<cucascade::idata_representation> compress_gpu_to_host(
   // Releasing early is only safe when *every* column could still be stored by its
   // dtype's default carrier: after the release there is no uncompressed spill to
   // fall back to, so a column whose planned encode fails must have somewhere to
-  // land. A DECIMAL128 column has nowhere — bitpack refuses it and identity cannot
-  // be read back — so on TPC-H q18 the retry loop exhausted its 20 attempts, took
-  // the batch down with it, and the empty batch resurfaced in PARTITION as an
-  // out-of-range access. Such batches take the whole-table path below instead,
-  // where any failure is still a clean decline.
-  const auto early_release_safe = [&] {
-    for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
-      if (!can_carry_without_plan(view.column(i).type())) { return false; }
-    }
-    return true;
-  }();
-  if (ctx.release_columns_early && host_mr_early != nullptr && early_release_safe) {
+  // land. default_plan_for provides one for every dtype, so the release is always
+  // safe; a column whose fallback also fails still declines the whole batch.
+  if (ctx.release_columns_early && host_mr_early != nullptr) {
     column_plans = resolve_or_explore_spill_plan(view, ctx, stream);
     owned        = rep.try_release_table();
     if (owned) {

@@ -65,6 +65,10 @@ class sirius_engine;
 
 namespace duckdb {
 
+/// Load every table plan in @p dir into the global plan register.
+/// Safe to call repeatedly; an empty @p dir is a no-op.
+void load_compression_plan_dir(std::string const& dir);
+
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
 ///

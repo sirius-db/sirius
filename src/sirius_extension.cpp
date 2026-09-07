@@ -2463,7 +2463,11 @@ static void SetPinTableInputCompressionPlanDir(ClientContext& context,
 {
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) { return; }
-  sirius_ctx->get_config().get_compression_config().input_plan_dir = StringValue::Get(parameter);
+  auto const dir = StringValue::Get(parameter);
+  sirius_ctx->get_config().get_compression_config().input_plan_dir = dir;
+  // Load here as well as at initialize(): a SET lands after that scan, so
+  // without this the setting names a directory nothing ever reads.
+  load_compression_plan_dir(dir);
   SIRIUS_LOG_DEBUG("Updated pin_table_input_compression_plan_dir");
 }
 

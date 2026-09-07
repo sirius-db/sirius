@@ -261,6 +261,33 @@ std::optional<std::string> find_legacy_config_file()
 
 }  // namespace
 
+/// Scan @p dir and install every table plan it holds into the global register.
+///
+/// Called from both SiriusContext::initialize() and the
+/// `pin_table_input_compression_plan_dir` setter, so that setting the directory
+/// by SQL loads the plans rather than assigning a field nothing reads again.
+void load_compression_plan_dir(std::string const& dir)
+{
+  if (dir.empty()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::size_t loaded = 0;
+  for (auto const& entry : fs::directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file()) { continue; }
+    std::ifstream f(entry.path());
+    std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (dsl.empty()) { continue; }
+    sirius::compression::plan_register::global().set_table_plan(entry.path().stem().string(),
+                                                                std::move(dsl));
+    ++loaded;
+  }
+  if (ec) {
+    SIRIUS_LOG_WARN("[compression] cannot scan plan dir '{}': {}", dir, ec.message());
+  } else {
+    SIRIUS_LOG_INFO("[compression] loaded {} table plan(s) from '{}'", loaded, dir);
+  }
+}
+
 // ================= sirius_context ================= //
 
 SiriusContext::SiriusContext() = default;
@@ -781,27 +808,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     // pin_table()'s bind, one table at a time — so a query that never pinned
     // anything never loaded them, and the spill path (which reaches them through
     // column lineage, not through pinning) found nothing.
-    if (!comp.input_plan_dir.empty()) {
-      namespace fs = std::filesystem;
-      std::error_code ec;
-      std::size_t loaded = 0;
-      for (auto const& entry : fs::directory_iterator(comp.input_plan_dir, ec)) {
-        if (!entry.is_regular_file()) { continue; }
-        std::ifstream f(entry.path());
-        std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (dsl.empty()) { continue; }
-        sirius::compression::plan_register::global().set_table_plan(entry.path().stem().string(),
-                                                                    std::move(dsl));
-        ++loaded;
-      }
-      if (ec) {
-        SIRIUS_LOG_WARN(
-          "[compression] cannot scan plan dir '{}': {}", comp.input_plan_dir, ec.message());
-      } else {
-        SIRIUS_LOG_INFO(
-          "[compression] loaded {} table plan(s) from '{}'", loaded, comp.input_plan_dir);
-      }
-    }
+    load_compression_plan_dir(comp.input_plan_dir);
   }
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
