@@ -281,6 +281,58 @@ statistics at all (§3.1), so Simpatico can prune where the parquet reader struc
 - **Caveat to carry:** these are *opportunity* numbers (bytes not decoded), not measured query time.
   Nothing here has been run end-to-end. See the log.
 
+### 3.7 Phase 0 result — measured on a clustered dataset (2026-09-07)
+
+`/datasets/tpch_sf100_sorted` was built from `/datasets/tpch_sf100` with lineitem ordered by
+`l_shipdate` and orders by `o_orderdate`, everything else symlinked
+(`tools/chunk-skipping-study/mksorted.py`). Row-group spans went from **2,525 days to 4.4 days**
+(lineitem) and 2,405 → 20.7 days (orders); the six lineitem files are non-overlapping in date.
+
+*Methodology note:* DuckDB's `FILE_SIZE_BYTES` rotation writes files in parallel and does **not**
+preserve a global `ORDER BY` across them — the first attempt produced overlapping files and only a
+197-day average span. The dataset must be written to one file and then split by `LIMIT`/`OFFSET`.
+
+Row-group pruning, same 22 queries, same script, both datasets at SF100 (identical row counts, so
+the row-weighted figure is a clean comparison; byte figures are not, because the two datasets were
+written by different parquet writers with different encodings):
+
+| | unsorted | clustered |
+|---|---|---|
+| rows scanned | 12.69e9 | 12.69e9 |
+| **rows prunable** | **0.00%** | **36.45%** |
+| bytes prunable | 0.00% | 33.85% |
+
+Per-query rows pruned: q14 98%, q15 96%, q6 85%, q20 85%, q12 83%, q7 69%, q10 50%, q1 47%,
+q3 46% on lineitem; q4 96%, q10 96%, q5 83%, q8 69%, q3 50%, q21 47% on orders. The orders
+pruning was not predicted by §3.3 (which only modelled lineitem) and is a free addition.
+
+This lands inside the 34–38% band predicted in §3.3 from the SF10 sweep, which validates the
+projection method.
+
+**The W1 delta-flip risk did not materialise — clustering *strengthens* the free metadata.**
+Running the explorer (`simpatico explore`) on sorted vs unsorted SF100 columns:
+
+| column | unsorted pick | ratio | clustered pick | ratio |
+|---|---|---|---|---|
+| `l_shipdate` | `input -> bitpack` | 2.651x | `input -> bitpack` | **426.5x** |
+| `l_commitdate` | `input -> bitpack` | 2.651x | `input -> bitpack` | 3.992x |
+| `l_receiptdate` | `input -> bitpack` | 2.651x | `input -> bitpack` | 6.311x |
+| `l_quantity` | `input -> bitpack` | 4.885x | `input -> bitpack` | 4.885x |
+| `l_discount` | `input -> bitpack` | 15.604x | `input -> bitpack` | 15.604x |
+| `l_orderkey` | `input -> bitpack` | 6.032x | `input -> bitpack` | 2.174x |
+| `l_returnflag` | `input -> str_split` | 1.000x | `dictionary -> bitpack` | 37.372x |
+
+Every column keeps a bitpack root. Inside a 1024-row chunk of clustered data the values are nearly
+identical, so `chunk_bits` collapses toward zero and plain bitpack already wins — `delta` buys
+nothing. **The prediction in §2/W1 that clustering would flip the date columns to `delta -> bitpack`
+and destroy `chunk_min` is refuted.** (Caveat: these are SF100 single-file columns; the shipped
+SF1000 plan does pick `delta -> bitpack` for `l_orderkey`, so delta roots do occur in practice —
+just not on the columns that do the pruning, and not as a consequence of clustering.)
+
+Clustering also improves compression on the pruning columns (`l_shipdate` 2.651x → 426x), so the
+pin gets smaller as well as more skippable. The net across all 16 columns is not yet measured —
+`l_orderkey` got worse (6.03x → 2.17x) — and needs a full re-explore.
+
 ### 3.6 Reproducing
 
 ```bash
@@ -423,9 +475,102 @@ Compression becomes worth revisiting only if we ever want 1024-row *new* metadat
 
 ---
 
-## 5. Where the index should live: device, host, spilled
+## 5. Clustering: what it costs, and how much of it is enough
 
-### 5.1 Keep the index in device memory even when the data is pinned to host — yes
+§3.1 and §3.7 together say the metadata is the cheap part and the clustering is the whole game
+(0.00% → 36.45%). So the cost of clustering is the project's real budget question. The premise
+here is that it runs as a **preprocessing step at pin time / table registration**, not as an
+offline dataset rewrite.
+
+### 5.1 Measured cost of sorting
+
+Two harnesses, both in `tools/chunk-skipping-study/`: `cpusort.py` (DuckDB, in-memory table, 72
+threads) and `gpusort/sortbench.cu` (a standalone libcudf `sorted_order` + `gather` on a
+lineitem-shaped table; build line in the file header). GB300, 256 GB HBM, 494 GB host.
+
+| method | measured | extrapolated to SF1000 lineitem (6.0e9 rows, 16 cols, 88 B/row) |
+|---|---|---|
+| **CPU** DuckDB in-memory global sort, 72 threads | 600 M rows in **7.6 s** = 79 Mrows/s | **76 s** — and the 600 GB working set exceeds the 494 GB host, so it would spill |
+| **CPU** DuckDB sort + parquet rewrite (what Phase 0 did) | SF100 lineitem: 44 s to one file, **393 s** including the 6-way split | ~65 min. Not viable as preprocessing |
+| **GPU** `sorted_order` + `gather`, one 189 M-row pin chunk | **0.071 s** (0.004 s order + 0.067 s gather) = 2,659 Mrows/s, 234 GB/s | — |
+| **GPU** local sort of all 32 pin chunks | — | **≈ 2.3 s** |
+| **GPU** global sort | does not fit: 528 GB in+out vs 256 GB HBM | needs partition + per-partition sort, ≈ 5 s of GPU work **plus a full-table shuffle** |
+
+**The GPU is ~34× faster than 72 CPU threads** (2,659 vs 79 Mrows/s) and the answer to "would the
+GPU help" is unambiguously yes.
+
+Two structural facts fall out of the split timings:
+
+- **The cost is the gather, not the comparison.** At 800 M rows, `sorted_order` is 0.016 s and the
+  gather is 0.304 s. Sorting is bandwidth-bound on the payload, so its cost scales with *pinned
+  bytes*, not with key cardinality or sortedness.
+- **Which means clustering during pinning is close to free**, because the pin already moves those
+  bytes. In principle the gather can be fused into the existing materialize→compress path rather
+  than run as a separate pass.
+
+**Budget anchor.** The SF1000 hot suite is ~5.8 s of query time, but the whole-process wall is
+~151 s, dominated by pinning. A 2.3 s GPU local sort is **~1.5% of the existing pin cost**; even a
+two-pass global sort is ~3%. Against a 36% reduction in scanned rows, that is not a close call —
+*provided* the skip mechanism can actually exploit the clustering the cheap strategy produces,
+which is the subject of §5.2.
+
+### 5.2 Full sort vs weaker clustering — the tradeoff
+
+You do not need a global sort. Zone maps only care about each group's `[min, max]`, not about
+order within the group, so there are strictly cheaper strategies. Measured on SF10 lineitem with
+the real TPC-H scan predicates (`tools/chunk-skipping-study/cluster_modes.py`), pin chunk sized to
+SF1000's 3.1% of table; mean % of chunks pruned across q1/q3/q6/q7/q10/q12/q14/q15/q20:
+
+| clustering strategy | cost | G=8 (8,192 rows) | G=64 (65,536) | pin chunk |
+|---|---|---|---|---|
+| 0. none (as generated) | — | 0.0% | 0.0% | 0.0% |
+| **1. local sort inside each pin chunk** | one GPU sort per batch, **no shuffle**, streaming | **72.7%** | 67.6% | **0.0%** |
+| 2. range-partition to pin chunks, unsorted within | full-table shuffle, **no comparison sort** | 71.2% | 71.1% | 69.0% |
+| 3. both (= global sort) | shuffle + sort | 73.5% | 73.4% | 71.7% |
+
+The two rows that matter:
+
+- **Local sort is the cheapest possible strategy and gets within 0.8 points of a global sort — but
+  only if the index is fine-grained.** It leaves every pin chunk spanning the full key range, so at
+  pin-chunk granularity it prunes **exactly nothing**. It needs no shuffle, fits on one GPU, is
+  embarrassingly parallel across batches, and drops straight into the streaming pin path.
+- **Range-partitioning is the strategy that works with today's coarse sidecar** (69.0% at pin-chunk
+  granularity) but requires a full-table shuffle, so it cannot be done streaming — it needs the
+  whole table before any chunk is final.
+
+> **This is the strongest argument in the project for the fine index (W3): it is what makes the
+> cheapest clustering strategy viable.** Local sort + a G=8 index ≈ a global sort, with no shuffle
+> and ~2.3 s of GPU time at SF1000.
+
+Note also that G=64 costs 5 points under local sort (72.7% → 67.6%) while costing nothing under the
+other two. Fine granularity matters *more* the weaker the clustering — consistent with §4.1's
+`max(group, clustering window)` rule, where local sort makes the effective window the group size
+itself.
+
+### 5.3 Where it would go, and what it breaks
+
+- **(a) Local sort per pin batch** — insert a `cudf::sort_by_key` in `materialize_pin_batches`
+  (`src/pin_table.cpp`) before compression. Streaming, no extra full-table memory, ~2.3 s at
+  SF1000. Pays only with the fine index.
+- **(b) Range-partition at registration** — two passes over the table, works with the existing
+  coarse sidecar, but cannot be folded into the streaming pin.
+
+Open in both cases: **choosing the sort key.** Needs a workload hint, a `SET` option, or a
+heuristic; out of scope for Phase 0/1.
+
+Reordering rows is not free of consequences — flag before implementing:
+
+1. Late-materialization row addressing is positional within a batch
+   (`src/include/late_mat/column_origin.hpp:26-44`); sorting must happen *before* those ids are
+   handed out, not after.
+2. MVCC deleted-row keep-masks are positional against the pinned order
+   (`src/scan_manager/sirius_scan_manager.cpp:312-318` already special-cases them).
+3. Any consumer relying on scan order matching file order. There should be none, but it is worth
+   an explicit check.
+
+## 6. Where the index should live: device, host, spilled
+
+### 6.1 Keep the index in device memory even when the data is pinned to host — yes
 
 This is the highest-leverage placement decision, and the asymmetry is stark. Take SF1000 lineitem,
 8K stride, 10 filterable columns: **0.11 GB of index against 264 GB of raw / 93 GB of compressed
@@ -455,7 +600,7 @@ unconditionally affordable; if a configuration ever exceeds a budget, drop the *
 before dropping *residency*, because coarsening costs ~0.5 pp of pruning while evicting the index
 to host costs the entire skip mechanism.
 
-### 5.2 When data spills to host
+### 6.2 When data spills to host
 
 Nothing changes for the index: it stays on device. The data moving to host makes the index *more*
 valuable, not less, because the cost of a wrong "do not skip" decision goes up by the H2D transfer.
@@ -467,7 +612,7 @@ Implication for the spill policy: when a table is demoted GPU→host, its index 
 demotion. Since `docs/super-sirius/scan.md:283-288` says statless entries are not retrofittable,
 losing the index on demotion would be permanent for that entry.
 
-### 5.3 When data spills to disk
+### 6.3 When data spills to disk
 
 Here the index should be **kept in device memory and additionally persisted**. Two distinct roles:
 
@@ -485,7 +630,7 @@ adding chunk-range granularity would let a spilled table read back only survivin
 the natural follow-on and the one place `range_slice` (`DECODE_PUSHDOWN_PLAN.md:722-723`) becomes
 necessary.
 
-### 5.4 Summary table
+### 6.4 Summary table
 
 | Data location | Index location | Compressed? | Why |
 |---|---|---|---|
@@ -496,7 +641,7 @@ necessary.
 
 ---
 
-## 6. Proposed order of work — prove value before committing
+## 7. Proposed order of work — prove value before committing
 
 The governing constraint: **on TPC-H as it sits, every implementation measures exactly zero**
 (§3.1). Any proof of value must first create clustered data. And the cheapest honest proof does
@@ -514,7 +659,9 @@ The governing constraint: **on TPC-H as it sits, every implementation measures e
    `chunk_min`? Either answer is useful — it either confirms the out-of-band store is mandatory or
    removes a stated risk.
 
-Cost: under a day, no build.
+**Status: done, 2026-09-07.** Results in §3.7 (0.00% → 36.45% of rows) and §5 (sort costs and the
+clustering-strategy tradeoff). The delta-flip risk was refuted. Actual cost: about half a day, no
+build required.
 
 ### Phase 1 — W2 plus a batch-size sweep: the whole value question, empirically
 
@@ -556,7 +703,7 @@ cheap and iteration is fast; confirm the winning configuration at SF1000 afterwa
 ### Phase 2 — only if Phase 1 pays: the out-of-band group index (W3)
 
 Minimum shape: extend `pinned_zone_maps` from one entry per pin chunk to one per group of G
-chunks, add a device-resident packed mirror (§5.1), have `build_cached_scan_plan` emit surviving
+chunks, add a device-resident packed mirror (§6.1), have `build_cached_scan_plan` emit surviving
 *group* ids, and expand those into a chunk-id list for `chunk_csr`. Default G = 8, configurable.
 Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
 
@@ -570,9 +717,9 @@ Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
    this is what converts 0% into ~34–38%. Arguably the real project, with the metadata as what
    makes it usable.
 
-## 7. Open questions / log
+## 8. Open questions / log
 
-- **2026-09-07** — project opened. Investigation and all measurements in §3–§5 done; nothing
+- **2026-09-07** — project opened. Investigation and all measurements in §3–§6 done; nothing
   implemented, nothing benchmarked end-to-end.
 - **2026-09-07** — plan audit corrected the W1 story: `chunk_min` is a value-domain minimum only
   for `input -> bitpack` roots. `delta -> bitpack` (`l_orderkey`, `o_orderkey`) and
@@ -580,16 +727,23 @@ Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
-- **Open:** all §3 numbers are *bytes-not-decoded*, not query time. Need one end-to-end datapoint —
+- **2026-09-07** — **Phase 0 done.** Built `/datasets/tpch_sf100_sorted`; row-group spans 2525 → 4.4
+  days; pruning 0.00% → **36.45% of rows**, inside the predicted band. The explorer keeps a bitpack
+  root on every clustered column (`l_shipdate` ratio 2.651x → 426x), refuting the delta-flip risk.
+  Added §5: GPU sort is ~34× faster than 72 CPU threads and a per-pin-chunk local sort of SF1000
+  lineitem costs ~2.3 s; local sort reaches 72.7% of the global sort's 73.5% at G=8 but **0.0%** at
+  pin-chunk granularity, which is the strongest argument yet for the fine index.
+- **Open:** the §3/§5 pruning numbers are still *rows/bytes not decoded*, not query time. Need one end-to-end datapoint —
   cheapest is W2 on a GPU-compressed lineitem pin with an artificially clustered SF100.
-- **Open:** is there a pin-time clustering hook at all? `pin_table` packs whole 122,880-row DuckDB
-  row groups (`src/pin_table.cpp:126`); a sort would have to happen before or during that.
-  Cost of sorting 6e9 rows at pin time vs. the 34–38% it unlocks is unmeasured.
+- **Answered (§5.1):** sorting 6e9 rows at pin time costs ~2.3 s on the GPU for a per-chunk local
+  sort — ~1.5% of the existing ~151 s pin. **Open:** where exactly the sort goes in
+  `materialize_pin_batches`, and how the sort key gets chosen.
+- **Open:** does clustering help or hurt the *net* compression ratio across all 16 columns?
+  `l_shipdate` improves 2.651x → 426x but `l_orderkey` degrades 6.03x → 2.17x; needs a full
+  re-explore and a re-picked plan file.
 - **Open:** how much of the suite's time is scan/decode on the winning GPU-compressed config?
   Without that, §3's 40% "of scanned bytes" cannot be converted into an expected speedup.
   `docs/super-sirius/compressed-pinning.md:93` has the closest existing measurement.
-- **Open:** does clustering a date column flip its plan to `delta -> bitpack` and remove the free
-  `chunk_min`? Phase 0 step 2 answers this.
 - **Open:** the `2^chunk_bits − 1` max bound over-estimates the true range by up to 2×. Unmeasured
   how much selectivity that costs versus an exact `chunk_max` (W3).
 - **Open:** interaction with the existing decompression-pushdown path

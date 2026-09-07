@@ -1,7 +1,10 @@
 import os
 import duckdb, os, time
-base='/datasets/tpch_sf1000'
+base=os.environ.get('DATASET','/datasets/tpch_sf1000')
 SP=os.environ.get('SCRATCH','/tmp/sirius-chunk-skipping')
+TAG=os.environ.get('DATASET','/datasets/tpch_sf1000').rstrip('/').split('/')[-1]
+SP=SP+'/'+TAG
+os.makedirs(SP, exist_ok=True)
 c=duckdb.connect()
 parts=[]
 for t in sorted(os.listdir(base)):

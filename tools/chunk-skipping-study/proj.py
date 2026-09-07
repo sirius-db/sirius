@@ -1,6 +1,9 @@
 import os
 import json
 SP=os.environ.get('SCRATCH','/tmp/sirius-chunk-skipping')
+TAG=os.environ.get('DATASET','/datasets/tpch_sf1000').rstrip('/').split('/')[-1]
+SP=SP+'/'+TAG
+os.makedirs(SP, exist_ok=True)
 rep=json.load(open(SP+'/prune_report.json')); sw=json.load(open(SP+'/sweep.json'))
 for layout in ('sort:shipdate','sort:(returnflag,shipdate)','sort:(shipmode,shipdate)'):
   for cs in (8192,65536,262144,1048576):
