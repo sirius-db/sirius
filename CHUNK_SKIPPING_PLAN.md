@@ -695,6 +695,23 @@ build required.
 
 ### Phase 1 — W2 plus a batch-size sweep: the whole value question, empirically
 
+**Status: W2 implemented (`f9ca10ad`), sweep running.** The four plumbing sites landed exactly as
+scoped — `device_pin_result::chunk_stats`, `materialize_all_batches_compressed` no longer forcing
+capture off, `insert_pinned_entry_device` building the sidecar, and the extension passing
+`capture_chunk_stats` through. 189 unit tests pass. First end-to-end chunk skipping on a
+compressed pin, on the clustered SF100 with all eight tables pinned GPU-tier compressed:
+
+```
+[sirius_scan_manager] zone-map pruning for pinned entry 'lineitem' (GPU tier): 26/34 chunks pruned  (q6)
+[sirius_scan_manager] zone-map pruning for pinned entry 'lineitem' (GPU tier): 28/30 chunks pruned  (q14)
+```
+
+76.5% and 93.3% against §3.3's fine-granularity predictions of 84.7% and 98.6% — the expected
+degradation at ~30-chunk granularity, and confirmation that the whole path works.
+
+Harness: `bench/chunk-skipping/run-sweep.sh` + `sirius-sf100.yaml`.
+
+
 **W2 alone is the experiment.** Plumb `capture_chunk_stats` through the device pin path — the four
 sites in §2 — and nothing else. Every downstream component already exists and ships:
 `compute_pinned_chunk_stats`, `pinned_zone_maps`, `build_cached_scan_plan`/`chunk_provably_empty`,

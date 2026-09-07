@@ -48,7 +48,7 @@ SET pin_table_input_compression_plan_dir = '$PLANS'; \
 SET expression_evaluator_strategy = 'ast_jit'"
     name="sf100_$(basename "$DATA")_${batch}_prune-${prune}"
     echo "################ $name"
-    python3 test/tpch_performance/performance_test.py \
+    pixi run python test/tpch_performance/performance_test.py \
       --input "$DATA" --data-source parquet \
       --mode grouped --iterations "$ITERS" --engine gpu --pin gpu \
       --queries 1-22 --config "$cfg" --name "$name" --output "$OUT"
