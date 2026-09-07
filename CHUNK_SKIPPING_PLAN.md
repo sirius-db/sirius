@@ -775,12 +775,43 @@ and fails the run if a prune-on arm logs no pruning.
 
 ### Phase 2 — NEXT: the out-of-band group index (W3)
 
-Phase 1 says build it, for the two reasons above rather than for lineitem prune rate.
+Phase 1 says build it, for the two reasons above rather than for lineitem prune rate. §4.3.0 says
+it is nearly free to build (1.7× the capture W2 already pays, ~0.20 s for all of SF1000 lineitem).
 
-Minimum shape: extend `pinned_zone_maps` from one entry per pin chunk to one per group of G
-chunks, add a device-resident packed mirror (§6.1), have `build_cached_scan_plan` emit surviving
-*group* ids, and expand those into a chunk-id list for `chunk_csr`. Default G = 8, configurable.
-Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
+**The hard part is not the statistics, it is serving a partial chunk.** Today
+`cached_scan_plan::survivor_chunk_indices` selects whole pin chunks, and
+`DECODE_PUSHDOWN_PLAN.md:722-723` records that "a chunk is all-or-nothing today". Three pieces, in
+dependency order:
+
+**2a. Capture (self-contained, testable in isolation).**
+`compute_pinned_group_stats(chunk, column_types, group_rows, …)` alongside the existing per-chunk
+function, using `cudf::segmented_reduce` over a fixed-stride offsets column (the exact shape
+benchmarked in §4.3.0). Extend `pinned_zone_maps` from `cell(pos, chunk)` to
+`cell(pos, chunk, group)` plus a `group_rows` field, keeping the existing all-or-nothing
+normalization and merge-degradation invariants. `group_rows = G * 1024` with G configurable,
+default 8; a short final group per chunk must be legal (the parquet pin path does not pack whole
+122,880-row units).
+
+**2b. Plan (mechanical).** `build_cached_scan_plan` gains a per-surviving-chunk list of surviving
+*group* ids. A chunk with every group pruned drops out exactly as today; a chunk with every group
+surviving carries no list (the common case — keep it free). Preserve the all-pruned sentinel
+(`sirius_scan_manager.cpp:2777-2782`).
+
+**2c. Serve (the real work), by chunk kind:**
+
+| chunk kind | route | notes |
+|---|---|---|
+| uncompressed GPU | `cudf::slice` the surviving group ranges + concatenate | no simpatico involvement; the easy case, good for landing 2a/2b end-to-end first |
+| compressed, `input -> bitpack` root | `simpatico::decompress_column_rows` with a `chunk_row_set` built from the surviving groups | the path already exists and already skips untouched 1024-row chunks (`chunk_row_set.hpp:22-23`). Group g maps to chunk ids `[g·G, (g+1)·G)` by construction — a shift, no modular arithmetic |
+| compressed, `dictionary`/`str_split`/`delta` root | full decode + gather | `decompress_column_rows` refuses these (nullptr + `error_out`, `simpatico_codegen.hpp:261-308`). Per the shipped plans that is `l_orderkey`, `l_shipmode`, `l_comment`, and the dictionary strings — so a mixed table skips what it can and full-decodes the rest |
+
+**Suggested landing order:** 2a with unit tests → 2b → 2c for uncompressed chunks (proves the whole
+path end to end against the existing zone-map tests) → 2c for bitpack-rooted compressed columns
+(where the suite time actually is).
+
+**Measurement that closes it:** re-run `bench/chunk-skipping/run-sweep.sh` at the *production* 8 GB
+batch with the group index on. The target is the 128 MB arm's 71% prune rate at the 8 GB arm's
+batching cost — which the Phase 1 table shows no batch size can deliver.
 
 ### Phase 3+ — in priority order, each independently justifiable
 
