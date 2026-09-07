@@ -738,6 +738,24 @@ This is the third of the three outcomes anticipated below: **the delta grows mon
 granularity refines.** The prune rate climbs 25 → 48 → 66 → 71%, approaching the 73.5% ceiling
 §3.3 predicted for this data and these predicates.
 
+**Run-to-run variance (3 independent processes, 8 GB and 2 GB arms).** Suite totals spread ~0.8%
+process-to-process, so single-arm absolutes are worth about one digit. The deltas are stable:
+
+| arm | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| 8 GB, ON − OFF | +0.1% | −0.0% | +0.4% | **+0.2% (noise)** |
+| 2 GB, ON − OFF | −1.5% | −1.5% | −2.4% | **−1.8%** |
+| 2 GB-ON vs 8 GB-OFF (absolute) | 0.9348 / 0.9544 | 0.9332 / 0.9484 | 0.9294 / 0.9465 | **−1.8%** |
+
+The 2 GB delta is outside the noise floor in all three runs; the 8 GB delta is not. The 512 MB and
+128 MB arms were run once each.
+
+**A free, actionable finding: the optimal batch size shifts once pruning exists.** `scan_task_batch_size`
+was tuned to 8 GB on *unclustered* data with no pruning, where bigger was strictly better
+(`bench/sf1000-repro/sirius-sf1000.yaml:10` records 5 GB → 8 GB as −1.85%). With W2 on clustered
+data the trade reverses at the margin: **2 GB-ON beats 8 GB-OFF by 1.8%**, reproducibly, with no
+code beyond W2. Worth re-testing at SF1000, where 8 GB also peaks at 253.9 GB of 256 GB HBM.
+
 **Mapping SF100 batch sizes onto SF1000.** What governs pruning is the chunk's *fraction of the
 table*, not its byte size (§4.1). SF1000 lineitem at the production 8 GB batch is 189 M of 6.0e9
 rows = **3.1%**; SF100 lineitem at 512 MB is 1/25…1/57 = **1.8–4.0%**. So:
