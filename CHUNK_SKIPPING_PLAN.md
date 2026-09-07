@@ -84,24 +84,44 @@ diagnosis, which is the thesis of this project:
 
 Five workstreams, roughly in dependency order. (1) and (2) are independently shippable.
 
-### W1 — Read the metadata that is already there (no format change)
+### W1 — The in-payload metadata: useful, but not a foundation
 
-Expose `chunk_min` / `chunk_bits` / `references` as a *zone map* rather than only as decode inputs.
-Two consumers, cheapest first:
+`chunk_min` is a value-domain minimum **only when `bitpack` consumes the raw input**. Auditing the
+shipped plans (`src/compression/simpatico_codegen/plans/tpch_sf1000/{lineitem,orders}.txt`):
+
+| Plan root | Columns | `chunk_min` is a min of… | Usable as a zone map? |
+|---|---|---|---|
+| `input -> bitpack` | `l_{partkey,suppkey,linenumber,quantity,extendedprice,discount,tax,shipdate,commitdate,receiptdate}`, `o_{custkey,totalprice,orderdate,shippriority}` | the values | **yes, directly** |
+| `dictionary -> bitpack(indices)` | `l_{returnflag,linestatus,shipinstruct}`, `o_{orderstatus,orderpriority,clerk}` | dictionary codes | **yes** — cuDF dictionary keys are "a sorted set of unique values" (`cudf/dictionary/dictionary_column_view.hpp:24`), so codes are order-preserving. Needs a per-pin-chunk lookup of the predicate constant into that chunk's key set |
+| `delta -> bitpack` | `l_orderkey`, `o_orderkey` | the **deltas** | **no** |
+| `str_split -> bitpack(offsets)` | `l_shipmode` | string **lengths** | **no** |
+| `str_split -> delta -> ans` / `snappy` | `l_comment` | — | **no** |
+| `identity` | `o_comment` | — | **no** |
+
+So today the free metadata happens to cover most filterable columns. It is still the wrong thing to
+build on, for two reasons:
+
+1. **It is contingent on a plan chosen for ratio and throughput, not for prunability.** The
+   compression explorer (`src/compression/simpatico_codegen/src/explore/compression_explorer.cpp`)
+   picks max ratio subject to a decode-throughput floor. Nothing keeps `chunk_min` in the value
+   domain.
+2. **Clustering the data is likely to destroy it.** §3.3 says the whole scheme only pays once a
+   column is clustered — and a clustered date column becomes monotone, which makes
+   `delta -> bitpack` the ratio winner on exactly the column that was going to do the pruning.
+   *Unverified prediction; cheap to check by re-running the explorer on sorted input, and worth
+   doing early (Phase 0 below).*
+
+**Therefore: min/max is stored out-of-band, unconditionally, for every column of a supported
+type, independent of the plan.** The in-payload arrays remain valuable as a *second-level*
+optimisation once the out-of-band index has already selected a group — the in-kernel early-out
+below costs nothing and needs no new storage:
 
 - **In-kernel early-out.** In the ballot emitters
-  (`src/compression/simpatico_codegen/src/decode/jit/renderer.cpp:~532-544`, `emit_generic_mask_out` `:885+`) the block already loads `chunk_min` and `chunk_bits` and already has `pred_lo`/`pred_hi`
-  as kernel parameters. Add: if `[chunk_min, chunk_min + 2^bits − 1]` is disjoint from the
-  predicate, write 32 zero mask words and return; if fully contained, write all-ones and return.
-  Saves the per-chunk unpack + ballot. **No new metadata, no format change, no host round trip.**
-- **Host-side chunk pre-selection.** Walk the plan tree (`describe()` /
-  `PlanNode::channels`, `leaf_desc::buffers`) to get device pointers to the `chunk_min`/`chunk_bits`
-  arrays, run a small kernel producing a survivor chunk list, and feed that list to
-  `chunk_csr` — which already skips absent chunks. This is the version that saves the
-  *decode launch* rather than just the ballot.
-
-Limitation: the max is a bound, not exact — `chunk_min + 2^bits − 1` over-estimates by up to
-2× the true range. Sound (never prunes a matching chunk), just less selective.
+  (`src/compression/simpatico_codegen/src/decode/jit/renderer.cpp:885+`, `emit_generic_mask_out`)
+  the block already loads `chunk_min` and `chunk_bits` and already has `pred_lo`/`pred_hi` as
+  kernel parameters. Add: if `[chunk_min, chunk_min + 2^bits − 1]` is disjoint from the predicate,
+  write 32 zero mask words and return; if fully contained, write all-ones and return. Applies only
+  to the `input -> bitpack` rows of the table above; sound to skip elsewhere.
 
 ### W2 — Plumb the existing sidecar into the GPU compressed pin path
 
@@ -112,13 +132,20 @@ Purely mechanical, unblocks pin-chunk pruning for the winning configuration:
 Note `docs/super-sirius/scan.md:283-288`: statless entries are **not** retrofittable, so this must
 be captured at pin time.
 
-### W3 — Exact per-chunk max (cheap format addition)
+### W3 — Out-of-band per-group min/max (the core of the project — see §4.3 for granularity)
 
-Add a `chunk_max` channel next to `chunk_min`: same `BlockReduce` already running in
-`emit_bitpack`/`emit_for`, one `add_buffer` at `.../src/encode/jit/renderer.cpp:1053-1055`, one
-registry entry. The `.hpln` format is self-describing per leaf
-(`.../api/compressed_table_io.hpp:14-39`) so this is additive and old files stay readable.
-Cost: `elem_size × num_chunks` — see §4.
+A sidecar of exact per-group `{min, max, null_count}`, computed at pin time from the
+*uncompressed* column before it enters the compressor — so it is exact, plan-independent, and
+covers `delta`, `str_split`, `ans` and `identity` columns alike. `compute_pinned_chunk_stats`
+(`src/include/scan_manager/pinned_chunk_stats.hpp:43`) already does exactly this with
+`cudf::minmax`; the work is to run it per *group* rather than per pin chunk, widen its type
+support, and give it a device-resident representation. Granularity and cost: §4.3.
+
+Optionally also add an exact `chunk_max` channel next to `chunk_min` in the encoder (same
+`BlockReduce` already running in `emit_bitpack`/`emit_for`, one `add_buffer` at
+`.../src/encode/jit/renderer.cpp:1053`, one registry entry; the `.hpln` format is self-describing
+per leaf so this is additive). Only worth it if the in-kernel early-out (W1) proves to be
+selectivity-limited by the `2^bits` bound.
 
 ### W4 — Metadata for the operators that have none
 
@@ -312,21 +339,64 @@ Whole-table sidecar for SF1000 lineitem (6.0e9 rows), against 93 GB of compresse
 | 10 filterable columns | 0.84 GB | 0.11 GB | 0.01 GB | 0.00 GB |
 | 3 date columns | 0.21 GB | 0.03 GB | 0.00 GB | 0.00 GB |
 
-### 4.3 Recommendation
+### 4.3 Recommendation: a configurable metadata group of G simpatico chunks, default **G = 8**
 
-- **Reuse 1024 for the free metadata (W1).** `chunk_min`/`chunk_bits` cost *nothing extra* — they
-  are already in the payload and already loaded by the decode kernel. At that price the granularity
-  question does not arise, and 1024 is the only granularity the decode path can act on anyway.
-- **Build any *new* sidecar (W3/W4) at a coarser stride — 8K or 16K rows, i.e. one entry per 8/16
-  simpatico chunks.** §4.1 says this loses ~0.5 percentage points of pruning; §4.2 says it costs
-  8–16× less. At 8K a full 16-column lineitem sidecar is 0.17 GB against 93 GB of payload (0.18%),
-  which is small enough not to argue about. 1024-row *new* metadata would be 1.36 GB — 1.5% of the
-  pin — for no measured gain.
-  A coarse sidecar still composes with the fine path: a surviving 8K super-chunk hands its 8
-  constituent chunk ids to `chunk_csr`, which then applies the free in-kernel test.
-- **Scope the sidecar to filterable columns.** Columns that never appear in a `TableFilterSet`
-  do not need entries. This is a 1.5–4× further reduction and is knowable at pin time only
-  heuristically — start with "all columns of a supported type", revisit if the size matters.
+**Shape: one metadata entry per group of G consecutive 1024-row simpatico chunks.** Not an
+independent stride, and not 1024.
+
+Why a *bundle of chunks* rather than an independent stride: group `g` covers chunk ids
+`[g·G, (g+1)·G)` exactly, so a surviving group expands into a chunk-id list for `chunk_csr` with a
+shift, no modular arithmetic and no partial-chunk case. It also composes with the free in-payload
+metadata (W1), which is defined at exactly 1024.
+
+Why **G = 8 (8,192 rows)** as the default:
+
+- **It costs nothing in pruning power.** On real SF10 lineitem under every sort key tested, 8,192
+  is indistinguishable from 1,024 — mean 73.5% vs 73.5% (`sort:shipdate`), 73.0% vs 73.1%
+  (`sort:(shipmode,shipdate)`). §4.1 explains why: effective granularity is
+  `max(group, clustering window)`, and any data with a clustering window under ~8K rows is close
+  enough to random that pruning is ~0 at every granularity.
+- **It costs 8× less than G=1.** SF1000 lineitem, all 16 columns: **0.17 GB at G=8 vs 1.36 GB at
+  G=1**, against a 93 GB compressed pin — 0.18% versus 1.5%.
+- **It tiles the pin chunk exactly.** DuckDB-native pin chunks are whole 122,880-row row groups
+  (`src/pin_table.cpp:126`) and 122,880 = 120 × 1024, so the well-behaved G are the divisors of
+  120: **8**, 10, 12, 15, 20, 24, 30, 40, 60. G = 8 gives 15 groups per row group. (G = 16 does
+  not divide 120 — avoid it despite being the obvious power of two.) The format must tolerate a
+  short final group regardless, since the parquet path packs differently.
+- **Going coarser buys nothing.** At G=8 the index is already 0.18% of the pin, so there is no
+  space left to win, and 262K/1M strides start to cost real selectivity on multi-key sorts
+  (73.0% → 69.1% → 57.7% for `sort:(shipmode,shipdate)`).
+
+Why **configurable**: the right G tracks the data's clustering window, which is not knowable at
+build time. G is a pure space-vs-selectivity knob with no correctness consequence — coarsening
+never produces a wrong answer, only fewer skips. Expose it as a `SET` option alongside
+`enable_pinned_zone_map_pruning`.
+
+**Scope the sidecar to columns of a supported type, all of them.** Restricting to "filterable"
+columns is a 1.5–4× further saving but needs a filter workload to know; at 0.18% it is not worth
+the coupling. Start with all supported types, revisit only if a wide table makes it hurt.
+
+### 4.3.1 Why pin-chunk granularity is not enough
+
+The existing sidecar is per *pin chunk*, and at the configured `scan_task_batch_size: 8GB`
+(`bench/sf1000-repro/sirius-sf1000.yaml:47`) a pin chunk is a large fraction of most SF1000 tables:
+
+| table | rows | pin-chunk rows @8 GB | % of table | chunks in the whole table |
+|---|---|---|---|---|
+| lineitem | 6.0e9 | 189 M | 3.1% | ~32 |
+| orders | 1.5e9 | 109 M | 7.3% | ~14 |
+| partsupp | 800 M | 64 M | 8.1% | ~12 |
+| customer | 150 M | 63 M | **42%** | ~2 |
+| part | 200 M | 161 M | **81%** | ~1 |
+| supplier | 10 M | 10 M | **100%** | 1 |
+
+(Rows are computed from raw bytes/row; a narrow pinned subset has fewer bytes/row and so *more*
+rows per chunk, making this worse.)
+
+Pin-chunk pruning is therefore only meaningful for lineitem and marginally orders — everything
+else has too few chunks for any prune rate to exist. On perfectly sorted lineitem the fine index
+buys only ~1–2.5 points over pin-chunk granularity (mean 73.5% at 8K vs 70.9–72.4% at 2–3.5% of
+table); on the other five tables it is the difference between a working mechanism and none.
 
 ### 4.4 Should the index be compressed?
 
@@ -426,29 +496,90 @@ necessary.
 
 ---
 
-## 6. Proposed order of work
+## 6. Proposed order of work — prove value before committing
 
-1. **W2** — plumb `capture_chunk_stats` through the device pin path. Mechanical, no format change,
-   immediately gives GPU-tier compressed pins the pin-chunk pruning that uncompressed pins already
-   have. Measurable on its own.
-2. **W1 in-kernel early-out** — the free bitpack zone map as a ballot short-circuit. No format
-   change, no new memory, self-contained in the decode renderer.
-3. **W1 host-side chunk pre-selection** — survivor chunk lists into `chunk_csr`. This is the first
-   version that skips *launches*.
-4. **W3** — exact `chunk_max`, if (2)/(3) show the `2^bits` bound is costing real selectivity.
-5. **W4 dictionary present-value bitmaps** — the only path to pruning on low-cardinality string
-   equality (§3.4), and the capability parquet cannot match.
-6. **W4 null counts** — unblocks compressed late-materialization, which is a separate win.
-7. **Clustering.** None of the above pays on TPC-H as it sits (§3.1). A pin-time sort/clustering
-   option is what converts 0% into ~34–38% (§3.3). This is arguably the real project; the metadata
-   is what makes it *usable*.
+The governing constraint: **on TPC-H as it sits, every implementation measures exactly zero**
+(§3.1). Any proof of value must first create clustered data. And the cheapest honest proof does
+*not* require building the out-of-band index at all.
 
----
+### Phase 0 — data prep and two cheap facts (no C++)
+
+1. **Build a clustered SF100.** `COPY (SELECT * FROM lineitem ORDER BY l_shipdate) TO …` and the
+   same for orders on `o_orderdate`, into `/datasets/tpch_sf100_sorted`. Point
+   `tools/chunk-skipping-study/explain.py` and `prune.py` at it and confirm parquet row-group
+   pruning goes from 0% to the predicted ~40–60%. This validates both the dataset and the
+   §3 methodology, and it is the artifact every later phase needs.
+2. **Re-run the compression explorer on the sorted columns.** Answers the W1 delta-flip question:
+   does a monotone `l_shipdate` make `delta -> bitpack` the ratio winner and remove the free
+   `chunk_min`? Either answer is useful — it either confirms the out-of-band store is mandatory or
+   removes a stated risk.
+
+Cost: under a day, no build.
+
+### Phase 1 — W2 plus a batch-size sweep: the whole value question, empirically
+
+**W2 alone is the experiment.** Plumb `capture_chunk_stats` through the device pin path — the four
+sites in §2 — and nothing else. Every downstream component already exists and ships:
+`compute_pinned_chunk_stats`, `pinned_zone_maps`, `build_cached_scan_plan`/`chunk_provably_empty`,
+the all-pruned sentinel, and the `enable_pinned_zone_map_pruning` flag. This is plumbing, not
+design: roughly 50–100 lines and no new concepts.
+
+The trick that makes this a complete answer: **`scan_task_batch_size` is a free granularity dial.**
+Shrinking it makes pin chunks smaller, which is exactly what a finer metadata group would do —
+without writing the group index. So sweep it:
+
+| `scan_task_batch_size` | SF100 lineitem pin chunks |
+|---|---|
+| 8 GB (current) | ~3 |
+| 2 GB | ~13 |
+| 512 MB | ~50 |
+| 128 MB | ~200 |
+
+Run each point **twice, with `enable_pinned_zone_map_pruning` on and off**, and read the *delta*.
+This isolates the pruning gain from the batching loss — smaller batches cost throughput on their
+own (the YAML notes 5 GB → 8 GB is worth −1.85%), so the absolute times are confounded but the
+on/off delta at a fixed batch size is not.
+
+What comes out is the pruning-versus-granularity curve **in real query time on real hardware**,
+which is the one thing §3 and §4 cannot give (they are bytes-not-decoded). Specifically:
+
+- If the delta is ~0 at every granularity → scan/decode is not enough of the critical path.
+  **Stop here.** Total spend: ~2 days.
+- If the delta is real but flat across batch sizes → coarse pruning is sufficient; ship W2, skip
+  the group index, and spend the effort on clustering instead.
+- If the delta grows as batches shrink → the group index is worth building, and the curve tells us
+  the right default G directly, replacing the §4.3 estimate with a measurement.
+
+Run under `/home/nvidia/joost/bench-lock.sh`. SF100 rather than SF1000 so the sort in Phase 0 is
+cheap and iteration is fast; confirm the winning configuration at SF1000 afterwards.
+
+### Phase 2 — only if Phase 1 pays: the out-of-band group index (W3)
+
+Minimum shape: extend `pinned_zone_maps` from one entry per pin chunk to one per group of G
+chunks, add a device-resident packed mirror (§5.1), have `build_cached_scan_plan` emit surviving
+*group* ids, and expand those into a chunk-id list for `chunk_csr`. Default G = 8, configurable.
+Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
+
+### Phase 3+ — in priority order, each independently justifiable
+
+1. W1 in-kernel early-out — free, no storage, applies to the `input -> bitpack` columns.
+2. W4 dictionary present-value bitmaps — the only path to pruning on `l_shipmode`-style
+   predicates (§3.4), and a capability parquet structurally cannot match.
+3. W4 per-group null counts — unblocks compressed late-materialization, a separate win.
+4. **Clustering as a first-class pin option.** None of the above pays on TPC-H as it sits (§3.1);
+   this is what converts 0% into ~34–38%. Arguably the real project, with the metadata as what
+   makes it usable.
 
 ## 7. Open questions / log
 
 - **2026-09-07** — project opened. Investigation and all measurements in §3–§5 done; nothing
   implemented, nothing benchmarked end-to-end.
+- **2026-09-07** — plan audit corrected the W1 story: `chunk_min` is a value-domain minimum only
+  for `input -> bitpack` roots. `delta -> bitpack` (`l_orderkey`, `o_orderkey`) and
+  `str_split -> bitpack(offsets)` (`l_shipmode`) give minima of deltas and of string lengths
+  respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
+  therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
+  G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
 - **Open:** all §3 numbers are *bytes-not-decoded*, not query time. Need one end-to-end datapoint —
   cheapest is W2 on a GPU-compressed lineitem pin with an artificially clustered SF100.
 - **Open:** is there a pin-time clustering hook at all? `pin_table` packs whole 122,880-row DuckDB
@@ -457,6 +588,8 @@ necessary.
 - **Open:** how much of the suite's time is scan/decode on the winning GPU-compressed config?
   Without that, §3's 40% "of scanned bytes" cannot be converted into an expected speedup.
   `docs/super-sirius/compressed-pinning.md:93` has the closest existing measurement.
+- **Open:** does clustering a date column flip its plan to `delta -> bitpack` and remove the free
+  `chunk_min`? Phase 0 step 2 answers this.
 - **Open:** the `2^chunk_bits − 1` max bound over-estimates the true range by up to 2×. Unmeasured
   how much selectivity that costs versus an exact `chunk_max` (W3).
 - **Open:** interaction with the existing decompression-pushdown path

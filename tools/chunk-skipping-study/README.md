@@ -13,6 +13,7 @@ pixi run python tools/chunk-skipping-study/mkcols.py      # §3.3 materialize SF
 pixi run python tools/chunk-skipping-study/gran.py        #      -> numpy arrays
 pixi run python tools/chunk-skipping-study/sweep.py       #      granularity x sort-key sweep
 pixi run python tools/chunk-skipping-study/proj.py        #      project onto SF1000 byte volumes
+pixi run python tools/chunk-skipping-study/coarse.py      # §4.3.1 pin-chunk-scale granularity
 pixi run python tools/chunk-skipping-study/synth.py       # §4.1 clustering-window vs chunk-size
 pixi run python tools/chunk-skipping-study/idxsize.py     # §4.2 index size
 pixi run python tools/chunk-skipping-study/idx2.py        # §4.2 index size vs compressed footprint
