@@ -710,10 +710,6 @@ device_pin_result materialize_all_batches_compressed(
   device_pin_result out;
   bool compression_failed = false;
 
-  // The device insert path stores no statistics sidecar (device_pin_result carries none), so a
-  // capture would be computed and dropped — force it off.
-  options.capture_chunk_stats = false;
-
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
@@ -724,11 +720,13 @@ device_pin_result materialize_all_batches_compressed(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       const std::int64_t chunk_rows = tbl->num_rows();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(chunk_rows));
       out.column_storage.emplace_back(std::move(column_storage));
+      // Captured off the uncompressed GPU table above, before this sink compresses it.
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {

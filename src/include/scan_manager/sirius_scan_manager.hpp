@@ -595,15 +595,24 @@ class sirius_scan_manager {
   ///                      @c column_ids-aligned names.
   /// \param chunks        One @ref device_pin_chunk per batch (compressed or not).
   /// \param memory_space  Representative GPU memory space (metadata only).
+  /// \param column_types  Pin-time DuckDB type of each cached column, positional
+  ///                      with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
+  ///                      compute_pinned_chunk_stats emits). Captured off the uncompressed GPU
+  ///                      table before compression, so a compressed pin gets zone maps even
+  ///                      though its payload cannot be introspected here.
   /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
   ///                      chunk's types are unreadable here, so its cells are trusted.
-  void insert_pinned_entry_device(const std::string& name,
-                                  cache_entry_info cache_info,
-                                  std::vector<sirius::device_pin_chunk> chunks,
-                                  cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage);
+  void insert_pinned_entry_device(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<sirius::device_pin_chunk> chunks,
+    cucascade::memory::memory_space& memory_space,
+    duckdb::vector<duckdb::LogicalType> column_types,
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///

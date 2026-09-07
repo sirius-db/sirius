@@ -88,7 +88,7 @@ void pin_once(sirius_scan_manager& manager,
   sirius::pinned_column_storage_matrix storage{
     {sirius::pinned_column_storage_meta{cudf::data_type{cudf::type_id::INT32}, false}}};
   manager.insert_pinned_entry_device(
-    kTable, make_cache_info(), std::move(chunks), space, std::move(storage));
+    kTable, make_cache_info(), std::move(chunks), space, {}, {}, std::move(storage));
 }
 
 /// An origin against whatever is pinned under kTable right now.

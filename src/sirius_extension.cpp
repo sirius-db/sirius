@@ -1536,7 +1536,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       *scan_mgr.io_ctx(),
       pinned_column_types,
       pin_comp,
-      {.capture_chunk_stats               = false,
+      {.capture_chunk_stats               = capture_chunk_stats,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
@@ -1546,6 +1546,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(cache_info),
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
+                                        pinned_column_types,
+                                        std::move(dev_result.chunk_stats),
                                         std::move(dev_result.column_storage));
     // The compressed device path always REPLACES, as above.
     attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);

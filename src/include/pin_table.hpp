@@ -264,6 +264,12 @@ struct device_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Per-chunk zone-map capture, taken on the GPU table BEFORE compression (so a
+  /// compressed chunk gets zone maps even though its payload is unreadable here);
+  /// chunk_stats[c][i] = stats of batch column i of chunk c (null = none). Parallel
+  /// to @c chunks when capture ran; empty when capture was skipped. Mirrors
+  /// @ref host_pin_result::chunk_stats and feeds insert_pinned_entry_device.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;
@@ -302,13 +308,14 @@ host_pin_result materialize_pin_to_host(
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
 /// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host.
-/// Zone-map capture is forced off:
-/// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
-/// none, so device pins keep the statless-pin serving behavior.
+/// Zone-map capture also runs exactly as in @ref materialize_pin_to_host — on the
+/// uncompressed GPU table, before compression — so a GPU-tier compressed pin gets the
+/// same per-chunk statistics a host pin does, landing in @c device_pin_result::chunk_stats.
 ///
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
-///                            (column_ids) order — drives the carrier narrowing. Empty is
-///                            valid only when narrowing is off.
+///                            (column_ids) order — drives the carrier narrowing and the
+///                            per-chunk zone-map capture. Empty is valid only when narrowing
+///                            is off, and skips capture (statless pin).
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
 /// \param options             Per-pin materialization behavior (carrier narrowing).

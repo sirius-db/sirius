@@ -2344,6 +2344,8 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cache_entry_info cache_info,
   std::vector<sirius::device_pin_chunk> chunks,
   cucascade::memory::memory_space& memory_space,
+  duckdb::vector<duckdb::LogicalType> column_types,
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
   std::size_t new_num_rows = 0;
@@ -2374,6 +2376,20 @@ void sirius_scan_manager::insert_pinned_entry_device(
       return chunks[chunk].columns[column]->type();
     });
 
+  // Normalize the optional zone-map capture, exactly as the host path does.
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
+  auto const n_chunks       = chunks.size();
+  auto pin_zone_maps        = pinned_zone_maps::from_capture(
+    std::move(column_types), std::move(chunk_stats), cache_info.column_ids.size(), n_chunks);
+  if (stats_supplied && !pin_zone_maps.has_stats()) {
+    // Only reason stats failed to append is a shape mismatch between the captured stats and the
+    // pinned entry; warn but still pin the entry.
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry_device] zone-map capture shape mismatch; "
+      "pinning '{}' without statistics",
+      name);
+  }
+
   pinned_entry entry;
   entry.cache_info     = std::move(cache_info);
   entry.tier           = cucascade::memory::Tier::GPU;
@@ -2381,6 +2397,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   entry.num_rows       = new_num_rows;
   entry.device_chunks  = std::move(chunks);
   entry.column_storage = std::move(column_storage);
+  entry.zone_maps      = std::move(pin_zone_maps);
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::insert_pinned_entry_device] '{}' chunks={} rows={}",
                    name,
