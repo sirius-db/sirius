@@ -458,6 +458,29 @@ never produces a wrong answer, only fewer skips. Expose it as a `SET` option alo
 columns is a 1.5–4× further saving but needs a filter workload to know; at 0.18% it is not worth
 the coupling. Start with all supported types, revisit only if a wide table makes it hurt.
 
+### 4.3.0 What the index costs to *build* (measured)
+
+Storage (§4.2) was never the worry; compute might have been. A G=8 index over a 189 M-row pin chunk
+needs 23,072 min/max pairs per column instead of one. Measured with `cudf::segmented_reduce` over a
+fixed-stride offsets column, all 16 lineitem columns, GB300
+(`tools/chunk-skipping-study/gpusort/statsbench.cu`):
+
+| G | stride | groups per 189 M-row chunk | segmented min+max | vs the whole-chunk `minmax` W2 already pays |
+|---|---|---|---|---|
+| 1 | 1,024 | 184,571 | 0.0209 s | 5.8× |
+| **8** | **8,192** | **23,072** | **0.0061 s** | **1.7×** |
+| 64 | 65,536 | 2,884 | 0.0061 s | 1.7× |
+
+(whole-chunk `cudf::minmax` × 16 columns = 0.0036 s; segmented at G≥8 runs at 2,730 GB/s, i.e.
+bandwidth-bound.)
+
+**Building the entire G=8 index for SF1000 lineitem costs 32 × 0.0061 s ≈ 0.20 s** against a
+~151 s pin — 0.13%. Negligible, and only 1.7× what the existing coarse capture already costs.
+
+This is a third independent argument for G=8, and the three converge: G=1 buys no extra pruning
+(§4.1), costs 8× the storage (§4.2), and costs **3.4× the compute**. Going coarser than 8 buys
+nothing either — G=64 is the same 0.0061 s, because the reduction is already bandwidth-bound.
+
 ### 4.3.1 Why pin-chunk granularity is not enough
 
 The existing sidecar is per *pin chunk*, and at the configured `scan_task_batch_size: 8GB`
