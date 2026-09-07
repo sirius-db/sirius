@@ -72,17 +72,17 @@ namespace {
 
 struct pool_mr_guard {
   rmm::mr::cuda_async_memory_resource mr{};
-  rmm::device_async_resource_ref previous{rmm::mr::get_current_device_resource_ref()};
+  cuda::mr::any_resource<cuda::mr::device_accessible> previous{};
   bool installed = false;
 
   void install()
   {
-    rmm::mr::set_current_device_resource_ref(mr);
+    previous  = rmm::mr::set_current_device_resource(mr);
     installed = true;
   }
   ~pool_mr_guard()
   {
-    if (installed) rmm::mr::set_current_device_resource_ref(previous);
+    if (installed) rmm::mr::set_current_device_resource(previous);
   }
 };
 
