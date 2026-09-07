@@ -16,6 +16,7 @@
 
 #include "op/scan/owning_table_view.hpp"
 
+#include <ctrack.hpp>
 #include <data/data_batch_utils.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/host_keep_mask.hpp>
@@ -33,9 +34,10 @@ filtered_table gpu_ingestible::materialize_table(
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
+  CTRACK_NAME("ingestible::materialize_table");
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
-    split.prefetch(io::cache::prefetching_stage::disposable);
+    split.update(io::cache::scan_stage::reading);
     auto materialized = materialize_metadata_to_table(
       split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
     if (split.mvcc_keep_mask.has_mask()) {

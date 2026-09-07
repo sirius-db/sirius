@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <absl/functional/any_invocable.h>
+#include "exec/invocable.hpp"
 
 #include <functional>
 #include <memory>
@@ -65,7 +65,7 @@ class completion_token {
   [[nodiscard]] bool is_armed() const noexcept { return _cb != nullptr; }
 
  private:
-  using impl_type = std::stop_callback<absl::AnyInvocable<void()>>;
+  using impl_type = std::stop_callback<sirius::exec::invocable<void()>>;
   std::unique_ptr<impl_type> _cb;
 };
 

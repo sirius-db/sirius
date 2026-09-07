@@ -20,8 +20,8 @@
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/object_store_config.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
-#include "io/s3/static_credentials.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
+#include "io/rest/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
@@ -72,18 +72,18 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
 /// the store is not configured (empty endpoint / credentials / region — which
 /// disables the REST backend).  The signing form follows @c s3_signing_mode.
-std::shared_ptr<s3::s3_request_authorizer> make_s3_authorizer(const object_store_config& os)
+std::shared_ptr<rest::request_authorizer> make_s3_authorizer(const object_store_config& os)
 {
   if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() || os.secret_key.empty()) {
     return nullptr;
   }
-  auto creds = s3::static_credentials_from(os);
+  auto creds = rest::s3::static_credentials_from(os);
   switch (os.s3_signing_mode) {
     case object_store_config::signing_mode::header:
-      return std::make_shared<s3::sirius_sigv4_header_authorizer>(
+      return std::make_shared<rest::s3::sigv4_header_authorizer>(
         std::move(creds), os.region, os.endpoint);
     case object_store_config::signing_mode::presigned:
-      return std::make_shared<s3::sirius_sigv4_presigned_authorizer>(
+      return std::make_shared<rest::s3::sigv4_presigned_authorizer>(
         std::move(creds), os.region, os.endpoint);
   }
   return nullptr;
@@ -96,9 +96,9 @@ using factory_type        = io_context_registry::factory_type;
 
 factory_type make_kvikio_ioctx_factory()
 {
-  return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<sirius_ioctx> {
+  return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
-      return std::make_shared<kvikio_context>();
+      return std::make_shared<kvikio_context>(config.kvikio, config.object_store);
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_kvikio_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -110,7 +110,7 @@ factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
   return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
@@ -118,12 +118,8 @@ factory_type make_uring_ioctx_factory(
           "make_uring_ioctx_factory: no HOST-tier memory resource for the reactor staging");
         return nullptr;
       }
-      // One reactor_context shared by the whole pool: it carries the per-reactor
-      // config (bounce-slot size taken from the staging resource's block size)
-      // and the pinned bounce-staging resource itself.
-      auto uring_cfg        = config.local;
-      uring_cfg.bounce_size = host_mr->get_block_size();
-      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(uring_cfg, host_mr);
+      // One reactor_context shares config and the pinned staging resource.
+      auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
       return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
@@ -136,7 +132,7 @@ factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
   return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
       if (!authorizer) {
@@ -145,11 +141,8 @@ factory_type make_rest_ioctx_factory(
           "region missing); REST backend disabled");
         return nullptr;
       }
-      // Host staging is optional for REST — when absent, reactor-staged device
-      // reads are disabled (bounce_block_size 0), host reads still work.
-      auto* host_mr              = first_host_resource(reservation_manager);
-      auto rest_cfg              = config.rest;
-      rest_cfg.bounce_block_size = host_mr != nullptr ? host_mr->get_block_size() : 0;
+      auto* host_mr = first_host_resource(reservation_manager);
+      auto rest_cfg = config.rest;
       // The object store owns the endpoint and its TLS trust; the reactor's
       // curl GETs must verify against the same CA bundle / policy the authorizer
       // presigns for, so source these from object_store rather than rest config.
@@ -173,7 +166,7 @@ io_context_registry::io_context_registry(
   config_type config, cucascade::memory::memory_reservation_manager& reservation_manager)
   : _config(std::move(config)),
     _reservation_manager(reservation_manager),
-    _prefer_kvikio_for_file_scheme(!_config.use_sirius_datasource)
+    _prefer_kvikio(_config.backend == scan_manager::io_backend::kvikio)
 {
   // uring / rest claim paths via their reactor's static supports() (local
   // files and s3:// URLs respectively).  kvikio is the universal fallback —
@@ -215,15 +208,18 @@ std::optional<io_context_type> io_context_registry::lookup_path(
       fallback = type;
       continue;
     }
-    // use_sirius_datasource=false disables the uring local datasource: let local
-    // files fall through to the kvikio catch-all instead of letting uring claim them.
-    if (type == io_context_type::uring && _prefer_kvikio_for_file_scheme) { continue; }
+    // backend=kvikio takes over reads from BOTH explicit backends: local files
+    // from uring, s3:// objects from rest (kvikIO's RemoteHandle serves them).
+    // LIST still needs the rest ioctx, which callers fetch by type instead.
+    if (_prefer_kvikio && (type == io_context_type::uring || type == io_context_type::restful)) {
+      continue;
+    }
     return type;
   }
   return fallback;
 }
 
-std::shared_ptr<sirius_ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
+std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
 {
   std::shared_lock lk{_mtx};
   auto it = _entries.find(type);

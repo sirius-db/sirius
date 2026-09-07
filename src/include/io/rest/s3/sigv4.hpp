@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 /// Static credentials + region/service for SigV4 signing.
 ///
@@ -135,4 +135,4 @@ std::string sha256_hex(std::string_view data);
 /// (used for path segments); if true, `/` becomes `%2F` (used for query components).
 std::string uri_encode(std::string_view s, bool encode_slash);
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

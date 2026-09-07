@@ -107,13 +107,25 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
  */
 class duckdb_native_scan_info : public op::scan::scan_info {
  public:
+  duckdb_native_scan_info() = default;
+
+  duckdb_native_scan_info(std::vector<duckdb_row_group_metadata> row_groups,
+                          std::shared_ptr<sirius::io::sirius_datasource> datasource,
+                          duckdb::SingleFileBlockManager const* block_manager)
+    : scan_info(make_fadvise_entries(row_groups, datasource, block_manager)),
+      row_groups(std::move(row_groups)),
+      datasource(std::move(datasource)),
+      block_manager(block_manager)
+  {
+  }
+
   /// Row-group metadata for this unit.
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
   std::shared_ptr<sirius::io::sirius_datasource> datasource;
   /// Resolves block ids to file offsets when deriving the on-disk ranges below.
   duckdb::SingleFileBlockManager const* block_manager = nullptr;
-  /// Owners of the bytes that host-backed descriptors (`host_ptr`) point
+  /// Owners of the bytes that host-backed descriptors (host_ptr) point
   /// into. Shared by the per-operator splits cut from one delta capture;
   /// must outlive this split's decode.
   std::vector<std::shared_ptr<void>> staging_keepalive;
@@ -122,24 +134,6 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// datasource.
   bool host_backed_only = false;
 
-  /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
-  /// groups currently held. The scan sequencer fadvises these to prefetch.
-  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override
-  {
-    if (block_manager == nullptr) { return {}; }
-    std::vector<fadvise_entry> entries;
-    append_fadvise_entry(entries, datasource, [this] {
-      std::vector<cudf::io::text::byte_range_info> ranges;
-      for (auto const& rg : row_groups) {
-        auto rg_ranges = row_group_file_ranges(*block_manager, rg);
-        ranges.insert(ranges.end(), rg_ranges.begin(), rg_ranges.end());
-      }
-      return ranges;
-    });
-    return entries;
-  }
-
-  /// Decoded (GPU) byte budget for this unit; drives memory reservation.
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
     std::size_t total = 0;
@@ -147,6 +141,23 @@ class duckdb_native_scan_info : public op::scan::scan_info {
       total += rg.decoded_bytes_budget;
     }
     return total;
+  }
+
+ private:
+  static std::vector<fadvise_entry> make_fadvise_entries(
+    std::vector<duckdb_row_group_metadata> const& row_groups,
+    std::shared_ptr<sirius::io::sirius_datasource> const& datasource,
+    duckdb::SingleFileBlockManager const* block_manager)
+  {
+    if (!datasource || block_manager == nullptr) { return {}; }
+
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    for (auto const& rg : row_groups) {
+      auto rg_ranges = row_group_file_ranges(*block_manager, rg);
+      ranges.insert(ranges.end(), rg_ranges.begin(), rg_ranges.end());
+    }
+    if (ranges.empty()) { return {}; }
+    return {{datasource, std::move(ranges)}};
   }
 };
 

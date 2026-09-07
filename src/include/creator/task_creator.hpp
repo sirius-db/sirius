@@ -21,6 +21,7 @@
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/query_stage_manager.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -73,6 +74,22 @@ struct task_creation_request {
   request_type type = request_type::active;
 };
 
+/// Why @ref task_creator::get_operator_for_next_task stopped.
+enum class next_task_state {
+  /// An operator is ready to have a task created for it.
+  ready,
+  /// No operator in the chain can produce right now.  Not necessarily terminal:
+  /// an operator waiting on input reports this until its input arrives.
+  depleted,
+};
+
+/// The operator @ref task_creator::get_operator_for_next_task settled on,
+/// together with what it means -- see @c next_task_state.
+struct next_task_result {
+  op::sirius_physical_operator* op{nullptr};
+  next_task_state state{next_task_state::depleted};
+};
+
 class task_creator {
  public:
   /**
@@ -112,6 +129,20 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+
+  /// Attach the query-stage observer, sharing ownership of it so the handle is
+  /// neither null nor dangling for as long as this creator can report.  Until
+  /// this is called the creator reports into its own private manager, which has
+  /// no listeners and so is a no-op.
+  void set_query_stage_manager(sirius::exec::query_stage_manager& manager)
+  {
+    _query_stage_manager = manager.shared_from_this();
+  }
+
+  /// Report that @p pipeline_id has closed, so its source will produce no more
+  /// tasks.  Called by sirius_pipeline; this supplies the query id, which the
+  /// pipeline cannot see.
+  void notify_pipeline_closure(std::size_t pipeline_id, std::size_t source_operator_id) noexcept;
 
   /// \brief prepare global states for all pipelines in the query
   void prepare_for_query(const sirius::planner::query& query);
@@ -191,11 +222,17 @@ class task_creator {
   /**
    * @brief Find the operator for which to create the next task based on operator hints.
    *
-   * This method queries the given node for a hint about what task to create next.
+   * This method queries the given node for a hint about what task to create next,
+   * walking through operators that are themselves waiting on input.
    *
    * @param node The operator node to get the next task hint from.
-   * @return The operator node that should be scheduled next, or nullptr if no task should be
-   * scheduled.
+   * @return The operator and what it means.  On @c ready, the operator is the
+   *         one to schedule.  On @c depleted, it is the operator that was asked
+   *         last and could not produce -- which is what makes the failure
+   *         attributable: the walk can descend several operators past the one
+   *         the request named, and reporting the request's own operator would
+   *         name a node that is waiting perfectly happily.  Null only when
+   *         @p node is null.
    */
   /// Follows WAITING_FOR_INPUT_DATA hints upstream to the operator that can
   /// produce next. get_next_task_hint() is side-effecting at every level (it
@@ -203,7 +240,7 @@ class task_creator {
   /// walk visits is appended to @p visited_pipelines for the caller to
   /// re-evaluate — a pipeline whose tasks all completed earlier gets no later
   /// mark_task_completed() to do it.
-  op::sirius_physical_operator* get_operator_for_next_task(
+  [[nodiscard]] next_task_result get_operator_for_next_task(
     op::sirius_physical_operator* node,
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
@@ -222,6 +259,13 @@ class task_creator {
   ::duckdb::ClientContext* _client_context;
   // Non-owning; SiriusContext stops and joins this creator before destroying the scheduler.
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Observer of query stage transitions.  Never null: seeded with an
+  /// unsubscribed manager so the reporting paths need no check, and replaced by
+  /// the context's own in set_query_stage_manager.
+  std::shared_ptr<sirius::exec::query_stage_manager> _query_stage_manager{
+    std::make_shared<sirius::exec::query_stage_manager>()};
+  /// Stamped by prepare_for_query; the manager loop has no other handle on it.
+  sirius::query_id_t _query_id{};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 

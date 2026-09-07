@@ -125,7 +125,7 @@ All commands run from the **project root** directory.
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
-# Both engines, 2 iterations, hot-cache (grouped) mode
+# Both engines, 2 iterations, hot cache (the default)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
     --engine both --iterations 2
@@ -150,27 +150,119 @@ pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
     --engine gpu --iterations 3 --pin gpu
 
-# Cold-start measurement (drops OS cache between runs; requires passwordless sudo)
+# Cold-start measurement (per-query OS cache drop + reset_sirius_cache();
+# requires passwordless sudo)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
-    --engine gpu --iterations 2 --mode isolated
+    --engine gpu --iterations 2 --execution cold
 
-# nsys-profile mode (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
+# Warm-but-contended: caches fill and stay filled, LRU retention, round-robin
+pixi run python test/tpch_performance/performance_test.py \
+    --input ~/sirius/test_datasets/tpch_parquet_sf10 \
+    --engine gpu --iterations 2 --execution lukewarm
+
+# nsys profiling (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
+    --engine gpu --iterations 2 --nsys-profile --queries 1,3,6
+
+# S3 prefix instead of a local directory (--engine gpu only; see below)
+pixi run python test/tpch_performance/performance_test.py \
+    --input s3://<bucket>/datasets/tpch_sf1 \
+    --engine gpu --iterations 2 --config /path/to/sirius_s3.yaml
 ```
+
+#### `csv/runtimes.csv`
+
+Columns are `engine,query,iteration,runtime_s`, one row per (engine, query, iteration), followed
+by a `TOTAL` row per (engine, iteration) summing that iteration's queries:
+
+```csv
+engine,query,iteration,runtime_s
+sirius,q6,0,0.678334
+sirius,q1,0,0.383860
+sirius,TOTAL,0,1.062193
+```
+
+A query that failed or timed out records `nan` and is left out of the total rather than
+poisoning it; the run log says how many queries a short total covers.
+
+#### `--pin parquet`
+
+A fourth pin tier alongside `gpu` / `host`. Instead of decoding and materialising columns, it
+pins the **undecoded parquet column-chunk bytes** into Sirius's prefetching cache; the ordinary
+scan path then finds them resident and serves from them. Parquet sources only — a duckdb-native
+table has no column chunks to pin, and the bind rejects it.
+
+It forces three cache settings into the effective config, overriding both `--config` and any
+`--execution` profile (with a warning when they disagree):
+
+| key | value | why |
+|---|---|---|
+| `cache.mode` | `sirius` | there is no cache to pin into otherwise |
+| `cache.eviction` | `lru` | `idle` drops a chunk the moment nothing reads it |
+| `cache.eviction_threshold_fraction` | `1.0` | the evictor should not start until the pool is full |
+
+Residency is held by keeping each file's datasource (and so its prefetching handle) alive until
+`unpin_table`. Passing `--pin parquet` is enough to trigger the config rewrite — `--execution` is
+not required.
+
+#### Execution profiles (`--execution`)
+
+`--execution` names a **cache state to measure**, not just an iteration order. Each value fixes
+the Sirius cache mode, the eviction policy, the ordering, and what is flushed between runs — and
+**overrides `cache.mode` / `cache.eviction` in whatever `--config` you pass** (it warns when it
+does). The effective config is written to `<bench>/effective_config.yml`; the untouched original
+is kept beside it as `config.yml`.
+
+| `--execution` | `cache.mode` | `cache.eviction` | ordering | between runs |
+|---|---|---|---|---|
+| *(omitted, default)* | *unchanged* | *unchanged* | back-to-back per query | nothing |
+| `cold` | `sirius` | `idle` | round-robin | drop OS cache **and** `CALL reset_sirius_cache()` |
+| `lukewarm` | `sirius` | `lru` | round-robin | nothing |
+| `hot` | `sirius` | `idle` | back-to-back per query | nothing |
+
+**The config is only rewritten when `--execution` is passed.** Omit it and your YAML is used
+exactly as written — no `effective_config.yml` is produced and no sanity check runs.
+
+All three named profiles drop the OS page cache once at startup. `cold` keeps the *connection*
+(and so the GPU context and compiled plans) — it flushes caches, not the process.
+
+`cold` requires the passwordless sudo setup below and refuses to start without it, because a cold
+run that silently measured a warm page cache is worse than one that errors.
+
+`--nsys-profile` is a separate flag with its own execution model; passing it together with an
+explicit `--execution` is an error.
+
+#### Benchmarking over S3
+
+`--input` accepts an `s3://` prefix holding one `<table>/` subdirectory per TPC-H
+table; the views become `read_parquet('s3://…/<table>/*.parquet')` and Sirius's
+`sirius_httpfs` expands the glob with `ListObjectsV2` at bind time.
+
+- **GPU only.** S3 has no CPU fallback (`src/sirius_context.cpp`,
+  `throw_if_s3_no_cpu_fallback`), so `--engine cpu|both`, `--validation`, and
+  `--pin` are rejected for an `s3://` input. Validate against a local copy of the
+  same data instead.
+- **Credentials must be in the Sirius YAML.** Sirius does not read the
+  environment, AWS profiles, or IMDS (`docs/super-sirius/scan.md`,
+  "Configuration") — put `endpoint` / `region` / `access_key` / `secret_key`
+  (plus `session_token` for temporary credentials) under
+  `sirius.executor.scan_manager.object_store` and pass the file via `--config`.
+  Endpoint must be the regional form `https://s3.<region>.amazonaws.com`.
+- The harness disables DuckDB's extension autoloading for `s3://` inputs so
+  DuckDB's own `httpfs` cannot claim the scheme ahead of `sirius_httpfs`.
 
 Key flags:
 - `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
-- `--mode grouped|sequential|isolated|nsys-profile` — `grouped` (default, hot cache), `sequential` (round-robin), `isolated` (fresh connection + drop_os_cache per run; requires passwordless sudo), `nsys-profile` (see below).
+- `--execution cold|lukewarm|hot` (optional) — cache state to measure; see "Execution profiles" above. When given it overrides `cache.mode` / `cache.eviction` in `--config`; when omitted the config is left alone.
 - `--queries 1,3,6-10` — subset selection.
 - `--pin gpu|host|none` — Sirius cache pre-load tier. Both `gpu` and `host` are supported; `host` converts the pinned table into NUMA-local pinned host memory. Any other tier throws `NotImplementedException` at bind time (`src/sirius_extension.cpp:811-813`).
 - `--pin-compression` / `--compression-plan-dir <dir>` — pin the tables Simpatico-compressed (requires `--pin gpu|host`; plan dir defaults to the shipped `plans/tpch_sf1000`). Confirm engagement by grepping the run's logs for `compressing with plan`.
 - `--validation` — byte-compare GPU vs CPU `result.txt` after timing (with `abs_tol=1e-10` on float columns). Requires `--engine both`.
-- `--mode nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
+- `--nsys-profile` — wrap each query in `nsys profile` (one DuckDB CLI subprocess per query; the cudaProfilerApi capture range covers the cold + hot iterations). Requires `--engine gpu`; incompatible with `--validation` and `--duckdb-profiling`.
 - `--query-timeout N` — per-query subprocess timeout in nsys-profile mode (default 90s).
 - `--name <NAME>` — override the auto-timestamped benchmark subdirectory name.
 - `--config <yaml>` — override `$SIRIUS_CONFIG_FILE` for this run.
@@ -458,17 +550,17 @@ A suite of scripts for GPU performance profiling and analysis using NVIDIA Nsigh
 
 ### Profiling queries
 
-The primary entry point is `performance_test.py --mode nsys-profile` (subprocess-per-query, one `.nsys-rep` + `.sqlite` per query under the standard `<bench>/sirius/q<N>/` layout):
+The primary entry point is `performance_test.py --nsys-profile` (subprocess-per-query, one `.nsys-rep` + `.sqlite` per query under the standard `<bench>/sirius/q<N>/` layout):
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
-    --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
+    --engine gpu --iterations 2 --nsys-profile --queries 1,3,6
 ```
 
-For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrator below) — it delegates to `performance_test.py --mode nsys-profile` under the hood and flattens the per-query outputs into the report's `profiles/` directory for the analyze/compare tools.
+For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrator below) — it delegates to `performance_test.py --nsys-profile` under the hood and flattens the per-query outputs into the report's `profiles/` directory for the analyze/compare tools.
 
 ### Analyzing profiles
 
@@ -511,7 +603,7 @@ For end-to-end profiling + analysis packaging, use `nsys_report.sh` (orchestrato
 ./test/tpch_performance/nsys_report.sh --sf 100 --iterations 4 1 3 6 10
 
 # DuckDB-native source: --data-source duckdb (defaults to test_datasets/tpch_sf<SF>.duckdb,
-# or pass --duckdb-file). Forwards --data-source to performance_test.py --mode nsys-profile.
+# or pass --duckdb-file). Forwards --data-source to performance_test.py --nsys-profile.
 ./test/tpch_performance/nsys_report.sh --sf 10 --data-source duckdb 1 3 6
 ./test/tpch_performance/nsys_report.sh --data-source duckdb --duckdb-file ./test_datasets/tpch_sf10.duckdb --sf 10
 
@@ -548,14 +640,8 @@ Output: `reports/<label>_<YYYYMMDD_HHMMSS>/` containing `report.md`, `summary.js
 | `nsys_report.sh` | Orchestrate profiling + analysis into a self-contained report |
 | `rewrite_parquet.py` | Rewrite parquet with GPU-optimized row groups (cudf or pyarrow fallback) |
 | `performance_test.py` | Python-based benchmark with result verification |
-| `queries.py` | TPC-H query templates (`{PLACEHOLDER}` substitution parameters) + the fixed default rendering `QUERIES` |
-| `tpch_query_streams.py` | Load the qgen stream files: split on `(Q<n>)` tags, fold the `:n` row limit into a `LIMIT` |
-| `generate_tpch_queries.sh` | Generate per-stream query sets (`stream<N>.sql`) with `qgen` |
-| `dbgen_bootstrap.sh` | Shared unzip/build of the classic `dbgen` / `qgen` tools |
-| `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by `performance_test.py --mode sequential`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
-| `tpch_power_throughput.py` | TPC-H power & throughput runs with RF1/RF2 refresh functions; Power@Size / Throughput@Size / QphH@Size + delta/mask overhead breakdown |
-| `tpch_stream_permutations.py` | Spec Appendix A query-stream orderings (streams 0–40) + spec-minimum stream counts |
-| `generate_tpch_refresh.sh` | Generate RF1/RF2 refresh sets (`orders.tbl.u*`, `lineitem.tbl.u*`, `delete.*`) via classic dbgen `-U` |
+| `queries.py` | TPC-H query definitions (base SQL) |
+| `tpch_pin_columns.py` | Per-query and union column → table mapping for `--pinning-mode per-query` / `pinned-hot` (union helpers also used by the round-robin orderings, i.e. `--execution cold|lukewarm`); emits `CALL pin_table(...)` / `CALL unpin_table(...)` SQL |
 | `generate_test_data.py` | Generate test data via dbgen |
 | `generate_test_data_tpchgen-rs.py` | Generate test data via tpchgen-rs Python wrapper + query files |
 | `pixi.toml` | Python environment with cudf, pyarrow, rust for tooling |
@@ -567,7 +653,7 @@ The Sirius config file (`test/cpp/integration/integration.yaml`) controls:
 - **Host memory**: `capacity_bytes`, `initial_number_pools`, `pool_size`, `block_size`
   - Initial allocation = `initial_number_pools * pool_size * block_size`
 - **Thread pools**: `pipeline`, `task_creator`, `downgrade` thread counts
-- **Cold-run benchmarking**: pass `--mode isolated` to `performance_test.py` to renew the DuckDB connection and drop OS filesystem cache before every run. Requires one-time passwordless sudo setup:
+- **Cold-run benchmarking**: pass `--execution cold` to `performance_test.py` to drop the OS filesystem cache and reset Sirius's prefetching cache before every run. Requires one-time passwordless sudo setup:
   ```bash
   echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches" | sudo tee /etc/sudoers.d/drop_caches
   ```

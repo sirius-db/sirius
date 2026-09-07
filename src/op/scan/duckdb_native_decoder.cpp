@@ -672,7 +672,7 @@ staged_column stage_one_array_column(staging_state& s,
 // Issue staged reads into a pinned host buffer, then copy them to the device.
 //
 // File-near segment reads are coalesced into large sequential reads (bridging the
-// per-block header gaps) and dispatched as one batch via host_read_ranges_async_io,
+// per-block header gaps) and dispatched as one batch via the datasource,
 // packed into a pinned multiple_blocks_allocation; the 16B device alignment the decode kernels need
 // is imposed by the per-segment H2D scatter instead.
 //===----------------------------------------------------------------------===//
@@ -721,7 +721,7 @@ void batched_h2d(std::vector<void*> const& dst,
 
 void submit_and_await(rmm::device_buffer& device_buf,
                       staging_state const& s,
-                      const sirius::io::sirius_datasource& datasource,
+                      sirius::io::sirius_datasource& datasource,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
@@ -812,7 +812,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   auto host_alloc = host_fsmr->allocate_multiple_blocks(host_bytes, reservation.get());
 
   // One coalesced range + contiguous dst span per piece.
-  std::vector<io::io_object_segment> ranges;
+  std::vector<io::slice> ranges;
   ranges.reserve(pieces.size());
   std::size_t total_read = 0;
   for (auto const& p : pieces) {
@@ -827,8 +827,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   // Issue the coalesced reads as one batch and await completion.
   {
     nvtx3::scoped_range nvtx_reads{"native_reads"};
-    auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    auto fut              = datasource.host_read_ranges_async(ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +

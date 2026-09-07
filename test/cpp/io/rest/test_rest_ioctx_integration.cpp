@@ -15,9 +15,9 @@
  */
 
 #include "catch.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -116,7 +116,7 @@ struct scan_manager_fixture {
 scan_manager_config make_minio_rest_config()
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource   = true;
+  cfg.backend                 = sirius::scan_manager::io_backend::sirius;
   cfg.object_store.endpoint   = require_env("SIRIUS_TEST_S3_ENDPOINT");
   cfg.object_store.region     = env_or("SIRIUS_TEST_S3_REGION", "us-east-1");
   cfg.object_store.access_key = require_env("SIRIUS_TEST_S3_ACCESS_KEY");
@@ -140,7 +140,7 @@ scan_manager_config make_tls_minio_rest_config()
 scan_manager_config make_fake_rest_config(std::string endpoint)
 {
   scan_manager_config cfg{};
-  cfg.use_sirius_datasource        = true;
+  cfg.backend                      = sirius::scan_manager::io_backend::sirius;
   cfg.object_store.endpoint        = std::move(endpoint);
   cfg.object_store.region          = "us-east-1";
   cfg.object_store.access_key      = "rest-integration-access-key";
@@ -154,7 +154,7 @@ scan_manager_config make_fake_rest_config(std::string endpoint)
   cfg.rest.retry_jitter            = std::chrono::milliseconds{0};
   cfg.rest.honor_retry_after       = false;
   cfg.rest_n_reactors              = 1;
-  cfg.enable_prefetch_cache        = false;
+  cfg.cache.mode                   = sirius::io::cache::cache_mode::none;
   return cfg;
 }
 
@@ -211,6 +211,15 @@ std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device,
   stream.synchronize();
   return out;
 }
+
+struct cuda_host_deleter {
+  void operator()(std::uint8_t* ptr) const noexcept
+  {
+    if (ptr != nullptr) { std::ignore = cudaFreeHost(ptr); }
+  }
+};
+
+using unique_cuda_host_buffer = std::unique_ptr<std::uint8_t, cuda_host_deleter>;
 
 rest_ioctx* require_rest_ioctx(std::shared_ptr<sirius::io::sirius_datasource> const& ds)
 {
@@ -277,20 +286,20 @@ enum class scripted_list_mode {
   truncated_empty_without_token
 };
 
-class fixed_url_authorizer final : public sirius::io::s3::s3_request_authorizer {
+class fixed_url_authorizer final : public sirius::io::rest::request_authorizer {
  public:
   explicit fixed_url_authorizer(std::string endpoint) : _endpoint(std::move(endpoint)) {}
 
-  sirius::io::s3::s3_authorized_request authorize(sirius::io::s3::s3_object_ref const& obj,
-                                                  sirius::io::s3::s3_request_method /*method*/,
-                                                  std::chrono::seconds /*timeout*/) override
+  sirius::io::rest::authorized_request authorize(sirius::io::rest::object_ref const& obj,
+                                                 sirius::io::rest::request_method /*method*/,
+                                                 std::chrono::seconds /*timeout*/) override
   {
     return {_endpoint + "/" + obj.bucket + "/" + obj.key, {}};
   }
 
-  sirius::io::s3::s3_authorized_request authorize_list(std::string_view bucket,
-                                                       std::string_view canonical_query,
-                                                       std::chrono::seconds /*timeout*/) override
+  sirius::io::rest::authorized_request authorize_list(std::string_view bucket,
+                                                      std::string_view canonical_query,
+                                                      std::chrono::seconds /*timeout*/) override
   {
     return {_endpoint + "/" + std::string{bucket} + "?" + std::string{canonical_query}, {}};
   }
@@ -357,6 +366,10 @@ class range_http_server {
   [[nodiscard]] std::size_t get_count() const noexcept { return _get_count.load(); }
   [[nodiscard]] std::size_t list_count() const noexcept { return _list_count.load(); }
   [[nodiscard]] std::size_t body_bytes_sent() const noexcept { return _body_bytes_sent.load(); }
+  [[nodiscard]] std::size_t max_requested_range() const noexcept
+  {
+    return _max_requested_range.load();
+  }
   [[nodiscard]] int peak_active_gets() const noexcept { return _peak_active_gets.load(); }
 
   void set_generated_listing(std::string prefix, std::size_t total)
@@ -561,7 +574,10 @@ class range_http_server {
         send_body(fd, _object.data(), _object.size());
         return;
       }
-      auto const len = end - start + 1;
+      auto const len    = end - start + 1;
+      auto previous_max = _max_requested_range.load(std::memory_order_relaxed);
+      while (len > previous_max && !_max_requested_range.compare_exchange_weak(
+                                     previous_max, len, std::memory_order_relaxed)) {}
       std::string response =
         "HTTP/1.1 206 Partial Content\r\nContent-Length: " + std::to_string(len);
       if (!_fault.omit_content_range) {
@@ -760,6 +776,7 @@ class range_http_server {
   std::atomic<std::size_t> _get_count{0};
   std::atomic<std::size_t> _list_count{0};
   std::atomic<std::size_t> _body_bytes_sent{0};
+  std::atomic<std::size_t> _max_requested_range{0};
   std::atomic<int> _active_gets{0};
   std::atomic<int> _peak_active_gets{0};
   std::thread _thread;
@@ -961,176 +978,6 @@ TEST_CASE("rest_ioctx accepts an empty final LIST page and rejects an empty cont
   }
 }
 
-TEST_CASE("rest perf snapshot attributes blocking host reads separately from chunk reads",
-          "[s3][integration][rest][perf]")
-{
-  SECTION("blocking host counters exist and default to zero")
-  {
-    sirius::io::rest::rest_perf_snapshot snapshot{};
-    CHECK(snapshot.blocking_host_get_count == 0);
-    CHECK(snapshot.blocking_host_get_wall_ns_total == 0);
-    CHECK(snapshot.blocking_host_get_wall_ns_max == 0);
-  }
-
-  SECTION("blocking host_read network GETs are counted and pool-aggregated")
-  {
-    auto payload = deterministic_payload(16 * 1024);
-    range_http_server server(payload);
-    auto cfg                  = direct_rest_test_config();
-    cfg.perf_instrumentation  = true;
-    cfg.max_connections       = 1;
-    std::size_t const readers = 2;
-    auto ioctx                = make_direct_rest_ioctx(server.endpoint(), cfg, readers);
-    auto datasource           = ioctx->open_datasource("s3://footer-bucket/native-footer.bin",
-                                             static_cast<std::uint64_t>(payload.size()));
-
-    auto const before = ioctx->perf_snapshot();
-
-    std::array<std::uint8_t, 64> first{};
-    REQUIRE(datasource->host_read(17, first.size(), first.data()) == first.size());
-    require_bytes_equal(first, std::span<std::uint8_t const>(payload.data() + 17, first.size()));
-
-    std::array<std::uint8_t, 32> second{};
-    REQUIRE(datasource->host_read(4096, second.size(), second.data()) == second.size());
-    require_bytes_equal(second,
-                        std::span<std::uint8_t const>(payload.data() + 4096, second.size()));
-
-    auto const after = ioctx->perf_snapshot();
-    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + readers);
-    CHECK(after.blocking_host_get_wall_ns_total > before.blocking_host_get_wall_ns_total);
-    CHECK(after.blocking_host_get_wall_ns_max > 0);
-    CHECK(after.chunk_get_count == before.chunk_get_count + readers);
-    CHECK(server.get_count() == readers);
-  }
-
-  SECTION("stash-served parquet footer reads are not counted as blocking host reads")
-  {
-    auto const parquet    = read_binary_file(committed_parquet_fixture("nation.parquet"));
-    auto const footer_len = static_cast<std::size_t>(parquet_footer_len(parquet));
-    auto const footer_off = parquet.size() - 8 - footer_len;
-    range_http_server server(parquet);
-    auto cfg                 = direct_rest_test_config();
-    cfg.perf_instrumentation = true;
-    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto datasource          = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
-                                             sirius::io::open_hint::parquet_footer_probe);
-    REQUIRE(datasource != nullptr);
-
-    auto const before = ioctx->perf_snapshot();
-
-    std::array<std::uint8_t, 8> trailer{};
-    REQUIRE(datasource->host_read(
-              parquet.size() - trailer.size(), trailer.size(), trailer.data()) == trailer.size());
-    require_bytes_equal(trailer,
-                        std::span<std::uint8_t const>(parquet.data() + parquet.size() - 8, 8));
-
-    std::vector<std::uint8_t> footer(footer_len);
-    REQUIRE(datasource->host_read(footer_off, footer.size(), footer.data()) == footer.size());
-    require_bytes_equal(footer,
-                        std::span<std::uint8_t const>(parquet.data() + footer_off, footer_len));
-
-    auto const after = ioctx->perf_snapshot();
-    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
-    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
-    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
-    CHECK(server.get_count() == 1);
-  }
-
-  SECTION("a blocking read outside the footer stash is counted as a blocking network read")
-  {
-    auto payload = deterministic_payload(16 * 1024);
-    range_http_server server(payload);
-    auto cfg                 = direct_rest_test_config();
-    cfg.perf_instrumentation = true;
-    cfg.footer_probe_bytes   = 8;
-    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto datasource          = ioctx->open_datasource("s3://footer-bucket/outside-stash.bin",
-                                             sirius::io::open_hint::parquet_footer_probe);
-    auto const before        = ioctx->perf_snapshot();
-
-    std::array<std::uint8_t, 32> out{};
-    REQUIRE(datasource->host_read(0, out.size(), out.data()) == out.size());
-    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data(), out.size()));
-
-    auto const after = ioctx->perf_snapshot();
-    CHECK(after.blocking_host_get_count == before.blocking_host_get_count + 1);
-    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
-    CHECK(server.get_count() == 2);
-  }
-
-  SECTION("the one-shot footer probe GET bypasses native counters but remains a chunk GET")
-  {
-    auto payload = deterministic_payload(16 * 1024);
-    range_http_server server(payload);
-    auto cfg                 = direct_rest_test_config();
-    cfg.perf_instrumentation = true;
-    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto const before        = ioctx->perf_snapshot();
-
-    auto datasource = ioctx->open_datasource("s3://footer-bucket/probe-only.bin",
-                                             sirius::io::open_hint::parquet_footer_probe);
-    REQUIRE(datasource != nullptr);
-
-    auto const after = ioctx->perf_snapshot();
-    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
-    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
-    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
-    CHECK(after.chunk_get_count == before.chunk_get_count + 1);
-    CHECK(server.get_count() == 1);
-  }
-
-  SECTION("async chunk reads bump chunk counters without touching blocking host counters")
-  {
-    auto payload = deterministic_payload(64 * 1024);
-    range_http_server server(payload);
-    auto cfg                 = direct_rest_test_config();
-    cfg.perf_instrumentation = true;
-    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto datasource          = ioctx->open_datasource("s3://footer-bucket/chunk-data.bin",
-                                             static_cast<std::uint64_t>(payload.size()));
-
-    std::vector<std::uint8_t> a(257);
-    std::vector<std::uint8_t> b(1024);
-    std::array<sirius::io::io_object_segment, 2> segments{
-      sirius::io::io_object_segment{17, a.size(), a.data()},
-      sirius::io::io_object_segment{4096, b.size(), b.data()}};
-
-    auto const before = ioctx->perf_snapshot();
-    auto got =
-      std::move(ioctx->host_read_ranges_async_io(datasource->io_object(), segments)).get(5s);
-    auto const after = ioctx->perf_snapshot();
-
-    REQUIRE(got == a.size() + b.size());
-    require_bytes_equal(a, std::span<std::uint8_t const>(payload.data() + 17, a.size()));
-    require_bytes_equal(b, std::span<std::uint8_t const>(payload.data() + 4096, b.size()));
-    CHECK(after.chunk_get_count > before.chunk_get_count);
-    CHECK(after.blocking_host_get_count == before.blocking_host_get_count);
-    CHECK(after.blocking_host_get_wall_ns_total == before.blocking_host_get_wall_ns_total);
-    CHECK(after.blocking_host_get_wall_ns_max == before.blocking_host_get_wall_ns_max);
-  }
-
-  SECTION("blocking host counters are gated off when perf instrumentation is disabled")
-  {
-    auto payload = deterministic_payload(4096);
-    range_http_server server(payload);
-    auto cfg                 = direct_rest_test_config();
-    cfg.perf_instrumentation = false;
-    auto ioctx               = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto datasource          = ioctx->open_datasource("s3://footer-bucket/perf-off.bin",
-                                             static_cast<std::uint64_t>(payload.size()));
-
-    std::array<std::uint8_t, 128> out{};
-    REQUIRE(datasource->host_read(99, out.size(), out.data()) == out.size());
-    require_bytes_equal(out, std::span<std::uint8_t const>(payload.data() + 99, out.size()));
-
-    auto const after = ioctx->perf_snapshot();
-    CHECK(after.blocking_host_get_count == 0);
-    CHECK(after.blocking_host_get_wall_ns_total == 0);
-    CHECK(after.blocking_host_get_wall_ns_max == 0);
-    CHECK(server.get_count() == 1);
-  }
-}
-
 TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
           "[s3][integration][rest][list]")
 {
@@ -1146,7 +993,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
     ctx->list_objects_paged("bucket",
                             "data/",
                             /*page_size=*/1,
-                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                            [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                               ++pages;
                               REQUIRE(page.entries.size() == 1);
                               CHECK(page.entries[0].key == "data/a.parquet");
@@ -1178,7 +1025,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         "bucket",
                         "data/",
                         /*page_size=*/1,
-                        [](sirius::io::s3::list_objects_v2_page const&) { return true; },
+                        [](sirius::io::rest::s3::list_objects_v2_page const&) { return true; },
                         /*max_scanned=*/2),
                       Catch::Contains("narrow the glob prefix"));
   }
@@ -1195,7 +1042,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
                         "bucket",
                         "data/",
                         /*page_size=*/1,
-                        [](sirius::io::s3::list_objects_v2_page const&) { return true; }),
+                        [](sirius::io::rest::s3::list_objects_v2_page const&) { return true; }),
                       Catch::Contains("narrow the glob prefix"));
 
     range_http_server override_server(deterministic_payload(16), {}, objects);
@@ -1206,7 +1053,7 @@ TEST_CASE("rest_ioctx paged LIST supports early stop and explicit safety caps",
       "bucket",
       "data/",
       /*page_size=*/1,
-      [&](sirius::io::s3::list_objects_v2_page const& page) {
+      [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
         ++pages;
         REQUIRE(page.entries.size() == 1);
         return true;
@@ -1264,7 +1111,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
       ctx->list_objects_paged("bucket",
                               "big/",
                               /*page_size=*/1000,
-                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                                 max_seen = std::max(max_seen, page.entries.size());
                                 ++sink_calls;
                                 return true;
@@ -1330,7 +1177,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys configured caps without accumul
     ctx->list_objects_paged("bucket",
                             "big/",
                             /*page_size=*/1000,
-                            [&](sirius::io::s3::list_objects_v2_page const& page) {
+                            [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                               max_seen = std::max(max_seen, page.entries.size());
                               ++sink_calls;
                               return false;
@@ -1358,7 +1205,7 @@ TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
       ctx->list_objects_paged("bucket",
                               "big/",
                               /*page_size=*/1000,
-                              [&](sirius::io::s3::list_objects_v2_page const& page) {
+                              [&](sirius::io::rest::s3::list_objects_v2_page const& page) {
                                 max_seen = std::max(max_seen, page.entries.size());
                                 ++sink_calls;
                                 return true;
@@ -1396,64 +1243,6 @@ TEST_CASE("rest_ioctx generated LIST scale obeys the default safety caps",
   }
 }
 
-TEST_CASE("rest LIST retries are observable and isolated from object-read byte counters",
-          "[s3][integration][rest][list][telemetry]")
-{
-  std::vector<listed_object> objects = {{"data/a.parquet", 1}};
-  auto cfg                           = direct_rest_test_config();
-  cfg.perf_instrumentation           = true;
-
-  SECTION("transient LIST failure retries and logs bucket/prefix")
-  {
-    range_fault_policy fault{};
-    fault.fail_first_lists = 1;
-    fault.fail_list_status = 503;
-    range_http_server server(deterministic_payload(16), fault, objects);
-    auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto before = ctx->perf_snapshot();
-    scoped_log_capture logs;
-
-    auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
-    auto after  = ctx->perf_snapshot();
-
-    REQUIRE(listed.size() == 1);
-    CHECK(after.retries_total - before.retries_total == 1);
-    CHECK(after.terminal_failures_total == before.terminal_failures_total);
-    CHECK(after.chunk_get_count == before.chunk_get_count);
-    CHECK(after.payload_bytes_read_total == before.payload_bytes_read_total);
-    CHECK(server.list_count() == 2);
-
-    auto records = logs.records();
-    CHECK(std::any_of(records.begin(), records.end(), [](capture_sink::record const& record) {
-      return record.level == sirius::log::level::warn &&
-             record.message.find("bucket") != std::string::npos &&
-             record.message.find("data/") != std::string::npos;
-    }));
-  }
-
-  SECTION("clean LIST is telemetry-quiet")
-  {
-    range_http_server server(deterministic_payload(16), {}, objects);
-    auto ctx    = make_direct_rest_ioctx(server.endpoint(), cfg);
-    auto before = ctx->perf_snapshot();
-    scoped_log_capture logs;
-
-    auto listed = ctx->list_objects("bucket", "data/", /*page_size=*/1000);
-    auto after  = ctx->perf_snapshot();
-
-    REQUIRE(listed.size() == 1);
-    CHECK(after.retries_total == before.retries_total);
-    CHECK(after.terminal_failures_total == before.terminal_failures_total);
-    CHECK(after.chunk_get_count == before.chunk_get_count);
-    CHECK(after.payload_bytes_read_total == before.payload_bytes_read_total);
-
-    auto records = logs.records();
-    CHECK(std::none_of(records.begin(), records.end(), [](capture_sink::record const& record) {
-      return record.level >= sirius::log::level::warn;
-    }));
-  }
-}
-
 TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
           "[s3][integration][rest][list][filesystem]")
 {
@@ -1464,7 +1253,7 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   auto datasource =
     ctx->open_datasource("s3://bucket/list-sized.bin", static_cast<std::uint64_t>(payload.size()));
   REQUIRE(datasource != nullptr);
-  CHECK(datasource->io_object().size() == payload.size());
+  CHECK(datasource->get_io_object().size() == payload.size());
   CHECK(server.head_count() == 0);
 
   std::vector<std::uint8_t> out(payload.size());
@@ -1472,6 +1261,53 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   CHECK(got == out.size());
   CHECK(out == payload);
   CHECK(server.get_count() == 1);
+}
+
+TEST_CASE("rest reactor dynamically splits one logical read below the physical GET maximum",
+          "[s3][integration][rest]")
+{
+  constexpr std::size_t max_rest_segment = 16UL << 20;
+  auto payload                           = deterministic_payload((33UL << 20) + 17);
+  range_http_server server(payload);
+  auto config            = direct_rest_test_config();
+  config.max_connections = 4;
+  auto ioctx             = make_direct_rest_ioctx(server.endpoint(), config);
+  auto datasource        = ioctx->open_datasource("s3://split-bucket/object.bin", payload.size());
+  std::vector<std::uint8_t> destination(payload.size());
+  std::vector<sirius::io::slice> slices;
+  slices.emplace_back(0, destination.size(), destination.data());
+
+  auto future = ioctx->host_readv_async_io(datasource->get_io_object(), slices);
+  REQUIRE(std::move(future).get(10s) == payload.size());
+
+  CHECK(server.get_count() > 1);
+  CHECK(server.max_requested_range() <= max_rest_segment);
+  require_bytes_equal(destination, payload);
+}
+
+TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest][cache]")
+{
+  constexpr std::size_t page_size = 4096;
+  constexpr std::size_t tail_size = 17;
+  auto payload                    = deterministic_payload(page_size + tail_size);
+  range_http_server server(payload);
+  scan_manager_fixture fixture;
+  auto cfg       = make_fake_rest_config(server.endpoint());
+  cfg.cache.mode = sirius::io::cache::cache_mode::sirius;
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+  auto datasource = manager.create_datasource("s3://tail-cache-bucket/object.bin");
+  REQUIRE(datasource != nullptr);
+
+  std::array<cudf::io::text::byte_range_info, 1> ranges{
+    cudf::io::text::byte_range_info{page_size, tail_size}};
+  datasource->fadvise(ranges, std::nullopt);
+  REQUIRE(datasource->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+
+  std::array<std::uint8_t, tail_size> destination{};
+  REQUIRE(datasource->host_read(page_size, destination.size(), destination.data()) == tail_size);
+  require_bytes_equal(destination,
+                      std::span<std::uint8_t const>(payload.data() + page_size, tail_size));
+  CHECK(server.max_requested_range() == payload.size());
 }
 
 TEST_CASE("rest footer suffix parses Content-Range totals", "[s3][integration][rest][footerbind]")
@@ -1559,7 +1395,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1587,7 +1423,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1724,7 +1560,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
-    CHECK(datasource->io_object().validation_etag().empty());
+    CHECK(datasource->get_io_object().validation_tag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -1823,9 +1659,6 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     CHECK(probe.bytes->size() == parquet.size());
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 3);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 2);
-    CHECK(perf.terminal_failures_total == 0);
   }
 
   SECTION("exhausted transient 503s throw after the retry budget")
@@ -1852,9 +1685,6 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     }
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 2);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == cfg.max_retry_attempts - 1);
-    CHECK(perf.terminal_failures_total == 1);
   }
 
   SECTION("hard non-retriable errors fail without retrying")
@@ -1880,12 +1710,9 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     }
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 1);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 0);
-    CHECK(perf.terminal_failures_total == 1);
   }
 
-  SECTION("clean 206 has no retry or terminal-failure telemetry")
+  SECTION("clean 206 succeeds without retries")
   {
     range_fault_policy fault{};
     fault.successful_get_etag = "\"footer-v1\"";
@@ -1907,14 +1734,10 @@ TEST_CASE("footer suffix probe retries transient GET failures",
     CHECK(probe.bytes->size() == parquet.size());
     CHECK(server.head_count() == 0);
     CHECK(server.get_count() == 1);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 0);
-    CHECK(perf.terminal_failures_total == 0);
   }
 }
 
-TEST_CASE("HEAD object-size retries update REST perf counters",
-          "[s3][integration][rest][footerbind]")
+TEST_CASE("HEAD object-size retries preserve retry behavior", "[s3][integration][rest][footerbind]")
 {
   auto const payload = deterministic_payload(4096);
 
@@ -1933,14 +1756,11 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-retry-success");
 
-    auto const result = reactor.head_object_size("head-bucket", "head-success.bin");
+    auto const result = reactor.head_object("head-bucket", "head-success.bin");
     CHECK(result.object_size == payload.size());
     CHECK(result.etag == "\"head-v2\"");
     CHECK(server.head_count() == 3);
     CHECK(server.get_count() == 0);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 2);
-    CHECK(perf.terminal_failures_total == 0);
   }
 
   SECTION("exhausted transient 503s are reported as one terminal failure")
@@ -1958,8 +1778,8 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
     sirius::io::rest::rest_reactor reactor(ctx, "head-retry-exhausted");
 
     try {
-      (void)reactor.head_object_size("head-bucket", "head-exhausted.bin");
-      FAIL("head_object_size should throw after exhausting transient retries");
+      (void)reactor.head_object("head-bucket", "head-exhausted.bin");
+      FAIL("head_object should throw after exhausting transient retries");
     } catch (std::runtime_error const& e) {
       auto const message = std::string{e.what()};
       CHECK(message.find("exhausted retries") != std::string::npos);
@@ -1967,9 +1787,6 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
     }
     CHECK(server.head_count() == 2);
     CHECK(server.get_count() == 0);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == cfg.max_retry_attempts - 1);
-    CHECK(perf.terminal_failures_total == 1);
   }
 
   SECTION("hard non-retriable HEAD errors fail without retrying")
@@ -1987,20 +1804,17 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
     sirius::io::rest::rest_reactor reactor(ctx, "head-hard-failure");
 
     try {
-      (void)reactor.head_object_size("head-bucket", "head-forbidden.bin");
-      FAIL("head_object_size should throw on a hard non-retriable HTTP error");
+      (void)reactor.head_object("head-bucket", "head-forbidden.bin");
+      FAIL("head_object should throw on a hard non-retriable HTTP error");
     } catch (std::runtime_error const& e) {
       auto const message = std::string{e.what()};
       CHECK(message.find("HTTP 403") != std::string::npos);
     }
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 0);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 0);
-    CHECK(perf.terminal_failures_total == 1);
   }
 
-  SECTION("clean HEAD has no retry or terminal-failure telemetry")
+  SECTION("clean HEAD succeeds without retries")
   {
     range_http_server server(payload);
     auto authorizer             = std::make_shared<fixed_url_authorizer>(server.endpoint());
@@ -2011,14 +1825,11 @@ TEST_CASE("HEAD object-size retries update REST perf counters",
       cfg, std::move(authorizer), nullptr);
     sirius::io::rest::rest_reactor reactor(ctx, "head-clean");
 
-    auto const result = reactor.head_object_size("head-bucket", "head-clean.bin");
+    auto const result = reactor.head_object("head-bucket", "head-clean.bin");
     CHECK(result.object_size == payload.size());
     CHECK(result.etag.empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 0);
-    auto const perf = reactor.perf_snapshot();
-    CHECK(perf.retries_total == 0);
-    CHECK(perf.terminal_failures_total == 0);
   }
 }
 
@@ -2067,7 +1878,7 @@ TEST_CASE("REST retry logging includes object keys and stays quiet on clean requ
     scoped_log_capture logs;
     auto probe = reactor.fetch_footer_suffix("log-bucket", "clean.parquet", 1024);
     REQUIRE(probe.bytes != nullptr);
-    CHECK(reactor.head_object_size("log-bucket", "clean.parquet").object_size == payload.size());
+    CHECK(reactor.head_object_size("log-bucket", "clean.parquet") == payload.size());
 
     auto const records        = logs.records();
     auto const warning_or_bad = std::any_of(records.begin(), records.end(), [](auto const& r) {
@@ -2197,14 +2008,13 @@ TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture
   scan_manager_fixture fixture;
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
-  cfg.rest.chunk_size      = 1UL << 20;
-  cfg.rest.max_n_chunks    = 1;
+  cfg.rest.merge_max_gap   = 0;  // one GET per range: no bridging across the gaps
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
   auto datasource = manager.create_datasource("s3://" + bucket + "/medium.bin");
   require_rest_ioctx(datasource);
 
   std::vector<std::vector<std::uint8_t>> buffers;
-  std::vector<sirius::io::io_object_segment> segments;
+  std::vector<sirius::io::slice> segments;
   std::vector<std::pair<std::size_t, std::size_t>> ranges{
     {17, 257},
     {64 * 1024 + 9, 1024},
@@ -2220,15 +2030,75 @@ TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture
     total += size;
   }
 
-  auto got =
-    std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
-      .get(5s);
+  auto got = std::move(datasource->io_ctx()->host_readv_async_io(
+                         datasource->get_io_object(), std::span<const sirius::io::slice>(segments)))
+               .get(5s);
   REQUIRE(got == total);
   for (std::size_t i = 0; i < ranges.size(); ++i) {
     auto const [offset, size] = ranges[i];
     require_bytes_equal(buffers[i], std::span<std::uint8_t const>(medium.data() + offset, size));
   }
+}
+
+TEST_CASE("rest_ioctx keeps caller host buffers until the device event completes",
+          "[s3][integration][rest]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("Skipping rest_ioctx caller-host device-event test: no CUDA device");
+    return;
+  }
+
+  auto payload = deterministic_payload(256 * 1024);
+  range_http_server server(payload);
+  auto ioctx      = make_direct_rest_ioctx(server.endpoint());
+  auto datasource = ioctx->open_datasource("s3://device-event-bucket/object.bin", payload.size());
+
+  void* raw_host = nullptr;
+  REQUIRE(cudaMallocHost(&raw_host, payload.size()) == cudaSuccess);
+  unique_cuda_host_buffer host{static_cast<std::uint8_t*>(raw_host)};
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer destination(payload.size(), stream);
+  struct stream_gate {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+  } gate;
+  REQUIRE(cudaLaunchHostFunc(
+            stream.value(),
+            [](void* opaque) {
+              auto& state = *static_cast<stream_gate*>(opaque);
+              state.entered.store(true, std::memory_order_release);
+              while (!state.release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+              }
+            },
+            &gate) == cudaSuccess);
+
+  std::jthread release_gate([&gate] {
+    std::this_thread::sleep_for(500ms);
+    gate.release.store(true, std::memory_order_release);
+  });
+  auto const gate_deadline = std::chrono::steady_clock::now() + 5s;
+  while (!gate.entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < gate_deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(gate.entered.load(std::memory_order_acquire));
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.emplace_back(
+    sirius::io::range{0, payload.size()},
+    sirius::io::host_buffer{host.get()},
+    sirius::io::device_buffer{static_cast<std::uint8_t*>(destination.data()), stream});
+
+  auto future = ioctx->host_device_readv_async_io(datasource->get_io_object(), std::move(slices));
+  REQUIRE(std::move(future).get(5s) == payload.size());
+
+  // The future owns the caller's source lifetime through the recorded event. If
+  // it settled at enqueue time, this overwrite would race the gated H2D copy.
+  std::memset(host.get(), 0, payload.size());
+  auto got = copy_device_to_host(destination, payload.size(), stream);
+  require_bytes_equal(got, payload);
 }
 
 TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chunk MinIO reads",
@@ -2249,7 +2119,6 @@ TEST_CASE("rest_ioctx stages device reads through FSMR for single and multi chun
   scan_manager_fixture fixture;
   auto cfg                 = make_minio_rest_config();
   cfg.rest.max_connections = 4;
-  cfg.rest.chunk_size      = 1UL << 20;
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   SECTION("single chunk")
@@ -2333,15 +2202,14 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
   scan_manager_fixture fixture;
   auto cfg                 = make_fake_rest_config(server.endpoint());
   cfg.rest.max_connections = 2;
-  cfg.rest.chunk_size      = 1024;
-  cfg.rest.max_n_chunks    = 1;
+  cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
   sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
 
   auto datasource = manager.create_datasource("s3://concurrency-bucket/object.bin");
   require_rest_ioctx(datasource);
 
   std::vector<std::vector<std::uint8_t>> buffers;
-  std::vector<sirius::io::io_object_segment> segments;
+  std::vector<sirius::io::slice> segments;
   for (std::size_t i = 0; i < 8; ++i) {
     std::size_t const offset = i * 4096 + 13;
     std::size_t const size   = 512;
@@ -2349,17 +2217,64 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
     segments.emplace_back(offset, size, buffers.back().data());
   }
 
-  auto got =
-    std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
-      .get(10s);
+  auto got = std::move(datasource->io_ctx()->host_readv_async_io(
+                         datasource->get_io_object(), std::span<const sirius::io::slice>(segments)))
+               .get(10s);
   REQUIRE(got == 8 * 512);
   CHECK(server.peak_active_gets() <= 2);
   CHECK(server.peak_active_gets() >= 1);
   for (std::size_t i = 0; i < segments.size(); ++i) {
     require_bytes_equal(
       buffers[i],
-      std::span<std::uint8_t const>(payload.data() + segments[i].offset, segments[i].size));
+      std::span<std::uint8_t const>(payload.data() + segments[i].offset(), segments[i].size()));
+  }
+}
+
+// One batched request must be driven by the whole reactor pool, not by whichever
+// reactor the round-robin happened to land on.  max_connections is per reactor,
+// so with a one-connection reactor the concurrency the server observes IS the
+// number of reactors the request reached: a single-reactor dispatch can never
+// exceed one in-flight GET no matter how many segments it was handed.
+TEST_CASE("rest_ioctx spreads one batched range read across the reactor pool",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(512 * 1024);
+  range_fault_policy fault{};
+  fault.response_delay = 50ms;
+  range_http_server server(payload, fault);
+  scan_manager_fixture fixture;
+  auto cfg                 = make_fake_rest_config(server.endpoint());
+  cfg.rest_n_reactors      = 4;
+  cfg.rest.max_connections = 1;
+  cfg.rest.merge_max_gap   = 0;  // keep the 8 segments as 8 separate GETs
+  sirius_scan_manager manager{cfg, *fixture.memory, fixture.topology};
+
+  auto datasource = manager.create_datasource("s3://fanout-bucket/object.bin");
+  require_rest_ioctx(datasource);
+
+  // Two chunks per reactor, so the split is even and every reactor has work
+  // queued behind its single connection.
+  std::vector<std::vector<std::uint8_t>> buffers;
+  std::vector<sirius::io::slice> segments;
+  for (std::size_t i = 0; i < 8; ++i) {
+    std::size_t const offset = i * 4096 + 13;
+    std::size_t const size   = 512;
+    buffers.emplace_back(size);
+    segments.emplace_back(offset, size, buffers.back().data());
+  }
+
+  auto got = std::move(datasource->io_ctx()->host_readv_async_io(
+                         datasource->get_io_object(), std::span<const sirius::io::slice>(segments)))
+               .get(10s);
+  REQUIRE(got == 8 * 512);
+  // > 1 is the fan-out itself; <= n_reactors is max_connections still holding
+  // per reactor rather than the pool becoming unbounded.
+  CHECK(server.peak_active_gets() > 1);
+  CHECK(server.peak_active_gets() <= 4);
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    require_bytes_equal(
+      buffers[i],
+      std::span<std::uint8_t const>(payload.data() + segments[i].offset(), segments[i].size()));
   }
 }
 

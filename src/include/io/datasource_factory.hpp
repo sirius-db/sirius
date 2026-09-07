@@ -19,8 +19,6 @@
 #include "io/io_context.hpp"
 #include "sirius_config.hpp"
 
-#include <absl/functional/any_invocable.h>
-
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -42,7 +40,7 @@ namespace sirius::io {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Thread-safe registry of @c sirius_ioctx backends, resolved by full path.
+ * @brief Thread-safe registry of @c ioctx backends, resolved by full path.
  *
  * The engine constructs a registry at startup and registers one entry per backend
  * (kvikio / uring / restful), each carrying a path-capability checker.  At
@@ -72,7 +70,7 @@ class io_context_registry {
   io_context_registry& operator=(io_context_registry const&) = delete;
 
   using scheme_checker_type = std::function<bool(std::string_view)>;
-  using factory_type        = std::function<std::shared_ptr<io::sirius_ioctx>(const config_type&)>;
+  using factory_type        = std::function<std::shared_ptr<io::ioctx>(const config_type&)>;
 
   /**
    * @brief Register an ioctx backend. Replaces any prior registration for the
@@ -89,11 +87,11 @@ class io_context_registry {
   /// (uring / restful) take precedence over the kvikio catch-all, so `s3://`
   /// never resolves to kvikio and a local file routes to uring before the
   /// universal fallback.  When the registry was built with
-  /// `use_sirius_datasource=false`, the uring local backend is suppressed so local
+  /// `backend: kvikio`, the uring local backend is suppressed so local
   /// files fall through to kvikio.  std::nullopt when nothing matches.
   std::optional<io_context_type> lookup_path(std::string_view path) const noexcept;
 
-  std::shared_ptr<sirius_ioctx> make_ioctx(io_context_type type) const noexcept;
+  std::shared_ptr<ioctx> make_ioctx(io_context_type type) const noexcept;
 
   /**
    * @brief Drop all registered ioctxs. Callers are responsible for shutting
@@ -109,7 +107,10 @@ class io_context_registry {
   };
   const config_type _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
-  bool _prefer_kvikio_for_file_scheme{false};
+  /// Set when @c backend=kvikio: kvikIO then serves BOTH local files (instead
+  /// of uring) and @c s3:// objects (instead of rest) for reads.  LIST / glob
+  /// still goes to the REST backend, which the scan manager obtains by type.
+  bool _prefer_kvikio{false};
   mutable std::shared_mutex _mtx;
   std::unordered_map<io_context_type, entry> _entries;
 };
@@ -126,13 +127,13 @@ class io_context_registry {
 // unconfigured credentials, …) is logged and reported as a null ioctx rather
 // than thrown, matching @c io_context_registry::make_ioctx.
 
-/// kvikio fallback backend (cudf default datasource).  Takes no reservation
-/// manager — kvikio owns no reactor staging.
+/// kvikio fallback backend (drives @c kvikio::FileHandle directly).  Takes no
+/// reservation manager — kvikio owns no reactor staging.
 io_context_registry::factory_type make_kvikio_ioctx_factory();
 
 /// io_uring local-disk backend.  Builds a @c uring_reactor::reactor_context from
-/// @c config.local (bounce-slot size taken from the HOST-tier resource's block
-/// size) and @c config.uring_n_reactors.
+/// @c config.uring and @c config.uring_n_reactors. Pinned staging uses the
+/// HOST-tier resource block size; physical grouping is chosen by the worker.
 io_context_registry::factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager);
 

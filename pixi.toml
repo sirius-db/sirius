@@ -38,6 +38,7 @@ mold = "*"
 libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
+boto3 = ">=1.43.68,<2"
 
 [pypi-dependencies]
 rumdl = "==0.2.44"
@@ -76,11 +77,14 @@ args = [{ arg = "output_dir", default = "telemetry_data" }]
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems.
 [feature.cuda13]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+# 26.08 is only published as nightlies; the hybrid-scan multi-file reader
+# (cudf/io/experimental/hybrid_scan_multifile.hpp) does not exist in 26.06.
+channels = [{ channel = "rapidsai-nightly", priority = 1 }]
 
 [feature.cuda13.dependencies]
 cuda-version = "13.2.*"
-libcudf = "26.06.*"
-libcuvs = "26.06.*"
+libcudf = "26.08.*"
+libcuvs = "26.08.*"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 89, 90a, 100f, 120a, 120)
@@ -89,11 +93,12 @@ VCPKG_CUDA_VERSION = "13"
 
 [feature.cuda12]
 platforms = ["linux-64-cuda12", "linux-aarch64-cuda12"]
+channels = [{ channel = "rapidsai-nightly", priority = 1 }]
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-libcudf = "26.06.*"
-libcuvs = "26.06.*"
+libcudf = "26.08.*"
+libcuvs = "26.08.*"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 89, 90a)

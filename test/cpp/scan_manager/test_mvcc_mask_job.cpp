@@ -157,7 +157,7 @@ TEST_CASE("fan_out_and_join assembles concurrent disjoint writes exactly once",
   constexpr std::size_t kSlice  = 4096;
   std::vector<std::uint8_t> buffer(kSlices * kSlice, 0);
 
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   for (std::size_t s = 0; s < kSlices; ++s) {
     tasks.push_back([&buffer, s] {
       std::fill_n(buffer.data() + s * kSlice, kSlice, static_cast<std::uint8_t>(s + 1));
@@ -181,7 +181,7 @@ TEST_CASE("fan_out_and_join rethrows the first task error after the join",
   sirius::exec::scoped_dispatcher dispatcher(pool, 4);
 
   std::atomic<int> ran{0};
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   tasks.push_back([&ran] { ran.fetch_add(1); });
   tasks.push_back([] { throw std::runtime_error("mask task blew up"); });
   tasks.push_back([&ran] { ran.fetch_add(1); });
@@ -199,7 +199,7 @@ TEST_CASE("fan_out_and_join turns dropped tasks into a loud error, not a deadloc
   dispatcher.request_stop();  // enqueue is a silent no-op from here on
 
   std::atomic<int> ran{0};
-  std::vector<absl::AnyInvocable<void()>> tasks;
+  std::vector<sirius::exec::invocable<void()>> tasks;
   for (int i = 0; i < 3; ++i) {
     tasks.push_back([&ran] { ran.fetch_add(1); });
   }

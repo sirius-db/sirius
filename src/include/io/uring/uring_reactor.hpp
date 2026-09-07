@@ -23,6 +23,8 @@
 #include "io/uring/config.hpp"
 #include "io/uring/types.hpp"
 
+#include <cudf/io/text/byte_range_info.hpp>
+
 #include <cuda_runtime.h>
 
 #include <blockingconcurrentqueue.h>
@@ -33,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -41,46 +44,20 @@
 #include <thread>
 #include <vector>
 
-namespace {
-inline void cuda_check(cudaError_t e, char const* file, int line)
-{
-  if (e != cudaSuccess)
-    throw std::runtime_error(std::string("CUDA error ") + file + ":" + std::to_string(line) +
-                             " – " + cudaGetErrorString(e));
-}
-}  // namespace
-
-#define CUDA_CHECK(call) cuda_check((call), __FILE__, __LINE__)
-
 namespace sirius::io::uring {
-
-// ---- bounce_slot -----------------------------------------------------------
-
-/**
- * @brief One pinned-memory staging buffer.
- *
- * The buffer is a non-owning pointer into a block owned by the reactor's
- * @c fixed_size_host_memory_resource allocation — the resource frees the
- * memory when the reactor is destroyed.  Used only by managed device reads;
- * host and BYO device reads supply their own destination buffer.
- */
-struct bounce_slot {
-  void* buf{nullptr};
-};
 
 // ---------------------------------------------------------------------------
 // local_io_object
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Concrete @c sirius_io_object backed by a filesystem path.
+ * @brief Concrete @c io_object backed by a filesystem path.
  *
- * Passive bag of native handles.  The buffered @c O_RDONLY fd
- * (for @c pread / host_read) and the @c O_DIRECT fd (for reactor-driven
- * device reads) are produced by @c uring_reactor::create_io_object — this
- * class does no I/O of its own.
+ * Passive bag of native handles. The buffered @c O_RDONLY fd and, when the
+ * filesystem supports it, an optional @c O_DIRECT fd are produced by
+ * @c uring_reactor::create_io_object. This class does no I/O of its own.
  */
-class local_io_object : public sirius_io_object {
+class local_io_object : public io_object {
  public:
   local_io_object(std::string path,
                   file_descriptor fd,
@@ -123,14 +100,20 @@ class local_io_object : public sirius_io_object {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Single-threaded I/O reactor for O_DIRECT device reads.
+ * @brief Single-threaded local-file I/O reactor.
  *
- * Owns one @c io_uring (O_DIRECT), one worker thread, @c NUM_CHUNKS pinned
- * bounce slots, and an MPSC request queue.  Models the reactor concept
- * consumed by @c templated_ioctx.
+ * Owns one @c io_uring, one worker thread, a fixed pool of pinned staging
+ * blocks, and an MPSC request queue. Physical operations use O_DIRECT only
+ * when the worker determines that the complete transfer is compatible.
+ * Models the reactor concept consumed by @c templated_ioctx.
  */
 class uring_reactor {
  public:
+  /// A read here is a syscall against page cache or NVMe, cheap enough that
+  /// batching buys little -- and demanding the whole range set up front forces
+  /// the caller to materialise ranges it might never read.
+  static constexpr bool prefers_bulk_io = false;
+
   /// Shared, immutable services for a pool of reactors.  One instance is built
   /// by @c uring_ioctx and shared (via shared_ptr) across every reactor in the
   /// pool — the natural home for things shared rather than per-reactor: the
@@ -155,14 +138,10 @@ class uring_reactor {
     cucascade::memory::fixed_size_host_memory_resource* _mr{nullptr};
   };
 
-  using native_handle_type        = int;
-  using io_object_type            = local_io_object;
-  using request_type              = rx_request;
-  using request_type_ptr          = std::unique_ptr<rx_request>;
-  using chunk_io_request_type     = chunked_rx_request;
-  using chunk_io_request_type_ptr = std::unique_ptr<chunked_rx_request>;
-  using reactor_config_type       = config;
-  using reactor_context_type      = reactor_context;
+  using native_handle_type   = int;
+  using io_object_type       = local_io_object;
+  using reactor_config_type  = config;
+  using reactor_context_type = reactor_context;
 
   /// Bounce slots are allocated from the context's host_memory_resource (which
   /// must be non-null); their size is taken from its @c get_block_size().  The
@@ -182,42 +161,9 @@ class uring_reactor {
   /// place — the context — rather than being passed in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
-  static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
-                                               const io_object_type& file,
-                                               const io_object_segment& segment);
-
-  static request_type_ptr prep_device_rx_request(const reactor_config_type& cfg,
-                                                 const io_object_type& file,
-                                                 uint8_t* dst,
-                                                 size_t offset,
-                                                 size_t size,
-                                                 rmm::cuda_stream_view stream,
-                                                 int device_id);
-
-  static request_type_ptr prep_host_to_device_rx_request(const reactor_config_type& cfg,
-                                                         const io_object_type& file,
-                                                         std::span<io_object_segment> bounce,
-                                                         uint8_t* dst,
-                                                         size_t offset,
-                                                         size_t size,
-                                                         rmm::cuda_stream_view stream,
-                                                         int device_id);
-
-  /// Build a host-read request that fuses runs of contiguous segments sharing
-  /// the same backing fd into vectored (readv) submissions of at most
-  /// @c cfg.max_n_chunks buffers each; non-contiguous boundaries / fd changes
-  /// start a new group.  A 1-buffer group degrades to a plain read.
-  ///
-  /// request_manager::total_chunks is set to the number of emitted GROUPS (each
-  /// group calls chunk_complete exactly once); bytes_requested is the clamped
-  /// sum over input segments.
-  static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
-                                                const io_object_type& file,
-                                                std::span<io_object_segment> segments);
-
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
-  /// config) and parked until it is actually needed — see @c sirius_ioctx::start.
+  /// config) and parked until it is actually needed — see @c ioctx::start.
   /// Idempotent: a second call (while the worker is already running) is a no-op.
   void start();
 
@@ -227,53 +173,25 @@ class uring_reactor {
   /// Synchronous buffered host read (pread on @p fd).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  void enqueue(request_type_ptr req);
+  void enqueue(std::unique_ptr<grouped_io_request> request) noexcept;
+
+  /// Approximate bytes not yet converted from logical slices to physical ops.
+  [[nodiscard]] std::size_t queued_bytes() const noexcept
+  {
+    return _queued_bytes.load(std::memory_order_relaxed);
+  }
 
   /// Whether @p path can be served by this reactor.  Local-disk only:
   /// returns true iff the path refers to an existing, accessible file.
   [[nodiscard]] static bool supports(std::string_view path);
 
-  /// Open the buffered + O_DIRECT fds for @p path and return them
-  /// packaged in a @c local_io_object.  Throws on unsupported paths or
-  /// open() failure.
+  /// Open the buffered fd and opportunistically open an O_DIRECT fd for
+  /// @p path. The buffered handle is always required; an unsupported direct
+  /// handle simply makes worker-planned operations use buffered I/O.
   static std::unique_ptr<io_object_type> create_io_object(std::string path);
 
   /// fstat the open fd to get the file's current size.
   static size_t size(int native_handle);
-
-  // ---- Backend capabilities --------------------------------------------
-  //
-  // io_uring + O_DIRECT serves device reads through the reactor's bounce
-  // slots, supports batched host reads via @c host_enqueue_bulk, and pairs
-  // well with eager prefill since local-disk latencies are low and we want
-  // to keep the device fed.
-  //
-  // supports_device_read / supports_vector_host_read are no longer declared
-  // here: they are derived structurally by reactor_traits from the presence of
-  // the corresponding create_*_rx_request overloads (both of which this
-  // reactor provides).
-
-  static constexpr cache::prefetching_stage preferred_prefetching_stage() noexcept
-  {
-    return cache::prefetching_stage::none;
-  }
-
- private:
-  /// Enqueue a whole batch of device read chunks with a single wake
-  /// notification.  Preferred over single-op enqueues when a caller
-  /// produces several chunks destined for this reactor — amortises the
-  /// wait-atomic notify and uses moodycamel's enqueue_bulk path.
-  /// The span's elements are moved out; the caller's backing storage
-  /// must outlive this call but the contents are left in moved-from state.
-  void enqueue_chunks(std::span<chunk_io_request_type_ptr> batch);
-
-  /// Enqueue a whole batch of device read chunks with a single wake
-  /// notification.  Preferred over single-op enqueues when a caller
-  /// produces several chunks destined for this reactor — amortises the
-  /// wait-atomic notify and uses moodycamel's enqueue_bulk path.
-  /// The span's elements are moved out; the caller's backing storage
-  /// must outlive this call but the contents are left in moved-from state.
-  void enqueue_chunk(chunk_io_request_type_ptr request);
 
  public:
   /// O_DIRECT requires 4 KiB alignment of both file offset and length.
@@ -290,7 +208,7 @@ class uring_reactor {
   /// value is ignored in favor of the reactor's own alignment.
   static std::vector<cudf::io::text::byte_range_info> align_and_coalesce(
     std::span<const cudf::io::text::byte_range_info> ranges,
-    std::optional<size_t> alignment = std::nullopt);
+    std::optional<size_t> alignment = std::nullopt) noexcept;
 
  private:
   void worker_loop(const std::stop_token& stop_token);
@@ -309,7 +227,10 @@ class uring_reactor {
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
   std::jthread _worker;
-  duckdb_moodycamel::BlockingConcurrentQueue<chunk_io_request_type_ptr> _requests;
+  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<grouped_io_request>> _requests;
+  mutable std::mutex _enqueue_mutex;
+  std::atomic<std::size_t> _queued_bytes{0};
+  std::atomic<bool> _accepting{false};
 };
 
 }  // namespace sirius::io::uring

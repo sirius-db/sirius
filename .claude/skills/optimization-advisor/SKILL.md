@@ -17,7 +17,7 @@ You are identifying optimization targets in Sirius, a GPU-accelerated SQL query 
 
 **nsys profiling adds measurable overhead to query execution times.** When the user wants to validate that an optimization actually improved performance, always recommend running queries both WITH and WITHOUT profiling:
 
-1. **Profiled run** (`nsys_report.sh`, which delegates to `performance_test.py --mode nsys-profile`) → Provides GPU analysis data (kernels, operators, occupancy, memory) to understand *why* performance changed
+1. **Profiled run** (`nsys_report.sh`, which delegates to `performance_test.py --nsys-profile`) → Provides GPU analysis data (kernels, operators, occupancy, memory) to understand *why* performance changed
 2. **Non-profiled run** (`performance_test.py`) → Provides accurate cold/hot timings to confirm the optimization actually helped
 
 Never claim an optimization improved or regressed performance based solely on profiled timings. The profiled data tells you what changed internally; the non-profiled timings tell you whether it actually got faster.

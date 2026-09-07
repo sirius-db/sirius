@@ -471,7 +471,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
     // Only this side knows a deferral is installed, and only a decode told
     // before it runs can report which rows it kept.
     scan_input->late_mat_wants_survivors = !deferred_output().empty();
-    scan_input->prefetch(io::cache::prefetching_stage::immediate);
+    scan_input->update(io::cache::scan_stage::queued);
   }
   return std::move(*next);
 }
