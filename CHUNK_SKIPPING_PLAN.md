@@ -693,61 +693,66 @@ The governing constraint: **on TPC-H as it sits, every implementation measures e
 clustering-strategy tradeoff). The delta-flip risk was refuted. Actual cost: about half a day, no
 build required.
 
-### Phase 1 — W2 plus a batch-size sweep: the whole value question, empirically
+### Phase 1 — DONE (2026-09-07). W2 landed; the sweep answers the granularity question.
 
-**Status: W2 implemented (`f9ca10ad`), sweep running.** The four plumbing sites landed exactly as
-scoped — `device_pin_result::chunk_stats`, `materialize_all_batches_compressed` no longer forcing
-capture off, `insert_pinned_entry_device` building the sidecar, and the extension passing
-`capture_chunk_stats` through. 189 unit tests pass. First end-to-end chunk skipping on a
-compressed pin, on the clustered SF100 with all eight tables pinned GPU-tier compressed:
+**W2 implemented (`f9ca10ad`).** The four plumbing sites landed exactly as scoped —
+`device_pin_result::chunk_stats`, `materialize_all_batches_compressed` no longer forcing capture
+off, `insert_pinned_entry_device` building the sidecar, the extension passing
+`capture_chunk_stats` through. 189 unit tests pass, and the full suite is **22/22 byte-exact**
+against DuckDB CPU with pruning on.
 
-```
-[sirius_scan_manager] zone-map pruning for pinned entry 'lineitem' (GPU tier): 26/34 chunks pruned  (q6)
-[sirius_scan_manager] zone-map pruning for pinned entry 'lineitem' (GPU tier): 28/30 chunks pruned  (q14)
-```
+**Result of the batch-size sweep** (`bench/chunk-skipping/run-sweep.sh`, clustered SF100, all eight
+tables pinned GPU-tier compressed, best-of-3, sum of per-query bests):
 
-76.5% and 93.3% against §3.3's fine-granularity predictions of 84.7% and 98.6% — the expected
-degradation at ~30-chunk granularity, and confirmation that the whole path works.
+| `scan_task_batch_size` | chunks pruned | suite ON | suite OFF | ON − OFF |
+|---|---|---|---|---|
+| 8 GB | 25% | 0.9551 s | 0.9544 s | +0.1% (noise) |
+| 2 GB | 48% | **0.9348 s** | 0.9493 s | **−1.5%** |
+| 512 MB | 66% | 1.0292 s | 1.0720 s | **−4.0%** |
+| 128 MB | 71% | 1.5801 s | 1.8085 s | **−12.6%** |
 
-Harness: `bench/chunk-skipping/run-sweep.sh` + `sirius-sf100.yaml`.
+This is the third of the three outcomes anticipated below: **the delta grows monotonically as
+granularity refines.** The prune rate climbs 25 → 48 → 66 → 71%, approaching the 73.5% ceiling
+§3.3 predicted for this data and these predicates.
 
+**Mapping SF100 batch sizes onto SF1000.** What governs pruning is the chunk's *fraction of the
+table*, not its byte size (§4.1). SF1000 lineitem at the production 8 GB batch is 189 M of 6.0e9
+rows = **3.1%**; SF100 lineitem at 512 MB is 1/25…1/57 = **1.8–4.0%**. So:
 
-**W2 alone is the experiment.** Plumb `capture_chunk_stats` through the device pin path — the four
-sites in §2 — and nothing else. Every downstream component already exists and ships:
-`compute_pinned_chunk_stats`, `pinned_zone_maps`, `build_cached_scan_plan`/`chunk_provably_empty`,
-the all-pruned sentinel, and the `enable_pinned_zone_map_pruning` flag. This is plumbing, not
-design: roughly 50–100 lines and no new concepts.
+> **SF100 @ 512 MB is the SF1000 @ 8 GB proxy, and it says W2 alone is worth ~4% of suite time**
+> on clustered data — from a change that is pure plumbing and adds no new metadata.
 
-The trick that makes this a complete answer: **`scan_task_batch_size` is a free granularity dial.**
-Shrinking it makes pin chunks smaller, which is exactly what a finer metadata group would do —
-without writing the group index. So sweep it:
+**The sweep also proves you cannot buy granularity with batch size.** 128 MB prunes the most (71%)
+yet is the *slowest* arm in absolute terms (1.58 s vs 0.955 s at 8 GB) because batching overhead
+grows faster than the pruning saves. The best whole configuration is 2 GB-ON at 0.9348 s. Shrinking
+batches to chase granularity is a losing trade — **granularity has to be bought with an index,
+which is exactly what Phase 2 is.**
 
-| `scan_task_batch_size` | SF100 lineitem pin chunks |
-|---|---|
-| 8 GB (current) | ~3 |
-| 2 GB | ~13 |
-| 512 MB | ~50 |
-| 128 MB | ~200 |
+**What Phase 2 is now worth, stated honestly.** On SF1000 lineitem the group index adds only about
+7 points of prune rate over the coarse sidecar (66% → ~73%), because a 3.1%-of-table chunk is
+already fine enough for these predicates. Its value is elsewhere, and both parts are already
+measured:
 
-Run each point **twice, with `enable_pinned_zone_map_pruning` on and off**, and read the *delta*.
-This isolates the pruning gain from the batching loss — smaller batches cost throughput on their
-own (the YAML notes 5 GB → 8 GB is worth −1.85%), so the absolute times are confounded but the
-on/off delta at a fixed batch size is not.
+1. **The other tables.** §4.3.1: at 8 GB a pin chunk is 42% of customer and 81% of part. Coarse
+   pruning is not weak there, it is structurally impossible — 1 or 2 chunks exist.
+2. **It is what makes cheap clustering viable.** §5.2: a local sort inside each pin chunk — no
+   shuffle, streaming, ~2.3 s at SF1000 — yields 72.7% at G=8 and **0.0%** at pin-chunk
+   granularity. Without the fine index the only clustering strategy that pays is the one that
+   needs a full-table shuffle.
 
-What comes out is the pruning-versus-granularity curve **in real query time on real hardware**,
-which is the one thing §3 and §4 cannot give (they are bytes-not-decoded). Specifically:
+*Caveat carried forward:* the −12.6% at 128 MB is measured against an inflated baseline (that arm's
+own batching overhead), so it is **not** a prediction of the group index's value. The defensible
+numbers are the ~4% for W2 at SF1000-equivalent granularity and the prune-rate curve.
 
-- If the delta is ~0 at every granularity → scan/decode is not enough of the critical path.
-  **Stop here.** Total spend: ~2 days.
-- If the delta is real but flat across batch sizes → coarse pruning is sufficient; ship W2, skip
-  the group index, and spend the effort on clustering instead.
-- If the delta grows as batches shrink → the group index is worth building, and the curve tells us
-  the right default G directly, replacing the §4.3 estimate with a measurement.
+*Process note:* the first run of this sweep was silently invalid — a `$( ... && ... )` inlined into
+a `sed` replacement, with `&` escaped for sed, broke the shell's AND operator so **both** arms got
+`enable_pinned_zone_map_pruning: false`. It reported a flat ±0.5% and would have been read as "the
+feature does not help". The script now computes the flag before the `sed`, verifies the injection,
+and fails the run if a prune-on arm logs no pruning.
 
-Run under `/home/nvidia/joost/bench-lock.sh`. SF100 rather than SF1000 so the sort in Phase 0 is
-cheap and iteration is fast; confirm the winning configuration at SF1000 afterwards.
+### Phase 2 — NEXT: the out-of-band group index (W3)
 
-### Phase 2 — only if Phase 1 pays: the out-of-band group index (W3)
+Phase 1 says build it, for the two reasons above rather than for lineitem prune rate.
 
 Minimum shape: extend `pinned_zone_maps` from one entry per pin chunk to one per group of G
 chunks, add a device-resident packed mirror (§6.1), have `build_cached_scan_plan` emit surviving
@@ -774,6 +779,12 @@ Reuse `chunk_provably_empty` and the DuckDB `CheckStatistics` path unchanged.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
+- **2026-09-07** — **Phase 1 done.** W2 landed (`f9ca10ad`), 22/22 byte-exact. The batch-size sweep
+  on clustered SF100 gives prune rates 25/48/66/71% at 8GB/2GB/512MB/128MB with suite deltas
+  +0.1/−1.5/−4.0/−12.6%. SF100@512MB is the SF1000@8GB proxy (both ~3% of table per chunk), so
+  **W2 alone is worth ~4%**. Shrinking batches to chase granularity loses on net — granularity must
+  come from an index. Phase 2 is justified by the small tables (§4.3.1) and by enabling local-sort
+  clustering (§5.2), not by lineitem prune rate.
 - **2026-09-07** — **Phase 0 done.** Built `/datasets/tpch_sf100_sorted`; row-group spans 2525 → 4.4
   days; pruning 0.00% → **36.45% of rows**, inside the predicted band. The explorer keeps a bitpack
   root on every clustered column (`l_shipdate` ratio 2.651x → 426x), refuting the delta-flip risk.
