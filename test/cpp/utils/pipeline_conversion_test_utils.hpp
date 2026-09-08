@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -91,9 +92,18 @@ void with_conversion_result(
   const std::function<void(pipeline::pipeline_conversion_result&)>& consume);
 
 //! Initialize an engine for `query` and invoke `consume` while its plan is alive.
+//!
+//! By default mints its own synthetic query id via `scoped_test_query` (for callers that build
+//! a `sirius_engine` without opening a real execution window). A caller that already opened a
+//! `SiriusContext::StandaloneQueryScope` on `con` and intends to call `engine.execute()` MUST
+//! pass that window's `query_id()` here instead: `execute()` routes through
+//! `task_creator::prepare_for_query`, which requires `set_client_context` to have already run
+//! for the exact query id the engine carries — the window's `begin_execution_window` is what
+//! calls it, keyed on the window's id, not on a separately synthesized one.
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
-                             const std::function<void(sirius_engine&)>& consume);
+                             const std::function<void(sirius_engine&)>& consume,
+                             std::optional<sirius::query_id_t> query_id = std::nullopt);
 
 //! SQL → bound LogicalOperator (tests stand in for Substrait). Caller must have a transaction.
 exec::logical_plan_source sql_plan_source(const std::string& query);

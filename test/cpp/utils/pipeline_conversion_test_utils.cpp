@@ -223,13 +223,19 @@ void with_conversion_result(
 
 void with_initialized_engine(duckdb::Connection& con,
                              const std::string& query,
-                             const std::function<void(sirius_engine&)>& consume)
+                             const std::function<void(sirius_engine&)>& consume,
+                             std::optional<sirius::query_id_t> query_id)
 {
   auto& context = *con.context;
 
-  // Stands in for the execution window this helper never opens: registers this plan's
-  // repository manager and drops it (with its repositories) on the way out.
-  scoped_test_query test_query(context);
+  // Only mint a synthetic query id (and its stand-in repository-manager registration) when the
+  // caller did not already open a real execution window: reusing that window's id here, instead,
+  // is what lets execute() find the set_client_context registration begin_execution_window made.
+  std::optional<scoped_test_query> test_query;
+  if (!query_id) {
+    test_query.emplace(context);
+    query_id = test_query->query_id();
+  }
 
   con.BeginTransaction();
   try {
@@ -248,7 +254,7 @@ void with_initialized_engine(duckdb::Connection& con,
                              op::sirius_physical_materialized_collector>(*prepared, context);
 
     sirius_interface iface(context);
-    sirius_engine engine(context, iface, test_query.query_id());
+    sirius_engine engine(context, iface, *query_id);
     engine.initialize(std::move(collector));
     consume(engine);
 
