@@ -487,6 +487,81 @@ int main()
     }
 
     {
+      // FACTOR at the region root with no fused child: `quotients` drains to a
+      // synthesized Raw passthrough (fixed stride) and `divisors` is the
+      // boundary channel on the op's own rep.  Values are all multiples of 100
+      // so the per-chunk GCD is a real divisor, not the 1 no-op.
+      auto t = make_scaled_int64_table(2, 2048, 11, 100);
+      std::string dsl =
+        "input -> factor -> quotients, divisors\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n";
+      roundtrip_once(t->view(), dsl, 1, "factor_only");
+      roundtrip_once(t->view(), dsl, 2, "factor_only_mt");
+    }
+
+    {
+      // FACTOR -> Bitpack (FUSED): the shape that makes the operator worth
+      // having — dividing out the common factor narrows the range bitpack has
+      // to cover.  int64 (decimal storage width) and int32.
+      auto t64 = make_scaled_int64_table(2, 4096, 13, 1000);
+      std::string dsl64 =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_factor_bp_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_factor_bp_int64_mt");
+
+      // Non-factorable input (consecutive residues => per-chunk GCD collapses
+      // to 1): exercises the divisor == 1 identity path end to end.
+      auto t32 = make_int32_table(2, 4096, 17);
+      std::string dsl32 =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_factor_bp_int32_gcd1");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_factor_bp_int32_gcd1_mt");
+    }
+
+    {
+      // FACTOR with `divisors` routed to a non-fused op, mirroring the
+      // for.references -> identity case: the boundary channel must survive
+      // being stored by a separate leaf.
+      auto t = make_scaled_int64_table(2, 4096, 19, 250);
+      std::string dsl =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "factor.divisors -> identity\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "factor.divisors -> identity\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_factor_div_identity_int64");
+      roundtrip_once(t->view(), dsl, 2, "jit_factor_div_identity_int64_mt");
+    }
+
+    {
+      // Delta -> FACTOR -> Bitpack (FUSED): FACTOR nested BELOW another
+      // transformer, so decode must materialise its child through the generic
+      // slab path rather than the closed-form leaf path.
+      auto t = make_scaled_int64_table(2, 4096, 23, 100);
+      std::string dsl =
+        "input -> delta -> differences\n"
+        "delta.differences -> factor -> quotients, divisors\n"
+        "delta.differences.quotients -> bitpack\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> factor -> quotients, divisors\n"
+        "delta.differences.quotients -> bitpack\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_delta_factor_bp_int64");
+      roundtrip_once(t->view(), dsl, 2, "jit_delta_factor_bp_int64_mt");
+    }
+
+    {
       // ZigZag leaf at the region root — stored as its own fixed-stride
       // `zigzag` channel.  int32 and int64.
       auto t32 = make_int32_table(2, 4096, 71);

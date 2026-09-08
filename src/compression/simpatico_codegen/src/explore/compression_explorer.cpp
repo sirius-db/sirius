@@ -73,7 +73,7 @@ inline double op_decode_cost(std::string_view op)
   if (op == "deflate" || op == "lz4" || op == "snappy" || op == "cascaded") return 5.0;
   if (op == "dictionary") return 3.0;
   if (op == "ans" || op == "bitcomp" || op == "alp" || op == "alp_rd") return 2.0;
-  return 1.0;  // bitpack, rle, delta, zigzag, for, bitextract — fast
+  return 1.0;  // bitpack, rle, delta, zigzag, for, factor, bitextract — fast
 }
 
 inline double weighted_score(double ratio, double comp, double decomp, double const w[3])
@@ -328,8 +328,8 @@ operator_trial try_operator(std::string const& name,
     return r;
   }
   // Integer-only preprocessing operators
-  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" ||
-       name == "rle") &&
+  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" || name == "rle" ||
+       name == "factor") &&
       !is_int && !is_float) {
     r.error_message = name + ": requires numeric input";
     return r;

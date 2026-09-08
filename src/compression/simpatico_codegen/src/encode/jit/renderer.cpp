@@ -324,6 +324,7 @@ class Walker {
   void emit_node(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_delta(const ::codegen::jit::FusedTree& node, LaneInput in);
   void emit_for(const ::codegen::jit::FusedTree& node, LaneInput in);
+  void emit_factor(const ::codegen::jit::FusedTree& node, LaneInput in);
   // use_smem: accumulate into a per-block __shared__ slab, then store to global.
   //   Eliminates the cudaMemsetAsync pre-zero requirement for the packed buffer.
   //   Valid only for leaf Bitpacks where bits * kChunkSize / 32 + 2 fits in the
@@ -346,6 +347,8 @@ class Walker {
 
 struct SimpaticoMin { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a < b ? a : b; } };
 struct SimpaticoMax { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a > b ? a : b; } };
+__device__ __forceinline__ unsigned long long simpatico_gcd_u64(unsigned long long a, unsigned long long b) { while (b != 0ULL) { unsigned long long t = a % b; a = b; b = t; } return a; }
+struct SimpaticoGcd { __device__ __forceinline__ unsigned long long operator()(const unsigned long long& a, const unsigned long long& b) const { return simpatico_gcd_u64(a, b); } };
 
 using ::cuda::std::int8_t;
 using ::cuda::std::int16_t;
@@ -382,6 +385,7 @@ void Walker::emit_node(const ::codegen::jit::FusedTree& node, LaneInput in)
     case ::codegen::OpKind::Rle: emit_rle(node, std::move(in)); return;
     case ::codegen::OpKind::Raw: emit_raw(node, std::move(in)); return;
     case ::codegen::OpKind::For: emit_for(node, std::move(in)); return;
+    case ::codegen::OpKind::Factor: emit_factor(node, std::move(in)); return;
     case ::codegen::OpKind::Zigzag: emit_zigzag(node, std::move(in)); return;
     case ::codegen::OpKind::None:
     default:
@@ -572,6 +576,105 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
   out.length_expr = in.length_expr;
 
   emit_node(*dit->second, std::move(out));
+}
+
+// =====================================================================
+// emit_factor — semi-inline transformer (FOR's structural twin).
+//
+// FACTOR computes the GCD of the magnitudes of a chunk's values (via CUB
+// BlockReduce over a Euclid functor), stores it in `divisors[chunk_id]`,
+// then rewrites the LaneInput so downstream ops see `value / divisor`.
+// Decode multiplies back.  Like FOR it preserves the element count and
+// needs no shared slab — the quotient is a closed-form expression the
+// child splices in.
+//
+// This is the integer/decimal analogue of ALP's factor step: a DECIMAL
+// column whose values share a common divisor (e.g. TPC-H l_quantity,
+// stored as mantissas 100..5000 that are all multiples of 100) collapses
+// to a far narrower range before bitpack sees it.  The GCD generalises
+// ALP's power-of-ten factor and costs one block reduction, not a search.
+//
+// `divisors` is a kernel output buffer (num_chunks x elem_size) exposed
+// as `named_channels()["divisors"]`, exactly like FOR's `references`.
+// =====================================================================
+void Walker::emit_factor(const ::codegen::jit::FusedTree& node, LaneInput in)
+{
+  if (node.children.size() != 1) {
+    throw RenderError(
+      "render: FACTOR must have exactly one child named 'quotients' "
+      "(got " +
+      std::to_string(node.children.size()) + " children)");
+  }
+  auto qit = node.children.find("quotients");
+  if (qit == node.children.end()) {
+    throw RenderError("render: FACTOR missing 'quotients' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+
+  const DtypeInfo* op_dt = lookup_dtype(in.elem_type);
+  if (op_dt == nullptr) {
+    throw RenderError("render: FACTOR op-local dtype '" + in.elem_type + "' not in dtype table");
+  }
+
+  const std::int32_t id   = take_id();
+  const std::string idstr = std::to_string(id);
+
+  // Output buffer: divisors[num_chunks] — one per-chunk GCD.
+  const std::string p_divs = "divisors_" + idstr;
+  add_param(in.elem_type + "*", p_divs);
+  add_buffer(id, "divisors", op_dt->elem_size, static_cast<std::size_t>(num_chunks_));
+
+  const std::string sh_div = "sh_fac_div_" + idstr;
+  const std::string v_div  = "fac_div_" + idstr;
+  const std::string v_lg   = "fac_lg_" + idstr;
+
+  // Per-lane running GCD of |value|, then a block-wide GCD reduce.
+  // Magnitudes are taken in uint64 via unsigned negation so INT*_MIN is
+  // well-defined (unary minus on the signed minimum is UB).  gcd(0, x) == x,
+  // so 0 is the correct identity for both the lane seed and empty lanes.
+  body_ << "    // --- node " << id << ": FACTOR (semi-inline, " << in.elem_type << ") ---\n"
+        << "    const int32_t fac_len_" << idstr << " = static_cast<int32_t>(" << in.length_expr
+        << ");\n"
+        << "    unsigned long long " << v_lg << " = 0ULL;\n"
+        << "    for (int32_t i = tid; i < fac_len_" << idstr << "; i += 128) {\n"
+        << "        " << in.elem_type << " _qv = (" << at_lane(in.read_expr, "i") << ");\n"
+        << "        unsigned long long _qu = static_cast<unsigned long long>("
+        << "static_cast<long long>(_qv));\n"
+        << "        unsigned long long _qm = (_qv < static_cast<" << in.elem_type
+        << ">(0)) ? (0ULL - _qu) : _qu;\n"
+        << "        " << v_lg << " = simpatico_gcd_u64(" << v_lg << ", _qm);\n"
+        << "    }\n"
+        << "    typedef cub::BlockReduce<unsigned long long, 128> FacBR_" << idstr << ";\n"
+        << "    __shared__ typename FacBR_" << idstr << "::TempStorage fac_br_ts_" << idstr << ";\n"
+        << "    __shared__ " << in.elem_type << " " << sh_div << ";\n"
+        << "    {\n"
+        << "        unsigned long long _g = FacBR_" << idstr << "(fac_br_ts_" << idstr
+        << ").Reduce(" << v_lg << ", SimpaticoGcd());\n"
+        << "        if (tid == 0) {\n"
+        // An all-zero chunk reduces to 0, and a chunk whose magnitudes are all
+        // exactly the type minimum reduces to 2^(N-1), which does not fit the
+        // signed divisor slot. Both fall back to the no-op divisor 1.
+        << "            if (_g == 0ULL || _g > static_cast<unsigned long long>("
+        << op_dt->max_literal << ")) _g = 1ULL;\n"
+        << "            " << sh_div << " = static_cast<" << in.elem_type << ">(_g);\n"
+        << "        }\n"
+        << "    }\n"
+        << "    __syncthreads();\n"
+        << "    const " << in.elem_type << " " << v_div << " = " << sh_div << ";\n"
+        << "    if (tid == 0) " << p_divs << "[chunk_id] = " << v_div << ";\n";
+
+  // Rewrite LaneInput for the child: quotient = parent_value / chunk_divisor.
+  // The divisor divides every magnitude in the chunk exactly, so the truncating
+  // signed division is exact for both signs and decode's multiply is lossless.
+  // Length is unchanged — FACTOR preserves the element count.
+  LaneInput out;
+  out.kind      = LaneInput::Expr;
+  out.elem_type = in.elem_type;
+  out.read_expr = "(static_cast<" + in.elem_type + ">((" + at_lane(in.read_expr, "(__LANE__)") +
+                  ") / " + v_div + "))";
+  out.length_expr = in.length_expr;
+
+  emit_node(*qit->second, std::move(out));
 }
 
 // =====================================================================

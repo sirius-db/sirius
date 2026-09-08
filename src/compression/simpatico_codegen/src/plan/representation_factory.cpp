@@ -619,6 +619,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Delta:
     case OpId::Rle:
     case OpId::For:
+    case OpId::Factor:
     case OpId::Zigzag: return unsupported();
   }
   return unsupported();

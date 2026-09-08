@@ -367,6 +367,10 @@ class Walker {
                          const std::string& dst,
                          const std::string& len,
                          const std::string& elem_type);
+  void emit_factor_producer(const ::codegen::jit::FusedTree& node,
+                            const std::string& dst,
+                            const std::string& len,
+                            const std::string& elem_type);
   void emit_for_producer(const ::codegen::jit::FusedTree& node,
                          const std::string& dst,
                          const std::string& len,
@@ -508,6 +512,7 @@ void Walker::emit_producer(const ::codegen::jit::FusedTree& node,
     case ::codegen::OpKind::Delta: emit_delta_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Rle: emit_rle_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::For: emit_for_producer(node, dst, len, elem_type); return;
+    case ::codegen::OpKind::Factor: emit_factor_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Raw: emit_raw_producer(node, dst, len, elem_type); return;
     case ::codegen::OpKind::Zigzag: emit_zigzag_producer(node, dst, len, elem_type); return;
     default:
@@ -1351,6 +1356,93 @@ void Walker::emit_for_producer(const ::codegen::jit::FusedTree& node,
           << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
           << "            static_cast<" << futype << ">(" << slab << "[i]) + static_cast<" << futype
           << ">(" << v_ref << "));\n"
+          << "    }\n"
+          << "    __syncthreads();\n";
+    sm_.release_to(mark);
+  }
+}
+
+// =====================================================================
+// FACTOR — semi-inline reverse transformer (mirrors emit_for_producer).
+//
+// Inverts the encode FACTOR step: given the compressed quotients (the
+// `quotients` child) and the per-chunk GCD stored in `divisors[chunk_id]`,
+// reconstruct `original[i] = quotient[i] * divisor`.
+//
+// Same two paths as FOR:
+//   * Closed-form child (Bitpack/Raw leaf): splice a `value_source` expr
+//     and multiply in a single strided loop.
+//   * Producer child (Delta/Rle): materialise into a shared slab first,
+//     then multiply in a second strided loop.
+// =====================================================================
+void Walker::emit_factor_producer(const ::codegen::jit::FusedTree& node,
+                                  const std::string& dst,
+                                  const std::string& len,
+                                  const std::string& elem_type)
+{
+  if (node.children.size() != 1) {
+    throw RenderError(
+      "decode render: FACTOR must have exactly one child named 'quotients' "
+      "(got " +
+      std::to_string(node.children.size()) + " children)");
+  }
+  auto qit = node.children.find("quotients");
+  if (qit == node.children.end()) {
+    throw RenderError("decode render: FACTOR missing 'quotients' child (got '" +
+                      node.children.begin()->first + "' instead)");
+  }
+  const std::size_t esize = dtype_elem_size(elem_type);
+  if (esize == 0) {
+    throw RenderError("decode render: FACTOR op-local dtype '" + elem_type + "' not supported");
+  }
+
+  const std::int32_t id   = id_of(node);
+  const std::string idstr = std::to_string(id);
+
+  // Kernel parameter: divisors buffer (one entry per chunk).
+  const std::string p_divs = "divisors_" + idstr;
+  add_param("const " + elem_type + "* __restrict__", p_divs);
+  add_buffer(id, "divisors", esize);
+
+  const std::string v_div = "fac_div_" + idstr;
+
+  body_ << "    // --- node " << id << ": FACTOR (reverse, " << elem_type << ") ---\n"
+        << "    const " << elem_type << " " << v_div << " = " << p_divs << "[chunk_id];\n";
+
+  const bool child_is_leaf =
+    (qit->second->op == ::codegen::OpKind::Bitpack && qit->second->children.empty()) ||
+    (qit->second->op == ::codegen::OpKind::Raw && qit->second->children.empty());
+
+  // quotient * divisor reproduces the original exactly, but the product can
+  // reach the signed extremes; multiply in the unsigned counterpart so the
+  // reconstruction never relies on signed-overflow UB (see emit_for_producer).
+  const std::string futype = unsigned_counterpart(esize);
+
+  if (child_is_leaf) {
+    const auto mark      = sm_.mark();
+    ValueSource child_vs = value_source(*qit->second, elem_type, len);
+    body_ << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+          << ") {\n"
+          << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
+          << "            static_cast<" << futype << ">(" << at_pos(child_vs.read_expr, "i")
+          << ") * static_cast<" << futype << ">(" << v_div << "));\n"
+          << "    }\n"
+          << "    __syncthreads();\n";
+    sm_.release_to(mark);
+  } else {
+    const auto mark        = sm_.mark();
+    const std::string slab = "fac_slab_" + idstr;
+    const std::size_t off  = sm_.alloc(esize, ::codegen::kChunkSize);
+
+    body_ << "    " << elem_type << "* " << slab << " = reinterpret_cast<" << elem_type
+          << "*>(workspace + " << off << ");\n";
+    emit_producer(*qit->second, slab, len, elem_type);
+    body_ << "    __syncthreads();\n"
+          << "    for (int32_t i = tid; i < static_cast<int32_t>(" << len << "); i += " << tbs_
+          << ") {\n"
+          << "        (" << dst << ")[i] = static_cast<" << elem_type << ">(\n"
+          << "            static_cast<" << futype << ">(" << slab << "[i]) * static_cast<" << futype
+          << ">(" << v_div << "));\n"
           << "    }\n"
           << "    __syncthreads();\n";
     sm_.release_to(mark);
