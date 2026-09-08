@@ -1,0 +1,8 @@
+[2026-09-08 06:14:59.176] [info] [sirius_context.cpp:1698] Loaded Sirius configuration from file: /home/nvidia/joost/sirius-zonemap/bench/chunk-skipping/results-sf1000-host-unsorted/cfg-8GB-on.yaml
+[2026-09-08 06:14:59.178] [info] [sirius_context.cpp:651] SiriusContext: topology summary — 1 GPU(s), 9 NUMA node(s), host='Workstation19'
+[2026-09-08 06:14:59.178] [info] [sirius_context.cpp:656]   GPU 0: NVIDIA GB300 (numa=0, pci=00000009:06:00.0)
+[2026-09-08 06:15:06.878] [info] [telemetry_context.cpp:137] Telemetry context initialized (engine=siriusDB, 1 GPU device group(s))
+[2026-09-08 06:15:06.878] [info] [sirius_context.cpp:703] SiriusContext: 1 host memory space(s) created for 9 NUMA node(s)
+[2026-09-08 06:15:06.878] [warning] [sirius_context.cpp:708] SiriusContext: host space count (1) != NUMA node count (9) — expected one host space per NUMA domain. Check sirius_config apply_defaults (.use_numa_id_as_host_id()) or YAML host configuration.
+[2026-09-08 06:15:06.878] [info] [sirius_context.cpp:772] SiriusContext: skipping peer-access enable loop (num_gpus=1); configured GPU set has no pairs to enable
+[2026-09-08 06:15:06.882] [info] [sirius_context.cpp:811] SiriusContext: cuDF pinned memory resource configured (NUMA-aware, max slab 8192 B, fallback node=0)
