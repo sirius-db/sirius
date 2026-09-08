@@ -51,34 +51,9 @@ task_scheduler::task_scheduler(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   const cucascade::memory::system_topology_info* sys_topology,
   const std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>>* downgrade_executors)
-  : _task_queue([](const sirius::parallel::itask& task) -> exec::index_keys {
-      // Derive the multi-index keys from the task. The queue orders by priority
-      // (lower value = dispatched first) and additionally indexes by operator type,
-      // query id, and preferred device. Non-pipeline tasks fall back to the maximum
-      // priority so they sort last, with sentinel index keys.
-      if (const auto* gpu_task = dynamic_cast<const pipeline::gpu_pipeline_task*>(&task)) {
-        const exec::queue_priority priority = gpu_task->get_priority();
-        // The scheduling priority packs query_id in its high 32 bits and the
-        // within-query pipeline rank in the low 32 (see task_creator), so the query
-        // id is recoverable here without extra plumbing.
-        const exec::query_key query_id =
-          static_cast<exec::query_key>(static_cast<std::uint64_t>(priority) >> 32);
-        exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
-        if (const auto* pipe = gpu_task->get_pipeline()) {
-          if (auto source = pipe->get_source()) { operator_type = source->type; }
-        }
-        const auto pref = gpu_task->get_preferred_device_id();
-        return exec::index_keys{priority,
-                                operator_type,
-                                query_id,
-                                pref.has_value() ? pref.value() : exec::no_preferred_device};
-      }
-      return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
-                              op::SiriusPhysicalOperatorType::INVALID,
-                              0,
-                              exec::no_preferred_device};
-    }),
-    _telemetry_context(std::move(telemetry_context))
+  // Shared with every gpu_pipeline_executor's queue so both agree on which query a task
+  // belongs to; see pipeline::index_keys_for.
+  : _task_queue(&index_keys_for), _telemetry_context(std::move(telemetry_context))
 {
   _task_queue_telemetry = std::make_unique<telemetry::TaskQueueHandleWrapper>(
     *_telemetry_context, "task-scheduler-gpu-queue", _telemetry_context->shared_group_id());
@@ -181,10 +156,9 @@ void task_scheduler::set_task_creator(sirius::creator::task_creator& task_creato
 
 void task_scheduler::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
-  // Drain leftover tasks from previous query
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->drain_leftover_tasks();
-  }
+  // No leftover-task drain here: each query drops its own queued work at cleanup
+  // (drain_query_tasks from SiriusContext::run_mandatory_cleanup). Draining every executor at
+  // query START would discard any other in-flight query's tasks along with the stale ones.
 
   std::lock_guard lock(_query_mutex);
   _query = std::move(query);
@@ -224,13 +198,20 @@ std::future<void> task_scheduler::start_query()
 
 void task_scheduler::terminate_query(std::exception_ptr error)
 {
+  // Report-only: this can be reached from a GPU executor's own worker thread (via
+  // notify_downstream_pipelines() in ~gpu_pipeline_task) or from the task_creator's own worker
+  // thread. stop() below joins each gpu_pipeline_executor's manager thread and then blocks in
+  // that executor's bounded_thread_pool::wait_all() -- if the calling thread is itself one of
+  // that pool's workers, its slot cannot free until this call returns, so wait_all() would never
+  // observe active_ == 0: a self-wait deadlock. report_error() alone fulfills the completion
+  // future; the query thread's future.get() (sirius_engine.cpp) throws and its catch block calls
+  // drain_after_error(), which does the actual draining from a thread that is never a pool worker.
   std::shared_ptr<completion_handler> completion;
   {
     std::scoped_lock lock(_query_mutex);
     completion = _completion_handler;
   }
   if (completion) { completion->report_error(std::move(error)); }
-  stop();
 }
 
 void task_scheduler::drain_after_error()
@@ -264,12 +245,12 @@ void task_scheduler::drain_after_error()
     gpu_exec->drain_and_wait();
   }
 
-  // Now that no executor can generate further task_creation_requests, discard
-  // any that accumulated (and release the shared_ptr<data_batch> references they
-  // hold, which would otherwise survive clear_all_repositories at QueryEnd and
-  // show up as inter-iteration "memory leak" warnings). drain_pending_tasks()
-  // reactivates the queue when done.
-  if (_task_creator) { _task_creator->drain_pending_tasks(); }
+  // Now that no executor can generate further task_creation_requests, discard the ones this
+  // query accumulated — they hold raw operator pointers into a plan that QueryEnd is about to
+  // destroy. Scoped to this query: any other in-flight query keeps its pending requests.
+  if (auto query_id = current_query_id(); query_id && _task_creator) {
+    _task_creator->drain_pending_tasks(*query_id);
+  }
 
   // Belt-and-suspenders: the executor restarts above emit device_ready signals,
   // and the management loop may have dispatched a leftover task into an executor
@@ -311,15 +292,33 @@ void task_scheduler::wait_for_completion()
     }
   } catch (...) {
     if (_task_creator) {
-      _task_creator->drain_pending_tasks();
+      if (auto query_id = current_query_id()) { _task_creator->drain_pending_tasks(*query_id); }
       _task_creator->start_thread_pool();
     }
     throw;
   }
   if (_task_creator) {
-    _task_creator->drain_pending_tasks();
+    if (auto query_id = current_query_id()) { _task_creator->drain_pending_tasks(*query_id); }
     _task_creator->start_thread_pool();
   }
+}
+
+void task_scheduler::drain_query_tasks(sirius::query_id_t query_id)
+{
+  // Pending work only, and only this query's: the scheduler's own queue first, then each GPU
+  // executor's staging queue. In-flight tasks are untouched — quiescing those is
+  // wait_for_completion / drain_after_error's job.
+  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_query_tasks(query_id);
+  }
+}
+
+std::optional<sirius::query_id_t> task_scheduler::current_query_id() const
+{
+  std::lock_guard lock(_query_mutex);
+  if (!_query) { return std::nullopt; }
+  return _query->query_id();
 }
 
 void task_scheduler::management_eventloop()
@@ -354,8 +353,9 @@ void task_scheduler::management_eventloop()
     // Work: let the creator pre-create for a waiting device (lookahead
     // strategy only), then sleep until something is pushed.
     if (_task_queue.empty()) {
-      if (_task_creator && !_ready_devices.empty()) {
-        _task_creator->schedule_lookahead(*_ready_devices.begin());
+      if (auto query_id = current_query_id();
+          query_id && _task_creator && !_ready_devices.empty()) {
+        _task_creator->schedule_lookahead(*query_id, *_ready_devices.begin());
       }
       if (!_task_queue.wait()) {
         SIRIUS_LOG_INFO("Task queue interrupted, exiting management event loop.");

@@ -456,13 +456,25 @@ void gpu_pipeline_executor::manager_loop()
           // the task destructor only fires once the pipeline drains —
           // mid-pipeline batches need to start rotating before that point so
           // they reach all GPUs.
-          for (auto* consumer : consumers) {
-            if (consumer) { _task_creator->schedule(consumer); }
+          try {
+            for (auto* consumer : consumers) {
+              if (consumer) { _task_creator->schedule(consumer); }
+            }
+          } catch (const std::exception& e) {
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
+                             e.what());
+            if (_completion_handler) {
+              _completion_handler->report_error(std::current_exception());
+            }
+            return;
           }
         }
 
         if (query_complete && _completion_handler) {
-          _task_creator->drain_pending_tasks();
+          // Scoped to the finishing query: its pending creation requests point at operators
+          // that mark_completed() may let the engine destroy. Any other query's requests are
+          // left alone.
+          _task_creator->drain_pending_tasks(pipeline->get_query_id());
           _completion_handler->mark_completed();
         }
       });
@@ -480,7 +492,7 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
   _task_creator = task_creator;
 }
 
-bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
+bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.empty(); }
 
 executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
 {
