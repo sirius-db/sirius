@@ -280,6 +280,32 @@ void test_alp_f32()
   io_roundtrip("alp_f32", t->view(), "input -> alp\n");
 }
 
+// ALP on DECIMAL64: the only operator that stores a leaf buffer with a
+// FIXED-POINT type (its `exceptions` channel carries the source column's own
+// type). Every other decimal plan reaches the file as integer buffers via the
+// codegen path, so this is the one case that exercises reconstructing a
+// non-numeric leaf buffer on read. Covered with and without exceptions, since
+// a zero-exception column stores that channel empty.
+void test_alp_decimal64()
+{
+  auto clean = make_decimal64_table(1, 4096, 17, 100, 0);
+  io_roundtrip("alp_decimal64", clean->view(), "input -> alp\n");
+
+  auto with_exc = make_decimal64_table(1, 4096, 19, 100, 37);
+  io_roundtrip("alp_decimal64_exceptions", with_exc->view(), "input -> alp\n");
+}
+
+// The `factor` operator through the file path: `divisors` is a boundary
+// channel on the op's own rep, so it must survive describe/rebuild.
+void test_factor_bitpack()
+{
+  auto t = make_scaled_int64_table(1, 4096, 23, 100);
+  io_roundtrip("factor_bitpack",
+               t->view(),
+               "input -> factor -> quotients, divisors\n"
+               "factor.quotients -> bitpack\n");
+}
+
 // Bitextract: multi-output op whose planes are terminal channel leaves,
 // exercising per-node output_names + terminal-slot attachment on read.
 void test_bitextract_f32()
@@ -661,6 +687,8 @@ int main()
     {"for_only", test_for_only},
     {"zigzag", test_zigzag},
     {"alp_f32", test_alp_f32},
+    {"alp_decimal64", test_alp_decimal64},
+    {"factor_bitpack", test_factor_bitpack},
     {"bitextract_f32", test_bitextract_f32},
     {"bitjoin_f32", test_bitjoin_f32},
     {"alp_rd_f64", test_alp_rd_f64},
