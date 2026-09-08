@@ -16,7 +16,10 @@
 
 #include "catch.hpp"
 #include "sirius_config.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "telemetry/telemetry_context.hpp"
+
+#include <dlfcn.h>
 
 #include <filesystem>
 #include <fstream>
@@ -26,6 +29,8 @@
 
 using namespace sirius;
 using namespace sirius::telemetry;
+
+extern "C" int InitializeInjectionNvtx2(void* get_export_table);
 
 namespace {
 
@@ -63,6 +68,15 @@ bool any_line_with_all(const std::vector<std::string>& lines,
 }
 
 }  // namespace
+
+TEST_CASE("static NVTX injection path resolves the host initializer", "[telemetry_context]")
+{
+  auto* handle = ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+  REQUIRE(handle != nullptr);
+  CHECK(::dlsym(handle, "InitializeInjectionNvtx2") ==
+        reinterpret_cast<void*>(&InitializeInjectionNvtx2));
+  CHECK(::dlclose(handle) == 0);
+}
 
 TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telemetry_context]")
 {

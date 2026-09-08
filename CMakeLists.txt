@@ -624,6 +624,15 @@ target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
 target_link_libraries(sirius_extension
                       "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
 
+# A statically embedded Sirius cannot give NVTX a DSO path. Its private dlopen
+# interposer maps one sentinel path to the running executable instead. Carry
+# both symbols into the final executable's dynamic symbol table so dependency
+# images such as libcudf can resolve the Quent initializer from that handle.
+target_link_options(
+  sirius_extension INTERFACE
+  "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2"
+  "LINKER:--export-dynamic-symbol=dlopen")
+
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
 

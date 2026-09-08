@@ -111,6 +111,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -161,6 +162,28 @@ extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
 {
   return quent_InitializeInjectionNvtx2(get_export_table);
 }
+
+#ifndef DUCKDB_BUILD_LOADABLE_EXTENSION
+// NVTX v3 discovers an injector independently in each ELF image. libcudf's
+// injection pointer is local to libcudf.so and its process-global preinjection
+// lookup is compiled out, so it can only reach Quent through its dlopen path.
+// A statically linked Sirius has no DSO to name. Interpose just our private
+// sentinel and turn that request into dlopen(NULL), whose handle exposes the
+// initializer exported by the running DuckDB executable. Every other request
+// is forwarded unchanged to libc.
+extern "C" __attribute__((visibility("default"))) void* dlopen(const char* filename, int flags)
+{
+  using dlopen_fn   = void* (*)(const char*, int);
+  auto* real_dlopen = reinterpret_cast<dlopen_fn>(::dlsym(RTLD_NEXT, "dlopen"));
+  if (real_dlopen == nullptr) { return nullptr; }
+
+  if (filename != nullptr &&
+      std::string_view{filename} == sirius::telemetry::detail::static_injection_path) {
+    return real_dlopen(nullptr, flags);
+  }
+  return real_dlopen(filename, flags);
+}
+#endif
 
 namespace duckdb {
 
@@ -3500,10 +3523,11 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
 ///
 /// An existing NVTX_INJECTION64_PATH remains authoritative. Otherwise, an
 /// explicit nvtx_injection_lib from the Sirius config is used. If neither is
-/// present, the loadable extension points NVTX at its own DSO: Quent's injector
-/// is statically embedded there and exported as InitializeInjectionNvtx2, so
-/// Sirius and dependency images such as libcudf attach to the same hook without
-/// requiring a separately deployed injection library or a user-supplied path.
+/// present, the loadable extension points NVTX at its own DSO. A statically
+/// linked Sirius instead uses a private dlopen token which resolves to the
+/// running executable. In both cases Quent's injector is embedded in the same
+/// image as Sirius, so dependency images such as libcudf attach to the same hook
+/// without requiring a separately deployed injection library.
 ///
 /// NVTX initialises lazily and per image, on that image's first NVTX call, so
 /// setting the variable here — after libcudf is mapped but before any NVTX call
@@ -3554,6 +3578,7 @@ static void maybe_set_nvtx_injection_path()
       return;
     }
 
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
     Dl_info self{};
     if (::dladdr(reinterpret_cast<void*>(&InitializeInjectionNvtx2), &self) == 0 ||
         self.dli_fname == nullptr) {
@@ -3561,13 +3586,24 @@ static void maybe_set_nvtx_injection_path()
     }
 
     auto self_path = std::filesystem::weakly_canonical(self.dli_fname);
-    // In the statically linked DuckDB target dladdr resolves to the executable,
-    // which cannot be used as an NVTX injection DSO. The built-in target already
-    // has plugin-local static injection; automatic cross-DSO discovery here is
-    // specific to the loadable extension.
     if (self_path.extension() != ".duckdb_extension") { return; }
-
     ::setenv("NVTX_INJECTION64_PATH", self_path.c_str(), /*overwrite=*/0);
+#else
+    // Probe the interposition path before publishing it. NVTX does not fall
+    // back to static injection after a dynamic lookup failure, so a broken
+    // final link must leave the environment unset.
+    auto* handle =
+      ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+    if (handle == nullptr) { return; }
+    auto* initializer = ::dlsym(handle, "InitializeInjectionNvtx2");
+    bool const usable = initializer == reinterpret_cast<void*>(&InitializeInjectionNvtx2);
+    ::dlclose(handle);
+    if (!usable) { return; }
+
+    ::setenv("NVTX_INJECTION64_PATH",
+             sirius::telemetry::detail::static_injection_path,
+             /*overwrite=*/0);
+#endif
   } catch (...) {
     // Silently ignore YAML parse errors in the early-init path — a diagnostic
     // would be premature here (logging is not yet configured).
@@ -3576,6 +3612,11 @@ static void maybe_set_nvtx_injection_path()
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  // libcudf is mapped before this point, but its NVTX state is still fresh
+  // because its constructors do not call NVTX. Configure discovery before any
+  // Sirius initialization can make the first NVTX call in an image.
+  maybe_set_nvtx_injection_path();
+
   sirius::util::install_segfault_backtrace_handler();
 
   auto& db     = loader.GetDatabaseInstance();
@@ -3652,14 +3693,7 @@ std::string SiriusExtension::Version() const
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader)
-{
-  // libcudf is already mapped at this point, but its NVTX state is still fresh
-  // because its constructors do not call NVTX. Configure discovery before
-  // LoadInternal can make the first NVTX call in any image.
-  duckdb::maybe_set_nvtx_injection_path();
-  duckdb::LoadInternal(loader);
-}
+DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { duckdb::LoadInternal(loader); }
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN
