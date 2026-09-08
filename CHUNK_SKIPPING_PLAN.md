@@ -866,6 +866,133 @@ is the same mechanism one level finer, not a new one.
 | spilled to disk | yes | biggest per skipped byte, worst penalty for scattered reads |
 | **simpatico as an ingestion format** | yes | its own section — see §7 |
 
+## 6.5 What range-skipped fetch actually needs
+
+This is the piece worth building: it targets the measured host-tier **−8.1%**, where every scan
+batch pays payload H2D on the critical path, rather than the ≈2.4% envelope of a GPU-resident pin.
+
+### 6.5.1 The key structural fact: a compacted subset of chunks is a valid column
+
+`bp_offsets` — where each 1024-row chunk's bits start inside `packed` — is **not stored**. It is
+computed at decode time by an exclusive scan over the `chunk_count` and `chunk_bits` arrays that
+were loaded (`src/bridge/offsets_cumsum.cu:78-95`).
+
+That has a consequence worth stating plainly:
+
+> If we load only the surviving chunks' metadata entries and only their `packed` bytes,
+> concatenated in order, the decode-time scan produces correct offsets **into the compacted
+> buffer**. A normal, unmodified full decode of that smaller table then yields exactly the
+> surviving rows.
+
+**So the fetch path needs no new decode enumerator** — the thing §6.6 says a GPU-resident chunk
+needs. Skipping transfer and skipping launches turn out to be separate problems with separate
+solutions, and the transfer one is both more valuable and cheaper.
+
+### 6.5.2 The pieces, in dependency order
+
+1. **The stored group→byte table (§6.1).** Which byte range of each bulk leaf buffer a group
+   occupies. Stored, not derived from bitpack's channels, for the plan-independence reason §6.1
+   gives. ~0.046% of payload at G = 8.
+
+2. **A per-operator "extract these groups" capability.** To hand the decoder a self-consistent
+   smaller table, an operator must say which of its channels are *per-chunk metadata* (compact by
+   selecting the surviving entries) versus *bulk* (fetch the surviving byte ranges). For `bitpack`
+   that is `{chunk_min, chunk_count, chunk_bits}` metadata and `packed` bulk. An operator that
+   cannot answer refuses, and its column is fetched whole — the same graceful degradation as a
+   missing zone-map cell. Per the shipped plans this covers the bitpack- and delta-rooted columns;
+   `ans`/`snappy`/`lz4`/`bitcomp` refuse.
+
+3. **Header synthesis.** `read_compressed_table_subset_from_memory` parses a header and calls
+   `payload_fetch_fn` per buffer (`compressed_table_io.hpp:137-143`). Serving a subset means
+   synthesizing a header whose buffer sizes and `num_rows` describe the compacted table. The header
+   is already built in memory, so this is bookkeeping, not format surgery.
+
+4. **Row-count bookkeeping.** The served batch has fewer rows than its chunk. The scan's row
+   accounting must follow, and late-mat must stay gated off for such a batch for the reason in
+   `a482f283` (its global row ids assume batch == whole chunk).
+
+5. **Coalescing policy (§7.3).** Merge adjacent surviving ranges, tolerate reading pruned bytes in
+   a small gap, and fall back to a bulk fetch past a fragmentation threshold. `align_and_coalesce`
+   already exists per backend and takes a caller-supplied alignment; what is missing is the policy,
+   not the mechanism.
+
+### 6.5.3 Does the existing plan still hold?
+
+Mostly, with one correction and one thing now done.
+
+| claim | status |
+|---|---|
+| §6.1 — byte addressing must be a stored table, not derived from bitpack channels | **holds**, and step 2 above is the part §6.1 did not spell out |
+| §6.2 — `payload_fetch_fn(offset, size, dst, stream)` is already the right shape | **holds** |
+| §6.3 — guard words need slop; coalescing is unmeasured | **holds**, still the main risk |
+| §6.6 — compressed chunks need a new decode enumerator | **corrected**: true for a GPU-resident chunk, **not** for the fetch path (§6.5.1) |
+| §7.5.5 — the in-memory sidecar should move to an arena before it has a consumer | **done** (`56db39e9`) |
+| §8.3 — the persisted copy enables partial re-read | **holds**, and is the same mechanism as this |
+
+The one genuinely new requirement is step 2: an operator-level notion of "metadata channel vs bulk
+channel". Nothing in the plan anticipated it, and it is what makes compaction expressible without
+special-casing bitpack everywhere.
+
+## 6.6 Skipping decode inside a GPU-resident compressed chunk
+
+**Scope: this section is about a chunk whose payload is already device-resident**, where the only
+thing to save is SM time. The *fetch* case is different and does **not** need what follows — see
+§6.5, which can skip transfer without any new decode primitive.
+
+Serving surviving row ranges works today for **uncompressed** chunks — `cudf::slice` narrows the
+views, ownership stays whole, no copy. A GPU-resident compressed chunk still decodes whole, and
+closing that gap needs one thing simpatico does not have.
+
+### 6.6.1 Why none of the three existing enumerators fits
+
+The decode is a product of an *enumerator* × a *consumer*
+(`codegen/decode/jit/renderer.hpp:92-101`). Three enumerators can express a selection:
+
+| enumerator | grid | selection storage | skips decode work? |
+|---|---|---|---|
+| `all_rows` | every chunk | — | no |
+| `mask_bits` | **every chunk** (dense grid, compacted by rank) | 1 bit/row | **no** — it compacts the output, it does not skip launches |
+| `index_list` | every chunk | 4 B/survivor row | no |
+| `chunk_csr` | **only touched chunks** | `in_chunk_rows`, **2 B/survivor row** | **yes** |
+
+So `chunk_csr` is the only one that actually avoids work — "the grid covers only TOUCHED chunks,
+and block b serves `chunk_ids[b]`" (`renderer.hpp:96-100`), with empty chunks "absent rather than
+launched-and-skipped" (`chunk_row_set.hpp:22-23`).
+
+But its cost is wrong for this use. `chunk_row_set` stores `in_chunk_rows` — a `uint16` in-chunk
+position per surviving row (`chunk_row_set.hpp:78`). For a 189 M-row pin chunk with half its rows
+surviving that is **~190 MB of device memory for the selection alone**, to express a selection
+whose content is "all 1024 rows of these chunks". Every one of those `uint16`s is the sequence
+0…1023 repeated.
+
+### 6.6.2 What is actually needed
+
+A **dense chunk-list enumerator**: block *b* decodes all of `chunk_ids[b]` and writes it at output
+offset `b * 1024`. Selection storage is one `uint32` per surviving *chunk* — for the same 189 M-row
+chunk, **~370 KB instead of ~190 MB**, a 500× reduction — and there is no per-row bookkeeping to
+build.
+
+It fits the group index exactly: groups are a whole number of 1024-row decode chunks by
+construction, so a surviving group *is* a run of chunk ids, and a surviving row range converts to
+one with a shift.
+
+Concretely that means a fourth `Enumerator` alongside `all_rows` / `mask_bits` / `index_list` /
+`chunk_csr`, its renderer support, and a launcher — the same surface the existing sparse shapes
+already occupy (`kShapeSparseConsume` and friends, `renderer.hpp:118-127`). Not conceptually new,
+but real work inside the decode JIT.
+
+### 6.6.3 Relative priority
+
+This is the smaller of the two remaining pieces. It saves SM time on a GPU-resident pin, where
+§3.9 measured the whole envelope for chunk skipping at ≈2.4% of suite time. The fetch path (§6.5)
+saves the H2D on a host pin, where the measured benefit is −8.1%. They are independent, and the
+fetch path does not depend on this one.
+
+A per-plan-root caveat carries over from §6.1: `dictionary`, `str_split` and `delta` roots are
+refused by `decompress_column_rows` today (`simpatico_codegen.hpp:261-308`), so a mixed table skips
+what it can and full-decodes the rest. That is the same graceful-degradation shape as a missing
+zone-map cell.
+
 ## 7. Simpatico as an ingestion format
 
 Today simpatico is a *pin-time* representation. `.hpln` exists as a serialization
@@ -948,74 +1075,13 @@ Two things to settle before committing to the format, both experiments rather th
    measuring latency and throughput — settles it without touching Sirius at all, and should be run
    before any format work.
 
-## 6A. Skipping decode inside a compressed chunk: the missing primitive
-
-Serving surviving row ranges works today for **uncompressed** chunks — `cudf::slice` narrows the
-views, ownership stays whole, no copy. Compressed chunks still serve whole, and closing that gap
-needs one thing simpatico does not have. This records exactly what, so the next person does not
-re-derive it.
-
-### 6A.1 Why none of the three existing enumerators fits
-
-The decode is a product of an *enumerator* × a *consumer*
-(`codegen/decode/jit/renderer.hpp:92-101`). Three enumerators can express a selection:
-
-| enumerator | grid | selection storage | skips decode work? |
-|---|---|---|---|
-| `all_rows` | every chunk | — | no |
-| `mask_bits` | **every chunk** (dense grid, compacted by rank) | 1 bit/row | **no** — it compacts the output, it does not skip launches |
-| `index_list` | every chunk | 4 B/survivor row | no |
-| `chunk_csr` | **only touched chunks** | `in_chunk_rows`, **2 B/survivor row** | **yes** |
-
-So `chunk_csr` is the only one that actually avoids work — "the grid covers only TOUCHED chunks,
-and block b serves `chunk_ids[b]`" (`renderer.hpp:96-100`), with empty chunks "absent rather than
-launched-and-skipped" (`chunk_row_set.hpp:22-23`).
-
-But its cost is wrong for this use. `chunk_row_set` stores `in_chunk_rows` — a `uint16` in-chunk
-position per surviving row (`chunk_row_set.hpp:78`). For a 189 M-row pin chunk with half its rows
-surviving that is **~190 MB of device memory for the selection alone**, to express a selection
-whose content is "all 1024 rows of these chunks". Every one of those `uint16`s is the sequence
-0…1023 repeated.
-
-### 6A.2 What is actually needed
-
-A **dense chunk-list enumerator**: block *b* decodes all of `chunk_ids[b]` and writes it at output
-offset `b * 1024`. Selection storage is one `uint32` per surviving *chunk* — for the same 189 M-row
-chunk, **~370 KB instead of ~190 MB**, a 500× reduction — and there is no per-row bookkeeping to
-build.
-
-It fits the group index exactly: groups are a whole number of 1024-row decode chunks by
-construction, so a surviving group *is* a run of chunk ids, and a surviving row range converts to
-one with a shift.
-
-Concretely that means a fourth `Enumerator` alongside `all_rows` / `mask_bits` / `index_list` /
-`chunk_csr`, its renderer support, and a launcher — the same surface the existing sparse shapes
-already occupy (`kShapeSparseConsume` and friends, `renderer.hpp:118-127`). Not conceptually new,
-but real work inside the decode JIT.
-
-### 6A.3 The order to do it in
-
-1. **The dense chunk-list enumerator** — unlocks decode skipping for every bitpack-rooted column,
-   which is most of the shipped plans.
-2. **The group→byte table (§6.1) and range-skipped fetch** — unlocks skipping the *transfer*,
-   which is where the measured host-tier −8.1% comes from and where the remaining headroom is.
-
-They are independent: (1) saves SM time on a GPU-resident pin, (2) saves the H2D on a host pin.
-(2) is worth more on the numbers so far, but (1) is self-contained and does not need a format
-change.
-
-A per-plan-root caveat carries over from §6.1: `dictionary`, `str_split` and `delta` roots are
-refused by `decompress_column_rows` today (`simpatico_codegen.hpp:261-308`), so a mixed table skips
-what it can and full-decodes the rest. That is the same graceful-degradation shape as a missing
-zone-map cell.
-
-## 7A. Physical layout: keep the metadata segregated and scannable on its own
+## 7.5 Physical layout: keep the metadata segregated and scannable on its own
 
 The index is only useful if it can be read *without* reading the data it describes. That is the
 whole premise of skipping a fetch: read metadata, decide, then fetch only what survived. Neither
 of the two layouts we have today satisfies it.
 
-### 7A.1 What is wrong today
+### 7.5.1 What is wrong today
 
 **On disk, metadata is interleaved with bulk data.** The `.hpln` payload is "all buffer bytes
 concatenated in write order" (`api/compressed_table_io.hpp:40`), and `payload_offset` is a running
@@ -1031,7 +1097,7 @@ so roughly `3 × n_columns × n_chunks` separate allocations, chunk-major. Evalu
 filter walks a pointer chase across the whole table, and there is no single buffer to hand to a
 GPU kernel or to copy H2D in one go.
 
-### 7A.2 The layout we want
+### 7.5.2 The layout we want
 
 **One contiguous metadata region per table, column-major over groups.**
 
@@ -1053,7 +1119,7 @@ Concretely at SF1000 lineitem, G = 8: 732k groups × 16 B = **11.7 MB contiguous
 for all sixteen. One column's bounds are a single 11.7 MB sequential read — one `GET`, not 732k
 lookups.
 
-### 7A.3 Why segregation buys more than tidiness
+### 7.5.3 Why segregation buys more than tidiness
 
 - **It is what makes the fetch skip possible at all.** Read metadata → decide → fetch surviving
   ranges. If metadata is interleaved, "read the metadata" already means touching the payload
@@ -1067,7 +1133,7 @@ lookups.
   read by every query against the table — exactly the thing a cache should hold and the payload
   should not evict.
 
-### 7A.4 File-format choice: separate section, or separate object?
+### 7.5.4 File-format choice: separate section, or separate object?
 
 Two shapes, and the answer differs by backend:
 
@@ -1088,19 +1154,15 @@ The `.hpln` header is self-describing per leaf, so this is additive: a new secti
 old files still readable, and the existing `payload_fetch_fn(offset, size, dst, stream)` callback
 already expresses "fetch this byte range" without change.
 
-### 7A.5 What this implies for the code as it stands
+### 7.5.5 What this implies for the code as it stands
 
-The in-memory sidecar should be rebuilt on an arena before it has any consumer, so the packed shape
-is the only shape anything ever sees:
+**Done in memory (`56db39e9`):** `group_bounds_arena` holds every (column, chunk, group) in one
+allocation, column-major, with `packed_column_bounds` a non-owning view of a slice. The layout
+assertions caught a heap overflow in the first packing (`total_groups` summed over chunks but not
+columns), which is the kind of bug only a contiguity test finds.
 
-- `packed_column_bounds` keeps its API but holds **spans into a per-table arena** rather than owning
-  `std::vector`s.
-- Ordering becomes column-major over (chunk, group) rather than chunk-major over columns.
-- One `rmm::device_buffer` mirror of the same bytes, so the layout is identical host and device and
-  a GPU evaluator needs no re-packing.
-
-None of that changes the semantics already tested (absent cell never prunes, refinement only
-narrows, sentinel unrefined); it changes where the bytes live.
+**Still to do:** a `rmm::device_buffer` mirror of the same bytes, so the layout is identical host
+and device and a GPU evaluator needs no repacking; and the persisted form (§7.5.4).
 
 ## 8. Where the index should live: device, host, spilled
 
@@ -1406,6 +1468,8 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Added §5: GPU sort is ~34× faster than 72 CPU threads and a per-pin-chunk local sort of SF1000
   lineitem costs ~2.3 s; local sort reaches 72.7% of the global sort's 73.5% at G=8 but **0.0%** at
   pin-chunk granularity, which is the strongest argument yet for the fine index.
+- **Open (§6.5):** the operator-level "metadata channel vs bulk channel" split — the one
+  requirement of range-skipped fetch that the earlier plan did not anticipate.
 - **Open (§7.2):** does S3 actually reward finer ranges, or does internal striping mean a pruned
   ranged GET costs the backend the same as an unpruned one? A standalone probe against a real
   bucket settles it without touching Sirius, and gates any simpatico-ingestion work.
