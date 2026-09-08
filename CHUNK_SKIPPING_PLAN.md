@@ -676,21 +676,98 @@ is the same mechanism one level finer, not a new one.
   fallback above some fragmentation threshold.
 - **Disk amplifies both effects**: bigger win per skipped byte, worse penalty for scattered reads.
 
-### 6.4 Is a simpatico ingestion format worth it?
+### 6.4 Where the fetch win lands
 
-The addressability argument is genuinely stronger than parquet's. Parquet's row-group statistics
-are ~1 M rows here and its `PageIndex`/`ColumnIndex` is **never read** by either Sirius or DuckDB
-(§1), so page-level skipping does not exist on the parquet path at all. A simpatico file would have
-exact 1024-row addressability for free, from metadata it already stores.
+| tier | is there a fetch to skip? | value |
+|---|---|---|
+| GPU pin | no — payload already device-resident | decode only |
+| **host pin** | **yes, and it is the dominant cost** | host-tier compressed loses 7.0% today entirely on fetch; see §8 for why this is the first thing to measure |
+| spilled to disk | yes | biggest per skipped byte, worst penalty for scattered reads |
+| **simpatico as an ingestion format** | yes | its own section — see §7 |
 
-But **measure the host tier first.** It exercises the identical mechanism (skip byte ranges of a
-compressed payload before decoding), it needs no new file format, and it has a clear existing
-target: turning host-tier compressed from −7.0% into a win. If range-skipped fetch does not pay
-there, it will not pay on disk either.
+## 7. Simpatico as an ingestion format
 
-## 7. Where the index should live: device, host, spilled
+Today simpatico is a *pin-time* representation. `.hpln` exists as a serialization
+(`api/compressed_table_io.hpp:14-39`) but nothing ingests it: a table is read from parquet (or
+DuckDB storage), materialized, then compressed on the way into the cache. The question is whether
+being able to *read* simpatico directly is worth the format work.
 
-### 7.1 Keep the index in device memory even when the data is pinned to host — yes
+The argument is the same one as §6.1, applied one tier further out — and it is stronger against
+parquet than it is against a host pin, for a reason specific to object storage.
+
+### 7.1 What it would buy over parquet
+
+Parquet's skip granularity here is a **~1 M-row row group**, and it is the only granularity that
+exists on that path: `PageIndex` / `ColumnIndex` / `OffsetIndex` are present in these files
+(parquet-rs writes them by default) but are **never read** by either Sirius or DuckDB (§1). So
+sub-row-group skipping is not merely coarse on the parquet path, it is absent.
+
+A simpatico file would carry exact **1024-row** addressability for free, from `chunk_count` and
+`chunk_bits` it already stores (§6.1) — roughly 0.01% of the payload, and three orders of magnitude
+finer than a parquet row group.
+
+### 7.2 The S3 case, where the gap is widest
+
+On object storage the mismatch is not just granularity, it is that **parquet's row-group size
+fights the storage layer's own striping.** S3 stripes and replicates objects internally for
+durability, with a layout we do not control and cannot see. A ranged `GET` that lands inside a
+~1 M-row row group still forces the backend to reconstruct whatever internal unit that range falls
+in, so a "pruned" parquet read plausibly costs the backend the same work as an unpruned one — the
+saving shows up in bytes-on-the-wire but not necessarily in backend cost or latency. We get to skip
+a row group only when the *whole* row group is prunable, which §3.1 says is essentially never on
+unclustered data and, even clustered, is a 1 M-row all-or-nothing bet.
+
+Finer granularity plausibly helps here precisely because it decouples "what we skip" from "what the
+backend has to restore": many small surviving ranges can be re-packed into request sizes that suit
+the backend, rather than being forced to the row-group boundary. **This is a hypothesis about
+storage-backend behaviour that we have not measured, and it is the interesting thing to experiment
+with** — it may well turn out that the backend cost is dominated by object-level effects that
+neither granularity escapes.
+
+### 7.3 The tension: fine skipping vs. large transfers
+
+Fine granularity is worthless over a network if it turns one 8 MB `GET` into two hundred 40 KB
+`GET`s. Network round-trips dominate; the REST reactor already says so —
+"Network round-trips are high-latency; read ahead on demand rather than eagerly prefilling"
+(`src/include/io/rest/rest_reactor.hpp:330-332`). So range-skipped ingestion needs **read
+coalescing as a first-class part of the design, not an afterthought**: merge surviving ranges,
+tolerate reading pruned bytes in the gaps when the gap is cheaper than an extra request, and fall
+back to a bulk read once fragmentation passes a threshold.
+
+The good news is the mechanism already exists and is already per-backend.
+`io_context::align_and_coalesce` is on the virtual interface (`src/include/io/io_context.hpp:209`)
+with backend-specific implementations: the uring one floors alignment at `IO_BLOCK_SIZE` for
+O_DIRECT (`src/io/uring/uring_reactor.cpp:753-795`), while the REST one has no physical alignment
+and honours a caller-supplied lower bound as a pure coalescing knob
+(`src/io/rest/rest_reactor.cpp:1103-1108`). That caller-supplied alignment is exactly the dial this
+needs — set it to a network-sensible minimum request size and the existing pass does the merging.
+
+What is missing is the *policy*: today the alignment is chosen for physical constraints, not for a
+skip-vs-request-count trade-off. Something like "merge ranges whose gap is under G bytes; if the
+merged set still exceeds N requests, widen G until it doesn't" — with G and N measured, not
+guessed.
+
+### 7.4 Recommendation
+
+Worth building, but **not first**. Sequence it behind the host-tier fetch experiment (§6, §8):
+that exercises the identical mechanism — skip byte ranges of a compressed payload before decoding —
+needs no new file format, and has a concrete existing target. If range-skipped fetch does not pay
+over a ~370 GB/s C2C link where round-trips are nearly free, it will not pay over S3 where they are
+not.
+
+Two things to settle before committing to the format, both experiments rather than design work:
+
+1. **Does coalescing hold up?** On clustered data surviving groups should be runs that merge into a
+   few large requests. Measure the request-count and bytes-amplification curve as a function of
+   selectivity and clustering strength.
+2. **Does S3 actually reward finer ranges?** The §7.2 argument is a hypothesis about backend
+   striping. A standalone probe — ranged GETs of varying size and scatter against a real bucket,
+   measuring latency and throughput — settles it without touching Sirius at all, and should be run
+   before any format work.
+
+## 8. Where the index should live: device, host, spilled
+
+### 8.1 Keep the index in device memory even when the data is pinned to host — yes
 
 This is the highest-leverage placement decision, and the asymmetry is stark. Take SF1000 lineitem,
 8K stride, 10 filterable columns: **0.11 GB of index against 264 GB of raw / 93 GB of compressed
@@ -720,7 +797,7 @@ unconditionally affordable; if a configuration ever exceeds a budget, drop the *
 before dropping *residency*, because coarsening costs ~0.5 pp of pruning while evicting the index
 to host costs the entire skip mechanism.
 
-### 7.2 When data spills to host
+### 8.2 When data spills to host
 
 Nothing changes for the index: it stays on device. The data moving to host makes the index *more*
 valuable, not less, because the cost of a wrong "do not skip" decision goes up by the H2D transfer.
@@ -732,7 +809,7 @@ Implication for the spill policy: when a table is demoted GPU→host, its index 
 demotion. Since `docs/super-sirius/scan.md:283-288` says statless entries are not retrofittable,
 losing the index on demotion would be permanent for that entry.
 
-### 7.3 When data spills to disk
+### 8.3 When data spills to disk
 
 Here the index should be **kept in device memory and additionally persisted**. Two distinct roles:
 
@@ -750,7 +827,7 @@ adding chunk-range granularity would let a spilled table read back only survivin
 the natural follow-on and the one place `range_slice` (`DECODE_PUSHDOWN_PLAN.md:722-723`) becomes
 necessary.
 
-### 7.4 Summary table
+### 8.4 Summary table
 
 | Data location | Index location | Compressed? | Why |
 |---|---|---|---|
@@ -761,7 +838,7 @@ necessary.
 
 ---
 
-## 8. Proposed order of work — prove value before committing
+## 9. Proposed order of work — prove value before committing
 
 The governing constraint: **on TPC-H as it sits, every implementation measures exactly zero**
 (§3.1). Any proof of value must first create clustered data. And the cheapest honest proof does
@@ -895,7 +972,7 @@ helps but does not fix an 83 ns primitive.
 > The 2a function stays useful as the *capture* (it is correct, tested, and GPU-side cheap); its
 > output type is what has to change.
 
-This also revises §7.1: keeping the index device-resident is right, but the load-bearing reason is
+This also revises §8.1: keeping the index device-resident is right, but the load-bearing reason is
 **evaluation throughput**, not avoiding an H2D round trip. 732,000 group cells is a GPU-shaped
 problem, not a host-loop-shaped one.
 
@@ -928,11 +1005,14 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
 2. W4 dictionary present-value bitmaps — the only path to pruning on `l_shipmode`-style
    predicates (§3.4), where min/max spans the whole domain regardless of granularity.
 3. W4 per-group null counts — unblocks compressed late-materialization, a separate win.
-4. **Clustering as a first-class pin option.** None of the above pays on TPC-H as it sits (§3.1);
+4. **Range-skipped fetch on a host-tier pin (§6).** The highest-value untested idea: host-tier
+   compressed loses 7.0% today entirely on fetch cost, and the byte ranges are exactly computable.
+   Gates the simpatico ingestion format (§7) — same mechanism, no new format.
+5. **Clustering as a first-class pin option.** None of the above pays on TPC-H as it sits (§3.1);
    this is what converts 0% into ~34–38%. Arguably the real project, with the metadata as what
    makes it usable.
 
-## 9. Open questions / log
+## 10. Open questions / log
 
 - **2026-09-07** — project opened. Investigation and all measurements in §3–§6 done; nothing
   implemented, nothing benchmarked end-to-end.
@@ -954,6 +1034,12 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Added §5: GPU sort is ~34× faster than 72 CPU threads and a per-pin-chunk local sort of SF1000
   lineitem costs ~2.3 s; local sort reaches 72.7% of the global sort's 73.5% at G=8 but **0.0%** at
   pin-chunk granularity, which is the strongest argument yet for the fine index.
+- **Open (§7.2):** does S3 actually reward finer ranges, or does internal striping mean a pruned
+  ranged GET costs the backend the same as an unpruned one? A standalone probe against a real
+  bucket settles it without touching Sirius, and gates any simpatico-ingestion work.
+- **Open (§7.3):** the coalescing policy — merge ranges whose gap is under G bytes, widen G until
+  the request count is acceptable. G and N need measuring; `align_and_coalesce` already takes a
+  caller-supplied alignment, so the mechanism exists and only the policy is missing.
 - **Open (§6):** range-skipped *fetch* on a host-tier pin — the highest-value untested idea, since
   host-tier compressed loses 7.0% today entirely on fetch cost. Needs the coalescing question
   answered: do surviving groups merge into few large copies on clustered data?
