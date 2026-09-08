@@ -244,18 +244,21 @@ std::unique_ptr<compressed_representation> alp_compressed_representation::from_o
   auto metadata            = std::move(outputs[3]);
 
   // Type validation. The (integers, exceptions) pair must match a supported
-  // (int_t, value_t) combination from alp_traits: INT32+FLOAT32 for f32
-  // input, INT64+FLOAT64 for f64. The other two outputs are precision-
-  // independent.
-  bool const is_f32 = integers->type().id() == cudf::type_id::INT32 &&
-                      exceptions->type().id() == cudf::type_id::FLOAT32;
-  bool const is_f64 = integers->type().id() == cudf::type_id::INT64 &&
-                      exceptions->type().id() == cudf::type_id::FLOAT64;
-  if (!is_f32 && !is_f64) {
+  // (int_t, value_t) combination from alp_traits: INT32 pairs with FLOAT32 or
+  // DECIMAL32, INT64 with FLOAT64 or DECIMAL64. (The fixed-point pairs are the
+  // decimal path, where the encoded integer is the mantissa divided by a power
+  // of ten.) The other two outputs are precision-independent.
+  auto const int_id = integers->type().id();
+  auto const exc_id = exceptions->type().id();
+  bool const is_32  = int_id == cudf::type_id::INT32 &&
+                     (exc_id == cudf::type_id::FLOAT32 || exc_id == cudf::type_id::DECIMAL32);
+  bool const is_64 = int_id == cudf::type_id::INT64 &&
+                     (exc_id == cudf::type_id::FLOAT64 || exc_id == cudf::type_id::DECIMAL64);
+  if (!is_32 && !is_64) {
     if (error_out)
       *error_out =
-        "alp (integers, exceptions) must be (INT32,FLOAT32) or "
-        "(INT64,FLOAT64)";
+        "alp (integers, exceptions) must be (INT32,FLOAT32|DECIMAL32) or "
+        "(INT64,FLOAT64|DECIMAL64)";
     return nullptr;
   }
   if (exception_positions->type().id() != cudf::type_id::INT32) {
@@ -273,8 +276,9 @@ std::unique_ptr<compressed_representation> alp_compressed_representation::from_o
 
   cudf::size_type num_rows    = integers->size();
   cudf::size_type num_vectors = metadata->size();
-  // The exceptions column's type IS the original float type by construction
-  // (alp_traits stores exceptions as the source value_t).
+  // The exceptions column's type IS the original column type by construction
+  // (compress builds it from the source column's data_type), which is also how
+  // a fixed-point column's scale survives the round trip.
   cudf::data_type original_type = exceptions->type();
 
   return std::make_unique<alp_compressed_representation>(original_type,

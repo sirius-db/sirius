@@ -452,7 +452,7 @@ std::unique_ptr<alp_rd_compressed_representation> alp_rd_compress_impl(
 
   // Step 4: compact exceptions into (positions, rejected left parts).
   auto exc = compact_exceptions<uint16_t>(
-    d_flags.data(), n, d_exception_left.data(), cudf::type_id::UINT16, stream, mr);
+    d_flags.data(), n, d_exception_left.data(), cudf::data_type{cudf::type_id::UINT16}, stream, mr);
 
   throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_rd_compress_impl sync");
 

@@ -185,6 +185,37 @@ inline std::unique_ptr<cudf::table> make_f64_table(int num_cols, int num_rows, i
 // Single-column chrono table (DATE32 days / int64 timestamps / durations),
 // bit-identical to its integer storage. A mild upward drift with small jitter
 // makes delta/bitpack meaningful, like real event times.
+// DECIMAL64 mantissas at scale -2 (money), all multiples of `mantissa_factor`
+// so a power-of-ten scale is actually available to find, plus a `1 / exc_every`
+// fraction of values that are NOT multiples -- those are the rows ALP has to
+// bank as exceptions, and the case that distinguishes it from `factor`, whose
+// GCD would collapse to 1 the moment one such value appears. exc_every <= 0
+// disables them.
+inline std::unique_ptr<cudf::table> make_decimal64_table(
+  int num_cols, int num_rows, int seed, std::int64_t mantissa_factor, int exc_every)
+{
+  auto const dt = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<std::int64_t> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r) {
+      std::int64_t m =
+        (static_cast<std::int64_t>((r * 17 + c * 1013 + seed) % 1000) - 500) * mantissa_factor;
+      if (exc_every > 0 && (r % exc_every) == 0) m += 1;
+      host[static_cast<std::size_t>(r)] = m;
+    }
+    auto col = cudf::make_fixed_width_column(dt, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<void>(),
+                   host.data(),
+                   host.size() * sizeof(std::int64_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_decimal64_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
 inline std::unique_ptr<cudf::table> make_chrono_table(cudf::type_id id, int num_rows, int seed)
 {
   auto const dt = cudf::data_type{id};

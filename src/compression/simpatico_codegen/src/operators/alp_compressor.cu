@@ -29,6 +29,7 @@
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/std/type_traits>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -115,6 +116,15 @@ constexpr double kExp[19] = {1e0,
 constexpr int kCandCount = 19;
 }  // namespace host_consts_f64
 
+// Exact power-of-ten tables for the fixed-point path. A DECIMAL column's
+// storage IS an integer mantissa, so its "scale search" is pure integer
+// arithmetic: divide by 10^d and check the division was exact. No float
+// constants, no rounding, no reciprocal.
+constexpr int kP10I32Count = 10;  // 10^9 is the largest that fits int32
+constexpr int kP10I64Count = 19;  // 10^18 is the largest that fits int64
+__constant__ int32_t d_alp_p10_i32[kP10I32Count];
+__constant__ int64_t d_alp_p10_i64[kP10I64Count];
+
 __constant__ float d_alp_exp_f32[11];
 __constant__ float d_alp_rhi_f32[11];
 __constant__ float d_alp_rlo_f32[11];
@@ -150,7 +160,20 @@ void fill_reciprocal_split(Narrow* rhi, Narrow* rlo, int count)
 // stream sync, avoiding the legacy default stream entirely.
 void alp_upload_constants(rmm::cuda_stream_view stream)
 {
+  int32_t p10_i32[kP10I32Count];
+  int64_t p10_i64[kP10I64Count];
+  {
+    int32_t p32 = 1;
+    for (int k = 0; k < kP10I32Count; ++k, p32 *= 10)
+      p10_i32[k] = p32;
+    int64_t p64 = 1;
+    for (int k = 0; k < kP10I64Count; ++k, p64 *= 10)
+      p10_i64[k] = p64;
+  }
+
   auto const s = stream.value();
+  cudaMemcpyToSymbolAsync(d_alp_p10_i32, p10_i32, sizeof(p10_i32), 0, cudaMemcpyHostToDevice, s);
+  cudaMemcpyToSymbolAsync(d_alp_p10_i64, p10_i64, sizeof(p10_i64), 0, cudaMemcpyHostToDevice, s);
   cudaMemcpyToSymbolAsync(d_alp_exp_f32,
                           host_consts_f32::kExp,
                           sizeof(host_consts_f32::kExp),
@@ -254,6 +277,39 @@ struct alp_traits<double> {
   __device__ static value_t rlo_(int i) { return d_alp_rlo_f64[i]; }
 };
 
+// Fixed-point (DECIMAL32 / DECIMAL64) specialisations. `value_t == int_t`: the
+// column's storage is already the integer ALP would produce, so encoding is a
+// division by 10^d and the round-trip check is an exact-divisibility test.
+// `value_type_id` is only the storage id -- the compress path passes the
+// column's real data_type (carrying its scale) where the type matters.
+template <>
+struct alp_traits<int32_t> {
+  using value_t                                 = int32_t;
+  using int_t                                   = int32_t;
+  using uint_t                                  = uint32_t;
+  static constexpr cudf::type_id value_type_id  = cudf::type_id::DECIMAL32;
+  static constexpr cudf::type_id int_type_id    = cudf::type_id::INT32;
+  static constexpr int cand_count               = kP10I32Count;
+  static constexpr int_t int_max                = 0x7FFFFFFF;
+  static constexpr int_t int_min                = static_cast<int_t>(0x80000000);
+  static constexpr uint32_t exception_cost_bits = 32 + 16;
+  __device__ static int_t p10_(int i) { return d_alp_p10_i32[i]; }
+};
+
+template <>
+struct alp_traits<int64_t> {
+  using value_t                                 = int64_t;
+  using int_t                                   = int64_t;
+  using uint_t                                  = uint64_t;
+  static constexpr cudf::type_id value_type_id  = cudf::type_id::DECIMAL64;
+  static constexpr cudf::type_id int_type_id    = cudf::type_id::INT64;
+  static constexpr int cand_count               = kP10I64Count;
+  static constexpr int_t int_max                = 0x7FFFFFFFFFFFFFFFLL;
+  static constexpr int_t int_min                = static_cast<int_t>(0x8000000000000000ULL);
+  static constexpr uint32_t exception_cost_bits = 64 + 16;
+  __device__ static int_t p10_(int i) { return d_alp_p10_i64[i]; }
+};
+
 // -----------------------------------------------------------------------------
 // Atomic min/max overloads. CUDA's atomicMin/atomicMax for 64-bit ints want
 // `long long*`, which is not the same type as int64_t on every platform.
@@ -320,35 +376,63 @@ __device__ inline int bits_for_range_u64(uint64_t range)
 // `is_exception` when the round-trip check fails (or the input is non-finite,
 // ±Inf, NaN, -0.0, or overflows the safe-integer range when scaled).
 template <typename T>
+__device__ inline T alp_decode_value(typename alp_traits<T>::int_t enc, int d);
+
+template <typename T>
 __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, bool& is_exception)
 {
   using traits = alp_traits<T>;
   using int_t  = typename traits::int_t;
-  if (!isfinite(v) || (v == T{0} && signbit(v))) {
-    is_exception = true;
-    return 0;
+
+  if constexpr (cuda::std::is_integral_v<T>) {
+    // Fixed-point path: the mantissa is already an integer, so "encoding at
+    // scale d" is dividing by 10^d and the round-trip is exact iff 10^d
+    // divides it. |q * p| <= |v| by construction, so the check cannot
+    // overflow. Truncation toward zero is the same on both signs, so a
+    // negative mantissa needs no special case.
+    int_t const p = traits::p10_(d);
+    int_t const q = v / p;
+    is_exception  = (q * p != v);
+    return q;
+  } else {
+    if (!isfinite(v) || (v == T{0} && signbit(v))) {
+      is_exception = true;
+      return 0;
+    }
+    // ALP as published parameterises the scale by a pair (e, f) and encodes
+    // round(v * 10^e * 10^-f), decoding as i * 10^f * 10^-e -- but only the
+    // DIFFERENCE d = e - f ever affects the result, and the published combo
+    // table constrains f <= e so d is exactly the non-negative range swept here.
+    // Collapsing to d drops the f64 candidate set from 190 pairs to 19 scales
+    // with no loss of coverage, and scaling by the single exact 10^d rounds once
+    // instead of twice.
+    T tmp = v * traits::exp_(d);
+    // Magic-number round-to-nearest-even.
+    T rounded = (tmp + traits::magic) - traits::magic;
+    if (!isfinite(rounded) || rounded > traits::safe_max || rounded < traits::safe_min) {
+      is_exception = true;
+      return 0;
+    }
+    int_t enc = static_cast<int_t>(rounded);
+    // Round-trip check: decode with the EXACT same expression as
+    // alp_decode_kernel and compare bit-exactly.
+    is_exception = (alp_decode_value<T>(enc, d) != v);
+    return enc;
   }
-  // ALP as published parameterises the scale by a pair (e, f) and encodes
-  // round(v * 10^e * 10^-f), decoding as i * 10^f * 10^-e -- but only the
-  // DIFFERENCE d = e - f ever affects the result, and the published combo
-  // table constrains f <= e so d is exactly the non-negative range swept here.
-  // Collapsing to d drops the f64 candidate set from 190 pairs to 19 scales
-  // with no loss of coverage, and scaling by the single exact 10^d rounds once
-  // instead of twice.
-  T tmp = v * traits::exp_(d);
-  // Magic-number round-to-nearest-even.
-  T rounded = (tmp + traits::magic) - traits::magic;
-  if (!isfinite(rounded) || rounded > traits::safe_max || rounded < traits::safe_min) {
-    is_exception = true;
-    return 0;
+}
+
+// Inverse of alp_encode_value. Kept as one function so encode's round-trip
+// check and the decode kernel can never drift apart.
+template <typename T>
+__device__ inline T alp_decode_value(typename alp_traits<T>::int_t enc, int d)
+{
+  using traits = alp_traits<T>;
+  if constexpr (cuda::std::is_integral_v<T>) {
+    return enc * traits::p10_(d);
+  } else {
+    T const encd = static_cast<T>(enc);
+    return fma(encd, traits::rhi_(d), encd * traits::rlo_(d));
   }
-  int_t enc = static_cast<int_t>(rounded);
-  // Round-trip check: decode with the EXACT same expression as
-  // alp_decode_kernel and compare bit-exactly.
-  T const encd = static_cast<T>(enc);
-  T decoded    = fma(encd, traits::rhi_(d), encd * traits::rlo_(d));
-  is_exception = (decoded != v);
-  return enc;
 }
 
 // -----------------------------------------------------------------------------
@@ -532,17 +616,11 @@ __global__ void alp_decode_kernel(const typename alp_traits<T>::int_t* __restric
                                   int32_t n_rows,
                                   T* __restrict__ out)
 {
-  using traits = alp_traits<T>;
-  int i        = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_rows) return;
-  int vec     = i / kAlpVectorSize;
-  int const d = static_cast<int>(metadata[vec]);
-  auto enc    = integers[i];
-  // v = enc * 10^-d, evaluated through the double-double reciprocal so a single
-  // rounded 10^-d never costs us an exception. Must stay bit-identical to the
-  // round-trip check in alp_encode_value.
-  T const encd = static_cast<T>(enc);
-  out[i]       = fma(encd, traits::rhi_(d), encd * traits::rlo_(d));
+  int const vec = i / kAlpVectorSize;
+  int const d   = static_cast<int>(metadata[vec]);
+  out[i]        = alp_decode_value<T>(integers[i], d);
 }
 
 // Exception scatter: fully data-parallel (G-ALP's key GPU optimisation).
@@ -573,8 +651,8 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
   if (n == 0) {
     auto empty_int = cudf::make_fixed_width_column(
       cudf::data_type(traits::int_type_id), 0, cudf::mask_state::UNALLOCATED, stream, mr);
-    auto empty_exc = cudf::make_fixed_width_column(
-      cudf::data_type(traits::value_type_id), 0, cudf::mask_state::UNALLOCATED, stream, mr);
+    auto empty_exc =
+      cudf::make_fixed_width_column(col.type(), 0, cudf::mask_state::UNALLOCATED, stream, mr);
     auto empty_pos = cudf::make_fixed_width_column(
       cudf::data_type(cudf::type_id::INT32), 0, cudf::mask_state::UNALLOCATED, stream, mr);
     auto empty_md = cudf::make_fixed_width_column(
@@ -609,8 +687,7 @@ std::unique_ptr<alp_compressed_representation> alp_compress_impl(cudf::column_vi
     d_flags.data());
 
   // Compact the per-row exception flags into (positions, exception values).
-  auto exc =
-    compact_exceptions<T>(d_flags.data(), n, col.data<T>(), traits::value_type_id, stream, mr);
+  auto exc = compact_exceptions<T>(d_flags.data(), n, col.data<T>(), col.type(), stream, mr);
 
   throw_if_cuda_error(cudaStreamSynchronize(stream.value()), "alp_compress_impl sync");
 
@@ -690,9 +767,12 @@ std::unique_ptr<cudf::column> alp_compressed_representation::decompress(
   switch (original_type.id()) {
     case cudf::type_id::FLOAT32: return alp_decompress_impl<float>(*this, stream, mr);
     case cudf::type_id::FLOAT64: return alp_decompress_impl<double>(*this, stream, mr);
+    case cudf::type_id::DECIMAL32: return alp_decompress_impl<int32_t>(*this, stream, mr);
+    case cudf::type_id::DECIMAL64: return alp_decompress_impl<int64_t>(*this, stream, mr);
     default:
-      throw std::runtime_error("alp: only FLOAT32 / FLOAT64 are supported (got " +
-                               type_id_to_name(original_type) + ")");
+      throw std::runtime_error(
+        "alp: only FLOAT32 / FLOAT64 / DECIMAL32 / DECIMAL64 are supported (got " +
+        type_id_to_name(original_type) + ")");
   }
 }
 
@@ -709,9 +789,16 @@ std::unique_ptr<compressed_representation> alp_compressor::compress(
   switch (dt.id()) {
     case cudf::type_id::FLOAT32: return alp_compress_impl<float>(column_to_compress, stream, mr);
     case cudf::type_id::FLOAT64: return alp_compress_impl<double>(column_to_compress, stream, mr);
+    // DECIMAL128's mantissa is __int128; there is no power-of-ten table or
+    // atomic support for it here, so it stays out.
+    case cudf::type_id::DECIMAL32:
+      return alp_compress_impl<int32_t>(column_to_compress, stream, mr);
+    case cudf::type_id::DECIMAL64:
+      return alp_compress_impl<int64_t>(column_to_compress, stream, mr);
     default:
-      throw std::runtime_error("alp: only FLOAT32 / FLOAT64 are supported (got " +
-                               type_id_to_name(dt) + "). Use alp_rd for non-decimal floats.");
+      throw std::runtime_error(
+        "alp: only FLOAT32 / FLOAT64 / DECIMAL32 / DECIMAL64 are supported (got " +
+        type_id_to_name(dt) + "). Use alp_rd for non-decimal floats.");
   }
 }
 

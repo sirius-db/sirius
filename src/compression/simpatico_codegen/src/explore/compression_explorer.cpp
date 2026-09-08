@@ -319,7 +319,18 @@ operator_trial try_operator(std::string const& name,
     r.error_message = name + ": requires float32 input";
     return r;
   }
-  if ((name == "alp" || name == "alp_rd") && !is_float) {
+  // alp takes fixed-point too: a DECIMAL column's mantissa is already an
+  // integer, so ALP's scale search there is exact integer divisibility -- and
+  // unlike `factor`, which needs a divisor common to EVERY value in a chunk,
+  // ALP can take a power of ten that most values share and bank the rest as
+  // exceptions. alp_rd stays float-only; it splits an IEEE significand.
+  bool const is_decimal = cudf::is_fixed_point(col.type()) &&
+                          (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64);
+  if (name == "alp" && !is_float && !is_decimal) {
+    r.error_message = name + ": requires floating-point or DECIMAL32/64 input";
+    return r;
+  }
+  if (name == "alp_rd" && !is_float) {
     r.error_message = name + ": requires floating-point input";
     return r;
   }

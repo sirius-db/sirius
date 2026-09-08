@@ -373,6 +373,39 @@ int main()
     }
 
     {
+      // ALP on DECIMAL64 — the fixed-point path, where the mantissa is already
+      // an integer and the scale search is exact integer divisibility rather
+      // than float round-tripping. Three shapes: a clean common power of ten,
+      // one with a fraction of values that do NOT divide (so the exception
+      // machinery runs on the decimal path), and one with no power of ten
+      // available at all (scale collapses to 10^0, an exact identity).
+      auto clean = make_decimal64_table(2, 4096, 21, 100, 0);
+      std::string dsl =
+        "input -> alp\n"
+        "---\n"
+        "input -> alp\n";
+      roundtrip_once(clean->view(), dsl, 1, "alp_decimal64");
+      roundtrip_once(clean->view(), dsl, 2, "alp_decimal64_mt");
+
+      auto with_exc = make_decimal64_table(2, 4096, 23, 100, 37);
+      roundtrip_once(with_exc->view(), dsl, 1, "alp_decimal64_exceptions");
+
+      auto no_factor = make_decimal64_table(2, 4096, 29, 1, 0);
+      roundtrip_once(no_factor->view(), dsl, 1, "alp_decimal64_no_scale");
+
+      // Composed with bitpack on the integers channel — the shape that makes
+      // the decimal path worth having.
+      std::string dsl_bp =
+        "input -> alp -> integers, exceptions, exception_positions, metadata\n"
+        "alp.integers -> bitpack\n"
+        "---\n"
+        "input -> alp -> integers, exceptions, exception_positions, metadata\n"
+        "alp.integers -> bitpack\n";
+      roundtrip_once(clean->view(), dsl_bp, 1, "alp_decimal64_bitpack");
+      roundtrip_once(with_exc->view(), dsl_bp, 1, "alp_decimal64_bitpack_exceptions");
+    }
+
+    {
       // ALP-RD (Right-Dictionary), FLOAT32 — the non-decimal float path.
       auto t = make_f32_table(2, 4096, 33);
       std::string dsl =
