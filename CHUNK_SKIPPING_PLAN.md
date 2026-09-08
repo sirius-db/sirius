@@ -948,6 +948,99 @@ Two things to settle before committing to the format, both experiments rather th
    measuring latency and throughput — settles it without touching Sirius at all, and should be run
    before any format work.
 
+## 7A. Physical layout: keep the metadata segregated and scannable on its own
+
+The index is only useful if it can be read *without* reading the data it describes. That is the
+whole premise of skipping a fetch: read metadata, decide, then fetch only what survived. Neither
+of the two layouts we have today satisfies it.
+
+### 7A.1 What is wrong today
+
+**On disk, metadata is interleaved with bulk data.** The `.hpln` payload is "all buffer bytes
+concatenated in write order" (`api/compressed_table_io.hpp:40`), and `payload_offset` is a running
+cursor assigned leaf by leaf (`src/api/compressed_table_io.cpp:755`). So a column's small metadata
+channels sit immediately before/after its multi-gigabyte `packed` buffer, and the next column's
+metadata is a payload-length away. Reading just the metadata for a table means one small scattered
+read per column per channel — the worst possible access pattern over a network, and not much
+better on disk.
+
+**In memory, the sidecar is fragmented.** `pinned_entry::group_bounds` is
+`vector<vector<packed_column_bounds>>`, and each `packed_column_bounds` owns three more vectors —
+so roughly `3 × n_columns × n_chunks` separate allocations, chunk-major. Evaluating one column's
+filter walks a pointer chase across the whole table, and there is no single buffer to hand to a
+GPU kernel or to copy H2D in one go.
+
+### 7A.2 The layout we want
+
+**One contiguous metadata region per table, column-major over groups.**
+
+- **Segregated**: metadata occupies its own region, addressed by a small directory, with zero bulk
+  data interleaved. A reader can fetch the entire region in **one** sequential read before touching
+  any payload — the property everything else here depends on.
+- **Column-major**: all groups of column *c* contiguous, then column *c+1*. A query filters on one
+  to three columns; column-major means those are a few large sequential runs and the other columns
+  are never touched at all. Chunk-major (today's shape) interleaves columns and forces a strided
+  walk over the whole thing.
+- **Parallel typed arrays within a column**: `mins[]`, then `maxs[]`, then the validity bitmap —
+  the `packed_column_bounds` shape, but as spans into one arena rather than owning vectors. This is
+  also exactly the shape a GPU evaluator wants.
+- **Small directory**: per (column, chunk), the offset and group count into the region, plus the
+  column's type, signedness and `group_rows`. Kilobytes, read first, tells you which slice to read
+  or which device pointer to hand a kernel.
+
+Concretely at SF1000 lineitem, G = 8: 732k groups × 16 B = **11.7 MB contiguous per column**, ~170 MB
+for all sixteen. One column's bounds are a single 11.7 MB sequential read — one `GET`, not 732k
+lookups.
+
+### 7A.3 Why segregation buys more than tidiness
+
+- **It is what makes the fetch skip possible at all.** Read metadata → decide → fetch surviving
+  ranges. If metadata is interleaved, "read the metadata" already means touching the payload
+  region, and the ordering the whole scheme needs collapses.
+- **It survives spilling independently.** A contiguous region can stay device-resident while the
+  payload spills to host or disk. A fragmented sidecar interleaved with payload cannot be pinned
+  separately from what it describes.
+- **It is one H2D copy and one kernel launch.** ~700k cells is GPU-shaped work; a pointer chase is
+  not.
+- **It is independently cacheable.** Over object storage the metadata region is small, hot, and
+  read by every query against the table — exactly the thing a cache should hold and the payload
+  should not evict.
+
+### 7A.4 File-format choice: separate section, or separate object?
+
+Two shapes, and the answer differs by backend:
+
+| | one object, separate section | separate sidecar object/file |
+|---|---|---|
+| reads to get metadata | 2 (footer, then the region) — or 1 if the directory rides in the footer | 1 |
+| atomicity | trivially consistent with the data | needs a version/identity check against the payload |
+| cacheable independently | by byte range | naturally, as its own object |
+| works for a pinned entry | n/a | n/a |
+
+**Recommendation: a separate, contiguous section within the file, with its directory in the footer
+so the region is reachable in one read after the footer.** It keeps data and index atomically
+consistent — which matters because a stale index is a *correctness* bug, not a performance one —
+and byte-range caching is enough to get the independent-caching benefit. A separate object is worth
+revisiting only if metadata turns out to be re-read far more often than footers.
+
+The `.hpln` header is self-describing per leaf, so this is additive: a new section plus a directory,
+old files still readable, and the existing `payload_fetch_fn(offset, size, dst, stream)` callback
+already expresses "fetch this byte range" without change.
+
+### 7A.5 What this implies for the code as it stands
+
+The in-memory sidecar should be rebuilt on an arena before it has any consumer, so the packed shape
+is the only shape anything ever sees:
+
+- `packed_column_bounds` keeps its API but holds **spans into a per-table arena** rather than owning
+  `std::vector`s.
+- Ordering becomes column-major over (chunk, group) rather than chunk-major over columns.
+- One `rmm::device_buffer` mirror of the same bytes, so the layout is identical host and device and
+  a GPU evaluator needs no re-packing.
+
+None of that changes the semantics already tested (absent cell never prunes, refinement only
+narrows, sentinel unrefined); it changes where the bytes live.
+
 ## 8. Where the index should live: device, host, spilled
 
 ### 8.1 Keep the index in device memory even when the data is pinned to host — yes
@@ -999,7 +1092,9 @@ Here the index should be **kept in device memory and additionally persisted**. T
 - **Resident copy (device):** answers "do I need to read this chunk back at all". This is the whole
   value — a disk round trip is orders of magnitude more expensive than the ~1:850 index, so the
   break-even is not close.
-- **Persisted copy (with the payload):** the `.hpln` format is self-describing per leaf
+- **Persisted copy (with the payload):** stored as its own contiguous section, not interleaved —
+  see the layout section above for why that is load-bearing rather than cosmetic. The `.hpln`
+  format is self-describing per leaf
   (`.../api/compressed_table_io.hpp:14-39`) and `payload_offset` is already per-buffer, so both the
   min/max index and the §6.1 group→byte table serialize alongside the data as ordinary buffers,
   with no format surgery.
