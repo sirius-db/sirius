@@ -360,7 +360,7 @@ void pin_columns(sirius_scan_manager& manager,
     names.size(),
     sirius::pinned_column_storage_meta{cudf::data_type{cudf::type_id::INT32}, false})};
   manager.insert_pinned_entry_device(
-    table, std::move(info), std::move(chunks), space, {}, {}, std::move(storage));
+    table, std::move(info), std::move(chunks), space, {}, {}, {}, std::move(storage));
 }
 
 /// Pin `names` under `table` through the merge-capable GPU path (one INT32

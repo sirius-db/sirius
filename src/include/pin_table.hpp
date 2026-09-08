@@ -17,6 +17,7 @@
 #pragma once
 
 #include "late_mat/pin_uniqueness.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 
 #include <cudf/types.hpp>
 
@@ -166,7 +167,13 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
-  bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
+  bool capture_chunk_stats = true;  ///< capture zone-map statistics per chunk
+  /// Rows per group for the finer-grained zone-map capture, 0 to skip it. A group is a whole
+  /// number of simpatico 1024-row decode chunks, so a surviving group maps to a chunk-id run.
+  /// Only captured when @c capture_chunk_stats is also set: the two share the same column types
+  /// and the same "no statistics never prunes" contract, and the coarse pass is the cheap
+  /// first filter the fine one refines.
+  std::size_t group_rows                 = 0;
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
   /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
@@ -220,6 +227,9 @@ struct host_pin_result {
   /// (no pinned column types). Fed with the pin-time column types into
   /// @c sirius_scan_manager::insert_pinned_entry_host to drive zone-map pruning.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Per-chunk, per-group zone-map capture, parallel to the chunks; empty when @c group_rows was
+  /// 0. Feeds group_bounds_arena::from_capture at insert.
+  std::vector<scan_manager::chunk_group_stats> group_stats;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;
@@ -270,6 +280,9 @@ struct device_pin_result {
   /// to @c chunks when capture ran; empty when capture was skipped. Mirrors
   /// @ref host_pin_result::chunk_stats and feeds insert_pinned_entry_device.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Per-chunk, per-group zone-map capture, parallel to the chunks; empty when @c group_rows was
+  /// 0. Feeds group_bounds_arena::from_capture at insert.
+  std::vector<scan_manager::chunk_group_stats> group_stats;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;

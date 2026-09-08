@@ -2075,7 +2075,9 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
 
   // Normalize the optional zone-map capture.
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
-  auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
+  // from_capture consumes column_types; the group arena needs the same list, so copy first.
+  auto const group_column_types = column_types;
+  auto pin_zone_maps            = pinned_zone_maps::from_capture(std::move(column_types),
                                                       std::move(chunk_stats),
                                                       cache_info.column_ids.size(),
                                                       data_tables.size());
@@ -2306,6 +2308,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<chunk_group_stats> group_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
@@ -2352,7 +2355,9 @@ void sirius_scan_manager::insert_pinned_entry_host(
     });
   // Normalize the optional zone-map capture
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
-  auto pin_zone_maps        = pinned_zone_maps::from_capture(std::move(column_types),
+  // from_capture consumes column_types; the group arena needs the same list, so copy first.
+  auto const group_column_types = column_types;
+  auto pin_zone_maps            = pinned_zone_maps::from_capture(std::move(column_types),
                                                       std::move(chunk_stats),
                                                       cache_info.column_ids.size(),
                                                       host_chunks.size());
@@ -2373,6 +2378,9 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.host_chunks    = std::move(host_chunks);
   entry.column_storage = std::move(column_storage);
   entry.zone_maps      = std::move(pin_zone_maps);
+  // The finer sidecar. from_capture returns empty on any inconsistency, which simply means no
+  // sub-chunk pruning; the coarse zone_maps above are unaffected either way.
+  entry.group_bounds = group_bounds_arena::from_capture(group_column_types, group_stats);
 
   // Assigning over an existing name destroys that entry in place, so its
   // handle has to be invalidated FIRST — afterwards the entry is gone but the
@@ -2390,6 +2398,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cucascade::memory::memory_space& memory_space,
   duckdb::vector<duckdb::LogicalType> column_types,
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+  std::vector<chunk_group_stats> group_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
   std::size_t new_num_rows = 0;
@@ -2423,7 +2432,9 @@ void sirius_scan_manager::insert_pinned_entry_device(
   // Normalize the optional zone-map capture, exactly as the host path does.
   bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
   auto const n_chunks       = chunks.size();
-  auto pin_zone_maps        = pinned_zone_maps::from_capture(
+  // from_capture consumes column_types; the group arena needs the same list, so copy first.
+  auto const group_column_types = column_types;
+  auto pin_zone_maps            = pinned_zone_maps::from_capture(
     std::move(column_types), std::move(chunk_stats), cache_info.column_ids.size(), n_chunks);
   if (stats_supplied && !pin_zone_maps.has_stats()) {
     // Only reason stats failed to append is a shape mismatch between the captured stats and the
@@ -2442,6 +2453,9 @@ void sirius_scan_manager::insert_pinned_entry_device(
   entry.device_chunks  = std::move(chunks);
   entry.column_storage = std::move(column_storage);
   entry.zone_maps      = std::move(pin_zone_maps);
+  // The finer sidecar. from_capture returns empty on any inconsistency, which simply means no
+  // sub-chunk pruning; the coarse zone_maps above are unaffected either way.
+  entry.group_bounds = group_bounds_arena::from_capture(group_column_types, group_stats);
 
   SIRIUS_LOG_DEBUG("[sirius_scan_manager::insert_pinned_entry_device] '{}' chunks={} rows={}",
                    name,
@@ -2835,6 +2849,14 @@ void build_survivor_row_ranges(pinned_entry const& entry,
 
   plan.survivor_row_ranges       = std::move(ranges);
   plan.rows_pruned_within_chunks = rows_dropped;
+  if (rows_dropped > 0) {
+    SIRIUS_LOG_INFO(
+      "[sirius_scan_manager] sub-chunk pruning: {} rows dropped within {} surviving chunks, "
+      "{} row ranges",
+      rows_dropped,
+      plan.survivor_chunk_indices.size(),
+      plan.survivor_row_ranges.size());
+  }
 }
 
 }  // namespace

@@ -294,6 +294,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
   r.optional(
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
+  r.optional("pinned_zone_map_group_rows", opt.pinned_zone_map_group_rows);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);
   r.optional("enable_dense_count_join", opt.enable_dense_count_join);
   if (r.has("dense_count_join_max_bytes")) {

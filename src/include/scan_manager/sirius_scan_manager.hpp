@@ -600,6 +600,8 @@ class sirius_scan_manager {
   ///                      with @p cache_info's column_ids; empty pins statless.
   /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
   ///                      compute_pinned_chunk_stats emits).
+  /// \param group_stats   Optional finer per-group capture, parallel to the chunks; empty skips
+  ///                      sub-chunk pruning and leaves the coarse stats in charge.
   /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
@@ -611,6 +613,7 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    std::vector<chunk_group_stats> group_stats,
     sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
@@ -633,6 +636,8 @@ class sirius_scan_manager {
   ///                      compute_pinned_chunk_stats emits). Captured off the uncompressed GPU
   ///                      table before compression, so a compressed pin gets zone maps even
   ///                      though its payload cannot be introspected here.
+  /// \param group_stats   Optional finer per-group capture, parallel to the chunks; empty skips
+  ///                      sub-chunk pruning and leaves the coarse stats in charge.
   /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
@@ -644,6 +649,7 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    std::vector<chunk_group_stats> group_stats,
     sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
