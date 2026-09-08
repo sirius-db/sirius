@@ -436,6 +436,58 @@ chunks.**
    rarely spanned much of the key space. The effect scales with the file count, which is why it
    appeared at SF1000 and not at SF100.
 
+### 3.9 The ceiling: this suite is join-bound, not scan-bound (2026-09-08)
+
+Two follow-up measurements reframe how much chunk skipping can ever be worth on the winning
+configuration.
+
+**(a) A fine index would see straight through the interleaving — no pin-time sorting needed.**
+The coalescer interleaves at *row-group* granularity: sorted SF1000 lineitem row groups are
+1,048,576 rows, so a G = 8 group (8,192 rows) sits entirely inside one row group and inherits its
+**0.44-day** span. The chunk spans seven years; the groups inside it do not. Measured at row-group
+granularity on the sorted SF1000, **36.54% of scanned rows are prunable** (0.00% unsorted) — that
+is the floor for what a G = 8 index recovers, against the 17% of chunks W2 prunes today at the
+production batch size. So §3.8's "clustering must happen at pin time" is true for *chunk*-level
+pruning but **not** a prerequisite for Phase 2: the fine index is an alternative to pin-time
+sorting, not a complement to it.
+
+**(b) But scan is a tiny share of the suite, so the ceiling is low.** Per-query bests from the
+8 GB-ON run (6.963 s total):
+
+| query | time | share |
+|---|---|---|
+| q18 | 1.7277 s | 24.8% |
+| q9 | 0.9366 s | 13.5% |
+| q21 | 0.8573 s | 12.3% |
+| q1 | 0.5489 s | 7.9% |
+| **q6** — the most scan-dominated query in TPC-H (filter + aggregate, no joins) | **0.0413 s** | **0.6%** |
+| q14 | 0.0745 s | 1.1% |
+
+The suite is dominated by join-heavy queries. Extrapolating the measured deltas linearly to a
+hypothetical 100% prune rate gives **≈ −2.4% at 8 GB** (−0.028 s for 17%) and **≈ −4.8% at 2 GB**
+(−0.151 s for 45%). That is the whole envelope for chunk skipping on a GPU-resident compressed pin
+at SF1000 — and Phase 2's realistic 17% → 36% would be worth roughly **−0.9%**.
+
+**Why the "34–38% of scanned bytes" headline does not translate.** On a GPU-tier compressed pin
+the payload is already device-resident and decodes at 500–1700 GB/s, so skipped bytes are cheap
+bytes. Scanned bytes are the right metric for a *fetch*-bound tier, not for this one.
+
+### 3.10 What this means for the project
+
+The mechanism works, is correct, and is nearly free — but on the configuration Sirius currently
+wins with, there is little for it to win. Its value is concentrated where scan cost is not already
+near zero:
+
+1. **Host-tier pins**, where payload H2D is on the critical path and compressed host-tier *loses*
+   7.0% today (`docs/super-sirius/compressed-pinning.md:52-56`). This is where §6's range-skipped
+   fetch has real headroom, and it is the case that matters when data does not fit on the GPU.
+2. **Spilling / larger-than-memory configurations**, for the same reason.
+3. **Scan-heavy workloads**, which TPC-H at this scale is not.
+
+None of that is visible in a benchmark where everything fits in GPU memory. Measuring the host tier
+is therefore not just the next experiment — it is the one that decides whether the project has a
+target at all.
+
 ## 4. Granularity, and whether to compress the index
 
 ### 4.1 The governing rule
@@ -1110,6 +1162,12 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
+- **2026-09-08** — **Ceiling measured (§3.9/§3.10).** A G=8 index sees through the interleaving
+  for free (groups are 1/128 of a row group, so they inherit a 0.44-day span; 36.54% of rows
+  prunable at row-group granularity) — so Phase 2 is an *alternative* to pin-time sorting, not
+  gated on it. But q6, the most scan-dominated TPC-H query, is 0.6% of the suite, and the whole
+  envelope for chunk skipping on a GPU-resident compressed pin is ≈2.4% at 8 GB. Phase 2 is worth
+  ≈0.9%. The project's real target is the host tier / spilling, not the GPU-resident config.
 - **2026-09-08** — **SF1000 validation done, and it overturns the Phase 1 projection.** Real number
   is **−0.4%** at the production 8 GB batch, not the projected ~4%. Root cause found (§3.8): the
   scan's row-group coalescer interleaves row groups across the file set, so pin chunks span most of
