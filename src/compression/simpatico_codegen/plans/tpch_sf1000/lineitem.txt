@@ -21,13 +21,8 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: l_quantity  dtype: t26  ratio: 10.383x  depth: 2
-# comp: 696.68 GB/s  decomp: 2938.41 GB/s  (GB300, sf1000 lineitem part.0)
-# Was `input -> bitpack`: 4.885x, comp 1366.78, decomp 2918.00 GB/s on the same
-# data. The mantissas are every multiple of 100 in [100, 5000] -- 50 distinct
-# values that bitpack alone spends 13 bits on -- so dividing the common factor
-# out first halves the bit width at no decode cost. Re-explore also offered a
-# depth-4 variant (two rle levels on chunk_bits) at 10.382x / decomp 2595 GB/s;
-# taken at the knee instead, since the extra depth buys -0.001x for -12% decode.
+# comp: 696.68 GB/s  decomp: 2938.41 GB/s
+# hand-picked knee: -0.001x ratio vs the depth-4 rule pick for +13% decode
 input -> factor -> quotients, divisors
 factor.quotients -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---

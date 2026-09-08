@@ -292,15 +292,8 @@ std::string format_output_names(std::vector<compressible_output> const& outs)
 
 namespace {
 
-// True when every element of `col` is the integer 1, read through the column's
-// underlying storage -- a fixed-point column's data IS its mantissa, so the
-// same comparison works for DECIMAL divisors without materialising a scale.
-// Dispatches on storage width because a `divisors` channel takes its width from
-// the rendered buffer (it can sit under a channel narrower than the column).
-//
-// Checked host-side: this translation unit is compiled by the host compiler, and
-// the channel is one element per 1024-row chunk (~780 KB for a 100M-row column),
-// so the copy is far cheaper than the encode that just produced it.
+// Compares raw storage, so a DECIMAL column's mantissa works unchanged. Host
+// side: this TU is host-compiled, and the channel is one element per chunk.
 bool all_ones(cudf::column_view const& col, rmm::cuda_stream_view stream)
 {
   auto const n = col.size();
@@ -336,15 +329,9 @@ bool all_ones(cudf::column_view const& col, rmm::cuda_stream_view stream)
   }
 }
 
-// Ask an operator's own output whether it actually did anything. Only ops that
-// can answer honestly are listed; everything else reports false and is left to
-// the byte-size rules.
-//
-// `factor` can answer exactly: its `divisors` channel is the per-chunk GCD, so
-// an all-ones channel means every chunk was divided by 1 and the transform is a
-// bit-exact identity. Detecting it here rather than by failing the operator
-// keeps `factor` safe to name in a hand-written plan -- a column whose GCD
-// happens to be 1 on one partition must still compress, not abort.
+// `factor`'s divisors are per-chunk GCDs, so all-ones means it divided by 1
+// everywhere. Reported rather than failed, so a plan naming `factor` still
+// compresses on a partition whose GCD happens to be 1.
 bool trial_is_identity(std::string const& name,
                        std::vector<compressible_output> const& outputs,
                        rmm::cuda_stream_view stream)
@@ -386,11 +373,8 @@ operator_trial try_operator(std::string const& name,
     r.error_message = name + ": requires float32 input";
     return r;
   }
-  // alp takes fixed-point too: a DECIMAL column's mantissa is already an
-  // integer, so ALP's scale search there is exact integer divisibility -- and
-  // unlike `factor`, which needs a divisor common to EVERY value in a chunk,
-  // ALP can take a power of ten that most values share and bank the rest as
-  // exceptions. alp_rd stays float-only; it splits an IEEE significand.
+  // A DECIMAL mantissa is already an integer, so alp's scale search there is
+  // exact divisibility. alp_rd stays float-only; it splits an IEEE significand.
   bool const is_decimal = cudf::is_fixed_point(col.type()) &&
                           (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64);
   if (name == "alp" && !is_float && !is_decimal) {
@@ -644,13 +628,9 @@ exploration_result explore_column_compression(cudf::column_view input,
                       << "x)\n";
           }
 
-          // Preprocessing ops are exempt from the must-shrink rule below --
-          // they earn their place at the NEXT level, not this one (`factor`
-          // measures 0.999x on its own and only pays off once bitpack sees the
-          // narrowed values). That waiver is only justified when the op
-          // transformed something: one that reports itself an identity would
-          // otherwise occupy a beam slot all the way to the depth where it is
-          // finally revealed to be worthless.
+          // The must-shrink waiver below only makes sense for an op that
+          // transformed something; an identity would ride the beam to the depth
+          // where it is finally revealed worthless.
           if (trial.no_benefit) continue;
           bool is_pre = is_preprocessing_compressor(op_name);
           if (trial.output_bytes >= pend.size_bytes && !is_pre) continue;

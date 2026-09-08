@@ -588,12 +588,6 @@ void Walker::emit_for(const ::codegen::jit::FusedTree& node, LaneInput in)
 // needs no shared slab — the quotient is a closed-form expression the
 // child splices in.
 //
-// This is the integer/decimal analogue of ALP's factor step: a DECIMAL
-// column whose values share a common divisor (e.g. TPC-H l_quantity,
-// stored as mantissas 100..5000 that are all multiples of 100) collapses
-// to a far narrower range before bitpack sees it.  The GCD generalises
-// ALP's power-of-ten factor and costs one block reduction, not a search.
-//
 // `divisors` is a kernel output buffer (num_chunks x elem_size) exposed
 // as `named_channels()["divisors"]`, exactly like FOR's `references`.
 // =====================================================================

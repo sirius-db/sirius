@@ -47,10 +47,8 @@ namespace {
 // Vector size is fixed at 1024 (matches ALP & FastLanes; aligned with G-ALP).
 constexpr int kAlpVectorSize = 1024;
 
-// Scale-selection sample: kAlpSampleRuns contiguous runs of kAlpSampleRunLen,
-// spread evenly across the vector. The total must be a whole number of warps
-// (the selection phase shuffle-reduces with a full mask) and no larger than the
-// vector.
+// Scale-selection sample: contiguous runs spread evenly across the vector. The
+// total must be a whole number of warps and no larger than the vector.
 constexpr int kAlpSampleRuns   = 8;
 constexpr int kAlpSampleRunLen = 8;
 constexpr int kAlpSampleSize   = kAlpSampleRuns * kAlpSampleRunLen;  // 64 = 2 warps
@@ -63,16 +61,9 @@ static_assert(kAlpSampleSize <= kAlpVectorSize, "sample must fit in a vector");
 // alp_traits<T> selects between them via the static accessor methods below.
 // -----------------------------------------------------------------------------
 
-// The 10^k tables below are the ONLY scaling constants either direction uses,
-// and every entry is exactly representable in its float type (10^k is exact up
-// to k=10 in f32 and k=22 in f64, both beyond the ranges searched here). Encode
-// and decode therefore scale by multiplying and DIVIDING by exact powers of
-// ten, never by a rounded reciprocal 10^-k: `enc * 0.01` and `enc / 100.0`
-// differ by an ulp on ordinary decimal data, and since the encoder's
-// round-trip check rejects any value that does not reproduce bit-exactly, that
-// ulp turns into a stored exception. On TPC-H l_extendedprice as f64 the
-// reciprocal form flagged 13.83% of rows as exceptions; the division form
-// flags 0.00%.
+// Every 10^k below is exactly representable in its float type. Never scale by a
+// rounded reciprocal instead: `enc * 0.01` and `enc / 100.0` differ by an ulp,
+// and the encoder's bit-exact round-trip check turns that ulp into an exception.
 namespace host_consts_f32 {
 // FLOAT32: e ∈ [0..10], f ∈ [0..min(e, 9)].
 constexpr float kExp[11] = {1.0f,
@@ -116,10 +107,8 @@ constexpr double kExp[19] = {1e0,
 constexpr int kCandCount = 19;
 }  // namespace host_consts_f64
 
-// Exact power-of-ten tables for the fixed-point path. A DECIMAL column's
-// storage IS an integer mantissa, so its "scale search" is pure integer
-// arithmetic: divide by 10^d and check the division was exact. No float
-// constants, no rounding, no reciprocal.
+// Fixed-point path: a DECIMAL column's storage is already an integer mantissa,
+// so its scale search is integer division with an exactness check.
 constexpr int kP10I32Count = 10;  // 10^9 is the largest that fits int32
 constexpr int kP10I64Count = 19;  // 10^18 is the largest that fits int64
 __constant__ int32_t d_alp_p10_i32[kP10I32Count];
@@ -133,16 +122,12 @@ __constant__ double d_alp_exp_f64[19];
 __constant__ double d_alp_rhi_f64[19];
 __constant__ double d_alp_rlo_f64[19];
 
-// Unevaluated-sum ("double-double") split of 10^-k: rhi = fl(10^-k) and
-// rlo = fl(10^-k - rhi), so rhi + rlo carries roughly twice the working
-// precision. Scaling by a single rounded 10^-k is what inflated the exception
-// rate (see the note above the tables); dividing by the exact 10^k fixes that
-// but an FP64 divide is punishingly slow on parts with cut FP64 throughput.
-// fma(v, rhi, v * rlo) recovers the divide's accuracy at two multiply-class
-// ops. Note this only has to be ACCURATE, never provably exact: encode's
-// round-trip check evaluates the identical expression, so any value the
-// approximation cannot reproduce simply becomes a stored exception. Accuracy
-// buys ratio, not correctness.
+// Unevaluated-sum split of 10^-k: rhi + rlo carries roughly twice the working
+// precision, so fma(v, rhi, v * rlo) matches a divide by 10^k at two
+// multiply-class ops (FP64 divide is punishing on parts with cut FP64). This
+// only has to be accurate, not exact -- encode's round-trip check evaluates the
+// identical expression, so what it cannot reproduce becomes an exception.
+// Accuracy buys ratio, not correctness.
 template <typename Wide, typename Narrow>
 void fill_reciprocal_split(Narrow* rhi, Narrow* rlo, int count)
 {
@@ -277,11 +262,8 @@ struct alp_traits<double> {
   __device__ static value_t rlo_(int i) { return d_alp_rlo_f64[i]; }
 };
 
-// Fixed-point (DECIMAL32 / DECIMAL64) specialisations. `value_t == int_t`: the
-// column's storage is already the integer ALP would produce, so encoding is a
-// division by 10^d and the round-trip check is an exact-divisibility test.
-// `value_type_id` is only the storage id -- the compress path passes the
-// column's real data_type (carrying its scale) where the type matters.
+// Fixed-point specialisations; `value_t == int_t`. `value_type_id` is only the
+// storage id -- compress passes the column's real data_type, carrying its scale.
 template <>
 struct alp_traits<int32_t> {
   using value_t                                 = int32_t;
@@ -329,10 +311,7 @@ __device__ inline int64_t atomic_max(int64_t* a, int64_t v)
 }
 
 // -----------------------------------------------------------------------------
-// Full-warp shuffle reductions. __shfl_down_sync handles 64-bit operands
-// natively, so one template covers int32_t and int64_t. Callers must have all
-// 32 lanes of the warp active (the sampling loop below sizes its participant
-// count as a whole number of warps precisely so this holds).
+// Full-warp shuffle reductions; callers must have all 32 lanes active.
 // -----------------------------------------------------------------------------
 
 template <typename V>
@@ -385,11 +364,8 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, boo
   using int_t  = typename traits::int_t;
 
   if constexpr (cuda::std::is_integral_v<T>) {
-    // Fixed-point path: the mantissa is already an integer, so "encoding at
-    // scale d" is dividing by 10^d and the round-trip is exact iff 10^d
-    // divides it. |q * p| <= |v| by construction, so the check cannot
-    // overflow. Truncation toward zero is the same on both signs, so a
-    // negative mantissa needs no special case.
+    // |q * p| <= |v| by construction, so the check cannot overflow, and
+    // truncation toward zero behaves the same on both signs.
     int_t const p = traits::p10_(d);
     int_t const q = v / p;
     is_exception  = (q * p != v);
@@ -399,13 +375,9 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, boo
       is_exception = true;
       return 0;
     }
-    // ALP as published parameterises the scale by a pair (e, f) and encodes
-    // round(v * 10^e * 10^-f), decoding as i * 10^f * 10^-e -- but only the
-    // DIFFERENCE d = e - f ever affects the result, and the published combo
-    // table constrains f <= e so d is exactly the non-negative range swept here.
-    // Collapsing to d drops the f64 candidate set from 190 pairs to 19 scales
-    // with no loss of coverage, and scaling by the single exact 10^d rounds once
-    // instead of twice.
+    // Published ALP encodes round(v * 10^e * 10^-f), but only d = e - f affects
+    // the result and its combo table constrains f <= e, so sweeping d covers the
+    // same ground in 19 scales rather than 190 pairs.
     T tmp = v * traits::exp_(d);
     // Magic-number round-to-nearest-even.
     T rounded = (tmp + traits::magic) - traits::magic;
@@ -421,8 +393,8 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, boo
   }
 }
 
-// Inverse of alp_encode_value. Kept as one function so encode's round-trip
-// check and the decode kernel can never drift apart.
+// Inverse of alp_encode_value. One function so encode's round-trip check and
+// the decode kernel cannot drift apart.
 template <typename T>
 __device__ inline T alp_decode_value(typename alp_traits<T>::int_t enc, int d)
 {
@@ -437,32 +409,12 @@ __device__ inline T alp_decode_value(typename alp_traits<T>::int_t enc, int d)
 
 // -----------------------------------------------------------------------------
 // Encode kernel: 1 block == 1 vector of 1024 values. blockDim.x == 1024.
-//
-// Two phases:
-//
-//   Selection -- the first kAlpSampleSize threads each hold one SAMPLED value
-//     and evaluate every candidate scale d on it, accumulating per-candidate
-//     (exc_count, min_enc, max_enc). Thread 0 then picks the d with the lowest
-//     cost (`vec_n * bitwidth + exc_count * exception_cost_bits`) and stores it
-//     into the metadata column.
-//
-//   Emit -- every thread re-encodes its own value with the winning d and writes
-//     (integer, exception_flag). This pass is exact and covers all 1024 values,
-//     so sampling only ever costs ratio (a slightly worse d), never correctness.
-//
-// Sampling is what makes the encoder affordable: scoring all 1024 values
-// against all candidates costs ~19k round-trip encodes per vector, each several
-// float multiplies, and on parts with cut FP64 throughput that dominates
-// everything. The published ALP algorithm samples too, for the same reason.
-//
-// The sample is kAlpSampleRuns contiguous runs spread evenly across the vector,
-// not a fixed stride: a stride can land on a period of the data (round-robin
-// sensor readings, interleaved currencies) and then observe only one phase of
-// it, picking a scale that suits a sixteenth of the rows.
-//
-// Within the selection phase the per-candidate accumulators are reduced across
-// each warp by shuffle first, so a candidate costs one shared atomic per warp
-// rather than one per participating thread.
+// Selection: the first kAlpSampleSize threads score every candidate scale d on
+// one sampled value each, warp-reducing per-candidate (exc_count, min_enc,
+// max_enc) before a single shared atomic; thread 0 picks the lowest-cost d
+// (`sample_n * bitwidth + exc_count * exception_cost_bits`) into the metadata
+// column. Emit: every thread re-encodes its own value with the winning d, so
+// sampling costs ratio (a worse d), never correctness.
 // -----------------------------------------------------------------------------
 template <typename T>
 __global__ void alp_encode_kernel(const T* __restrict__ in,
@@ -490,8 +442,7 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
   __shared__ uint16_t s_best_d;  // the winning scale exponent, stored verbatim
   __shared__ int_t s_fill;       // value written at exception slots
 
-  // Init the per-candidate accumulators. cand_count <= 1024 so the first
-  // `cand_count` threads cover the init in one pass.
+  // cand_count <= 1024, so the first cand_count threads init in one pass.
   if (tid < cand_count) {
     s_exc_count[tid] = 0u;
     s_min_enc[tid]   = traits::int_max;
@@ -499,10 +450,9 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
   }
   __syncthreads();
 
-  // Pick this thread's sample: kAlpSampleRuns contiguous runs spread evenly
-  // over the vector. Threads at or past kAlpSampleSize sit the phase out.
-  // Short vectors (the trailing partial one) collapse runs onto each other,
-  // which just resamples the same values -- harmless for a ranking.
+  // Contiguous runs, not a fixed stride: a stride can land on a period of the
+  // data and observe only one phase of it. A short trailing vector collapses
+  // runs onto each other, which merely resamples -- harmless for a ranking.
   bool const samples = (tid < kAlpSampleSize);
   T sv               = T{0};
   bool sv_valid      = false;
@@ -514,10 +464,8 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
     if (sv_valid) sv = in[vec_base + idx];
   }
 
-  // Score every candidate on the sample. Each warp reduces its own lanes by
-  // shuffle and contributes a single atomic per candidate; kAlpSampleSize is a
-  // whole number of warps so every lane in a participating warp is active and
-  // the full-mask shuffles below are well formed.
+  // kAlpSampleSize is a whole number of warps, so every lane in a participating
+  // warp is active and the full-mask shuffles below are well formed.
   if (samples) {
     int const lane = tid & 31;
     for (int c = 0; c < cand_count; ++c) {
@@ -525,8 +473,7 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
       int_t enc   = int_t{0};
       if (sv_valid) enc = alp_encode_value<T>(sv, c, is_exc);
 
-      // Non-participating lanes fold in as identities: they add 0 exceptions
-      // and contribute the neutral extremes to min/max.
+      // Non-participating lanes fold in as reduction identities.
       uint32_t const exc_bit = (sv_valid && is_exc) ? 1u : 0u;
       bool const counts      = (sv_valid && !is_exc);
       int_t const lo_in      = counts ? enc : traits::int_max;
@@ -549,10 +496,8 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
 
   // Single-thread cost-based selection. cand_count is small; full pass is fine.
   if (tid == 0) {
-    // Scored over the sample, so `sample_n` (not vec_n) is the population the
-    // exception counts are drawn from. Cost is proportional either way; what
-    // matters is that the bit-width term and the exception term are weighed
-    // against the same denominator.
+    // sample_n, not vec_n: both cost terms must share the denominator the
+    // exception counts were drawn from.
     uint32_t const sample_n = static_cast<uint32_t>(min(vec_n, kAlpSampleSize));
     uint64_t best_cost      = UINT64_MAX;
     int best                = 0;
@@ -580,24 +525,18 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
     }
     s_best_d          = static_cast<uint16_t>(best);
     out_metadata[vec] = s_best_d;
-    // Fill value for exception slots: the winning candidate's minimum encoded
-    // value, which is exactly the frame of reference a downstream bitpack will
-    // subtract. Writing 0 instead (the old behaviour) drags the chunk's range
-    // down to zero whenever the real values cluster away from it, so a single
-    // exception could cost ~30 bits per row on an otherwise narrow chunk --
-    // and it made the emitted buffer disagree with the bit-width this very
-    // cost model just scored. Being a sample minimum it may sit above the true
-    // vector minimum, but never below it, so it always lands inside the range
-    // bitpack will cover. s_min_enc keeps its int_max sentinel when every
-    // sampled value is an exception; 0 is as good as anything there.
+    // Exception slots take the winning candidate's minimum encoded value -- the
+    // frame of reference a downstream bitpack subtracts. Writing 0 instead would
+    // stretch the chunk's range whenever the real values cluster away from it.
+    // A sample minimum can sit above the true one but never below, so it always
+    // lands inside bitpack's range. int_max sentinel survives when every sampled
+    // value is an exception; 0 is as good as anything there.
     s_fill = (s_exc_count[best] < sample_n) ? s_min_enc[best] : int_t{0};
   }
   __syncthreads();
 
-  // Re-encode with the chosen scale. Exception positions get the fill value
-  // (the vector's minimum encoded value) so downstream bit-packing on the
-  // chunk stays tight; the real payload lives in the `exceptions` channel and
-  // is scattered back over these slots on decode.
+  // Exception slots carry the fill value; their real payload lives in the
+  // `exceptions` channel and is scattered back over them on decode.
   if (valid) {
     bool is_exc;
     int_t enc                    = alp_encode_value<T>(v, static_cast<int>(s_best_d), is_exc);
@@ -789,8 +728,7 @@ std::unique_ptr<compressed_representation> alp_compressor::compress(
   switch (dt.id()) {
     case cudf::type_id::FLOAT32: return alp_compress_impl<float>(column_to_compress, stream, mr);
     case cudf::type_id::FLOAT64: return alp_compress_impl<double>(column_to_compress, stream, mr);
-    // DECIMAL128's mantissa is __int128; there is no power-of-ten table or
-    // atomic support for it here, so it stays out.
+    // DECIMAL128 stays out: its mantissa is __int128, with no table or atomics.
     case cudf::type_id::DECIMAL32:
       return alp_compress_impl<int32_t>(column_to_compress, stream, mr);
     case cudf::type_id::DECIMAL64:

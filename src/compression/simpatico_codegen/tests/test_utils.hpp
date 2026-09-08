@@ -45,10 +45,8 @@ inline std::unique_ptr<cudf::table> make_int32_table(int num_cols, int num_rows,
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
-// Values that all share the common factor `scale`, spanning both signs and
-// hitting zero — the shape the `factor` operator exists to exploit (a decimal
-// column whose mantissas are all multiples of a power of ten). gcd(0, x) == x,
-// so the embedded zeros also exercise the reduction's identity element.
+// Values sharing the common factor `scale`, spanning both signs and hitting
+// zero — gcd(0, x) == x, so the zeros exercise the reduction's identity.
 inline std::unique_ptr<cudf::table> make_scaled_int64_table(int num_cols,
                                                             int num_rows,
                                                             int seed,
@@ -185,12 +183,9 @@ inline std::unique_ptr<cudf::table> make_f64_table(int num_cols, int num_rows, i
 // Single-column chrono table (DATE32 days / int64 timestamps / durations),
 // bit-identical to its integer storage. A mild upward drift with small jitter
 // makes delta/bitpack meaningful, like real event times.
-// DECIMAL64 mantissas at scale -2 (money), all multiples of `mantissa_factor`
-// so a power-of-ten scale is actually available to find, plus a `1 / exc_every`
-// fraction of values that are NOT multiples -- those are the rows ALP has to
-// bank as exceptions, and the case that distinguishes it from `factor`, whose
-// GCD would collapse to 1 the moment one such value appears. exc_every <= 0
-// disables them.
+// DECIMAL64 mantissas at scale -2, all multiples of `mantissa_factor`, plus a
+// 1/exc_every fraction that are not -- the rows ALP banks as exceptions.
+// exc_every <= 0 disables them.
 inline std::unique_ptr<cudf::table> make_decimal64_table(
   int num_cols, int num_rows, int seed, std::int64_t mantissa_factor, int exc_every)
 {

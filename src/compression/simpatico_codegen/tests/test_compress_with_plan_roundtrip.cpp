@@ -373,12 +373,9 @@ int main()
     }
 
     {
-      // ALP on DECIMAL64 — the fixed-point path, where the mantissa is already
-      // an integer and the scale search is exact integer divisibility rather
-      // than float round-tripping. Three shapes: a clean common power of ten,
-      // one with a fraction of values that do NOT divide (so the exception
-      // machinery runs on the decimal path), and one with no power of ten
-      // available at all (scale collapses to 10^0, an exact identity).
+      // ALP on DECIMAL64 — the fixed-point path. Three shapes: a clean common
+      // power of ten, a fraction of values that do not divide (exceptions on
+      // the decimal path), and none available at all (scale 10^0, an identity).
       auto clean = make_decimal64_table(2, 4096, 21, 100, 0);
       std::string dsl =
         "input -> alp\n"
@@ -522,8 +519,7 @@ int main()
     {
       // FACTOR at the region root with no fused child: `quotients` drains to a
       // synthesized Raw passthrough (fixed stride) and `divisors` is the
-      // boundary channel on the op's own rep.  Values are all multiples of 100
-      // so the per-chunk GCD is a real divisor, not the 1 no-op.
+      // boundary channel on the op's own rep.
       auto t = make_scaled_int64_table(2, 2048, 11, 100);
       std::string dsl =
         "input -> factor -> quotients, divisors\n"
@@ -534,9 +530,7 @@ int main()
     }
 
     {
-      // FACTOR -> Bitpack (FUSED): the shape that makes the operator worth
-      // having — dividing out the common factor narrows the range bitpack has
-      // to cover.  int64 (decimal storage width) and int32.
+      // FACTOR -> Bitpack (FUSED): int64 (decimal storage width) and int32.
       auto t64 = make_scaled_int64_table(2, 4096, 13, 1000);
       std::string dsl64 =
         "input -> factor -> quotients, divisors\n"

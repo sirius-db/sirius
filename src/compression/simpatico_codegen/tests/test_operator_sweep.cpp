@@ -182,10 +182,8 @@ std::unique_ptr<cudf::table> make_uint16_table(int num_rows, int seed)
 // lockstep with build_fixtures() below — the orchestrator sizes/labels work by
 // index into this list, so a shorter list silently drops the trailing fixtures
 // from the sweep.
-// MUST stay in the same order as build_fixtures(): build_work() indexes into
-// the fixture vector by position in this array, so a name added to one and not
-// the other silently attributes every later fixture's chains to the wrong
-// column.
+// MUST stay in the same order as build_fixtures(); build_work() indexes the
+// fixture vector by position in this array.
 constexpr std::array<char const*, 12> kFixtureNames = {"i16",
                                                        "i32",
                                                        "i64",
@@ -219,8 +217,7 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
   add_numeric("i16", make_int16_table(n, 9));
   add_numeric("i32", make_int32_table(1, n, 1));
   add_numeric("i64", make_int64_table(1, n, 2));
-  // Values sharing a common factor -- the shape `factor` exists to exploit, and
-  // the only fixture on which it is not an identity.
+  // The only fixture on which `factor` is not an identity.
   add_numeric("i64_scaled", make_scaled_int64_table(1, n, 12, 100));
   add_numeric("u16", make_uint16_table(n, 10));
   add_numeric("u32", make_uint32_table(1, n, 7));
@@ -476,9 +473,8 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
   auto fixtures = build_fixtures(stream, n);
   auto work     = build_work();
 
-  // build_work() addresses fixtures positionally; if the two lists ever drift,
-  // every chain after the insertion point runs against the wrong column and
-  // still "passes". Check the correspondence instead of trusting the comment.
+  // Drift here runs every later fixture's chains against the wrong column and
+  // still reports "passed", so check rather than trust the comment above.
   if (fixtures.size() != kFixtureNames.size()) {
     throw std::runtime_error("fixture count " + std::to_string(fixtures.size()) +
                              " != kFixtureNames size " + std::to_string(kFixtureNames.size()));
@@ -521,18 +517,11 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
     must_apply("i64_scaled", {"factor", "delta", "bitpack"});
 
-    // `factor` self-reports whether it did anything, via the no_benefit flag on
-    // the trial. The explorer relies on this to stop carrying an identity
-    // `factor` through the beam: on its own the op measures ~0.999x on ANY
-    // input (the quotients keep the source width and `divisors` adds bytes), so
-    // byte size alone cannot tell a useful application from a useless one, and
-    // preprocessing ops are deliberately exempt from the must-shrink rule.
-    //
-    // Both directions matter. A false positive silently drops the one operator
-    // that can exploit a factorable column; a false negative puts the waiver
-    // back where it was. Note this is NOT an applicability failure -- the op
-    // succeeds either way, so that an explicit plan naming `factor` still
-    // compresses correctly on a column whose GCD happens to be 1.
+    // `factor` measures ~0.999x on any input, so only its own no_benefit flag
+    // separates a useful application from an identity. Both directions matter:
+    // a false positive drops the operator on the columns it exists for, a false
+    // negative restores the wasted beam slots. Not an applicability failure --
+    // the op succeeds either way.
     auto no_benefit_is = [&](char const* fixture_name, bool expected) {
       for (auto const& f : fixtures) {
         if (f.name != fixture_name) continue;

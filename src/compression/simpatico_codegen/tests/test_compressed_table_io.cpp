@@ -280,12 +280,9 @@ void test_alp_f32()
   io_roundtrip("alp_f32", t->view(), "input -> alp\n");
 }
 
-// ALP on DECIMAL64: the only operator that stores a leaf buffer with a
-// FIXED-POINT type (its `exceptions` channel carries the source column's own
-// type). Every other decimal plan reaches the file as integer buffers via the
-// codegen path, so this is the one case that exercises reconstructing a
-// non-numeric leaf buffer on read. Covered with and without exceptions, since
-// a zero-exception column stores that channel empty.
+// ALP on DECIMAL64: the only operator storing a leaf buffer with a fixed-point
+// type, so the one case that exercises reconstructing a non-numeric leaf on
+// read. With and without exceptions -- a zero-exception column stores it empty.
 void test_alp_decimal64()
 {
   auto clean = make_decimal64_table(1, 4096, 17, 100, 0);

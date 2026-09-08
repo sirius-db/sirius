@@ -256,13 +256,9 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    // make_fixed_width_column, not make_numeric_column: cudf classes fixed-point
-    // and chrono types as non-numeric, and a leaf buffer can legitimately carry
-    // either -- ALP's `exceptions` channel on a DECIMAL column is stored with
-    // the column's own fixed-point type. (tag_to_dtype yields scale 0 here; the
-    // real scale rides on the column record and apply_stored_dtype restores it
-    // at the end of decompress. Nothing in between reads the scale -- the buffer
-    // is the mantissa either way.)
+    // Not make_numeric_column: cudf classes fixed-point and chrono as
+    // non-numeric, and a leaf buffer can carry either (alp's `exceptions` on a
+    // DECIMAL column). Scale is 0 here; apply_stored_dtype restores the real one.
     auto col = cudf::make_fixed_width_column(dt,
                                              static_cast<cudf::size_type>(bd.num_rows),
                                              cudf::mask_state::UNALLOCATED,

@@ -245,9 +245,8 @@ std::unique_ptr<compressed_representation> alp_compressed_representation::from_o
 
   // Type validation. The (integers, exceptions) pair must match a supported
   // (int_t, value_t) combination from alp_traits: INT32 pairs with FLOAT32 or
-  // DECIMAL32, INT64 with FLOAT64 or DECIMAL64. (The fixed-point pairs are the
-  // decimal path, where the encoded integer is the mantissa divided by a power
-  // of ten.) The other two outputs are precision-independent.
+  // DECIMAL32, INT64 with FLOAT64 or DECIMAL64. The other two outputs are
+  // precision-independent.
   auto const int_id = integers->type().id();
   auto const exc_id = exceptions->type().id();
   bool const is_32  = int_id == cudf::type_id::INT32 &&
@@ -276,9 +275,8 @@ std::unique_ptr<compressed_representation> alp_compressed_representation::from_o
 
   cudf::size_type num_rows    = integers->size();
   cudf::size_type num_vectors = metadata->size();
-  // The exceptions column's type IS the original column type by construction
-  // (compress builds it from the source column's data_type), which is also how
-  // a fixed-point column's scale survives the round trip.
+  // The exceptions column's type IS the original column type by construction,
+  // which is also how a fixed-point column's scale survives the round trip.
   cudf::data_type original_type = exceptions->type();
 
   return std::make_unique<alp_compressed_representation>(original_type,
