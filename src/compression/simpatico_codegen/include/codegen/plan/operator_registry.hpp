@@ -56,9 +56,13 @@ enum class ChannelLayout : std::uint8_t {
   /// One entry per 1024-row chunk, in chunk order. A subset is formed by keeping the surviving
   /// entries: fixed stride, so the byte range of any chunk is arithmetic.
   per_chunk_metadata,
-  /// Variable-width bytes whose per-chunk extent is not derivable from the channel itself. A
-  /// subset needs an out-of-band group-to-byte table.
-  bulk_chunked,
+  /// Fixed bytes per ROW, so chunk c starts at (rows before c) * element size. Derivable from
+  /// the row count alone — no operator-specific knowledge, no metadata read.
+  bulk_fixed_stride,
+  /// Variable bytes per chunk, derivable only from that operator's own per-chunk metadata
+  /// (bitpack's packed, sized by chunk_count x chunk_bits) or from an out-of-band
+  /// group-to-byte table. The ONLY layout that needs operator-specific arithmetic.
+  bulk_variable,
   /// No per-chunk structure at all — column-wide state (a dictionary's keys), or a codec's opaque
   /// output with its own internal chunking. Always fetched whole; a column whose bulk channel is
   /// opaque cannot be partially fetched.
