@@ -49,6 +49,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -72,6 +73,24 @@
 #include <vector>
 
 namespace sirius {
+
+/**
+ * @brief Apply a boolean retention mask across supported cuDF releases.
+ *
+ * cuDF 26.10 renamed apply_boolean_mask() to apply_retention_mask(). Keep the
+ * compatibility decision here so call sites use the non-deprecated name.
+ */
+inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
+                                                       cudf::column_view const& retention_mask,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+#if CUDF_VERSION_NUM >= 2610
+  return cudf::apply_retention_mask(input, retention_mask, stream, mr);
+#else
+  return cudf::apply_boolean_mask(input, retention_mask, stream, mr);
+#endif
+}
 
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
 {
