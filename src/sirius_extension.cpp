@@ -1389,6 +1389,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
   auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
+  // 0 disables the finer capture, leaving whole-chunk pruning as before.
+  std::size_t const zone_map_group_rows =
+    capture_chunk_stats ? pin_op_params.pinned_zone_map_group_rows : 0;
   // Read from the connection running the CALL, so a table pins with the carriers that
   // connection asked for rather than whatever another connection set last.
   bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
@@ -1545,6 +1548,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       pinned_column_types,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
+                                       .group_rows                        = zone_map_group_rows,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
@@ -1560,6 +1564,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       *representative_host_space,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
+                                      std::move(host_result.group_stats),
                                       std::move(host_result.column_storage));
     // The host path always REPLACES, so every pinned column holds this
     // materialization's values.
@@ -1577,6 +1582,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       pinned_column_types,
       pin_comp,
       {.capture_chunk_stats               = capture_chunk_stats,
+       .group_rows                        = zone_map_group_rows,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
@@ -1588,6 +1594,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         *gpu_spaces_mut[0],
                                         pinned_column_types,
                                         std::move(dev_result.chunk_stats),
+                                        std::move(dev_result.group_stats),
                                         std::move(dev_result.column_storage));
     // The compressed device path always REPLACES, as above.
     attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
