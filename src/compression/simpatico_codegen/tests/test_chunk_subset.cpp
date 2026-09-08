@@ -145,6 +145,59 @@ void test_bitpack_packed_subset()
   }
 }
 
+// The dispatching entry point. Its job is to keep operator-specific arithmetic out of callers:
+// only bulk_variable needs to know what operator it is looking at, and everything else is derived
+// from the row count and element size alone.
+void test_dispatch()
+{
+  using simpatico::OpId;
+  std::vector<std::uint32_t> const survivors{0, 2};
+
+  // per_chunk_metadata: fixed stride, one entry per chunk.
+  auto const meta =
+    simpatico::plan_buffer_subset(OpId::Bitpack, "chunk_bits", 1, 3 * 1024, 1024, survivors);
+  expect(meta.has_value() && meta->compacted_size == 2,
+         "chunk_bits subsets generically as one byte per surviving chunk");
+
+  // bulk_fixed_stride: derived from rows alone, no operator knowledge and no metadata read.
+  auto const zz =
+    simpatico::plan_buffer_subset(OpId::Zigzag, "zigzag", 4, 3 * 1024, 1024, survivors);
+  expect(zz.has_value() && zz->ranges.size() == 2, "zigzag subsets without operator-specific math");
+  expect(zz->ranges[0] == byte_range{0, 4096} && zz->ranges[1] == byte_range{8192, 4096},
+         "fixed-stride ranges are rows * element size at the chunk's row offset");
+
+  // The short final chunk must not read past the column.
+  auto const tail = simpatico::plan_buffer_subset(
+    OpId::Identity, "data", 4, 2 * 1024 + 100, 1024, std::vector<std::uint32_t>{2});
+  expect(tail.has_value() && tail->ranges.size() == 1 && tail->ranges[0] == byte_range{8192, 400},
+         "the last chunk is short and is clamped to the column");
+
+  // bulk_variable without its sizing metadata must refuse rather than guess.
+  auto const no_sizing =
+    simpatico::plan_buffer_subset(OpId::Bitpack, "packed", 4, 3 * 1024, 1024, survivors);
+  expect(!no_sizing.has_value(), "packed without sizing metadata refuses");
+
+  std::vector<std::int32_t> const counts{1024, 1024, 1024};
+  std::vector<std::uint8_t> const bits{4, 8, 2};
+  auto const with_sizing = simpatico::plan_buffer_subset(
+    OpId::Bitpack, "packed", 4, 3 * 1024, 1024, survivors, {counts, bits});
+  expect(with_sizing.has_value(), "packed with sizing metadata subsets");
+  expect(
+    with_sizing->ranges == simpatico::plan_bitpack_packed_subset(counts, bits, survivors).ranges,
+    "dispatch matches the direct bitpack derivation");
+
+  // whole_column and unclassified operators refuse, so the caller fetches them whole.
+  expect(
+    !simpatico::plan_buffer_subset(OpId::Snappy, "output", 1, 3072, 1024, survivors).has_value(),
+    "a whole-column buffer refuses");
+  expect(!simpatico::plan_buffer_subset(OpId::Dictionary, "indices", 4, 3072, 1024, survivors)
+            .has_value(),
+         "an unclassified operator refuses");
+  expect(
+    !simpatico::plan_buffer_subset(OpId::Bitpack, "bogus", 4, 3072, 1024, survivors).has_value(),
+    "an unknown buffer refuses");
+}
+
 }  // namespace
 
 int main()
@@ -152,6 +205,7 @@ int main()
   test_coalescing();
   test_metadata_subset();
   test_bitpack_packed_subset();
+  test_dispatch();
   if (g_failures != 0) {
     std::fprintf(stderr, "test_chunk_subset: %d failure(s)\n", g_failures);
     return 1;

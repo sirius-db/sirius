@@ -36,6 +36,58 @@ buffer_subset plan_metadata_subset(std::size_t elem_size,
   return out;
 }
 
+buffer_subset plan_fixed_stride_subset(std::size_t elem_size,
+                                       std::uint64_t total_rows,
+                                       std::uint64_t rows_per_chunk,
+                                       std::span<std::uint32_t const> surviving_chunks,
+                                       std::uint64_t max_gap_bytes)
+{
+  buffer_subset out;
+  if (elem_size == 0 || rows_per_chunk == 0) { return out; }
+  auto const n_chunks = (total_rows + rows_per_chunk - 1) / rows_per_chunk;
+  for (auto const chunk : surviving_chunks) {
+    if (chunk >= n_chunks) { continue; }
+    auto const first = static_cast<std::uint64_t>(chunk) * rows_per_chunk;
+    // The last chunk of a column is short.
+    auto const rows = std::min(rows_per_chunk, total_rows - first);
+    append_coalesced(out.ranges, {first * elem_size, rows * elem_size}, max_gap_bytes);
+    out.compacted_size += rows * elem_size;
+  }
+  return out;
+}
+
+std::optional<buffer_subset> plan_buffer_subset(OpId kind,
+                                                std::string_view buffer,
+                                                std::size_t elem_size,
+                                                std::uint64_t total_rows,
+                                                std::uint64_t rows_per_chunk,
+                                                std::span<std::uint32_t const> surviving_chunks,
+                                                chunk_sizing_metadata const& sizing,
+                                                std::uint64_t max_gap_bytes)
+{
+  auto const layout = buffer_layout(kind, buffer);
+  if (!layout) { return std::nullopt; }  // unclassified operator or unknown buffer: fetch whole
+  auto const n_chunks =
+    rows_per_chunk == 0 ? 0 : (total_rows + rows_per_chunk - 1) / rows_per_chunk;
+  switch (*layout) {
+    case ChannelLayout::per_chunk_metadata:
+      return plan_metadata_subset(elem_size, n_chunks, surviving_chunks, max_gap_bytes);
+    case ChannelLayout::bulk_fixed_stride:
+      return plan_fixed_stride_subset(
+        elem_size, total_rows, rows_per_chunk, surviving_chunks, max_gap_bytes);
+    case ChannelLayout::bulk_variable:
+      // The one case needing operator-specific arithmetic. Without its sizing metadata there is
+      // no way to know where a chunk's bytes are, so refuse rather than guess.
+      if (kind == OpId::Bitpack && !sizing.chunk_count.empty()) {
+        return plan_bitpack_packed_subset(
+          sizing.chunk_count, sizing.chunk_bits, surviving_chunks, max_gap_bytes);
+      }
+      return std::nullopt;
+    case ChannelLayout::whole_column: return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 buffer_subset plan_bitpack_packed_subset(std::span<std::int32_t const> chunk_count,
                                          std::span<std::uint8_t const> chunk_bits,
                                          std::span<std::uint32_t const> surviving_chunks,

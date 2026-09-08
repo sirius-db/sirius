@@ -43,9 +43,9 @@ std::vector<OperatorInfo> const& operator_registry()
   static const std::vector<OperatorInfo> kTable = {
     {OpId::Delta,          "delta",           {"differences"},                                                        true,  false, true,  true, {{"delta_first", ChannelLayout::per_chunk_metadata}}},
     {OpId::Rle,            "rle",             {"runs", "values"},                                                     true,  false, true,  true, {{"rle_runs_offsets", ChannelLayout::whole_column}}},
-    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true, {{"chunk_min", ChannelLayout::per_chunk_metadata}, {"chunk_count", ChannelLayout::per_chunk_metadata}, {"chunk_bits", ChannelLayout::per_chunk_metadata}, {"packed", ChannelLayout::bulk_chunked}}},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true, {{"chunk_min", ChannelLayout::per_chunk_metadata}, {"chunk_count", ChannelLayout::per_chunk_metadata}, {"chunk_bits", ChannelLayout::per_chunk_metadata}, {"packed", ChannelLayout::bulk_variable}}},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true, {{"references", ChannelLayout::per_chunk_metadata}}},
-    {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true, {{"zigzag", ChannelLayout::bulk_chunked}}},
+    {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true, {{"zigzag", ChannelLayout::bulk_fixed_stride}}},
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false, {}},
     {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          true,  false, true,  false, {}},
     {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, true, false, true, false, {}},
@@ -55,12 +55,12 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Deflate,        "deflate",         {"output"},                                                             true,  true,  false, false, {{"output", ChannelLayout::whole_column}}},
     {OpId::Lz4,            "lz4",             {"output"},                                                             true,  true,  false, false, {{"output", ChannelLayout::whole_column}}},
     {OpId::Bitextract,     "bitextract",      {},                                                                     true,  false, true,  false, {}},
-    {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false, {{"data", ChannelLayout::bulk_chunked}}},
+    {OpId::Identity,       "identity",        {"data"},                                                               false, false, false, false, {{"data", ChannelLayout::bulk_fixed_stride}}},
     {OpId::NvcompCascaded, "nvcomp_cascaded", {"output"},                                                             false, false, false, false, {{"output", ChannelLayout::whole_column}}},
 
     // 2 or 3 channels: offsets, chars[, null_mask]. null_mask is optional (present only when
     // nullable); the generic named_channels() skips nullptr slots so arity is correct at runtime.
-    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false, {{"offsets", ChannelLayout::bulk_chunked}, {"chars", ChannelLayout::whole_column}, {"null_mask", ChannelLayout::bulk_chunked}}},
+    {OpId::StrSplit,       "str_split",       {"offsets", "chars", "null_mask"},                                     true,  false, true,  false, {{"offsets", ChannelLayout::bulk_fixed_stride}, {"chars", ChannelLayout::whole_column}, {"null_mask", ChannelLayout::bulk_fixed_stride}}},
 
   };
   // clang-format on

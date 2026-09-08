@@ -226,8 +226,14 @@ void test_channel_layout()
          "bitpack.chunk_min is per-chunk metadata");
   expect(buffer_layout(OpId::Bitpack, "chunk_bits") == ChannelLayout::per_chunk_metadata,
          "bitpack.chunk_bits is per-chunk metadata");
-  expect(buffer_layout(OpId::Bitpack, "packed") == ChannelLayout::bulk_chunked,
-         "bitpack.packed is bulk");
+  // packed is the ONLY buffer whose per-chunk extent needs operator-specific arithmetic; every
+  // other subsettable buffer is derivable from the row count alone.
+  expect(buffer_layout(OpId::Bitpack, "packed") == ChannelLayout::bulk_variable,
+         "bitpack.packed is the variable-extent case");
+  expect(buffer_layout(OpId::Zigzag, "zigzag") == ChannelLayout::bulk_fixed_stride,
+         "zigzag is fixed stride per row");
+  expect(buffer_layout(OpId::Identity, "data") == ChannelLayout::bulk_fixed_stride,
+         "identity is fixed stride per row");
   expect(supports_chunk_subset(OpId::Bitpack), "bitpack supports chunk subsets");
 
   // Keyed on PERSISTED buffers, not output ports: delta's port is "differences" (the edge to its

@@ -15,9 +15,13 @@
 
 #pragma once
 
+#include "codegen/plan/operator_registry.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace simpatico {
@@ -65,6 +69,44 @@ void append_coalesced(std::vector<byte_range>& out, byte_range r, std::uint64_t 
                                                  std::size_t n_chunks,
                                                  std::span<std::uint32_t const> surviving_chunks,
                                                  std::uint64_t max_gap_bytes = 0);
+
+/// Bytes to move for a `bulk_fixed_stride` buffer: chunk c starts at (rows before c) * @p
+/// elem_size and runs for its own row count, so nothing operator-specific is needed. The final
+/// chunk of a column is short.
+[[nodiscard]] buffer_subset plan_fixed_stride_subset(
+  std::size_t elem_size,
+  std::uint64_t total_rows,
+  std::uint64_t rows_per_chunk,
+  std::span<std::uint32_t const> surviving_chunks,
+  std::uint64_t max_gap_bytes = 0);
+
+/// The per-chunk metadata a `bulk_variable` buffer needs to size its chunks. Only bitpack has one
+/// today; the fields are named for it because there is nothing to generalise over yet.
+struct chunk_sizing_metadata {
+  std::span<std::int32_t const> chunk_count;
+  std::span<std::uint8_t const> chunk_bits;
+};
+
+/// Bytes to move for @p buffer of a leaf of type @p kind, dispatching on the buffer's registered
+/// layout (simpatico::buffer_layout).
+///
+/// This is the entry point a caller should use: it keeps operator-specific arithmetic out of the
+/// caller, so nothing above this line names an operator. `per_chunk_metadata` and
+/// `bulk_fixed_stride` are handled generically; `bulk_variable` is the only case that consults
+/// @p sizing, and the only case an operator has to be taught about.
+///
+/// Returns nullopt when the buffer cannot be subsetted -- an unclassified operator, a
+/// `whole_column` buffer, or a `bulk_variable` buffer whose sizing metadata was not supplied. The
+/// caller must then fetch that buffer whole, which is always correct.
+[[nodiscard]] std::optional<buffer_subset> plan_buffer_subset(
+  OpId kind,
+  std::string_view buffer,
+  std::size_t elem_size,
+  std::uint64_t total_rows,
+  std::uint64_t rows_per_chunk,
+  std::span<std::uint32_t const> surviving_chunks,
+  chunk_sizing_metadata const& sizing = {},
+  std::uint64_t max_gap_bytes         = 0);
 
 /// Bytes to move for a bitpack `packed` buffer.
 ///
