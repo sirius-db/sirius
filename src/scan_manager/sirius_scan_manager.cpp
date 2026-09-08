@@ -163,6 +163,9 @@ struct cached_databatch_provider : public databatch_provider {
       _column_indices.push_back(idx);
     });
     prepare_origin_annotation();
+    // Serving a mid-chunk slice is only sound once nothing downstream assumes batch == chunk.
+    // prepare_origin_annotation() sets _origin_columns exactly when late-mat has that assumption.
+    _serve_row_ranges = !_plan.survivor_row_ranges.empty() && _origin_columns == nullptr;
   }
 
   /// Precompute what every served batch's origin annotation shares: the column
@@ -210,6 +213,15 @@ struct cached_databatch_provider : public databatch_provider {
       _chunk_row_start[c + 1] = _chunk_row_start[c] + pinned_chunk_rows(_entry, c);
     }
     _origin_columns = std::move(columns);
+    // Late-mat addresses a deferred row by its position in pinned-table order and decomposes it
+    // as local = gid - range.start, chunk = local / 1024 (column_origin.hpp). A batch that is a
+    // mid-chunk slice would shift that decomposition by the slice's offset, and the failure mode
+    // is a silent off-by-a-chunk rather than an error. Serving whole chunks is always correct, so
+    // a stamped scan gives up sub-chunk pruning rather than risk it.
+    //
+    // In practice this costs nothing where the pruning pays: the late-mat install gate needs
+    // pinned_column_null_count, which refuses any entry holding a compressed chunk, so a
+    // compressed pin is never stamped.
     if (sirius::codegen::decompression_pushdown_diag_enabled()) {
       std::fprintf(stderr,
                    "sirius: late-mat origin stamped: chunks=%zu rows=%lld columns=%zu\n",
@@ -238,8 +250,10 @@ struct cached_databatch_provider : public databatch_provider {
     // index; positions past the survivors yield the insert-delta splits.
     // The cursor hands out unique positions, so each split is moved out once.
     auto const cursor = _index.fetch_add(1);
-    if (cursor >= _plan.survivor_chunk_indices.size()) {
-      auto const delta_idx = cursor - _plan.survivor_chunk_indices.size();
+    auto const served_count =
+      _serve_row_ranges ? _plan.survivor_row_ranges.size() : _plan.survivor_chunk_indices.size();
+    if (cursor >= served_count) {
+      auto const delta_idx = cursor - served_count;
       if (delta_idx >= _delta_splits.size()) { return {}; }
       auto& delta = _delta_splits[delta_idx];
       databatch_provider::batch out;
@@ -248,10 +262,22 @@ struct cached_databatch_provider : public databatch_provider {
       out.preferred_device = delta.preferred_device;
       return out;
     }
-    auto const index = _plan.survivor_chunk_indices[cursor];
+    // A served position is either a whole chunk or one of its surviving row ranges.
+    std::optional<chunk_row_range> range;
+    std::size_t index = 0;
+    if (_serve_row_ranges) {
+      range = _plan.survivor_row_ranges[cursor];
+      index = range->chunk;
+    } else {
+      index = _plan.survivor_chunk_indices[cursor];
+    }
+    // An MVCC keep-mask is positional against the whole chunk, so a slice would misalign it.
+    // Fall back to the whole chunk for that chunk only; the GPU filter still removes its rows.
+    if (range && index < _mvcc_masks.size() && chunk_has_mvcc_mask(index)) { range.reset(); }
+
     std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      data = get_device_databatch(index);
+      data = get_device_databatch(index, range);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
       data = get_host_databatch(index);
     }
@@ -271,6 +297,8 @@ struct cached_databatch_provider : public databatch_provider {
   std::shared_ptr<std::vector<late_mat::column_origin> const> _origin_columns;
   /// Exclusive scan of per-chunk rows over ALL the entry's chunks.
   std::vector<std::int64_t> _chunk_row_start;
+  /// True when this scan may serve a chunk's surviving row ranges instead of the whole chunk.
+  bool _serve_row_ranges{false};
 
   std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
   {
@@ -290,7 +318,8 @@ struct cached_databatch_provider : public databatch_provider {
       telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
   }
 
-  std::shared_ptr<cucascade::data_batch> get_device_databatch(std::size_t index)
+  std::shared_ptr<cucascade::data_batch> get_device_databatch(
+    std::size_t index, std::optional<chunk_row_range> const& range = std::nullopt)
   {
     // GPU-tier compression-enabled pin: one device_pin_chunk per batch, in
     // emission order. Dispatch per chunk on the populated form — a single pin may
@@ -373,13 +402,28 @@ struct cached_databatch_provider : public databatch_provider {
       }
       // Uncompressed chunk: project the requested columns (positions into the
       // pinned column set) and serve directly as a gpu_table_representation.
+      //
+      // With a row range, the VIEWS are narrowed to it while OWNERSHIP stays the whole column —
+      // cudf slicing is a view operation, so this skips rows with no copy and no reallocation.
       std::vector<std::shared_ptr<cudf::column>> columns;
       std::vector<cudf::column_view> column_views;
       std::size_t alloc_size = 0;
       for (auto const& col_idx : _column_indices) {
         if (col_idx >= chunk.columns.size() || !chunk.columns[col_idx]) { return nullptr; }
         columns.push_back(chunk.columns[col_idx]);
-        column_views.emplace_back(columns.back()->view());
+        auto full = columns.back()->view();
+        if (range) {
+          // The last group of a chunk is short, so a range's end may exceed the column; clamp
+          // rather than trusting the plan's arithmetic against this chunk's real row count.
+          auto const rows  = static_cast<std::size_t>(full.size());
+          auto const begin = std::min(range->begin_row, rows);
+          auto const end   = std::min(range->end_row, rows);
+          if (begin >= end) { return nullptr; }
+          full = cudf::slice(
+                   full, {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end)})
+                   .front();
+        }
+        column_views.emplace_back(full);
         alloc_size += columns.back()->alloc_size();
       }
       cudf::table_view view(column_views);
