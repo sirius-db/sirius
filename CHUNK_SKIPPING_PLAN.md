@@ -380,6 +380,62 @@ pixi run python synth.py
 
 ---
 
+### 3.8 SF1000 validation — and the row-order finding that dominates everything (2026-09-08)
+
+Built `/datasets/tpch_sf1000_sorted` (global sort, verified: row counts and checksums match the
+source, lineitem row-group spans 2525 → **0.44 days**, files monotone) and ran the same on/off
+sweep with the tuned `bench/sf1000-repro` config.
+
+| batch | chunks pruned | suite ON | suite OFF | ON − OFF |
+|---|---|---|---|---|
+| 8 GB (production) | 17% | 6.9625 s | 6.9903 s | **−0.4%** |
+| 2 GB | 45% | 7.2858 s | 7.4372 s | −2.0% |
+
+**The ~4% projected in §7 Phase 1 did not materialise: the real number is −0.4%.** As at SF100,
+2 GB is worse in absolute terms (7.29 s vs 6.96 s), so 8 GB-ON remains the best configuration and
+W2's benefit there is at or below the noise floor.
+
+### Why: pin chunks are not clustered, even when the file is
+
+The prune *rate* is the tell. At SF100@512 MB q14 pruned 28/30 chunks; at SF1000@8 GB it prunes
+3/19. q14 is a **one-month** predicate over seven years, so a clustered layout should prune ~98%.
+
+A direct probe settles it. On the globally sorted SF1000 lineitem, a **single-day** predicate
+(`l_shipdate = DATE '1995-06-15'`) prunes only **13/37 chunks** — 24 of 37 pin chunks contain one
+particular day. The pin chunks span most of the seven-year range regardless of how the file is
+sorted.
+
+Two hypotheses tested and eliminated first: scan thread count (18 vs 3: identical, 41/75) and
+lexicographic file ordering, where glob order `part.0, part.1, part.10, …` makes consecutive files
+jump a year (zero-padding the names to restore numeric order moved q14 only 41→44 of 75).
+
+The cause is documented in the pin path itself, `src/pin_table.cpp:260-262`:
+
+> "chunk ranges overlap, because **the coalescer interleaves row groups rather than partitioning
+> the key space**"
+
+The scan's row-group coalescer builds each batch from row groups spread across the file set — good
+for IO parallelism, fatal for zone maps. **Sorting the data on disk does not produce clustered pin
+chunks.**
+
+### What this changes
+
+1. **Clustering must happen at pin time, not in the dataset.** §5.3's "(a) local sort per pin
+   batch" is not an optimisation over the dataset sort — it is the only thing that works, because
+   the pin discards file order regardless. That also makes the §5.1 measurement the relevant one:
+   a GPU sort inside `materialize_pin_batches`, ~2.3 s for SF1000 lineitem.
+2. **Every §3 pruning number is an upper bound that the current pin path cannot reach.** They were
+   computed against parquet row groups and against synthetic reorderings, both of which assume the
+   scan preserves row order into chunks. It does not.
+3. **It does not invalidate Phase 2**, and arguably strengthens it: a coalescer-interleaved chunk
+   is exactly the case where one min/max per chunk is useless and finer groups could still isolate
+   runs — *if* the interleaving is at row-group granularity (≈1 M rows) rather than finer. Whether
+   G = 8 (8,192 rows) is fine enough to see through it is now the open question, and it is
+   measurable against the existing sorted dataset.
+4. **The SF100 result was not wrong, it was lucky.** Six files and 512 MB batches meant a batch
+   rarely spanned much of the key space. The effect scales with the file count, which is why it
+   appeared at SF1000 and not at SF100.
+
 ## 4. Granularity, and whether to compress the index
 
 ### 4.1 The governing rule
@@ -932,6 +988,13 @@ rows = **3.1%**; SF100 lineitem at 512 MB is 1/25…1/57 = **1.8–4.0%**. So:
 > **SF100 @ 512 MB is the SF1000 @ 8 GB proxy, and it says W2 alone is worth ~4% of suite time**
 > on clustered data — from a change that is pure plumbing and adds no new metadata.
 
+**⚠ This projection was measured at SF1000 on 2026-09-08 and is wrong: the real number is −0.4%
+(§3.8).** The proxy failed not because the fraction-of-table reasoning was wrong but because it
+assumed pin chunks inherit the file's row order, and they do not — the scan's row-group coalescer
+interleaves across the file set, so SF1000 pin chunks span most of the key range. SF100 escaped
+this because six files and 512 MB batches rarely spanned much of the key space. Read §3.8 before
+trusting anything below.
+
 **The sweep also proves you cannot buy granularity with batch size.** 128 MB prunes the most (71%)
 yet is the *slowest* arm in absolute terms (1.58 s vs 0.955 s at 8 GB) because batching overhead
 grows faster than the pruning saves. The best whole configuration is 2 GB-ON at 0.9348 s. Shrinking
@@ -1047,6 +1110,11 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
+- **2026-09-08** — **SF1000 validation done, and it overturns the Phase 1 projection.** Real number
+  is **−0.4%** at the production 8 GB batch, not the projected ~4%. Root cause found (§3.8): the
+  scan's row-group coalescer interleaves row groups across the file set, so pin chunks span most of
+  the key range even on a globally sorted table — a one-day predicate prunes only 13/37 chunks.
+  Sorting the dataset does not cluster the pin; clustering has to happen at pin time.
 - **2026-09-07** — **Phase 1 done.** W2 landed (`f9ca10ad`), 22/22 byte-exact. The batch-size sweep
   on clustered SF100 gives prune rates 25/48/66/71% at 8GB/2GB/512MB/128MB with suite deltas
   +0.1/−1.5/−4.0/−12.6%. SF100@512MB is the SF1000@8GB proxy (both ~3% of table per chunk), so
