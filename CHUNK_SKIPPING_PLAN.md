@@ -621,9 +621,76 @@ Reordering rows is not free of consequences — flag before implementing:
 3. Any consumer relying on scan order matching file order. There should be none, but it is worth
    an explicit check.
 
-## 6. Where the index should live: device, host, spilled
+## 6. Skipping the *fetch*, not just the decode
 
-### 6.1 Keep the index in device memory even when the data is pinned to host — yes
+Chunk skipping saves different things at different tiers. On a GPU-tier pin the payload is already
+device-resident, so a skip saves only decode. On a **host** pin, and on any future **disk** read, a
+skip could save the transfer itself — which on the host tier is the dominant cost
+(`docs/super-sirius/compressed-pinning.md:52-56`: host-tier compressed *loses* 7.0% today precisely
+because every scan batch pays payload H2D → sync → decode on the critical path).
+
+The question is whether a row range maps to a computable byte range. For simpatico it does, exactly.
+
+### 6.1 Row range → byte range is exact, from ~0.01% of the payload
+
+`src/compression/simpatico_codegen/src/bridge/offsets_cumsum.cu:9-11`:
+
+> derive `n_words[c]` from `(chunk_count[c]*chunk_bits[c]+31)>>5`, exclusive-scan into
+> `bp_offsets[0..num_chunks)`
+
+So the byte offset of any 1024-row chunk inside a `packed` buffer is a prefix sum over two tiny
+per-chunk arrays: `chunk_count` (4 B/chunk) and `chunk_bits` (1 B/chunk). For a 189 M-row pin chunk
+that is 184,571 × 5 B ≈ **923 KB of addressing metadata against ~8 GB of payload — 0.01%**. Read
+those two arrays, scan them, and you know exactly which bytes any group needs. `bp_offsets` is not
+even persisted: it is synthesized on device from data already stored.
+
+Addressability by plan root, for the shipped TPC-H plans:
+
+| root | addressable per 1024-row chunk? | why |
+|---|---|---|
+| `input -> bitpack` | **exact** | `bp_offsets` above. Covers the dates, quantity, discount, partkey, suppkey |
+| `delta -> bitpack` | **exact** | `delta_first[c]` is a *per-chunk anchor*, not a running global prefix (`encode/jit/renderer.cpp:403,443`), so chunks decode independently. Covers `l_orderkey`, `o_orderkey` |
+| `dictionary -> bitpack(indices)` | **exact** for the indices | the key set is per-pin-chunk and small — fetch it whole |
+| `str_split -> bitpack(offsets)` | two-step | offsets are addressable, but `chars` needs `offsets[start..end]` first: one extra dependent round trip |
+| `ans` / `snappy` / `lz4` / `bitcomp` | **no** | opaque blobs with codec-internal chunking; would need groups aligned to codec blocks |
+| `identity` | trivial | fixed stride |
+
+### 6.2 The plumbing already has the right shape
+
+The host→GPU path drives every fetch through a byte-range callback —
+`simpatico::payload_fetch_fn = void(offset, size, dst, stream)`
+(`src/compression/compression_converters.cpp:167-171`, declared at `compressed_table_io.hpp:111`) —
+and `read_compressed_table_subset_from_memory` already does **column**-granular partial fetch via
+each buffer's `payload_offset`. Going from "which buffers" to "which byte ranges within a buffer"
+is the same mechanism one level finer, not a new one.
+
+### 6.3 Caveats to measure before believing it
+
+- **Guard words.** Decode reads a few words past a chunk's end ("dense Compact words + decode
+  gather guard words", `tests/test_bitpack_layout_contract.cpp:5,141`), so every fetched range
+  needs slop. Cheap, but it must be in the range arithmetic.
+- **Many small transfers may beat one large one only if they coalesce.** On clustered data
+  surviving groups are *runs*, so ranges should merge into a few large copies — but that is an
+  assumption, not a measurement. Unclustered survivors would scatter and could easily be slower
+  than one bulk copy. Any implementation needs a coalescing pass and a "just fetch it all"
+  fallback above some fragmentation threshold.
+- **Disk amplifies both effects**: bigger win per skipped byte, worse penalty for scattered reads.
+
+### 6.4 Is a simpatico ingestion format worth it?
+
+The addressability argument is genuinely stronger than parquet's. Parquet's row-group statistics
+are ~1 M rows here and its `PageIndex`/`ColumnIndex` is **never read** by either Sirius or DuckDB
+(§1), so page-level skipping does not exist on the parquet path at all. A simpatico file would have
+exact 1024-row addressability for free, from metadata it already stores.
+
+But **measure the host tier first.** It exercises the identical mechanism (skip byte ranges of a
+compressed payload before decoding), it needs no new file format, and it has a clear existing
+target: turning host-tier compressed from −7.0% into a win. If range-skipped fetch does not pay
+there, it will not pay on disk either.
+
+## 7. Where the index should live: device, host, spilled
+
+### 7.1 Keep the index in device memory even when the data is pinned to host — yes
 
 This is the highest-leverage placement decision, and the asymmetry is stark. Take SF1000 lineitem,
 8K stride, 10 filterable columns: **0.11 GB of index against 264 GB of raw / 93 GB of compressed
@@ -653,7 +720,7 @@ unconditionally affordable; if a configuration ever exceeds a budget, drop the *
 before dropping *residency*, because coarsening costs ~0.5 pp of pruning while evicting the index
 to host costs the entire skip mechanism.
 
-### 6.2 When data spills to host
+### 7.2 When data spills to host
 
 Nothing changes for the index: it stays on device. The data moving to host makes the index *more*
 valuable, not less, because the cost of a wrong "do not skip" decision goes up by the H2D transfer.
@@ -665,7 +732,7 @@ Implication for the spill policy: when a table is demoted GPU→host, its index 
 demotion. Since `docs/super-sirius/scan.md:283-288` says statless entries are not retrofittable,
 losing the index on demotion would be permanent for that entry.
 
-### 6.3 When data spills to disk
+### 7.3 When data spills to disk
 
 Here the index should be **kept in device memory and additionally persisted**. Two distinct roles:
 
@@ -683,7 +750,7 @@ adding chunk-range granularity would let a spilled table read back only survivin
 the natural follow-on and the one place `range_slice` (`DECODE_PUSHDOWN_PLAN.md:722-723`) becomes
 necessary.
 
-### 6.4 Summary table
+### 7.4 Summary table
 
 | Data location | Index location | Compressed? | Why |
 |---|---|---|---|
@@ -694,7 +761,7 @@ necessary.
 
 ---
 
-## 7. Proposed order of work — prove value before committing
+## 8. Proposed order of work — prove value before committing
 
 The governing constraint: **on TPC-H as it sits, every implementation measures exactly zero**
 (§3.1). Any proof of value must first create clustered data. And the cheapest honest proof does
@@ -828,7 +895,7 @@ helps but does not fix an 83 ns primitive.
 > The 2a function stays useful as the *capture* (it is correct, tested, and GPU-side cheap); its
 > output type is what has to change.
 
-This also revises §6.1: keeping the index device-resident is right, but the load-bearing reason is
+This also revises §7.1: keeping the index device-resident is right, but the load-bearing reason is
 **evaluation throughput**, not avoiding an H2D round trip. 732,000 group cells is a GPU-shaped
 problem, not a host-loop-shaped one.
 
@@ -865,7 +932,7 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
    this is what converts 0% into ~34–38%. Arguably the real project, with the metadata as what
    makes it usable.
 
-## 8. Open questions / log
+## 9. Open questions / log
 
 - **2026-09-07** — project opened. Investigation and all measurements in §3–§6 done; nothing
   implemented, nothing benchmarked end-to-end.
@@ -887,6 +954,9 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Added §5: GPU sort is ~34× faster than 72 CPU threads and a per-pin-chunk local sort of SF1000
   lineitem costs ~2.3 s; local sort reaches 72.7% of the global sort's 73.5% at G=8 but **0.0%** at
   pin-chunk granularity, which is the strongest argument yet for the fine index.
+- **Open (§6):** range-skipped *fetch* on a host-tier pin — the highest-value untested idea, since
+  host-tier compressed loses 7.0% today entirely on fetch cost. Needs the coalescing question
+  answered: do surviving groups merge into few large copies on clustered data?
 - **Open:** the §3/§5 pruning numbers are still *rows/bytes not decoded*, not query time. Need one end-to-end datapoint —
   cheapest is W2 on a GPU-compressed lineitem pin with an artificially clustered SF100.
 - **Answered (§5.1):** sorting 6e9 rows at pin time costs ~2.3 s on the GPU for a per-chunk local
