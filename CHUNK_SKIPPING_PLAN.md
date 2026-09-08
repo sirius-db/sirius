@@ -922,12 +922,48 @@ host path is the cheap way to prove the mechanism first, not a different mechani
    missing zone-map cell. Per the shipped plans this covers the bitpack- and delta-rooted columns;
    `ans`/`snappy`/`lz4`/`bitcomp` refuse.
 
-3. **Header synthesis.** `read_compressed_table_subset_from_memory` parses a header and calls
-   `payload_fetch_fn` per buffer (`compressed_table_io.hpp:137-143`). Serving a subset means
-   synthesizing a header whose buffer sizes and `num_rows` describe the compacted table. The header
-   is already built in memory, so this is bookkeeping, not format surgery.
+3. **Header synthesis — the next piece, and the one to be careful with.**
 
-4. **Row-count bookkeeping.** The served batch has fewer rows than its chunk. The scan's row
+   `read_compressed_table_subset_from_memory` allocates each leaf buffer at its *declared* size and
+   fills it via `payload_fetch_fn(offset, size, dst, stream)`. So serving a compacted table means
+   handing it a header whose declared sizes are the compacted ones, plus a fetch that gathers the
+   ranges. The reader itself then needs no change at all — that is what makes this approach
+   attractive.
+
+   Shape, and why it is two-phase:
+
+   ```
+   // Phase 1: read the small per-chunk metadata buffers (5 B/chunk for bitpack) — a memcpy on a
+   //          host pin. Their VALUES are what the byte ranges are derived from.
+   // Phase 2: compute per-buffer subsets, re-lay-out the payload densely, emit a new header.
+   std::string plan_chunk_subset(std::span<const std::uint8_t> header,
+                                 std::span<const std::uint32_t> surviving_chunks,
+                                 metadata_read_fn const& read_metadata,   // phase 1
+                                 std::vector<std::uint8_t>& out_header,
+                                 std::vector<gather_range>& out_gather);  // {src_offset, size, dst}
+   ```
+
+   Per leaf buffer, classified by `buffer_layout(leaf.kind, buffer.name)`:
+   `per_chunk_metadata` → `plan_metadata_subset`; `bulk_chunked` → `plan_bitpack_packed_subset`
+   (or the stored-table equivalent); `whole_column` → the whole range, and its presence means the
+   column is not subsettable at all.
+
+   Bookkeeping that must move with it: each buffer's `size_bytes` and `num_rows`, each leaf's
+   `num_rows`, and the column's `num_rows` (the sum of surviving chunks' rows, where the last
+   chunk of a column is short). `leaf_desc::num_rows` is explicitly the *node's own* output length,
+   not the column's (`leaf_desc.hpp:106-110`), so the two must be recomputed separately.
+
+   **Why this deserves its own careful pass rather than being appended to a long session:** it is
+   binary-format rewriting where a wrong `size_bytes` does not fault — the reader allocates what
+   the header says and the decode reads whatever landed there, so the failure is wrong values, not
+   a crash. It wants the same treatment `plan_bitpack_packed_subset` got: a test asserting that
+   "every chunk surviving" reproduces the original header byte-for-byte, so the subset path
+   provably degrades to the existing one.
+
+   Everything it needs already exists in one place: `parse_hpln_header` and the header writer are
+   both in `src/api/compressed_table_io.cpp`, and the arithmetic is done (`073dd5e1`).
+
+4. **Row-count bookkeeping at the scan level.** The served batch has fewer rows than its chunk. The scan's row
    accounting must follow, and late-mat must stay gated off for such a batch for the reason in
    `a482f283` (its global row ids assume batch == whole chunk).
 
