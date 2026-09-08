@@ -72,7 +72,7 @@ struct chunk_group_stats {
  * Same type allowlist and same soundness contract as @ref compute_pinned_chunk_stats, but at
  * @p group_rows granularity instead of one cell per chunk. Uses a single segmented reduction per
  * column rather than one reduction per group: measured at 1.7x the cost of the whole-chunk
- * capture for a 189M-row chunk at group_rows=8192 (see CHUNK_SKIPPING_PLAN.md §4.3.0).
+ * capture for a 189M-row chunk at group_rows=8192, measured on GB300.
  *
  * Null handling matches the coarse capture's precision deliberately: a column with no nulls marks
  * every group CANNOT_HAVE_NULL_VALUES, otherwise every group is marked "may have nulls". Per-group

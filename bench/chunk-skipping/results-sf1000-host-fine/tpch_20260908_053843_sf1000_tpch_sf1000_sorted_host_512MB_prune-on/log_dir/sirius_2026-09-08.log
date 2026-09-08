@@ -1,3 +1,0 @@
-[2026-09-08 05:38:53.721] [info] [sirius_context.cpp:1698] Loaded Sirius configuration from file: /home/nvidia/joost/sirius-zonemap/bench/chunk-skipping/results-sf1000-host-fine/cfg-512MB-on.yaml
-[2026-09-08 05:38:53.722] [info] [sirius_context.cpp:651] SiriusContext: topology summary — 1 GPU(s), 9 NUMA node(s), host='Workstation19'
-[2026-09-08 05:38:53.722] [info] [sirius_context.cpp:656]   GPU 0: NVIDIA GB300 (numa=0, pci=00000009:06:00.0)

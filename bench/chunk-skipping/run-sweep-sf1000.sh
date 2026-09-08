@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 1 validation at production scale (CHUNK_SKIPPING_PLAN.md §9).
+# Zone-map pruning sweep at production scale (SF1000).
 #
 # Same experiment as run-sweep.sh, at SF1000 on the clustered dataset, reusing the tuned
 # sf1000-repro config so the only variables are scan_task_batch_size and
@@ -19,7 +19,7 @@ BATCHES="${BATCHES:-8GB 2GB}"
 # TIER=host is the experiment that matters for fetch-bound skipping: on a host pin every scan
 # batch pays payload H2D -> sync -> decode on the critical path, so a skipped chunk saves the
 # transfer, not just the decode. On a GPU pin the payload is already resident (ceiling ~2.4%,
-# CHUNK_SKIPPING_PLAN.md §3.9).
+# measured at ~2.4% of suite time on a GPU pin).
 TIER="${TIER:-gpu}"
 ITERS="${ITERS:-3}"
 OUT="${OUT:-$REPO/bench/chunk-skipping/results-sf1000-$TIER}"
@@ -61,7 +61,7 @@ for batch in $BATCHES; do
     cfg="$OUT/cfg-$batch-$prune.yaml"
     # Replace the base config's own scan_task_batch_size and append the pruning flag.
     # Computing the flag BEFORE the sed matters: '&' is special in sed replacement text, so an
-    # inlined $( ... && ... ) silently yields "false" for both arms (see §9 Phase 1 process note).
+    # inlined $( ... && ... ) silently yields "false" for both arms, which reads as "no benefit".
     # The base config's downgrade_root_dirs points at a /localhome path that does not exist on
     # this box; repoint it so a downgrade does not fail on a missing directory.
     sed -e "s|^        scan_task_batch_size: .*|        scan_task_batch_size: $batch\n        enable_pinned_zone_map_pruning: $flag|" \
