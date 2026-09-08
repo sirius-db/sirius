@@ -56,9 +56,19 @@ unset CUDA_VISIBLE_DEVICES
 # reaches every CN; sweeps that would otherwise record a silent wedge as a timeout set it to 60.
 export SIRIUS_QUERY_WATCHDOG_SECS=${SIRIUS_QUERY_WATCHDOG_SECS:-0}
 
+# GPU_DEVICES="0,0" places CN i on the i-th listed device instead of device i, so two CNs can
+# share one card on a single-GPU box (each must then carve out a GPU_MEM + STAGING slice that
+# fits alongside the other's). Default: one CN per GPU.
 avail=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-[ "$avail" -ge "$NUM_CNS" ] || {
-    echo "asked for $NUM_CNS CNs but only $avail GPUs are visible" >&2; exit 1; }
+if [ -n "${GPU_DEVICES:-}" ]; then
+    IFS=, read -r -a gpu_of_cn <<< "$GPU_DEVICES"
+    [ "${#gpu_of_cn[@]}" -ge "$NUM_CNS" ] || {
+        echo "GPU_DEVICES=$GPU_DEVICES lists ${#gpu_of_cn[@]} devices for $NUM_CNS CNs" >&2; exit 1; }
+else
+    [ "$avail" -ge "$NUM_CNS" ] || {
+        echo "asked for $NUM_CNS CNs but only $avail GPUs are visible" >&2; exit 1; }
+    gpu_of_cn=($(seq 0 $((NUM_CNS - 1))))
+fi
 
 pids=()
 cleanup() {
@@ -76,8 +86,9 @@ pids+=("$!")
 
 for i in $(seq 0 $((NUM_CNS - 1))); do
     base=$((PORT_BASE + i * PORT_STRIDE))
+    gpu=${gpu_of_cn[$i]}
     "$CN_BIN" \
-        --gpu-device "$i" \
+        --gpu-device "$gpu" \
         --heartbeat-port "$base" \
         --thrift-port    "$((base + 1))" \
         --brpc-port      "$((base + 2))" \
@@ -87,7 +98,7 @@ for i in $(seq 0 $((NUM_CNS - 1))); do
         --host-memory-limit "$HOST_MEM" \
         --engine-dir ".cn$i" &
     pids+=("$!")
-    echo "CN$i gpu=$i heartbeat=$base brpc=$((base + 2)) pid=${pids[-1]}"
+    echo "CN$i gpu=$gpu heartbeat=$base brpc=$((base + 2)) pid=${pids[-1]}"
 done
 
 echo "FE + $NUM_CNS CNs launched; each CN self-registers with the FE on :9030"
