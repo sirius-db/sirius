@@ -163,11 +163,15 @@ std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
 
   // A starved arm outranks a ready one, because nothing else will start it.
   // `task_creator::get_operator_for_next_task` reaches an operator *only* by walking
-  // `hint.producer`, and `task_scheduler::start_query` schedules `scans.front()` alone — so an arm
-  // is named here or never runs, and answering READY first spends that request on draining. The
-  // producer is likewise never null, or the still-producing arm has nothing to run it. The walk is
-  // all-or-nothing too: when it yields no operator `task_creator` abandons the whole request, so
-  // advancing past the arm just nominated spreads that loss instead of concentrating it on one.
+  // `hint.producer`, and `task_scheduler::start_query` schedules `scans.front()` alone. Nothing
+  // schedules a scan again after that: both recurring paths schedule a pipeline's output consumers,
+  // never its own source. So this branch is not only how an arm starts, it is how every arm's scan
+  // resumes each time its splits run dry — answering READY first spends that request on draining.
+  // The producer is likewise never null, or the still-producing arm has nothing to run it. The walk
+  // is all-or-nothing too: when it yields no operator `task_creator` abandons the whole request,
+  // and an arm whose connector closed while its last tasks run is starved but yields nothing — so a
+  // fixed start would burn every request for that arm's tail, which is what `_wait_cursor` advances
+  // past.
   if (starved_producer != nullptr) {
     _wait_cursor = (starved_arm + 1) % num_arms;
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, starved_producer};
