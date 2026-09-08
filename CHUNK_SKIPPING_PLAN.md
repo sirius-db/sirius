@@ -539,6 +539,32 @@ still slower in absolute terms (9.68 s vs 6.96 s), so this is not "host tier now
 "chunk skipping recovers a meaningful part of the fetch penalty that makes host tier lose", which
 is what matters for the configurations where data does not fit on the GPU.
 
+### 3.12 The group index, measured end to end (2026-09-08)
+
+The capture is now wired into the pin, so the chain runs: per-group min/max at pin time → packed
+arena → row ranges in the scan plan → the scan serves them. SF1000 clustered, host pin, 2 GB
+batches (the best configuration from §3.11), pruning on in both arms so the only variable is the
+finer capture:
+
+| `pinned_zone_map_group_rows` | sub-chunk rows dropped | suite |
+|---|---|---|
+| 8192 (8 decode chunks) | **44.6e9** | **9.4813 s** |
+| 0 (whole-chunk pruning only) | 0 | 9.6943 s |
+
+**−2.20%** on top of the −8.1% whole-chunk pruning already delivered. It moves the scan-bound
+queries and nothing else: q12 −0.043 s, q14 −0.043 s, q8 −0.037 s, q4 −0.036 s, q15 −0.020 s,
+q20 −0.019 s. Two queries move the other way by less than the ~0.8% noise floor.
+
+Worth being precise about what this is and is not:
+
+- **It is not the fetch saving.** These chunks are still fetched whole; only the served row ranges
+  narrow, so what is saved is downstream work, not the H2D transfer. The fetch skip (§6.5) is a
+  separate and larger prize, and this number does not include it.
+- **44.6e9 rows dropped for 0.21 s** says the same thing §3.9 did: on this suite, rows are cheap
+  once resident. The value of skipping is dominated by what it lets you *not move*.
+- The prediction that a G = 8 index sees through the coalescer's row-group interleaving (§3.9) is
+  confirmed — the pruning materialises without any pin-time clustering.
+
 ## 4. Granularity, and whether to compress the index
 
 ### 4.1 The governing rule
@@ -1496,6 +1522,11 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
+- **2026-09-08** — **The group index runs end to end (§3.12).** The capture was inert (nothing
+  populated `pinned_entry::group_bounds`); wiring it in gives **−2.20%** at SF1000 host tier on top
+  of whole-chunk pruning, dropping 44.6e9 rows. Confirms a G = 8 index sees through the
+  coalescer's interleaving with no pin-time clustering. This is decode/downstream saving only —
+  the chunks are still fetched whole.
 - **2026-09-08** — **Host tier measured (§3.11): the project has a target.** Same sweep with
   `--pin host` gives **−7.3% at 2 GB** and −1.7% at 8 GB, against −2.0%/−0.4% on the GPU tier.
   2 GB-ON (9.678 s) is the best host configuration measured. Confirms the §6 fetch hypothesis
