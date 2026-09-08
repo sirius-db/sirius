@@ -49,6 +49,12 @@ constexpr int kAlpVectorSize = 1024;
 
 // Scale-selection sample: contiguous runs spread evenly across the vector. The
 // total must be a whole number of warps and no larger than the vector.
+// Decode maps one block to one vector, so the scale is read once per block and
+// each thread carries kAlpVectorSize / kAlpDecodeBlock elements.
+constexpr int kAlpDecodeBlock     = 256;
+constexpr int kAlpDecodePerThread = kAlpVectorSize / kAlpDecodeBlock;
+static_assert(kAlpVectorSize % kAlpDecodeBlock == 0, "decode block must divide the vector");
+
 constexpr int kAlpSampleRuns   = 8;
 constexpr int kAlpSampleRunLen = 8;
 constexpr int kAlpSampleSize   = kAlpSampleRuns * kAlpSampleRunLen;  // 64 = 2 warps
@@ -555,11 +561,13 @@ __global__ void alp_decode_kernel(const typename alp_traits<T>::int_t* __restric
                                   int32_t n_rows,
                                   T* __restrict__ out)
 {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n_rows) return;
-  int const vec = i / kAlpVectorSize;
-  int const d   = static_cast<int>(metadata[vec]);
-  out[i]        = alp_decode_value<T>(integers[i], d);
+  int const base = blockIdx.x * kAlpVectorSize;
+  int const d    = static_cast<int>(metadata[blockIdx.x]);
+#pragma unroll
+  for (int k = 0; k < kAlpDecodePerThread; ++k) {
+    int const i = base + k * kAlpDecodeBlock + static_cast<int>(threadIdx.x);
+    if (i < n_rows) out[i] = alp_decode_value<T>(integers[i], d);
+  }
 }
 
 // Exception scatter: fully data-parallel (G-ALP's key GPU optimisation).
@@ -657,8 +665,8 @@ std::unique_ptr<cudf::column> alp_decompress_impl(alp_compressed_representation 
   auto out = cudf::make_fixed_width_column(
     repr.original_type, repr.num_rows, cudf::mask_state::UNALLOCATED, stream, mr);
 
-  const int block = 256;
-  int grid        = (repr.num_rows + block - 1) / block;
+  const int block = kAlpDecodeBlock;
+  int const grid  = repr.num_vectors;
   alp_decode_kernel<T><<<grid, block, 0, stream.value()>>>(repr.integers()->view().data<int_t>(),
                                                            repr.metadata()->view().data<uint16_t>(),
                                                            repr.num_rows,
