@@ -64,6 +64,7 @@
 #include <scan_manager/pinned_chunk_stats.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -1134,4 +1135,61 @@ TEST_CASE("compute_pinned_group_stats - nulls and degenerate input", "[pinned_ch
       mr);
     REQUIRE(gs.empty());
   }
+}
+
+// Not a correctness test: a timing probe for the Phase 2b design question — does one
+// duckdb::BaseStatistics object per (group, column) scale to the group counts a real pin
+// produces? Tagged [.] so it only runs when named explicitly.
+TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
+          "[.][pinned_chunk_stats][bench]")
+{
+  auto& e     = genv();
+  auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+  auto stream = sirius::test::operator_utils::default_stream();
+
+  constexpr std::size_t kRows = 8ull * 1024 * 1024;  // 8 M rows
+  std::vector<int32_t> values(kRows);
+  for (std::size_t i = 0; i < kRows; ++i) {
+    values[i] = static_cast<int32_t>(i % 100000);
+  }
+  auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, values);
+
+  for (std::size_t group_rows : {kRows, std::size_t{65536}, std::size_t{8192}}) {
+    auto const t0 = std::chrono::high_resolution_clock::now();
+    auto gs       = sirius::scan_manager::compute_pinned_group_stats(
+      cudf::table_view{{col->view()}},
+      duckdb::vector<LogicalType>{LogicalType::INTEGER},
+      group_rows,
+      stream,
+      mr);
+    auto const t1 = std::chrono::high_resolution_clock::now();
+    auto const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    WARN("group_rows=" << group_rows << " groups=" << gs.group_count() << " -> " << ms
+                       << " ms for 1 column of " << kRows << " rows");
+    REQUIRE(gs.group_count() >= 1);
+  }
+
+  // Evaluation side: what a per-query plan pass over group cells costs. This is the number that
+  // decides whether duckdb::BaseStatistics + CheckStatistics is a viable representation for the
+  // group index, or whether 2b needs a packed columnar form.
+  auto gs = sirius::scan_manager::compute_pinned_group_stats(
+    cudf::table_view{{col->view()}},
+    duckdb::vector<LogicalType>{LogicalType::INTEGER},
+    8192,
+    stream,
+    mr);
+  auto filter         = cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(50000));
+  std::size_t empties = 0;
+  constexpr int kReps = 200;
+  auto const t0       = std::chrono::high_resolution_clock::now();
+  for (int r = 0; r < kReps; ++r) {
+    for (auto const& group : gs.groups) {
+      if (group[0] && sirius::scan_manager::chunk_provably_empty(*filter, *group[0])) { ++empties; }
+    }
+  }
+  auto const t1    = std::chrono::high_resolution_clock::now();
+  auto const cells = static_cast<double>(gs.group_count()) * kReps;
+  auto const ns    = std::chrono::duration<double, std::nano>(t1 - t0).count() / cells;
+  WARN("chunk_provably_empty over " << gs.group_count() << " group cells: " << ns
+                                    << " ns/cell (empties=" << empties << ")");
 }
