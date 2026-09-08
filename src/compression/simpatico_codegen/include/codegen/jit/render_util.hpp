@@ -17,6 +17,11 @@ namespace codegen::jit {
 // instead of relying on signed overflow (UB).
 inline const char* unsigned_counterpart(std::size_t elem_size)
 {
+  // Exact-width for the sizes that have one. Narrower elements deliberately
+  // widen to uint32_t (the codecs compute in 32-bit registers and the callers
+  // mask back); 16 must NOT fall into that default, which would silently
+  // truncate a 128-bit value to 32 bits rather than fail to compile.
+  if (elem_size == 16) { return "unsigned __int128"; }
   return (elem_size == 8) ? "uint64_t" : "uint32_t";
 }
 

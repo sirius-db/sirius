@@ -108,6 +108,12 @@ const DtypeInfo* lookup_dtype(const std::string& name)
     {"int16_t", {sizeof(std::int16_t), "INT16_MAX", "INT16_MIN"}},
     {"int32_t", {sizeof(std::int32_t), "INT32_MAX", "INT32_MIN"}},
     {"int64_t", {sizeof(std::int64_t), "INT64_MAX", "INT64_MIN"}},
+    // No INT128_MAX macro exists; derive the bounds from the unsigned all-ones
+    // value so the literals stay valid inside an NVRTC translation unit.
+    {"__int128",
+     {sizeof(__int128),
+      "(static_cast<__int128>((~static_cast<unsigned __int128>(0)) >> 1))",
+      "(-(static_cast<__int128>((~static_cast<unsigned __int128>(0)) >> 1)) - 1)"}},
   };
   auto it = table.find(name);
   return (it == table.end()) ? nullptr : &it->second;
@@ -365,6 +371,14 @@ namespace {
 // path handles reconstruction.
 __device__ inline int simpatico_bit_width_u64(unsigned long long x) {
     return (x == 0ULL) ? 0 : (64 - __clzll(x));
+}
+
+// 128-bit counterpart: __clzll only reaches 64 bits, so test the high half first.
+__device__ inline int simpatico_bit_width_u128(unsigned __int128 x) {
+    const unsigned long long hi = static_cast<unsigned long long>(x >> 64);
+    const unsigned long long lo = static_cast<unsigned long long>(x);
+    if (hi != 0ULL) return 128 - __clzll(hi);
+    return (lo == 0ULL) ? 0 : (64 - __clzll(lo));
 }
 
 }  // namespace
@@ -1028,6 +1042,11 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::string resid   = "resid_" + idstr;
   const std::string max_r   = "max_resid_" + idstr;
   const std::string bits_v  = "bits_" + idstr;
+  // The chunk range and the pack accumulator must be as wide as the element:
+  // at 16 bytes a uint64_t would silently truncate the high half.
+  const std::string bp_utype    = unsigned_counterpart(op_dt->elem_size);
+  const std::string bp_width_fn = (op_dt->elem_size == 16) ? "simpatico_bit_width_u128"
+                                                           : "simpatico_bit_width_u64";
   const std::string dst     = "dst_base_" + idstr;
   const std::string sw_var  = "stride_words_" + idstr;
   const std::string emax    = "elem_max_" + idstr;
@@ -1112,10 +1131,10 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
         << "        __syncthreads();\n"
         << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-        << "        const uint64_t " << max_r << " = static_cast<uint64_t>(" << sh_max
-        << "_b) - static_cast<uint64_t>(" << cmin << ");\n"
-        << "        const int32_t " << bits_v << " = simpatico_bit_width_u64("
-        << "static_cast<unsigned long long>(" << max_r << "));\n"
+        << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype
+        << ">(" << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+        << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
+        << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
         << "        if (tid == 0) {\n"
         << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
         << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
@@ -1196,8 +1215,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
     // One 32-bit IMAD (_ibits) shared for both _tw and _tb replaces
     // the original two independent 64-bit multiplies (~4 vs ~8 cycles).
     body_ << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-          << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
-          << ") - static_cast<uint64_t>(" << cmin << ");\n"
+          << "            " << bp_utype << " _rv = static_cast<" << bp_utype
+          << ">(" << at_lane(in.read_expr, "i") << ") - static_cast<" << bp_utype
+          << ">(" << cmin << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"

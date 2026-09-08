@@ -487,14 +487,6 @@ std::string default_plan_for(cudf::column_view const& col, rmm::cuda_stream_view
   const auto type = col.type();
   if (type.id() == cudf::type_id::STRING) { return default_string_plan(col, stream); }
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
-  // DECIMAL128 gets `ans`, not bitpack: bitpack encodes a decimal column as its
-  // integer storage, but the codegen dtype vocabulary stops at 64 bits, so a
-  // __int128_t storage type is not fusable and the plan fails outright. `ans` is
-  // not a codegen op and has no such width limit. It also compresses these
-  // columns better -- `simpatico explore` on a TPC-H q18/SF3000 spill batch
-  // measured 5.1x for `ans` on its DECIMAL(38,2) column against 2.1x for bitpack
-  // on the int64 beside it.
-  if (type.id() == cudf::type_id::DECIMAL128) { return "input -> ans\n"; }
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 }
 

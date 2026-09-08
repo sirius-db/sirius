@@ -67,6 +67,7 @@ std::size_t dtype_elem_size(const std::string& name)
   if (name == "int16_t") return 2;
   if (name == "int32_t") return 4;
   if (name == "int64_t") return 8;
+  if (name == "__int128") return 16;
   return 0;  // 0 => unsupported (caller throws)
 }
 
@@ -77,10 +78,11 @@ std::size_t dtype_elem_size(const std::string& name)
 // elements (exact width == counterpart width).
 const char* exact_unsigned(std::size_t elem_size)
 {
-  return (elem_size == 8)   ? "uint64_t"
-         : (elem_size == 2) ? "uint16_t"
-         : (elem_size == 1) ? "uint8_t"
-                            : "uint32_t";
+  return (elem_size == 16)  ? "unsigned __int128"
+         : (elem_size == 8)  ? "uint64_t"
+         : (elem_size == 2)  ? "uint16_t"
+         : (elem_size == 1)  ? "uint8_t"
+                             : "uint32_t";
 }
 
 // Substitute a value source's __POS__ token with the given position expr.
@@ -480,15 +482,51 @@ __device__ __forceinline__ uint64_t simpatico_bitunpack_one(
     return stitched & mask;
 }
 
+// 5-word gather: the 128-bit counterpart of the above. A 128-bit value starting
+// at an arbitrary bit offset spans ceil((128+31)/32) = 5 uint32 words, so the
+// 3-word stitch cannot reach it. Same shape otherwise: unconditional loads, no
+// data dependency between them.
+__device__ __forceinline__ unsigned __int128 simpatico_bitunpack_one_128(
+    const uint32_t* __restrict__ packed, int bits, int32_t idx) {
+    using u128 = unsigned __int128;
+    const uint64_t bp      = static_cast<uint64_t>(static_cast<uint32_t>(idx))
+                           * static_cast<uint32_t>(bits);
+    const int32_t  word_in = static_cast<int32_t>(bp >> 5);
+    const int32_t  bit_in  = static_cast<int32_t>(bp & 31);
+    u128 v =  static_cast<u128>(packed[word_in    ])
+           | (static_cast<u128>(packed[word_in + 1]) << 32)
+           | (static_cast<u128>(packed[word_in + 2]) << 64)
+           | (static_cast<u128>(packed[word_in + 3]) << 96);
+    v >>= bit_in;
+    // Guarded: at bit_in == 0 the top word contributes nothing and the shift
+    // would be by 128, which is undefined.
+    if (bit_in != 0) {
+        v |= static_cast<u128>(packed[word_in + 4]) << (128 - bit_in);
+    }
+    const u128 mask = (bits == 128) ? ~static_cast<u128>(0)
+                                    : ((static_cast<u128>(1) << bits) - 1);
+    return v & mask;
+}
+
+// cuda::std::make_unsigned has no __int128 specialisation in this toolkit, so
+// name the counterpart directly.
+template <class T> struct simpatico_unsigned { using type = typename ::cuda::std::make_unsigned<T>::type; };
+template <> struct simpatico_unsigned<__int128> { using type = unsigned __int128; };
+
 // Random-access bitpack read at per-chunk position `idx`, with the
 // constant-chunk (bits==0) short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
                                           int32_t bits, T minv, int32_t idx) {
-    using U = typename ::cuda::std::make_unsigned<T>::type;
+    using U = typename simpatico_unsigned<T>::type;
     if (bits == 0) return minv;
-    const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
-    return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+    if constexpr (sizeof(T) == 16) {
+        const unsigned __int128 v = simpatico_bitunpack_one_128(packed_base, bits, idx);
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+    } else {
+        const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+    }
 }
 
 }  // namespace

@@ -221,6 +221,11 @@ CompiledKernel compile_plain_kernel(const std::string& source,
     nvrtc_opts.push_back(cccl_inc.c_str());
   }
   if (opts.default_device) { nvrtc_opts.push_back("-default-device"); }
+  // NVRTC rejects __int128 unless asked: "128-bit integer type is only supported
+  // in Linux with the --device-int128 flag". DECIMAL128 columns are encoded as
+  // their __int128 storage, so every rendered kernel needs it available. Passing
+  // it unconditionally costs nothing for kernels that never name the type.
+  nvrtc_opts.push_back("--device-int128");
 
   nvrtcResult compile_result =
     nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());

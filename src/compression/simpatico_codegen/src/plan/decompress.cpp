@@ -67,6 +67,11 @@ const char* codegen_dtype_str_for(cudf::data_type type)
     case cudf::type_id::UINT64: return "uint64";
     case cudf::type_id::FLOAT32: return "float32";
     case cudf::type_id::FLOAT64: return "float64";
+    // The narrower decimals and the chrono types are stored as their integer
+    // storage type, so they arrive here already as INT32/INT64. DECIMAL128 is
+    // the exception: cudf has no 128-bit integer type_id, so its storage column
+    // stays DECIMAL128 and has to be named here.
+    case cudf::type_id::DECIMAL128: return "int128";
     default: return nullptr;
   }
 }
