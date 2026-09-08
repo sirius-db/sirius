@@ -157,6 +157,92 @@ class pinned_zone_maps {
 };
 
 /**
+ * @brief One column's per-group min/max cells, packed as parallel typed arrays.
+ *
+ * The group index needs a representation that scales: SF1000 lineitem at G = 8 has ~732,000
+ * groups, and the @ref chunk_provably_empty path costs ~83 ns per cell (a @c BaseStatistics copy
+ * plus a virtual @c CheckStatistics), i.e. ~61 ms of plan time per filter column per query. This
+ * holds the same information in three flat arrays and evaluates a filter that was lowered once.
+ *
+ * Every supported type (integers <= 8 B, DATE, TIMESTAMP) fits in 8 bytes, so bounds are stored
+ * as the raw carrier: signed integers, DATE days and TIMESTAMP micros as themselves; unsigned
+ * integers as their bit pattern, reinterpreted via @c is_unsigned at comparison time (a UBIGINT
+ * above INT64_MAX stores as negative and compares correctly as uint64).
+ *
+ * @c valid is false for a cell with no statistics, which never prunes — the same contract as a
+ * null @c BaseStatistics.
+ */
+struct packed_column_bounds {
+  duckdb::LogicalType type;
+  bool is_unsigned{false};
+  /// True when the whole column had no nulls at capture time (see compute_pinned_group_stats).
+  bool column_has_no_nulls{false};
+  std::vector<std::int64_t> mins;
+  std::vector<std::int64_t> maxs;
+  std::vector<bool> valid;
+
+  [[nodiscard]] std::size_t size() const noexcept { return mins.size(); }
+};
+
+/**
+ * @brief A @c TableFilter lowered once into bounds arithmetic, to be evaluated against many
+ * @ref packed_column_bounds cells.
+ *
+ * Lowering fails (returns nullopt) for exactly the shapes @ref filter_safe_for_stats rejects, so
+ * an un-lowerable filter prunes nothing rather than pruning wrongly. The evaluation is verified
+ * against @ref chunk_provably_empty by a randomized cross-check in the unit tests: the two must
+ * agree on every input, since this is the release-mode safety line for dropping data.
+ */
+class lowered_bound_filter {
+ public:
+  /// @return nullopt when @p filter is not a shape this can evaluate against @p stats_type.
+  [[nodiscard]] static std::optional<lowered_bound_filter> lower(
+    duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type);
+
+  /// True iff no row with bounds [@p min, @p max] can match. @p has_null / @p all_null describe
+  /// the cell's null facts, mirroring BaseStatistics' CAN_HAVE_NULL_VALUES / all-null cases.
+  [[nodiscard]] bool provably_empty(std::int64_t min,
+                                    std::int64_t max,
+                                    bool has_null,
+                                    bool all_null) const noexcept;
+
+  /// Evaluate every cell of @p bounds, appending surviving indices to @p survivors.
+  void select_survivors(packed_column_bounds const& bounds,
+                        std::vector<std::uint32_t>& survivors) const;
+
+ private:
+  enum class op : std::uint8_t {
+    cmp_eq,
+    cmp_ne,
+    cmp_lt,
+    cmp_le,
+    cmp_gt,
+    cmp_ge,
+    in_list,
+    is_null,
+    is_not_null,
+    conj,
+    disj
+  };
+  struct node {
+    op kind{op::conj};
+    bool is_unsigned{false};
+    std::int64_t constant{0};
+    /// in_list values / conj+disj children, as [begin, end) into _values or _children.
+    std::uint32_t begin{0}, end{0};
+  };
+  [[nodiscard]] bool eval(std::uint32_t node_index,
+                          std::int64_t min,
+                          std::int64_t max,
+                          bool has_null,
+                          bool all_null) const noexcept;
+
+  std::vector<node> _nodes;           ///< _nodes[0] is the root
+  std::vector<std::int64_t> _values;  ///< in_list constants
+  std::vector<std::uint32_t> _children;
+};
+
+/**
  * @brief True iff @p filter is a shape whose CheckStatistics method can be called on a statistics
  * object of type @p stats_type.
  *

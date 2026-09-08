@@ -439,6 +439,233 @@ bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalTyp
   }
 }
 
+namespace {
+
+/// Raw 8-byte carrier of a Value whose type is in the zone-map allowlist. Unsigned values are
+/// stored as their bit pattern and compared via is_unsigned; see packed_column_bounds.
+std::optional<std::int64_t> value_carrier(duckdb::Value const& v)
+{
+  if (v.IsNull()) { return std::nullopt; }
+  switch (v.type().id()) {
+    case duckdb::LogicalTypeId::TINYINT: return v.GetValue<std::int8_t>();
+    case duckdb::LogicalTypeId::SMALLINT: return v.GetValue<std::int16_t>();
+    case duckdb::LogicalTypeId::INTEGER: return v.GetValue<std::int32_t>();
+    case duckdb::LogicalTypeId::BIGINT: return v.GetValue<std::int64_t>();
+    case duckdb::LogicalTypeId::UTINYINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint8_t>());
+    case duckdb::LogicalTypeId::USMALLINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint16_t>());
+    case duckdb::LogicalTypeId::UINTEGER:
+      return static_cast<std::int64_t>(v.GetValue<std::uint32_t>());
+    case duckdb::LogicalTypeId::UBIGINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint64_t>());
+    case duckdb::LogicalTypeId::DATE:
+      return static_cast<std::int64_t>(v.GetValue<duckdb::date_t>().days);
+    case duckdb::LogicalTypeId::TIMESTAMP:
+      return static_cast<std::int64_t>(v.GetValue<duckdb::timestamp_t>().value);
+    default: return std::nullopt;
+  }
+}
+
+bool type_is_unsigned(duckdb::LogicalType const& t)
+{
+  switch (t.id()) {
+    case duckdb::LogicalTypeId::UTINYINT:
+    case duckdb::LogicalTypeId::USMALLINT:
+    case duckdb::LogicalTypeId::UINTEGER:
+    case duckdb::LogicalTypeId::UBIGINT: return true;
+    default: return false;
+  }
+}
+
+/// Three-way ordering on carriers, honoring the column's signedness.
+int carrier_cmp(std::int64_t a, std::int64_t b, bool is_unsigned) noexcept
+{
+  if (is_unsigned) {
+    auto const ua = static_cast<std::uint64_t>(a);
+    auto const ub = static_cast<std::uint64_t>(b);
+    return ua < ub ? -1 : (ua > ub ? 1 : 0);
+  }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+}  // namespace
+
+std::optional<lowered_bound_filter> lowered_bound_filter::lower(
+  duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
+{
+  // Gate on exactly the same allowlist as the BaseStatistics path, so the two can never disagree
+  // about WHICH filters are evaluable — only (and verifiably not) about the answer.
+  if (!filter_safe_for_stats(filter, stats_type)) { return std::nullopt; }
+
+  lowered_bound_filter out;
+  bool const uns = type_is_unsigned(stats_type);
+  bool ok        = true;
+
+  // Recursive build; returns the index of the node it appended. Children are appended first and
+  // their indices recorded in _children, so evaluation never chases pointers.
+  auto const build = [&](auto&& self, duckdb::TableFilter const& f) -> std::uint32_t {
+    node n;
+    n.is_unsigned = uns;
+    switch (f.filter_type) {
+      case duckdb::TableFilterType::CONSTANT_COMPARISON: {
+        auto const& cf = f.Cast<duckdb::ConstantFilter>();
+        auto const c   = value_carrier(cf.constant);
+        if (!c) {
+          ok = false;
+          break;
+        }
+        n.constant = *c;
+        switch (cf.comparison_type) {
+          case duckdb::ExpressionType::COMPARE_EQUAL: n.kind = op::cmp_eq; break;
+          case duckdb::ExpressionType::COMPARE_NOTEQUAL: n.kind = op::cmp_ne; break;
+          case duckdb::ExpressionType::COMPARE_LESSTHAN: n.kind = op::cmp_lt; break;
+          case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO: n.kind = op::cmp_le; break;
+          case duckdb::ExpressionType::COMPARE_GREATERTHAN: n.kind = op::cmp_gt; break;
+          case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: n.kind = op::cmp_ge; break;
+          default: ok = false; break;
+        }
+        break;
+      }
+      case duckdb::TableFilterType::IS_NULL: n.kind = op::is_null; break;
+      case duckdb::TableFilterType::IS_NOT_NULL: n.kind = op::is_not_null; break;
+      case duckdb::TableFilterType::IN_FILTER: {
+        auto const& in = f.Cast<duckdb::InFilter>();
+        n.kind         = op::in_list;
+        n.begin        = static_cast<std::uint32_t>(out._values.size());
+        for (auto const& v : in.values) {
+          auto const c = value_carrier(v);
+          if (!c) {
+            ok = false;
+            break;
+          }
+          out._values.push_back(*c);
+        }
+        n.end = static_cast<std::uint32_t>(out._values.size());
+        break;
+      }
+      case duckdb::TableFilterType::CONJUNCTION_AND:
+      case duckdb::TableFilterType::CONJUNCTION_OR: {
+        auto const& children = f.filter_type == duckdb::TableFilterType::CONJUNCTION_AND
+                                 ? f.Cast<duckdb::ConjunctionAndFilter>().child_filters
+                                 : f.Cast<duckdb::ConjunctionOrFilter>().child_filters;
+        n.kind = f.filter_type == duckdb::TableFilterType::CONJUNCTION_AND ? op::conj : op::disj;
+        std::vector<std::uint32_t> kids;
+        kids.reserve(children.size());
+        for (auto const& c : children) {
+          if (!c) {
+            ok = false;
+            break;
+          }
+          kids.push_back(self(self, *c));
+        }
+        n.begin = static_cast<std::uint32_t>(out._children.size());
+        out._children.insert(out._children.end(), kids.begin(), kids.end());
+        n.end = static_cast<std::uint32_t>(out._children.size());
+        break;
+      }
+      case duckdb::TableFilterType::OPTIONAL_FILTER: {
+        auto const& opt = f.Cast<duckdb::OptionalFilter>();
+        if (!opt.child_filter) {
+          ok = false;
+          break;
+        }
+        // An optional wrapping one child behaves as a single-child conjunction.
+        auto const kid = self(self, *opt.child_filter);
+        n.kind         = op::conj;
+        n.begin        = static_cast<std::uint32_t>(out._children.size());
+        out._children.push_back(kid);
+        n.end = static_cast<std::uint32_t>(out._children.size());
+        break;
+      }
+      default: ok = false; break;
+    }
+    out._nodes.push_back(n);
+    return static_cast<std::uint32_t>(out._nodes.size() - 1);
+  };
+
+  auto const root = build(build, filter);
+  if (!ok) { return std::nullopt; }
+  // Evaluation starts from the root, which the post-order build leaves last.
+  if (root + 1 != out._nodes.size()) { return std::nullopt; }
+  std::swap(out._nodes[0], out._nodes[root]);
+  // Re-point any child references to the two swapped slots.
+  for (auto& c : out._children) {
+    if (c == 0) {
+      c = static_cast<std::uint32_t>(root);
+    } else if (c == root) {
+      c = 0;
+    }
+  }
+  return out;
+}
+
+bool lowered_bound_filter::eval(std::uint32_t node_index,
+                                std::int64_t min,
+                                std::int64_t max,
+                                bool has_null,
+                                bool all_null) const noexcept
+{
+  auto const& n      = _nodes[node_index];
+  auto const cmp_min = [&](std::int64_t c) { return carrier_cmp(min, c, n.is_unsigned); };
+  auto const cmp_max = [&](std::int64_t c) { return carrier_cmp(max, c, n.is_unsigned); };
+  switch (n.kind) {
+    // A value range proof says nothing about rows that are NULL, but a NULL never satisfies a
+    // comparison either, so "no non-null row can match" is enough to prune.
+    case op::cmp_eq: return cmp_min(n.constant) > 0 || cmp_max(n.constant) < 0;
+    case op::cmp_ne: return cmp_min(n.constant) == 0 && cmp_max(n.constant) == 0;
+    case op::cmp_lt: return cmp_min(n.constant) >= 0;
+    case op::cmp_le: return cmp_min(n.constant) > 0;
+    case op::cmp_gt: return cmp_max(n.constant) <= 0;
+    case op::cmp_ge: return cmp_max(n.constant) < 0;
+    case op::in_list: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (cmp_min(_values[i]) <= 0 && cmp_max(_values[i]) >= 0) { return false; }
+      }
+      return true;
+    }
+    case op::is_null: return !has_null;
+    case op::is_not_null: return all_null;
+    case op::conj: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (eval(_children[i], min, max, has_null, all_null)) { return true; }
+      }
+      return false;
+    }
+    case op::disj: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (!eval(_children[i], min, max, has_null, all_null)) { return false; }
+      }
+      return n.begin != n.end;
+    }
+  }
+  return false;
+}
+
+bool lowered_bound_filter::provably_empty(std::int64_t min,
+                                          std::int64_t max,
+                                          bool has_null,
+                                          bool all_null) const noexcept
+{
+  if (_nodes.empty()) { return false; }
+  return eval(0, min, max, has_null, all_null);
+}
+
+void lowered_bound_filter::select_survivors(packed_column_bounds const& bounds,
+                                            std::vector<std::uint32_t>& survivors) const
+{
+  auto const n = bounds.size();
+  survivors.clear();
+  survivors.reserve(n);
+  bool const has_null = !bounds.column_has_no_nulls;
+  for (std::size_t i = 0; i < n; ++i) {
+    // An absent cell never prunes, exactly as a null BaseStatistics does not.
+    if (!bounds.valid[i] || !provably_empty(bounds.mins[i], bounds.maxs[i], has_null, false)) {
+      survivors.push_back(static_cast<std::uint32_t>(i));
+    }
+  }
+}
+
 bool chunk_provably_empty(duckdb::TableFilter const& filter,
                           duckdb::BaseStatistics const& stats) noexcept
 {

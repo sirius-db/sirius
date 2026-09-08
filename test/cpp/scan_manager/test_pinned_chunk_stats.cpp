@@ -1192,4 +1192,192 @@ TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
   auto const ns    = std::chrono::duration<double, std::nano>(t1 - t0).count() / cells;
   WARN("chunk_provably_empty over " << gs.group_count() << " group cells: " << ns
                                     << " ns/cell (empties=" << empties << ")");
+
+  // The packed evaluator on the same cells: pack once, lower once, then a flat loop.
+  sirius::scan_manager::packed_column_bounds packed;
+  packed.type                = LogicalType::INTEGER;
+  packed.column_has_no_nulls = true;
+  packed.mins.reserve(gs.group_count());
+  packed.maxs.reserve(gs.group_count());
+  packed.valid.reserve(gs.group_count());
+  for (auto const& group : gs.groups) {
+    bool const ok = group[0] != nullptr;
+    packed.valid.push_back(ok);
+    packed.mins.push_back(ok ? duckdb::NumericStats::Min(*group[0]).GetValue<int32_t>() : 0);
+    packed.maxs.push_back(ok ? duckdb::NumericStats::Max(*group[0]).GetValue<int32_t>() : 0);
+  }
+  auto lowered = sirius::scan_manager::lowered_bound_filter::lower(*filter, LogicalType::INTEGER);
+  REQUIRE(lowered.has_value());
+  std::vector<std::uint32_t> survivors;
+  auto const t2 = std::chrono::high_resolution_clock::now();
+  for (int r = 0; r < kReps; ++r) {
+    lowered->select_survivors(packed, survivors);
+  }
+  auto const t3  = std::chrono::high_resolution_clock::now();
+  auto const ns2 = std::chrono::duration<double, std::nano>(t3 - t2).count() / cells;
+  WARN("lowered_bound_filter over " << gs.group_count() << " group cells: " << ns2
+                                    << " ns/cell (survivors=" << survivors.size() << ") -> "
+                                    << (ns / ns2) << "x faster");
+}
+
+// ---------------------------------------------------------------------------
+// lowered_bound_filter — the packed evaluator for the group index.
+//
+// It exists because chunk_provably_empty costs ~83 ns/cell and the group index has ~732k cells
+// per pinned lineitem. It replaces DuckDB's CheckStatistics with bounds arithmetic, so the
+// load-bearing test is not "does it prune" but "does it prune EXACTLY what CheckStatistics
+// prunes" — a disagreement in the pruning direction drops rows and returns wrong answers.
+// ---------------------------------------------------------------------------
+
+namespace {
+using sirius::scan_manager::lowered_bound_filter;
+using sirius::scan_manager::packed_column_bounds;
+
+/// Stats shaped exactly as the capture builds them, for cross-checking.
+duckdb::unique_ptr<duckdb::BaseStatistics> int_stats(int32_t lo, int32_t hi, bool has_null)
+{
+  auto s = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+  duckdb::NumericStats::SetMin(s, Value::INTEGER(lo));
+  duckdb::NumericStats::SetMax(s, Value::INTEGER(hi));
+  if (has_null) {
+    s.SetHasNull();
+  } else {
+    s.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+  }
+  return s.ToUnique();
+}
+}  // namespace
+
+TEST_CASE("lowered_bound_filter - agrees with chunk_provably_empty on every input",
+          "[pinned_chunk_stats]")
+{
+  // Every filter shape the allowlist admits, over bounds chosen to straddle each constant:
+  // disjoint below, touching, containing, touching above, disjoint above, and degenerate.
+  std::vector<duckdb::unique_ptr<duckdb::TableFilter>> filters;
+  for (auto cmp_type : {ExpressionType::COMPARE_EQUAL,
+                        ExpressionType::COMPARE_NOTEQUAL,
+                        ExpressionType::COMPARE_LESSTHAN,
+                        ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                        ExpressionType::COMPARE_GREATERTHAN,
+                        ExpressionType::COMPARE_GREATERTHANOREQUALTO}) {
+    for (int32_t c : {-5, 0, 10, 50}) {
+      filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(cmp_type, Value::INTEGER(c)));
+    }
+  }
+  filters.push_back(duckdb::make_uniq<duckdb::IsNullFilter>());
+  filters.push_back(duckdb::make_uniq<duckdb::IsNotNullFilter>());
+  {
+    duckdb::vector<Value> vals{Value::INTEGER(3), Value::INTEGER(11), Value::INTEGER(99)};
+    filters.push_back(duckdb::make_uniq<duckdb::InFilter>(std::move(vals)));
+  }
+  {  // AND(x >= 10, x <= 20)
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(10)));
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(20)));
+    filters.push_back(std::move(conj));
+  }
+  {  // OR(x < 0, x > 40)
+    auto disj = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(40)));
+    filters.push_back(std::move(disj));
+  }
+  {  // OPTIONAL(x = 10) — an optional wrapping one child
+    auto inner =
+      duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::INTEGER(10));
+    filters.push_back(duckdb::make_uniq<duckdb::OptionalFilter>(std::move(inner)));
+  }
+  {  // Nested: AND(OR(x < 0, x > 40), x != 50)
+    auto disj = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(40)));
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    conj->child_filters.push_back(std::move(disj));
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(50)));
+    filters.push_back(std::move(conj));
+  }
+
+  std::vector<std::pair<int32_t, int32_t>> ranges{{-100, -50},
+                                                  {-10, -1},
+                                                  {-5, -5},
+                                                  {0, 0},
+                                                  {0, 10},
+                                                  {5, 5},
+                                                  {10, 10},
+                                                  {10, 20},
+                                                  {11, 39},
+                                                  {40, 100},
+                                                  {50, 50},
+                                                  {-100, 100}};
+
+  std::size_t compared = 0, disagreements = 0;
+  for (auto const& f : filters) {
+    auto lowered = lowered_bound_filter::lower(*f, LogicalType::INTEGER);
+    REQUIRE(lowered.has_value());  // every shape above is on the allowlist
+    for (auto [lo, hi] : ranges) {
+      for (bool has_null : {false, true}) {
+        auto stats           = int_stats(lo, hi, has_null);
+        bool const reference = sirius::scan_manager::chunk_provably_empty(*f, *stats);
+        bool const fast      = lowered->provably_empty(lo, hi, has_null, false);
+        ++compared;
+        if (reference != fast) {
+          ++disagreements;
+          UNSCOPED_INFO("filter type " << static_cast<int>(f->filter_type) << " range [" << lo
+                                       << "," << hi << "] has_null=" << has_null
+                                       << " reference=" << reference << " fast=" << fast);
+        }
+      }
+    }
+  }
+  INFO("compared " << compared << " (filter, range) pairs");
+  REQUIRE(disagreements == 0);
+  REQUIRE(compared > 300);
+}
+
+TEST_CASE("lowered_bound_filter - rejects what the allowlist rejects", "[pinned_chunk_stats]")
+{
+  SECTION("type mismatch between constant and stats type")
+  {
+    auto f =
+      duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(10));
+    REQUIRE_FALSE(lowered_bound_filter::lower(*f, LogicalType::INTEGER).has_value());
+  }
+  SECTION("a childless conjunction")
+  {
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    REQUIRE_FALSE(lowered_bound_filter::lower(*conj, LogicalType::INTEGER).has_value());
+  }
+  SECTION("a dynamic filter is never lowered")
+  {
+    auto dyn = duckdb::make_uniq<duckdb::DynamicFilter>();
+    REQUIRE_FALSE(lowered_bound_filter::lower(*dyn, LogicalType::INTEGER).has_value());
+  }
+}
+
+TEST_CASE("lowered_bound_filter - select_survivors over packed cells", "[pinned_chunk_stats]")
+{
+  packed_column_bounds b;
+  b.type                = LogicalType::INTEGER;
+  b.column_has_no_nulls = true;
+  //         g0      g1       g2        g3 (absent)
+  b.mins  = {0, 100, 200, 0};
+  b.maxs  = {9, 109, 209, 0};
+  b.valid = {true, true, true, false};
+
+  auto f       = duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_LESSTHAN,
+                                                     Value::INTEGER(150));
+  auto lowered = lowered_bound_filter::lower(*f, LogicalType::INTEGER);
+  REQUIRE(lowered.has_value());
+
+  std::vector<std::uint32_t> survivors;
+  lowered->select_survivors(b, survivors);
+  // g0 and g1 can contain values < 150; g2 cannot; g3 has no statistics so it must survive.
+  REQUIRE(survivors == std::vector<std::uint32_t>{0, 1, 3});
 }
