@@ -140,10 +140,11 @@ void test_compact_persistence_and_decode()
   }
   // The persisted packed column is the dense Compact words plus the guard words that keep
   // the decode gather addressable: simpatico_bitunpack_one loads packed[word_in ..
-  // word_in + 2] unconditionally, so the last element reaches two words past the final
-  // live word. Anything wider than this means the OverAllocate encode stride leaked into
-  // the persisted rep.
-  constexpr std::uint64_t kDecodeGuardWords = 3;  // compact_bitpack_packed; covers that reach
+  // word_in + 2] unconditionally, and its 128-bit counterpart reaches word_in + 4 (a
+  // 128-bit value at an arbitrary bit offset spans ceil((128+31)/32) = 5 words), so the
+  // buffer is sized for the wider of the two regardless of dtype. Anything wider than
+  // this means the OverAllocate encode stride leaked into the persisted rep.
+  constexpr std::uint64_t kDecodeGuardWords = 5;  // compact_bitpack_packed; covers that reach
   expect(expected_words == 361, "fixture no longer exercises the intended compact sizes");
   expect(packed_desc.num_rows == expected_words + kDecodeGuardWords,
          "persisted packed column is not compact words plus decode guard");

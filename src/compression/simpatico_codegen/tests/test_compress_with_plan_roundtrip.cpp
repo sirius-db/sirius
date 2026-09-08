@@ -136,8 +136,8 @@ compressed_table roundtrip_once(cudf::table_view input,
 void test_async_mr_free_safety()
 {
   rmm::mr::cuda_async_memory_resource async_mr{};
-  rmm::device_async_resource_ref prev{rmm::mr::get_current_device_resource_ref()};
-  rmm::mr::set_current_device_resource_ref(async_mr);
+  cuda::mr::any_resource<cuda::mr::device_accessible> prev{
+    rmm::mr::set_current_device_resource(async_mr)};
   try {
     auto t = make_int32_table(3, 8192, 21);
     std::string dsl =
@@ -166,10 +166,10 @@ void test_async_mr_free_safety()
     }
     expect(cudaDeviceSynchronize() == cudaSuccess, "async_mr: device sync after async free");
   } catch (...) {
-    rmm::mr::set_current_device_resource_ref(prev);
+    rmm::mr::set_current_device_resource(prev);
     throw;
   }
-  rmm::mr::set_current_device_resource_ref(prev);
+  rmm::mr::set_current_device_resource(prev);
 }
 
 }  // namespace
@@ -1055,6 +1055,52 @@ int main()
                      1,
                      "timestamp_us_delta_bitpack");
       roundtrip_once(tu->view(), "input -> nvcomp_cascaded\n", 1, "timestamp_us_cascaded");
+    }
+
+    {
+      // A DECIMAL128 whose per-chunk residual exceeds 64 bits, under RLE and
+      // standalone.
+      //
+      // Two paths pack a bitpack chunk: the global atomicOr path, whose residual
+      // is the element's unsigned counterpart, and a shared-memory slab path
+      // whose residual is a uint64_t. The slab path is only reached for elements
+      // of 4 bytes or fewer (vals_is_bp_leaf_smem admits int8/int16/int32, and
+      // RLE's `runs` child is always int32_t), so the narrower residual is safe
+      // there today -- this case pins that invariant: relaxing the guard to
+      // admit a wider dtype without widening the residual would truncate here.
+      //
+      // The values straddle 2^64 within a chunk and repeat in runs, so RLE forms
+      // runs and a residual narrowed to 64 bits could not round-trip.
+      auto stream = cudf::get_default_stream();
+      auto mr     = rmm::mr::get_current_device_resource_ref();
+
+      constexpr cudf::size_type kRows = 4096;
+      auto col = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::DECIMAL128, 0},
+                                               kRows,
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream,
+                                               mr);
+      std::vector<__int128> host(static_cast<std::size_t>(kRows));
+      const __int128 base = (static_cast<__int128>(1) << 100);
+      for (cudf::size_type r = 0; r < kRows; ++r) {
+        // Runs of 8 equal values, each run a further 2^70 above the chunk
+        // minimum, so the residual needs more than 64 bits.
+        const __int128 step = static_cast<__int128>(r / 8) * (static_cast<__int128>(1) << 70);
+        host[static_cast<std::size_t>(r)] = base + step;
+      }
+      if (cudaMemcpy(col->mutable_view().head<__int128>(),
+                     host.data(),
+                     host.size() * sizeof(__int128),
+                     cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("decimal128 wide residual: cudaMemcpy failed");
+      cudf::table_view wide({col->view()});
+
+      roundtrip_once(wide,
+                     "input -> rle -> runs, values\n"
+                     "rle.values -> bitpack\n",
+                     1,
+                     "decimal128_rle_bitpack_smem_wide_residual");
+      roundtrip_once(wide, "input -> bitpack\n", 1, "decimal128_bitpack_global_wide_residual");
     }
 
     test_async_mr_free_safety();

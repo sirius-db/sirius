@@ -1188,6 +1188,11 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           << "        __syncthreads();\n"
           // Pack into smem (SM-local atomicOr, no L2 cache contention).
           << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
+          // uint64_t is sufficient here, unlike the global path below: this slab
+          // path is only ever reached with elements of 4 bytes or fewer -- RLE's
+          // `runs` child is always int32_t, and its `values` child takes it only
+          // for int8/int16/int32 (see vals_is_bp_leaf_smem). Widening the guard
+          // there would require widening this residual too.
           << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
           << ") - static_cast<uint64_t>(" << cmin << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
