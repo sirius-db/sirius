@@ -810,10 +810,29 @@ capture. 25 cases / 243 assertions cover the edge cases that matter: short final
 group, partly-null group, off-allowlist type, `group_rows == 0`, shape mismatch, and
 "one group per chunk reproduces the whole-chunk capture".
 
-Still to do in 2a: extend `pinned_zone_maps` from `cell(pos, chunk)` to `cell(pos, chunk, group)`
-plus a `group_rows` field, keeping the all-or-nothing normalization and merge-degradation
-invariants; and make G configurable (default 8). Deferred until 2b needs it, so the storage shape
-is driven by a real consumer.
+**But the storage shape 2a emits does not scale, and that is now measured.** `chunk_group_stats`
+holds one `duckdb::unique_ptr<duckdb::BaseStatistics>` per (group, column), mirroring the coarse
+sidecar. Timed on this box (`[.][pinned_chunk_stats][bench]`, 8 M-row column):
+
+- capture including host-side `BaseStatistics` construction: **~147 ns per group cell**
+- `chunk_provably_empty` (the plan-time probe): **83 ns per group cell**
+
+At 32 chunks those are irrelevant (32 × 83 ns = 2.7 µs). At SF1000 lineitem with G=8 there are
+**732,000 groups**, so one filter column costs ~61 ms of plan time *per query*, and a three-column
+predicate ~180 ms — against a 5.8 s suite. Pruning chunk-first and descending only into survivors
+helps but does not fix an 83 ns primitive.
+
+> **So 2b must not store one `BaseStatistics` per group cell.** It needs a packed columnar form —
+> typed parallel min/max arrays per column, evaluated vectorized or on the GPU — with the DuckDB
+> `TableFilter` lowered once per query into a typed bound rather than re-dispatched per cell.
+> The 2a function stays useful as the *capture* (it is correct, tested, and GPU-side cheap); its
+> output type is what has to change.
+
+This also revises §6.1: keeping the index device-resident is right, but the load-bearing reason is
+**evaluation throughput**, not avoiding an H2D round trip. 732,000 group cells is a GPU-shaped
+problem, not a host-loop-shaped one.
+
+Still to do in 2a: the packed representation above, and making G configurable (default 8).
 
 **2b. Plan (mechanical).** `build_cached_scan_plan` gains a per-surviving-chunk list of surviving
 *group* ids. A chunk with every group pruned drops out exactly as today; a chunk with every group
