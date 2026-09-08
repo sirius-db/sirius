@@ -486,7 +486,44 @@ near zero:
 
 None of that is visible in a benchmark where everything fits in GPU memory. Measuring the host tier
 is therefore not just the next experiment — it is the one that decides whether the project has a
-target at all.
+target at all. **Measured in §3.11: it does.**
+
+### 3.11 Host tier: the project has a target after all (2026-09-08)
+
+Same sweep, same clustered SF1000, `--pin host` instead of `--pin gpu`. This is the tier where a
+skipped chunk saves the payload H2D transfer, not just the decode.
+
+| batch | chunks pruned | suite ON | suite OFF | ON − OFF |
+|---|---|---|---|---|
+| 8 GB | 23% | 11.0396 s | 11.2354 s | **−1.7%** |
+| 2 GB | 50% | **9.6778 s** | 10.4428 s | **−7.3%** |
+
+**−7.3%, against −2.0% for the same arm on the GPU tier — and −0.4% at the GPU tier's production
+batch.** Every one of the deltas is far outside the ~0.8% run-to-run noise floor. The per-query
+pattern is the expected one: the scan-bound queries move most (q12 −0.124 s, q6 −0.101 s,
+q15 −0.083 s, q20 −0.086 s, q14 −0.076 s).
+
+Three things follow.
+
+**(a) The fetch hypothesis (§6) is confirmed empirically, before any implementation.** q6 costs
+0.0413 s on a GPU pin and 0.1143 s on a host pin — 2.8×, and that difference is payload H2D. That
+is the headroom chunk skipping is eating into, and it is why the same mechanism is worth 4× more
+here.
+
+**(b) The batch-size conclusion inverts on this tier.** On the GPU tier smaller batches always lost
+in absolute terms (§3.8: 2 GB 7.29 s vs 8 GB 6.96 s). On the host tier **2 GB-ON (9.678 s) is the
+best configuration measured**, beating 8 GB-OFF (11.235 s) by 13.9% and 2 GB-OFF by 7.3%. Fetch
+granularity matters more than batching overhead once the transfer is on the critical path.
+
+**(c) Phase 2 now has a quantified target at the production batch size.** At 8 GB the coarse
+sidecar prunes 23% for −1.7%. §3.9 says a G = 8 index reaches ≈36% at row-group granularity
+without any pin-time sorting; on the 2 GB evidence (50% → −7.3%) the relationship is steeper than
+linear, so Phase 2 at 8 GB is plausibly worth **−3% to −5%** on the host tier.
+
+**This does not rescue the GPU tier**, and the two should not be conflated. Host-tier compressed is
+still slower in absolute terms (9.68 s vs 6.96 s), so this is not "host tier now wins" — it is
+"chunk skipping recovers a meaningful part of the fetch penalty that makes host tier lose", which
+is what matters for the configurations where data does not fit on the GPU.
 
 ## 4. Granularity, and whether to compress the index
 
@@ -1162,6 +1199,11 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   respectively. `dictionary -> bitpack` *is* usable (cuDF dictionary keys are sorted). Min/max is
   therefore stored **out-of-band**, unconditionally. Granularity settled at a configurable group of
   G simpatico chunks, default G = 8 (8,192 rows); see §4.3.
+- **2026-09-08** — **Host tier measured (§3.11): the project has a target.** Same sweep with
+  `--pin host` gives **−7.3% at 2 GB** and −1.7% at 8 GB, against −2.0%/−0.4% on the GPU tier.
+  2 GB-ON (9.678 s) is the best host configuration measured. Confirms the §6 fetch hypothesis
+  empirically — q6 is 0.041 s GPU-pinned vs 0.114 s host-pinned, and that 2.8× is what skipping
+  eats into. Phase 2 at the production 8 GB batch is plausibly worth −3% to −5% here.
 - **2026-09-08** — **Ceiling measured (§3.9/§3.10).** A G=8 index sees through the interleaving
   for free (groups are 1/128 of a row group, so they inherit a 0.44-day span; 36.54% of rows
   prunable at row-group granularity) — so Phase 2 is an *alternative* to pin-time sorting, not
