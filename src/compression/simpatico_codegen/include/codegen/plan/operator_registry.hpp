@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace simpatico {
@@ -43,6 +44,41 @@ enum class OpId : std::uint8_t {
 // Canonical position of a channel within its operator's fixed channel set.
 using ChannelId = std::uint8_t;
 
+// How a channel is laid out with respect to the 1024-row decode chunk, which is what decides
+// whether a subset of chunks can be served without the rest of the column.
+//
+// Fetching only some chunks of a column is only possible if the result is still a VALID column:
+// the decode must see metadata whose entries correspond one-to-one with the bulk bytes it was
+// given. Bitpack makes that work because `bp_offsets` is not stored — it is scanned from the
+// `chunk_count`/`chunk_bits` that were loaded (src/bridge/offsets_cumsum.cu) — so a compacted
+// metadata array plus the matching packed bytes decodes correctly on its own.
+enum class ChannelLayout : std::uint8_t {
+  /// One entry per 1024-row chunk, in chunk order. A subset is formed by keeping the surviving
+  /// entries: fixed stride, so the byte range of any chunk is arithmetic.
+  per_chunk_metadata,
+  /// Variable-width bytes whose per-chunk extent is not derivable from the channel itself. A
+  /// subset needs an out-of-band group-to-byte table.
+  bulk_chunked,
+  /// No per-chunk structure at all — column-wide state (a dictionary's keys), or a codec's opaque
+  /// output with its own internal chunking. Always fetched whole; a column whose bulk channel is
+  /// opaque cannot be partially fetched.
+  whole_column,
+};
+
+// Layout of the PERSISTED BUFFER named @p buffer within @p id, or nullopt when the operator
+// persists no such buffer.
+//
+// Deliberately keyed on buffer names, not on OperatorInfo::channels: those are the operator's
+// output PORTS (delta's "differences" names the edge to its child), whereas what a fetch has to
+// address is what actually lands in the payload (delta persists "delta_first"). The two coincide
+// for bitpack and diverge for every preprocessing op.
+[[nodiscard]] std::optional<ChannelLayout> buffer_layout(OpId id, std::string_view buffer);
+
+// True when a node of type @p id can be served as a subset of its 1024-row chunks: it persists at
+// least one buffer, every persisted buffer is classified, and none is whole_column. False means
+// "fetch it whole", which is always correct and merely forgoes the saving.
+[[nodiscard]] bool supports_chunk_subset(OpId id);
+
 // One row of the operator registry: the single source of truth tying an
 // operator's DSL/diagnostic name, canonical output-channel order, and
 // classification together. make_compressor / reconstruct_representation /
@@ -59,6 +95,10 @@ struct OperatorInfo {
   bool terminal;       // emits an opaque byte payload that ends a cascade branch
   bool preprocessing;  // reshapes data without necessarily shrinking it
   bool codegen;        // inverted by the JIT codegen decode path, not a rep's decompress()
+  // The buffers this operator PERSISTS, and how each sits relative to the 1024-row decode chunk.
+  // Independent of `channels` above, which names output ports; see buffer_layout(). Empty means
+  // "not classified", which makes the operator ineligible for chunk-subset serving.
+  std::vector<std::pair<std::string_view, ChannelLayout>> persisted_buffers;
 };
 
 // The full registry, in catalog order.
