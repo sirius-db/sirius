@@ -1145,7 +1145,7 @@ capture. 25 cases / 243 assertions cover the edge cases that matter: short final
 group, partly-null group, off-allowlist type, `group_rows == 0`, shape mismatch, and
 "one group per chunk reproduces the whole-chunk capture".
 
-**But the storage shape 2a emits does not scale, and that is now measured.** `chunk_group_stats`
+**The storage shape 2a emits does not scale — measured, and now fixed in 2b (`56295d4e`).** `chunk_group_stats`
 holds one `duckdb::unique_ptr<duckdb::BaseStatistics>` per (group, column), mirroring the coarse
 sidecar. Timed on this box (`[.][pinned_chunk_stats][bench]`, 8 M-row column):
 
@@ -1162,6 +1162,15 @@ helps but does not fix an 83 ns primitive.
 > `TableFilter` lowered once per query into a typed bound rather than re-dispatched per cell.
 > The 2a function stays useful as the *capture* (it is correct, tested, and GPU-side cheap); its
 > output type is what has to change.
+
+**Done (`56295d4e`):** `packed_column_bounds` (parallel min/max/valid arrays) plus
+`lowered_bound_filter` (a `TableFilter` lowered once into a flat node array, evaluated with bounds
+arithmetic). **79.9 → 3.4 ns/cell, 23×** — ~2.5 ms per filter column for SF1000 lineitem instead of
+~61 ms. Correctness is defended two ways: `lower()` gates on the same `filter_safe_for_stats`
+allowlist the `BaseStatistics` path uses, so the two cannot disagree about *which* filters are
+evaluable; and a cross-check test runs both evaluators over 336 (filter, range) pairs — every
+admitted shape, ranges straddling each constant, with and without nulls — requiring zero
+disagreements. Still host-side; a GPU evaluator remains possible if 3.4 ns/cell ever matters.
 
 This also revises §8.1: keeping the index device-resident is right, but the load-bearing reason is
 **evaluation throughput**, not avoiding an H2D round trip. 732,000 group cells is a GPU-shaped
