@@ -710,7 +710,8 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
       const std::size_t len = it->second.length;
       const bool is_off     = (b.field == "rle_runs_offsets" || b.field == "bp_offsets");
       const bool is_perchk =
-        (b.field == "chunk_min" || b.field == "chunk_bits" || b.field == "chunk_count" ||
+        (b.field == "chunk_min" || b.field == "chunk_divisors" || b.field == "chunk_bits" ||
+         b.field == "chunk_count" ||
          b.field == "references" || b.field == "offsets" || is_off);
       const std::size_t need = static_cast<std::size_t>(num_chunks) + (is_off ? 1u : 0u);
       if (is_perchk && len < need) {
@@ -1408,6 +1409,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       switch (node.op) {
         case cc::OpKind::Bitpack: {
           const auto i_min  = find_buffer_idx(spec.buffers, node_id, "chunk_min");
+          const auto i_divs = find_buffer_idx(spec.buffers, node_id, "chunk_divisors");
           const auto i_cnt  = find_buffer_idx(spec.buffers, node_id, "chunk_count");
           const auto i_bits = find_buffer_idx(spec.buffers, node_id, "chunk_bits");
           const auto i_pkd  = find_buffer_idx(spec.buffers, node_id, "packed");
@@ -1466,6 +1468,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                          std::move(bufs[i_min]),
                                                          rmm::device_buffer(0, stream),
                                                          0);
+          auto divs_col = std::make_unique<cudf::column>(bp_elem_type,
+                                                         static_cast<cudf::size_type>(num_chunks),
+                                                         std::move(bufs[i_divs]),
+                                                         rmm::device_buffer(0, stream),
+                                                         0);
           auto cnt_col  = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                                         static_cast<cudf::size_type>(num_chunks),
                                                         std::move(bufs[i_cnt]),
@@ -1506,6 +1513,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           rep->buffers.emplace_back("chunk_count", std::move(cnt_col));
           rep->buffers.emplace_back("chunk_bits", std::move(bits_col));
           rep->buffers.emplace_back("packed", std::move(pkd_col));
+          // Trailing, so a reader that knows only the first four still binds them.
+          rep->buffers.emplace_back("chunk_divisors", std::move(divs_col));
           builder->leaves.emplace(origin.plan_node, std::move(rep));
           break;
         }

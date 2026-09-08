@@ -352,6 +352,8 @@ class Walker {
 
 struct SimpaticoMin { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a < b ? a : b; } };
 struct SimpaticoMax { template <class T> __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a > b ? a : b; } };
+__device__ __forceinline__ unsigned long long simpatico_gcd_u64(unsigned long long a, unsigned long long b) { while (b != 0ULL) { unsigned long long t = a % b; a = b; b = t; } return a; }
+struct SimpaticoGcd { __device__ __forceinline__ unsigned long long operator()(const unsigned long long& a, const unsigned long long& b) const { return simpatico_gcd_u64(a, b); } };
 
 using ::cuda::std::int8_t;
 using ::cuda::std::int16_t;
@@ -1044,6 +1046,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   const std::string bits_v  = "bits_" + idstr;
   // The chunk range and the pack accumulator must be as wide as the element:
   // at 16 bytes a uint64_t would silently truncate the high half.
+  const std::string sh_div      = "sh_bpdiv_" + idstr;
+  const std::string v_div       = "bp_div_" + idstr;
+  const std::string p_divs      = "chunk_divisors_" + idstr;
   const std::string bp_utype    = unsigned_counterpart(op_dt->elem_size);
   const std::string bp_width_fn = (op_dt->elem_size == 16) ? "simpatico_bit_width_u128"
                                                            : "simpatico_bit_width_u64";
@@ -1058,6 +1063,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
   add_param("uint8_t*", p_bits);
   add_param("uint32_t*", p_pkd);
   add_param("uint32_t*", p_lws);  // sharded live-word counter (16-shard)
+  // Trailing: `chunk_divisors` is appended after every pre-existing channel so a
+  // plan or payload that knows only the original four stays valid.
+  add_param(in.elem_type + "*", p_divs);
 
   const std::size_t stride_words =
     static_cast<std::size_t>(::codegen::kChunkSize) * op_dt->elem_size / sizeof(std::uint32_t);
@@ -1081,6 +1089,8 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
              nc * stride_words,
              /*no_pre_zero=*/use_smem);
   add_buffer(id, "lw_shards", sizeof(std::uint32_t), kMaxBitsShards * kShardStride);
+  // Trailing, matching the param order above.
+  add_buffer(id, "chunk_divisors", op_dt->elem_size, nc);
   // Note: no per-chunk live_words buffer — live_packed_bytes is derived
   // from lw_shards (DtoH only 2 KB instead of num_chunks×4 B).
   // compact_in_place() reconstructs per-chunk offsets from chunk_bits+chunk_count.
@@ -1108,17 +1118,34 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << ");\n"
         << "        if (" << bp_len << " <= 0) {\n"
         << "            if (tid == 0) { " << p_min << "[chunk_id] = " << in.elem_type << "{0}; "
-        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1; }\n"
+        << p_cnt << "[chunk_id] = 0; " << p_bits << "[chunk_id] = 1; "
+        << p_divs << "[chunk_id] = " << in.elem_type << "{1}; }\n"
         << "            break;\n"
         << "        }\n"
         // Pass 1: combined min+max in a single grid-stride loop.
         << "        " << in.elem_type << " _lmin = " << emax << ";\n"
         << "        " << in.elem_type << " _lmax = static_cast<" << in.elem_type << ">("
         << op_dt->min_literal << ");\n"
+        << "        unsigned long long _lg_" << idstr << " = 0ULL;\n"
+        << "        int _gwide_" << idstr << " = 0;\n"
         << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
         << "            " << in.elem_type << " _vi = (" << at_lane(in.read_expr, "i") << ");\n"
         << "            if (_vi < _lmin) _lmin = _vi;\n"
         << "            if (_vi > _lmax) _lmax = _vi;\n"
+        // The GCD rides this pass rather than getting one of its own: that is
+        // the entire reason for folding it in here instead of leaving it to a
+        // separate `factor` node, which costs an extra read of the column and a
+        // division evaluated twice per element (it rewrites its child's
+        // read_expr, which bitpack evaluates in both this pass and the pack).
+        << "            " << bp_utype << " _mu = static_cast<" << bp_utype << ">(_vi);\n"
+        << "            if (_vi < static_cast<" << in.elem_type << ">(0)) _mu = "
+        << "static_cast<" << bp_utype << ">(0) - _mu;\n"
+        << (op_dt->elem_size == 16
+              ? "            if ((_mu >> 64) != 0) _gwide_" + idstr + " = 1;\n"
+                "            else _lg_" + idstr + " = simpatico_gcd_u64(_lg_" + idstr +
+                  ", static_cast<unsigned long long>(_mu));\n"
+              : "            _lg_" + idstr + " = simpatico_gcd_u64(_lg_" + idstr +
+                  ", static_cast<unsigned long long>(_mu));\n")
         << "        }\n"
         << "        typedef cub::BlockReduce<" << in.elem_type << ", 128> BR_" << idstr << ";\n"
         << "        __shared__ typename BR_" << idstr << "::TempStorage br_ts_" << idstr << ";\n"
@@ -1131,12 +1158,37 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
         << ").Reduce(_lmax, SimpaticoMax()); if (tid == 0) " << sh_max << "_b = _m; }\n"
         << "        __syncthreads();\n"
         << "        const " << in.elem_type << " " << cmin << " = " << sh_min << "_b;\n"
-        << "        const " << bp_utype << " " << max_r << " = static_cast<" << bp_utype
-        << ">(" << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin << ");\n"
+        << "        typedef cub::BlockReduce<unsigned long long, 128> GBR_" << idstr << ";\n"
+        << "        __shared__ typename GBR_" << idstr << "::TempStorage g_br_ts_" << idstr
+        << ";\n"
+        << "        __shared__ " << in.elem_type << " " << sh_div << "_b;\n"
+        << "        __shared__ int " << sh_div << "_wide;\n"
+        << "        if (tid == 0) " << sh_div << "_wide = 0;\n"
+        << "        __syncthreads();\n"
+        << "        if (_gwide_" << idstr << " != 0) " << sh_div << "_wide = 1;\n"
+        << "        {\n"
+        << "            unsigned long long _g = GBR_" << idstr << "(g_br_ts_" << idstr
+        << ").Reduce(_lg_" << idstr << ", SimpaticoGcd());\n"
+        << "            __syncthreads();\n"
+        // Fall back to the no-op divisor 1 for: a magnitude too wide for the
+        // 64-bit GCD, an all-zero chunk (GCD 0), and a GCD that does not fit the
+        // signed divisor slot.
+        << "            if (tid == 0) {\n"
+        << "                if (" << sh_div << "_wide != 0 || _g == 0ULL || _g > "
+        << "static_cast<unsigned long long>(" << op_dt->max_literal << ")) _g = 1ULL;\n"
+        << "                " << sh_div << "_b = static_cast<" << in.elem_type << ">(_g);\n"
+        << "            }\n"
+        << "        }\n"
+        << "        __syncthreads();\n"
+        << "        const " << in.elem_type << " " << v_div << " = " << sh_div << "_b;\n"
+        << "        const " << bp_utype << " " << max_r << " = (static_cast<" << bp_utype
+        << ">(" << sh_max << "_b) - static_cast<" << bp_utype << ">(" << cmin
+        << ")) / static_cast<" << bp_utype << ">(" << v_div << ");\n"
         << "        const int32_t " << bits_v << " = " << bp_width_fn << "("
         << "static_cast<" << bp_utype << ">(" << max_r << "));\n"
         << "        if (tid == 0) {\n"
         << "            " << p_min << "[chunk_id] = " << cmin << ";\n"
+        << "            " << p_divs << "[chunk_id] = " << v_div << ";\n"
         << "            " << p_cnt << "[chunk_id] = " << bp_len << ";\n"
         << "            " << p_bits << "[chunk_id] = static_cast<uint8_t>(" << bits_v << ");\n"
         << "            const uint32_t _pw = static_cast<uint32_t>((static_cast<int32_t>(" << bp_len
@@ -1193,8 +1245,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
           // `runs` child is always int32_t, and its `values` child takes it only
           // for int8/int16/int32 (see vals_is_bp_leaf_smem). Widening the guard
           // there would require widening this residual too.
-          << "            uint64_t _rv = static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
-          << ") - static_cast<uint64_t>(" << cmin << ");\n"
+          << "            uint64_t _rv = (static_cast<uint64_t>(" << at_lane(in.read_expr, "i")
+          << ") - static_cast<uint64_t>(" << cmin << ")) / static_cast<uint64_t>(" << v_div
+          << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"
@@ -1220,9 +1273,9 @@ void Walker::emit_bitpack(const ::codegen::jit::FusedTree& node, LaneInput in, b
     // One 32-bit IMAD (_ibits) shared for both _tw and _tb replaces
     // the original two independent 64-bit multiplies (~4 vs ~8 cycles).
     body_ << "        for (int32_t i = tid; i < " << bp_len << "; i += 128) {\n"
-          << "            " << bp_utype << " _rv = static_cast<" << bp_utype
+          << "            " << bp_utype << " _rv = (static_cast<" << bp_utype
           << ">(" << at_lane(in.read_expr, "i") << ") - static_cast<" << bp_utype
-          << ">(" << cmin << ");\n"
+          << ">(" << cmin << ")) / static_cast<" << bp_utype << ">(" << v_div << ");\n"
           << "            const int32_t _ibits = i * static_cast<int32_t>(" << bits_v << ");\n"
           << "            int32_t _tw = _ibits >> 5;\n"
           << "            int32_t _tb = _ibits & 31;\n"

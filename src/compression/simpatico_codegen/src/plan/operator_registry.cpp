@@ -42,7 +42,7 @@ std::vector<OperatorInfo> const& operator_registry()
   static const std::vector<OperatorInfo> kTable = {
     {OpId::Delta,          "delta",           {"differences"},                                                        true,  false, true,  true},
     {OpId::Rle,            "rle",             {"runs", "values"},                                                     true,  false, true,  true},
-    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true},
+    {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"},                   true,  false, false, true},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true},
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false},

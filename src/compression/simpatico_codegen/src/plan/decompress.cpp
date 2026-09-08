@@ -97,7 +97,8 @@ std::string codegen_kind_for_compressor(std::string const& c)
 // list → unknown kind.
 std::vector<std::string> consumed_slots(std::string const& kind)
 {
-  if (kind == "bitpack") return {"chunk_min", "chunk_count", "chunk_bits", "packed"};
+  if (kind == "bitpack")
+    return {"chunk_min", "chunk_count", "chunk_bits", "packed", "chunk_divisors"};
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};

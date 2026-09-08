@@ -517,15 +517,15 @@ template <> struct simpatico_unsigned<__int128> { using type = unsigned __int128
 // constant-chunk (bits==0) short-circuit returning the chunk minimum.
 template <class T>
 __device__ __forceinline__ T simpatico_bp_at(const uint32_t* packed_base,
-                                          int32_t bits, T minv, int32_t idx) {
+                                          int32_t bits, T minv, T divv, int32_t idx) {
     using U = typename simpatico_unsigned<T>::type;
     if (bits == 0) return minv;
     if constexpr (sizeof(T) == 16) {
         const unsigned __int128 v = simpatico_bitunpack_one_128(packed_base, bits, idx);
-        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(divv) * static_cast<U>(v));
     } else {
         const uint64_t v = simpatico_bitunpack_one(packed_base, bits, idx);
-        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(v));
+        return static_cast<T>(static_cast<U>(minv) + static_cast<U>(divv) * static_cast<U>(v));
     }
 }
 
@@ -568,9 +568,11 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   const std::string idstr = std::to_string(id);
 
   const std::string p_min  = "chunk_min_" + idstr;
+  const std::string p_divs = "chunk_divisors_" + idstr;
   const std::string p_bits = "chunk_bits_" + idstr;
   const std::string p_pkd  = "packed_" + idstr;
   const std::string v_min  = "bpmin_" + idstr;
+  const std::string v_div  = "bpdiv_" + idstr;
   const std::string v_bits = "bpbits_" + idstr;
   const std::string v_base = "bpbase_" + idstr;
 
@@ -578,15 +580,18 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   add_param("const " + elem_type + "* __restrict__", p_min);
   add_param("const uint8_t* __restrict__", p_bits);
   add_param("const uint32_t* __restrict__", p_pkd);
+  add_param("const " + elem_type + "* __restrict__", p_divs);
   add_buffer(id, "chunk_min", esize);
   add_buffer(id, "chunk_bits", sizeof(std::uint8_t));
   add_buffer(id, "packed", sizeof(std::uint32_t));
+  add_buffer(id, "chunk_divisors", esize);
 
   // Per-chunk scalar prelude (loaded once per block).
   body_ << "    // --- node " << id << ": Bitpack (" << elem_type << ") value source ---\n"
         << "    const int32_t " << v_bits << " = static_cast<int32_t>(" << p_bits
         << "[chunk_id]);\n"
-        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n";
+        << "    const " << elem_type << " " << v_min << " = " << p_min << "[chunk_id];\n"
+        << "    const " << elem_type << " " << v_div << " = " << p_divs << "[chunk_id];\n";
 
   // Decode reads the Compact per-chunk ``bp_offsets`` layout; every stored
   // bitpack rep is dense (the fused encode path compacts in place).
@@ -600,7 +605,8 @@ ValueSource Walker::bitpack_value_source(const ::codegen::jit::FusedTree& node,
   ValueSource vs;
   vs.elem_type = elem_type;
   vs.read_expr =
-    "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", (__POS__))";
+    "simpatico_bp_at(" + p_pkd + " + " + v_base + ", " + v_bits + ", " + v_min + ", " + v_div +
+    ", (__POS__))";
   return vs;
 }
 
@@ -900,7 +906,8 @@ void Walker::emit_str_split_meta(const ::codegen::jit::FusedTree& node)
           << "[chunk_id + 1],\n"
           << "                                static_cast<int32_t>(chunk_bits_" << idstr
           << "[chunk_id + 1]),\n"
-          << "                                chunk_min_" << idstr << "[chunk_id + 1], 0);\n";
+          << "                                chunk_min_" << idstr << "[chunk_id + 1],\n"
+          << "                                chunk_divisors_" << idstr << "[chunk_id + 1], 0);\n";
   } else {
     body_ << "        next0 = delta_first_" << idstr << "[chunk_id + 1];\n";
   }
@@ -1210,13 +1217,14 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
     if (vit->second->op == ::codegen::OpKind::Bitpack) {
       body_ << "        struct " << vstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            " << elem_type << " min; int32_t base;\n"
+            << "            " << elem_type << " min; " << elem_type << " div; int32_t base;\n"
             << "            __device__ __forceinline__ " << elem_type
             << " operator()(int32_t idx) const noexcept {\n"
-            << "                return simpatico_bp_at(packed + base, bits, min, idx);\n"
+            << "                return simpatico_bp_at(packed + base, bits, min, div, idx);\n"
             << "            }\n"
             << "        } " << vread << " { packed_" << v_child_id << ", bpbits_" << v_child_id
-            << ", bpmin_" << v_child_id << ", bpbase_" << v_child_id << " };\n";
+            << ", bpmin_" << v_child_id << ", bpdiv_" << v_child_id << ", bpbase_"
+            << v_child_id << " };\n";
     } else {
       // Raw leaf
       body_ << "        struct " << vstruct << " {\n"
@@ -1237,14 +1245,15 @@ void Walker::emit_rle_producer(const ::codegen::jit::FusedTree& node,
       bitpack_value_source(*rit->second, "int32_t");  // emits kernel params
       body_ << "        struct " << cstruct << " {\n"
             << "            const uint32_t* packed; int32_t bits;\n"
-            << "            int32_t min; int32_t base;\n"
+            << "            int32_t min; int32_t div; int32_t base;\n"
             << "            __device__ __forceinline__ int32_t operator()(int32_t idx) const "
                "noexcept {\n"
             << "                return static_cast<int32_t>(simpatico_bp_at(packed + base, bits, "
-               "min, idx));\n"
+               "min, div, idx));\n"
             << "            }\n"
             << "        } " << cread << " { packed_" << c_child_id << ", bpbits_" << c_child_id
-            << ", bpmin_" << c_child_id << ", bpbase_" << c_child_id << " };\n"
+            << ", bpmin_" << c_child_id << ", bpdiv_" << c_child_id << ", bpbase_"
+            << c_child_id << " };\n"
             << "        ::codegen::block_rle_decompress_fv<" << elem_type << ", "
             << ::codegen::kChunkSize << ", " << tbs_ << ">(\n"
             << "            " << vread << ", " << cread << ",\n"

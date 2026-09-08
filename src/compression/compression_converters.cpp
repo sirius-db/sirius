@@ -487,27 +487,6 @@ std::string default_plan_for(cudf::column_view const& col, rmm::cuda_stream_view
   const auto type = col.type();
   if (type.id() == cudf::type_id::STRING) { return default_string_plan(col, stream); }
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
-  // DECIMAL128 takes `ans`, not bitpack, even though the codegen can now encode
-  // it (see the __int128 support in simpatico) and bitpack wins by a wide margin
-  // on an isolated column: 8.49x against 5.12x, and faster both ways.
-  //
-  // That ranking inverts on real spill batches. Measured on TPC-H q18/SF3000,
-  // same query, same config, only this line differing:
-  //
-  //                    encodes   achieved ratio   below-gate declines
-  //   ans                 1109            3.38x            3 @ 1.02x
-  //   bitpack              403            2.42x          225 @ 1.30x
-  //
-  // bitpack's ratio depends on the per-chunk value range, and a spilled partial
-  // aggregate's chunks are far wider than a fully aggregated column's. At 1.30x
-  // most batches fall under the 1.33x gate (max_compressed_fraction 0.75),
-  // decline, and spill uncompressed -- 244.3 GB to disk against ans's 43.5 GB.
-  // `ans` is distribution-adaptive and does not have that cliff.
-  //
-  // The codegen support is still worth having: it is what makes DECIMAL128
-  // eligible for cascades and for decompression pushdown, neither of which `ans`
-  // can do. It just should not be the blind default here.
-  if (type.id() == cudf::type_id::DECIMAL128) { return "input -> ans\n"; }
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 }
 

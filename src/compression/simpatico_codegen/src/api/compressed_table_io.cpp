@@ -329,10 +329,15 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 12: a per-column validity sidecar record sits beside each column's plan tree (see
 //     push_validity), so a nullable column compresses instead of falling back.
 //
+// 14: Bitpack carries a trailing `chunk_divisors` channel (the folded-in common
+//     divisor). It is trailing so plan text naming only the original four
+//     channels stays valid, but a v13 payload has no such buffer, so the exact
+//     version match is what keeps an old payload from being bound without it.
+//
 // 13: a Bitpack "packed" buffer carries five decode guard words rather than three,
 //     because the 128-bit gather spans five uint32 words. The count is part of the
 //     buffer's num_rows, so a v12 payload read with a v13 decoder would over-read.
-static constexpr std::uint8_t kVersion = 13;
+static constexpr std::uint8_t kVersion = 14;
 
 // Per-column validity record, written right after num_rows:
 //
