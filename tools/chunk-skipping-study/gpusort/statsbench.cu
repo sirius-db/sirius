@@ -1,4 +1,4 @@
-// Phase 2 feasibility: what does computing per-GROUP min/max cost at pin time?
+// Feasibility: what does computing per-GROUP min/max cost at pin time?
 //
 // W2 today runs one cudf::minmax per (pin chunk, column). A group index needs
 // n_groups = chunk_rows / (G*1024) min/max pairs per column instead. This times

@@ -1003,7 +1003,7 @@ TEST_CASE("build_cached_scan_plan - duplicate column names never alias (position
 // compute_pinned_group_stats — the per-group (G * 1024 rows) capture.
 // Same allowlist and same "null cell never prunes" contract as the whole-chunk
 // capture; the difference is one segmented reduction per column instead of one
-// reduction per group. See CHUNK_SKIPPING_PLAN.md §4.3.0.
+// reduction per group.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1137,7 +1137,7 @@ TEST_CASE("compute_pinned_group_stats - nulls and degenerate input", "[pinned_ch
   }
 }
 
-// Not a correctness test: a timing probe for the Phase 2b design question — does one
+// Not a correctness test: a timing probe for the representation question — does one
 // duckdb::BaseStatistics object per (group, column) scale to the group counts a real pin
 // produces? Tagged [.] so it only runs when named explicitly.
 TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",

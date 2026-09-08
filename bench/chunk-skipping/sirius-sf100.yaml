@@ -1,8 +1,8 @@
-# Phase 1 of CHUNK_SKIPPING_PLAN.md: SF100 on GB300, all tables GPU-tier compressed.
+# Zone-map pruning sweep: SF100 on GB300, all tables GPU-tier compressed.
 #
 # scan_task_batch_size is DELIBERATELY left out — run-sweep.sh injects it, because the sweep
 # uses it as a granularity dial: smaller batches => smaller pin chunks => finer zone maps,
-# which is what a per-group index would do, without building one. See §7 Phase 1.
+# which is what a per-group index would do, without building one.
 sirius:
     topology:
         num_gpus: 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 1 of CHUNK_SKIPPING_PLAN.md.
+# Zone-map pruning: benefit vs. pin-chunk granularity, at SF100.
 #
 # Sweeps scan_task_batch_size (a free granularity dial: smaller batch => smaller pin chunk =>
 # finer zone maps) crossed with enable_pinned_zone_map_pruning on/off, on the clustered SF100
