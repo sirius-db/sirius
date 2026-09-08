@@ -221,6 +221,16 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
+  /// Finer-grained companion to @c zone_maps: per chunk, per cached column, min/max bounds over
+  /// fixed-size groups of rows (@c group_rows). Chunk-major, then positional with
+  /// cache_info.column_ids, exactly like @c zone_maps' cells.
+  ///
+  /// Empty when the pin captured none, which simply means no sub-chunk pruning — the coarse
+  /// zone_maps still apply. Kept separate from @c zone_maps rather than folded into it so the
+  /// existing sidecar's merge and degradation invariants are untouched.
+  std::vector<std::vector<packed_column_bounds>> group_bounds;
+  /// Rows per group in @c group_bounds; 0 when absent.
+  std::size_t group_rows{0};
   /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
   /// the column's values were proven distinct across the whole pinned table at
   /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
@@ -348,9 +358,34 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
+/// A contiguous half-open row range within one pinned chunk.
+struct chunk_row_range {
+  std::size_t chunk;      ///< index into the entry's chunks
+  std::size_t begin_row;  ///< first row, relative to the chunk
+  std::size_t end_row;    ///< one past the last row
+
+  [[nodiscard]] std::size_t rows() const noexcept { return end_row - begin_row; }
+  [[nodiscard]] bool operator==(chunk_row_range const&) const = default;
+};
+
 struct cached_scan_plan {
   std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
   std::size_t pruned{0};
+
+  /// Surviving row ranges within the surviving chunks, coalesced, in chunk then row order.
+  ///
+  /// Empty means "serve each surviving chunk whole" — the behaviour before group statistics
+  /// existed, and still the case whenever an entry carries no per-group bounds. When non-empty it
+  /// refines @c survivor_chunk_indices: every range's chunk appears in that list, and a chunk with
+  /// no range in this list is fully pruned. Adjacent surviving groups are merged, so a chunk whose
+  /// groups all survive yields exactly one range covering it.
+  ///
+  /// A consumer that cannot serve a partial chunk may ignore this entirely and serve whole chunks;
+  /// that is always sound, just less selective.
+  std::vector<chunk_row_range> survivor_row_ranges;
+  /// Rows the row ranges exclude within chunks that survived at chunk granularity. Zero when no
+  /// per-group bounds were available.
+  std::size_t rows_pruned_within_chunks{0};
 };
 
 /// Build the cached-serving databatch_provider for @p entry over

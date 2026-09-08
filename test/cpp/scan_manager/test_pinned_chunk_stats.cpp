@@ -1381,3 +1381,140 @@ TEST_CASE("lowered_bound_filter - select_survivors over packed cells", "[pinned_
   // g0 and g1 can contain values < 150; g2 cannot; g3 has no statistics so it must survive.
   REQUIRE(survivors == std::vector<std::uint32_t>{0, 1, 3});
 }
+
+// ---------------------------------------------------------------------------
+// build_cached_scan_plan — refining surviving chunks into surviving row ranges.
+//
+// The coarse pass keeps a chunk whose min/max overlaps the filter at all. Per-group bounds then
+// say WHICH rows of that chunk can match. The properties that matter to every consumer:
+// refinement only ever narrows an already-surviving chunk, adjacent surviving groups coalesce so
+// an unprunable chunk costs nothing, and an entry with no group bounds keeps the old whole-chunk
+// behaviour.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// Per-group bounds for one column of one chunk: group g covers [base + 10*g, base + 10*g + 9],
+/// so groups are disjoint and strictly increasing — a filter's cut point is unambiguous.
+sirius::scan_manager::packed_column_bounds ascending_groups(int32_t base, std::size_t n_groups)
+{
+  sirius::scan_manager::packed_column_bounds b;
+  b.type                = LogicalType::INTEGER;
+  b.column_has_no_nulls = true;
+  for (std::size_t g = 0; g < n_groups; ++g) {
+    b.mins.push_back(base + static_cast<int64_t>(10 * g));
+    b.maxs.push_back(base + static_cast<int64_t>(10 * g) + 9);
+    b.valid.push_back(true);
+  }
+  return b;
+}
+
+/// A one-column, one-chunk entry whose chunk min/max spans all its groups, so the coarse pass
+/// always keeps the chunk and only the refinement can narrow it.
+pinned_entry make_group_entry(std::size_t n_groups, std::size_t group_rows)
+{
+  pinned_entry entry;
+  entry.cache_info.column_ids.emplace_back(duckdb::ColumnIndex(3));
+  entry.cache_info.names.push_back("c0");
+  entry.tier = cucascade::memory::Tier::HOST;
+  entry.host_chunks.resize(1);
+
+  auto const lo = 0;
+  auto const hi = static_cast<int32_t>(10 * n_groups - 1);
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> capture(1);
+  capture[0].push_back(
+    make_stats(LogicalType::INTEGER, Value::INTEGER(lo), Value::INTEGER(hi)).ToUnique());
+  entry.zone_maps = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 1);
+
+  entry.group_rows = group_rows;
+  entry.group_bounds.push_back({ascending_groups(0, n_groups)});
+  return entry;
+}
+}  // namespace
+
+TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
+          "[pinned_chunk_stats]")
+{
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+
+  SECTION("a filter cutting mid-chunk yields the surviving prefix only")
+  {
+    // 8 groups of 100 rows spanning [0,79]; "< 25" can only match groups 0..2.
+    auto const entry = make_group_entry(8, 100);
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});  // chunk still survives coarsely
+    REQUIRE(plan.survivor_row_ranges.size() == 1);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 300});
+    REQUIRE(plan.rows_pruned_within_chunks == 500);
+  }
+
+  SECTION("disjoint surviving groups produce separate ranges")
+  {
+    // OR(< 5, > 74) keeps group 0 and group 7 only.
+    auto const entry = make_group_entry(8, 100);
+    auto disj        = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(5)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(74)));
+    auto fs   = make_filter_set(0, std::move(disj));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_row_ranges.size() == 2);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 100});
+    REQUIRE(plan.survivor_row_ranges[1] == sirius::scan_manager::chunk_row_range{0, 700, 800});
+    REQUIRE(plan.rows_pruned_within_chunks == 600);
+  }
+
+  SECTION("an unprunable filter coalesces to exactly one range covering the chunk")
+  {
+    auto const entry = make_group_entry(8, 100);
+    auto fs =
+      make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(0)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_row_ranges.size() == 1);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 800});
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+
+  SECTION("an entry without group bounds keeps the whole-chunk behaviour")
+  {
+    auto entry = make_group_entry(8, 100);
+    entry.group_bounds.clear();
+    entry.group_rows = 0;
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+    REQUIRE(plan.survivor_row_ranges.empty());
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+
+  SECTION("an absent group cell keeps its rows")
+  {
+    auto entry                        = make_group_entry(8, 100);
+    entry.group_bounds[0][0].valid[5] = false;  // no statistics for group 5
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    // Groups 0..2 match the filter; group 5 has no evidence, so it must survive too.
+    REQUIRE(plan.survivor_row_ranges.size() == 2);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 300});
+    REQUIRE(plan.survivor_row_ranges[1] == sirius::scan_manager::chunk_row_range{0, 500, 600});
+  }
+
+  SECTION("the all-pruned sentinel chunk is never refined")
+  {
+    // A filter no group can satisfy prunes the chunk coarsely; the sentinel that keeps the
+    // pipeline alive must not then be narrowed to nothing.
+    auto const entry = make_group_entry(8, 100);
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(10000)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+    REQUIRE(plan.survivor_row_ranges.empty());
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+}

@@ -2713,6 +2713,94 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      std::move(dynamic_filters));
 }
 
+namespace {
+
+/// Narrow each surviving chunk to the row ranges its per-group bounds cannot rule out.
+/// @p usable is the same filter list the chunk-level pass used, so a filter that could not be
+/// evaluated coarsely is not evaluated here either.
+template <typename UsableFilter>
+void build_survivor_row_ranges(pinned_entry const& entry,
+                               std::vector<UsableFilter> const& usable,
+                               cached_scan_plan& plan)
+{
+  // Lower each filter once for the whole plan rather than once per group cell: the lowered form
+  // is what makes a 700k-group index affordable to evaluate at all.
+  struct lowered_entry {
+    lowered_bound_filter filter;
+    std::size_t entry_pos;
+  };
+  std::vector<lowered_entry> lowered;
+  lowered.reserve(usable.size());
+  for (auto const& uf : usable) {
+    if (uf.entry_pos >= entry.zone_maps.column_count()) { continue; }
+    auto low = lowered_bound_filter::lower(*uf.filter, entry.zone_maps.column_type(uf.entry_pos));
+    // A filter the fast path cannot lower simply does not narrow anything; the coarse pass
+    // already applied it.
+    if (low) { lowered.push_back({std::move(*low), uf.entry_pos}); }
+  }
+  if (lowered.empty()) { return; }
+
+  std::size_t const group_rows = entry.group_rows;
+  std::vector<chunk_row_range> ranges;
+  std::size_t rows_dropped = 0;
+
+  for (auto const chunk : plan.survivor_chunk_indices) {
+    if (chunk >= entry.group_bounds.size()) {
+      // No bounds for this chunk: serve it whole. Row count is unknown here, so emit no range and
+      // fall back for the entire plan — a partially-refined plan would let a consumer skip rows it
+      // has no evidence about.
+      return;
+    }
+    auto const& per_column = entry.group_bounds[chunk];
+    if (per_column.empty()) { return; }
+    std::size_t const n_groups = per_column.front().size();
+    if (n_groups == 0) { return; }
+
+    // A group survives unless SOME filter proves it empty — the same AND-over-filters the
+    // chunk-level pass applies.
+    std::vector<bool> keep(n_groups, true);
+    for (auto const& le : lowered) {
+      if (le.entry_pos >= per_column.size()) { continue; }
+      auto const& bounds = per_column[le.entry_pos];
+      if (bounds.size() != n_groups) { continue; }  // shape disagreement: cannot narrow safely
+      bool const has_null = !bounds.column_has_no_nulls;
+      for (std::size_t g = 0; g < n_groups; ++g) {
+        if (!keep[g] || !bounds.valid[g]) { continue; }  // absent cell never prunes
+        if (le.filter.provably_empty(bounds.mins[g], bounds.maxs[g], has_null, false)) {
+          keep[g] = false;
+        }
+      }
+    }
+
+    // Coalesce runs of surviving groups into row ranges. The final group of a chunk may be short;
+    // the chunk's true row count is not known here, so the last range is clamped by the caller's
+    // serve path (a range past the end of a chunk must be treated as ending at the chunk).
+    std::size_t const chunk_rows = n_groups * group_rows;
+    std::size_t g                = 0;
+    std::size_t kept_rows        = 0;
+    while (g < n_groups) {
+      if (!keep[g]) {
+        ++g;
+        continue;
+      }
+      std::size_t const run_begin = g;
+      while (g < n_groups && keep[g]) {
+        ++g;
+      }
+      auto const begin_row = run_begin * group_rows;
+      auto const end_row   = std::min(g * group_rows, chunk_rows);
+      ranges.push_back({chunk, begin_row, end_row});
+      kept_rows += end_row - begin_row;
+    }
+    rows_dropped += chunk_rows - kept_rows;
+  }
+
+  plan.survivor_row_ranges       = std::move(ranges);
+  plan.rows_pruned_within_chunks = rows_dropped;
+}
+
+}  // namespace
+
 cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
                                         duckdb::TableFilterSet const* table_filters,
                                         duckdb::vector<duckdb::ColumnIndex> const* column_ids)
@@ -2790,12 +2878,31 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   }
   plan.pruned = n_chunks - plan.survivor_chunk_indices.size();
 
+  // Refine the surviving chunks into surviving ROW RANGES, when the entry carries per-group
+  // bounds. A chunk that survived only because SOME of its rows can match still has groups that
+  // provably cannot, and those are what a consumer able to serve a partial chunk skips.
+  //
+  // Two properties the rest of the system depends on:
+  //  - This only ever narrows what an already-surviving chunk serves. It never resurrects a
+  //    chunk the coarse pass pruned, and it never drops a chunk entirely (a chunk whose every
+  //    group prunes would have been caught by the coarse pass, since the chunk's own min/max
+  //    bounds every group's).
+  //  - Ranges are coalesced, so a chunk with no prunable group yields exactly one range covering
+  //    it and costs a consumer nothing over serving the chunk whole.
+  if (!entry.group_bounds.empty() && entry.group_rows > 0) {
+    build_survivor_row_ranges(entry, usable, plan);
+  }
+
   // Sentinel chunk: an all-pruned scan must not become a zero-batch scan (zero
   // splits => zero tasks => pipeline completion never fires — the hazard both
   // disk paths guard against). Keep chunk 0; the GPU filter empties it.
   if (plan.survivor_chunk_indices.empty()) {
     plan.survivor_chunk_indices.push_back(0);
     plan.pruned = n_chunks - 1;
+    // The sentinel exists to keep the pipeline alive, not to serve rows; leave it unrefined so a
+    // partial-serve consumer cannot narrow it to nothing and reintroduce the zero-batch hazard.
+    plan.survivor_row_ranges.clear();
+    plan.rows_pruned_within_chunks = 0;
   }
   return plan;
 }
