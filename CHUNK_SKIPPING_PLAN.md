@@ -503,6 +503,19 @@ batch.** Every one of the deltas is far outside the ~0.8% run-to-run noise floor
 pattern is the expected one: the scan-bound queries move most (q12 −0.124 s, q6 −0.101 s,
 q15 −0.083 s, q20 −0.086 s, q14 −0.076 s).
 
+**Extended and reproduced** (second independent process, 512 MB added):
+
+| batch | chunks pruned | suite ON | suite OFF | ON − OFF |
+|---|---|---|---|---|
+| 8 GB | 23% | 11.0396 s | 11.2354 s | −1.7% |
+| **2 GB** | 50% | **9.6250 / 9.6778 s** | 10.4733 / 10.4428 s | **−8.1% / −7.3%** |
+| 512 MB | 69% | 10.4173 s | 11.9232 s | −12.6% |
+
+The 2 GB arm reproduces across two processes (−7.3%, −8.1%), so it is solid. And the curve has the
+same shape as the GPU tier, just shifted: **512 MB prunes far more (69%) and shows the largest
+delta (−12.6%), yet is slower in absolute terms** (10.42 s vs 9.63 s) because batching overhead
+overtakes the saving. **2 GB-ON at 9.625 s is the optimum.**
+
 Three things follow.
 
 **(a) The fetch hypothesis (§6) is confirmed empirically, before any implementation.** q6 costs
@@ -515,10 +528,11 @@ in absolute terms (§3.8: 2 GB 7.29 s vs 8 GB 6.96 s). On the host tier **2 GB-O
 best configuration measured**, beating 8 GB-OFF (11.235 s) by 13.9% and 2 GB-OFF by 7.3%. Fetch
 granularity matters more than batching overhead once the transfer is on the critical path.
 
-**(c) Phase 2 now has a quantified target at the production batch size.** At 8 GB the coarse
-sidecar prunes 23% for −1.7%. §3.9 says a G = 8 index reaches ≈36% at row-group granularity
-without any pin-time sorting; on the 2 GB evidence (50% → −7.3%) the relationship is steeper than
-linear, so Phase 2 at 8 GB is plausibly worth **−3% to −5%** on the host tier.
+**(c) Phase 2 has a quantified target, and it is the same argument as §7 Phase 1: you cannot buy
+granularity with batch size.** 512 MB reaches a 69% prune rate but pays for it in batching
+overhead. The index's job is to deliver 512 MB's prune rate at 2 GB's batching cost. Scaling the
+2 GB arm's saving (50% → 0.85 s) up to a 69% rate predicts ≈1.17 s off 10.47 s, i.e. **≈9.3 s
+against today's best of 9.625 s — roughly a further −3%** on the host tier.
 
 **This does not rescue the GPU tier**, and the two should not be conflated. Host-tier compressed is
 still slower in absolute terms (9.68 s vs 6.96 s), so this is not "host tier now wins" — it is
