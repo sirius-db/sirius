@@ -38,7 +38,23 @@ export SIRIUS_PRE_SQL="SET pin_table_compression = true; \
 SET pin_table_input_compression_plan_dir = '$PLANS'; \
 SET expression_evaluator_strategy = 'ast_jit'"
 
+# Refuse to measure against a busy GPU. bench-lock.sh serialises OUR runs, but anything started
+# outside it (another worktree's test binary, a stray process) still contends -- and a contended
+# run either OOMs at pool init or silently reports inflated times.
+require_idle_gpu() {
+  for _ in $(seq 1 180); do
+    local mem util
+    mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader | tr -dc '0-9')
+    util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | tr -dc '0-9')
+    if [ "${mem:-9999}" -lt 2048 ] && [ "${util:-100}" -lt 20 ]; then return 0; fi
+    echo "waiting for an idle GPU (used ${mem} MiB, util ${util}%)"
+    sleep 20
+  done
+  echo "ERROR: GPU still busy after 60 min; refusing to measure"; exit 1
+}
+
 cd "$REPO"
+require_idle_gpu
 for batch in $BATCHES; do
   for prune in on off; do
     if [ "$prune" = on ]; then flag=true; else flag=false; fi
@@ -54,6 +70,7 @@ for batch in $BATCHES; do
     grep -q "enable_pinned_zone_map_pruning: $flag" "$cfg" || { echo "ERROR: config injection failed"; exit 1; }
     grep -q "scan_task_batch_size: $batch" "$cfg" || { echo "ERROR: batch injection failed"; exit 1; }
 
+    require_idle_gpu
     name="sf1000_$(basename "$DATA")_${TIER}_${batch}_prune-${prune}"
     echo "################ $name"
     pixi run python test/tpch_performance/performance_test.py \
