@@ -290,6 +290,73 @@ std::string format_output_names(std::vector<compressible_output> const& outs)
   return oss.str();
 }
 
+namespace {
+
+// True when every element of `col` is the integer 1, read through the column's
+// underlying storage -- a fixed-point column's data IS its mantissa, so the
+// same comparison works for DECIMAL divisors without materialising a scale.
+// Dispatches on storage width because a `divisors` channel takes its width from
+// the rendered buffer (it can sit under a channel narrower than the column).
+//
+// Checked host-side: this translation unit is compiled by the host compiler, and
+// the channel is one element per 1024-row chunk (~780 KB for a 100M-row column),
+// so the copy is far cheaper than the encode that just produced it.
+bool all_ones(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  auto const n = col.size();
+  if (n == 0) return true;
+  auto const width = cudf::size_of(col.type());
+  if (width == 0 || width > 8) return false;
+
+  std::vector<std::uint8_t> host(static_cast<std::size_t>(n) * width);
+  if (cudaMemcpyAsync(host.data(),
+                      col.head<std::uint8_t>() + static_cast<std::size_t>(col.offset()) * width,
+                      host.size(),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+
+  auto scan = [n](auto const* p) {
+    for (cudf::size_type i = 0; i < n; ++i)
+      if (p[i] != 1) return false;
+    return true;
+  };
+  switch (width) {
+    case 1: return scan(reinterpret_cast<std::int8_t const*>(host.data()));
+    case 2: return scan(reinterpret_cast<std::int16_t const*>(host.data()));
+    case 4: return scan(reinterpret_cast<std::int32_t const*>(host.data()));
+    case 8: return scan(reinterpret_cast<std::int64_t const*>(host.data()));
+    default: return false;
+  }
+}
+
+// Ask an operator's own output whether it actually did anything. Only ops that
+// can answer honestly are listed; everything else reports false and is left to
+// the byte-size rules.
+//
+// `factor` can answer exactly: its `divisors` channel is the per-chunk GCD, so
+// an all-ones channel means every chunk was divided by 1 and the transform is a
+// bit-exact identity. Detecting it here rather than by failing the operator
+// keeps `factor` safe to name in a hand-written plan -- a column whose GCD
+// happens to be 1 on one partition must still compress, not abort.
+bool trial_is_identity(std::string const& name,
+                       std::vector<compressible_output> const& outputs,
+                       rmm::cuda_stream_view stream)
+{
+  if (name != "factor") return false;
+  for (auto const& o : outputs)
+    if (o.name == "divisors") return all_ones(o.view, stream);
+  return false;
+}
+
+}  // namespace
+
 operator_trial try_operator(std::string const& name,
                             cudf::column_view col,
                             rmm::cuda_stream_view stream,
@@ -369,7 +436,8 @@ operator_trial try_operator(std::string const& name,
     for (auto const& o : r.outputs) {
       r.output_bytes += column_size_bytes_ex(o.view, stream);
     }
-    r.success = true;
+    r.no_benefit = trial_is_identity(name, r.outputs, stream);
+    r.success    = true;
   } catch (std::exception const& e) {
     cudaGetLastError();  // clear any CUDA error state left by the exception
     r.error_message = e.what();
@@ -576,6 +644,14 @@ exploration_result explore_column_compression(cudf::column_view input,
                       << "x)\n";
           }
 
+          // Preprocessing ops are exempt from the must-shrink rule below --
+          // they earn their place at the NEXT level, not this one (`factor`
+          // measures 0.999x on its own and only pays off once bitpack sees the
+          // narrowed values). That waiver is only justified when the op
+          // transformed something: one that reports itself an identity would
+          // otherwise occupy a beam slot all the way to the depth where it is
+          // finally revealed to be worthless.
+          if (trial.no_benefit) continue;
           bool is_pre = is_preprocessing_compressor(op_name);
           if (trial.output_bytes >= pend.size_bytes && !is_pre) continue;
 

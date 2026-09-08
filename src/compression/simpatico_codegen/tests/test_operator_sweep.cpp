@@ -182,8 +182,22 @@ std::unique_ptr<cudf::table> make_uint16_table(int num_rows, int seed)
 // lockstep with build_fixtures() below — the orchestrator sizes/labels work by
 // index into this list, so a shorter list silently drops the trailing fixtures
 // from the sweep.
-constexpr std::array<char const*, 11> kFixtureNames = {
-  "i16", "i32", "i64", "u16", "u32", "u64", "f32", "f64", "u8_binary", "date", "string"};
+// MUST stay in the same order as build_fixtures(): build_work() indexes into
+// the fixture vector by position in this array, so a name added to one and not
+// the other silently attributes every later fixture's chains to the wrong
+// column.
+constexpr std::array<char const*, 12> kFixtureNames = {"i16",
+                                                       "i32",
+                                                       "i64",
+                                                       "i64_scaled",
+                                                       "u16",
+                                                       "u32",
+                                                       "u64",
+                                                       "f32",
+                                                       "f64",
+                                                       "u8_binary",
+                                                       "date",
+                                                       "string"};
 
 struct fixture {
   std::string name;
@@ -205,6 +219,9 @@ std::vector<fixture> build_fixtures(rmm::cuda_stream_view stream, int n)
   add_numeric("i16", make_int16_table(n, 9));
   add_numeric("i32", make_int32_table(1, n, 1));
   add_numeric("i64", make_int64_table(1, n, 2));
+  // Values sharing a common factor -- the shape `factor` exists to exploit, and
+  // the only fixture on which it is not an identity.
+  add_numeric("i64_scaled", make_scaled_int64_table(1, n, 12, 100));
   add_numeric("u16", make_uint16_table(n, 10));
   add_numeric("u32", make_uint32_table(1, n, 7));
   add_numeric("u64", make_uint64_table(1, n, 8));
@@ -459,6 +476,20 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
   auto fixtures = build_fixtures(stream, n);
   auto work     = build_work();
 
+  // build_work() addresses fixtures positionally; if the two lists ever drift,
+  // every chain after the insertion point runs against the wrong column and
+  // still "passes". Check the correspondence instead of trusting the comment.
+  if (fixtures.size() != kFixtureNames.size()) {
+    throw std::runtime_error("fixture count " + std::to_string(fixtures.size()) +
+                             " != kFixtureNames size " + std::to_string(kFixtureNames.size()));
+  }
+  for (std::size_t i = 0; i < fixtures.size(); ++i) {
+    if (fixtures[i].name != kFixtureNames[i]) {
+      throw std::runtime_error("fixture " + std::to_string(i) + " is '" + fixtures[i].name +
+                               "' but kFixtureNames says '" + kFixtureNames[i] + "'");
+    }
+  }
+
   // Minimum applicability: the sweep treats any op failure as "inapplicable"
   // and skips silently, so a regression that breaks a whole (op, dtype) class
   // would otherwise just shrink coverage. Assert on shard 0 that the ops each
@@ -488,6 +519,38 @@ int run_shard(unsigned shard_idx, unsigned n_shards)
     must_apply("f64", {"alp", "alp_rd", "for", "bitpack"});
     must_apply("u8_binary", {"delta", "rle", "for", "zigzag", "bitpack"});
     must_apply("date", {"delta", "rle", "for", "zigzag", "bitpack", "ans", "bitcomp"});
+    must_apply("i64_scaled", {"factor", "delta", "bitpack"});
+
+    // `factor` self-reports whether it did anything, via the no_benefit flag on
+    // the trial. The explorer relies on this to stop carrying an identity
+    // `factor` through the beam: on its own the op measures ~0.999x on ANY
+    // input (the quotients keep the source width and `divisors` adds bytes), so
+    // byte size alone cannot tell a useful application from a useless one, and
+    // preprocessing ops are deliberately exempt from the must-shrink rule.
+    //
+    // Both directions matter. A false positive silently drops the one operator
+    // that can exploit a factorable column; a false negative puts the waiver
+    // back where it was. Note this is NOT an applicability failure -- the op
+    // succeeds either way, so that an explicit plan naming `factor` still
+    // compresses correctly on a column whose GCD happens to be 1.
+    auto no_benefit_is = [&](char const* fixture_name, bool expected) {
+      for (auto const& f : fixtures) {
+        if (f.name != fixture_name) continue;
+        auto trial = simpatico::try_operator("factor", f.view, stream, mr);
+        if (!trial.success) {
+          throw std::runtime_error(std::string("factor failed on fixture '") + fixture_name +
+                                   "': " + trial.error_message);
+        }
+        if (trial.no_benefit != expected) {
+          throw std::runtime_error(std::string("factor no_benefit on fixture '") + fixture_name +
+                                   "': expected " + (expected ? "true" : "false") + ", got " +
+                                   (trial.no_benefit ? "true" : "false"));
+        }
+      }
+    };
+    no_benefit_is("i64_scaled", false);  // every value a multiple of 100
+    no_benefit_is("i64", true);          // consecutive residues -> per-chunk GCD 1
+    no_benefit_is("i32", true);
   }
 
   std::vector<sweep_stats> per_fixture(fixtures.size());

@@ -99,6 +99,13 @@ size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view 
 struct operator_trial {
   bool success = false;
   std::string error_message;
+  /// The op applied cleanly but transformed nothing -- it is a bit-exact
+  /// identity on this data. Distinct from `!success`: the operator is valid
+  /// here and an explicit plan naming it still compresses correctly; it simply
+  /// has no value to a search. Only reported by operators that can tell (see
+  /// `try_operator`); false everywhere else, so it never suppresses a candidate
+  /// on a guess.
+  bool no_benefit = false;
   std::vector<compressible_output> outputs;         ///< typed channels of the resulting rep
   std::size_t output_bytes = 0;                     ///< sum of logical channel byte sizes
   std::shared_ptr<compressed_representation> repr;  ///< keeps the outputs' views valid
