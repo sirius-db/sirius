@@ -15,14 +15,17 @@
  */
 
 #include "catch.hpp"
+#include "duckdb.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <dlfcn.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -33,6 +36,30 @@ using namespace sirius::telemetry;
 extern "C" int InitializeInjectionNvtx2(void* get_export_table);
 
 namespace {
+
+class scoped_env_restore {
+ public:
+  explicit scoped_env_restore(const char* name) : name_(name)
+  {
+    if (auto const* value = std::getenv(name)) { original_ = value; }
+  }
+
+  ~scoped_env_restore()
+  {
+    if (original_) {
+      ::setenv(name_.c_str(), original_->c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+  scoped_env_restore(scoped_env_restore const&)            = delete;
+  scoped_env_restore& operator=(scoped_env_restore const&) = delete;
+
+ private:
+  std::string name_;
+  std::optional<std::string> original_;
+};
 
 std::string uuid_str(const uuid::UUID& id) { return std::string(uuid::to_string(id)); }
 
@@ -68,6 +95,21 @@ bool any_line_with_all(const std::vector<std::string>& lines,
 }
 
 }  // namespace
+
+TEST_CASE("SIRIUS_DISABLE skips automatic NVTX injection discovery",
+          "[telemetry_context][isolated_context]")
+{
+  scoped_env_restore restore_disable{"SIRIUS_DISABLE"};
+  scoped_env_restore restore_nvtx_path{"NVTX_INJECTION64_PATH"};
+  ::setenv("SIRIUS_DISABLE", "1", /*overwrite=*/1);
+  ::unsetenv("NVTX_INJECTION64_PATH");
+
+  {
+    duckdb::DuckDB db(nullptr);
+  }
+
+  CHECK(std::getenv("NVTX_INJECTION64_PATH") == nullptr);
+}
 
 TEST_CASE("static NVTX injection path resolves the host initializer", "[telemetry_context]")
 {

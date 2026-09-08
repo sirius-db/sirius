@@ -3519,6 +3519,15 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
+/// Whether Super Sirius runtime initialization is disabled for this process.
+/// The extension still loads and registers its surface in this mode so CPU
+/// baselines and the legacy gpu_processing path remain available.
+static bool sirius_is_disabled() noexcept
+{
+  auto const* value = std::getenv("SIRIUS_DISABLE");
+  return value != nullptr && std::string_view{value} != "0";
+}
+
 /// Configure NVTX runtime discovery before the process's first NVTX call.
 ///
 /// An existing NVTX_INJECTION64_PATH remains authoritative. Otherwise, an
@@ -3612,10 +3621,13 @@ static void maybe_set_nvtx_injection_path()
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  bool const sirius_disabled = sirius_is_disabled();
+
   // libcudf is mapped before this point, but its NVTX state is still fresh
   // because its constructors do not call NVTX. Configure discovery before any
-  // Sirius initialization can make the first NVTX call in an image.
-  maybe_set_nvtx_injection_path();
+  // Sirius initialization can make the first NVTX call in an image. A disabled
+  // Sirius must not publish either the DSO path or the static-host sentinel.
+  if (!sirius_disabled) { maybe_set_nvtx_injection_path(); }
 
   sirius::util::install_segfault_backtrace_handler();
 
@@ -3669,10 +3681,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
   // extension binary itself may still be loaded).
-  bool const sirius_disabled = [] {
-    auto* val = std::getenv("SIRIUS_DISABLE");
-    return val != nullptr && std::string(val) != "0";
-  }();
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 
