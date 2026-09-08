@@ -542,9 +542,9 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
-| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error (`spdlog` only) |
+| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
-| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds (`spdlog` only) |
+| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
 - **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
   `sirius_log_level` and `sirius_log_flush_seconds`.
