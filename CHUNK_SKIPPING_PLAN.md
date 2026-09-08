@@ -631,29 +631,51 @@ because every scan batch pays payload H2D → sync → decode on the critical pa
 
 The question is whether a row range maps to a computable byte range. For simpatico it does, exactly.
 
-### 6.1 Row range → byte range is exact, from ~0.01% of the payload
+### 6.1 Byte-range addressing is a SECOND out-of-band table, not a derived bitpack fact
 
-`src/compression/simpatico_codegen/src/bridge/offsets_cumsum.cu:9-11`:
+The index that decides *which groups survive* is out-of-band min/max at G = 8 groups (§4.3). Fetch
+skipping needs a second, separate thing: a map from **group id → byte range** in each bulk leaf
+buffer. It is tempting to derive that from what bitpack already stores, and for a bitpack root you
+can — `bp_offsets[c]` is an exclusive scan of `(chunk_count[c]*chunk_bits[c]+31)>>5`
+(`src/compression/simpatico_codegen/src/bridge/offsets_cumsum.cu:9-11`), so 5 B/chunk of existing
+metadata locates every chunk exactly.
 
-> derive `n_words[c]` from `(chunk_count[c]*chunk_bits[c]+31)>>5`, exclusive-scan into
-> `bp_offsets[0..num_chunks)`
+**But that is a bitpack channel, and depending on it repeats the mistake §2/W1 exists to avoid.**
+The plan is chosen by an explorer optimising ratio and decode throughput
+(`src/compression/simpatico_codegen/src/explore/compression_explorer.cpp`); nothing keeps a column
+on a bitpack root, and a plan change would silently remove the addressing. The min/max index is
+stored out-of-band for exactly this reason, and the byte-range map has to be too.
 
-So the byte offset of any 1024-row chunk inside a `packed` buffer is a prefix sum over two tiny
-per-chunk arrays: `chunk_count` (4 B/chunk) and `chunk_bits` (1 B/chunk). For a 189 M-row pin chunk
-that is 184,571 × 5 B ≈ **923 KB of addressing metadata against ~8 GB of payload — 0.01%**. Read
-those two arrays, scan them, and you know exactly which bytes any group needs. `bp_offsets` is not
-even persisted: it is synthesized on device from data already stored.
+**So: the encoder emits an explicit per-group byte-offset table per bulk leaf buffer, at the same
+G = 8 granularity as the index.** Stored, not derived. Properties:
 
-Addressability by plan root, for the shipped TPC-H plans:
+- **Granularity must match the index.** We skip at group granularity, so byte ranges are needed at
+  group granularity — 23,072 entries for a 189 M-row pin chunk at G = 8, not the 184,571 that
+  per-1024-chunk addressing would need.
+- **Cost is negligible.** 8 B per group per bulk buffer. Only *bulk* buffers need one — the small
+  per-chunk metadata channels are fetched whole. For 16 lineitem columns (~20 bulk buffers) that is
+  23,072 × 8 B × 20 ≈ **3.7 MB against ~8 GB of payload, 0.046%**. Larger than the 5 B/chunk
+  bitpack derivation, and worth it to be plan-independent.
+- **It degrades gracefully, like a missing zone-map cell.** An operator that cannot be
+  group-addressed simply emits no table, and its buffers are fetched whole. No correctness
+  consequence, just no fetch saving for that column.
 
-| root | addressable per 1024-row chunk? | why |
+Which operators *can* emit one, for the shipped TPC-H plans:
+
+| root | can emit a group→byte table? | why |
 |---|---|---|
-| `input -> bitpack` | **exact** | `bp_offsets` above. Covers the dates, quantity, discount, partkey, suppkey |
-| `delta -> bitpack` | **exact** | `delta_first[c]` is a *per-chunk anchor*, not a running global prefix (`encode/jit/renderer.cpp:403,443`), so chunks decode independently. Covers `l_orderkey`, `o_orderkey` |
-| `dictionary -> bitpack(indices)` | **exact** for the indices | the key set is per-pin-chunk and small — fetch it whole |
-| `str_split -> bitpack(offsets)` | two-step | offsets are addressable, but `chars` needs `offsets[start..end]` first: one extra dependent round trip |
-| `ans` / `snappy` / `lz4` / `bitcomp` | **no** | opaque blobs with codec-internal chunking; would need groups aligned to codec blocks |
-| `identity` | trivial | fixed stride |
+| `input -> bitpack` | yes | variable width per chunk, but the encoder knows every boundary as it writes |
+| `delta -> bitpack` | yes | `delta_first[c]` is a *per-chunk anchor*, not a running global prefix (`encode/jit/renderer.cpp:403,443`), so groups decode independently |
+| `dictionary -> bitpack(indices)` | yes for the indices | the key set is per-pin-chunk and small — fetch it whole |
+| `str_split -> bitpack(offsets)` | offsets yes, `chars` two-step | `chars` is data-dependent: you need `offsets[start..end]` before you know the char range. One extra dependent round trip |
+| `ans` / `snappy` / `lz4` / `bitcomp` | **no** | codec-internal chunking we do not control; would need groups aligned to codec blocks |
+| `identity` | trivial | fixed stride, computable without a table |
+
+**This does put a third axis on plan choice.** Whether a column can skip fetch at all depends on
+its plan, and the explorer currently optimises only ratio and decode throughput — so a
+ratio-optimal plan can silently cost fetch skippability, the same way §5.1 notes clustering changes
+what the ratio-optimal plan is. Worth surfacing to the explorer eventually; not a blocker, since
+the degradation is per-column and graceful.
 
 ### 6.2 The plumbing already has the right shape
 
@@ -702,9 +724,11 @@ exists on that path: `PageIndex` / `ColumnIndex` / `OffsetIndex` are present in 
 (parquet-rs writes them by default) but are **never read** by either Sirius or DuckDB (§1). So
 sub-row-group skipping is not merely coarse on the parquet path, it is absent.
 
-A simpatico file would carry exact **1024-row** addressability for free, from `chunk_count` and
-`chunk_bits` it already stores (§6.1) — roughly 0.01% of the payload, and three orders of magnitude
-finer than a parquet row group.
+A simpatico file would carry exact **group-granular** addressability (G = 8, i.e. 8,192 rows) from
+the byte-offset table of §6.1 — ~0.046% of the payload, and still two orders of magnitude finer
+than a parquet row group. Note this is a table the writer must emit, not something derivable from
+any particular compression plan; §6.1 explains why deriving it from bitpack's channels would be a
+mistake.
 
 ### 7.2 The S3 case, where the gap is widest
 
@@ -817,13 +841,14 @@ Here the index should be **kept in device memory and additionally persisted**. T
   value — a disk round trip is orders of magnitude more expensive than the ~1:850 index, so the
   break-even is not close.
 - **Persisted copy (with the payload):** the `.hpln` format is self-describing per leaf
-  (`.../api/compressed_table_io.hpp:14-39`) and `payload_offset` is already per-buffer, so index
-  buffers serialize alongside the data with no format work. For W1 metadata this is automatic —
-  `chunk_min`/`chunk_bits` are already part of the serialized payload.
+  (`.../api/compressed_table_io.hpp:14-39`) and `payload_offset` is already per-buffer, so both the
+  min/max index and the §6.1 group→byte table serialize alongside the data as ordinary buffers,
+  with no format surgery.
 
 The persisted copy is also what enables **partial re-read**: `read_compressed_table_subset_from_memory`
 (`compressed_table_io.hpp:137-143`) already does column-granular partial fetch via `payload_offset`;
-adding chunk-range granularity would let a spilled table read back only surviving chunks. That is
+adding group-range granularity — using the §6.1 table — would let a spilled table read back only
+surviving groups. That is
 the natural follow-on and the one place `range_slice` (`DECODE_PUSHDOWN_PLAN.md:722-723`) becomes
 necessary.
 
@@ -1037,6 +1062,12 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
 - **Open (§7.2):** does S3 actually reward finer ranges, or does internal striping mean a pruned
   ranged GET costs the backend the same as an unpruned one? A standalone probe against a real
   bucket settles it without touching Sirius, and gates any simpatico-ingestion work.
+- **Open (§6.1):** the group→byte table is new format surface. Confirm it can be added as an
+  ordinary per-leaf buffer (the `.hpln` header is self-describing, so this should be additive and
+  leave old files readable), and decide whether the encoder emits it always or only when asked.
+- **Open (§6.1):** should the compression explorer learn about fetch-skippability as a third
+  objective alongside ratio and decode throughput? Today a ratio-optimal plan can silently pick a
+  codec whose buffers cannot be group-addressed.
 - **Open (§7.3):** the coalescing policy — merge ranges whose gap is under G bytes, widen G until
   the request count is acceptable. G and N need measuring; `align_and_coalesce` already takes a
   caller-supplied alignment, so the mechanism exists and only the policy is missing.
