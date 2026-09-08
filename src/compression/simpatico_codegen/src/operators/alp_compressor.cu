@@ -7,9 +7,9 @@
 //   integers             INT32  (f32 input) / INT64 (f64 input) — main payload
 //   exceptions           FLOAT32 / FLOAT64 — raw values that failed lossless encode
 //   exception_positions  INT32  — global row indices of exceptions
-//   metadata             UINT16 — one per 1024-vector: (exp_idx << 8) | fac_idx
+//   metadata             UINT16 — one per 1024-vector: the scale exponent d
 //
-// Decode: v[i] = integers[i] * 10^f / 10^e; then scatter exceptions.
+// Decode: v[i] = integers[i] * 10^-d; then scatter exceptions.
 //
 // Implementation note: the kernels and host orchestrator are templated on
 // the float type T; per-type constants live in __constant__ symbols selected
@@ -52,150 +52,94 @@ constexpr int kAlpVectorSize = 1024;
 // alp_traits<T> selects between them via the static accessor methods below.
 // -----------------------------------------------------------------------------
 
+// The 10^k tables below are the ONLY scaling constants either direction uses,
+// and every entry is exactly representable in its float type (10^k is exact up
+// to k=10 in f32 and k=22 in f64, both beyond the ranges searched here). Encode
+// and decode therefore scale by multiplying and DIVIDING by exact powers of
+// ten, never by a rounded reciprocal 10^-k: `enc * 0.01` and `enc / 100.0`
+// differ by an ulp on ordinary decimal data, and since the encoder's
+// round-trip check rejects any value that does not reproduce bit-exactly, that
+// ulp turns into a stored exception. On TPC-H l_extendedprice as f64 the
+// reciprocal form flagged 13.83% of rows as exceptions; the division form
+// flags 0.00%.
 namespace host_consts_f32 {
-// FLOAT32: e ∈ [0..10], f ∈ [0..min(e, 9)]. FACT has 10 entries because
-// 10^10 doesn't fit in int32.
-constexpr float kExp[11]    = {1.0f,
-                               10.0f,
-                               100.0f,
-                               1000.0f,
-                               10000.0f,
-                               100000.0f,
-                               1000000.0f,
-                               10000000.0f,
-                               100000000.0f,
-                               1000000000.0f,
-                               10000000000.0f};
-constexpr float kFrac[11]   = {1.0f,
-                               0.1f,
-                               0.01f,
-                               0.001f,
-                               0.0001f,
-                               0.00001f,
-                               0.000001f,
-                               0.0000001f,
-                               0.00000001f,
-                               0.000000001f,
-                               0.0000000001f};
-constexpr int32_t kFact[10] = {
-  1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
-constexpr int kMaxExp  = 10;
-constexpr int kMaxFrac = 9;
-// 1+2+...+10 + 10 = 65 combos.
-constexpr int kComboCount = 65;
+// FLOAT32: e ∈ [0..10], f ∈ [0..min(e, 9)].
+constexpr float kExp[11] = {1.0f,
+                            10.0f,
+                            100.0f,
+                            1000.0f,
+                            10000.0f,
+                            100000.0f,
+                            1000000.0f,
+                            10000000.0f,
+                            100000000.0f,
+                            1000000000.0f,
+                            10000000000.0f};
+// Candidate scales are 10^d for d in [0..10]; see alp_encode_value for why the
+// paper's (e, f) pair collapses to their difference.
+constexpr int kCandCount = 11;
 }  // namespace host_consts_f32
 
 namespace host_consts_f64 {
-// FLOAT64: e ∈ [0..18], f ∈ [0..min(e, 18)]. FACT goes up to 10^18 (fits in
-// int64; max int64 ≈ 9.22e18).
-constexpr double kExp[19]   = {1e0,
-                               1e1,
-                               1e2,
-                               1e3,
-                               1e4,
-                               1e5,
-                               1e6,
-                               1e7,
-                               1e8,
-                               1e9,
-                               1e10,
-                               1e11,
-                               1e12,
-                               1e13,
-                               1e14,
-                               1e15,
-                               1e16,
-                               1e17,
-                               1e18};
-constexpr double kFrac[19]  = {1e-0,
-                               1e-1,
-                               1e-2,
-                               1e-3,
-                               1e-4,
-                               1e-5,
-                               1e-6,
-                               1e-7,
-                               1e-8,
-                               1e-9,
-                               1e-10,
-                               1e-11,
-                               1e-12,
-                               1e-13,
-                               1e-14,
-                               1e-15,
-                               1e-16,
-                               1e-17,
-                               1e-18};
-constexpr int64_t kFact[19] = {1LL,
-                               10LL,
-                               100LL,
-                               1000LL,
-                               10000LL,
-                               100000LL,
-                               1000000LL,
-                               10000000LL,
-                               100000000LL,
-                               1000000000LL,
-                               10000000000LL,
-                               100000000000LL,
-                               1000000000000LL,
-                               10000000000000LL,
-                               100000000000000LL,
-                               1000000000000000LL,
-                               10000000000000000LL,
-                               100000000000000000LL,
-                               1000000000000000000LL};
-constexpr int kMaxExp       = 18;
-constexpr int kMaxFrac      = 18;
-// 1+2+...+19 = 190 combos.
-constexpr int kComboCount = 190;
+// FLOAT64: e ∈ [0..18], f ∈ [0..min(e, 18)].
+constexpr double kExp[19] = {1e0,
+                             1e1,
+                             1e2,
+                             1e3,
+                             1e4,
+                             1e5,
+                             1e6,
+                             1e7,
+                             1e8,
+                             1e9,
+                             1e10,
+                             1e11,
+                             1e12,
+                             1e13,
+                             1e14,
+                             1e15,
+                             1e16,
+                             1e17,
+                             1e18};
+// Candidate scales are 10^d for d in [0..18].
+constexpr int kCandCount = 19;
 }  // namespace host_consts_f64
 
 __constant__ float d_alp_exp_f32[11];
-__constant__ float d_alp_frac_f32[11];
-__constant__ int32_t d_alp_fact_f32[10];
-__constant__ uint8_t d_alp_combos_f32[host_consts_f32::kComboCount];
+__constant__ float d_alp_rhi_f32[11];
+__constant__ float d_alp_rlo_f32[11];
 
 __constant__ double d_alp_exp_f64[19];
-__constant__ double d_alp_frac_f64[19];
-__constant__ int64_t d_alp_fact_f64[19];
-__constant__ uint8_t d_alp_combos_f64[host_consts_f64::kComboCount];
+__constant__ double d_alp_rhi_f64[19];
+__constant__ double d_alp_rlo_f64[19];
+
+// Unevaluated-sum ("double-double") split of 10^-k: rhi = fl(10^-k) and
+// rlo = fl(10^-k - rhi), so rhi + rlo carries roughly twice the working
+// precision. Scaling by a single rounded 10^-k is what inflated the exception
+// rate (see the note above the tables); dividing by the exact 10^k fixes that
+// but an FP64 divide is punishingly slow on parts with cut FP64 throughput.
+// fma(v, rhi, v * rlo) recovers the divide's accuracy at two multiply-class
+// ops. Note this only has to be ACCURATE, never provably exact: encode's
+// round-trip check evaluates the identical expression, so any value the
+// approximation cannot reproduce simply becomes a stored exception. Accuracy
+// buys ratio, not correctness.
+template <typename Wide, typename Narrow>
+void fill_reciprocal_split(Narrow* rhi, Narrow* rlo, int count)
+{
+  Wide p = Wide{1};
+  for (int k = 0; k < count; ++k) {
+    Wide const r = Wide{1} / p;
+    rhi[k]       = static_cast<Narrow>(r);
+    rlo[k]       = static_cast<Narrow>(r - static_cast<Wide>(rhi[k]));
+    p *= Wide{10};
+  }
+}
 
 // One-shot initialisation of both __constant__ table sets. Idempotent.
 // Uploads run async on the caller's stream and are bounded by a single
 // stream sync, avoiding the legacy default stream entirely.
 void alp_upload_constants(rmm::cuda_stream_view stream)
 {
-  // Build packed combo tables on the host then upload.
-  uint8_t combos_f32[host_consts_f32::kComboCount];
-  {
-    int idx = 0;
-    for (uint8_t e = 0; e <= host_consts_f32::kMaxExp; ++e) {
-      uint8_t f_max = (e <= host_consts_f32::kMaxFrac) ? e : host_consts_f32::kMaxFrac;
-      for (uint8_t f = 0; f <= f_max; ++f) {
-        combos_f32[idx++] = static_cast<uint8_t>((e << 4) | f);
-      }
-    }
-    if (idx != host_consts_f32::kComboCount) {
-      throw std::runtime_error("alp: f32 combo table size mismatch");
-    }
-  }
-  uint8_t combos_f64[host_consts_f64::kComboCount];
-  {
-    int idx = 0;
-    for (uint8_t e = 0; e <= host_consts_f64::kMaxExp; ++e) {
-      uint8_t f_max = (e <= host_consts_f64::kMaxFrac) ? e : host_consts_f64::kMaxFrac;
-      for (uint8_t f = 0; f <= f_max; ++f) {
-        // Pack (e << 5) | f. Both e and f are ≤ 18 < 32 so 5 bits each fit
-        // in a uint8_t. f32 uses (e << 4) | f because both ≤ 10 there.
-        combos_f64[idx++] = static_cast<uint8_t>((e << 5) | f);
-      }
-    }
-    if (idx != host_consts_f64::kComboCount) {
-      throw std::runtime_error("alp: f64 combo table size mismatch");
-    }
-  }
-
   auto const s = stream.value();
   cudaMemcpyToSymbolAsync(d_alp_exp_f32,
                           host_consts_f32::kExp,
@@ -203,20 +147,10 @@ void alp_upload_constants(rmm::cuda_stream_view stream)
                           0,
                           cudaMemcpyHostToDevice,
                           s);
-  cudaMemcpyToSymbolAsync(d_alp_frac_f32,
-                          host_consts_f32::kFrac,
-                          sizeof(host_consts_f32::kFrac),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_fact_f32,
-                          host_consts_f32::kFact,
-                          sizeof(host_consts_f32::kFact),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(
-    d_alp_combos_f32, combos_f32, sizeof(combos_f32), 0, cudaMemcpyHostToDevice, s);
+  float rhi_f32[11], rlo_f32[11];
+  fill_reciprocal_split<double, float>(rhi_f32, rlo_f32, 11);
+  cudaMemcpyToSymbolAsync(d_alp_rhi_f32, rhi_f32, sizeof(rhi_f32), 0, cudaMemcpyHostToDevice, s);
+  cudaMemcpyToSymbolAsync(d_alp_rlo_f32, rlo_f32, sizeof(rlo_f32), 0, cudaMemcpyHostToDevice, s);
 
   cudaMemcpyToSymbolAsync(d_alp_exp_f64,
                           host_consts_f64::kExp,
@@ -224,20 +158,10 @@ void alp_upload_constants(rmm::cuda_stream_view stream)
                           0,
                           cudaMemcpyHostToDevice,
                           s);
-  cudaMemcpyToSymbolAsync(d_alp_frac_f64,
-                          host_consts_f64::kFrac,
-                          sizeof(host_consts_f64::kFrac),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(d_alp_fact_f64,
-                          host_consts_f64::kFact,
-                          sizeof(host_consts_f64::kFact),
-                          0,
-                          cudaMemcpyHostToDevice,
-                          s);
-  cudaMemcpyToSymbolAsync(
-    d_alp_combos_f64, combos_f64, sizeof(combos_f64), 0, cudaMemcpyHostToDevice, s);
+  double rhi_f64[19], rlo_f64[19];
+  fill_reciprocal_split<long double, double>(rhi_f64, rlo_f64, 19);
+  cudaMemcpyToSymbolAsync(d_alp_rhi_f64, rhi_f64, sizeof(rhi_f64), 0, cudaMemcpyHostToDevice, s);
+  cudaMemcpyToSymbolAsync(d_alp_rlo_f64, rlo_f64, sizeof(rlo_f64), 0, cudaMemcpyHostToDevice, s);
 
   // Constants must be visible before any kernel that reads them runs; the
   // upload is host-side one-time work so a bounded sync here is acceptable.
@@ -279,7 +203,7 @@ struct alp_traits<float> {
   using uint_t                                 = uint32_t;
   static constexpr cudf::type_id value_type_id = cudf::type_id::FLOAT32;
   static constexpr cudf::type_id int_type_id   = cudf::type_id::INT32;
-  static constexpr int combo_count             = host_consts_f32::kComboCount;
+  static constexpr int cand_count              = host_consts_f32::kCandCount;
   static constexpr value_t magic               = 12582912.0f;    // 2^23 + 2^22
   static constexpr value_t safe_max            = 2147483520.0f;  // ≈ INT32_MAX, f32-representable
   static constexpr value_t safe_min            = -2147483520.0f;
@@ -290,14 +214,8 @@ struct alp_traits<float> {
   // Exception cost: payload (32) + position (16) bits per exception.
   static constexpr uint32_t exception_cost_bits = 32 + 16;
   __device__ static value_t exp_(int i) { return d_alp_exp_f32[i]; }
-  __device__ static value_t frac_(int i) { return d_alp_frac_f32[i]; }
-  __device__ static int_t fact_(int i) { return d_alp_fact_f32[i]; }
-  __device__ static void unpack_combo(int c, uint8_t& e, uint8_t& f)
-  {
-    uint8_t packed = d_alp_combos_f32[c];
-    e              = packed >> 4;
-    f              = packed & 0xF;
-  }
+  __device__ static value_t rhi_(int i) { return d_alp_rhi_f32[i]; }
+  __device__ static value_t rlo_(int i) { return d_alp_rlo_f32[i]; }
 };
 
 template <>
@@ -307,7 +225,7 @@ struct alp_traits<double> {
   using uint_t                                 = uint64_t;
   static constexpr cudf::type_id value_type_id = cudf::type_id::FLOAT64;
   static constexpr cudf::type_id int_type_id   = cudf::type_id::INT64;
-  static constexpr int combo_count             = host_consts_f64::kComboCount;
+  static constexpr int cand_count              = host_consts_f64::kCandCount;
   // 2^52 + 2^51. Adding/subtracting forces IEEE round-to-nearest-even into
   // the mantissa truncation, producing CPU-identical encoded integers.
   static constexpr value_t magic = 6755399441055744.0;
@@ -322,14 +240,8 @@ struct alp_traits<double> {
   // Exception cost: 64-bit payload + 16-bit position.
   static constexpr uint32_t exception_cost_bits = 64 + 16;
   __device__ static value_t exp_(int i) { return d_alp_exp_f64[i]; }
-  __device__ static value_t frac_(int i) { return d_alp_frac_f64[i]; }
-  __device__ static int_t fact_(int i) { return d_alp_fact_f64[i]; }
-  __device__ static void unpack_combo(int c, uint8_t& e, uint8_t& f)
-  {
-    uint8_t packed = d_alp_combos_f64[c];
-    e              = packed >> 5;
-    f              = packed & 0x1F;
-  }
+  __device__ static value_t rhi_(int i) { return d_alp_rhi_f64[i]; }
+  __device__ static value_t rlo_(int i) { return d_alp_rlo_f64[i]; }
 };
 
 // -----------------------------------------------------------------------------
@@ -364,10 +276,7 @@ __device__ inline int bits_for_range_u64(uint64_t range)
 // `is_exception` when the round-trip check fails (or the input is non-finite,
 // ±Inf, NaN, -0.0, or overflows the safe-integer range when scaled).
 template <typename T>
-__device__ inline typename alp_traits<T>::int_t alp_encode_value(T v,
-                                                                 uint8_t e,
-                                                                 uint8_t f,
-                                                                 bool& is_exception)
+__device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, bool& is_exception)
 {
   using traits = alp_traits<T>;
   using int_t  = typename traits::int_t;
@@ -375,7 +284,14 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v,
     is_exception = true;
     return 0;
   }
-  T tmp = v * traits::exp_(e) * traits::frac_(f);
+  // ALP as published parameterises the scale by a pair (e, f) and encodes
+  // round(v * 10^e * 10^-f), decoding as i * 10^f * 10^-e -- but only the
+  // DIFFERENCE d = e - f ever affects the result, and the published combo
+  // table constrains f <= e so d is exactly the non-negative range swept here.
+  // Collapsing to d drops the f64 candidate set from 190 pairs to 19 scales
+  // with no loss of coverage, and scaling by the single exact 10^d rounds once
+  // instead of twice.
+  T tmp = v * traits::exp_(d);
   // Magic-number round-to-nearest-even.
   T rounded = (tmp + traits::magic) - traits::magic;
   if (!isfinite(rounded) || rounded > traits::safe_max || rounded < traits::safe_min) {
@@ -383,22 +299,22 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v,
     return 0;
   }
   int_t enc = static_cast<int_t>(rounded);
-  // Round-trip check: decode and compare bit-exactly. The cast-back-to-T after
-  // the integer multiply matches CPU ALP (it forces single/double rounding to
-  // happen in the same order on both sides).
-  T decoded    = static_cast<T>(enc * traits::fact_(f)) * traits::frac_(e);
+  // Round-trip check: decode with the EXACT same expression as
+  // alp_decode_kernel and compare bit-exactly.
+  T const encd = static_cast<T>(enc);
+  T decoded    = fma(encd, traits::rhi_(d), encd * traits::rlo_(d));
   is_exception = (decoded != v);
   return enc;
 }
 
 // -----------------------------------------------------------------------------
 // Encode kernel: 1 block == 1 vector of 1024 values. blockDim.x == 1024.
-// Each thread handles one value. For each candidate (e, f) the threads
-// atomically update per-combo (exc_count, min_enc, max_enc) in shared mem;
-// thread 0 then picks the combo with the lowest cost
-// (`vec_n * bitwidth + exc_count * exception_cost_bits`) and stores the
-// chosen (e, f) into the metadata column. Finally every thread re-encodes
-// its value with the winning (e, f) and writes (integer, exception_flag).
+// Each thread handles one value. For each candidate scale d the threads
+// atomically update per-candidate (exc_count, min_enc, max_enc) in shared mem;
+// thread 0 then picks the d with the lowest cost
+// (`vec_n * bitwidth + exc_count * exception_cost_bits`) and stores it into the
+// metadata column. Finally every thread re-encodes its value with the winning
+// d and writes (integer, exception_flag).
 // -----------------------------------------------------------------------------
 template <typename T>
 __global__ void alp_encode_kernel(const T* __restrict__ in,
@@ -407,9 +323,9 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
                                   uint16_t* __restrict__ out_metadata,
                                   uint8_t* __restrict__ out_exception_flag)
 {
-  using traits              = alp_traits<T>;
-  using int_t               = typename traits::int_t;
-  constexpr int combo_count = traits::combo_count;
+  using traits             = alp_traits<T>;
+  using int_t              = typename traits::int_t;
+  constexpr int cand_count = traits::cand_count;
 
   int vec      = blockIdx.x;
   int tid      = threadIdx.x;
@@ -419,30 +335,28 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
 
   int vec_n = min(n_rows - vec * kAlpVectorSize, kAlpVectorSize);
 
-  __shared__ uint32_t s_exc_count[combo_count];
-  __shared__ int_t s_min_enc[combo_count];
-  __shared__ int_t s_max_enc[combo_count];
-  __shared__ uint16_t s_best_md;  // (e << 8) | f
+  __shared__ uint32_t s_exc_count[cand_count];
+  __shared__ int_t s_min_enc[cand_count];
+  __shared__ int_t s_max_enc[cand_count];
+  __shared__ uint16_t s_best_d;  // the winning scale exponent, stored verbatim
+  __shared__ int_t s_fill;       // value written at exception slots
 
-  // Init the per-combo accumulators. combo_count ≤ 1024 so the first
-  // `combo_count` threads cover the init in one pass.
-  if (tid < combo_count) {
+  // Init the per-candidate accumulators. cand_count <= 1024 so the first
+  // `cand_count` threads cover the init in one pass.
+  if (tid < cand_count) {
     s_exc_count[tid] = 0u;
     s_min_enc[tid]   = traits::int_max;
     s_max_enc[tid]   = traits::int_min;
   }
   __syncthreads();
 
-  // Sweep candidates. Atomic contention is per-combo across the block; for
+  // Sweep candidates. Atomic contention is per-candidate across the block; for
   // typical inputs most threads hit the same min/max paths so this is
   // dominated by atomic latency, not contention.
-  for (int c = 0; c < combo_count; ++c) {
-    uint8_t e, f;
-    traits::unpack_combo(c, e, f);
-
+  for (int c = 0; c < cand_count; ++c) {
     if (valid) {
       bool is_exc;
-      int_t enc = alp_encode_value<T>(v, e, f, is_exc);
+      int_t enc = alp_encode_value<T>(v, c, is_exc);
       if (is_exc) {
         atomicAdd(&s_exc_count[c], 1u);
       } else {
@@ -453,11 +367,11 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
   }
   __syncthreads();
 
-  // Single-thread cost-based selection. combo_count is small; full pass is fine.
+  // Single-thread cost-based selection. cand_count is small; full pass is fine.
   if (tid == 0) {
     uint64_t best_cost = UINT64_MAX;
     int best           = 0;
-    for (int c = 0; c < combo_count; ++c) {
+    for (int c = 0; c < cand_count; ++c) {
       uint32_t exc     = s_exc_count[c];
       uint32_t non_exc = static_cast<uint32_t>(vec_n) - exc;
       uint32_t bits    = 0;
@@ -479,21 +393,28 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
         best      = c;
       }
     }
-    uint8_t best_e, best_f;
-    traits::unpack_combo(best, best_e, best_f);
-    s_best_md         = (static_cast<uint16_t>(best_e) << 8) | best_f;
-    out_metadata[vec] = s_best_md;
+    s_best_d          = static_cast<uint16_t>(best);
+    out_metadata[vec] = s_best_d;
+    // Fill value for exception slots: the winning candidate's minimum encoded
+    // value, which is exactly the frame of reference a downstream bitpack will
+    // subtract. Writing 0 instead (the old behaviour) drags the chunk's range
+    // down to zero whenever the real values cluster away from it, so a single
+    // exception could cost ~30 bits per row on an otherwise narrow chunk --
+    // and it made the emitted buffer disagree with the bit-width this very
+    // cost model just scored. s_min_enc keeps its int_max sentinel when every
+    // value in the vector is an exception; 0 is as good as anything there.
+    s_fill = (s_exc_count[best] < static_cast<uint32_t>(vec_n)) ? s_min_enc[best] : int_t{0};
   }
   __syncthreads();
 
-  // Re-encode with the chosen (e, f). For exception positions we write 0 to
-  // `integers` so downstream bit-packing on the chunk stays tight.
+  // Re-encode with the chosen scale. Exception positions get the fill value
+  // (the vector's minimum encoded value) so downstream bit-packing on the
+  // chunk stays tight; the real payload lives in the `exceptions` channel and
+  // is scattered back over these slots on decode.
   if (valid) {
-    uint8_t best_e = static_cast<uint8_t>(s_best_md >> 8);
-    uint8_t best_f = static_cast<uint8_t>(s_best_md & 0xFF);
     bool is_exc;
-    int_t enc                    = alp_encode_value<T>(v, best_e, best_f, is_exc);
-    out_integers[global_i]       = is_exc ? int_t{0} : enc;
+    int_t enc                    = alp_encode_value<T>(v, static_cast<int>(s_best_d), is_exc);
+    out_integers[global_i]       = is_exc ? s_fill : enc;
     out_exception_flag[global_i] = is_exc ? 1u : 0u;
   }
 }
@@ -512,13 +433,13 @@ __global__ void alp_decode_kernel(const typename alp_traits<T>::int_t* __restric
   int i        = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_rows) return;
   int vec     = i / kAlpVectorSize;
-  uint16_t md = metadata[vec];
-  uint8_t e   = static_cast<uint8_t>(md >> 8);
-  uint8_t f   = static_cast<uint8_t>(md & 0xFF);
+  int const d = static_cast<int>(metadata[vec]);
   auto enc    = integers[i];
-  // v = enc * 10^f / 10^e. The cast-to-T forces the integer multiply to land
-  // in the target precision before the final scaling, matching CPU ALP.
-  out[i] = static_cast<T>(enc * traits::fact_(f)) * traits::frac_(e);
+  // v = enc * 10^-d, evaluated through the double-double reciprocal so a single
+  // rounded 10^-d never costs us an exception. Must stay bit-identical to the
+  // round-trip check in alp_encode_value.
+  T const encd = static_cast<T>(enc);
+  out[i]       = fma(encd, traits::rhi_(d), encd * traits::rlo_(d));
 }
 
 // Exception scatter: fully data-parallel (G-ALP's key GPU optimisation).

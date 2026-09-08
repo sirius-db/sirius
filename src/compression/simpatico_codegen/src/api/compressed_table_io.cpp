@@ -323,7 +323,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+static constexpr std::uint8_t kVersion = 12;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
