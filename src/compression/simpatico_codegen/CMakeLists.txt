@@ -154,6 +154,7 @@ add_library(
   src/plan/plan_dsl.cpp
   src/plan/plan_tree.cpp
   src/plan/operator_registry.cpp
+  src/plan/chunk_subset.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
   src/plan/compress.cpp
@@ -223,6 +224,7 @@ add_codegen_host_test(test_compress_with_plan_roundtrip)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
+add_codegen_host_test(test_chunk_subset)
 add_codegen_host_test(test_fused_tree_build)
 add_codegen_host_test(test_jit_kernel_cache_plain)
 add_codegen_host_test(test_jit_kernel_cache)
@@ -263,6 +265,7 @@ add_test(NAME compress_with_plan_roundtrip
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)
+add_test(NAME chunk_subset COMMAND test_chunk_subset)
 add_test(NAME fused_tree_build COMMAND test_fused_tree_build)
 add_test(NAME jit_kernel_cache_plain COMMAND test_jit_kernel_cache_plain)
 add_test(NAME jit_kernel_cache COMMAND test_jit_kernel_cache)
