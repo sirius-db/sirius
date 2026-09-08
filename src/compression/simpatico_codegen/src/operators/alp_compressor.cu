@@ -46,6 +46,16 @@ namespace {
 // Vector size is fixed at 1024 (matches ALP & FastLanes; aligned with G-ALP).
 constexpr int kAlpVectorSize = 1024;
 
+// Scale-selection sample: kAlpSampleRuns contiguous runs of kAlpSampleRunLen,
+// spread evenly across the vector. The total must be a whole number of warps
+// (the selection phase shuffle-reduces with a full mask) and no larger than the
+// vector.
+constexpr int kAlpSampleRuns   = 8;
+constexpr int kAlpSampleRunLen = 8;
+constexpr int kAlpSampleSize   = kAlpSampleRuns * kAlpSampleRunLen;  // 64 = 2 warps
+static_assert(kAlpSampleSize % 32 == 0, "sample must be a whole number of warps");
+static_assert(kAlpSampleSize <= kAlpVectorSize, "sample must fit in a vector");
+
 // -----------------------------------------------------------------------------
 // Per-type constant tables. Two separate __constant__ symbol sets because CUDA
 // does not allow __constant__ arrays inside templates with proper linkage.
@@ -263,6 +273,40 @@ __device__ inline int64_t atomic_max(int64_t* a, int64_t v)
 }
 
 // -----------------------------------------------------------------------------
+// Full-warp shuffle reductions. __shfl_down_sync handles 64-bit operands
+// natively, so one template covers int32_t and int64_t. Callers must have all
+// 32 lanes of the warp active (the sampling loop below sizes its participant
+// count as a whole number of warps precisely so this holds).
+// -----------------------------------------------------------------------------
+
+template <typename V>
+__device__ inline V warp_reduce_min(V x)
+{
+  for (int off = 16; off > 0; off >>= 1) {
+    V const y = __shfl_down_sync(0xFFFFFFFFu, x, off);
+    x         = (y < x) ? y : x;
+  }
+  return x;
+}
+
+template <typename V>
+__device__ inline V warp_reduce_max(V x)
+{
+  for (int off = 16; off > 0; off >>= 1) {
+    V const y = __shfl_down_sync(0xFFFFFFFFu, x, off);
+    x         = (y > x) ? y : x;
+  }
+  return x;
+}
+
+__device__ inline uint32_t warp_reduce_add(uint32_t x)
+{
+  for (int off = 16; off > 0; off >>= 1)
+    x += __shfl_down_sync(0xFFFFFFFFu, x, off);
+  return x;
+}
+
+// -----------------------------------------------------------------------------
 // Device helpers
 // -----------------------------------------------------------------------------
 
@@ -309,12 +353,32 @@ __device__ inline typename alp_traits<T>::int_t alp_encode_value(T v, int d, boo
 
 // -----------------------------------------------------------------------------
 // Encode kernel: 1 block == 1 vector of 1024 values. blockDim.x == 1024.
-// Each thread handles one value. For each candidate scale d the threads
-// atomically update per-candidate (exc_count, min_enc, max_enc) in shared mem;
-// thread 0 then picks the d with the lowest cost
-// (`vec_n * bitwidth + exc_count * exception_cost_bits`) and stores it into the
-// metadata column. Finally every thread re-encodes its value with the winning
-// d and writes (integer, exception_flag).
+//
+// Two phases:
+//
+//   Selection -- the first kAlpSampleSize threads each hold one SAMPLED value
+//     and evaluate every candidate scale d on it, accumulating per-candidate
+//     (exc_count, min_enc, max_enc). Thread 0 then picks the d with the lowest
+//     cost (`vec_n * bitwidth + exc_count * exception_cost_bits`) and stores it
+//     into the metadata column.
+//
+//   Emit -- every thread re-encodes its own value with the winning d and writes
+//     (integer, exception_flag). This pass is exact and covers all 1024 values,
+//     so sampling only ever costs ratio (a slightly worse d), never correctness.
+//
+// Sampling is what makes the encoder affordable: scoring all 1024 values
+// against all candidates costs ~19k round-trip encodes per vector, each several
+// float multiplies, and on parts with cut FP64 throughput that dominates
+// everything. The published ALP algorithm samples too, for the same reason.
+//
+// The sample is kAlpSampleRuns contiguous runs spread evenly across the vector,
+// not a fixed stride: a stride can land on a period of the data (round-robin
+// sensor readings, interleaved currencies) and then observe only one phase of
+// it, picking a scale that suits a sixteenth of the rows.
+//
+// Within the selection phase the per-candidate accumulators are reduced across
+// each warp by shuffle first, so a candidate costs one shared atomic per warp
+// rather than one per participating thread.
 // -----------------------------------------------------------------------------
 template <typename T>
 __global__ void alp_encode_kernel(const T* __restrict__ in,
@@ -329,11 +393,12 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
 
   int vec      = blockIdx.x;
   int tid      = threadIdx.x;
-  int global_i = vec * kAlpVectorSize + tid;
+  int vec_base = vec * kAlpVectorSize;
+  int global_i = vec_base + tid;
   bool valid   = (global_i < n_rows);
   T v          = valid ? in[global_i] : T{0};
 
-  int vec_n = min(n_rows - vec * kAlpVectorSize, kAlpVectorSize);
+  int vec_n = min(n_rows - vec_base, kAlpVectorSize);
 
   __shared__ uint32_t s_exc_count[cand_count];
   __shared__ int_t s_min_enc[cand_count];
@@ -350,18 +415,49 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
   }
   __syncthreads();
 
-  // Sweep candidates. Atomic contention is per-candidate across the block; for
-  // typical inputs most threads hit the same min/max paths so this is
-  // dominated by atomic latency, not contention.
-  for (int c = 0; c < cand_count; ++c) {
-    if (valid) {
-      bool is_exc;
-      int_t enc = alp_encode_value<T>(v, c, is_exc);
-      if (is_exc) {
-        atomicAdd(&s_exc_count[c], 1u);
-      } else {
-        atomic_min(&s_min_enc[c], enc);
-        atomic_max(&s_max_enc[c], enc);
+  // Pick this thread's sample: kAlpSampleRuns contiguous runs spread evenly
+  // over the vector. Threads at or past kAlpSampleSize sit the phase out.
+  // Short vectors (the trailing partial one) collapse runs onto each other,
+  // which just resamples the same values -- harmless for a ranking.
+  bool const samples = (tid < kAlpSampleSize);
+  T sv               = T{0};
+  bool sv_valid      = false;
+  if (samples) {
+    int const run = tid / kAlpSampleRunLen;
+    int const off = tid % kAlpSampleRunLen;
+    int const idx = (run * vec_n) / kAlpSampleRuns + off;
+    sv_valid      = (idx < vec_n);
+    if (sv_valid) sv = in[vec_base + idx];
+  }
+
+  // Score every candidate on the sample. Each warp reduces its own lanes by
+  // shuffle and contributes a single atomic per candidate; kAlpSampleSize is a
+  // whole number of warps so every lane in a participating warp is active and
+  // the full-mask shuffles below are well formed.
+  if (samples) {
+    int const lane = tid & 31;
+    for (int c = 0; c < cand_count; ++c) {
+      bool is_exc = true;
+      int_t enc   = int_t{0};
+      if (sv_valid) enc = alp_encode_value<T>(sv, c, is_exc);
+
+      // Non-participating lanes fold in as identities: they add 0 exceptions
+      // and contribute the neutral extremes to min/max.
+      uint32_t const exc_bit = (sv_valid && is_exc) ? 1u : 0u;
+      bool const counts      = (sv_valid && !is_exc);
+      int_t const lo_in      = counts ? enc : traits::int_max;
+      int_t const hi_in      = counts ? enc : traits::int_min;
+
+      uint32_t const exc_sum = warp_reduce_add(exc_bit);
+      int_t const lo         = warp_reduce_min<int_t>(lo_in);
+      int_t const hi         = warp_reduce_max<int_t>(hi_in);
+
+      if (lane == 0) {
+        if (exc_sum != 0u) atomicAdd(&s_exc_count[c], exc_sum);
+        if (lo <= hi) {
+          atomic_min(&s_min_enc[c], lo);
+          atomic_max(&s_max_enc[c], hi);
+        }
       }
     }
   }
@@ -369,11 +465,16 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
 
   // Single-thread cost-based selection. cand_count is small; full pass is fine.
   if (tid == 0) {
-    uint64_t best_cost = UINT64_MAX;
-    int best           = 0;
+    // Scored over the sample, so `sample_n` (not vec_n) is the population the
+    // exception counts are drawn from. Cost is proportional either way; what
+    // matters is that the bit-width term and the exception term are weighed
+    // against the same denominator.
+    uint32_t const sample_n = static_cast<uint32_t>(min(vec_n, kAlpSampleSize));
+    uint64_t best_cost      = UINT64_MAX;
+    int best                = 0;
     for (int c = 0; c < cand_count; ++c) {
       uint32_t exc     = s_exc_count[c];
-      uint32_t non_exc = static_cast<uint32_t>(vec_n) - exc;
+      uint32_t non_exc = sample_n - exc;
       uint32_t bits    = 0;
       if (non_exc > 0) {
         int_t lo = s_min_enc[c];
@@ -386,7 +487,7 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
           bits           = static_cast<uint32_t>(bits_for_range_u64(range));
         }
       }
-      uint64_t cost = static_cast<uint64_t>(vec_n) * bits +
+      uint64_t cost = static_cast<uint64_t>(sample_n) * bits +
                       static_cast<uint64_t>(exc) * traits::exception_cost_bits;
       if (cost < best_cost) {
         best_cost = cost;
@@ -401,9 +502,11 @@ __global__ void alp_encode_kernel(const T* __restrict__ in,
     // down to zero whenever the real values cluster away from it, so a single
     // exception could cost ~30 bits per row on an otherwise narrow chunk --
     // and it made the emitted buffer disagree with the bit-width this very
-    // cost model just scored. s_min_enc keeps its int_max sentinel when every
-    // value in the vector is an exception; 0 is as good as anything there.
-    s_fill = (s_exc_count[best] < static_cast<uint32_t>(vec_n)) ? s_min_enc[best] : int_t{0};
+    // cost model just scored. Being a sample minimum it may sit above the true
+    // vector minimum, but never below it, so it always lands inside the range
+    // bitpack will cover. s_min_enc keeps its int_max sentinel when every
+    // sampled value is an exception; 0 is as good as anything there.
+    s_fill = (s_exc_count[best] < sample_n) ? s_min_enc[best] : int_t{0};
   }
   __syncthreads();
 
