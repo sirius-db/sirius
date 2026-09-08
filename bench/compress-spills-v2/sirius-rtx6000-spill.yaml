@@ -49,13 +49,21 @@ sirius:
             # and cannot be reclaimed by the kernel, so this ceiling has to leave real
             # room for DuckDB, Python and the parquet page cache on a 62 GB box.
             # 40 GB ceiling; initial_number_pools * pool_size * block_size
-            # = 32 * 8 * 64 MB = 16.4 GB is pinned eagerly at startup, the rest grows
+            # = 32 * 8 * 1 MB = 256 MB is pinned eagerly at startup, the rest grows
             # on demand. (52 GB / 50 pools left only ~10 GB of headroom and drew the
             # OOM killer during startup probing.)
+            #
+            # block_size is cucascade's 1 MB default. It was 64 MB here, which was
+            # only ever chosen to make the eager-pinning arithmetic above land on a
+            # round number -- there was no allocation-behaviour argument for it.
+            # fixed_size_host_memory_resource rounds EVERY allocation up to a whole
+            # block, so at 64 MB the tier ran with no slack: q18/SF3000 threw 78 host
+            # allocation failures and rescheduled tasks 254 times, and the same
+            # binary on the same data threw none at 1 MB.
             capacity_bytes: 40000000000      # 40 GB
             initial_number_pools: 32         # 16.4 GB pinned up front
             pool_size: 8
-            block_size: 67108864             # 64 MB
+            block_size: 1048576              # 1 MB (cucascade default)
         disk:
             disk_id: 0
             capacity_bytes: 1000000000000    # 1 TB
