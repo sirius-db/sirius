@@ -1,0 +1,1 @@
+(4255990, 'Supplier#004255990', 'Fya5Dyiij ByYC4mK5iq2Iix4dJ', '13-744-793-9735', Decimal('3448076.3573'))
