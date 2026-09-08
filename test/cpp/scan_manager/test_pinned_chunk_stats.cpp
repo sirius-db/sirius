@@ -1178,34 +1178,29 @@ TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
     8192,
     stream,
     mr);
-  auto filter         = cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(50000));
-  std::size_t empties = 0;
-  constexpr int kReps = 200;
-  auto const t0       = std::chrono::high_resolution_clock::now();
+  auto filter               = cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(50000));
+  std::size_t empties       = 0;
+  constexpr int kReps       = 200;
+  std::size_t const n_cells = gs.group_count();
+  auto const t0             = std::chrono::high_resolution_clock::now();
   for (int r = 0; r < kReps; ++r) {
     for (auto const& group : gs.groups) {
       if (group[0] && sirius::scan_manager::chunk_provably_empty(*filter, *group[0])) { ++empties; }
     }
   }
   auto const t1    = std::chrono::high_resolution_clock::now();
-  auto const cells = static_cast<double>(gs.group_count()) * kReps;
+  auto const cells = static_cast<double>(n_cells) * kReps;
   auto const ns    = std::chrono::duration<double, std::nano>(t1 - t0).count() / cells;
-  WARN("chunk_provably_empty over " << gs.group_count() << " group cells: " << ns
+  WARN("chunk_provably_empty over " << n_cells << " group cells: " << ns
                                     << " ns/cell (empties=" << empties << ")");
 
-  // The packed evaluator on the same cells: pack once, lower once, then a flat loop.
-  sirius::scan_manager::packed_column_bounds packed;
-  packed.type                = LogicalType::INTEGER;
-  packed.column_has_no_nulls = true;
-  packed.mins.reserve(gs.group_count());
-  packed.maxs.reserve(gs.group_count());
-  packed.valid.reserve(gs.group_count());
-  for (auto const& group : gs.groups) {
-    bool const ok = group[0] != nullptr;
-    packed.valid.push_back(ok);
-    packed.mins.push_back(ok ? duckdb::NumericStats::Min(*group[0]).GetValue<int32_t>() : 0);
-    packed.maxs.push_back(ok ? duckdb::NumericStats::Max(*group[0]).GetValue<int32_t>() : 0);
-  }
+  // The packed evaluator on the same cells: pack once into the arena, lower once, flat loop.
+  std::vector<sirius::scan_manager::chunk_group_stats> capture;
+  capture.push_back(std::move(gs));
+  auto const arena = sirius::scan_manager::group_bounds_arena::from_capture(
+    duckdb::vector<LogicalType>{LogicalType::INTEGER}, capture);
+  REQUIRE_FALSE(arena.empty());
+  auto const packed = arena.cell(0, 0);
   auto lowered = sirius::scan_manager::lowered_bound_filter::lower(*filter, LogicalType::INTEGER);
   REQUIRE(lowered.has_value());
   std::vector<std::uint32_t> survivors;
@@ -1215,7 +1210,7 @@ TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
   }
   auto const t3  = std::chrono::high_resolution_clock::now();
   auto const ns2 = std::chrono::duration<double, std::nano>(t3 - t2).count() / cells;
-  WARN("lowered_bound_filter over " << gs.group_count() << " group cells: " << ns2
+  WARN("lowered_bound_filter over " << packed.size() << " group cells: " << ns2
                                     << " ns/cell (survivors=" << survivors.size() << ") -> "
                                     << (ns / ns2) << "x faster");
 }
@@ -1230,8 +1225,32 @@ TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
 // ---------------------------------------------------------------------------
 
 namespace {
+using sirius::scan_manager::group_bounds_arena;
 using sirius::scan_manager::lowered_bound_filter;
 using sirius::scan_manager::packed_column_bounds;
+
+/// A one-column, one-chunk arena from explicit per-group [min, max] cells; nullopt = no
+/// statistics for that group. Builds through from_capture so tests exercise the real packing.
+group_bounds_arena make_arena(std::vector<std::optional<std::pair<int64_t, int64_t>>> const& cells,
+                              std::size_t group_rows = 100)
+{
+  sirius::scan_manager::chunk_group_stats cs;
+  cs.group_rows = group_rows;
+  cs.groups.resize(cells.size());
+  for (std::size_t g = 0; g < cells.size(); ++g) {
+    cs.groups[g].resize(1);
+    if (!cells[g]) { continue; }
+    auto st = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+    duckdb::NumericStats::SetMin(st, Value::INTEGER(static_cast<int32_t>(cells[g]->first)));
+    duckdb::NumericStats::SetMax(st, Value::INTEGER(static_cast<int32_t>(cells[g]->second)));
+    st.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+    cs.groups[g][0] = st.ToUnique();
+  }
+  std::vector<sirius::scan_manager::chunk_group_stats> capture;
+  capture.push_back(std::move(cs));
+  return group_bounds_arena::from_capture(duckdb::vector<LogicalType>{LogicalType::INTEGER},
+                                          capture);
+}
 
 /// Stats shaped exactly as the capture builds them, for cross-checking.
 duckdb::unique_ptr<duckdb::BaseStatistics> int_stats(int32_t lo, int32_t hi, bool has_null)
@@ -1363,13 +1382,14 @@ TEST_CASE("lowered_bound_filter - rejects what the allowlist rejects", "[pinned_
 
 TEST_CASE("lowered_bound_filter - select_survivors over packed cells", "[pinned_chunk_stats]")
 {
-  packed_column_bounds b;
-  b.type                = LogicalType::INTEGER;
-  b.column_has_no_nulls = true;
-  //         g0      g1       g2        g3 (absent)
-  b.mins  = {0, 100, 200, 0};
-  b.maxs  = {9, 109, 209, 0};
-  b.valid = {true, true, true, false};
+  //                  g0        g1          g2        g3 (no statistics)
+  std::vector<std::optional<std::pair<int64_t, int64_t>>> const cells{
+    std::pair<int64_t, int64_t>{0, 9},
+    std::pair<int64_t, int64_t>{100, 109},
+    std::pair<int64_t, int64_t>{200, 209},
+    std::nullopt};
+  auto const arena = make_arena(cells);
+  auto const b     = arena.cell(0, 0);
 
   auto f       = duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_LESSTHAN,
                                                      Value::INTEGER(150));
@@ -1393,20 +1413,6 @@ TEST_CASE("lowered_bound_filter - select_survivors over packed cells", "[pinned_
 // ---------------------------------------------------------------------------
 
 namespace {
-/// Per-group bounds for one column of one chunk: group g covers [base + 10*g, base + 10*g + 9],
-/// so groups are disjoint and strictly increasing — a filter's cut point is unambiguous.
-sirius::scan_manager::packed_column_bounds ascending_groups(int32_t base, std::size_t n_groups)
-{
-  sirius::scan_manager::packed_column_bounds b;
-  b.type                = LogicalType::INTEGER;
-  b.column_has_no_nulls = true;
-  for (std::size_t g = 0; g < n_groups; ++g) {
-    b.mins.push_back(base + static_cast<int64_t>(10 * g));
-    b.maxs.push_back(base + static_cast<int64_t>(10 * g) + 9);
-    b.valid.push_back(true);
-  }
-  return b;
-}
 
 /// A one-column, one-chunk entry whose chunk min/max spans all its groups, so the coarse pass
 /// always keeps the chunk and only the refinement can narrow it.
@@ -1425,8 +1431,14 @@ pinned_entry make_group_entry(std::size_t n_groups, std::size_t group_rows)
     make_stats(LogicalType::INTEGER, Value::INTEGER(lo), Value::INTEGER(hi)).ToUnique());
   entry.zone_maps = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 1);
 
-  entry.group_rows = group_rows;
-  entry.group_bounds.push_back({ascending_groups(0, n_groups)});
+  // group g covers [10*g, 10*g + 9]: disjoint and strictly increasing, so a filter's cut point
+  // is unambiguous.
+  std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+  for (std::size_t g = 0; g < n_groups; ++g) {
+    cells.emplace_back(
+      std::pair<int64_t, int64_t>{static_cast<int64_t>(10 * g), static_cast<int64_t>(10 * g) + 9});
+  }
+  entry.group_bounds = make_arena(cells, group_rows);
   return entry;
 }
 }  // namespace
@@ -1481,9 +1493,8 @@ TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
 
   SECTION("an entry without group bounds keeps the whole-chunk behaviour")
   {
-    auto entry = make_group_entry(8, 100);
-    entry.group_bounds.clear();
-    entry.group_rows = 0;
+    auto entry         = make_group_entry(8, 100);
+    entry.group_bounds = sirius::scan_manager::group_bounds_arena{};
     auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
     auto plan = build_cached_scan_plan(entry, &fs, &qcols);
 
@@ -1494,8 +1505,18 @@ TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
 
   SECTION("an absent group cell keeps its rows")
   {
-    auto entry                        = make_group_entry(8, 100);
-    entry.group_bounds[0][0].valid[5] = false;  // no statistics for group 5
+    auto entry = make_group_entry(8, 100);
+    // Rebuild with group 5 carrying no statistics.
+    std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+    for (std::size_t g = 0; g < 8; ++g) {
+      if (g == 5) {
+        cells.emplace_back(std::nullopt);
+      } else {
+        cells.emplace_back(std::pair<int64_t, int64_t>{static_cast<int64_t>(10 * g),
+                                                       static_cast<int64_t>(10 * g) + 9});
+      }
+    }
+    entry.group_bounds = make_arena(cells, 100);
     auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
     auto plan = build_cached_scan_plan(entry, &fs, &qcols);
 
@@ -1517,4 +1538,137 @@ TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
     REQUIRE(plan.survivor_row_ranges.empty());
     REQUIRE(plan.rows_pruned_within_chunks == 0);
   }
+}
+
+// ---------------------------------------------------------------------------
+// group_bounds_arena — the contiguous, column-major packing.
+//
+// The layout is the point: one allocation that can be read (or copied to device, or written to a
+// file) as a unit, without touching the data it describes. These tests pin the properties that
+// makes possible — contiguity, column-major ordering, and refusing to build anything inconsistent
+// rather than building something subtly wrong.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// A capture of @p n_chunks chunks x @p n_columns columns, where column i of chunk c group g gets
+/// [base, base+1] with base = 1000*c + 100*i + g. Every cell is therefore distinguishable, so a
+/// misplaced one fails loudly rather than coincidentally matching.
+std::vector<sirius::scan_manager::chunk_group_stats> make_multi_capture(
+  std::size_t n_chunks, std::size_t n_columns, std::size_t n_groups, std::size_t group_rows = 100)
+{
+  std::vector<sirius::scan_manager::chunk_group_stats> capture(n_chunks);
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    capture[c].group_rows = group_rows;
+    capture[c].groups.resize(n_groups);
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      capture[c].groups[g].resize(n_columns);
+      for (std::size_t i = 0; i < n_columns; ++i) {
+        auto const base = static_cast<int32_t>(1000 * c + 100 * i + g);
+        auto st         = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+        duckdb::NumericStats::SetMin(st, Value::INTEGER(base));
+        duckdb::NumericStats::SetMax(st, Value::INTEGER(base + 1));
+        st.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+        capture[c].groups[g][i] = st.ToUnique();
+      }
+    }
+  }
+  return capture;
+}
+}  // namespace
+
+TEST_CASE("group_bounds_arena - packs column-major and addresses every cell",
+          "[pinned_chunk_stats]")
+{
+  constexpr std::size_t kChunks = 3, kColumns = 2, kGroups = 4;
+  auto const arena = group_bounds_arena::from_capture(
+    int_types(kColumns), make_multi_capture(kChunks, kColumns, kGroups));
+  REQUIRE_FALSE(arena.empty());
+  REQUIRE(arena.column_count() == kColumns);
+  REQUIRE(arena.chunk_count() == kChunks);
+  REQUIRE(arena.group_rows() == 100);
+  REQUIRE(arena.groups_in_chunk(0) == kGroups);
+
+  SECTION("every (column, chunk, group) reads back the value it was given")
+  {
+    for (std::size_t c = 0; c < kChunks; ++c) {
+      for (std::size_t i = 0; i < kColumns; ++i) {
+        auto const cell = arena.cell(i, c);
+        REQUIRE(cell.size() == kGroups);
+        for (std::size_t g = 0; g < kGroups; ++g) {
+          auto const base = static_cast<int64_t>(1000 * c + 100 * i + g);
+          REQUIRE(cell.mins[g] == base);
+          REQUIRE(cell.maxs[g] == base + 1);
+          REQUIRE(cell.valid[g] == 1);
+        }
+      }
+    }
+  }
+
+  SECTION("one column's chunks are contiguous, which is what column-major buys")
+  {
+    // Column 0's chunk 0 and chunk 1 must be adjacent in the arena: chunk 0 occupies
+    // [mins | maxs], so chunk 1's mins start immediately after.
+    auto const c0 = arena.cell(0, 0);
+    auto const c1 = arena.cell(0, 1);
+    REQUIRE(c1.mins.data() == c0.maxs.data() + c0.maxs.size());
+  }
+
+  SECTION("the whole arena is one contiguous allocation")
+  {
+    auto const raw = arena.raw();
+    REQUIRE(raw.size() == kChunks * kColumns * kGroups * 2);  // mins + maxs
+    auto const first = arena.cell(0, 0);
+    auto const last  = arena.cell(kColumns - 1, kChunks - 1);
+    REQUIRE(first.mins.data() == raw.data());
+    REQUIRE(last.maxs.data() + last.maxs.size() == raw.data() + raw.size());
+  }
+
+  SECTION("out-of-range lookups return an empty cell rather than reading past the arena")
+  {
+    REQUIRE(arena.cell(kColumns, 0).empty());
+    REQUIRE(arena.cell(0, kChunks).empty());
+    REQUIRE(arena.groups_in_chunk(kChunks) == 0);
+  }
+}
+
+TEST_CASE("group_bounds_arena - refuses inconsistent captures", "[pinned_chunk_stats]")
+{
+  // Each of these would otherwise produce an arena that silently describes the wrong rows, so
+  // from_capture returns empty: no sub-chunk pruning, never a wrong one.
+  SECTION("a chunk whose cells disagree with the column count")
+  {
+    auto capture = make_multi_capture(2, 2, 3);
+    capture[1].groups[0].resize(1);  // one column short
+    REQUIRE(group_bounds_arena::from_capture(int_types(2), capture).empty());
+  }
+  SECTION("chunks that disagree about group_rows")
+  {
+    auto capture          = make_multi_capture(2, 1, 3);
+    capture[1].group_rows = 200;
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), capture).empty());
+  }
+  SECTION("a zero group_rows")
+  {
+    auto capture          = make_multi_capture(1, 1, 3);
+    capture[0].group_rows = 0;
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), capture).empty());
+  }
+  SECTION("an empty capture or no columns")
+  {
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), {}).empty());
+    REQUIRE(group_bounds_arena::from_capture({}, make_multi_capture(1, 1, 3)).empty());
+  }
+}
+
+TEST_CASE("group_bounds_arena - chunks may differ in group count", "[pinned_chunk_stats]")
+{
+  // The last chunk of a pin is usually short, so its group count legitimately differs.
+  auto capture = make_multi_capture(2, 1, 4);
+  capture[1].groups.resize(2);
+  auto const arena = group_bounds_arena::from_capture(int_types(1), capture);
+  REQUIRE_FALSE(arena.empty());
+  REQUIRE(arena.groups_in_chunk(0) == 4);
+  REQUIRE(arena.groups_in_chunk(1) == 2);
+  REQUIRE(arena.cell(0, 1).size() == 2);
+  REQUIRE(arena.cell(0, 1).mins[0] == 1000);  // chunk 1, column 0, group 0
 }

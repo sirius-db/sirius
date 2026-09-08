@@ -491,6 +491,92 @@ int carrier_cmp(std::int64_t a, std::int64_t b, bool is_unsigned) noexcept
 
 }  // namespace
 
+packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t chunk) const noexcept
+{
+  packed_column_bounds out;
+  if (column >= _n_columns || chunk >= _n_chunks) { return out; }
+  auto const& sl = _slices[column * _n_chunks + chunk];
+  if (sl.count == 0) { return out; }
+  out.type                = _types[column];
+  out.is_unsigned         = _is_unsigned[column];
+  out.column_has_no_nulls = _column_has_no_nulls[column];
+  out.mins                = std::span<std::int64_t const>{_storage.data() + sl.offset, sl.count};
+  out.maxs  = std::span<std::int64_t const>{_storage.data() + sl.offset + sl.count, sl.count};
+  out.valid = std::span<std::uint8_t const>{_valid.data() + sl.valid_offset, sl.count};
+  return out;
+}
+
+std::size_t group_bounds_arena::groups_in_chunk(std::size_t chunk) const noexcept
+{
+  if (chunk >= _n_chunks || _n_columns == 0) { return 0; }
+  return _slices[chunk].count;  // column 0's slice for this chunk
+}
+
+group_bounds_arena group_bounds_arena::from_capture(
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<chunk_group_stats> const& per_chunk)
+{
+  group_bounds_arena out;
+  if (column_types.empty() || per_chunk.empty()) { return out; }
+  auto const n_columns = column_types.size();
+  auto const n_chunks  = per_chunk.size();
+
+  // One group_rows for the whole table, and every chunk's cells must agree with its own group
+  // count. Anything inconsistent yields an empty arena: no sub-chunk pruning, never a wrong one.
+  std::size_t const group_rows = per_chunk.front().group_rows;
+  if (group_rows == 0) { return out; }
+  std::vector<std::size_t> groups_per_chunk(n_chunks);
+  std::size_t total_groups = 0;
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    auto const& cs = per_chunk[c];
+    if (cs.group_rows != group_rows || cs.groups.empty()) { return out; }
+    for (auto const& row : cs.groups) {
+      if (row.size() != n_columns) { return out; }
+    }
+    groups_per_chunk[c] = cs.groups.size();
+    total_groups += groups_per_chunk[c];
+  }
+
+  out._group_rows = group_rows;
+  out._n_columns  = n_columns;
+  out._n_chunks   = n_chunks;
+  out._types      = column_types;
+  out._is_unsigned.resize(n_columns, false);
+  out._column_has_no_nulls.resize(n_columns, true);
+  out._slices.resize(n_columns * n_chunks);
+  // Every column stores a full set of groups, and each (column, chunk) reserves 2 * groups for
+  // its mins and maxs back to back.
+  out._storage.assign(2 * total_groups * n_columns, 0);
+  out._valid.assign(total_groups * n_columns, 0);
+
+  std::size_t cursor       = 0;  // into _storage, advancing by 2 * groups
+  std::size_t valid_cursor = 0;  // into _valid, advancing by groups
+  for (std::size_t col = 0; col < n_columns; ++col) {
+    out._is_unsigned[col] = type_is_unsigned(column_types[col]);
+    for (std::size_t chunk = 0; chunk < n_chunks; ++chunk) {
+      auto const n_groups                 = groups_per_chunk[chunk];
+      out._slices[col * n_chunks + chunk] = {cursor, valid_cursor, n_groups};
+      auto const& groups                  = per_chunk[chunk].groups;
+      for (std::size_t g = 0; g < n_groups; ++g) {
+        auto const* cell = groups[g][col].get();
+        if (cell == nullptr) { continue; }  // leaves valid = 0, which never prunes
+        auto const lo = value_carrier(duckdb::NumericStats::Min(*cell));
+        auto const hi = value_carrier(duckdb::NumericStats::Max(*cell));
+        if (!lo || !hi) { continue; }
+        out._storage[cursor + g]            = *lo;
+        out._storage[cursor + n_groups + g] = *hi;
+        out._valid[valid_cursor + g]        = 1;
+        // A single cell that admits nulls makes the column's cells all "may have nulls", which is
+        // exactly the precision compute_pinned_group_stats captures.
+        if (cell->CanHaveNull()) { out._column_has_no_nulls[col] = false; }
+      }
+      cursor += 2 * n_groups;
+      valid_cursor += n_groups;
+    }
+  }
+  return out;
+}
+
 std::optional<lowered_bound_filter> lowered_bound_filter::lower(
   duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
 {
@@ -660,7 +746,7 @@ void lowered_bound_filter::select_survivors(packed_column_bounds const& bounds,
   bool const has_null = !bounds.column_has_no_nulls;
   for (std::size_t i = 0; i < n; ++i) {
     // An absent cell never prunes, exactly as a null BaseStatistics does not.
-    if (!bounds.valid[i] || !provably_empty(bounds.mins[i], bounds.maxs[i], has_null, false)) {
+    if (bounds.valid[i] == 0 || !provably_empty(bounds.mins[i], bounds.maxs[i], has_null, false)) {
       survivors.push_back(static_cast<std::uint32_t>(i));
     }
   }

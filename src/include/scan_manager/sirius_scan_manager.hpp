@@ -221,16 +221,13 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
-  /// Finer-grained companion to @c zone_maps: per chunk, per cached column, min/max bounds over
-  /// fixed-size groups of rows (@c group_rows). Chunk-major, then positional with
-  /// cache_info.column_ids, exactly like @c zone_maps' cells.
+  /// Finer-grained companion to @c zone_maps: min/max bounds over fixed-size groups of rows,
+  /// for every (cached column, chunk), in one contiguous column-major allocation.
   ///
   /// Empty when the pin captured none, which simply means no sub-chunk pruning — the coarse
   /// zone_maps still apply. Kept separate from @c zone_maps rather than folded into it so the
   /// existing sidecar's merge and degradation invariants are untouched.
-  std::vector<std::vector<packed_column_bounds>> group_bounds;
-  /// Rows per group in @c group_bounds; 0 when absent.
-  std::size_t group_rows{0};
+  group_bounds_arena group_bounds;
   /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
   /// the column's values were proven distinct across the whole pinned table at
   /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —

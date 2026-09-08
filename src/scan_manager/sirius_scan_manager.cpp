@@ -2740,32 +2740,26 @@ void build_survivor_row_ranges(pinned_entry const& entry,
   }
   if (lowered.empty()) { return; }
 
-  std::size_t const group_rows = entry.group_rows;
+  std::size_t const group_rows = entry.group_bounds.group_rows();
   std::vector<chunk_row_range> ranges;
   std::size_t rows_dropped = 0;
 
   for (auto const chunk : plan.survivor_chunk_indices) {
-    if (chunk >= entry.group_bounds.size()) {
-      // No bounds for this chunk: serve it whole. Row count is unknown here, so emit no range and
-      // fall back for the entire plan — a partially-refined plan would let a consumer skip rows it
-      // has no evidence about.
-      return;
-    }
-    auto const& per_column = entry.group_bounds[chunk];
-    if (per_column.empty()) { return; }
-    std::size_t const n_groups = per_column.front().size();
+    // No bounds for this chunk: serve it whole. Row count is unknown here, so emit no range and
+    // fall back for the entire plan — a partially-refined plan would let a consumer skip rows it
+    // has no evidence about.
+    std::size_t const n_groups = entry.group_bounds.groups_in_chunk(chunk);
     if (n_groups == 0) { return; }
 
     // A group survives unless SOME filter proves it empty — the same AND-over-filters the
     // chunk-level pass applies.
     std::vector<bool> keep(n_groups, true);
     for (auto const& le : lowered) {
-      if (le.entry_pos >= per_column.size()) { continue; }
-      auto const& bounds = per_column[le.entry_pos];
-      if (bounds.size() != n_groups) { continue; }  // shape disagreement: cannot narrow safely
+      auto const bounds = entry.group_bounds.cell(le.entry_pos, chunk);
+      if (bounds.size() != n_groups) { continue; }  // absent or shape disagreement: cannot narrow
       bool const has_null = !bounds.column_has_no_nulls;
       for (std::size_t g = 0; g < n_groups; ++g) {
-        if (!keep[g] || !bounds.valid[g]) { continue; }  // absent cell never prunes
+        if (!keep[g] || bounds.valid[g] == 0) { continue; }  // absent cell never prunes
         if (le.filter.provably_empty(bounds.mins[g], bounds.maxs[g], has_null, false)) {
           keep[g] = false;
         }
@@ -2889,7 +2883,7 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
   //    bounds every group's).
   //  - Ranges are coalesced, so a chunk with no prunable group yields exactly one range covering
   //    it and costs a consumer nothing over serving the chunk whole.
-  if (!entry.group_bounds.empty() && entry.group_rows > 0) {
+  if (!entry.group_bounds.empty() && entry.group_bounds.group_rows() > 0) {
     build_survivor_row_ranges(entry, usable, plan);
   }
 

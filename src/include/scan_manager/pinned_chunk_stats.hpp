@@ -27,6 +27,8 @@
 #include <duckdb/storage/statistics/base_statistics.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <span>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -157,31 +159,95 @@ class pinned_zone_maps {
 };
 
 /**
- * @brief One column's per-group min/max cells, packed as parallel typed arrays.
+ * @brief A view of one column's per-group min/max cells within one chunk.
  *
- * The group index needs a representation that scales: SF1000 lineitem at G = 8 has ~732,000
- * groups, and the @ref chunk_provably_empty path costs ~83 ns per cell (a @c BaseStatistics copy
- * plus a virtual @c CheckStatistics), i.e. ~61 ms of plan time per filter column per query. This
- * holds the same information in three flat arrays and evaluates a filter that was lowered once.
+ * Non-owning: the bytes live in a @ref group_bounds_arena. Every supported type (integers <= 8 B,
+ * DATE, TIMESTAMP) fits in 8 bytes, so bounds are stored as the raw carrier — signed integers,
+ * DATE days and TIMESTAMP micros as themselves; unsigned integers as their bit pattern,
+ * reinterpreted via @c is_unsigned at comparison time (a UBIGINT above INT64_MAX stores as
+ * negative and compares correctly as uint64).
  *
- * Every supported type (integers <= 8 B, DATE, TIMESTAMP) fits in 8 bytes, so bounds are stored
- * as the raw carrier: signed integers, DATE days and TIMESTAMP micros as themselves; unsigned
- * integers as their bit pattern, reinterpreted via @c is_unsigned at comparison time (a UBIGINT
- * above INT64_MAX stores as negative and compares correctly as uint64).
- *
- * @c valid is false for a cell with no statistics, which never prunes — the same contract as a
- * null @c BaseStatistics.
+ * A cell with @c valid false has no statistics and never prunes — the same contract as a null
+ * @c BaseStatistics.
  */
 struct packed_column_bounds {
   duckdb::LogicalType type;
   bool is_unsigned{false};
   /// True when the whole column had no nulls at capture time (see compute_pinned_group_stats).
   bool column_has_no_nulls{false};
-  std::vector<std::int64_t> mins;
-  std::vector<std::int64_t> maxs;
-  std::vector<bool> valid;
+  std::span<std::int64_t const> mins;
+  std::span<std::int64_t const> maxs;
+  /// One byte per group rather than a bitset: the evaluator reads it per cell, and a bitset would
+  /// trade a byte per group (0.01% of the region) for a shift and mask on the hot path.
+  std::span<std::uint8_t const> valid;
 
   [[nodiscard]] std::size_t size() const noexcept { return mins.size(); }
+  [[nodiscard]] bool empty() const noexcept { return mins.empty(); }
+};
+
+/**
+ * @brief Per-group min/max bounds for a whole pinned table, in one contiguous allocation.
+ *
+ * The index only earns its keep if it can be read WITHOUT reading the data it describes: read
+ * metadata, decide, then fetch only what survived. That requires it to be contiguous and
+ * segregated, not scattered across one allocation per (chunk, column).
+ *
+ * Layout is **column-major over (chunk, group)**: every group of column 0 across every chunk,
+ * then column 1, and so on, with the three arrays for a column stored back to back. A query
+ * filters on one to three columns, so column-major makes those a few long sequential runs and
+ * leaves the other columns untouched; chunk-major would interleave columns and force a strided
+ * walk over the whole region. It is also the layout a GPU evaluator wants, so a device mirror is
+ * a straight copy with no repacking.
+ *
+ * At SF1000 lineitem with 8192-row groups this is ~11.7 MB per column, ~170 MB for sixteen —
+ * one sequential read per column rather than ~732k lookups.
+ */
+class group_bounds_arena {
+ public:
+  group_bounds_arena() = default;
+
+  /// Rows per group; 0 when the arena is empty.
+  [[nodiscard]] std::size_t group_rows() const noexcept { return _group_rows; }
+  [[nodiscard]] std::size_t column_count() const noexcept { return _n_columns; }
+  [[nodiscard]] std::size_t chunk_count() const noexcept { return _n_chunks; }
+  [[nodiscard]] bool empty() const noexcept { return _storage.empty(); }
+  /// Contiguous bytes, for a single H2D copy or a single ranged write/read.
+  [[nodiscard]] std::span<std::int64_t const> raw() const noexcept { return _storage; }
+
+  /// Bounds of column @p column within chunk @p chunk; an empty view when absent.
+  [[nodiscard]] packed_column_bounds cell(std::size_t column, std::size_t chunk) const noexcept;
+
+  /// Number of groups covering chunk @p chunk (0 when out of range).
+  [[nodiscard]] std::size_t groups_in_chunk(std::size_t chunk) const noexcept;
+
+  /**
+   * @brief Build from a per-chunk capture, in chunk-major order as
+   * @ref compute_pinned_group_stats emits it, repacking to column-major.
+   *
+   * @p column_types is positional with the pinned columns. Returns an empty arena — meaning no
+   * sub-chunk pruning, never a wrong answer — if the capture is inconsistent: a differing column
+   * count, a differing @c group_rows, or a chunk whose group count disagrees with its own cells.
+   */
+  [[nodiscard]] static group_bounds_arena from_capture(
+    duckdb::vector<duckdb::LogicalType> const& column_types,
+    std::vector<chunk_group_stats> const& per_chunk);
+
+ private:
+  struct slice {
+    std::size_t offset{0};        ///< index into _storage of this (column, chunk)'s mins
+    std::size_t valid_offset{0};  ///< index into _valid; _storage advances 2x faster
+    std::size_t count{0};         ///< groups
+  };
+  /// _slices[column * _n_chunks + chunk]; mins at offset, maxs at offset + count.
+  std::vector<slice> _slices;
+  std::vector<std::int64_t> _storage;
+  std::vector<std::uint8_t> _valid;
+  duckdb::vector<duckdb::LogicalType> _types;
+  std::vector<bool> _is_unsigned;
+  std::vector<bool> _column_has_no_nulls;
+  std::size_t _group_rows{0};
+  std::size_t _n_columns{0};
+  std::size_t _n_chunks{0};
 };
 
 /**
