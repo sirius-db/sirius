@@ -948,6 +948,67 @@ Two things to settle before committing to the format, both experiments rather th
    measuring latency and throughput — settles it without touching Sirius at all, and should be run
    before any format work.
 
+## 6A. Skipping decode inside a compressed chunk: the missing primitive
+
+Serving surviving row ranges works today for **uncompressed** chunks — `cudf::slice` narrows the
+views, ownership stays whole, no copy. Compressed chunks still serve whole, and closing that gap
+needs one thing simpatico does not have. This records exactly what, so the next person does not
+re-derive it.
+
+### 6A.1 Why none of the three existing enumerators fits
+
+The decode is a product of an *enumerator* × a *consumer*
+(`codegen/decode/jit/renderer.hpp:92-101`). Three enumerators can express a selection:
+
+| enumerator | grid | selection storage | skips decode work? |
+|---|---|---|---|
+| `all_rows` | every chunk | — | no |
+| `mask_bits` | **every chunk** (dense grid, compacted by rank) | 1 bit/row | **no** — it compacts the output, it does not skip launches |
+| `index_list` | every chunk | 4 B/survivor row | no |
+| `chunk_csr` | **only touched chunks** | `in_chunk_rows`, **2 B/survivor row** | **yes** |
+
+So `chunk_csr` is the only one that actually avoids work — "the grid covers only TOUCHED chunks,
+and block b serves `chunk_ids[b]`" (`renderer.hpp:96-100`), with empty chunks "absent rather than
+launched-and-skipped" (`chunk_row_set.hpp:22-23`).
+
+But its cost is wrong for this use. `chunk_row_set` stores `in_chunk_rows` — a `uint16` in-chunk
+position per surviving row (`chunk_row_set.hpp:78`). For a 189 M-row pin chunk with half its rows
+surviving that is **~190 MB of device memory for the selection alone**, to express a selection
+whose content is "all 1024 rows of these chunks". Every one of those `uint16`s is the sequence
+0…1023 repeated.
+
+### 6A.2 What is actually needed
+
+A **dense chunk-list enumerator**: block *b* decodes all of `chunk_ids[b]` and writes it at output
+offset `b * 1024`. Selection storage is one `uint32` per surviving *chunk* — for the same 189 M-row
+chunk, **~370 KB instead of ~190 MB**, a 500× reduction — and there is no per-row bookkeeping to
+build.
+
+It fits the group index exactly: groups are a whole number of 1024-row decode chunks by
+construction, so a surviving group *is* a run of chunk ids, and a surviving row range converts to
+one with a shift.
+
+Concretely that means a fourth `Enumerator` alongside `all_rows` / `mask_bits` / `index_list` /
+`chunk_csr`, its renderer support, and a launcher — the same surface the existing sparse shapes
+already occupy (`kShapeSparseConsume` and friends, `renderer.hpp:118-127`). Not conceptually new,
+but real work inside the decode JIT.
+
+### 6A.3 The order to do it in
+
+1. **The dense chunk-list enumerator** — unlocks decode skipping for every bitpack-rooted column,
+   which is most of the shipped plans.
+2. **The group→byte table (§6.1) and range-skipped fetch** — unlocks skipping the *transfer*,
+   which is where the measured host-tier −8.1% comes from and where the remaining headroom is.
+
+They are independent: (1) saves SM time on a GPU-resident pin, (2) saves the H2D on a host pin.
+(2) is worth more on the numbers so far, but (1) is self-contained and does not need a format
+change.
+
+A per-plan-root caveat carries over from §6.1: `dictionary`, `str_split` and `delta` roots are
+refused by `decompress_column_rows` today (`simpatico_codegen.hpp:261-308`), so a mixed table skips
+what it can and full-decodes the rest. That is the same graceful-degradation shape as a missing
+zone-map cell.
+
 ## 7A. Physical layout: keep the metadata segregated and scannable on its own
 
 The index is only useful if it can be read *without* reading the data it describes. That is the
