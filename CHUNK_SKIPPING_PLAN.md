@@ -888,13 +888,33 @@ That has a consequence worth stating plainly:
 needs. Skipping transfer and skipping launches turn out to be separate problems with separate
 solutions, and the transfer one is both more valuable and cheaper.
 
+### 6.5.1a Two ways to get the byte ranges — and why the host path needs no format change
+
+Where the ranges come from differs by backend, but the *result* is the same type, so the consumer
+does not care:
+
+| backend | how ranges are obtained | cost | needs the stored table? |
+|---|---|---|---|
+| **host pin** | derive from the column's own per-chunk metadata (`chunk_count`/`chunk_bits`, 5 B/chunk), read from pinned host memory | a memcpy, no round trip | **no** |
+| disk / S3 | read the group→byte table out of the segregated metadata region (§7.5) | one sequential read, already amortised over the query | **yes** |
+
+The host path can therefore ship with **no format change at all** — deriving is cheap precisely
+because the metadata is already local. Deriving is the wrong answer over a network, where those
+same 5 B/chunk arrays are scattered through the payload region and cost a request each; that is
+what the stored table buys.
+
+**Keep both behind one interface.** `plan_bitpack_packed_subset` (derived) and a future
+`plan_from_stored_table` both return `buffer_subset`, so the fetch machinery, the coalescing policy
+and the header synthesis are written once and shared. Disk and S3 remain the eventual target; the
+host path is the cheap way to prove the mechanism first, not a different mechanism.
+
 ### 6.5.2 The pieces, in dependency order
 
-1. **The stored group→byte table (§6.1).** Which byte range of each bulk leaf buffer a group
-   occupies. Stored, not derived from bitpack's channels, for the plan-independence reason §6.1
-   gives. ~0.046% of payload at G = 8.
+1. **Byte ranges per surviving chunk.** Derived from per-chunk metadata for a host pin, or read
+   from the stored group→byte table (§6.1) for disk and S3 — see §6.5.1a. **Done** for the derived
+   case (`073dd5e1`: `plan_bitpack_packed_subset`, guard words and zero-bit chunks included).
 
-2. **A per-operator "extract these groups" capability.** To hand the decoder a self-consistent
+2. **A per-operator "extract these groups" capability. Done** (`d14b9161`). To hand the decoder a self-consistent
    smaller table, an operator must say which of its channels are *per-chunk metadata* (compact by
    selecting the surviving entries) versus *bulk* (fetch the surviving byte ranges). For `bitpack`
    that is `{chunk_min, chunk_count, chunk_bits}` metadata and `packed` bulk. An operator that
