@@ -99,7 +99,7 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
   /// N=1: native push. N>1: hash-partition; skip empty slices. Refused push = silent drop.
   void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
-  /// 0 if N==1; ~2× when partitioned (hash_partition holds reorder + slices).
+  /// 0 if N==1; one input when hash-partitioned (the reorder buffer the slices view).
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 

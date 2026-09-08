@@ -263,6 +263,98 @@ TEST_CASE("Hash partition with num partitions larger than input size", "[operato
   validate_hash_partition(*input_batch, output_batches, num_partitions);
 }
 
+TEST_CASE("Hash partition drops the appended cast key columns", "[operator][hash_partition]")
+{
+  auto* mem_space                           = get_shared_mem_space();
+  constexpr size_t num_input_rows           = 1000;
+  constexpr size_t num_partitions           = 4;
+  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::vector<int> partition_key_idx        = {0, 1};
+  // Key 0 is hashed as INT64; key 1 keeps its own type. The cast column is appended to the
+  // hashed table only, so it must not reach the output.
+  std::vector<cudf::data_type> cast_types = {cudf::data_type{cudf::type_id::INT64},
+                                             cudf::data_type{cudf::type_id::EMPTY}};
+  std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(),
+                                                         std::pair<int, int>{0, 100000});
+
+  auto input_batch =
+    create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  {
+    auto ro        = input_batch->to_read_only();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, cast_types, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
+  // Checks that every output carries exactly the input schema, so a retained cast column shows
+  // up as an extra column rather than as wrong data.
+  validate_hash_partition(*input_batch, output_batches, num_partitions);
+}
+
+TEST_CASE("Hash partition output slices alias one reordered table", "[operator][hash_partition]")
+{
+  auto* mem_space                           = get_shared_mem_space();
+  constexpr size_t num_input_rows           = 4000;
+  constexpr size_t num_partitions           = 4;
+  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::vector<int> partition_key_idx        = {0, 1};
+  // Wide key range so every partition receives rows.
+  std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(),
+                                                         std::pair<int, int>{0, 100000});
+
+  auto input_batch =
+    create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
+  std::vector<std::shared_ptr<data_batch>> output_batches;
+  std::size_t input_bytes = 0;
+  {
+    auto ro        = input_batch->to_read_only();
+    input_bytes    = ro.get_data()->get_size_in_bytes();
+    output_batches = gpu_partition_impl::hash_partition(
+      ro, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space);
+  }
+  validate_hash_partition(*input_batch, output_batches, num_partitions);
+
+  std::vector<cudf::table_view> views;
+  views.reserve(output_batches.size());
+  for (const auto& output_batch : output_batches) {
+    views.push_back(sirius::get_cudf_table_view(*output_batch));
+  }
+
+  // The partitions must be adjacent windows of a single reordered allocation per column: a
+  // per-partition deep copy would place each one in its own allocation instead.
+  int checked_columns = 0;
+  for (int c = 0; c < views[0].num_columns(); ++c) {
+    const std::byte* base       = nullptr;
+    cudf::size_type next_offset = 0;
+    for (const auto& view : views) {
+      if (view.num_rows() == 0) { continue; }
+      const auto& col = view.column(c);
+      if (base == nullptr) {
+        base        = col.head<std::byte>();
+        next_offset = col.offset();
+      }
+      REQUIRE(col.head<std::byte>() == base);
+      REQUIRE(col.offset() == next_offset);
+      next_offset += view.num_rows();
+    }
+    REQUIRE(base != nullptr);
+    ++checked_columns;
+  }
+  REQUIRE(checked_columns == views[0].num_columns());
+
+  // The reordered table is charged once across the partitions, not once per partition.
+  std::size_t charged = 0;
+  for (const auto& output_batch : output_batches) {
+    charged += output_batch->to_read_only().get_data()->get_size_in_bytes();
+  }
+  REQUIRE(charged <= input_bytes);
+}
+
 namespace {
 
 void validate_evenly_partition(data_batch& input_batch,

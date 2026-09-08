@@ -557,7 +557,10 @@ std::size_t sirius_physical_partition::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
   if (_num_partitions.has_value() && *_num_partitions == 1) { return 0; }
-  return stats.bytes * 2;
+  // hash_partition's reorder buffer. The partitions are views into it rather than copies,
+  // so it is the whole cost — but it lives until the last partition referencing it is
+  // released, rather than being freed as each one drains.
+  return stats.bytes;
 }
 
 }  // namespace op
