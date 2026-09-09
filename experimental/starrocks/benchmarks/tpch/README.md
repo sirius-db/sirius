@@ -10,6 +10,25 @@ files, which `mysql -e` would swallow). q11 keeps its `0.0001` fraction spec-cor
 scale through `__TPCH_SF__`, substituted with `$TPCH_SF` (default 1) by `bench.sh` and
 `oracle.py`; at SF1000 without it the query returns zero rows on every engine.
 
+## Runtime prerequisites
+
+This harness is useful as a reproducible workload and correctness gate now, but a real
+multi-CN Sirius run is not available on `dev` alone. It requires the CN bring-up work in
+#1714 (the `--gpu-device`, memory-carve-out and readiness behavior used by
+`cluster8.sh`), the stable exchange staging arena from #1693, and the follow-on
+distributed exchange runtime. Keep this PR as a Draft until that runtime is ready to
+land with it.
+
+`cluster8.sh` accepts `GPU_DEVICES=0,0` when two CNs intentionally share a GPU. Its
+`MIG_DEVICES` UUID branch is retained as future launcher plumbing, but is **not a
+supported launch on the current engine**: the engine's NVML device-count check fails
+under UUID-only visibility. On the current two-MIG box use whole-GPU ordinals such as
+`GPU_DEVICES=0,1` until that engine limitation is fixed. Each CN reserves `GPU_MEM`
+for the engine **plus** `STAGING` outside that limit, as well as a CUDA context; size
+every shared GPU or MIG slice for the total. For example, the default
+`GPU_MEM=64GiB STAGING=8GiB` needs about 72 GiB before context overhead per CN.
+`MIG_DEVICES` takes precedence over `GPU_DEVICES` when it becomes supported.
+
 ## Layout
 
 - `queries/qNN.sql` — the queries with `FILES()` preludes; `__TPCH_DATA__` is substituted
