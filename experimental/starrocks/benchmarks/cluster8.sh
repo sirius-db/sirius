@@ -59,8 +59,17 @@ export SIRIUS_QUERY_WATCHDOG_SECS=${SIRIUS_QUERY_WATCHDOG_SECS:-0}
 # GPU_DEVICES="0,0" places CN i on the i-th listed device instead of device i, so two CNs can
 # share one card on a single-GPU box (each must then carve out a GPU_MEM + STAGING slice that
 # fits alongside the other's). Default: one CN per GPU.
+# MIG_DEVICES="MIG-<uuid>,MIG-<uuid>" places CN i on the i-th MIG instance. A MIG instance is only
+# reachable through CUDA_VISIBLE_DEVICES=<uuid>, and the CN rejects a UUID next to --gpu-device, so
+# each CN is launched with the variable exported and without the flag.
 avail=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
-if [ -n "${GPU_DEVICES:-}" ]; then
+mig_of_cn=()
+if [ -n "${MIG_DEVICES:-}" ]; then
+    IFS=, read -r -a mig_of_cn <<< "$MIG_DEVICES"
+    [ "${#mig_of_cn[@]}" -ge "$NUM_CNS" ] || {
+        echo "MIG_DEVICES=$MIG_DEVICES lists ${#mig_of_cn[@]} instances for $NUM_CNS CNs" >&2; exit 1; }
+    gpu_of_cn=()
+elif [ -n "${GPU_DEVICES:-}" ]; then
     IFS=, read -r -a gpu_of_cn <<< "$GPU_DEVICES"
     [ "${#gpu_of_cn[@]}" -ge "$NUM_CNS" ] || {
         echo "GPU_DEVICES=$GPU_DEVICES lists ${#gpu_of_cn[@]} devices for $NUM_CNS CNs" >&2; exit 1; }
@@ -86,9 +95,13 @@ pids+=("$!")
 
 for i in $(seq 0 $((NUM_CNS - 1))); do
     base=$((PORT_BASE + i * PORT_STRIDE))
-    gpu=${gpu_of_cn[$i]}
+    if [ "${#mig_of_cn[@]}" -gt 0 ]; then
+        gpu=${mig_of_cn[$i]}; gpu_args=(); export CUDA_VISIBLE_DEVICES=$gpu
+    else
+        gpu=${gpu_of_cn[$i]}; gpu_args=(--gpu-device "$gpu"); unset CUDA_VISIBLE_DEVICES
+    fi
     "$CN_BIN" \
-        --gpu-device "$gpu" \
+        "${gpu_args[@]}" \
         --heartbeat-port "$base" \
         --thrift-port    "$((base + 1))" \
         --brpc-port      "$((base + 2))" \
