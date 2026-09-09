@@ -18,7 +18,7 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 project(
   sirius
-  VERSION 0.1.0
+  VERSION 0.0.0
   LANGUAGES CXX CUDA)
 option(SIRIUS_BUILD_SHARED_LIBRARY
        "Build the standalone libsirius shared library" ON)
