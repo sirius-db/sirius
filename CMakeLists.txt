@@ -20,8 +20,6 @@ project(
   sirius
   VERSION 0.0.0
   LANGUAGES CXX CUDA)
-option(SIRIUS_BUILD_SHARED_LIBRARY
-       "Build the standalone libsirius shared library" ON)
 
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -677,30 +675,28 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 target_link_options(sirius_loadable_extension PRIVATE
                     "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
 
-if(SIRIUS_BUILD_SHARED_LIBRARY)
-  add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
-  add_library(sirius::sirius ALIAS sirius_shared)
-  set_target_properties(
-    sirius_shared
-    PROPERTIES OUTPUT_NAME sirius
-               EXPORT_NAME sirius
-               VERSION "${PROJECT_VERSION}"
-               SOVERSION 0
-               INSTALL_RPATH "$ORIGIN"
-               INSTALL_REMOVE_ENVIRONMENT_RPATH ON
-               CXX_STANDARD 20
-               CXX_STANDARD_REQUIRED ON
-               LINKER_TYPE BFD
-               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_include_directories(
-    sirius_shared
-    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-           $<INSTALL_INTERFACE:include/sirius>)
-  target_link_libraries(
-    sirius_shared
-    PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
-            "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
-endif()
+add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
+add_library(sirius::sirius ALIAS sirius_shared)
+set_target_properties(
+  sirius_shared
+  PROPERTIES OUTPUT_NAME sirius
+             EXPORT_NAME sirius
+             VERSION "${PROJECT_VERSION}"
+             SOVERSION 0
+             INSTALL_RPATH "$ORIGIN"
+             INSTALL_REMOVE_ENVIRONMENT_RPATH ON
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             LINKER_TYPE BFD
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  sirius_shared
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+         $<INSTALL_INTERFACE:include/sirius>)
+target_link_libraries(
+  sirius_shared
+  PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
+          "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
@@ -754,36 +750,34 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-if(SIRIUS_BUILD_SHARED_LIBRARY)
-  include(CMakePackageConfigHelpers)
-  configure_package_config_file(
-    cmake/SiriusConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfig.cmake"
-    INSTALL_DESTINATION "lib/cmake/Sirius")
-  write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfigVersion.cmake"
-    VERSION "${PROJECT_VERSION}"
-    COMPATIBILITY SameMinorVersion)
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+  INSTALL_DESTINATION "lib/cmake/sirius")
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMinorVersion)
 
-  install(
-    TARGETS sirius_shared
-    EXPORT SiriusTargets
-    LIBRARY DESTINATION lib COMPONENT SiriusLibrary)
-  install(
-    FILES src/include/sirius_ffi.hpp
-    DESTINATION include/sirius
-    COMPONENT SiriusLibrary)
-  install(
-    EXPORT SiriusTargets
-    FILE SiriusTargets.cmake
-    NAMESPACE sirius::
-    DESTINATION "lib/cmake/Sirius"
-    COMPONENT SiriusLibrary)
-  install(
-    FILES "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfig.cmake"
-          "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfigVersion.cmake"
-    DESTINATION "lib/cmake/Sirius"
-    COMPONENT SiriusLibrary)
-endif()
+install(
+  TARGETS sirius_shared
+  EXPORT sirius-targets
+  LIBRARY DESTINATION lib COMPONENT sirius_library)
+install(
+  FILES src/include/sirius_ffi.hpp
+  DESTINATION include/sirius
+  COMPONENT sirius_library)
+install(
+  EXPORT sirius-targets
+  FILE sirius-targets.cmake
+  NAMESPACE sirius::
+  DESTINATION "lib/cmake/sirius"
+  COMPONENT sirius_library)
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  DESTINATION "lib/cmake/sirius"
+  COMPONENT sirius_library)
 
 if(ENABLE_STREAM_CHECK)
   message(
