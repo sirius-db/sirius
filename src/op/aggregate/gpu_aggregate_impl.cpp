@@ -32,6 +32,8 @@
 
 #include <rmm/error.hpp>
 
+#include <thrust/system/system_error.h>
+
 #include <algorithm>
 #include <new>
 
@@ -341,8 +343,29 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   }
 
   // Call cudf groupby and populate output columns
-  auto groupby_result = grpby_obj.aggregate(requests, stream, mr);
-  auto output_cols    = groupby_result.first->release();
+  auto groupby_result = [&]() {
+    try {
+      return grpby_obj.aggregate(requests, stream, mr);
+    } catch (const thrust::system_error& cuda_err) {
+      // The task executor can retry selected transient launch failures, but at
+      // that layer the failing cuDF phase and grouped-aggregate shape have
+      // already been lost. Preserve enough context here to distinguish the
+      // COLLECT_SET sorted-groupby path from the other aggregate paths without
+      // changing the exception type or recovery behavior.
+      SIRIUS_LOG_WARN(
+        "local_grouped_agg: cudf groupby aggregate threw CUDA/Thrust error [{}] {} "
+        "(rows={}, group_columns={}, requests={}, collect_set={}, label_keys={})",
+        cuda_err.code().value(),
+        cuda_err.what(),
+        input_table.num_rows(),
+        group_cols.size(),
+        requests.size(),
+        has_collect_set,
+        use_label_keys);
+      throw;
+    }
+  }();
+  auto output_cols = groupby_result.first->release();
 
   // Expand the single label key back into the original group key columns. The groupby emits
   // one row per distinct label, so this gather runs at group cardinality, not input rows.
