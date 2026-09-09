@@ -291,7 +291,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `monitor_period` | int (ms) | 10 | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely. |
+| `monitor_period` | duration (**>= 0**) | 10ms | Period of the memory-pressure monitor loop. Set to `0` to disable the monitor loop entirely; negative durations are rejected. |
 
 ## Scan Manager & IO Configuration
 
