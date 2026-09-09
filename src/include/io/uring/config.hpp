@@ -22,9 +22,12 @@ namespace sirius::io::uring {
 
 struct config {
   std::size_t bounce_size{1UL << 20};
-  /// When false, every prep path except the BYO-device-buffer read
-  /// (prep_device_rx_request) reads through the buffered (page-cache) file
-  /// handle instead of the O_DIRECT one.  Defaults to O_DIRECT.
+  /// Select the file handle used by local read requests.  When true, aligned
+  /// requests use the O_DIRECT handle and incompatible requests fall back to
+  /// the buffered (page-cache) handle; false forces every request through the
+  /// buffered handle.  This is a request-mode switch, not a deployment-mode
+  /// switch: create_io_object still opens both handles, so the filesystem must
+  /// support O_DIRECT in either mode.  Defaults to true.
   bool use_odirect{true};
 
   // max number of contiguous segments to fuse into one readv SQE.  The
