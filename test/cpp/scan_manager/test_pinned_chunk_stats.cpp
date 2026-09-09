@@ -1540,6 +1540,56 @@ TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
   }
 }
 
+TEST_CASE("surviving_decode_chunks maps row ranges onto 1024-row decode chunks",
+          "[pinned_chunk_stats]")
+{
+  using sirius::scan_manager::chunk_row_range;
+  using sirius::scan_manager::surviving_decode_chunk_rows;
+  using sirius::scan_manager::surviving_decode_chunks;
+  using ids_t = std::vector<std::uint32_t>;
+
+  constexpr std::size_t kDecode = 1024;
+
+  SECTION("a group-aligned range expands to its decode chunks")
+  {
+    // Groups of 8 decode chunks: rows [8192, 16384) is decode chunks 8..15.
+    auto const ids = surviving_decode_chunks(std::vector<chunk_row_range>{{0, 8192, 16384}},
+                                             /*rows=*/32768);
+    REQUIRE(ids == ids_t{8, 9, 10, 11, 12, 13, 14, 15});
+    REQUIRE(surviving_decode_chunk_rows(ids, 32768) == 8192);
+  }
+
+  SECTION("disjoint ranges stay ascending and do not repeat a chunk")
+  {
+    auto const ids = surviving_decode_chunks(
+      std::vector<chunk_row_range>{{0, 0, 2 * kDecode}, {0, 4 * kDecode, 5 * kDecode}},
+      /*rows=*/10 * kDecode);
+    REQUIRE(ids == ids_t{0, 1, 4});
+    REQUIRE(surviving_decode_chunk_rows(ids, 10 * kDecode) == 3 * kDecode);
+  }
+
+  SECTION("a range past the end of a short final group is clamped")
+  {
+    // The last group of a chunk may be short, so the plan's end may exceed the chunk.
+    auto const rows = 3 * kDecode + 100;
+    auto const ids =
+      surviving_decode_chunks(std::vector<chunk_row_range>{{0, 2 * kDecode, 8 * kDecode}}, rows);
+    REQUIRE(ids == ids_t{2, 3});
+    // Chunk 3 holds only the 100 rows that exist.
+    REQUIRE(surviving_decode_chunk_rows(ids, rows) == kDecode + 100);
+  }
+
+  SECTION("covering every chunk asks for no subset at all")
+  {
+    // Empty means "serve the chunk whole" — synthesizing a header that reproduces the original
+    // is pure cost.
+    REQUIRE(surviving_decode_chunks(std::vector<chunk_row_range>{{0, 0, 4 * kDecode}}, 4 * kDecode)
+              .empty());
+    REQUIRE(surviving_decode_chunks({}, 4 * kDecode).empty());
+    REQUIRE(surviving_decode_chunks(std::vector<chunk_row_range>{{0, 0, 100}}, 0).empty());
+  }
+}
+
 // ---------------------------------------------------------------------------
 // group_bounds_arena — the contiguous, column-major packing.
 //

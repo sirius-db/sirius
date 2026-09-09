@@ -346,10 +346,23 @@ void test_whole_column_is_emitted_whole()
   std::vector<std::uint8_t> header;
   std::vector<simpatico::gather_range> gather;
   std::uint64_t payload_bytes = 0;
-  auto const err              = simpatico::build_chunk_subset_header(
-    src.header, survivors, host_reader(src), header, gather, /*max_gap_bytes=*/0, &payload_bytes);
+  std::vector<std::uint8_t> subsetted;
+  auto const err = simpatico::build_chunk_subset_header(src.header,
+                                                        survivors,
+                                                        host_reader(src),
+                                                        header,
+                                                        gather,
+                                                        /*max_gap_bytes=*/0,
+                                                        &payload_bytes,
+                                                        &subsetted);
   expect(err.empty(), err.empty() ? "subset header build failed" : err.c_str());
   check_gather_well_formed(gather, "mixed");
+
+  // The per-column report is how a caller avoids assembling a compacted column and a whole one
+  // into one table: their row counts differ, and nothing downstream would tell it apart from a
+  // correct table until the values were wrong.
+  expect(subsetted == std::vector<std::uint8_t>{1, 0},
+         "the per-column subsetted report does not match what was emitted");
 
   auto const compacted = apply_gather(src, gather, payload_bytes);
   auto const table     = decode_from(header, compacted, nullptr, stream);

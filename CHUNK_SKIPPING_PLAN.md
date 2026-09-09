@@ -22,6 +22,7 @@ Read this first; the rest of the document is the reasoning and the measurements 
 | **Best host-tier configuration** | 10.44 s → **9.48 s** at SF1000 (~−9.2%), 22/22 byte-exact |
 | whole-chunk pruning on compressed pins | **−8.1%** (host, 2 GB batches) |
 | the per-group index on top | **−2.20%** (44.6e9 further rows dropped) |
+| range-skipped **fetch** on a host pin | **−1.03%** at SF1000 / 2 GB, and blocked on string columns (§6.5.4) |
 | GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
 
 Two findings that stand on their own, independent of the remaining work:
@@ -35,21 +36,26 @@ Two findings that stand on their own, independent of the remaining work:
 
 Per-group min/max capture at pin time → contiguous column-major arena → filter lowered once and
 evaluated over packed bounds (24× faster than the `BaseStatistics` path) → surviving row ranges in
-the scan plan → the scan serves those ranges for **uncompressed** chunks (zero-copy `cudf::slice`).
+the scan plan → the scan serves those ranges: an uncompressed chunk by narrowing its column views
+(zero-copy `cudf::slice`), a **host-tier compressed chunk by fetching and decoding only the
+surviving 1024-row decode chunks** (`SIRIUS_EXP_CHUNK_SUBSET_FETCH`, on by default; `0` is the A/B
+arm and the kill switch). 22/22 byte-exact on clustered SF100, host and GPU tier.
 
-### Built, tested, and NOT yet connected
+### What the fetch skip is worth today, and what caps it
 
-The compressed *fetch* path: operator classification (`buffer_layout`, `supports_chunk_subset`),
-byte-range arithmetic (`plan_buffer_subset`), and header synthesis
-(`build_chunk_subset_header`). All have host tests; **nothing calls them.**
-
-> **The next step is wiring them into `decompress_host_to_gpu`, plus the scan-level row-count
-> bookkeeping.** Until then this is inert — and inert machinery passing its unit tests is exactly
-> how the per-group index sat unused for a day before anyone noticed nothing populated
-> `pinned_entry::group_bounds`. Integration is what makes it real; §6.5 has the design.
+**−1.03%** at SF1000 / host / 2 GB against the same build with the gate off — around the ~0.8%
+noise floor, and **not** because the mechanism is weak. It engages on q6 and q14 and refuses on
+q1, q4 and q12, always for the same reason: **one string column in the projection**
+(`l_returnflag`, `l_shipmode`, `o_orderpriority`). A `dictionary` or `str_split` root is not
+chunk-addressable, and a table cannot mix a compacted column with a whole one (§6.5.4), so a
+single such column serves the whole chunk. **Extending `supports_chunk_subset` to the string trees
+is now the highest-value work in this project** — the scan-bound queries are exactly the blocked
+ones.
 
 ### Known gaps, in the order they will bite
 
+- **String columns block the fetch skip entirely** for any query that reads one (see above). This
+  is the binding constraint on the whole §6 line of work, not a detail.
 - Only a **plain bitpack** plan is exercised end to end through the header synthesis. `delta ->
   bitpack`, `for` and `zigzag` should work per the registry but have no fixture.
 - `plan_bitpack_packed_subset` computes 0 words for a `chunk_count == 0` chunk where the decode's
@@ -1076,14 +1082,61 @@ host path is the cheap way to prove the mechanism first, not a different mechani
    A column that cannot be subsetted is emitted whole (only its payload offsets shift to keep the
    payload dense), so a mixed table degrades per column rather than failing.
 
-4. **Row-count bookkeeping at the scan level.** The served batch has fewer rows than its chunk. The scan's row
-   accounting must follow, and late-mat must stay gated off for such a batch for the reason in
-   `a482f283` (its global row ids assume batch == whole chunk).
+4. **Row-count bookkeeping at the scan level. Done.** The projected representation reports the
+   rows the subset will produce and scales its byte footprints to match, so a reservation sized
+   off it fits what the decode returns. Late-mat stays gated off for a narrowed batch for the
+   reason in `a482f283`; on the host tier it is never stamped anyway.
+
+   The integration also had to answer a question the design did not ask: **how a chunk's row
+   ranges become BATCHES depends on what the chunk can serve.** An uncompressed device chunk
+   slices, so a range is a batch. A compressed chunk cannot be sliced, so all its ranges must
+   arrive as ONE batch naming the decode chunks to fetch — and a pinned HOST column, which
+   `host_data_representation::slice` narrows by COLUMN only, serves whole. Getting that wrong is
+   not a missed optimization; see §6.5.5.
 
 5. **Coalescing policy (§7.3).** Merge adjacent surviving ranges, tolerate reading pruned bytes in
    a small gap, and fall back to a bulk fetch past a fragmentation threshold. `align_and_coalesce`
    already exists per backend and takes a caller-supplied alignment; what is missing is the policy,
-   not the mechanism.
+   not the mechanism. **Less urgent than it looked**: on clustered data the surviving groups
+   already merge into a handful of large copies — a measured q6 batch gathered 6,152 surviving
+   decode chunks into **16 ranges**, so `max_gap_bytes = 0` costs almost nothing today.
+
+### 6.5.4 A compacted column and a whole one cannot be the same table
+
+`build_chunk_subset_header` emits a column it cannot address per chunk WHOLE, which §6.5.2 step 3
+described as degrading "per column rather than failing". That is true of the column and false of
+the **table**: a compacted column has the survivors' row count, a whole one has the chunk's, and
+`cudf::table` rejects the pair (`Column size mismatch: 30433664 != 8192`).
+
+The failure was loud only by luck — the mismatch throws inside `prepare_for_processing`, the query
+falls back to DuckDB, and the *results stay correct* while the query gets ~10× slower. The first
+SF1000-shaped measurement of this path read `+48%` and validated 22/22, which is exactly what a
+silent fallback looks like.
+
+So the builder now reports, per column, whether it was compacted, and the converter uses the
+subset only when **every column the scan reads** was. Unread columns may be whole — the reader
+never fetches their buffers.
+
+### 6.5.5 Serving row ranges duplicated rows on two of the four serve paths
+
+Wiring the fetch skip surfaced a **correctness bug in what `a482f283` already shipped**. The
+provider walked `survivor_row_ranges` and served one batch per range, but only ONE of the four
+serve paths narrowed anything: a `device_pin_chunk`'s uncompressed columns. The other three —
+per-column device storage (`data_batches_by_column`), a compressed chunk (either tier), and an
+uncompressed HOST chunk — ignored the range and served the WHOLE chunk, once per range. A chunk
+with two surviving groups was therefore emitted twice.
+
+It reproduces as wrong query results: TPC-H q5 on clustered SF100, host tier, `group_rows = 8192`
+returns revenue ~6% high, and is correct with `group_rows = 0`. It is fixed by deciding the batch
+shape per chunk before serving (step 4 above) rather than assuming every chunk can slice.
+
+Two lessons worth keeping:
+
+- **The §3.12 −2.20% was measured with this bug live.** The timing is not invalidated (duplicated
+  rows cost time, they do not save it) but nothing about that run's results was checked.
+- A serve path that silently ignores a narrowing instruction is indistinguishable from one that
+  cannot narrow — until the row count is wrong. The provider now decides `chunk_slices_per_range`
+  explicitly for every chunk, so a new storage form has to answer the question.
 
 ### 6.5.3 Does the existing plan still hold?
 
@@ -1601,6 +1654,19 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
 
 ## 10. Open questions / log
 
+- **2026-09-09** — **Range-skipped fetch runs end to end on a host-tier pin (§6.5).** The scan
+  hands a compressed chunk its surviving 1024-row decode chunks, `build_chunk_subset_header`
+  synthesizes a header for them, and the converter gathers only those bytes out of the pinned
+  payload. **−1.03%** at SF1000 / host / 2 GB (9.6845 → 9.5848 s, best-of-3), 22/22 byte-exact on
+  clustered SF100 at both tiers. Gate: `SIRIUS_EXP_CHUNK_SUBSET_FETCH` (on by default, `0` = off).
+  Two things had to be fixed to get there, both in §6.5: a table cannot mix a compacted column
+  with a whole one (§6.5.4), and the shipped row-range serving duplicated rows on three of the
+  four serve paths (§6.5.5, a real wrong-answer bug).
+- **2026-09-09** — **The fetch skip is capped by string columns, not by the mechanism.** It
+  engages on q6/q14 and refuses on q1/q4/q12 because each reads one `dictionary`- or
+  `str_split`-rooted column, and one unaddressable column in the projection sends the whole chunk.
+  Coalescing, meanwhile, is a non-problem on clustered data: 6,152 surviving decode chunks
+  gathered into 16 ranges. **Next: teach `supports_chunk_subset` the string trees.**
 - **2026-09-07** — project opened. Investigation and all measurements in §3–§6 done; nothing
   implemented, nothing benchmarked end-to-end.
 - **2026-09-07** — plan audit corrected the W1 story: `chunk_min` is a value-domain minimum only
@@ -1656,9 +1722,9 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
 - **Open (§7.3):** the coalescing policy — merge ranges whose gap is under G bytes, widen G until
   the request count is acceptable. G and N need measuring; `align_and_coalesce` already takes a
   caller-supplied alignment, so the mechanism exists and only the policy is missing.
-- **Open (§6):** range-skipped *fetch* on a host-tier pin — the highest-value untested idea, since
-  host-tier compressed loses 7.0% today entirely on fetch cost. Needs the coalescing question
-  answered: do surviving groups merge into few large copies on clustered data?
+- **Answered (§6):** range-skipped *fetch* on a host-tier pin is built, measured (−1.03% at
+  SF1000/2 GB) and gated. Surviving groups DO merge into few large copies on clustered data (16
+  ranges for 6,152 chunks). **Open:** the string-column ceiling above is what it now costs.
 - **Open:** the §3/§5 pruning numbers are still *rows/bytes not decoded*, not query time. Need one end-to-end datapoint —
   cheapest is W2 on a GPU-compressed lineitem pin with an artificially clustered SF100.
 - **Answered (§5.1):** sorting 6e9 rows at pin time costs ~2.3 s on the GPU for a per-chunk local
