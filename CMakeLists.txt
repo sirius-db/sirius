@@ -16,11 +16,10 @@
 
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
-project(sirius LANGUAGES CXX CUDA)
-
-set(SIRIUS_PACKAGE_VERSION
-    "0.1.0"
-    CACHE STRING "Version used for installable Sirius library artifacts")
+project(
+  sirius
+  VERSION 0.1.0
+  LANGUAGES CXX CUDA)
 option(SIRIUS_BUILD_SHARED_LIBRARY
        "Build the standalone libsirius shared library" ON)
 
@@ -685,7 +684,7 @@ if(SIRIUS_BUILD_SHARED_LIBRARY)
     sirius_shared
     PROPERTIES OUTPUT_NAME sirius
                EXPORT_NAME sirius
-               VERSION "${SIRIUS_PACKAGE_VERSION}"
+               VERSION "${PROJECT_VERSION}"
                SOVERSION 0
                INSTALL_RPATH "$ORIGIN"
                INSTALL_REMOVE_ENVIRONMENT_RPATH ON
@@ -762,7 +761,7 @@ if(SIRIUS_BUILD_SHARED_LIBRARY)
     INSTALL_DESTINATION "lib/cmake/Sirius")
   write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfigVersion.cmake"
-    VERSION "${SIRIUS_PACKAGE_VERSION}"
+    VERSION "${PROJECT_VERSION}"
     COMPATIBILITY SameMinorVersion)
 
   install(
