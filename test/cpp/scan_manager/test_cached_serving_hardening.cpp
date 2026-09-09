@@ -698,6 +698,111 @@ TEST_CASE("cached provider marks only selected converting columns",
   }
 }
 
+TEST_CASE("cached provider serves a chunk's row ranges as the chunk can take them",
+          "[cached_serving][scan_manager]")
+{
+  // Sub-chunk pruning gives a plan several row ranges per chunk. How those become BATCHES depends
+  // on the chunk: an uncompressed column is sliced, so a range is a batch; a compressed chunk
+  // cannot be sliced, so its ranges must arrive as ONE batch naming the decode chunks to fetch.
+  // Serving one batch per range there would hand out the whole chunk once per range — duplicated
+  // rows, not an error.
+  auto& e = env();
+  constexpr std::size_t kDecode{1024};
+  constexpr std::size_t rows{4 * kDecode};
+  auto const int32{cudf::data_type{cudf::type_id::INT32}};
+
+  // Two disjoint ranges of chunk 0: decode chunks {0} and {2}.
+  sirius::scan_manager::cached_scan_plan plan{
+    .survivor_chunk_indices = {0},
+    .pruned                 = 0,
+    .survivor_row_ranges    = {{0, 0, kDecode}, {0, 2 * kDecode, 3 * kDecode}},
+  };
+
+  auto drain = [](databatch_provider& provider) {
+    std::vector<databatch_provider::batch> batches;
+    for (auto b = provider.get_next_batch(); b.data; b = provider.get_next_batch()) {
+      batches.push_back(std::move(b));
+    }
+    return batches;
+  };
+
+  SECTION("a compressed host chunk serves one batch naming its surviving decode chunks")
+  {
+    pinned_entry entry;
+    set_cached_columns(entry, {"k"});
+    entry.tier         = cucascade::memory::Tier::HOST;
+    entry.memory_space = e.host_space;
+    entry.host_chunks.emplace_back(std::make_shared<sirius::compressed_host_representation>(
+      *e.host_space,
+      std::make_shared<sirius::pinned_compressed_blob>(),
+      std::vector<std::string>{"k"},
+      /*compressed_bytes=*/1024,
+      /*uncompressed_bytes=*/4096,
+      static_cast<std::int64_t>(rows)));
+    entry.num_rows = rows;
+
+    std::vector<std::size_t> cols{0};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+    auto const batches = drain(*provider);
+
+    REQUIRE(batches.size() == 1);
+    auto ro         = batches[0].data->to_read_only();
+    auto const* rep = dynamic_cast<sirius::compressed_host_representation const*>(ro.get_data());
+    REQUIRE(rep != nullptr);
+    REQUIRE(
+      std::vector<std::uint32_t>(rep->surviving_chunks().begin(), rep->surviving_chunks().end()) ==
+      std::vector<std::uint32_t>{0, 2});
+    // The batch reports the rows it will actually produce, so a reservation sized off it fits.
+    REQUIRE(rep->num_rows() == static_cast<std::int64_t>(2 * kDecode));
+    REQUIRE(rep->get_uncompressed_data_size_in_bytes() == 2048);
+  }
+
+  SECTION("an uncompressed HOST chunk serves its chunk exactly once")
+  {
+    // A pinned host column is sliced by COLUMN only (host_data_representation::slice), so it
+    // cannot narrow rows. Serving it once per range would hand the same rows out twice and
+    // silently inflate every aggregate over the table.
+    auto entry = make_host_entry(e, /*n_chunks=*/1, rows);
+
+    std::vector<std::size_t> cols{0, 1};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+    auto const batches = drain(*provider);
+
+    REQUIRE(batches.size() == 1);
+    auto ro         = batches[0].data->to_read_only();
+    auto const* rep = dynamic_cast<cucascade::host_data_representation const*>(ro.get_data());
+    REQUIRE(rep != nullptr);
+    REQUIRE(rep->column_size(0) == rows * sizeof(std::int32_t));  // column_size is in BYTES
+  }
+
+  SECTION("an uncompressed device chunk serves one sliced batch per range")
+  {
+    pinned_entry entry;
+    set_cached_columns(entry, {"k"});
+    entry.tier         = cucascade::memory::Tier::GPU;
+    entry.memory_space = e.gpu_space;
+    entry.chunk_memory_spaces.push_back(e.gpu_space);
+    entry.data_batches_by_column["k"].push_back(
+      make_typed_gpu_column(*e.gpu_space, int32, rows, cudf::mask_state::UNALLOCATED));
+    entry.num_rows = rows;
+
+    std::vector<std::size_t> cols{0};
+    auto provider = sirius::scan_manager::make_provider_for_pinned_entry(
+      entry, cols, plan, sirius::telemetry::batch_telemetry_info{});
+    auto const batches = drain(*provider);
+
+    REQUIRE(batches.size() == 2);
+    for (auto const& b : batches) {
+      auto ro         = b.data->to_read_only();
+      auto const* rep = dynamic_cast<cucascade::gpu_table_representation const*>(ro.get_data());
+      REQUIRE(rep != nullptr);
+      REQUIRE(rep->get_table_view().num_rows() == static_cast<cudf::size_type>(kDecode));
+    }
+  }
+}
+
 TEST_CASE("cached provider computes exact conversion-destination bytes per chunk",
           "[cached_serving][scan_manager]")
 {

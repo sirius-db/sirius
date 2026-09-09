@@ -30,6 +30,7 @@
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -157,6 +158,26 @@ cudf::data_type pin_native_type(cudf::data_type decoded_type,
   return native.value_or(decoded_type);
 }
 
+std::unique_ptr<cudf::table> cluster_pin_chunk(std::unique_ptr<cudf::table> table,
+                                               std::span<std::size_t const> key_columns,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  if (!table || table->num_rows() == 0) { return table; }
+  std::vector<cudf::size_type> keys;
+  keys.reserve(key_columns.size());
+  for (auto const column : key_columns) {
+    if (column < static_cast<std::size_t>(table->num_columns())) {
+      keys.push_back(static_cast<cudf::size_type>(column));
+    }
+  }
+  if (keys.empty()) { return table; }
+  nvtx3::scoped_range range{"sirius::pin::cluster"};
+  // Unstable: ties may land in any order, and clustering only cares that equal keys end up
+  // adjacent. Ascending with nulls first, which is what an unspecified order gives.
+  return cudf::sort_by_key(table->view(), table->view().select(keys), {}, {}, stream, mr);
+}
+
 namespace {
 
 /// Per-materialized-batch sink: receives one GPU-resident table, its GPU placement, the
@@ -170,7 +191,8 @@ using pin_batch_sink =
                      cucascade::memory::memory_space* target,
                      rmm::cuda_stream_view stream,
                      std::vector<pinned_column_storage_meta> column_storage,
-                     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats)>;
+                     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+                     scan_manager::chunk_group_stats group_stats)>;
 
 struct narrowed_pin_chunk {
   std::unique_ptr<cudf::table> table;
@@ -313,16 +335,33 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
+    // Cluster BEFORE anything observes the chunk: the zone maps below must describe the order the
+    // rows are stored in, and every id handed out downstream (late-mat's, the compressor's chunk
+    // grid) is positional against it.
+    if (!options.cluster_key_columns.empty()) {
+      tbl = cluster_pin_chunk(
+        std::move(tbl), options.cluster_key_columns, stream, target->get_default_allocator());
+    }
     // Zone-map capture, while the decode device guard + stream are active and the
     // GPU table is alive. The scalar downloads inside are synchronous, so the
     // capture is complete before the sink converts or frees the table. Clean
     // unsupported-metadata cases degrade to null cells inside; CUDA errors
     // propagate and abort the pin like any other pin-time CUDA failure.
     std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats;
+    scan_manager::chunk_group_stats group_stats;
     std::vector<bool> narrowed_columns(static_cast<std::size_t>(tbl->num_columns()), false);
     if (options.capture_chunk_stats && !pinned_column_types.empty()) {
       chunk_stats = scan_manager::compute_pinned_chunk_stats(
         tbl->view(), pinned_column_types, stream, target->get_default_allocator());
+      // The finer pass, on the same table and the same types. Costs ~1.7x the coarse capture and
+      // only refines what the coarse pass already kept, so it is gated behind it.
+      if (options.group_rows > 0) {
+        group_stats = scan_manager::compute_pinned_group_stats(tbl->view(),
+                                                               pinned_column_types,
+                                                               options.group_rows,
+                                                               stream,
+                                                               target->get_default_allocator());
+      }
     }
     // Observe BEFORE narrowing: the proof is about values, and same-family
     // narrowing preserves them, so the native carriers are both cheaper to
@@ -378,7 +417,12 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
                                 narrowed_columns[static_cast<std::size_t>(i)],
                                 native_types[static_cast<std::size_t>(i)]});
     }
-    on_batch(std::move(tbl), target, stream, std::move(column_storage), std::move(chunk_stats));
+    on_batch(std::move(tbl),
+             target,
+             stream,
+             std::move(column_storage),
+             std::move(chunk_stats),
+             std::move(group_stats));
   };
 
   while (!ingestible.has_processed_all_metadata()) {
@@ -576,7 +620,11 @@ materialized_pin materialize_all_batches(
         cucascade::memory::memory_space* target,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+        scan_manager::chunk_group_stats group_stats) {
+      // materialize_all_batches has no statistics sidecar of its own; the group capture is
+      // simply not requested on this path.
+      (void)group_stats;
       // Cached GPU batches are stored with a null writer stream, so the data
       // must be fully resident before it can be served or host-converted.
       stream.synchronize();
@@ -612,12 +660,14 @@ host_pin_result materialize_pin_to_host(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+        scan_manager::chunk_group_stats group_stats) {
       auto* target_host_space    = host_space_by_gpu.at(src_space->get_device_id());
       bool compressed_this_chunk = false;
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(tbl->num_rows()));
       out.column_storage.emplace_back(std::move(column_storage));
       if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
+      if (!group_stats.empty()) { out.group_stats.emplace_back(std::move(group_stats)); }
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {
@@ -710,10 +760,6 @@ device_pin_result materialize_all_batches_compressed(
   device_pin_result out;
   bool compression_failed = false;
 
-  // The device insert path stores no statistics sidecar (device_pin_result carries none), so a
-  // capture would be computed and dropped — force it off.
-  options.capture_chunk_stats = false;
-
   out.unique_verdicts = materialize_pin_batches(
     ingestible,
     gpu_spaces,
@@ -724,11 +770,16 @@ device_pin_result materialize_all_batches_compressed(
         cucascade::memory::memory_space* src_space,
         rmm::cuda_stream_view stream,
         std::vector<pinned_column_storage_meta> column_storage,
-        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> /*chunk_stats*/) {
+        std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> chunk_stats,
+        scan_manager::chunk_group_stats group_stats) {
       std::shared_ptr<sirius::compressed_device_representation> compressed_chunk;
       const std::int64_t chunk_rows = tbl->num_rows();
       out.base_row_count_per_chunk.push_back(static_cast<std::size_t>(chunk_rows));
       out.column_storage.emplace_back(std::move(column_storage));
+      // Captured off the uncompressed GPU table above, before this sink compresses it.
+      if (!chunk_stats.empty()) { out.chunk_stats.emplace_back(std::move(chunk_stats)); }
+      if (!group_stats.empty()) { out.group_stats.emplace_back(std::move(group_stats)); }
+      if (!group_stats.empty()) { out.group_stats.emplace_back(std::move(group_stats)); }
 
       if (compression.enabled && !compression_failed && tbl && !compression.plan_dsl.empty()) {
         try {

@@ -17,8 +17,13 @@
 #pragma once
 
 #include "late_mat/pin_uniqueness.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -46,6 +51,13 @@ struct PinTableArgs {
   /// duckdb-native only: schema that contains the table named by `name`. Defaults
   /// to "main"; the catalog search path (current/USE'd database) still applies.
   std::string schema = "main";
+  /// Columns to cluster each pin chunk on, in sort-key order. Empty pins in source order.
+  ///
+  /// Zone maps only prune when a chunk's values are narrow, and TPC-H as generated prunes 0.00%
+  /// because every chunk spans the whole key range. Sorting the FILES does not fix that (the scan
+  /// coalescer interleaves row groups), so clustering has to happen here — see
+  /// CHUNK_SKIPPING_PLAN.md 5.
+  std::vector<std::string> cluster_by;
 };
 
 void pin_table_to(const PinTableArgs& args);
@@ -164,15 +176,55 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 [[nodiscard]] cudf::data_type pin_native_type(cudf::data_type decoded_type,
                                               duckdb::LogicalType const* declared_type);
 
+/**
+ * @brief Sort one materialized pin chunk on @p key_columns, so its zone maps describe a narrow
+ * range of the key space instead of all of it.
+ *
+ * The cheapest clustering strategy there is: each chunk independently, no shuffle, one gather over
+ * bytes the pin is already moving. It leaves every chunk spanning the whole key range, so it
+ * prunes NOTHING at chunk granularity and everything it buys comes through the per-group index —
+ * see CHUNK_SKIPPING_PLAN.md 5.2, which measures 72.7% of chunks pruned at G=8 against 0.0% at
+ * chunk granularity.
+ *
+ * Declared here to be unit-testable; the pin drivers call it from materialize_pin_batches, before
+ * anything observes the chunk.
+ *
+ * @param table Chunk to reorder. Returned unchanged when it is empty or has no rows.
+ * @param key_columns Positions to sort on, in key order. Empty returns @p table unchanged; a
+ *                    position past the chunk's width is skipped, since pinning in source order is
+ *                    always correct.
+ * @return The chunk with every column gathered into the key's ascending order.
+ */
+[[nodiscard]] std::unique_ptr<cudf::table> cluster_pin_chunk(
+  std::unique_ptr<cudf::table> table,
+  std::span<std::size_t const> key_columns,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
-  bool capture_chunk_stats               = true;   ///< capture zone-map statistics per chunk
+  bool capture_chunk_stats = true;  ///< capture zone-map statistics per chunk
+  /// Rows per group for the finer-grained zone-map capture, 0 to skip it. A group is a whole
+  /// number of simpatico 1024-row decode chunks, so a surviving group maps to a chunk-id run.
+  /// Only captured when @c capture_chunk_stats is also set: the two share the same column types
+  /// and the same "no statistics never prunes" contract, and the coarse pass is the cheap
+  /// first filter the fine one refines.
+  std::size_t group_rows                 = 0;
   bool enable_compressed_materialization = false;  ///< narrow eligible numeric and DATE carriers
   /// Positional with the pinned columns: observe this column for whole-table
   /// distinctness (see @c late_mat::unique_probe). Empty — or all false —
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Positions (into the pinned columns) to sort each materialized chunk on, in key order.
+  /// Empty leaves every chunk in source order, which is the default.
+  ///
+  /// A LOCAL sort — each chunk independently, no shuffle — because that is what fits the
+  /// streaming pin: measured at ~2.3 s for SF1000 lineitem against a ~151 s pin, and within 0.8
+  /// points of a global sort's pruning PROVIDED the zone-map index is per-group rather than
+  /// per-chunk (a locally sorted chunk still spans the whole key range, so it prunes exactly
+  /// nothing at chunk granularity). See CHUNK_SKIPPING_PLAN.md 5.2.
+  std::vector<std::size_t> cluster_key_columns;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,
@@ -220,6 +272,9 @@ struct host_pin_result {
   /// (no pinned column types). Fed with the pin-time column types into
   /// @c sirius_scan_manager::insert_pinned_entry_host to drive zone-map pruning.
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Per-chunk, per-group zone-map capture, parallel to the chunks; empty when @c group_rows was
+  /// 0. Feeds group_bounds_arena::from_capture at insert.
+  std::vector<scan_manager::chunk_group_stats> group_stats;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;
@@ -264,6 +319,15 @@ struct device_pin_result {
   /// and uncompressed chunks alike); becomes duckdb_mvcc_metadata::
   /// base_row_count_per_chunk for duckdb-format pins.
   std::vector<std::size_t> base_row_count_per_chunk;
+  /// Per-chunk zone-map capture, taken on the GPU table BEFORE compression (so a
+  /// compressed chunk gets zone maps even though its payload is unreadable here);
+  /// chunk_stats[c][i] = stats of batch column i of chunk c (null = none). Parallel
+  /// to @c chunks when capture ran; empty when capture was skipped. Mirrors
+  /// @ref host_pin_result::chunk_stats and feeds insert_pinned_entry_device.
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats;
+  /// Per-chunk, per-group zone-map capture, parallel to the chunks; empty when @c group_rows was
+  /// 0. Feeds group_bounds_arena::from_capture at insert.
+  std::vector<scan_manager::chunk_group_stats> group_stats;
   /// Late-mat uniqueness verdicts, positional with the pinned columns; see
   /// @ref materialized_pin::unique_verdicts.
   std::vector<late_mat::unique_verdict> unique_verdicts;
@@ -302,13 +366,14 @@ host_pin_result materialize_pin_to_host(
 /// fails to compress usefully) is kept as an uncompressed device chunk instead, so
 /// @c device_pin_result::chunks may interleave the two forms in emission order.
 /// Carrier narrowing runs before compression exactly as in @ref materialize_pin_to_host.
-/// Zone-map capture is forced off:
-/// @c device_pin_result carries no statistics and @c insert_pinned_entry_device stores
-/// none, so device pins keep the statless-pin serving behavior.
+/// Zone-map capture also runs exactly as in @ref materialize_pin_to_host — on the
+/// uncompressed GPU table, before compression — so a GPU-tier compressed pin gets the
+/// same per-chunk statistics a host pin does, landing in @c device_pin_result::chunk_stats.
 ///
 /// \param pinned_column_types Pin-time DuckDB type of each batch column, in batch-column
-///                            (column_ids) order — drives the carrier narrowing. Empty is
-///                            valid only when narrowing is off.
+///                            (column_ids) order — drives the carrier narrowing and the
+///                            per-chunk zone-map capture. Empty is valid only when narrowing
+///                            is off, and skips capture (statless pin).
 /// \param compression         Per-table Simpatico settings; disabled pins every chunk
 ///                            uncompressed.
 /// \param options             Per-pin materialization behavior (carrier narrowing).

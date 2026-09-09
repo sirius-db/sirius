@@ -1,0 +1,4 @@
+# Benchmark output: per-run logs, per-query result dumps and generated configs.
+# Regenerate with run-sweep.sh / run-sweep-sf1000.sh; only the runtime CSVs are worth
+# keeping, and those live in runtimes/.
+results*/

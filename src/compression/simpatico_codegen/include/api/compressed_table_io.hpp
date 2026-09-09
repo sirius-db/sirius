@@ -142,4 +142,64 @@ compressed_table read_compressed_table_subset_from_memory(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
+// ─── Serving a subset of a column's 1024-row chunks ─────────────────────────
+//
+// A compressed column can be served as a compacted table containing only some of its 1024-row
+// chunks, because bitpack's `bp_offsets` -- where each chunk's bits start inside `packed` -- is
+// not stored: it is scanned at decode time from the `chunk_count`/`chunk_bits` that were loaded
+// (src/bridge/offsets_cumsum.cu). Hand the reader a header whose declared sizes are the compacted
+// ones, plus a fetch that yields the surviving chunks' bytes concatenated in order, and an
+// ordinary unmodified full decode produces exactly the surviving rows. Nothing on the read side
+// changes.
+
+/// One contiguous copy from the original payload into the compacted payload.
+struct gather_range {
+  std::uint64_t src_offset = 0;  ///< offset in the ORIGINAL payload
+  std::uint64_t size       = 0;
+  std::uint64_t dst_offset = 0;  ///< offset in the COMPACTED payload the new header describes
+};
+
+/// Reads @p size bytes of the original payload at @p offset into host memory at @p dst.
+/// Returns false if the range cannot be served. Used only to read the small per-chunk metadata
+/// buffers that size a bitpack `packed` buffer; on a host pin this is a memcpy.
+using payload_host_read_fn =
+  std::function<bool(std::uint64_t offset, std::uint64_t size, void* dst)>;
+
+/// Synthesize a header describing only @p surviving_chunks of every column of @p header, together
+/// with the ranges to gather from the original payload into the compacted one.
+///
+/// @p surviving_chunks are batch-local 1024-row chunk ids, strictly ascending. The result is fed
+/// to read_compressed_table_from_memory unchanged, with a @ref payload_fetch_fn backed by
+/// @p out_gather; the reader needs no knowledge that a subset is in play.
+///
+/// A column that cannot be subsetted -- a whole_column buffer such as a snappy root, an
+/// unclassified operator, a nested node whose length differs from the column's, or missing sizing
+/// metadata -- is emitted WHOLE (all its buffers at full size). Fetching whole is always correct
+/// for that COLUMN, so this never fails for a well-formed table; an error string is returned only
+/// for genuinely malformed input.
+///
+/// It is not automatically correct for the TABLE, and a caller must not ignore it: a subsetted
+/// column and a whole one have different row counts, and assembling them into one cudf::table
+/// throws (or, in a consumer that does not check, silently misaligns rows). @p
+/// out_column_subsetted reports the outcome per column, in header column order, so a caller can
+/// fall back to fetching the whole chunk when any column it actually reads was emitted whole.
+///
+/// @p read_payload supplies the values of a bitpack leaf's chunk_count/chunk_bits, which live in
+/// the payload and are the only way to size its `packed` chunks. A null or failing reader demotes
+/// that column to whole rather than failing.
+/// @p max_gap_bytes bridges small holes between kept ranges into one range (see
+/// simpatico::append_coalesced): moving a few pruned bytes beats paying for another request.
+/// @p out_payload_bytes, when non-null, receives the compacted payload's total size, which can
+/// exceed the gathered bytes (a bitpack `packed` buffer's decode guard words).
+/// @p out_column_subsetted, when non-null, receives one entry per column of @p header: 1 when the
+/// column was compacted to the surviving chunks, 0 when it was emitted whole.
+std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
+                                      std::span<const std::uint32_t> surviving_chunks,
+                                      payload_host_read_fn const& read_payload,
+                                      std::vector<std::uint8_t>& out_header,
+                                      std::vector<gather_range>& out_gather,
+                                      std::uint64_t max_gap_bytes                     = 0,
+                                      std::uint64_t* out_payload_bytes                = nullptr,
+                                      std::vector<std::uint8_t>* out_column_subsetted = nullptr);
+
 }  // namespace simpatico

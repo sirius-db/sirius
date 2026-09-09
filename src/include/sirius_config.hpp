@@ -179,6 +179,11 @@ struct operator_params {
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is
   /// off carries no zone maps and cannot prune until re-pinned with the flag on.
   bool enable_pinned_zone_map_pruning = true;
+  /// Rows per group for the finer, sub-chunk zone-map capture; 0 disables it, leaving whole-chunk
+  /// pruning. A group is a whole number of simpatico 1024-row decode chunks, so this should stay a
+  /// multiple of 1024. The default of 8 chunks is where the measured curves flatten: finer buys no
+  /// additional pruning while costing proportionally more index and more capture time.
+  std::size_t pinned_zone_map_group_rows = 8192;
 
   /// Store eligible integer and fixed-point DECIMAL columns in carriers selected from exact
   /// per-chunk bounds during pinning. Matching pinned scans derive targets from recorded storage

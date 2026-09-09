@@ -18,10 +18,20 @@
 
 #include "log/logging.hpp"
 
+#include <cudf/aggregation.hpp>
+#include <cudf/column/column.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/span.hpp>
 #include <cudf/wrappers/timestamps.hpp>
+
+#include <rmm/device_uvector.hpp>
+
+#include <cuda_runtime.h>
 
 #include <duckdb/common/enums/expression_type.hpp>
 #include <duckdb/common/enums/filter_propagate_result.hpp>
@@ -37,6 +47,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sirius::scan_manager {
@@ -106,6 +118,69 @@ duckdb::Value scalar_to_value(cudf::scalar const& s, rmm::cuda_stream_view strea
       return duckdb::Value();
   }
 }
+/// Host-side element -> duckdb::Value, mirroring scalar_to_value's allowlist exactly. Used by
+/// the per-group capture, which reads whole reduction-output columns back rather than scalars.
+template <typename T>
+duckdb::Value element_to_value(cudf::type_id id, T raw)
+{
+  switch (id) {
+    case cudf::type_id::INT8: return duckdb::Value::TINYINT(static_cast<std::int8_t>(raw));
+    case cudf::type_id::INT16: return duckdb::Value::SMALLINT(static_cast<std::int16_t>(raw));
+    case cudf::type_id::INT32: return duckdb::Value::INTEGER(static_cast<std::int32_t>(raw));
+    case cudf::type_id::INT64: return duckdb::Value::BIGINT(static_cast<std::int64_t>(raw));
+    case cudf::type_id::UINT8: return duckdb::Value::UTINYINT(static_cast<std::uint8_t>(raw));
+    case cudf::type_id::UINT16: return duckdb::Value::USMALLINT(static_cast<std::uint16_t>(raw));
+    case cudf::type_id::UINT32: return duckdb::Value::UINTEGER(static_cast<std::uint32_t>(raw));
+    case cudf::type_id::UINT64: return duckdb::Value::UBIGINT(static_cast<std::uint64_t>(raw));
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return duckdb::Value::DATE(duckdb::date_t{static_cast<std::int32_t>(raw)});
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{static_cast<std::int64_t>(raw)});
+    default: return duckdb::Value();
+  }
+}
+
+/// Copy a fixed-width reduction-output column to host as duckdb::Values, one per group.
+/// A null output element (an all-null group) yields a NULL Value, which the caller drops.
+std::vector<duckdb::Value> reduction_column_to_values(cudf::column_view const& col,
+                                                      rmm::cuda_stream_view stream)
+{
+  auto const n = static_cast<std::size_t>(col.size());
+  std::vector<duckdb::Value> out(n);
+  std::vector<bool> valid(n, true);
+  if (col.nullable() && col.null_count() > 0) {
+    auto const host_mask = cudf::detail::make_std_vector(
+      cudf::device_span<cudf::bitmask_type const>{col.null_mask(),
+                                                  cudf::num_bitmask_words(col.size())},
+      stream);
+    for (std::size_t g = 0; g < n; ++g) {
+      valid[g] = (host_mask[g / 32] >> (g % 32)) & 1u;
+    }
+  }
+
+  auto const copy_as = [&](auto tag) {
+    using T   = decltype(tag);
+    auto host = cudf::detail::make_std_vector(
+      cudf::device_span<T const>{col.data<T>(), static_cast<std::size_t>(col.size())}, stream);
+    for (std::size_t g = 0; g < n; ++g) {
+      out[g] = valid[g] ? element_to_value(col.type().id(), host[g]) : duckdb::Value();
+    }
+  };
+  switch (col.type().id()) {
+    case cudf::type_id::INT8: copy_as(std::int8_t{}); break;
+    case cudf::type_id::INT16: copy_as(std::int16_t{}); break;
+    case cudf::type_id::INT32: copy_as(std::int32_t{}); break;
+    case cudf::type_id::INT64: copy_as(std::int64_t{}); break;
+    case cudf::type_id::UINT8: copy_as(std::uint8_t{}); break;
+    case cudf::type_id::UINT16: copy_as(std::uint16_t{}); break;
+    case cudf::type_id::UINT32: copy_as(std::uint32_t{}); break;
+    case cudf::type_id::UINT64: copy_as(std::uint64_t{}); break;
+    case cudf::type_id::TIMESTAMP_DAYS: copy_as(std::int32_t{}); break;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS: copy_as(std::int64_t{}); break;
+    default: break;  // outside the allowlist -> all-null, caller drops the cells
+  }
+  return out;
+}
 }  // namespace
 
 std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_stats(
@@ -159,6 +234,95 @@ std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_sta
     stats[i] = column_stats.ToUnique();
   }
   return stats;
+}
+
+chunk_group_stats compute_pinned_group_stats(
+  cudf::table_view const& chunk,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::size_t group_rows,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  chunk_group_stats out;
+  auto const n_columns = static_cast<std::size_t>(chunk.num_columns());
+  auto const n_rows    = static_cast<std::size_t>(chunk.num_rows());
+  if (group_rows == 0 || n_rows == 0 || n_columns == 0) { return out; }
+  if (column_types.size() != n_columns) {
+    SIRIUS_LOG_WARN(
+      "[pinned_chunk_stats] column_types size ({}) != chunk column count ({}); capturing no "
+      "group statistics for this chunk",
+      column_types.size(),
+      n_columns);
+    return out;
+  }
+
+  auto const n_groups = (n_rows + group_rows - 1) / group_rows;
+  out.group_rows      = group_rows;
+  out.groups.resize(n_groups);
+  for (auto& row : out.groups) {
+    row.resize(n_columns);
+  }  // unique_ptr rows are move-only
+
+  // One offsets column shared by every reduction: fixed stride, clamped final group.
+  std::vector<cudf::size_type> host_offsets(n_groups + 1);
+  for (std::size_t g = 0; g <= n_groups; ++g) {
+    host_offsets[g] = static_cast<cudf::size_type>(std::min(g * group_rows, n_rows));
+  }
+  rmm::device_uvector<cudf::size_type> offsets(host_offsets.size(), stream, mr);
+  if (auto const rc = cudaMemcpyAsync(offsets.data(),
+                                      host_offsets.data(),
+                                      host_offsets.size() * sizeof(cudf::size_type),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value());
+      rc != cudaSuccess) {
+    // Match the whole-chunk capture: a CUDA failure here leaves device state suspect, so let the
+    // pin's own error handling abort rather than silently pinning without statistics.
+    throw std::runtime_error(std::string("[pinned_chunk_stats] offsets upload failed: ") +
+                             cudaGetErrorString(rc));
+  }
+  auto const offsets_span =
+    cudf::device_span<cudf::size_type const>{offsets.data(), offsets.size()};
+
+  auto const min_agg = cudf::make_min_aggregation<cudf::segmented_reduce_aggregation>();
+  auto const max_agg = cudf::make_max_aggregation<cudf::segmented_reduce_aggregation>();
+
+  for (std::size_t i = 0; i < n_columns; ++i) {
+    auto const& col     = chunk.column(static_cast<cudf::size_type>(i));
+    auto const& type    = column_types[i];
+    auto const expected = expected_cudf_type(type);
+    if (!expected || col.type().id() != *expected) { continue; }  // outside allowlist
+    if (col.size() == 0 || col.null_count() == col.size()) { continue; }
+
+    // EXCLUDE so a group with some nulls still reduces over its valid rows; the output element
+    // is null only for an all-null group, which leaves that cell absent (and so never pruning).
+    // CUDA failures propagate, as in the whole-chunk capture.
+    auto const mins = cudf::segmented_reduce(
+      col, offsets_span, *min_agg, col.type(), cudf::null_policy::EXCLUDE, stream, mr);
+    auto const maxs = cudf::segmented_reduce(
+      col, offsets_span, *max_agg, col.type(), cudf::null_policy::EXCLUDE, stream, mr);
+    if (!mins || !maxs) { continue; }
+
+    auto const min_values = reduction_column_to_values(mins->view(), stream);
+    auto const max_values = reduction_column_to_values(maxs->view(), stream);
+    if (min_values.size() != n_groups || max_values.size() != n_groups) { continue; }
+
+    // Deliberately the same precision as the coarse capture: a column-level fact, not a
+    // per-group count. See the header.
+    bool const column_has_no_nulls = col.null_count() == 0;
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      if (min_values[g].IsNull() || max_values[g].IsNull()) { continue; }
+      auto group_stats = duckdb::NumericStats::CreateUnknown(type);
+      duckdb::NumericStats::SetMin(group_stats, min_values[g]);
+      duckdb::NumericStats::SetMax(group_stats, max_values[g]);
+      if (column_has_no_nulls) {
+        group_stats.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+      } else {
+        group_stats.SetHasNull();
+      }
+      out.groups[g][i] = group_stats.ToUnique();
+    }
+  }
+  return out;
 }
 
 pinned_zone_maps pinned_zone_maps::from_capture(
@@ -272,6 +436,319 @@ bool filter_safe_for_stats(duckdb::TableFilter const& filter, duckdb::LogicalTyp
     // (shapes CheckStatistics may misread against numeric stats), and any
     // future filter type default to "keep the chunk".
     default: return false;
+  }
+}
+
+namespace {
+
+/// Raw 8-byte carrier of a Value whose type is in the zone-map allowlist. Unsigned values are
+/// stored as their bit pattern and compared via is_unsigned; see packed_column_bounds.
+std::optional<std::int64_t> value_carrier(duckdb::Value const& v)
+{
+  if (v.IsNull()) { return std::nullopt; }
+  switch (v.type().id()) {
+    case duckdb::LogicalTypeId::TINYINT: return v.GetValue<std::int8_t>();
+    case duckdb::LogicalTypeId::SMALLINT: return v.GetValue<std::int16_t>();
+    case duckdb::LogicalTypeId::INTEGER: return v.GetValue<std::int32_t>();
+    case duckdb::LogicalTypeId::BIGINT: return v.GetValue<std::int64_t>();
+    case duckdb::LogicalTypeId::UTINYINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint8_t>());
+    case duckdb::LogicalTypeId::USMALLINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint16_t>());
+    case duckdb::LogicalTypeId::UINTEGER:
+      return static_cast<std::int64_t>(v.GetValue<std::uint32_t>());
+    case duckdb::LogicalTypeId::UBIGINT:
+      return static_cast<std::int64_t>(v.GetValue<std::uint64_t>());
+    case duckdb::LogicalTypeId::DATE:
+      return static_cast<std::int64_t>(v.GetValue<duckdb::date_t>().days);
+    case duckdb::LogicalTypeId::TIMESTAMP:
+      return static_cast<std::int64_t>(v.GetValue<duckdb::timestamp_t>().value);
+    default: return std::nullopt;
+  }
+}
+
+bool type_is_unsigned(duckdb::LogicalType const& t)
+{
+  switch (t.id()) {
+    case duckdb::LogicalTypeId::UTINYINT:
+    case duckdb::LogicalTypeId::USMALLINT:
+    case duckdb::LogicalTypeId::UINTEGER:
+    case duckdb::LogicalTypeId::UBIGINT: return true;
+    default: return false;
+  }
+}
+
+/// Three-way ordering on carriers, honoring the column's signedness.
+int carrier_cmp(std::int64_t a, std::int64_t b, bool is_unsigned) noexcept
+{
+  if (is_unsigned) {
+    auto const ua = static_cast<std::uint64_t>(a);
+    auto const ub = static_cast<std::uint64_t>(b);
+    return ua < ub ? -1 : (ua > ub ? 1 : 0);
+  }
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+}  // namespace
+
+packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t chunk) const noexcept
+{
+  packed_column_bounds out;
+  if (column >= _n_columns || chunk >= _n_chunks) { return out; }
+  auto const& sl = _slices[column * _n_chunks + chunk];
+  if (sl.count == 0) { return out; }
+  out.type                = _types[column];
+  out.is_unsigned         = _is_unsigned[column];
+  out.column_has_no_nulls = _column_has_no_nulls[column];
+  out.mins                = std::span<std::int64_t const>{_storage.data() + sl.offset, sl.count};
+  out.maxs  = std::span<std::int64_t const>{_storage.data() + sl.offset + sl.count, sl.count};
+  out.valid = std::span<std::uint8_t const>{_valid.data() + sl.valid_offset, sl.count};
+  return out;
+}
+
+std::size_t group_bounds_arena::groups_in_chunk(std::size_t chunk) const noexcept
+{
+  if (chunk >= _n_chunks || _n_columns == 0) { return 0; }
+  return _slices[chunk].count;  // column 0's slice for this chunk
+}
+
+group_bounds_arena group_bounds_arena::from_capture(
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<chunk_group_stats> const& per_chunk)
+{
+  group_bounds_arena out;
+  if (column_types.empty() || per_chunk.empty()) { return out; }
+  auto const n_columns = column_types.size();
+  auto const n_chunks  = per_chunk.size();
+
+  // One group_rows for the whole table, and every chunk's cells must agree with its own group
+  // count. Anything inconsistent yields an empty arena: no sub-chunk pruning, never a wrong one.
+  std::size_t const group_rows = per_chunk.front().group_rows;
+  if (group_rows == 0) { return out; }
+  std::vector<std::size_t> groups_per_chunk(n_chunks);
+  std::size_t total_groups = 0;
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    auto const& cs = per_chunk[c];
+    if (cs.group_rows != group_rows || cs.groups.empty()) { return out; }
+    for (auto const& row : cs.groups) {
+      if (row.size() != n_columns) { return out; }
+    }
+    groups_per_chunk[c] = cs.groups.size();
+    total_groups += groups_per_chunk[c];
+  }
+
+  out._group_rows = group_rows;
+  out._n_columns  = n_columns;
+  out._n_chunks   = n_chunks;
+  out._types      = column_types;
+  out._is_unsigned.resize(n_columns, false);
+  out._column_has_no_nulls.resize(n_columns, true);
+  out._slices.resize(n_columns * n_chunks);
+  // Every column stores a full set of groups, and each (column, chunk) reserves 2 * groups for
+  // its mins and maxs back to back.
+  out._storage.assign(2 * total_groups * n_columns, 0);
+  out._valid.assign(total_groups * n_columns, 0);
+
+  std::size_t cursor       = 0;  // into _storage, advancing by 2 * groups
+  std::size_t valid_cursor = 0;  // into _valid, advancing by groups
+  for (std::size_t col = 0; col < n_columns; ++col) {
+    out._is_unsigned[col] = type_is_unsigned(column_types[col]);
+    for (std::size_t chunk = 0; chunk < n_chunks; ++chunk) {
+      auto const n_groups                 = groups_per_chunk[chunk];
+      out._slices[col * n_chunks + chunk] = {cursor, valid_cursor, n_groups};
+      auto const& groups                  = per_chunk[chunk].groups;
+      for (std::size_t g = 0; g < n_groups; ++g) {
+        auto const* cell = groups[g][col].get();
+        if (cell == nullptr) { continue; }  // leaves valid = 0, which never prunes
+        auto const lo = value_carrier(duckdb::NumericStats::Min(*cell));
+        auto const hi = value_carrier(duckdb::NumericStats::Max(*cell));
+        if (!lo || !hi) { continue; }
+        out._storage[cursor + g]            = *lo;
+        out._storage[cursor + n_groups + g] = *hi;
+        out._valid[valid_cursor + g]        = 1;
+        // A single cell that admits nulls makes the column's cells all "may have nulls", which is
+        // exactly the precision compute_pinned_group_stats captures.
+        if (cell->CanHaveNull()) { out._column_has_no_nulls[col] = false; }
+      }
+      cursor += 2 * n_groups;
+      valid_cursor += n_groups;
+    }
+  }
+  return out;
+}
+
+std::optional<lowered_bound_filter> lowered_bound_filter::lower(
+  duckdb::TableFilter const& filter, duckdb::LogicalType const& stats_type)
+{
+  // Gate on exactly the same allowlist as the BaseStatistics path, so the two can never disagree
+  // about WHICH filters are evaluable — only (and verifiably not) about the answer.
+  if (!filter_safe_for_stats(filter, stats_type)) { return std::nullopt; }
+
+  lowered_bound_filter out;
+  bool const uns = type_is_unsigned(stats_type);
+  bool ok        = true;
+
+  // Recursive build; returns the index of the node it appended. Children are appended first and
+  // their indices recorded in _children, so evaluation never chases pointers.
+  auto const build = [&](auto&& self, duckdb::TableFilter const& f) -> std::uint32_t {
+    node n;
+    n.is_unsigned = uns;
+    switch (f.filter_type) {
+      case duckdb::TableFilterType::CONSTANT_COMPARISON: {
+        auto const& cf = f.Cast<duckdb::ConstantFilter>();
+        auto const c   = value_carrier(cf.constant);
+        if (!c) {
+          ok = false;
+          break;
+        }
+        n.constant = *c;
+        switch (cf.comparison_type) {
+          case duckdb::ExpressionType::COMPARE_EQUAL: n.kind = op::cmp_eq; break;
+          case duckdb::ExpressionType::COMPARE_NOTEQUAL: n.kind = op::cmp_ne; break;
+          case duckdb::ExpressionType::COMPARE_LESSTHAN: n.kind = op::cmp_lt; break;
+          case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO: n.kind = op::cmp_le; break;
+          case duckdb::ExpressionType::COMPARE_GREATERTHAN: n.kind = op::cmp_gt; break;
+          case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: n.kind = op::cmp_ge; break;
+          default: ok = false; break;
+        }
+        break;
+      }
+      case duckdb::TableFilterType::IS_NULL: n.kind = op::is_null; break;
+      case duckdb::TableFilterType::IS_NOT_NULL: n.kind = op::is_not_null; break;
+      case duckdb::TableFilterType::IN_FILTER: {
+        auto const& in = f.Cast<duckdb::InFilter>();
+        n.kind         = op::in_list;
+        n.begin        = static_cast<std::uint32_t>(out._values.size());
+        for (auto const& v : in.values) {
+          auto const c = value_carrier(v);
+          if (!c) {
+            ok = false;
+            break;
+          }
+          out._values.push_back(*c);
+        }
+        n.end = static_cast<std::uint32_t>(out._values.size());
+        break;
+      }
+      case duckdb::TableFilterType::CONJUNCTION_AND:
+      case duckdb::TableFilterType::CONJUNCTION_OR: {
+        auto const& children = f.filter_type == duckdb::TableFilterType::CONJUNCTION_AND
+                                 ? f.Cast<duckdb::ConjunctionAndFilter>().child_filters
+                                 : f.Cast<duckdb::ConjunctionOrFilter>().child_filters;
+        n.kind = f.filter_type == duckdb::TableFilterType::CONJUNCTION_AND ? op::conj : op::disj;
+        std::vector<std::uint32_t> kids;
+        kids.reserve(children.size());
+        for (auto const& c : children) {
+          if (!c) {
+            ok = false;
+            break;
+          }
+          kids.push_back(self(self, *c));
+        }
+        n.begin = static_cast<std::uint32_t>(out._children.size());
+        out._children.insert(out._children.end(), kids.begin(), kids.end());
+        n.end = static_cast<std::uint32_t>(out._children.size());
+        break;
+      }
+      case duckdb::TableFilterType::OPTIONAL_FILTER: {
+        auto const& opt = f.Cast<duckdb::OptionalFilter>();
+        if (!opt.child_filter) {
+          ok = false;
+          break;
+        }
+        // An optional wrapping one child behaves as a single-child conjunction.
+        auto const kid = self(self, *opt.child_filter);
+        n.kind         = op::conj;
+        n.begin        = static_cast<std::uint32_t>(out._children.size());
+        out._children.push_back(kid);
+        n.end = static_cast<std::uint32_t>(out._children.size());
+        break;
+      }
+      default: ok = false; break;
+    }
+    out._nodes.push_back(n);
+    return static_cast<std::uint32_t>(out._nodes.size() - 1);
+  };
+
+  auto const root = build(build, filter);
+  if (!ok) { return std::nullopt; }
+  // Evaluation starts from the root, which the post-order build leaves last.
+  if (root + 1 != out._nodes.size()) { return std::nullopt; }
+  std::swap(out._nodes[0], out._nodes[root]);
+  // Re-point any child references to the two swapped slots.
+  for (auto& c : out._children) {
+    if (c == 0) {
+      c = static_cast<std::uint32_t>(root);
+    } else if (c == root) {
+      c = 0;
+    }
+  }
+  return out;
+}
+
+bool lowered_bound_filter::eval(std::uint32_t node_index,
+                                std::int64_t min,
+                                std::int64_t max,
+                                bool has_null,
+                                bool all_null) const noexcept
+{
+  auto const& n      = _nodes[node_index];
+  auto const cmp_min = [&](std::int64_t c) { return carrier_cmp(min, c, n.is_unsigned); };
+  auto const cmp_max = [&](std::int64_t c) { return carrier_cmp(max, c, n.is_unsigned); };
+  switch (n.kind) {
+    // A value range proof says nothing about rows that are NULL, but a NULL never satisfies a
+    // comparison either, so "no non-null row can match" is enough to prune.
+    case op::cmp_eq: return cmp_min(n.constant) > 0 || cmp_max(n.constant) < 0;
+    case op::cmp_ne: return cmp_min(n.constant) == 0 && cmp_max(n.constant) == 0;
+    case op::cmp_lt: return cmp_min(n.constant) >= 0;
+    case op::cmp_le: return cmp_min(n.constant) > 0;
+    case op::cmp_gt: return cmp_max(n.constant) <= 0;
+    case op::cmp_ge: return cmp_max(n.constant) < 0;
+    case op::in_list: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (cmp_min(_values[i]) <= 0 && cmp_max(_values[i]) >= 0) { return false; }
+      }
+      return true;
+    }
+    case op::is_null: return !has_null;
+    case op::is_not_null: return all_null;
+    case op::conj: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (eval(_children[i], min, max, has_null, all_null)) { return true; }
+      }
+      return false;
+    }
+    case op::disj: {
+      for (std::uint32_t i = n.begin; i < n.end; ++i) {
+        if (!eval(_children[i], min, max, has_null, all_null)) { return false; }
+      }
+      return n.begin != n.end;
+    }
+  }
+  return false;
+}
+
+bool lowered_bound_filter::provably_empty(std::int64_t min,
+                                          std::int64_t max,
+                                          bool has_null,
+                                          bool all_null) const noexcept
+{
+  if (_nodes.empty()) { return false; }
+  return eval(0, min, max, has_null, all_null);
+}
+
+void lowered_bound_filter::select_survivors(packed_column_bounds const& bounds,
+                                            std::vector<std::uint32_t>& survivors) const
+{
+  auto const n = bounds.size();
+  survivors.clear();
+  survivors.reserve(n);
+  bool const has_null = !bounds.column_has_no_nulls;
+  for (std::size_t i = 0; i < n; ++i) {
+    // An absent cell never prunes, exactly as a null BaseStatistics does not.
+    if (bounds.valid[i] == 0 || !provably_empty(bounds.mins[i], bounds.maxs[i], has_null, false)) {
+      survivors.push_back(static_cast<std::uint32_t>(i));
+    }
   }
 }
 

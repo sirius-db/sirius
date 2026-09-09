@@ -64,6 +64,7 @@
 #include <scan_manager/pinned_chunk_stats.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -996,4 +997,728 @@ TEST_CASE("build_cached_scan_plan - duplicate column names never alias (position
   auto plan = build_cached_scan_plan(entry, &fs, &qcols);
   REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
   REQUIRE(plan.pruned == 2);
+}
+
+// ---------------------------------------------------------------------------
+// compute_pinned_group_stats — the per-group (G * 1024 rows) capture.
+// Same allowlist and same "null cell never prunes" contract as the whole-chunk
+// capture; the difference is one segmented reduction per column instead of one
+// reduction per group.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// Run the group capture over a single-column chunk with @p type declared for it.
+sirius::scan_manager::chunk_group_stats capture_groups(cudf::column_view const& col,
+                                                       LogicalType const& type,
+                                                       std::size_t group_rows)
+{
+  auto& e     = genv();
+  auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+  auto stream = sirius::test::operator_utils::default_stream();
+  return sirius::scan_manager::compute_pinned_group_stats(
+    cudf::table_view{{col}}, duckdb::vector<LogicalType>{type}, group_rows, stream, mr);
+}
+
+/// [min, max] of a group cell, as ints.
+std::pair<int32_t, int32_t> int_bounds(duckdb::BaseStatistics const& s)
+{
+  return {duckdb::NumericStats::Min(s).GetValue<int32_t>(),
+          duckdb::NumericStats::Max(s).GetValue<int32_t>()};
+}
+}  // namespace
+
+TEST_CASE("compute_pinned_group_stats - exact per-group bounds", "[pinned_chunk_stats]")
+{
+  SECTION("groups divide the chunk evenly")
+  {
+    // 8 rows, 2 groups of 4: [5,1,9,3] -> [1,9]; [40,42,41,44] -> [40,44].
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3, 40, 42, 41, 44});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 4);
+    REQUIRE(gs.group_rows == 4);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] != nullptr);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+    REQUIRE(int_bounds(*gs.groups[1][0]) == std::pair<int32_t, int32_t>{40, 44});
+  }
+
+  SECTION("a short final group is captured, not dropped")
+  {
+    // 7 rows, group_rows 3 -> groups of 3, 3, 1. The parquet pin path does not
+    // pack whole 122,880-row units, so a short tail group must be legal.
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 30, 33, 31, 77});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 3);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+    REQUIRE(int_bounds(*gs.groups[1][0]) == std::pair<int32_t, int32_t>{30, 33});
+    REQUIRE(int_bounds(*gs.groups[2][0]) == std::pair<int32_t, int32_t>{77, 77});
+  }
+
+  SECTION("one group per chunk reproduces the whole-chunk capture")
+  {
+    auto col    = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto coarse = capture_one(col->view(), LogicalType::INTEGER);
+    auto gs     = capture_groups(col->view(), LogicalType::INTEGER, 4);
+    REQUIRE(gs.group_count() == 1);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == int_bounds(*coarse));
+  }
+
+  SECTION("group_rows larger than the chunk yields a single group")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 1024);
+    REQUIRE(gs.group_count() == 1);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{1, 9});
+  }
+
+  SECTION("DATE reduces in the date domain")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::TIMESTAMP_DAYS, {100, 90, 5000, 4000});
+    auto gs  = capture_groups(col->view(), LogicalType::DATE, 2);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(duckdb::NumericStats::Min(*gs.groups[0][0]) == Value::DATE(duckdb::date_t{90}));
+    REQUIRE(duckdb::NumericStats::Max(*gs.groups[1][0]) == Value::DATE(duckdb::date_t{5000}));
+  }
+}
+
+TEST_CASE("compute_pinned_group_stats - nulls and degenerate input", "[pinned_chunk_stats]")
+{
+  SECTION("a partly-null group reduces over its valid rows")
+  {
+    // Group 0 = [5, NULL, 9]; min/max must ignore the null, and the cell must
+    // advertise that nulls are possible.
+    auto col = make_gpu_col<int32_t>(
+      cudf::type_id::INT32, {5, 7, 9, 30, 33, 31}, {true, false, true, true, true, true});
+    auto gs = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(int_bounds(*gs.groups[0][0]) == std::pair<int32_t, int32_t>{5, 9});
+    REQUIRE(gs.groups[0][0]->CanHaveNull());
+  }
+
+  SECTION("an all-null group leaves its cell absent, which never prunes")
+  {
+    auto col = make_gpu_col<int32_t>(
+      cudf::type_id::INT32, {5, 7, 9, 30, 33, 31}, {true, true, true, false, false, false});
+    auto gs = capture_groups(col->view(), LogicalType::INTEGER, 3);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] != nullptr);
+    REQUIRE(gs.groups[1][0] == nullptr);
+  }
+
+  SECTION("a type outside the allowlist leaves every cell absent")
+  {
+    auto col = make_gpu_col<float>(cudf::type_id::FLOAT32, {1.0f, 2.0f, 3.0f, 4.0f});
+    auto gs  = capture_groups(col->view(), LogicalType::FLOAT, 2);
+    REQUIRE(gs.group_count() == 2);
+    REQUIRE(gs.groups[0][0] == nullptr);
+    REQUIRE(gs.groups[1][0] == nullptr);
+  }
+
+  SECTION("group_rows == 0 yields no statistics rather than throwing")
+  {
+    auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 1, 9, 3});
+    auto gs  = capture_groups(col->view(), LogicalType::INTEGER, 0);
+    REQUIRE(gs.empty());
+  }
+
+  SECTION("a column count that disagrees with column_types captures nothing")
+  {
+    auto& e     = genv();
+    auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+    auto stream = sirius::test::operator_utils::default_stream();
+    auto a      = make_gpu_col<int32_t>(cudf::type_id::INT32, {1, 2, 3, 4});
+    auto b      = make_gpu_col<int32_t>(cudf::type_id::INT32, {5, 6, 7, 8});
+    auto gs     = sirius::scan_manager::compute_pinned_group_stats(
+      cudf::table_view{{a->view(), b->view()}},
+      duckdb::vector<LogicalType>{LogicalType::INTEGER},
+      2,
+      stream,
+      mr);
+    REQUIRE(gs.empty());
+  }
+}
+
+// Not a correctness test: a timing probe for the representation question — does one
+// duckdb::BaseStatistics object per (group, column) scale to the group counts a real pin
+// produces? Tagged [.] so it only runs when named explicitly.
+TEST_CASE("compute_pinned_group_stats - capture cost at realistic group counts",
+          "[.][pinned_chunk_stats][bench]")
+{
+  auto& e     = genv();
+  auto mr     = sirius::test::operator_utils::get_resource_ref(*e.gpu_space);
+  auto stream = sirius::test::operator_utils::default_stream();
+
+  constexpr std::size_t kRows = 8ull * 1024 * 1024;  // 8 M rows
+  std::vector<int32_t> values(kRows);
+  for (std::size_t i = 0; i < kRows; ++i) {
+    values[i] = static_cast<int32_t>(i % 100000);
+  }
+  auto col = make_gpu_col<int32_t>(cudf::type_id::INT32, values);
+
+  for (std::size_t group_rows : {kRows, std::size_t{65536}, std::size_t{8192}}) {
+    auto const t0 = std::chrono::high_resolution_clock::now();
+    auto gs       = sirius::scan_manager::compute_pinned_group_stats(
+      cudf::table_view{{col->view()}},
+      duckdb::vector<LogicalType>{LogicalType::INTEGER},
+      group_rows,
+      stream,
+      mr);
+    auto const t1 = std::chrono::high_resolution_clock::now();
+    auto const ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    WARN("group_rows=" << group_rows << " groups=" << gs.group_count() << " -> " << ms
+                       << " ms for 1 column of " << kRows << " rows");
+    REQUIRE(gs.group_count() >= 1);
+  }
+
+  // Evaluation side: what a per-query plan pass over group cells costs. This is the number that
+  // decides whether duckdb::BaseStatistics + CheckStatistics is a viable representation for the
+  // group index, or whether 2b needs a packed columnar form.
+  auto gs = sirius::scan_manager::compute_pinned_group_stats(
+    cudf::table_view{{col->view()}},
+    duckdb::vector<LogicalType>{LogicalType::INTEGER},
+    8192,
+    stream,
+    mr);
+  auto filter               = cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(50000));
+  std::size_t empties       = 0;
+  constexpr int kReps       = 200;
+  std::size_t const n_cells = gs.group_count();
+  auto const t0             = std::chrono::high_resolution_clock::now();
+  for (int r = 0; r < kReps; ++r) {
+    for (auto const& group : gs.groups) {
+      if (group[0] && sirius::scan_manager::chunk_provably_empty(*filter, *group[0])) { ++empties; }
+    }
+  }
+  auto const t1    = std::chrono::high_resolution_clock::now();
+  auto const cells = static_cast<double>(n_cells) * kReps;
+  auto const ns    = std::chrono::duration<double, std::nano>(t1 - t0).count() / cells;
+  WARN("chunk_provably_empty over " << n_cells << " group cells: " << ns
+                                    << " ns/cell (empties=" << empties << ")");
+
+  // The packed evaluator on the same cells: pack once into the arena, lower once, flat loop.
+  std::vector<sirius::scan_manager::chunk_group_stats> capture;
+  capture.push_back(std::move(gs));
+  auto const arena = sirius::scan_manager::group_bounds_arena::from_capture(
+    duckdb::vector<LogicalType>{LogicalType::INTEGER}, capture);
+  REQUIRE_FALSE(arena.empty());
+  auto const packed = arena.cell(0, 0);
+  auto lowered = sirius::scan_manager::lowered_bound_filter::lower(*filter, LogicalType::INTEGER);
+  REQUIRE(lowered.has_value());
+  std::vector<std::uint32_t> survivors;
+  auto const t2 = std::chrono::high_resolution_clock::now();
+  for (int r = 0; r < kReps; ++r) {
+    lowered->select_survivors(packed, survivors);
+  }
+  auto const t3  = std::chrono::high_resolution_clock::now();
+  auto const ns2 = std::chrono::duration<double, std::nano>(t3 - t2).count() / cells;
+  WARN("lowered_bound_filter over " << packed.size() << " group cells: " << ns2
+                                    << " ns/cell (survivors=" << survivors.size() << ") -> "
+                                    << (ns / ns2) << "x faster");
+}
+
+// ---------------------------------------------------------------------------
+// lowered_bound_filter — the packed evaluator for the group index.
+//
+// It exists because chunk_provably_empty costs ~83 ns/cell and the group index has ~732k cells
+// per pinned lineitem. It replaces DuckDB's CheckStatistics with bounds arithmetic, so the
+// load-bearing test is not "does it prune" but "does it prune EXACTLY what CheckStatistics
+// prunes" — a disagreement in the pruning direction drops rows and returns wrong answers.
+// ---------------------------------------------------------------------------
+
+namespace {
+using sirius::scan_manager::group_bounds_arena;
+using sirius::scan_manager::lowered_bound_filter;
+using sirius::scan_manager::packed_column_bounds;
+
+/// A one-column, one-chunk arena from explicit per-group [min, max] cells; nullopt = no
+/// statistics for that group. Builds through from_capture so tests exercise the real packing.
+group_bounds_arena make_arena(std::vector<std::optional<std::pair<int64_t, int64_t>>> const& cells,
+                              std::size_t group_rows = 100)
+{
+  sirius::scan_manager::chunk_group_stats cs;
+  cs.group_rows = group_rows;
+  cs.groups.resize(cells.size());
+  for (std::size_t g = 0; g < cells.size(); ++g) {
+    cs.groups[g].resize(1);
+    if (!cells[g]) { continue; }
+    auto st = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+    duckdb::NumericStats::SetMin(st, Value::INTEGER(static_cast<int32_t>(cells[g]->first)));
+    duckdb::NumericStats::SetMax(st, Value::INTEGER(static_cast<int32_t>(cells[g]->second)));
+    st.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+    cs.groups[g][0] = st.ToUnique();
+  }
+  std::vector<sirius::scan_manager::chunk_group_stats> capture;
+  capture.push_back(std::move(cs));
+  return group_bounds_arena::from_capture(duckdb::vector<LogicalType>{LogicalType::INTEGER},
+                                          capture);
+}
+
+/// Stats shaped exactly as the capture builds them, for cross-checking.
+duckdb::unique_ptr<duckdb::BaseStatistics> int_stats(int32_t lo, int32_t hi, bool has_null)
+{
+  auto s = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+  duckdb::NumericStats::SetMin(s, Value::INTEGER(lo));
+  duckdb::NumericStats::SetMax(s, Value::INTEGER(hi));
+  if (has_null) {
+    s.SetHasNull();
+  } else {
+    s.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+  }
+  return s.ToUnique();
+}
+}  // namespace
+
+TEST_CASE("lowered_bound_filter - agrees with chunk_provably_empty on every input",
+          "[pinned_chunk_stats]")
+{
+  // Every filter shape the allowlist admits, over bounds chosen to straddle each constant:
+  // disjoint below, touching, containing, touching above, disjoint above, and degenerate.
+  std::vector<duckdb::unique_ptr<duckdb::TableFilter>> filters;
+  for (auto cmp_type : {ExpressionType::COMPARE_EQUAL,
+                        ExpressionType::COMPARE_NOTEQUAL,
+                        ExpressionType::COMPARE_LESSTHAN,
+                        ExpressionType::COMPARE_LESSTHANOREQUALTO,
+                        ExpressionType::COMPARE_GREATERTHAN,
+                        ExpressionType::COMPARE_GREATERTHANOREQUALTO}) {
+    for (int32_t c : {-5, 0, 10, 50}) {
+      filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(cmp_type, Value::INTEGER(c)));
+    }
+  }
+  filters.push_back(duckdb::make_uniq<duckdb::IsNullFilter>());
+  filters.push_back(duckdb::make_uniq<duckdb::IsNotNullFilter>());
+  {
+    duckdb::vector<Value> vals{Value::INTEGER(3), Value::INTEGER(11), Value::INTEGER(99)};
+    filters.push_back(duckdb::make_uniq<duckdb::InFilter>(std::move(vals)));
+  }
+  {  // AND(x >= 10, x <= 20)
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(10)));
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHANOREQUALTO, Value::INTEGER(20)));
+    filters.push_back(std::move(conj));
+  }
+  {  // OR(x < 0, x > 40)
+    auto disj = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(40)));
+    filters.push_back(std::move(disj));
+  }
+  {  // OPTIONAL(x = 10) — an optional wrapping one child
+    auto inner =
+      duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::INTEGER(10));
+    filters.push_back(duckdb::make_uniq<duckdb::OptionalFilter>(std::move(inner)));
+  }
+  {  // Nested: AND(OR(x < 0, x > 40), x != 50)
+    auto disj = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(0)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(40)));
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    conj->child_filters.push_back(std::move(disj));
+    conj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_NOTEQUAL, Value::INTEGER(50)));
+    filters.push_back(std::move(conj));
+  }
+
+  std::vector<std::pair<int32_t, int32_t>> ranges{{-100, -50},
+                                                  {-10, -1},
+                                                  {-5, -5},
+                                                  {0, 0},
+                                                  {0, 10},
+                                                  {5, 5},
+                                                  {10, 10},
+                                                  {10, 20},
+                                                  {11, 39},
+                                                  {40, 100},
+                                                  {50, 50},
+                                                  {-100, 100}};
+
+  std::size_t compared = 0, disagreements = 0;
+  for (auto const& f : filters) {
+    auto lowered = lowered_bound_filter::lower(*f, LogicalType::INTEGER);
+    REQUIRE(lowered.has_value());  // every shape above is on the allowlist
+    for (auto [lo, hi] : ranges) {
+      for (bool has_null : {false, true}) {
+        auto stats           = int_stats(lo, hi, has_null);
+        bool const reference = sirius::scan_manager::chunk_provably_empty(*f, *stats);
+        bool const fast      = lowered->provably_empty(lo, hi, has_null, false);
+        ++compared;
+        if (reference != fast) {
+          ++disagreements;
+          UNSCOPED_INFO("filter type " << static_cast<int>(f->filter_type) << " range [" << lo
+                                       << "," << hi << "] has_null=" << has_null
+                                       << " reference=" << reference << " fast=" << fast);
+        }
+      }
+    }
+  }
+  INFO("compared " << compared << " (filter, range) pairs");
+  REQUIRE(disagreements == 0);
+  REQUIRE(compared > 300);
+}
+
+TEST_CASE("lowered_bound_filter - rejects what the allowlist rejects", "[pinned_chunk_stats]")
+{
+  SECTION("type mismatch between constant and stats type")
+  {
+    auto f =
+      duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value::BIGINT(10));
+    REQUIRE_FALSE(lowered_bound_filter::lower(*f, LogicalType::INTEGER).has_value());
+  }
+  SECTION("a childless conjunction")
+  {
+    auto conj = duckdb::make_uniq<duckdb::ConjunctionAndFilter>();
+    REQUIRE_FALSE(lowered_bound_filter::lower(*conj, LogicalType::INTEGER).has_value());
+  }
+  SECTION("a dynamic filter is never lowered")
+  {
+    auto dyn = duckdb::make_uniq<duckdb::DynamicFilter>();
+    REQUIRE_FALSE(lowered_bound_filter::lower(*dyn, LogicalType::INTEGER).has_value());
+  }
+}
+
+TEST_CASE("lowered_bound_filter - select_survivors over packed cells", "[pinned_chunk_stats]")
+{
+  //                  g0        g1          g2        g3 (no statistics)
+  std::vector<std::optional<std::pair<int64_t, int64_t>>> const cells{
+    std::pair<int64_t, int64_t>{0, 9},
+    std::pair<int64_t, int64_t>{100, 109},
+    std::pair<int64_t, int64_t>{200, 209},
+    std::nullopt};
+  auto const arena = make_arena(cells);
+  auto const b     = arena.cell(0, 0);
+
+  auto f       = duckdb::make_uniq<duckdb::ConstantFilter>(ExpressionType::COMPARE_LESSTHAN,
+                                                     Value::INTEGER(150));
+  auto lowered = lowered_bound_filter::lower(*f, LogicalType::INTEGER);
+  REQUIRE(lowered.has_value());
+
+  std::vector<std::uint32_t> survivors;
+  lowered->select_survivors(b, survivors);
+  // g0 and g1 can contain values < 150; g2 cannot; g3 has no statistics so it must survive.
+  REQUIRE(survivors == std::vector<std::uint32_t>{0, 1, 3});
+}
+
+// ---------------------------------------------------------------------------
+// build_cached_scan_plan — refining surviving chunks into surviving row ranges.
+//
+// The coarse pass keeps a chunk whose min/max overlaps the filter at all. Per-group bounds then
+// say WHICH rows of that chunk can match. The properties that matter to every consumer:
+// refinement only ever narrows an already-surviving chunk, adjacent surviving groups coalesce so
+// an unprunable chunk costs nothing, and an entry with no group bounds keeps the old whole-chunk
+// behaviour.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A one-column, one-chunk entry whose chunk min/max spans all its groups, so the coarse pass
+/// always keeps the chunk and only the refinement can narrow it.
+pinned_entry make_group_entry(std::size_t n_groups, std::size_t group_rows)
+{
+  pinned_entry entry;
+  entry.cache_info.column_ids.emplace_back(duckdb::ColumnIndex(3));
+  entry.cache_info.names.push_back("c0");
+  entry.tier = cucascade::memory::Tier::HOST;
+  entry.host_chunks.resize(1);
+
+  auto const lo = 0;
+  auto const hi = static_cast<int32_t>(10 * n_groups - 1);
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> capture(1);
+  capture[0].push_back(
+    make_stats(LogicalType::INTEGER, Value::INTEGER(lo), Value::INTEGER(hi)).ToUnique());
+  entry.zone_maps = pinned_zone_maps::from_capture(int_types(1), std::move(capture), 1, 1);
+
+  // group g covers [10*g, 10*g + 9]: disjoint and strictly increasing, so a filter's cut point
+  // is unambiguous.
+  std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+  for (std::size_t g = 0; g < n_groups; ++g) {
+    cells.emplace_back(
+      std::pair<int64_t, int64_t>{static_cast<int64_t>(10 * g), static_cast<int64_t>(10 * g) + 9});
+  }
+  entry.group_bounds = make_arena(cells, group_rows);
+  return entry;
+}
+}  // namespace
+
+TEST_CASE("build_cached_scan_plan - refines surviving chunks into row ranges",
+          "[pinned_chunk_stats]")
+{
+  duckdb::vector<duckdb::ColumnIndex> qcols{duckdb::ColumnIndex(3)};
+
+  SECTION("a filter cutting mid-chunk yields the surviving prefix only")
+  {
+    // 8 groups of 100 rows spanning [0,79]; "< 25" can only match groups 0..2.
+    auto const entry = make_group_entry(8, 100);
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});  // chunk still survives coarsely
+    REQUIRE(plan.survivor_row_ranges.size() == 1);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 300});
+    REQUIRE(plan.rows_pruned_within_chunks == 500);
+  }
+
+  SECTION("disjoint surviving groups produce separate ranges")
+  {
+    // OR(< 5, > 74) keeps group 0 and group 7 only.
+    auto const entry = make_group_entry(8, 100);
+    auto disj        = duckdb::make_uniq<duckdb::ConjunctionOrFilter>();
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(5)));
+    disj->child_filters.push_back(duckdb::make_uniq<duckdb::ConstantFilter>(
+      ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(74)));
+    auto fs   = make_filter_set(0, std::move(disj));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_row_ranges.size() == 2);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 100});
+    REQUIRE(plan.survivor_row_ranges[1] == sirius::scan_manager::chunk_row_range{0, 700, 800});
+    REQUIRE(plan.rows_pruned_within_chunks == 600);
+  }
+
+  SECTION("an unprunable filter coalesces to exactly one range covering the chunk")
+  {
+    auto const entry = make_group_entry(8, 100);
+    auto fs =
+      make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHANOREQUALTO, Value::INTEGER(0)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_row_ranges.size() == 1);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 800});
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+
+  SECTION("an entry without group bounds keeps the whole-chunk behaviour")
+  {
+    auto entry         = make_group_entry(8, 100);
+    entry.group_bounds = sirius::scan_manager::group_bounds_arena{};
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+    REQUIRE(plan.survivor_row_ranges.empty());
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+
+  SECTION("an absent group cell keeps its rows")
+  {
+    auto entry = make_group_entry(8, 100);
+    // Rebuild with group 5 carrying no statistics.
+    std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+    for (std::size_t g = 0; g < 8; ++g) {
+      if (g == 5) {
+        cells.emplace_back(std::nullopt);
+      } else {
+        cells.emplace_back(std::pair<int64_t, int64_t>{static_cast<int64_t>(10 * g),
+                                                       static_cast<int64_t>(10 * g) + 9});
+      }
+    }
+    entry.group_bounds = make_arena(cells, 100);
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    // Groups 0..2 match the filter; group 5 has no evidence, so it must survive too.
+    REQUIRE(plan.survivor_row_ranges.size() == 2);
+    REQUIRE(plan.survivor_row_ranges[0] == sirius::scan_manager::chunk_row_range{0, 0, 300});
+    REQUIRE(plan.survivor_row_ranges[1] == sirius::scan_manager::chunk_row_range{0, 500, 600});
+  }
+
+  SECTION("the all-pruned sentinel chunk is never refined")
+  {
+    // A filter no group can satisfy prunes the chunk coarsely; the sentinel that keeps the
+    // pipeline alive must not then be narrowed to nothing.
+    auto const entry = make_group_entry(8, 100);
+    auto fs   = make_filter_set(0, cmp(ExpressionType::COMPARE_GREATERTHAN, Value::INTEGER(10000)));
+    auto plan = build_cached_scan_plan(entry, &fs, &qcols);
+
+    REQUIRE(plan.survivor_chunk_indices == survivors_t{0});
+    REQUIRE(plan.survivor_row_ranges.empty());
+    REQUIRE(plan.rows_pruned_within_chunks == 0);
+  }
+}
+
+TEST_CASE("surviving_decode_chunks maps row ranges onto 1024-row decode chunks",
+          "[pinned_chunk_stats]")
+{
+  using sirius::scan_manager::chunk_row_range;
+  using sirius::scan_manager::surviving_decode_chunk_rows;
+  using sirius::scan_manager::surviving_decode_chunks;
+  using ids_t = std::vector<std::uint32_t>;
+
+  constexpr std::size_t kDecode = 1024;
+
+  SECTION("a group-aligned range expands to its decode chunks")
+  {
+    // Groups of 8 decode chunks: rows [8192, 16384) is decode chunks 8..15.
+    auto const ids = surviving_decode_chunks(std::vector<chunk_row_range>{{0, 8192, 16384}},
+                                             /*rows=*/32768);
+    REQUIRE(ids == ids_t{8, 9, 10, 11, 12, 13, 14, 15});
+    REQUIRE(surviving_decode_chunk_rows(ids, 32768) == 8192);
+  }
+
+  SECTION("disjoint ranges stay ascending and do not repeat a chunk")
+  {
+    auto const ids = surviving_decode_chunks(
+      std::vector<chunk_row_range>{{0, 0, 2 * kDecode}, {0, 4 * kDecode, 5 * kDecode}},
+      /*rows=*/10 * kDecode);
+    REQUIRE(ids == ids_t{0, 1, 4});
+    REQUIRE(surviving_decode_chunk_rows(ids, 10 * kDecode) == 3 * kDecode);
+  }
+
+  SECTION("a range past the end of a short final group is clamped")
+  {
+    // The last group of a chunk may be short, so the plan's end may exceed the chunk.
+    auto const rows = 3 * kDecode + 100;
+    auto const ids =
+      surviving_decode_chunks(std::vector<chunk_row_range>{{0, 2 * kDecode, 8 * kDecode}}, rows);
+    REQUIRE(ids == ids_t{2, 3});
+    // Chunk 3 holds only the 100 rows that exist.
+    REQUIRE(surviving_decode_chunk_rows(ids, rows) == kDecode + 100);
+  }
+
+  SECTION("covering every chunk asks for no subset at all")
+  {
+    // Empty means "serve the chunk whole" — synthesizing a header that reproduces the original
+    // is pure cost.
+    REQUIRE(surviving_decode_chunks(std::vector<chunk_row_range>{{0, 0, 4 * kDecode}}, 4 * kDecode)
+              .empty());
+    REQUIRE(surviving_decode_chunks({}, 4 * kDecode).empty());
+    REQUIRE(surviving_decode_chunks(std::vector<chunk_row_range>{{0, 0, 100}}, 0).empty());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// group_bounds_arena — the contiguous, column-major packing.
+//
+// The layout is the point: one allocation that can be read (or copied to device, or written to a
+// file) as a unit, without touching the data it describes. These tests pin the properties that
+// makes possible — contiguity, column-major ordering, and refusing to build anything inconsistent
+// rather than building something subtly wrong.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// A capture of @p n_chunks chunks x @p n_columns columns, where column i of chunk c group g gets
+/// [base, base+1] with base = 1000*c + 100*i + g. Every cell is therefore distinguishable, so a
+/// misplaced one fails loudly rather than coincidentally matching.
+std::vector<sirius::scan_manager::chunk_group_stats> make_multi_capture(
+  std::size_t n_chunks, std::size_t n_columns, std::size_t n_groups, std::size_t group_rows = 100)
+{
+  std::vector<sirius::scan_manager::chunk_group_stats> capture(n_chunks);
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    capture[c].group_rows = group_rows;
+    capture[c].groups.resize(n_groups);
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      capture[c].groups[g].resize(n_columns);
+      for (std::size_t i = 0; i < n_columns; ++i) {
+        auto const base = static_cast<int32_t>(1000 * c + 100 * i + g);
+        auto st         = duckdb::NumericStats::CreateUnknown(LogicalType::INTEGER);
+        duckdb::NumericStats::SetMin(st, Value::INTEGER(base));
+        duckdb::NumericStats::SetMax(st, Value::INTEGER(base + 1));
+        st.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+        capture[c].groups[g][i] = st.ToUnique();
+      }
+    }
+  }
+  return capture;
+}
+}  // namespace
+
+TEST_CASE("group_bounds_arena - packs column-major and addresses every cell",
+          "[pinned_chunk_stats]")
+{
+  constexpr std::size_t kChunks = 3, kColumns = 2, kGroups = 4;
+  auto const arena = group_bounds_arena::from_capture(
+    int_types(kColumns), make_multi_capture(kChunks, kColumns, kGroups));
+  REQUIRE_FALSE(arena.empty());
+  REQUIRE(arena.column_count() == kColumns);
+  REQUIRE(arena.chunk_count() == kChunks);
+  REQUIRE(arena.group_rows() == 100);
+  REQUIRE(arena.groups_in_chunk(0) == kGroups);
+
+  SECTION("every (column, chunk, group) reads back the value it was given")
+  {
+    for (std::size_t c = 0; c < kChunks; ++c) {
+      for (std::size_t i = 0; i < kColumns; ++i) {
+        auto const cell = arena.cell(i, c);
+        REQUIRE(cell.size() == kGroups);
+        for (std::size_t g = 0; g < kGroups; ++g) {
+          auto const base = static_cast<int64_t>(1000 * c + 100 * i + g);
+          REQUIRE(cell.mins[g] == base);
+          REQUIRE(cell.maxs[g] == base + 1);
+          REQUIRE(cell.valid[g] == 1);
+        }
+      }
+    }
+  }
+
+  SECTION("one column's chunks are contiguous, which is what column-major buys")
+  {
+    // Column 0's chunk 0 and chunk 1 must be adjacent in the arena: chunk 0 occupies
+    // [mins | maxs], so chunk 1's mins start immediately after.
+    auto const c0 = arena.cell(0, 0);
+    auto const c1 = arena.cell(0, 1);
+    REQUIRE(c1.mins.data() == c0.maxs.data() + c0.maxs.size());
+  }
+
+  SECTION("the whole arena is one contiguous allocation")
+  {
+    auto const raw = arena.raw();
+    REQUIRE(raw.size() == kChunks * kColumns * kGroups * 2);  // mins + maxs
+    auto const first = arena.cell(0, 0);
+    auto const last  = arena.cell(kColumns - 1, kChunks - 1);
+    REQUIRE(first.mins.data() == raw.data());
+    REQUIRE(last.maxs.data() + last.maxs.size() == raw.data() + raw.size());
+  }
+
+  SECTION("out-of-range lookups return an empty cell rather than reading past the arena")
+  {
+    REQUIRE(arena.cell(kColumns, 0).empty());
+    REQUIRE(arena.cell(0, kChunks).empty());
+    REQUIRE(arena.groups_in_chunk(kChunks) == 0);
+  }
+}
+
+TEST_CASE("group_bounds_arena - refuses inconsistent captures", "[pinned_chunk_stats]")
+{
+  // Each of these would otherwise produce an arena that silently describes the wrong rows, so
+  // from_capture returns empty: no sub-chunk pruning, never a wrong one.
+  SECTION("a chunk whose cells disagree with the column count")
+  {
+    auto capture = make_multi_capture(2, 2, 3);
+    capture[1].groups[0].resize(1);  // one column short
+    REQUIRE(group_bounds_arena::from_capture(int_types(2), capture).empty());
+  }
+  SECTION("chunks that disagree about group_rows")
+  {
+    auto capture          = make_multi_capture(2, 1, 3);
+    capture[1].group_rows = 200;
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), capture).empty());
+  }
+  SECTION("a zero group_rows")
+  {
+    auto capture          = make_multi_capture(1, 1, 3);
+    capture[0].group_rows = 0;
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), capture).empty());
+  }
+  SECTION("an empty capture or no columns")
+  {
+    REQUIRE(group_bounds_arena::from_capture(int_types(1), {}).empty());
+    REQUIRE(group_bounds_arena::from_capture({}, make_multi_capture(1, 1, 3)).empty());
+  }
+}
+
+TEST_CASE("group_bounds_arena - chunks may differ in group count", "[pinned_chunk_stats]")
+{
+  // The last chunk of a pin is usually short, so its group count legitimately differs.
+  auto capture = make_multi_capture(2, 1, 4);
+  capture[1].groups.resize(2);
+  auto const arena = group_bounds_arena::from_capture(int_types(1), capture);
+  REQUIRE_FALSE(arena.empty());
+  REQUIRE(arena.groups_in_chunk(0) == 4);
+  REQUIRE(arena.groups_in_chunk(1) == 2);
+  REQUIRE(arena.cell(0, 1).size() == 2);
+  REQUIRE(arena.cell(0, 1).mins[0] == 1000);  // chunk 1, column 0, group 0
 }
