@@ -498,7 +498,9 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 - `src/io/io_context.cpp` — `sirius_ioctx` cache integration and coverage policy
 - `src/include/exec/semi_future.hpp` — async I/O completion primitive
 
-**Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`
+**Config:** `enable_prefetch_cache` and the `cache` sub-config under `executor.scan_manager`.
+The prefetch cache is currently supported only with exactly one configured GPU;
+configuration loading rejects an enabled cache for multi-GPU execution.
 
 ### Load-Balanced Scan Batch Coalescing (PR #997)
 

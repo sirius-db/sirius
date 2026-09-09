@@ -1,0 +1,9 @@
+sirius:
+  topology:
+    num_gpus: 1
+  executor:
+    scan_manager:
+      enable_prefetch_cache: true
+      cache:
+        min_prefetching_budget_fraction: 0.8
+        eviction_threshold_fraction: 0.6
