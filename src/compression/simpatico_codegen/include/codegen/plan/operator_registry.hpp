@@ -63,10 +63,17 @@ enum class ChannelLayout : std::uint8_t {
   /// (bitpack's packed, sized by chunk_count x chunk_bits) or from an out-of-band
   /// group-to-byte table. The ONLY layout that needs operator-specific arithmetic.
   bulk_variable,
-  /// No per-chunk structure at all — column-wide state (a dictionary's keys), or a codec's opaque
-  /// output with its own internal chunking. Always fetched whole; a column whose bulk channel is
-  /// opaque cannot be partially fetched.
+  /// No per-chunk structure at all: a codec's opaque output with its own internal chunking. Always
+  /// fetched whole, and its bytes depend on WHICH rows are in the column, so a column whose bulk
+  /// channel is opaque cannot be partially fetched at all.
   whole_column,
+  /// Column-wide STATE, not rows: a dictionary's keys. Fetched whole like @c whole_column, but
+  /// unlike it the bytes do not depend on which rows are served, so the column can still be
+  /// subsetted — the keys stay valid for any subset of the indices that reference them.
+  ///
+  /// The distinction between this and @c whole_column is the whole reason a dictionary-encoded
+  /// string column can be chunk-addressed while an lz4 one cannot.
+  column_state,
 };
 
 // Layout of the PERSISTED BUFFER named @p buffer within @p id, or nullopt when the operator
@@ -79,9 +86,21 @@ enum class ChannelLayout : std::uint8_t {
 [[nodiscard]] std::optional<ChannelLayout> buffer_layout(OpId id, std::string_view buffer);
 
 // True when a node of type @p id can be served as a subset of its 1024-row chunks: it persists at
-// least one buffer, every persisted buffer is classified, and none is whole_column. False means
-// "fetch it whole", which is always correct and merely forgoes the saving.
+// least one buffer, every persisted buffer is classified, and none is whole_column
+// (column_state buffers are fine — see ChannelLayout). False means "fetch it whole", which is
+// always correct and merely forgoes the saving.
 [[nodiscard]] bool supports_chunk_subset(OpId id);
+
+// True when the values @p id produces on output channel @p channel are column-wide STATE rather
+// than one value per row of the op's own output.
+//
+// This is about the EDGE, not the buffer: whatever compresses `dictionary.keys_offsets` — a
+// bitpack, a delta feeding an rle, an ans — produces buffers of its own that look perfectly
+// row-indexed on their own grid, and are not the column's rows at all. A caller serving a subset
+// of a column's chunks must fetch that whole subtree whole, and must not mistake its differing
+// length for a reason to refuse the column. @p channel may be a dotted path; the last component
+// is the port name.
+[[nodiscard]] bool channel_is_column_state(OpId id, std::string_view channel);
 
 // One row of the operator registry: the single source of truth tying an
 // operator's DSL/diagnostic name, canonical output-channel order, and

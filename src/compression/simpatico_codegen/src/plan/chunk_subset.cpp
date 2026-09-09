@@ -83,7 +83,11 @@ std::optional<buffer_subset> plan_buffer_subset(OpId kind,
           sizing.chunk_count, sizing.chunk_bits, surviving_chunks, max_gap_bytes);
       }
       return std::nullopt;
-    case ChannelLayout::whole_column: return std::nullopt;
+    // Both are fetched whole, and the CALLER must tell them apart: whole_column means the column
+    // cannot be subsetted at all, column_state means this buffer alone is fetched whole while the
+    // column's row-indexed buffers still compact (see channel_is_column_state).
+    case ChannelLayout::whole_column:
+    case ChannelLayout::column_state: return std::nullopt;
   }
   return std::nullopt;
 }

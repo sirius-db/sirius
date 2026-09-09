@@ -46,7 +46,11 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true, {{"chunk_min", ChannelLayout::per_chunk_metadata}, {"chunk_count", ChannelLayout::per_chunk_metadata}, {"chunk_bits", ChannelLayout::per_chunk_metadata}, {"packed", ChannelLayout::bulk_variable}}},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true, {{"references", ChannelLayout::per_chunk_metadata}}},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true, {{"zigzag", ChannelLayout::bulk_fixed_stride}}},
-    {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false, {}},
+    // keys_* are the dictionary itself — column state, valid for any subset of the rows that
+    // index into it. `indices` is the row-indexed channel. `null_mask` is deliberately NOT
+    // classified: it is one BIT per row, which no layout here describes, so a nullable dictionary
+    // column refuses (correctly) rather than being addressed with byte-per-row arithmetic.
+    {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false, {{"keys_offsets", ChannelLayout::column_state}, {"keys_chars", ChannelLayout::column_state}, {"indices", ChannelLayout::bulk_fixed_stride}}},
     {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          true,  false, true,  false, {}},
     {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, true, false, true, false, {}},
     {OpId::Ans,            "ans",             {"output"},                                                             true,  true,  false, false, {{"output", ChannelLayout::whole_column}}},
@@ -83,6 +87,19 @@ bool supports_chunk_subset(OpId id)
   if (bufs.empty()) { return false; }
   return std::ranges::none_of(
     bufs, [](auto const& b) { return b.second == ChannelLayout::whole_column; });
+}
+
+bool channel_is_column_state(OpId id, std::string_view channel)
+{
+  // The DSL names an edge by its dotted path (`dictionary.keys_offsets`); the port is the last
+  // component. Matching on that keeps this working for a nested path without teaching it the
+  // path grammar.
+  auto const dot  = channel.rfind('.');
+  auto const port = dot == std::string_view::npos ? channel : channel.substr(dot + 1);
+  for (auto const& [name, layout] : op_info(id).persisted_buffers) {
+    if (name == port) { return layout == ChannelLayout::column_state; }
+  }
+  return false;
 }
 
 OperatorInfo const& op_info(OpId id)

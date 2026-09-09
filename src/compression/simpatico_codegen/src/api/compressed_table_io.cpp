@@ -1028,14 +1028,59 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
     auto const col_rows =
       cr.num_rows > 0 ? static_cast<std::uint64_t>(cr.num_rows) : std::uint64_t{0};
 
-    // Plan every buffer of every leaf first. A column is served as a subset only if ALL of them
-    // can be, because the leaves of one column decode together: a compacted `packed` next to a
-    // full-length `chunk_count` is not a valid column, it is silently wrong data.
+    // Which nodes are COLUMN STATE rather than rows. A dictionary's keys are the case that
+    // matters: whatever compresses them produces buffers that look row-indexed on their own grid
+    // and have nothing to do with the column's rows, so the whole subtree hanging off such a
+    // channel is fetched whole and its length is not evidence that the column cannot be subsetted.
+    // Marked by walking the edges from the root; the mark is inherited, since a dictionary's keys
+    // stay column state however deeply they are then compressed.
+    std::vector<bool> node_is_column_state(cr.tree.nodes.size(), false);
+    {
+      std::vector<std::uint32_t> pending;
+      if (!cr.tree.nodes.empty()) { pending.push_back(0); }
+      while (!pending.empty()) {
+        auto const ni = pending.back();
+        pending.pop_back();
+        auto const& node = cr.tree.nodes[ni];
+        auto const kind  = op_id_from_name(node.op).value_or(OpId::Unknown);
+        for (auto const& edge : node.children) {
+          auto const child = static_cast<std::size_t>(edge.child);
+          if (child >= cr.tree.nodes.size() || child == ni) { continue; }
+          node_is_column_state[child] =
+            node_is_column_state[ni] || channel_is_column_state(kind, edge.channel);
+          pending.push_back(static_cast<std::uint32_t>(child));
+        }
+      }
+    }
+    // A leaf is column state when its node is, or when it IS a column-state output channel of a
+    // row-indexed node (a bare `input -> dictionary`, whose keys are stored as they are).
+    auto const leaf_is_column_state = [&](leaf_desc const& ld) {
+      auto const node = static_cast<std::size_t>(ld.node_index);
+      if (node >= cr.tree.nodes.size()) { return false; }
+      if (node_is_column_state[node]) { return true; }
+      if (ld.slot < 0) { return false; }
+      auto const& names = cr.tree.nodes[node].output_names;
+      auto const slot   = static_cast<std::size_t>(ld.slot);
+      if (slot >= names.size()) { return false; }
+      return channel_is_column_state(
+        op_id_from_name(cr.tree.nodes[node].op).value_or(OpId::Unknown), names[slot]);
+    };
+
+    // Plan every buffer of every leaf first. A column is served as a subset only if ALL of its
+    // ROW-INDEXED buffers can be, because the leaves of one column decode together: a compacted
+    // `packed` next to a full-length `chunk_count` is not a valid column, it is silently wrong
+    // data. Column-state leaves and buffers are emitted whole and constrain nothing.
     std::vector<std::vector<buffer_subset>> plans(cr.leaf_descs.size());
+    std::vector<std::vector<bool>> buffer_whole(cr.leaf_descs.size());
+    std::vector<bool> leaf_whole(cr.leaf_descs.size(), false);
     bool subsettable = col_rows > 0;
 
     for (std::size_t li = 0; subsettable && li < cr.leaf_descs.size(); ++li) {
       auto const& ld = cr.leaf_descs[li];
+      if (leaf_is_column_state(ld)) {
+        leaf_whole[li] = true;
+        continue;
+      }
       if (!supports_chunk_subset(ld.kind)) {
         subsettable = false;  // whole_column or unclassified: fetch the column whole
         break;
@@ -1084,8 +1129,16 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
       chunk_sizing_metadata const sizing{chunk_count, chunk_bits};
 
       plans[li].resize(ld.buffers.size());
+      buffer_whole[li].assign(ld.buffers.size(), false);
       for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
-        auto const& bd       = ld.buffers[bi];
+        auto const& bd = ld.buffers[bi];
+        // A column-state buffer of an otherwise row-indexed leaf — the keys of a bare
+        // `input -> dictionary`, which stores its keys and its per-row indices in one leaf. The
+        // keys are fetched whole and stay valid for whichever rows the indices name.
+        if (buffer_layout(ld.kind, bd.name) == ChannelLayout::column_state) {
+          buffer_whole[li][bi] = true;
+          continue;
+        }
         auto const elem_size = buffer_elem_size(bd.type_tag);
         auto const plan      = plan_buffer_subset(ld.kind,
                                              bd.name,
@@ -1148,6 +1201,19 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
 
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld = cr.leaf_descs[li];
+      // A column-state leaf is not indexed by rows at all, so neither its own length nor its
+      // buffers change; only where they sit in the compacted payload.
+      if (leaf_whole[li]) {
+        for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+          auto const size = ld.buffers[bi].size_bytes;
+          if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at, dst_offset)) {
+            return "build_chunk_subset_header: header field offset out of range";
+          }
+          append_gather(cr.buf_offsets[li][bi], size, dst_offset);
+          dst_offset += size;
+        }
+        continue;
+      }
       // leaf_desc::num_rows is the NODE's own output length, not the column's (it drives the
       // codegen decode grid), so it is recomputed over the survivors in its own right.
       if (!patch(col_offs.leaves[li].num_rows_at,
@@ -1157,8 +1223,16 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
 
       for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
         auto const& bd  = ld.buffers[bi];
-        auto const& sub = plans[li][bi];
         auto const& bof = col_offs.leaves[li].buffers[bi];
+        if (buffer_whole[li][bi]) {
+          if (!patch(bof.payload_offset_at, dst_offset)) {
+            return "build_chunk_subset_header: header field offset out of range";
+          }
+          append_gather(cr.buf_offsets[li][bi], bd.size_bytes, dst_offset);
+          dst_offset += bd.size_bytes;
+          continue;
+        }
+        auto const& sub = plans[li][bi];
         if (!patch(bof.size_bytes_at, sub.compacted_size) ||
             !patch(bof.payload_offset_at, dst_offset)) {
           return "build_chunk_subset_header: header field offset out of range";

@@ -22,7 +22,7 @@ Read this first; the rest of the document is the reasoning and the measurements 
 | **Best host-tier configuration** | 10.44 s → **9.48 s** at SF1000 (~−9.2%), 22/22 byte-exact |
 | whole-chunk pruning on compressed pins | **−8.1%** (host, 2 GB batches) |
 | the per-group index on top | **−2.20%** (44.6e9 further rows dropped) |
-| range-skipped **fetch** on a host pin | **−1.03%** at SF1000 / 2 GB, and blocked on string columns (§6.5.4) |
+| range-skipped **fetch** on a host pin | **−1.33%** at SF1000 / 2 GB, dictionary strings included (§6.5.6) |
 | GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
 
 Two findings that stand on their own, independent of the remaining work:
@@ -43,19 +43,20 @@ arm and the kill switch). 22/22 byte-exact on clustered SF100, host and GPU tier
 
 ### What the fetch skip is worth today, and what caps it
 
-**−1.03%** at SF1000 / host / 2 GB against the same build with the gate off — around the ~0.8%
-noise floor, and **not** because the mechanism is weak. It engages on q6 and q14 and refuses on
-q1, q4 and q12, always for the same reason: **one string column in the projection**
-(`l_returnflag`, `l_shipmode`, `o_orderpriority`). A `dictionary` or `str_split` root is not
-chunk-addressable, and a table cannot mix a compacted column with a whole one (§6.5.4), so a
-single such column serves the whole chunk. **Extending `supports_chunk_subset` to the string trees
-is now the highest-value work in this project** — the scan-bound queries are exactly the blocked
-ones.
+**−1.33%** at SF1000 / host / 2 GB (9.6680 → 9.5395 s, best of two independent A/B pairs) against
+the same build with the gate off. The scan-bound queries are what move: q3 −0.050, q1 −0.041,
+q7 −0.035, q20 −0.032, q6 −0.015 (−22% of q6 itself). Each pair on its own reads −0.68% / −0.43%,
+so the suite number sits at the noise floor while the per-query pattern is consistent.
+
+**Dictionary-encoded strings are addressable (§6.5.6); `str_split` ones are not.** After the
+dictionary work, the only column still forcing a whole-chunk serve in TPC-H is `l_shipmode`
+(`input -> str_split`), which blocks q12. Extending this to `str_split` means rewriting offset
+VALUES rather than gathering byte ranges — see §6.5.6 for why that is a different kind of problem.
 
 ### Known gaps, in the order they will bite
 
-- **String columns block the fetch skip entirely** for any query that reads one (see above). This
-  is the binding constraint on the whole §6 line of work, not a detail.
+- **`str_split` string columns block the fetch skip** for any query that reads one (`l_shipmode`,
+  `l_comment`). Dictionary-encoded ones no longer do.
 - Only a **plain bitpack** plan is exercised end to end through the header synthesis. `delta ->
   bitpack`, `for` and `zigzag` should work per the registry but have no fixture.
 - `plan_bitpack_packed_subset` computes 0 words for a `chunk_count == 0` chunk where the decode's
@@ -1117,6 +1118,46 @@ So the builder now reports, per column, whether it was compacted, and the conver
 subset only when **every column the scan reads** was. Unread columns may be whole — the reader
 never fetches their buffers.
 
+### 6.5.6 Rows versus column state: what makes a dictionary column addressable
+
+A dictionary column is `input -> dictionary -> keys_offsets, keys_chars, indices`, usually with
+`dictionary.indices -> bitpack` and sometimes `dictionary.keys_offsets -> bitpack` on top. Serving
+a subset of its chunks looks impossible under the original rule — the keys are `whole_column`, and
+one of those refuses the column — but the rule was conflating two different things:
+
+| | fetched whole | depends on WHICH rows are served |
+|---|---|---|
+| an lz4 / snappy / ans payload | yes | **yes** — so the column cannot be subsetted |
+| a dictionary's keys | yes | **no** — they stay valid for any subset of the indices |
+
+So `ChannelLayout` gained `column_state` beside `whole_column`, and `supports_chunk_subset`
+accepts it. The keys are emitted whole (their `num_rows` and `size_bytes` untouched, only their
+payload offset moved), the indices compact on the column's 1024-row grid, and an ordinary decode
+gathers the surviving indices against the full keys.
+
+**The mark has to follow the tree, not just the buffer.** When the keys are themselves compressed
+(`dictionary.keys_offsets -> bitpack`, as `o_orderpriority` and `l_shipinstruct` do), that bitpack
+leaf's buffers look perfectly row-indexed on their own grid, and its `num_rows` is the key count —
+which the old code read as "a leaf whose length is not the column's", i.e. as a refusal. The
+builder now walks the edges from the root and marks every node reached through a column-state
+channel, so the whole keys subtree is fetched whole and its length is not evidence about the
+column. `o_clerk`'s `keys_chars -> ans` and `keys_offsets -> delta -> rle` fall out of the same
+rule for free.
+
+`null_mask` is deliberately left unclassified: it is one BIT per row, which no layout here
+describes, so a nullable dictionary column refuses rather than being addressed with byte-per-row
+arithmetic. (str_split's `null_mask` is classified `bulk_fixed_stride` today, which is wrong for
+the same reason; it is unreachable because str_split refuses anyway, and the per-buffer self-check
+would demote the column if it ever became reachable.)
+
+**Why `str_split` is a different problem.** Its `chars` are addressable only through the `offsets`
+VALUES — which is the `bulk_variable` pattern bitpack already uses — but two things break the
+byte-gather model: the offsets are cumulative over the whole column, so a compacted `chars` needs
+its offsets REBASED rather than copied, and in the plans that matter the offsets are themselves
+bitpacked, so the values are not readable host-side without decoding them. That is a value
+rewrite, not a range gather, and it needs its own design (either a stored per-chunk chars offset
+table, §6.1, or a post-fetch rebase on the GPU).
+
 ### 6.5.5 Serving row ranges duplicated rows on two of the four serve paths
 
 Wiring the fetch skip surfaced a **correctness bug in what `a482f283` already shipped**. The
@@ -1662,6 +1703,19 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Two things had to be fixed to get there, both in §6.5: a table cannot mix a compacted column
   with a whole one (§6.5.4), and the shipped row-range serving duplicated rows on three of the
   four serve paths (§6.5.5, a real wrong-answer bug).
+- **2026-09-09** — **Dictionary-encoded strings are now chunk-addressable (§6.5.6).** The blocker
+  was a conflation: a dictionary's keys are fetched whole like an lz4 payload, but unlike it they
+  do not depend on WHICH rows are served. `ChannelLayout::column_state` names that, and the
+  builder marks whole subtrees reached through such a channel so compressed keys
+  (`dictionary.keys_offsets -> bitpack`) stop looking like a refusal. q1 and q4 now engage; the
+  suite goes to **−1.33%** at SF1000/host/2 GB (pooled over two A/B pairs), 22/22 byte-exact.
+  Only `str_split` columns (`l_shipmode`) still force a whole-chunk serve, and that is a value
+  rewrite rather than a byte gather — §6.5.6 says why.
+- **2026-09-09** — **The simpatico host tests are NOT built by `pixi run make`.** Three runs of
+  `test_chunk_subset_header` reported PASS from a stale binary while the new cases had never been
+  compiled. Build them explicitly: `pixi run cmake --build build/release --target all` (or
+  `--target test_chunk_subset_header`). A negative control — revert the change, expect the test to
+  fail — is what caught it.
 - **2026-09-09** — **The fetch skip is capped by string columns, not by the mechanism.** It
   engages on q6/q14 and refuses on q1/q4/q12 because each reads one `dictionary`- or
   `str_split`-rooted column, and one unaddressable column in the projection sends the whole chunk.

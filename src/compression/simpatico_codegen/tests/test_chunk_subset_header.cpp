@@ -346,7 +346,7 @@ void test_whole_column_is_emitted_whole()
   std::vector<std::uint8_t> header;
   std::vector<simpatico::gather_range> gather;
   std::uint64_t payload_bytes = 0;
-  std::vector<std::uint8_t> subsetted;
+  std::vector<std::uint8_t> column_subsetted;
   auto const err = simpatico::build_chunk_subset_header(src.header,
                                                         survivors,
                                                         host_reader(src),
@@ -354,14 +354,14 @@ void test_whole_column_is_emitted_whole()
                                                         gather,
                                                         /*max_gap_bytes=*/0,
                                                         &payload_bytes,
-                                                        &subsetted);
+                                                        &column_subsetted);
   expect(err.empty(), err.empty() ? "subset header build failed" : err.c_str());
   check_gather_well_formed(gather, "mixed");
 
   // The per-column report is how a caller avoids assembling a compacted column and a whole one
   // into one table: their row counts differ, and nothing downstream would tell it apart from a
   // correct table until the values were wrong.
-  expect(subsetted == std::vector<std::uint8_t>{1, 0},
+  expect(column_subsetted == std::vector<std::uint8_t>{1, 0},
          "the per-column subsetted report does not match what was emitted");
 
   auto const compacted = apply_gather(src, gather, payload_bytes);
@@ -403,6 +403,93 @@ void test_whole_column_is_emitted_whole()
   expect(sub_err.empty(), sub_err.empty() ? "column 1 read failed" : sub_err.c_str());
   expect(decode_values(whole, stream) == host,
          "the whole-emitted column did not decode to every row");
+}
+
+// ---------------------------------------------------------------------------
+// Dictionary-encoded strings: the shape that blocks the scan-bound TPC-H queries.
+//
+// A dictionary's keys are column-wide STATE -- they stay valid for whatever subset of the indices
+// is served -- while the indices are one entry per row. That is what lets a dictionary column be
+// chunk-addressed at all, and it is a different fact from "this buffer is opaque" (snappy), which
+// still cannot be. The three plans below are the ones TPC-H actually uses: bare, indices bitpacked
+// (l_returnflag), and keys bitpacked as well (o_orderpriority).
+// ---------------------------------------------------------------------------
+
+// Low-cardinality strings whose value identifies the chunk AND the position within it, so a subset
+// that is off by a chunk decodes to values from the wrong chunk rather than passing by luck.
+std::vector<std::string> dictionary_fixture_values()
+{
+  static char const* const kKeys[] = {"AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB", "REG AIR"};
+  std::vector<std::string> out(static_cast<std::size_t>(kNumRows));
+  for (std::int32_t i = 0; i < kNumRows; ++i) {
+    auto const chunk                 = i / kChunkRows;
+    auto const pos                   = i % kChunkRows;
+    out[static_cast<std::size_t>(i)] = kKeys[(chunk * 3 + pos) % std::size(kKeys)];
+  }
+  return out;
+}
+
+void test_dictionary_shape(char const* dsl, char const* label)
+{
+  auto const stream = cudf::get_default_stream();
+  auto const host   = dictionary_fixture_values();
+  auto const input  = make_strings_table(host, {}, stream);
+  auto compressed   = simpatico::compress_with_plan(
+    input->view(), dsl, stream, rmm::mr::get_current_device_resource_ref());
+  auto const src = serialize(compressed, stream);
+
+  // Every chunk surviving must reproduce the original header byte for byte: with the keys emitted
+  // whole and the indices compacted to everything, the subset path has to be the existing path.
+  {
+    std::vector<std::uint8_t> header;
+    std::vector<simpatico::gather_range> gather;
+    std::uint64_t payload_bytes = 0;
+    std::vector<std::uint8_t> column_subsetted;
+    auto const err = simpatico::build_chunk_subset_header(src.header,
+                                                          all_chunk_ids(kNumRows),
+                                                          host_reader(src),
+                                                          header,
+                                                          gather,
+                                                          /*max_gap_bytes=*/0,
+                                                          &payload_bytes,
+                                                          &column_subsetted);
+    expect(err.empty(), err.empty() ? "subset header build failed" : err.c_str());
+    expect(column_subsetted == std::vector<std::uint8_t>{1},
+           (std::string(label) + ": the column was not subsetted at all").c_str());
+    expect(header == src.header,
+           (std::string(label) + ": all chunks surviving must reproduce the header").c_str());
+    expect(payload_bytes == src.payload.size(),
+           (std::string(label) + ": all chunks surviving must reproduce the payload size").c_str());
+  }
+
+  auto const survivors = chunk_ids({1, 3});
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::gather_range> gather;
+  std::uint64_t payload_bytes = 0;
+  auto const err              = simpatico::build_chunk_subset_header(
+    src.header, survivors, host_reader(src), header, gather, /*max_gap_bytes=*/0, &payload_bytes);
+  expect(err.empty(), err.empty() ? "subset header build failed" : err.c_str());
+  check_gather_well_formed(gather, label);
+
+  auto const compacted = apply_gather(src, gather, payload_bytes);
+  auto const table     = decode_from(header, compacted, nullptr, stream);
+  auto const decoded =
+    simpatico::decompress(table, stream, rmm::mr::get_current_device_resource_ref());
+  expect(decoded != nullptr && decoded->num_columns() == 1, "decompress produced no column");
+
+  std::vector<std::string> want;
+  for (auto const chunk : survivors) {
+    auto const first = static_cast<std::int32_t>(chunk) * kChunkRows;
+    auto const last  = std::min(first + kChunkRows, kNumRows);
+    for (std::int32_t i = first; i < last; ++i) {
+      want.push_back(host[static_cast<std::size_t>(i)]);
+    }
+  }
+  auto const expected = make_strings_column(want, {}, stream);
+  expect(decoded->view().column(0).size() == static_cast<cudf::size_type>(want.size()),
+         (std::string(label) + ": decoded row count is not the surviving rows").c_str());
+  expect(strings_equal(decoded->view().column(0), expected->view(), stream),
+         (std::string(label) + ": decoded values are not the surviving rows").c_str());
 }
 
 void test_malformed_input()
@@ -465,6 +552,16 @@ int main()
     test_roundtrip_values(chunk_ids({2, 3, 4}), "adjacent subset including the short tail");
     test_roundtrip_values(all_chunk_ids(kNumRows), "all chunks");
     test_whole_column_is_emitted_whole();
+    test_dictionary_shape("input -> dictionary\n", "bare dictionary");
+    test_dictionary_shape(
+      "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+      "dictionary with bitpacked indices");
+    test_dictionary_shape(
+      "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+      "dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+      "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+      "dictionary with bitpacked keys and indices");
     test_malformed_input();
     test_missing_sizing_metadata_falls_back_to_whole();
   } catch (std::exception const& e) {
