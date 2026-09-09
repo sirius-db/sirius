@@ -34,7 +34,7 @@ std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const
   return get_metadata(obj.raw_file_cache_id());
 }
 
-std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string const& cache_key) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
 {
   std::shared_lock lk(_mtx);
   auto it = _by_key.find(cache_key);

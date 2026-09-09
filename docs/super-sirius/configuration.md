@@ -80,7 +80,11 @@ sirius:
     host: { capacity_bytes: 25GB, initial_number_pools: 50, pool_size: 512, block_size: 1048576 }
     disk: { disk_id: 0, capacity_bytes: 1000000000000, downgrade_root_dirs: "/tmp/sirius_disk_memory" }
   executor:
-    scan_manager: { num_threads: 4, use_sirius_datasource: true, uring_n_reactors: 1, enable_prefetch_cache: false }
+    scan_manager:
+      num_threads: 4
+      backend: sirius
+      uring_n_reactors: 1
+      cache: { mode: none, eviction: lru }
     pipeline:     { num_threads: 4 }
     downgrade:    { num_threads: 1 }
     task_creator: { num_threads: 1 }
@@ -303,12 +307,159 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 |-----|------|---------|-------------|
 | `num_threads` | int (**> 2**) | remaining cores (min 4) | Threads in the scan-manager pool that run metadata tasks. Defaults to every core left after the other default pools (1 downgrade + 1 task_creator + 4 pipeline + 1 uring reactor), with a floor of 4. Rejected unless strictly greater than 2 (i.e. minimum 3). |
 | `cpu_affinity` | list of int | — | Cores to pin scan-manager threads to. |
-| `use_sirius_datasource` | bool | true | Route reads through the Sirius `io_uring` datasource. When false, the kvikio fallback is used (single-GPU only; multi-GPU requires the Sirius datasource). |
+| `backend` | enum: `sirius`, `kvikio` | `sirius` | IO backend for reads. `sirius` uses the Sirius IO stack (`io_uring` for local paths, REST for `s3://`); `kvikio` routes local files to the kvikIO fallback (single-GPU only; multi-GPU requires `sirius`). Values are lowercase. |
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
-| `enable_prefetch_cache` | bool | false | Attach the pinned-memory prefetching cache in front of the backend. |
+| `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local ones (uring, kvikIO). Values are lowercase. |
 
-Five optional nested sub-configs tune the individual backends, caches, and the memory prefetcher:
+Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
+sub-config below.
+
+`max_readahead_scans` has three states:
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | Defers to `cache`: with `mode` other than `none`, the budget is the backend reactor's own `n_max_concurrent_scans`; with `mode: none` the readahead does not run. |
+| `0` | The readahead does not run, whatever the cache mode. |
+| `n > 0` | The readahead runs with a budget of `n`, whatever the cache mode. |
+
+`readahead_strategy` works the same way, deferring to the backend rather than to the cache:
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring and kvikIO. |
+| `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
+| `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
+
+When the readahead ends up `opportunistic` (either way), an *unset* `max_readahead_scans` schedules
+against the pipeline pool's width rather than the backend's depth — one prefetch per non-scan
+deployment is only useful while a pipeline thread could still pick up another scan. An explicit
+`max_readahead_scans` wins over that substitution.
+
+Both are resolved against a single backend: the live one publishing the widest
+`n_max_concurrent_scans`, so the budget and the strategy always describe the same reactor.
+
+Six optional nested sub-configs tune the individual backends, the cache, and the memory prefetcher:
+
+### `scan_manager.uring` — io_uring backend (`io/uring/config.hpp`)
+
+There are no static chunk-size or `readv`-fusion knobs. The worker chooses physical
+operation sizes dynamically from backlog pressure, available slots, and the pinned block size.
+
+### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
+
+TLS verification policy and the CA bundle are configured only under
+`scan_manager.object_store`. The REST reactor consumes those values so signing
+and transport use one trust policy; there are no separate REST YAML controls.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
+| `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
+| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
+| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
+| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
+| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
+| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
+| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
+| `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
+| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
+| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
+| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
+
+Two REST values are deliberately not YAML keys. **Connections per reactor** is
+fixed at 64 — the useful number is a property of one reactor thread, not of a
+deployment, and more concurrency comes from adding reactors (`rest_n_reactors`),
+each with its own thread to service them. **Physical GET size** is worker-owned:
+the reactor derives a target between 4 MiB and 16 MiB from its queued logical
+bytes and currently free connections. Large contiguous requests are balanced
+under the 16 MiB ceiling. Fragmented cache fills are grouped only at whole
+cache-chunk boundaries so a chunk is never published before all of its bytes
+arrive.
+
+`merge_max_gap` remains a logical planner hint: nearby ranges can be represented
+as prepared slices without forcing a static physical layout. Device operations
+allocate as many pinned CuCascade blocks as their selected physical range needs;
+those blocks stay owned through curl retries, the asynchronous H2D copy, and its
+CUDA completion event. Staging is therefore proportional to active device work
+instead of being reserved as one fixed bounce slot per connection.
+
+### `scan_manager.kvikio` — kvikIO local-file backend (`io/kvikio/config.hpp`)
+
+Used only when `backend: kvikio` routes local files to the kvikIO
+fallback. **Every key is optional and unset means "leave kvikIO's own default
+alone"** — kvikIO seeds each setting from an environment variable at first use, so
+omitting a key preserves that value and setting one overrides it.
+
+**These are process-global.** Every key except `compat_mode` maps to a setter on
+kvikIO's `defaults` singleton, so the last context constructed wins and the
+setting is shared with every other kvikIO user in the process. Treat it as
+startup configuration. `compat_mode` is the exception: it rides the file-handle
+constructor, so it scopes to files this backend opens.
+
+| Key | Type | Env default | Description |
+|-----|------|-------------|-------------|
+| `nthreads` | int (**> 0**) | `KVIKIO_NTHREADS` (1) | Threads in kvikIO's task pool — the parallelism bound for a single read. |
+| `task_size` | bytes (**> 0**) | `KVIKIO_TASK_SIZE` (4Mi) | Chunk size a parallel read is split into. Keep it a page multiple when `auto_direct_io_read` is on. |
+| `gds_threshold` | bytes | `KVIKIO_GDS_THRESHOLD` (1Mi) | Minimum read size routed through GDS + the thread pool; smaller reads take a direct POSIX shortcut. 0 is legal. |
+| `bounce_buffer_size` | bytes (**> 0**) | `KVIKIO_BOUNCE_BUFFER_SIZE` (16Mi) | Host staging buffer for device reads that cannot go straight to GPU memory. |
+| `auto_direct_io_read` | bool | `KVIKIO_AUTO_DIRECT_IO_READ` | Use `O_DIRECT` for POSIX reads. POSIX path only — the cuFile/GDS path manages its own I/O mode. |
+| `auto_direct_io_read_overread` | bool | `KVIKIO_AUTO_DIRECT_IO_READ_OVERREAD` (false) | Align device-read offsets down and sizes up to pages so the whole transfer is pure Direct I/O, at the cost of extra bytes. Requires `auto_direct_io_read`. |
+| `thread_pool_per_block_device` | bool | `KVIKIO_THREAD_POOL_PER_BLOCK_DEVICE` (false) | Give each block device its own pool instead of sharing one global pool. |
+| `compat_mode` | enum: `auto`, `on`, `off` | `KVIKIO_COMPAT_MODE` | cuFile vs POSIX selection, per file handle. `off` enforces cuFile/GDS, `on` enforces POSIX, `auto` tries cuFile and falls back. Values are lowercase. |
+
+### `scan_manager.cache` — read-path caching (`io/cache/config.hpp`)
+
+Everything about read-path caching lives in this one block — rather than a mode on the
+scan manager and the cache's tunables in a sibling block.
+
+```yaml
+sirius:
+  executor:
+    scan_manager:
+      cache:
+        mode: sirius
+        eviction: lru
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | enum: `none`, `os`, `sirius` | `none` | Which cache the read path goes through. Values are lowercase. |
+| `eviction` | enum: `idle`, `lru` | `lru` | What retires an idle chunk from the Sirius cache. Only meaningful under `mode: sirius`. Values are lowercase. |
+| `eviction_threshold_fraction` | double [0,1] | 0.8 | Start evicting when the cache pool fills to this fraction. |
+| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the pool reserved for prefetching. |
+
+`mode: none` bypasses every cache (`O_DIRECT`, no prefetching cache). `mode: os` reads
+through the kernel page cache instead. `mode: sirius` reads `O_DIRECT` into Sirius's own
+pinned prefetching cache.
+
+`eviction: lru` keeps idle chunks for reuse and evicts least-recently-used ones once the
+pool fills past `eviction_threshold_fraction`; `eviction: idle` drops each chunk as soon as
+it goes idle, making the cache a prefetch staging area sized for the reads in flight rather
+than for reuse.
+
+Those two knobs derive the settings below, which are therefore **not** individually settable from YAML:
+
+| Derived setting | Derived from |
+|-----------------|--------------|
+| `uring.use_odirect` | `mode` — true for everything but `os` |
+| whether the prefetching cache is armed | `mode` — only under `sirius` |
+| `dispose_on_idle` | `eviction` — true under `idle` |
+| the readahead's default budget | `mode` — the readahead does not run under `none`; see [`max_readahead_scans`](#scan-manager--io-configuration) |
+
+### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `endpoint` | string | "" | S3 endpoint URL. |
+| `region` | string | "" | AWS region. |
+| `access_key` / `secret_key` | string | "" | Static credentials. |
+| `session_token` | string | "" | STS session token for temporary credentials. |
+| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
+| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
+| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
+| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ### `scan_manager.memory_prefetcher` — background host→GPU upload of pinned-cache scan splits (`scan_manager/config.hpp`)
 
@@ -325,60 +476,6 @@ single-GPU configurations only (logs a warning and disables itself otherwise).
 | `min_free_fraction` | double [0,1] | 0.4 | Keep at least this fraction of the GPU space free after each prefetch; conversions (and their reservations) are only attempted above this floor. |
 | `poll_interval_ms` | int (**> 0**) | 2 | Worker sweep interval while waiting for headroom / new splits. |
 | `drain_quiet_ms` | int (ms) | 100 | A connector counts as actively draining (and is skipped) until this long passes since its last pop. Must exceed the scan's inter-pop interval. |
-
-### `scan_manager.local` — io_uring backend (`io/uring/config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `use_odirect` | bool | true | Use `O_DIRECT` for local-disk reads. |
-| `max_n_chunks` | int | 1 | Max contiguous file segments fused into one vectored read. |
-
-### `scan_manager.rest` — REST / S3 backend (`io/rest/config.hpp`)
-
-TLS verification policy and the CA bundle are configured only under
-`scan_manager.object_store`. The REST reactor consumes those values so signing
-and transport use one trust policy; there are no separate REST YAML controls.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
-| `max_connections` | int | 16 | Max concurrent in-flight connections per reactor. |
-| `chunk_size` | bytes | 8Mi | Target bytes per ranged GET (scatter/device-staging paths). |
-| `max_n_chunks` | int | 16 | Max file-adjacent segments fused into one scatter GET. |
-| `max_read_split` | int | 16 | Max parallel ranged GETs for one contiguous host read (reads < 2 MiB stay a single GET). |
-| `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
-| `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
-| `retry_backoff_base_ms` | int (ms) | 50 | Base backoff between retries. |
-| `retry_jitter_ms` | int (ms) | 50 | Random jitter added to retry backoff. |
-| `max_retry_attempts` | int | 10 | Retry attempts for transient errors. |
-| `max_auth_retry_attempts` | int | 3 | Retry attempts for HTTP 403 (expired presigned URL). Kept low so a genuine AccessDenied fails fast. |
-| `honor_retry_after` | bool | true | Respect the server's `Retry-After` header. |
-| `perf_instrumentation` | bool | false | Record per-chunk micro-timings (chunk_get, queue_wait, ttfb, h2d) into perf counters. |
-| `footer_probe_bytes` | bytes | 512Ki | Suffix-range window for the parquet footer probe. Must cover the footer, so err large. |
-| `list_max_matches` | int | 100000 | Cap on files a glob/listing may accumulate (throws "narrow the glob prefix", never truncates). |
-| `list_max_scanned` | int | 1000000 | Cap on objects a LIST sweep may scan across pages (throws, never truncates). |
-
-### `scan_manager.cache` — prefetching cache (`io/cache/config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `inflight_io_chunk_budget` | int (**> 0**) | 2048 | Max in-flight IO chunks (enforced by admission control). |
-| `eviction_threshold_fraction` | double [0,1] | 0.6 | Start evicting when the pool fills to this fraction. |
-| `min_prefetching_budget_fraction` | double [0,1] | 0.05 | Floor of the budget reserved for prefetching. |
-| `dispose_after_use` | bool | false | Discard chunks immediately after use. |
-
-### `scan_manager.object_store` — S3 credentials & endpoint (`io/object_store_config.hpp`)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `endpoint` | string | "" | S3 endpoint URL. |
-| `region` | string | "" | AWS region. |
-| `access_key` / `secret_key` | string | "" | Static credentials. |
-| `session_token` | string | "" | STS session token for temporary credentials. |
-| `signing_mode` | enum: `presigned`, `header` | `presigned` | SigV4 form: `presigned` (auth in the URL query string) or `header` (`Authorization` + `x-amz-*` headers). Values are lowercase. |
-| `s3_transport` | enum: `auto`, `http`, `https`, `rdma` | `auto` | Transport selection. Values are lowercase; `https` is an alias for `http`. `auto` lets the backend choose from the URI scheme and endpoint. |
-| `ca_bundle_path` | string | "" | Sole YAML source for the REST endpoint's PEM CA bundle. |
-| `tls_verify` | bool | true | Sole YAML source for REST endpoint certificate verification. |
 
 ## Operator Parameters
 
@@ -738,8 +835,9 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 | `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
 | `src/include/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, readahead, object store) |
+| `src/include/io/cache/config.hpp` | Read-path caching config (`scan_manager.cache`: mode, eviction policy, prefetching-cache tunables) |
+| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / object-store sub-configs |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

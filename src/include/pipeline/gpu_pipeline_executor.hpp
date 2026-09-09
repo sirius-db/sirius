@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "event/query_event_publisher.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "parallel/task_executor.hpp"
@@ -85,6 +86,14 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   ~gpu_pipeline_executor();
 
+  /// Attach the query-event observer, sharing ownership so the handle is
+  /// neither null nor dangling.  Propagated by task_scheduler; until then this
+  /// executor reports into its own subscriber-less publisher.
+  void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+  {
+    _query_event_publisher = publisher.shared_from_this();
+  }
+
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
   gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
@@ -131,7 +140,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
  protected:
   void manager_loop() override;
 
-  absl::AnyInvocable<void() noexcept> get_per_thread_init() override;
+  sirius::exec::invocable<void() noexcept> get_per_thread_init() override;
 
  private:
   /**
@@ -147,6 +156,9 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::parallel::downgrade_executor* _downgrade_executor{nullptr};
+  /// Observer of query event transitions.  Never null; see task_creator.
+  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
+    std::make_shared<sirius::event::query_event_publisher>()};
   sirius::creator::task_creator* _task_creator{nullptr};
   completion_handler* _completion_handler{nullptr};
   std::atomic<size_t> _tasks_executed{0};

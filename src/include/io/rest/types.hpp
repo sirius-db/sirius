@@ -17,14 +17,10 @@
 #pragma once
 
 #include "io/io_request.hpp"
-#include "io/s3/s3_object_ref.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/types.hpp"
 
-#include <cuda_runtime.h>
-
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
@@ -71,66 +67,27 @@ struct header_capture {
   }
 };
 
-/// One ranged HTTP GET.  The unit the reactor submits as a single easy handle.
-///
-/// @c object identifies the bucket/key so the reactor can re-authorize on every
-/// attempt (presigned URLs expire).  @c chunk carries the file range
-/// [offset, offset+size) and its destination buffer; a null destination
-/// (@c chunk.data() == nullptr) means the reactor stages the read through one
-/// of its own pinned bounce slots before the host->device copy.  @c cpy_req is
-/// non-null only for device-bound reads.  @c attempt persists across retries
-/// (the chunk is re-enqueued by the retry engine) so backoff can grow.
-struct rest_chunked_rx_request {
-  s3::s3_object_ref object;
-  io_object_segment chunk;
-  std::size_t file_size{0};
-  std::size_t attempt{0};       // transient (5xx / curl / short-read) retries
-  std::size_t auth_attempt{0};  // bounded HTTP 403 (re-presign) retries
-  std::unique_ptr<device_cpy_request> cpy_req;
-  std::shared_ptr<request_manager> manager;
+/// REST-specific retry envelope around a backend-neutral physical operation.
+/// The operation owns any CuCascade staging allocation through staging_owner,
+/// so its iovecs remain stable across retries and until a CUDA event drains.
+struct rest_io_op_request {
+  object_ref object;
+  std::unique_ptr<io_op_request> op;
+  std::size_t attempt{0};
+  std::size_t auth_attempt{0};
+  bool needs_staging{false};
+  std::size_t logical_bytes{0};
 
-  // Set by submit() once this (originally null-buffer) device read has been
-  // staged through a pinned bounce slot (set_data).  Recorded explicitly because
-  // set_data makes chunk.is_buffer_allocated() true, so finish() can no longer
-  // infer bounce-staging from the chunk itself; it must consult this flag to
-  // take the event-synchronized recycle path (see needs_event_for_synchronization).
-  bool staged_through_bounce{false};
-
-  // Marks synchronous network reads for blocking_host_get_* attribution.
-  bool perf_blocking_host_get{false};
-
-  // perf (set only when the reactor's perf_instrumentation is on): t_enqueue at
-  // queue insertion, t_submit at dequeue onto a connection; their delta is the
-  // queue_wait sample (attempt 0 only), and t_submit anchors the chunk_get span.
-  std::chrono::steady_clock::time_point t_enqueue{};
-  std::chrono::steady_clock::time_point t_submit{};
-
-  /// True iff this read's bytes must be host->device copied after landing.
-  [[nodiscard]] bool is_device() const noexcept { return cpy_req != nullptr; }
-
-  /// Issue the host->device copy (batch + optional event) for this chunk.  The
-  /// host source is @c chunk.data() (the bounce slot or caller buffer).
-  cudaError_t copy_h2d_async(cudaEvent_t event = nullptr) noexcept
+  [[nodiscard]] bool is_device() const noexcept
   {
-    if (cpy_req) { return cpy_req->copy_async(chunk.data(), chunk.size, event); }
-    return cudaSuccess;
+    return op != nullptr && op->device_copy != nullptr;
   }
 
-  /// True iff the H2D copy must be synchronized through a CUDA event: it stages
-  /// through a reactor-owned bounce slot that can only be recycled once the copy
-  /// off it has completed.  Keys off @c staged_through_bounce rather than
-  /// chunk.is_buffer_allocated(), because submit() sets the chunk's data to the
-  /// bounce (set_data) *before* finish() evaluates this — reading the chunk
-  /// would report "already buffered" and wrongly skip the event/park path,
-  /// letting the slot (and its bounce) be recycled while the copy still drains.
-  [[nodiscard]] bool needs_event_for_synchronization() const noexcept
+  [[nodiscard]] cudaError_t copy_h2d_async(cudaEvent_t event = nullptr) const noexcept
   {
-    return staged_through_bounce && cpy_req != nullptr;
+    if (!is_device()) return cudaSuccess;
+    return op->device_copy->copy_async(op->io_rng, op->iovecs, event);
   }
 };
-
-/// The per-reactor request container for the REST backend: the shared
-/// rx_request_t template instantiated for the REST chunk type.
-using rest_rx_request = rx_request_t<rest_chunked_rx_request>;
 
 }  // namespace sirius::io::rest

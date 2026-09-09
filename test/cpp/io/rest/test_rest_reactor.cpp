@@ -16,39 +16,53 @@
 
 #include <cudf/io/text/byte_range_info.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-
-#include <cuda_runtime_api.h>
-
 #include <catch.hpp>
+#include <io/rest/mock_authorizer.hpp>
 #include <io/rest/rest_reactor.hpp>
-#include <io/rest/types.hpp>
-#include <io/types.hpp>
 
 #include <array>
-#include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
 using cudf::io::text::byte_range_info;
-using sirius::io::device_cpy_request;
-using sirius::io::io_object_segment;
-using sirius::io::rest::rest_chunked_rx_request;
+using sirius::io::grouped_coordinator;
+using sirius::io::grouped_io_request;
+using sirius::io::host_buffer;
+using sirius::io::prepared_io_slice;
+using sirius::io::range;
+using sirius::io::rest::mock_authorizer;
 using sirius::io::rest::rest_io_object;
 using sirius::io::rest::rest_reactor;
 
 namespace {
 
-// Non-null buffer base for segments; the pure prep/coalesce logic never
-// dereferences it.
-uint8_t* fake_ptr(uintptr_t v) { return reinterpret_cast<uint8_t*>(v); }
-
 std::vector<byte_range_info> coalesce(std::vector<byte_range_info> ranges,
-                                      std::optional<size_t> alignment = std::nullopt)
+                                      std::optional<std::size_t> alignment = std::nullopt)
 {
-  return rest_reactor::align_and_coalesce(
-    std::span<const byte_range_info>(ranges.data(), ranges.size()), alignment);
+  return rest_reactor::align_and_coalesce(ranges, alignment);
+}
+
+std::unique_ptr<rest_reactor> make_reactor()
+{
+  auto authorizer = std::make_shared<mock_authorizer>(
+    sirius::io::rest::authorized_request{"http://127.0.0.1/unused", {}});
+  sirius::io::rest::config config;
+  config.max_connections = 1;
+  auto context =
+    std::make_shared<rest_reactor::reactor_context>(config, std::move(authorizer), nullptr);
+  return std::make_unique<rest_reactor>(std::move(context), "rest_lifecycle_test");
+}
+
+sirius::exec::semi_future<std::size_t> enqueue_one(rest_reactor& reactor, std::uint8_t* destination)
+{
+  auto object      = std::make_shared<rest_io_object>("s3://bucket/object", "bucket", "object", 1);
+  auto coordinator = std::make_shared<grouped_coordinator>(1, 1);
+  auto future      = coordinator->get_future();
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{0, 1}, host_buffer{destination});
+  reactor.enqueue(grouped_io_request::create(std::move(object), std::move(slices), coordinator));
+  return future;
 }
 
 }  // namespace
@@ -66,11 +80,7 @@ TEST_CASE("rest_reactor::supports only accepts s3 URLs", "[rest]")
 TEST_CASE("align_and_coalesce coalesces without alignment by default", "[rest]")
 {
   SECTION("empty input") { CHECK(coalesce({}).empty()); }
-  SECTION("zero-size ranges dropped")
-  {
-    auto out = coalesce({byte_range_info{100, 0}});
-    CHECK(out.empty());
-  }
+  SECTION("zero-size ranges dropped") { CHECK(coalesce({byte_range_info{100, 0}}).empty()); }
   SECTION("disjoint ranges stay separate and sorted")
   {
     auto out = coalesce({byte_range_info{200, 50}, byte_range_info{0, 50}});
@@ -98,8 +108,6 @@ TEST_CASE("align_and_coalesce coalesces without alignment by default", "[rest]")
 
 TEST_CASE("align_and_coalesce honors a caller alignment as a lower bound", "[rest]")
 {
-  // align=4096: [100,200) -> [0,4096); [9000,9100) -> [8192,12288).  The two
-  // rounded ranges leave a gap (4096..8192), so they stay separate.
   auto out = coalesce({byte_range_info{100, 100}, byte_range_info{9000, 100}}, 4096);
   REQUIRE(out.size() == 2);
   CHECK(out[0].offset() == 0);
@@ -107,419 +115,33 @@ TEST_CASE("align_and_coalesce honors a caller alignment as a lower bound", "[res
   CHECK(out[1].offset() == 8192);
   CHECK(out[1].size() == 4096);
 
-  // After rounding, [100,200) and [3000,3100) both land in [0,4096) and merge.
   auto merged = coalesce({byte_range_info{100, 100}, byte_range_info{3000, 100}}, 4096);
   REQUIRE(merged.size() == 1);
   CHECK(merged[0].offset() == 0);
   CHECK(merged[0].size() == 4096);
 }
 
-TEST_CASE("prep_host_rx_request builds a single chunk for the segment", "[rest]")
+TEST_CASE("rest_reactor rejects work outside its running lifetime", "[rest]")
 {
-  sirius::io::rest::config cfg;  // pure primitives; shared services live on the context
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
+  std::array<std::uint8_t, 1> destination{};
 
-  SECTION("non-empty segment")
+  SECTION("before start")
   {
-    auto req = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{4096, 8192, fake_ptr(0x1000)});
-    REQUIRE(req->size() == 1);
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 1);
-    CHECK(chunks[0]->object.bucket == "bkt");
-    CHECK(chunks[0]->object.key == "key");
-    CHECK(chunks[0]->chunk.offset == 4096);
-    CHECK(chunks[0]->chunk.size == 8192);
-    CHECK_FALSE(chunks[0]->is_device());
+    auto reactor = make_reactor();
+    auto future  = enqueue_one(*reactor, destination.data());
+    CHECK(future.is_ready());
+    CHECK_THROWS(std::move(future).get());
+    CHECK(reactor->queued_bytes() == 0);
   }
-  SECTION("zero-size segment yields no chunks")
+
+  SECTION("after shutdown")
   {
-    auto req =
-      rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{0, 0, fake_ptr(0x1)});
-    CHECK(req->size() == 0);
+    auto reactor = make_reactor();
+    reactor->start();
+    reactor->shutdown();
+    auto future = enqueue_one(*reactor, destination.data());
+    CHECK(future.is_ready());
+    CHECK_THROWS(std::move(future).get());
+    CHECK(reactor->queued_bytes() == 0);
   }
-}
-
-TEST_CASE("prep_host_rxv_request builds one chunk per non-empty segment", "[rest]")
-{
-  sirius::io::rest::config cfg;
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/10000);
-
-  SECTION("three in-range segments")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0x1)},
-                                        io_object_segment{500, 100, fake_ptr(0x2)},
-                                        io_object_segment{9000, 100, fake_ptr(0x3)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 3);
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 3);
-    for (auto const& c : chunks) {
-      CHECK(c->object.bucket == "bkt");
-      CHECK_FALSE(c->is_device());
-    }
-  }
-  SECTION("segment past EOF is clamped away")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0x1)},
-                                        io_object_segment{20000, 100, fake_ptr(0x2)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 1);  // the past-EOF segment contributes nothing
-  }
-  SECTION("segment straddling EOF is clamped to the file end")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{9900, 1000, fake_ptr(0x1)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 1);
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 1);
-    CHECK(chunks[0]->chunk.offset == 9900);
-    CHECK(chunks[0]->chunk.size == 100);  // clamped from 1000 to 10000-9900
-  }
-  SECTION("empty segment list yields no chunks")
-  {
-    std::vector<io_object_segment> segs;
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    CHECK(req->size() == 0);
-  }
-}
-
-TEST_CASE("prep_host_rx_request splits a contiguous read by max_read_split", "[rest]")
-{
-  constexpr size_t kMiB     = 1UL << 20;
-  constexpr uintptr_t kBase = 0x10000;
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/256 * kMiB);
-
-  SECTION("a read below 2 MiB stays a single GET")
-  {
-    sirius::io::rest::config cfg;
-    cfg.max_read_split = 16;
-    auto req           = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, kMiB + kMiB / 2, fake_ptr(kBase)});  // 1.5 MiB
-    CHECK(req->size() == 1);
-  }
-
-  SECTION("split count is capped by max_read_split")
-  {
-    sirius::io::rest::config cfg;
-    cfg.max_read_split = 4;
-    // 8 MiB / 1 MiB = 8 candidate pieces, but max_read_split caps it at 4.
-    auto req = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, 8 * kMiB, fake_ptr(kBase)});
-    REQUIRE(req->size() == 4);
-    auto chunks  = req->get_all_chunks();
-    size_t total = 0;
-    size_t pos   = 0;
-    for (auto const& c : chunks) {
-      CHECK(c->chunk.offset == pos);
-      CHECK(c->chunk.size == 2 * kMiB);
-      CHECK(c->chunk.n_chunks() == 1);  // each piece is a plain single-buffer GET
-      CHECK(reinterpret_cast<uintptr_t>(c->chunk.data()) == kBase + pos);
-      pos += c->chunk.size;
-      total += c->chunk.size;
-    }
-    CHECK(total == 8 * kMiB);  // pieces cover the whole range, contiguously
-  }
-
-  SECTION("pieces stay at least 1 MiB when max_read_split exceeds size / 1 MiB")
-  {
-    sirius::io::rest::config cfg;
-    cfg.max_read_split = 16;
-    // 5 MiB / 1 MiB = 5 pieces, fewer than the cap, so each piece is exactly 1 MiB.
-    auto req = rest_reactor::prep_host_rx_request(
-      cfg, file, io_object_segment{0, 5 * kMiB, fake_ptr(kBase)});
-    REQUIRE(req->size() == 5);
-    auto chunks = req->get_all_chunks();
-    for (auto const& c : chunks) {
-      CHECK(c->chunk.size == kMiB);
-    }
-  }
-
-  SECTION("an uneven split spreads the remainder over the leading pieces")
-  {
-    sirius::io::rest::config cfg;
-    cfg.max_read_split = 4;
-    size_t const size  = 8 * kMiB + 3;  // 3 leading pieces get one extra byte
-    auto req =
-      rest_reactor::prep_host_rx_request(cfg, file, io_object_segment{1000, size, fake_ptr(kBase)});
-    REQUIRE(req->size() == 4);
-    auto chunks  = req->get_all_chunks();
-    size_t total = 0;
-    size_t pos   = 0;
-    for (auto const& c : chunks) {
-      CHECK(c->chunk.offset == 1000 + pos);
-      CHECK(reinterpret_cast<uintptr_t>(c->chunk.data()) == kBase + pos);
-      pos += c->chunk.size;
-      total += c->chunk.size;
-    }
-    CHECK(total == size);                               // every byte covered exactly once
-    CHECK(chunks.front()->chunk.size == 2 * kMiB + 1);  // leading piece took a remainder byte
-    CHECK(chunks.back()->chunk.size == 2 * kMiB);       // trailing piece did not
-  }
-}
-
-TEST_CASE("prep_host_rxv_request fuses file-adjacent segments into a scatter GET", "[rest]")
-{
-  sirius::io::rest::config cfg;
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
-
-  SECTION("three contiguous segments, separate buffers -> one multi-buffer chunk")
-  {
-    cfg.chunk_size   = 1 << 20;  // big enough to fit all three
-    cfg.max_n_chunks = 16;
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{100, 100, fake_ptr(0xB00)},
-                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 1);
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 1);
-    CHECK(chunks[0]->chunk.offset == 0);
-    CHECK(chunks[0]->chunk.size == 300);      // one contiguous range
-    CHECK(chunks[0]->chunk.n_chunks() == 3);  // scattered across 3 buffers
-    CHECK(chunks[0]->chunk.is_vectored());
-  }
-  SECTION("max_n_chunks caps the fusion")
-  {
-    cfg.chunk_size   = 1 << 20;
-    cfg.max_n_chunks = 2;  // at most 2 buffers per request
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{100, 100, fake_ptr(0xB00)},
-                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
-  }
-  SECTION("chunk_size caps the fused span")
-  {
-    cfg.chunk_size   = 250;  // two 100B segments fit, the third spills over
-    cfg.max_n_chunks = 16;
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{100, 100, fake_ptr(0xB00)},
-                                        io_object_segment{200, 100, fake_ptr(0xC00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 2);  // [0,200) then [200,300)
-  }
-  SECTION("non-contiguous segments stay separate")
-  {
-    cfg.chunk_size   = 1 << 20;
-    cfg.max_n_chunks = 16;
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(0xA00)},
-                                        io_object_segment{500, 100, fake_ptr(0xB00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 2);
-  }
-  SECTION("a large segment in the vector is split")
-  {
-    cfg.chunk_size   = 4096;
-    cfg.max_n_chunks = 16;
-    std::vector<io_object_segment> segs{io_object_segment{0, 3 * 4096, fake_ptr(0xA00)}};
-    auto req = rest_reactor::prep_host_rxv_request(cfg, file, segs);
-    REQUIRE(req->size() == 3);
-  }
-}
-
-TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk", "[rest]")
-{
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
-  constexpr uintptr_t kDst = 0x100000;
-  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000, kB2 = 0xC000;
-
-  SECTION("three contiguous buffers, full overlap -> one chunk, three copies")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
-                                        io_object_segment{100, 100, fake_ptr(kB1)},
-                                        io_object_segment{200, 100, fake_ptr(kB2)}};
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/0, /*size=*/300, rmm::cuda_stream_view{}, 0);
-    REQUIRE(req->size() == 1);
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 1);
-    auto const& c = *chunks[0];
-    CHECK(c.is_device());
-    CHECK(c.chunk.offset == 0);
-    CHECK(c.chunk.size == 300);      // one contiguous scatter GET
-    CHECK(c.chunk.n_chunks() == 3);  // landing across three buffers
-    REQUIRE(c.cpy_req != nullptr);
-    REQUIRE(c.cpy_req->copies.size() == 3);  // one H2D copy per buffer
-    std::array<uintptr_t, 3> const bufs{kB0, kB1, kB2};
-    for (size_t i = 0; i < 3; ++i) {
-      auto const& cp = c.cpy_req->copies[i];
-      CHECK(reinterpret_cast<uintptr_t>(cp.dst) == kDst + i * 100);
-      CHECK(reinterpret_cast<uintptr_t>(cp.src) == bufs[i]);  // absolute per-buffer src
-      CHECK(cp.src_off == 0);
-      CHECK(cp.size == 100);
-    }
-  }
-
-  SECTION("partial device window clips each buffer's copy")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
-                                        io_object_segment{100, 100, fake_ptr(kB1)},
-                                        io_object_segment{200, 100, fake_ptr(kB2)}};
-    // Device window [50, 250): clips the first and last buffers.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/50, /*size=*/200, rmm::cuda_stream_view{}, 0);
-    REQUIRE(req->size() == 1);
-    auto chunks   = req->get_all_chunks();
-    auto const& c = *chunks[0];
-    REQUIRE(c.cpy_req->copies.size() == 3);
-    // buffer0 file [0,100) intersects [50,250) as [50,100)
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].src) == kB0 + 50);
-    CHECK(c.cpy_req->copies[0].src_off == 0);
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[0].dst) == kDst + 0);
-    CHECK(c.cpy_req->copies[0].size == 50);
-    // buffer1 file [100,200) fully inside -> [100,200)
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].src) == kB1);
-    CHECK(c.cpy_req->copies[1].src_off == 0);
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[1].dst) == kDst + 50);
-    CHECK(c.cpy_req->copies[1].size == 100);
-    // buffer2 file [200,300) intersects [50,250) as [200,250)
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].src) == kB2);
-    CHECK(c.cpy_req->copies[2].src_off == 0);
-    CHECK(reinterpret_cast<uintptr_t>(c.cpy_req->copies[2].dst) == kDst + 150);
-    CHECK(c.cpy_req->copies[2].size == 50);
-  }
-
-  SECTION("max_n_chunks caps the fused buffers per chunk")
-  {
-    cfg.max_n_chunks = 2;
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
-                                        io_object_segment{100, 100, fake_ptr(kB1)},
-                                        io_object_segment{200, 100, fake_ptr(kB2)}};
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), 0, 300, rmm::cuda_stream_view{}, 0);
-    REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
-  }
-
-  SECTION("non-contiguous buffers stay separate single-copy chunks")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
-                                        io_object_segment{500, 100, fake_ptr(kB1)}};
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), 0, 600, rmm::cuda_stream_view{}, 0);
-    REQUIRE(req->size() == 2);
-    auto chunks = req->get_all_chunks();
-    for (auto const& cp : chunks) {
-      CHECK(cp->chunk.n_chunks() == 1);
-      REQUIRE(cp->cpy_req->copies.size() == 1);
-    }
-  }
-}
-
-TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-staged chunks",
-          "[rest]")
-{
-  sirius::io::rest::config cfg;  // default chunk_size (8 MiB) / max_n_chunks (16)
-  rest_io_object const file("s3://bkt/key", "bkt", "key", /*size=*/1 << 20);
-  constexpr uintptr_t kDst = 0x100000;
-  constexpr uintptr_t kB0 = 0xA000, kB1 = 0xB000;
-
-  SECTION("real-null-real neighbors are not fused across the null segment")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{100, 100, fake_ptr(kB0)},
-                                        io_object_segment{200, 100, nullptr},
-                                        io_object_segment{300, 100, fake_ptr(kB1)}};
-    // Device window [150, 380): clips the first and last real buffers while the
-    // null-buffer gap is staged later through a reactor-owned bounce slot.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/150, /*size=*/230, rmm::cuda_stream_view{}, 0);
-
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 3);
-    for (auto const& chunk : chunks) {
-      CHECK(chunk->is_device());
-      CHECK(chunk->chunk.n_chunks() == 1);
-      REQUIRE(chunk->cpy_req != nullptr);
-      REQUIRE(chunk->cpy_req->copies.size() == 1);
-    }
-
-    auto const& first = chunks[0]->cpy_req->copies[0];
-    CHECK(chunks[0]->chunk.offset == 100);
-    CHECK(chunks[0]->chunk.size == 100);
-    CHECK(reinterpret_cast<uintptr_t>(first.dst) == kDst);
-    CHECK(reinterpret_cast<uintptr_t>(first.src) == kB0 + 50);
-    CHECK(first.src_off == 0);
-    CHECK(first.size == 50);
-
-    auto const& gap = chunks[1]->cpy_req->copies[0];
-    CHECK(chunks[1]->chunk.offset == 200);
-    CHECK(chunks[1]->chunk.size == 100);
-    CHECK(chunks[1]->chunk.data() == nullptr);
-    CHECK(gap.dst == fake_ptr(kDst + 50));
-    CHECK(gap.src == nullptr);
-    CHECK(gap.src_off == 0);
-    CHECK(gap.size == 100);
-
-    auto const& last = chunks[2]->cpy_req->copies[0];
-    CHECK(chunks[2]->chunk.offset == 300);
-    CHECK(chunks[2]->chunk.size == 100);
-    CHECK(reinterpret_cast<uintptr_t>(last.dst) == kDst + 150);
-    CHECK(reinterpret_cast<uintptr_t>(last.src) == kB1);
-    CHECK(last.src_off == 0);
-    CHECK(last.size == 80);
-  }
-
-  SECTION("adjacent null-buffer segments are not fused")
-  {
-    std::vector<io_object_segment> segs{io_object_segment{100, 100, nullptr},
-                                        io_object_segment{200, 100, nullptr}};
-    // Device window [125, 275): the first null-buffer chunk starts 25 bytes into
-    // its future bounce slot, proving the copy carries a src_off instead of a
-    // near-null absolute pointer.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/125, /*size=*/150, rmm::cuda_stream_view{}, 0);
-
-    auto chunks = req->get_all_chunks();
-    REQUIRE(chunks.size() == 2);
-    for (auto const& chunk : chunks) {
-      CHECK(chunk->is_device());
-      CHECK(chunk->chunk.n_chunks() == 1);
-      CHECK(chunk->chunk.data() == nullptr);
-      REQUIRE(chunk->cpy_req != nullptr);
-      REQUIRE(chunk->cpy_req->copies.size() == 1);
-      CHECK(chunk->cpy_req->copies[0].src == nullptr);
-    }
-
-    CHECK(chunks[0]->chunk.offset == 100);
-    CHECK(chunks[0]->chunk.size == 100);
-    CHECK(chunks[0]->cpy_req->copies[0].dst == fake_ptr(kDst));
-    CHECK(chunks[0]->cpy_req->copies[0].src_off == 25);
-    CHECK(chunks[0]->cpy_req->copies[0].size == 75);
-
-    CHECK(chunks[1]->chunk.offset == 200);
-    CHECK(chunks[1]->chunk.size == 100);
-    CHECK(chunks[1]->cpy_req->copies[0].dst == fake_ptr(kDst + 75));
-    CHECK(chunks[1]->cpy_req->copies[0].src_off == 0);
-    CHECK(chunks[1]->cpy_req->copies[0].size == 75);
-  }
-}
-
-TEST_CASE("device_cpy_request rejects null-derived host sources before cuda memcpy", "[rest][gpu]")
-{
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-    WARN("Skipping device_cpy_request CUDA guard: no CUDA device");
-    return;
-  }
-
-  device_cpy_request invalid;
-  invalid.stream    = rmm::cuda_stream_view{};
-  invalid.device_id = 0;
-  invalid.copies.push_back(device_cpy_request::copy{
-    /*dst=*/fake_ptr(0x100000), /*src=*/nullptr, /*src_off=*/4, /*size=*/4});
-  CHECK(invalid.copy_async(nullptr, 0) == cudaErrorInvalidValue);
-
-  std::array<uint8_t, 8> host{0, 1, 2, 3, 4, 5, 6, 7};
-  uint8_t* device_dst = nullptr;
-  REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device_dst), host.size()) == cudaSuccess);
-
-  device_cpy_request valid;
-  valid.stream    = rmm::cuda_stream_view{};
-  valid.device_id = 0;
-  valid.copies.push_back(device_cpy_request::copy{
-    /*dst=*/device_dst, /*src=*/nullptr, /*src_off=*/0, /*size=*/host.size()});
-  CHECK(valid.copy_async(host.data(), host.size()) == cudaSuccess);
-  CHECK(cudaDeviceSynchronize() == cudaSuccess);
-  CHECK(cudaFree(device_dst) == cudaSuccess);
 }

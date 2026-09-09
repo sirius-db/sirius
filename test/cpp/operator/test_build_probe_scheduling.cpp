@@ -435,7 +435,7 @@ TEST_CASE("compute_hash_join_partition_strategy - num_gpus < 1 is a precondition
 TEST_CASE("select_build_probe_action - no partitions means the operator is complete",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({});
+  auto const d = select_build_probe_action({}, /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::none);
 }
 
@@ -443,7 +443,8 @@ TEST_CASE("select_build_probe_action - schedules a build for a ready NOT_BUILT p
           "[hash_join][build_probe][unit]")
 {
   // NOT_BUILT with both its build batch and a probe batch -> build (and first probe) it.
-  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true)});
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true)},
+                                           /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 0);
 }
@@ -451,34 +452,68 @@ TEST_CASE("select_build_probe_action - schedules a build for a ready NOT_BUILT p
 TEST_CASE("select_build_probe_action - waits on build vs probe input when nothing is schedulable",
           "[hash_join][build_probe][unit]")
 {
-  // Missing build batch -> wait for the build producer so the build can start.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)}).action ==
-    build_probe_action::wait_for_build);
+  // Missing build batch -> wait for the build producer so the build can start, regardless of
+  // whether the probe side is finished (the build hasn't even arrived).
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_build);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, false, true)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_build);
 
-  // Build batch present but no probe batch yet -> wait for probe input.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)}).action ==
-    build_probe_action::wait_for_probe);
+  // Build batch present but no probe batch yet, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
 
-  // A build in flight (SCHEDULING/SCHEDULED) with no other work -> wait for probe input.
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false)}).action ==
-    build_probe_action::wait_for_probe);
-  REQUIRE(
-    select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)}).action ==
-    build_probe_action::wait_for_probe);
+  // A build in flight (SCHEDULING/SCHEDULED) with no other work -> wait for probe input, even
+  // once probe_finished: a task is still running against this slot.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::wait_for_probe);
 
-  // Built but drained of probe data -> wait for probe input (this is also how the op idles until
-  // the probe pipeline signals completion).
-  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)}).action ==
-          build_probe_action::wait_for_probe);
+  // Built but drained of probe data, probe side still open -> wait for probe input.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/false)
+            .action == build_probe_action::wait_for_probe);
+}
+
+TEST_CASE(
+  "select_build_probe_action - probe_finished retires orphaned/drained slots into completion",
+  "[hash_join][build_probe][unit]")
+{
+  // A NOT_BUILT partition holding a build batch but no probe data (broadcast orphan) has nothing
+  // left to do once the probe side is finished -- it does not need to be torn down first for the
+  // operator to report completion.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // A BUILT-and-drained partition likewise has nothing left to do once probe_finished: this is
+  // the exact state that used to make the operator report wait_for_probe forever.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
+
+  // Mixed: one already-DESTROYED slot alongside a BUILT-and-drained one -- still complete once
+  // probe_finished.
+  REQUIRE(select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+                                     slot(BUILD_HASH_TABLE_STATE::BUILT, false, false)},
+                                    /*probe_finished=*/true)
+            .action == build_probe_action::none);
 }
 
 TEST_CASE("select_build_probe_action - probes a built partition that has probe data",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, true)});
+  auto const d = select_build_probe_action({slot(BUILD_HASH_TABLE_STATE::BUILT, false, true)},
+                                           /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 0);
 }
@@ -488,10 +523,12 @@ TEST_CASE("select_build_probe_action - prefers starting a build over probing a b
 {
   // Partition 0 is BUILT with probe data; partition 1 is NOT_BUILT and ready. Building 1 first
   // gets its GPU busy sooner, so build wins.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 1);
 }
@@ -501,10 +538,12 @@ TEST_CASE("select_build_probe_action - interleaves: probes a built partition whi
 {
   // Partition 0 is still building (SCHEDULED); partition 1 is BUILT with probe data. With no
   // NOT_BUILT partition ready to build, we probe partition 1 on its GPU while 0 finishes.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 1);
 }
@@ -514,10 +553,12 @@ TEST_CASE("select_build_probe_action - a SCHEDULING partition is not re-schedule
 {
   // Partition 0 was just claimed for build (SCHEDULING) by a prior hint; it must not be picked
   // again. Partition 1 is BUILT with probe data, so that is the next action.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, true),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::SCHEDULING, true, true),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_probe);
   REQUIRE(d.partition == 1);
 }
@@ -525,10 +566,12 @@ TEST_CASE("select_build_probe_action - a SCHEDULING partition is not re-schedule
 TEST_CASE("select_build_probe_action - all partitions destroyed reports completion",
           "[hash_join][build_probe][unit]")
 {
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-    slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+      slot(BUILD_HASH_TABLE_STATE::DESTROYED, false, false),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::none);
 }
 
@@ -537,12 +580,14 @@ TEST_CASE("select_build_probe_action - first ready build wins across many partit
 {
   // Partition 0 built+drained, 1 built+drained, 2 NOT_BUILT+ready, 3 NOT_BUILT+ready. The first
   // schedulable build (partition 2) is chosen.
-  auto const d = select_build_probe_action({
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-    slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-    slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
-  });
+  auto const d = select_build_probe_action(
+    {
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::BUILT, false, false),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+      slot(BUILD_HASH_TABLE_STATE::NOT_BUILT, true, true),
+    },
+    /*probe_finished=*/false);
   REQUIRE(d.action == build_probe_action::schedule_build);
   REQUIRE(d.partition == 2);
 }

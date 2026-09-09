@@ -91,6 +91,24 @@ endforeach()
 find_package(cudf REQUIRED CONFIG)
 find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
+find_package(kvikio REQUIRED CONFIG)
+
+# kvikio::kvikio's interface pulls in BS::thread_pool, whose
+# INTERFACE_COMPILE_FEATURES include `cuda_std_17`. That requirement propagates
+# through sirius_extension into duckdb_static, whose project() scope enables
+# only C/CXX, and CMake then fails to generate with "No known features for CUDA
+# compiler". Sirius only uses kvikIO's host-side API, so drop the CUDA feature
+# from the imported target.
+if(TARGET BS::thread_pool)
+  get_target_property(_bs_thread_pool_features BS::thread_pool
+                      INTERFACE_COMPILE_FEATURES)
+  if(_bs_thread_pool_features)
+    list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+    set_target_properties(
+      BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                 "${_bs_thread_pool_features}")
+  endif()
+endif()
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -321,8 +339,8 @@ set(EXTENSION_SOURCES
     src/io/rest/rest_reactor.cpp
     src/io/rest/s3/list_parser.cpp
     src/io/rest/s3/sigv4.cpp
-    src/io/s3/sirius_httpfs.cpp
     src/io/rest/s3/sigv4_authorizer.cpp
+    src/io/s3/sirius_httpfs.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/log/duckdb_sink.cpp
@@ -339,6 +357,7 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/parquet_materialize.cpp
     src/op/scan/duckdb_insert_delta.cpp
     src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
@@ -431,6 +450,8 @@ set(EXTENSION_SOURCES
     src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
+    src/scan_manager/prefetching_scheduler.cpp
+    src/scan_manager/readahead_scan_manager.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
@@ -614,11 +635,18 @@ foreach(_target sirius_extension sirius_loadable_extension)
 endforeach()
 
 # Additional libraries only needed by the static extension
-target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
+target_link_libraries(
+  sirius_extension
+  PkgConfig::NUMA
+  PkgConfig::LIBURING
+  PkgConfig::CURL
+  OpenSSL::Crypto
+  absl::any_invocable
+  kvikio::kvikio)
 
-target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto)
+target_link_libraries(
+  sirius_loadable_extension PkgConfig::LIBURING PkgConfig::CURL OpenSSL::Crypto
+  absl::any_invocable kvikio::kvikio)
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
@@ -689,6 +717,7 @@ set(TEST_SOURCES
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
+    test/cpp/config/test_scan_manager_config.cpp
     test/cpp/config/test_topology_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
@@ -752,6 +781,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
     test/cpp/integration/test_pin_table_mvcc_delete.cpp
+    test/cpp/integration/test_reset_sirius_cache.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
     test/cpp/integration/test_pin_table_mvcc_insert.cpp
     test/cpp/integration/test_pin_table_mvcc_update.cpp
@@ -759,11 +789,18 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
+    test/cpp/io/cache/test_chunk_state.cpp
+    test/cpp/io/cache/test_dispose_eviction.cpp
+    test/cpp/io/cache/test_explicit_eviction.cpp
+    test/cpp/io/cache/test_stage_machines.cpp
+    test/cpp/io/kvikio/test_kvikio_remote.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
     test/cpp/io/s3/test_static_credentials.cpp
+    test/cpp/io/test_io_request.cpp
     test/cpp/io/test_parquet_helpers.cpp
+    test/cpp/io/test_templated_ioctx.cpp
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
@@ -772,10 +809,13 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_prefetching_scheduler.cpp
+    test/cpp/scan_manager/test_readahead_lifecycle.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
+    test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -995,6 +1035,273 @@ target_link_options(parquet_benchmark PRIVATE
 
 set_target_properties(
   parquet_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/prefetch_benchmark — plain read_parquet vs. prefetch-then-read
+# -----------------------------------------------------------------------------
+add_executable(prefetch_benchmark test/io/prefetch_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(prefetch_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                      ON)
+  target_include_directories(prefetch_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  prefetch_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  prefetch_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(prefetch_benchmark "")
+
+target_link_options(prefetch_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  prefetch_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/prefetch_hybrid_scan_benchmark — read_parquet vs. direct-to-device
+# hybrid scan
+# -----------------------------------------------------------------------------
+add_executable(prefetch_hybrid_scan_benchmark
+               test/io/prefetch_hybrid_scan_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(prefetch_hybrid_scan_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(prefetch_hybrid_scan_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  prefetch_hybrid_scan_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  prefetch_hybrid_scan_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(prefetch_hybrid_scan_benchmark "")
+
+target_link_options(prefetch_hybrid_scan_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  prefetch_hybrid_scan_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/columnar_parquet_poc — per-column IO/decode pipelining
+# -----------------------------------------------------------------------------
+add_executable(columnar_parquet_poc test/io/columnar_parquet_poc.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(columnar_parquet_poc PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                        ON)
+  target_include_directories(columnar_parquet_poc BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  columnar_parquet_poc
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  columnar_parquet_poc
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(columnar_parquet_poc "")
+
+target_link_options(columnar_parquet_poc PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  columnar_parquet_poc
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/retirer_benchmark — cuda_event_completion_poll vs. event + retire
+# threads
+# -----------------------------------------------------------------------------
+add_executable(retirer_benchmark test/io/retirer_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(retirer_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(retirer_benchmark BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  retirer_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  retirer_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(retirer_benchmark "")
+
+target_link_options(retirer_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  retirer_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/s3_throughput_test — raw S3 read throughput via REST reactor, no
+# parquet decoding
+# -----------------------------------------------------------------------------
+add_executable(s3_throughput_test test/io/s3_throughput_test.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(s3_throughput_test PROPERTIES NO_SYSTEM_FROM_IMPORTED
+                                                      ON)
+  target_include_directories(s3_throughput_test BEFORE PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  s3_throughput_test
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  s3_throughput_test
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(s3_throughput_test "")
+
+target_link_options(s3_throughput_test PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  s3_throughput_test
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/s3_autotune_throughput_bench — connection / GET sizing model vs.
+# measured S3 throughput
+# -----------------------------------------------------------------------------
+add_executable(s3_autotune_throughput_bench
+               test/io/s3_autotune_throughput_bench.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(s3_autotune_throughput_bench
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(s3_autotune_throughput_bench BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  s3_autotune_throughput_bench
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  s3_autotune_throughput_bench
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(s3_autotune_throughput_bench "")
+
+target_link_options(s3_autotune_throughput_bench PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  s3_autotune_throughput_bench
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# test/io/range_prefetch_benchmark — raw byte-range reads, no parquet decoding
+# -----------------------------------------------------------------------------
+add_executable(range_prefetch_benchmark test/io/range_prefetch_benchmark.cpp)
+
+if(VCPKG_BUILD)
+  set_target_properties(range_prefetch_benchmark
+                        PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+  target_include_directories(range_prefetch_benchmark BEFORE
+                             PRIVATE ${_VCPKG_INC})
+endif()
+
+target_include_directories(
+  range_prefetch_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+
+target_link_libraries(
+  range_prefetch_benchmark
+  sirius_extension
+  duckdb_static
+  cudf::cudf
+  rmm::rmm
+  spdlog::spdlog
+  cuCascade::cucascade
+  cuCascade::cucascade_cudf
+  PkgConfig::LIBURING
+  PkgConfig::NUMA)
+link_extension_libraries(range_prefetch_benchmark "")
+
+target_link_options(range_prefetch_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+
+set_target_properties(
+  range_prefetch_benchmark
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")

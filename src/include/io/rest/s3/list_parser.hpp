@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 /// Default cap on the number of entries a whole-listing call will accumulate.
 /// Exceeding it throws (never truncates) — a partial key set would resolve a
@@ -65,4 +65,4 @@ struct list_objects_v2_page {
  */
 list_objects_v2_page parse_list_objects_v2(std::string_view xml);
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

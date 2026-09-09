@@ -16,9 +16,9 @@
 
 #pragma once
 
-// Shared cache entry types used by both prefetching_cache and the IO context
-// virtual interface (device_read_async_io_using).  Extracted here to break the
-// circular include between io_context.hpp and prefetching_cache.hpp.
+// Shared cache entry types used by both prefetching_cache and prepared IO
+// slices. Extracted here to keep the shared request contracts independent of
+// the cache implementation.
 
 #include "cucascade/memory/memory_reservation.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
@@ -31,16 +31,13 @@
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
-#include <concepts>
 #include <cstddef>
-#include <iterator>
-#include <list>
+#include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <ranges>
 #include <span>
 #include <utility>
 #include <vector>
@@ -48,17 +45,40 @@
 namespace sirius::io::cache {
 
 /**
- * @brief How the prefetching layer should behave on top of a given backend.
+ * @brief Stage of a scan's consumer-visible lifecycle.
  *
- * - @c none: no prefetching.  Either the backend does not support vector host
- *   reads (so the prefetcher cannot batch range requests cheaply) or the
- *   backend explicitly opted out.
- * - @c immediate: prefill the cache ahead of consumer demand.
- * - @c opportunistic: read-ahead on demand — issue extra IO only when triggered by a
- *   consumer read.
- * - @c disposable: prefetching is temporary and can be discarded when no longer needed.
+ * - @c none: the backend opted out of prefetching.
+ * - @c initialized: the scan's ranges are known but no work is queued yet.
+ * - @c queued: the ranges are queued with the prefetching layer.
+ * - @c preparing: the IO for the ranges is being prepared.
+ * - @c reading: the consumer is reading the ranges.
+ * - @c disposed: the scan is cancelled or finished; its work can be dropped.
+ *
+ * Consumer-side only, and the order is load-bearing: callers ask questions like
+ * `stage >= reading` (is the executor pulling these bytes itself?) and
+ * `stage == disposed` (is this split finished?).  Read-ahead is not a stage
+ * here -- it is producer-side work that runs alongside this progression, and
+ * @c scan_info::prefetch_state tracks it separately.
  */
-enum class prefetching_stage { none, opportunistic, immediate, just_in_time, disposable };
+enum class scan_stage { none, initialized, queued, preparing, reading, disposed };
+
+// ---------------------------------------------------------------------------
+// Page-alignment helpers
+// ---------------------------------------------------------------------------
+//
+// @p a must be a power of two (in practice @c io::IO_BLOCK_SIZE, the O_DIRECT
+// page size).  Used to keep partial chunk fills O_DIRECT-compatible — never
+// hardcode 4096 at call sites.
+
+[[nodiscard]] constexpr std::size_t align_down(std::size_t x, std::size_t a) noexcept
+{
+  return x & ~(a - 1);
+}
+
+[[nodiscard]] constexpr std::size_t align_up(std::size_t x, std::size_t a) noexcept
+{
+  return (x + a - 1) & ~(a - 1);
+}
 
 // ---------------------------------------------------------------------------
 // buffer_pool — growable pool of pinned chunks
@@ -129,407 +149,841 @@ class buffer_pool {
 };
 
 // ---------------------------------------------------------------------------
-// entry_state — packed atomic state + pin_count
+// chunk_fill — the populated extent of a chunk
 // ---------------------------------------------------------------------------
 //
-// Packs a 4-bit state enum and a 28-bit reader pin count into a single
-// atomic uint32_t.  Every transition is a single CAS, which eliminates the
-// TOCTOU race between checking state and modifying pin_count.
+// A chunk's staging buffer need not be filled end to end.  A read that only
+// touches the head or tail of a chunk populates just that edge, so a query over
+// a small file no longer pays a full chunk of IO to cache a few kilobytes.
+//
+// The extent is edge-anchored and measured in @c io::IO_BLOCK_SIZE pages, so
+// every derived read stays O_DIRECT-compatible:
+//
+//   unset  -> nothing recorded yet (a fresh or freshly-reclaimed chunk)
+//   full   -> the whole chunk is populated
+//   prefix -> [chunk_off, chunk_off + pages * PAGE) is populated
+//   suffix -> [chunk_off + chunk_bytes - pages * PAGE, chunk_off + chunk_bytes)
+//
+// @c unset is deliberately a distinct value from @c full: a single sentinel for
+// both would make a freshly-created chunk read as "already populated", and a
+// merge into it would silently drop the caller's desired extent.
+
+struct chunk_fill {
+  std::uint16_t pages{0};
+  bool suffix{false};
+  bool full{false};
+
+  [[nodiscard]] static constexpr chunk_fill unset() noexcept { return {}; }
+  [[nodiscard]] static constexpr chunk_fill whole() noexcept { return {0, false, true}; }
+  [[nodiscard]] static constexpr chunk_fill prefix_of(std::uint16_t pages) noexcept
+  {
+    return {pages, false, false};
+  }
+  [[nodiscard]] static constexpr chunk_fill suffix_of(std::uint16_t pages) noexcept
+  {
+    return {pages, true, false};
+  }
+
+  [[nodiscard]] constexpr bool is_unset() const noexcept { return !full && pages == 0; }
+
+  [[nodiscard]] friend constexpr bool operator==(chunk_fill, chunk_fill) noexcept = default;
+};
+
+/// Fold @p want into @p cur.  @c full wins over everything; two extents anchored
+/// to opposite edges together span the chunk, so they also fold to @c full; two
+/// on the same edge keep the wider one.
+[[nodiscard]] constexpr chunk_fill merge(chunk_fill cur, chunk_fill want) noexcept
+{
+  if (cur.is_unset()) { return want; }
+  if (want.is_unset()) { return cur; }
+  if (cur.full || want.full) { return chunk_fill::whole(); }
+  if (cur.suffix != want.suffix) { return chunk_fill::whole(); }
+  return cur.pages >= want.pages ? cur : want;
+}
+
+/// True iff @p f guarantees the bytes [@p lo, @p hi) of the chunk at
+/// @p chunk_off have been written.  An @c unset extent covers nothing.
+[[nodiscard]] constexpr bool covers(
+  chunk_fill f, std::size_t chunk_off, std::size_t chunk_bytes, std::size_t lo, std::size_t hi)
+{
+  if (f.full) { return true; }
+  if (f.is_unset()) { return false; }
+  auto const bytes = std::min(static_cast<std::size_t>(f.pages) * io::IO_BLOCK_SIZE, chunk_bytes);
+  return f.suffix ? lo >= chunk_off + chunk_bytes - bytes : hi <= chunk_off + bytes;
+}
+
+/// The half-open file span that must be read to populate the chunk at
+/// @p chunk_off to exactly the extent @p f advertises.  Deriving the span FROM
+/// the extent (rather than from the request that motivated it) is what
+/// guarantees the bytes read are exactly the bytes @c covers will later claim.
+/// An @c unset extent conservatively yields the whole chunk.
+[[nodiscard]] constexpr std::pair<std::size_t, std::size_t> fill_span(
+  chunk_fill f, std::size_t chunk_off, std::size_t chunk_bytes) noexcept
+{
+  if (f.full || f.is_unset()) { return {chunk_off, chunk_off + chunk_bytes}; }
+  auto const bytes = std::min(static_cast<std::size_t>(f.pages) * io::IO_BLOCK_SIZE, chunk_bytes);
+  return f.suffix ? std::pair{chunk_off + chunk_bytes - bytes, chunk_off + chunk_bytes}
+                  : std::pair{chunk_off, chunk_off + bytes};
+}
+
+/// The extent a request over [@p req_lo, @p req_hi) (NOT yet clamped to the
+/// chunk) implies for the chunk at @p chunk_off.  Magnitudes are rounded out to
+/// whole pages, so an interior read conservatively fills to the nearer chunk
+/// edge — it over-reads the head or tail, never the whole chunk.
+///
+/// An extent is edge-anchored (see @ref chunk_fill), so a request touching
+/// neither edge cannot be recorded as-is and has to widen to one of them.  Both
+/// widenings are correct; this picks whichever fetches less, which for a request
+/// near the head is the head.  Anchoring unconditionally to the tail — the
+/// obvious reading of "starts inside the chunk, so it is a suffix" — costs the
+/// whole rest of the chunk for a request sitting one page in.
+[[nodiscard]] constexpr chunk_fill needed_fill(std::size_t chunk_off,
+                                               std::size_t chunk_bytes,
+                                               std::size_t req_lo,
+                                               std::size_t req_hi) noexcept
+{
+  constexpr std::size_t page = io::IO_BLOCK_SIZE;
+  auto const lo              = std::max(req_lo, chunk_off);
+  auto const hi              = std::min(req_hi, chunk_off + chunk_bytes);
+  if (lo >= hi) { return chunk_fill::unset(); }  // no overlap
+  if (lo <= chunk_off && hi >= chunk_off + chunk_bytes) { return chunk_fill::whole(); }
+
+  // Both shapes contain [lo, hi); the smaller one is the one worth reading.
+  auto const prefix_bytes = std::min(align_up(hi - chunk_off, page), chunk_bytes);
+  auto const suffix_bytes = std::min((chunk_off + chunk_bytes) - align_down(lo, page), chunk_bytes);
+  bool const prefer_prefix = prefix_bytes <= suffix_bytes;
+  auto const bytes         = prefer_prefix ? prefix_bytes : suffix_bytes;
+  if (bytes >= chunk_bytes) { return chunk_fill::whole(); }
+  auto const pages = static_cast<std::uint16_t>(bytes / page);
+  return prefer_prefix ? chunk_fill::prefix_of(pages) : chunk_fill::suffix_of(pages);
+}
+
+// ---------------------------------------------------------------------------
+// chunk_state — the whole per-chunk concurrency state, in one atomic word
+// ---------------------------------------------------------------------------
+//
+// State, reader pins, the populated extent, and the live-subscriber count all
+// live in a single atomic uint64_t:
+//
+//   bits [ 3: 0]  state        4b   empty|queued|allocated|loading|cached|in_use|evicting
+//   bits [15: 4]  pins        12b   concurrent readers (max 4095)
+//   bits [29:16]  fill_pages  14b   populated extent, in IO_BLOCK_SIZE pages
+//   bit  [30]     fill_side    1b   0 = prefix from chunk start, 1 = suffix to chunk end
+//   bit  [31]     fill_full    1b   whole chunk populated (overrides the two above)
+//   bits [47:32]  subscribers 16b   live prefetch requests naming this chunk
+//   bits [63:48]  spare
+//
+// Packing buys three things beyond size.  (1) Every transition is one CAS, so
+// there is no TOCTOU window between reading the state and mutating the pins or
+// the extent — the escape hatch a lock would need for the extent merge is just
+// the CAS retry.  (2) A loader receives the extent it must fill out of the same
+// CAS that claims the chunk, so it can never fill a different extent from the
+// one it publishes.  (3) The eviction sweep answers "is this chunk reclaimable"
+// with a single relaxed load instead of a locked read plus a second cache line.
 //
 // State machine — each row is the complete set of valid outbound transitions
 // for that state.  Any other transition is rejected by the corresponding
-// method's precondition CAS (return value == false).
+// method's precondition (return value == false).
 //
-//   empty      ──mark_queued()──►       queued
-//   queued     ──mark_allocated()──►    allocated
-//   allocated  ──mark_loading()──►      loading
-//   allocated  ──mark_evicting()──►     evicting
-//   loading    ──mark_cached()──►       cached
-//   loading    ──mark_loading_in_use()──►       in_use(pin = 1)
-//   loading    ──mark_load_failed()──►    allocated        (IO failure)
-//   cached     ──mark_evicting()──►     evicting
-//   cached     ──acquire_read()──►      in_use(pin = 1)
-//   in_use     ──acquire_read()──►      in_use(pin += 1)
-//   in_use     ──release_read()──►      in_use(pin -= 1) | cached (when pin → 0)
-//   evicting   ──mark_empty()──►        empty
+//   empty      ──mark_queued()──────────►  queued
+//   queued     ──mark_allocated()───────►  allocated
+//   allocated  ──take_loading()─────────►  loading
+//   allocated  ──mark_evicting()────────►  evicting
+//   loading    ──mark_cached()──────────►  cached
+//   loading    ──mark_load_failed()─────►  allocated     (IO failure)
+//   cached     ──mark_evicting()────────►  evicting
+//   cached     ──acquire_read()─────────►  in_use(pin = 1)
+//   in_use     ──acquire_read()─────────►  in_use(pin += 1)
+//   in_use     ──release_read()─────────►  in_use(pin -= 1) | cached (when pin → 0)
+//   evicting   ──mark_empty()───────────►  empty         (clears the extent)
 //
 // `empty` is the only state with no inbound transitions other than from
-// `evicting` — once an entry leaves `empty`, it can only return through the
+// `evicting` — once a chunk leaves `empty`, it can only return through the
 // `evicting` reclamation path.  `evicting` is a one-way transit state.
 //
-// `loading` is the only non-terminal state with a wait point: readers that
-// observe `loading` park on wait_while_pending() until the IO settles to one
-// of cached / in_use(1) / allocated.
+// The subscriber count is orthogonal to the state machine: it is incremented
+// when a request names the chunk and decremented when that request is retired,
+// and it survives every state transition including `mark_empty()`.
 
-class entry_state {
+class chunk_state {
  public:
-  enum value : uint8_t {
+  enum value : std::uint8_t {
     empty     = 0,
-    queued    = 1,  ///< registered for prefetch, not yet given chunks
-    allocated = 2,  ///< chunks assigned, IO not yet dispatched
+    queued    = 1,  ///< registered for prefetch, not yet given a buffer
+    allocated = 2,  ///< buffer assigned, IO not yet dispatched
     loading   = 3,
     cached    = 4,
     in_use    = 5,
     evicting  = 6,
   };
 
-  entry_state() noexcept = default;
+  static constexpr std::uint32_t MAX_PINS        = (1U << 12) - 1;
+  static constexpr std::uint32_t MAX_SUBSCRIBERS = (1U << 16) - 1;
 
-  [[nodiscard]] value get_state() const noexcept
-  {
-    return unpack_state(_packed.load(std::memory_order_acquire));
-  }
+  /// Widest extent the packed field can express, in pages.  The chunk size must
+  /// stay under this many pages; @ref buffer_pool checks it at construction.
+  [[nodiscard]] static constexpr std::uint32_t max_fill_pages() noexcept { return (1U << 14) - 1; }
 
-  [[nodiscard]] uint32_t get_pin_count() const noexcept
-  {
-    return unpack_pins(_packed.load(std::memory_order_acquire));
-  }
+  chunk_state() noexcept = default;
 
-  /// empty → queued.  Returns false on precondition mismatch.
-  [[nodiscard]] bool mark_queued() noexcept
-  {
-    auto expected = pack(empty, 0);
-    return _packed.compare_exchange_strong(expected, pack(queued, 0), std::memory_order_acq_rel);
-  }
+  chunk_state(chunk_state const&)            = delete;
+  chunk_state& operator=(chunk_state const&) = delete;
 
-  /// queued → allocated.  Returns false on precondition mismatch.  Called by
-  /// the allocator when it attaches chunks to a previously-queued entry.
-  [[nodiscard]] bool mark_allocated() noexcept
-  {
-    auto expected = pack(queued, 0);
-    return _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
-  }
+  /// An immutable read of the whole word.  One relaxed load answers every
+  /// question the eviction sweep asks, so the sweep never writes to the line.
+  class snapshot {
+   public:
+    explicit constexpr snapshot(std::uint64_t w) noexcept : _w(w) {}
 
-  /// loading → allocated (IO-failure revert).  Returns false on precondition
-  /// mismatch.  Used by io_dispatch_loop's failure paths to revert an entry
-  /// whose IO did not complete: the entry's chunks stay attached so a
-  /// subsequent allocated-steal read can retry the load with a fresh
-  /// request_context, instead of discarding the entry to `empty` and forcing
-  /// the next reader through a fresh queue/allocate roundtrip.  Wakes any
-  /// threads parked in @c wait_while_pending().
-  [[nodiscard]] bool mark_load_failed() noexcept
-  {
-    auto expected = pack(loading, 0);
-    bool ok =
-      _packed.compare_exchange_strong(expected, pack(allocated, 0), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
-  }
-
-  /// allocated → loading.  Returns false on precondition mismatch.
-  [[nodiscard]] bool mark_loading() noexcept
-  {
-    auto expected = pack(allocated, 0);
-    return _packed.compare_exchange_strong(expected, pack(loading, 0), std::memory_order_acq_rel);
-  }
-
-  /// loading → cached.  Returns false on precondition mismatch.  Wakes any
-  /// threads parked in @c wait_while_pending().
-  [[nodiscard]] bool mark_cached() noexcept
-  {
-    auto expected = pack(loading, 0);
-    bool ok = _packed.compare_exchange_strong(expected, pack(cached, 0), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
-  }
-
-  [[nodiscard]] bool mark_loading_in_use() noexcept
-  {
-    auto expected = pack(loading, 0);
-    bool ok = _packed.compare_exchange_strong(expected, pack(in_use, 1), std::memory_order_acq_rel);
-    if (ok) { _packed.notify_all(); }
-    return ok;
-  }
-
-  /// allocated → evicting, or cached → evicting.  Returns false on
-  /// precondition mismatch.  Both source states have pin_count == 0 by
-  /// invariant (allocated is set with pin==0 by mark_allocated(); cached is
-  /// only entered from in_use via release_read() when pin → 0), so the two
-  /// strong-CAS attempts below cover every legal transition exactly.
-  [[nodiscard]] bool mark_evicting() noexcept
-  {
-    auto expected_allocated = pack(allocated, 0);
-    if (_packed.compare_exchange_strong(
-          expected_allocated, pack(evicting, 0), std::memory_order_acq_rel)) {
-      return true;
-    }
-    auto expected_cached = pack(cached, 0);
-    return _packed.compare_exchange_strong(
-      expected_cached, pack(evicting, 0), std::memory_order_acq_rel);
-  }
-
-  /// evicting → empty.  Returns false on precondition mismatch.
-  [[nodiscard]] bool mark_empty() noexcept
-  {
-    auto expected = pack(evicting, 0);
-    return _packed.compare_exchange_strong(expected, pack(empty, 0), std::memory_order_acq_rel);
-  }
-
-  /// Block while state is @c loading.  Returns when the state transitions to
-  /// any other state (i.e. to cached, in_use(1), or allocated — the three
-  /// outbound transitions from `loading`).
-  void wait_while_pending() noexcept
-  {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (unpack_state(cur) == loading) {
-      _packed.wait(cur, std::memory_order_relaxed);
-      cur = _packed.load(std::memory_order_acquire);
-    }
-  }
-
-  /// Park while state is @c loading, then acquire a read pin via the normal
-  /// (cached | in_use) → in_use(pin++) path.  Returns true if a read pin was
-  /// acquired (load completed successfully and the entry is now readable),
-  /// false if the load reverted to @c allocated (IO failure) or the entry was
-  /// otherwise made non-readable (evicted / drained) while we were parked.
-  /// Safe to call from any state: if the state is already past @c loading on
-  /// entry, the wait loop is skipped and we go straight to @c acquire_read().
-  [[nodiscard]] bool acquire_read_after_loading() noexcept
-  {
-    wait_while_pending();
-    return acquire_read();
-  }
-
-  /// (cached | in_use) → in_use with pin_count += 1.
-  /// Returns false if the entry is not in a readable state.
-  [[nodiscard]] bool acquire_read() noexcept
-  {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    while (true) {
-      auto st = unpack_state(cur);
-      if (st != cached && st != in_use) return false;
-      auto pins = unpack_pins(cur);
-      auto next = pack(in_use, pins + 1);
-      if (_packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
-        return true;
-    }
-  }
-
-  /// Decrement pin_count.  If it reaches 0, transition in_use → cached.
-  /// Returns true if this was the last reader.
-  bool release_read() noexcept
-  {
-    uint32_t cur = _packed.load(std::memory_order_acquire);
-    assert(unpack_state(cur) == in_use && unpack_pins(cur) > 0);
-    while (true) {
-      auto pins      = unpack_pins(cur);
-      auto new_pins  = pins - 1;
-      auto new_state = new_pins == 0 ? cached : in_use;
-      auto next      = pack(new_state, new_pins);
-      if (_packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_acquire))
-        return new_pins == 0;
-    }
-  }
-
- private:
-  static constexpr uint32_t STATE_BITS = 4;
-  static constexpr uint32_t STATE_MASK = (1U << STATE_BITS) - 1;
-  static constexpr uint32_t PIN_SHIFT  = STATE_BITS;
-
-  static constexpr uint32_t pack(value s, uint32_t pins) noexcept
-  {
-    return static_cast<uint32_t>(s) | (pins << PIN_SHIFT);
-  }
-  static constexpr value unpack_state(uint32_t v) noexcept
-  {
-    return static_cast<value>(v & STATE_MASK);
-  }
-  static constexpr uint32_t unpack_pins(uint32_t v) noexcept { return v >> PIN_SHIFT; }
-
-  std::atomic<uint32_t> _packed{pack(empty, 0)};
-};
-
-struct alignas(64) chunk_lifecycle {
-  std::atomic<uint64_t> packed{0};
-
-  static constexpr uint64_t INSERT_MASK = 0xFFFFull;
-  static constexpr uint64_t READ_SHIFT  = 16;
-  static constexpr uint64_t READ_MASK   = 0xFFFFull << READ_SHIFT;
-  static constexpr uint64_t TICK_SHIFT  = 32;
-  static constexpr uint64_t TICK_MASK   = 0xFFFFFFFFull << TICK_SHIFT;
-  static constexpr uint64_t FRESH_SCORE = 4;
-
-  static constexpr uint64_t pack(uint32_t tick, uint16_t reads, uint16_t inserts) noexcept
-  {
-    return (uint64_t(tick) << TICK_SHIFT) | (uint64_t(reads) << READ_SHIFT) | uint64_t(inserts);
-  }
-
-  void on_request(uint32_t query_tick) noexcept
-  {
-    uint64_t cur = packed.load(std::memory_order_relaxed);
-    for (;;) {
-      auto cur_tick    = uint32_t(cur >> TICK_SHIFT);
-      auto cur_reads   = uint16_t((cur >> READ_SHIFT) & 0xFFFFu);
-      auto cur_inserts = uint16_t(cur & INSERT_MASK);
-
-      uint64_t next;
-      if (query_tick > cur_tick) {
-        // New query — reset counters to reflect just this insert.
-        next = pack(query_tick, 0, 1);
-      } else {
-        // Same tick (or stale tick — treat as same). Increment inserts,
-        // saturate at uint16 max to avoid wrap.
-        uint16_t new_inserts = cur_inserts == 0xFFFFu ? 0xFFFFu : cur_inserts + 1;
-        next                 = pack(cur_tick, cur_reads, new_inserts);
-      }
-
-      if (packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_relaxed))
-        return;
-    }
-  }
-
-  void on_consume() noexcept
-  {
-    uint64_t cur = packed.load(std::memory_order_relaxed);
-    for (;;) {
-      auto cur_reads   = uint16_t((cur >> READ_SHIFT) & 0xFFFFu);
-      auto cur_inserts = uint16_t(cur & INSERT_MASK);
-
-      // Clamp: never read more than we promised.
-      if (cur_reads >= cur_inserts) return;
-
-      uint64_t next = (cur & ~READ_MASK) | (uint64_t(cur_reads + 1) << READ_SHIFT);
-
-      if (packed.compare_exchange_weak(
-            cur, next, std::memory_order_acq_rel, std::memory_order_relaxed))
-        return;
-    }
-  }
-
-  struct snapshot {
-    uint32_t tick;
-    uint16_t reads;
-    uint16_t inserts;
-
-    [[nodiscard]] uint16_t eviction_tier(uint32_t query_tick) const noexcept
+    [[nodiscard]] constexpr value state() const noexcept
     {
-      return query_tick > tick
-               ? 0
-               : (inserts > reads ? std::min<uint16_t>(inserts - reads, FRESH_SCORE) : 0);
+      return static_cast<value>(_w & STATE_MASK);
     }
+    [[nodiscard]] constexpr std::uint32_t pins() const noexcept
+    {
+      return static_cast<std::uint32_t>((_w & PIN_MASK) >> PIN_SHIFT);
+    }
+    [[nodiscard]] constexpr std::uint32_t subscribers() const noexcept
+    {
+      return static_cast<std::uint32_t>((_w & SUB_MASK) >> SUB_SHIFT);
+    }
+    [[nodiscard]] constexpr chunk_fill fill() const noexcept { return decode(_w); }
+
+    /// The chunk owns a staging buffer and no reader is holding it — i.e. it is
+    /// a candidate for @ref mark_evicting.  Says nothing about subscribers; the
+    /// evictor gates on those separately so its last-resort pass can ignore them.
+    [[nodiscard]] constexpr bool is_reclaimable() const noexcept
+    {
+      auto const s = state();
+      return (s == allocated || s == cached) && pins() == 0;
+    }
+
+   private:
+    std::uint64_t _w;
   };
 
   [[nodiscard]] snapshot load() const noexcept
   {
-    uint64_t v = packed.load(std::memory_order_acquire);
-    return {
-      uint32_t(v >> TICK_SHIFT),
-      uint16_t((v >> READ_SHIFT) & 0xFFFFu),
-      uint16_t(v & INSERT_MASK),
-    };
+    return snapshot(_w.load(std::memory_order_acquire));
   }
+
+  [[nodiscard]] value get_state() const noexcept { return load().state(); }
+  [[nodiscard]] std::uint32_t get_pin_count() const noexcept { return load().pins(); }
+  [[nodiscard]] std::uint32_t get_subscribers() const noexcept { return load().subscribers(); }
+  [[nodiscard]] chunk_fill get_fill() const noexcept { return load().fill(); }
+
+  /// empty → queued.  Returns false on precondition mismatch.
+  [[nodiscard]] bool mark_queued() noexcept { return transition(empty, queued); }
+
+  /// queued → allocated.  Called by the allocator once it attaches a buffer.
+  [[nodiscard]] bool mark_allocated() noexcept { return transition(queued, allocated); }
+
+  /// loading → cached.  Publishes the loader's writes to subsequent readers:
+  /// this is the release half of the pair @ref acquire_read completes.
+  [[nodiscard]] bool mark_cached() noexcept { return transition(loading, cached); }
+
+  /// loading → allocated (IO-failure revert).  The buffer stays attached so a
+  /// later reader can retry the load without a fresh queue/allocate roundtrip.
+  /// The recorded extent is left alone: `allocated` is not readable, and the
+  /// next loader re-derives its fill span from whatever the extent then holds.
+  [[nodiscard]] bool mark_load_failed() noexcept { return transition(loading, allocated); }
+
+  /// allocated → loading, handing back the extent the loader must populate.
+  /// Reading the extent out of the claiming CAS (rather than with a second,
+  /// unsynchronized load) is what makes "bytes read" == "bytes advertised".
+  [[nodiscard]] bool take_loading(chunk_fill& out) noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(allocated)) {
+        return false;
+      }
+      std::uint64_t const next = (cur & ~STATE_MASK) | static_cast<std::uint64_t>(loading);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        out = decode(cur);
+        return true;
+      }
+    }
+  }
+
+  /// allocated → loading, first widening the recorded extent by @p want.
+  /// @p out is the MERGED extent — a demand read that claims a chunk somebody
+  /// else queued for a wider fill must honour the wider promise, or a reader
+  /// waiting on it would later be told bytes are present that nobody wrote.
+  [[nodiscard]] bool take_loading_merging(chunk_fill want, chunk_fill& out) noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(allocated)) {
+        return false;
+      }
+      chunk_fill const merged = merge(decode(cur), want);
+      std::uint64_t const next =
+        (cur & ~(STATE_MASK | FILL_MASK)) | static_cast<std::uint64_t>(loading) | encode(merged);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        out = merged;
+        return true;
+      }
+    }
+  }
+
+  /// Widen the recorded extent by @p want, but only while the chunk is still
+  /// pre-load.  A `loading` chunk is owned by its loader; a `cached` / `in_use`
+  /// one is already populated to its current extent, and widening it would
+  /// advertise bytes nobody wrote.  A request needing more than a cached chunk
+  /// holds correctly MISSES via @ref try_pin_covering and reads for itself.
+  ///
+  /// Returns true if the recorded extent now covers @p want.
+  bool merge_fill(chunk_fill want) noexcept
+  {
+    if (want.is_unset()) { return false; }
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      switch (static_cast<value>(cur & STATE_MASK)) {
+        case empty:
+        case queued:
+        case allocated: break;
+        default: return false;  // loading: owned by its loader; cached/in_use: already populated
+      }
+      std::uint64_t const next = (cur & ~FILL_MASK) | encode(merge(decode(cur), want));
+      if (next == cur) { return true; }  // already covered — no atomic RMW at all
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+  }
+
+  /// (cached | in_use) → in_use with pins += 1.
+  [[nodiscard]] bool acquire_read() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if (!readable(cur)) { return false; }
+      if (!pin_once(cur)) { return true; }
+    }
+  }
+
+  /// (cached | in_use) → in_use with pins += 1, but only if the populated
+  /// extent already covers [@p lo, @p hi).  A coverage miss costs one relaxed
+  /// load and no atomic RMW — with partial fills in play that is the common
+  /// case, and the pin/unpin pair it replaces was two.
+  [[nodiscard]] bool try_pin_covering(std::size_t chunk_off,
+                                      std::size_t chunk_bytes,
+                                      std::size_t lo,
+                                      std::size_t hi) noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if (!readable(cur)) { return false; }
+      if (!covers(decode(cur), chunk_off, chunk_bytes, lo, hi)) { return false; }
+      if (!pin_once(cur)) { return true; }
+    }
+  }
+
+  /// Decrement the pin count, returning to `cached` at zero.
+  /// Returns true if this was the last reader.
+  bool release_read() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      auto const pins = static_cast<std::uint64_t>((cur & PIN_MASK) >> PIN_SHIFT);
+      assert(static_cast<value>(cur & STATE_MASK) == in_use && pins > 0);
+      std::uint64_t const left = pins - 1;
+      std::uint64_t const next = (cur & ~(STATE_MASK | PIN_MASK)) |
+                                 static_cast<std::uint64_t>(left == 0 ? cached : in_use) |
+                                 (left << PIN_SHIFT);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return left == 0;
+      }
+    }
+  }
+
+  /// (allocated | cached) with no reader → evicting.  When @p only_unsubscribed
+  /// the chunk must also have no live subscriber; the evictor clears that flag
+  /// only for its last-resort pass, when nothing else can be freed.
+  [[nodiscard]] bool mark_evicting(bool only_unsubscribed = true) noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      auto const st = static_cast<value>(cur & STATE_MASK);
+      if (st != allocated && st != cached) { return false; }
+      if ((cur & PIN_MASK) != 0) { return false; }
+      if (only_unsubscribed && (cur & SUB_MASK) != 0) { return false; }
+      std::uint64_t const next = (cur & ~STATE_MASK) | static_cast<std::uint64_t>(evicting);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+  }
+
+  /// evicting → empty, clearing the populated extent in the same CAS so a
+  /// reclaimed chunk can never advertise the previous tenant's bytes.
+  /// Subscribers are preserved: a request may have named the chunk again while
+  /// it was in transit, and it still has to be able to drop its reference.
+  [[nodiscard]] bool mark_empty() noexcept { return transition(evicting, empty, FILL_MASK); }
+
+  /// Count one more live request naming this chunk.  Saturates rather than
+  /// wrapping — an overflowed count would make the chunk permanently evictable.
+  void add_subscriber() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_relaxed);
+    for (;;) {
+      auto const n = (cur & SUB_MASK) >> SUB_SHIFT;
+      if (n >= MAX_SUBSCRIBERS) { return; }
+      std::uint64_t const next = (cur & ~SUB_MASK) | ((n + 1) << SUB_SHIFT);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
+  /// Retire one request's reference.  Clamps at zero rather than borrowing into
+  /// the neighbouring fields, so a double-drop degrades to a lost hint instead
+  /// of corrupting the state machine.
+  void drop_subscriber() noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_relaxed);
+    for (;;) {
+      auto const n = (cur & SUB_MASK) >> SUB_SHIFT;
+      if (n == 0) { return; }
+      std::uint64_t const next = (cur & ~SUB_MASK) | ((n - 1) << SUB_SHIFT);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
+ private:
+  static constexpr std::uint64_t STATE_MASK = 0xFULL;
+  static constexpr int PIN_SHIFT            = 4;
+  static constexpr std::uint64_t PIN_MASK   = 0xFFFULL << PIN_SHIFT;
+  static constexpr int PAGE_SHIFT           = 16;
+  static constexpr std::uint64_t PAGE_MASK  = 0x3FFFULL << PAGE_SHIFT;
+  static constexpr std::uint64_t SIDE_BIT   = 1ULL << 30;
+  static constexpr std::uint64_t FULL_BIT   = 1ULL << 31;
+  static constexpr std::uint64_t FILL_MASK  = PAGE_MASK | SIDE_BIT | FULL_BIT;
+  static constexpr int SUB_SHIFT            = 32;
+  static constexpr std::uint64_t SUB_MASK   = 0xFFFFULL << SUB_SHIFT;
+
+  static constexpr std::uint64_t encode(chunk_fill f) noexcept
+  {
+    return (static_cast<std::uint64_t>(f.pages) << PAGE_SHIFT) | (f.suffix ? SIDE_BIT : 0) |
+           (f.full ? FULL_BIT : 0);
+  }
+
+  static constexpr chunk_fill decode(std::uint64_t w) noexcept
+  {
+    return chunk_fill{static_cast<std::uint16_t>((w & PAGE_MASK) >> PAGE_SHIFT),
+                      (w & SIDE_BIT) != 0,
+                      (w & FULL_BIT) != 0};
+  }
+
+  static constexpr bool readable(std::uint64_t w) noexcept
+  {
+    auto const st = static_cast<value>(w & STATE_MASK);
+    return st == cached || st == in_use;
+  }
+
+  /// One attempt at (cached | in_use) → in_use, pins += 1.  Returns false when
+  /// the CAS succeeded (or the pin count is saturated, which cannot be retried);
+  /// true means @p cur was refreshed and the caller must re-check its guards.
+  bool pin_once(std::uint64_t& cur) noexcept
+  {
+    auto const pins = (cur & PIN_MASK) >> PIN_SHIFT;
+    if (pins >= MAX_PINS) { return false; }
+    std::uint64_t const next = (cur & ~(STATE_MASK | PIN_MASK)) |
+                               static_cast<std::uint64_t>(in_use) | ((pins + 1) << PIN_SHIFT);
+    return !_w.compare_exchange_weak(
+      cur, next, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+
+  /// Exact-precondition transition: requires state == @p from AND no reader
+  /// pins, preserves the extent and the subscriber count, and additionally
+  /// clears the bits in @p clear.
+  bool transition(value from, value to, std::uint64_t clear = 0) noexcept
+  {
+    std::uint64_t cur = _w.load(std::memory_order_acquire);
+    for (;;) {
+      if ((cur & (STATE_MASK | PIN_MASK)) != static_cast<std::uint64_t>(from)) { return false; }
+      std::uint64_t const next = (cur & ~(STATE_MASK | clear)) | static_cast<std::uint64_t>(to);
+      if (_w.compare_exchange_weak(
+            cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+  }
+
+  std::atomic<std::uint64_t> _w{0};  // == {empty, 0 pins, unset extent, 0 subscribers}
 };
 
+static_assert(sizeof(chunk_state) == 8, "chunk_state must stay a single 64-bit word");
+
 // ---------------------------------------------------------------------------
-// cache_entry — per-range metadata
+// producer_stage — atomic state of the producer side of a scan
 // ---------------------------------------------------------------------------
 //
-// State transitions are managed by the entry_state class above.
-// See entry_state's state machine diagram for the full picture.
+// Single atomic uint32_t holding the current state.  Forward transitions are
+// *monotone-max*: `mark_x()` succeeds iff the current state is strictly earlier
+// than x, and then CASes straight to x — intermediate stages may be skipped.
+// It returns false when the state already is at or past x, so the state can
+// never move backwards and a skipped stage cannot wedge the machine.
+//
+//   < queued    ──mark_queued()──►      queued
+//   < preparing ──mark_preparing()──►   preparing
+//   < prepared  ──mark_prepared()──►    prepared
+//   < loading   ──mark_loading()──►     loading
+//   < ready     ──mark_ready()──►       ready
+//   any         ──mark_abandoned()──►   abandoned       (request dropped)
+//
+// The one exception is the backward IO-failure revert, which stays an exact
+// precondition CAS:
+//
+//   loading     ──mark_load_failed()──► prepared        (IO failure revert)
+//
+// `preparing` and `loading` are the two wait points: waiters park in
+// wait_for_prepared() / wait_till_not_loading() until the state moves on, and
+// each reports whether its target was actually reached.  `abandoned` is terminal and
+// exists so that every path which drops a request can leave the producer in a
+// non-transient, notified state instead of stranding waiters.
 
-struct alignas(64) cached_chunk {
-  explicit cached_chunk(size_t off) : offset(off) {}
+class producer_stage {
+ public:
+  enum value : uint32_t {
+    initialized = 0,
+    queued      = 1,
+    preparing   = 2,
+    prepared    = 3,
+    loading     = 4,
+    ready       = 5,
+    abandoned   = 6,  ///< terminal: the request was dropped before completing
+  };
 
-  std::size_t offset;
-  uint8_t* data;
-  int numa_node{-1};
-  entry_state state;
-  chunk_lifecycle lifecycle;
+  producer_stage() noexcept = default;
+
+  /// Current state.
+  [[nodiscard]] value get() const noexcept
+  {
+    return static_cast<value>(_packed.load(std::memory_order_acquire));
+  }
+
+  /// → queued.  Returns false if the state is already at or past @c queued.
+  [[nodiscard]] bool mark_queued() noexcept { return advance(queued); }
+
+  /// → preparing.  Returns false if the state is already at or past @c preparing.
+  [[nodiscard]] bool mark_preparing() noexcept { return advance(preparing); }
+
+  /// → prepared.  Wakes threads parked in @c wait_for_prepared().  Returns
+  /// false if the state is already at or past @c prepared.
+  [[nodiscard]] bool mark_prepared() noexcept { return advance_and_notify(prepared); }
+
+  /// → loading.  Returns false if the state is already at or past @c loading.
+  [[nodiscard]] bool mark_loading() noexcept { return advance(loading); }
+
+  /// → ready.  Wakes threads parked in @c wait_till_not_loading().  Returns
+  /// false if the state is already at or past @c ready.
+  [[nodiscard]] bool mark_ready() noexcept { return advance_and_notify(ready); }
+
+  /// loading → prepared (IO-failure revert).  The only backward transition, so
+  /// it keeps an exact precondition CAS and returns false from any other state.
+  /// Wakes threads parked in @c wait_till_not_loading().
+  [[nodiscard]] bool mark_load_failed() noexcept
+  {
+    auto expected = static_cast<uint32_t>(loading);
+    bool ok       = _packed.compare_exchange_strong(
+      expected, static_cast<uint32_t>(prepared), std::memory_order_acq_rel);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  /// any → abandoned (the request was dropped).  Always succeeds and always
+  /// wakes threads parked in @c wait_for_prepared() / @c wait_till_not_loading().
+  void mark_abandoned() noexcept
+  {
+    _packed.exchange(static_cast<uint32_t>(abandoned), std::memory_order_acq_rel);
+    _packed.notify_all();
+  }
+
+  /// Block while the state is @c preparing.  Returns true iff the request
+  /// reached @c prepared (or beyond), false if it was abandoned.
+  [[nodiscard]] bool wait_for_prepared() noexcept
+  {
+    auto const st = wait_while(preparing);
+    return st >= prepared && st != abandoned;
+  }
+
+  /// Block until state >= @c prepared, regardless of which pre-prepared state
+  /// (initialized, queued, preparing) it starts in.  Each intermediate state
+  /// either returns immediately from @c _packed.wait (value already changed)
+  /// or parks until @c mark_prepared / @c mark_abandoned notifies.
+  [[nodiscard]] bool wait_until_prepared() noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(prepared)) {
+      _packed.wait(cur, std::memory_order_relaxed);
+      cur = _packed.load(std::memory_order_acquire);
+    }
+    return static_cast<value>(cur) != abandoned;
+  }
+
+  /// Block until the state stops being @c loading.
+  ///
+  /// The wait is over the loading window, not over readiness: a load is not a
+  /// promise of success.  It can settle at @c ready, revert to @c prepared when
+  /// the IO fails, or be cut short by @c abandoned -- so the caller is told
+  /// which of those happened rather than just "done".
+  ///
+  /// @return true iff the load this call waited out reached @c ready.
+  ///
+  /// Only a load actually in flight is worth blocking on, so any other state
+  /// returns false immediately rather than parking.  That includes @c ready:
+  /// this reports on a load it witnessed finish, and a request already past
+  /// @c loading has nothing left for the caller to wait out.
+  [[nodiscard]] bool wait_till_not_loading() noexcept
+  {
+    if (get() != loading) { return false; }
+    return wait_while(loading) == ready;
+  }
+
+ private:
+  bool advance(value to) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(to)) {
+      if (_packed.compare_exchange_weak(
+            cur, static_cast<uint32_t>(to), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool advance_and_notify(value to) noexcept
+  {
+    bool ok = advance(to);
+    if (ok) { _packed.notify_all(); }
+    return ok;
+  }
+
+  value wait_while(value st) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur == static_cast<uint32_t>(st)) {
+      _packed.wait(cur, std::memory_order_relaxed);
+      cur = _packed.load(std::memory_order_acquire);
+    }
+    return static_cast<value>(cur);
+  }
+
+  std::atomic<uint32_t> _packed{static_cast<uint32_t>(initialized)};
 };
 
-// Coverage requirement for find_entry.
+// ---------------------------------------------------------------------------
+// consumer_stage — atomic state of the consumer side of a scan
+// ---------------------------------------------------------------------------
+//
+// Mirrors the consumer-visible values of @c scan_stage.  Forward transitions
+// are *monotone-max*, exactly as in @c producer_stage: `mark_x()` succeeds iff
+// the current state is strictly earlier than x and then CASes straight to x, so
+// stages may be skipped but the state never moves backwards.  `disposed` is the
+// last value, hence reachable from every state — cancellation can happen at any
+// time.
+//
+//   < queued    ──mark_queued()──►     queued
+//   < preparing ──mark_preparing()──►  preparing
+//   < reading   ──mark_reading()──►    reading
+//   any         ──mark_disposed()──►   disposed
+
+class consumer_stage {
+ public:
+  enum value : uint32_t {
+    initialized = 0,
+    queued      = 1,
+    preparing   = 2,
+    reading     = 3,
+    disposed    = 4,
+  };
+
+  consumer_stage() noexcept = default;
+
+  /// Current state.
+  [[nodiscard]] value get() const noexcept
+  {
+    return static_cast<value>(_packed.load(std::memory_order_acquire));
+  }
+
+  /// → queued.  Returns false if the state is already at or past @c queued.
+  [[nodiscard]] bool mark_queued() noexcept { return advance(queued); }
+
+  /// → preparing.  Returns false if the state is already at or past @c preparing.
+  [[nodiscard]] bool mark_preparing() noexcept { return advance(preparing); }
+
+  /// → reading.  Returns false if the state is already at or past @c reading.
+  [[nodiscard]] bool mark_reading() noexcept { return advance(reading); }
+
+  /// any → disposed (cancellation).  Always succeeds.
+  void mark_disposed() noexcept
+  {
+    _packed.exchange(static_cast<uint32_t>(disposed), std::memory_order_acq_rel);
+  }
+
+  /// Advance to @p to.  Routes @c disposed to @ref mark_disposed (which always
+  /// succeeds); otherwise monotone-max, returning false if already at or past.
+  [[nodiscard]] bool mark(value to) noexcept
+  {
+    if (to == disposed) {
+      mark_disposed();
+      return true;
+    }
+    return advance(to);
+  }
+
+ private:
+  bool advance(value to) noexcept
+  {
+    uint32_t cur = _packed.load(std::memory_order_acquire);
+    while (cur < static_cast<uint32_t>(to)) {
+      if (_packed.compare_exchange_weak(
+            cur, static_cast<uint32_t>(to), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::atomic<uint32_t> _packed{static_cast<uint32_t>(initialized)};
+};
+
+/// Map a @ref scan_stage onto its @ref consumer_stage counterpart.
+/// @c none has no counterpart and yields nullopt.
+[[nodiscard]] inline std::optional<consumer_stage::value> to_consumer_stage(scan_stage s) noexcept
+{
+  switch (s) {
+    case scan_stage::none: return std::nullopt;
+    case scan_stage::initialized: return consumer_stage::initialized;
+    case scan_stage::queued: return consumer_stage::queued;
+    case scan_stage::preparing: return consumer_stage::preparing;
+    case scan_stage::reading: return consumer_stage::reading;
+    case scan_stage::disposed: return consumer_stage::disposed;
+  }
+  return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// cached_chunk — one chunk-aligned slot of a file
+// ---------------------------------------------------------------------------
+//
+// Deliberately small and deliberately NOT cache-line aligned.  Chunks adjacent
+// in a file are almost always walked by the same thread (the request that
+// covers that range), so packing them two-per-half-line quarters the lines a
+// range sweep touches; padding each chunk out to 64 bytes would defend against
+// a contention pattern this workload does not produce.  All cross-thread state
+// is in the single word, so there is nothing else to isolate.
+
+struct cached_chunk {
+  cached_chunk() noexcept = default;
+  explicit cached_chunk(std::size_t off) noexcept : offset(off) {}
+
+  chunk_state state;
+  std::size_t offset{0};
+  std::uint8_t* data{nullptr};
+  std::int32_t numa_node{-1};
+};
+
+static_assert(sizeof(cached_chunk) == 32, "cached_chunk should stay 4 per cache line");
+
+// ---------------------------------------------------------------------------
+// chunk_arena — append-only, pointer-stable storage for cached_chunk
+// ---------------------------------------------------------------------------
+//
+// Raw @c cached_chunk* escape into prefetch requests and outlive the call that
+// produced them, so chunk addresses must never move.  Chunks are never removed:
+// eviction resets one in place (buffer returned, state back to `empty`), which
+// is why a plain bump allocator over stable slabs is enough — no free list.
+
+class chunk_arena {
+ public:
+  static constexpr std::size_t SLAB_CHUNKS = 1024;  // 32 KiB per slab
+
+  [[nodiscard]] cached_chunk* emplace(std::size_t offset)
+  {
+    if (_used == SLAB_CHUNKS) {
+      _slabs.push_back(std::make_unique<slab>());
+      _used = 0;
+    }
+    auto* c   = &(*_slabs.back())[_used++];
+    c->offset = offset;
+    return c;
+  }
+
+ private:
+  using slab = std::array<cached_chunk, SLAB_CHUNKS>;
+
+  std::vector<std::unique_ptr<slab>> _slabs;
+  std::size_t _used{SLAB_CHUNKS};  // forces a slab on first use
+};
+
+/// Coverage requirement for @ref find_entry.
 enum class coverage_policy {
   full,     // return the chunks only when they fully cover [offset, offset + size); else none
   partial,  // return every chunk overlapping [offset, offset + size), even if coverage is partial
 };
 
-// A pointer-like handle to a cached_chunk: a raw pointer or a smart pointer
-// (std::unique_ptr / std::shared_ptr), with or without const.  std::to_address
-// yields the underlying cached_chunk* (const-qualified iff the handle is to a
-// const cached_chunk).
-template <class P>
-concept cached_chunk_pointer = requires(const P& p) {
-  { std::to_address(p) } -> std::convertible_to<const cached_chunk*>;
-};
-
-// Find the cached chunks of @p chunks (sorted by offset, non-overlapping,
-// fixed-size) that serve the request [@p offset, @p offset + @p size).
-//
-// With coverage_policy::full the request must be wholly covered or an empty
-// vector is returned; with coverage_policy::partial every overlapping chunk is
-// returned regardless of gaps.  Pure lookup: it does not mutate the chunks
-// (callers apply lifecycle side effects on the result).  Accepts any contiguous
-// range (vector, span, array, …) of cached_chunk pointer handles (raw / shared /
-// unique, const or not); the returned pointers preserve the handle's constness.
-//
-// @p chunk_size is the fixed chunk size the chunks were laid out with — pass
-// the backing buffer_pool's chunk_bytes() so the alignment arithmetic matches.
-template <std::ranges::contiguous_range Chunks>
-  requires cached_chunk_pointer<std::ranges::range_value_t<Chunks>>
-[[nodiscard]] std::vector<
-  decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()))>
-find_entry(const Chunks& chunks,
-           std::size_t offset,
-           std::size_t size,
-           coverage_policy policy,
-           std::size_t chunk_size)
+/// Select the chunks of @p chunks (sorted by offset, non-overlapping, all
+/// @p chunk_size bytes apart) that serve [@p offset, @p offset + @p size).
+///
+/// With @c coverage_policy::full the request must map onto a contiguous run of
+/// present chunks or an empty vector is returned; with @c partial every
+/// overlapping chunk is returned regardless of gaps.  This is POSITIONAL
+/// coverage only — that the requested bytes are actually populated is a
+/// separate question, answered by @c chunk_state::try_pin_covering.
+///
+/// Pure lookup: it does not mutate the chunks.
+[[nodiscard]] inline std::vector<cached_chunk*> find_entry(std::span<cached_chunk* const> chunks,
+                                                           std::size_t offset,
+                                                           std::size_t size,
+                                                           coverage_policy policy,
+                                                           std::size_t chunk_size)
 {
-  using chunk_ptr_t =
-    decltype(std::to_address(std::declval<const std::ranges::range_value_t<Chunks>&>()));
-  if (size == 0) return {};
+  if (size == 0) { return {}; }
 
-  auto const first        = std::ranges::begin(chunks);
-  auto const last         = std::ranges::end(chunks);
-  const std::size_t count = std::ranges::size(chunks);
-
-  // Align the request to chunk boundaries.
-  const std::size_t first_chunk_off = (offset / chunk_size) * chunk_size;
-  const std::size_t end_off         = offset + size;
-  const std::size_t last_chunk_off  = ((end_off - 1) / chunk_size) * chunk_size;
-  const std::size_t expected_count  = (last_chunk_off - first_chunk_off) / chunk_size + 1;
+  auto const first_chunk_off = (offset / chunk_size) * chunk_size;
+  auto const last_chunk_off  = ((offset + size - 1) / chunk_size) * chunk_size;
+  auto const expected_count  = (last_chunk_off - first_chunk_off) / chunk_size + 1;
 
   // Find the first chunk at/after the aligned start (chunks are sorted).
-  auto first_it = std::lower_bound(first, last, first_chunk_off, [](const auto& c, std::size_t v) {
-    return std::to_address(c)->offset < v;
-  });
+  auto const first_it = std::lower_bound(
+    chunks.begin(), chunks.end(), first_chunk_off, [](cached_chunk* c, std::size_t v) {
+      return c->offset < v;
+    });
+
+  std::vector<cached_chunk*> result;
+  result.reserve(expected_count);
 
   if (policy == coverage_policy::full) {
-    if (count < expected_count) return {};
-    if (first_it == last || std::to_address(*first_it)->offset != first_chunk_off) {
-      return {};  // first chunk missing
-    }
+    if (chunks.size() < expected_count) { return {}; }
+    if (first_it == chunks.end() || (*first_it)->offset != first_chunk_off) { return {}; }
 
-    // Check the last chunk is at the expected position.
-    const auto first_idx       = static_cast<std::size_t>(std::distance(first, first_it));
-    const std::size_t last_idx = first_idx + expected_count - 1;
-
-    if (last_idx >= count) return {};
-    if (std::to_address(first[last_idx])->offset != last_chunk_off) return {};
+    auto const first_idx = static_cast<std::size_t>(first_it - chunks.begin());
+    auto const last_idx  = first_idx + expected_count - 1;
+    if (last_idx >= chunks.size() || chunks[last_idx]->offset != last_chunk_off) { return {}; }
 
     // Coverage confirmed by the invariant: sorted + non-overlapping + fixed-size
     // means consecutive chunks differ by exactly chunk_size, so the intermediates
     // are forced once the first and last are at the expected positions.
-    std::vector<chunk_ptr_t> result;
-    result.reserve(expected_count);
-    for (std::size_t i = 0; i < expected_count; ++i) {
-      first[first_idx + i]
-        ->lifecycle.on_consume();  // side effect: count this chunk as consumed for eviction scoring
-      result.push_back(std::to_address(first[first_idx + i]));
-    }
+    result.assign(chunks.begin() + static_cast<std::ptrdiff_t>(first_idx),
+                  chunks.begin() + static_cast<std::ptrdiff_t>(last_idx) + 1);
     return result;
   }
 
-  // coverage_policy::partial: return every chunk overlapping the request range,
-  // even when some are missing (the invariant means offsets in
-  // [first_chunk_off, last_chunk_off] are exactly the overlapping chunks).
-  std::vector<chunk_ptr_t> result;
-  result.reserve(expected_count);
-  for (auto it = first_it; it != last && std::to_address(*it)->offset <= last_chunk_off; ++it) {
-    std::to_address(*it)->lifecycle.on_consume();
-    result.push_back(std::to_address(*it));
+  for (auto it = first_it; it != chunks.end() && (*it)->offset <= last_chunk_off; ++it) {
+    result.push_back(*it);
   }
   return result;
 }

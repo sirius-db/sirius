@@ -38,12 +38,17 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <variant>
 #include <vector>
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
 }
+
+namespace sirius::scan_manager {
+class readahead_scan_manager;
+}  // namespace sirius::scan_manager
 
 namespace sirius::op::scan {
 
@@ -89,15 +94,31 @@ struct membership_snapshot {
  */
 class scan_operator_input : public op::operator_data {
  public:
-  explicit scan_operator_input(std::unique_ptr<scan_info> metadata)
-    : materialization_info(std::move(metadata))
-  {
-  }
+  /// Hint the IO layer about every range this split will read, then publish it
+  /// to @p readahead -- in that order, which is why both belong here.
+  /// Registration makes the split eligible for prefetching and takes the
+  /// readahead's mutex, which the worker also takes to collect, so it is the
+  /// release/acquire pair that publishes the hints written before it.  Hinting
+  /// from the caller instead would let the worker collect a split whose
+  /// datasources have no prefetch handle yet, and would leave the handle write
+  /// racing the worker's read of it.  @p preferred_device is passed in for the
+  /// same reason: an fadvise names the GPU its bytes are headed for.
+  explicit scan_operator_input(
+    std::shared_ptr<scan_info> metadata,
+    std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
+    std::size_t operator_id                                         = 0,
+    std::optional<int> preferred_device                             = std::nullopt);
 
-  explicit scan_operator_input(std::shared_ptr<cucascade::data_batch> cached_batch)
-    : materialization_info(std::move(cached_batch))
-  {
-  }
+  explicit scan_operator_input(
+    std::shared_ptr<cucascade::data_batch> cached_batch,
+    std::shared_ptr<scan_manager::readahead_scan_manager> readahead = nullptr,
+    std::size_t operator_id                                         = 0);
+
+  /// Reports @c scan_stage::disposed, freeing this split's readahead slot.
+  ~scan_operator_input() override;
+
+  scan_operator_input(scan_operator_input const&)            = delete;
+  scan_operator_input& operator=(scan_operator_input const&) = delete;
 
   [[nodiscard]] op::operator_data_type get_type() const override
   {
@@ -123,24 +144,31 @@ class scan_operator_input : public op::operator_data {
 
   [[nodiscard]] bool has_scan_metadata() const noexcept
   {
-    return std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info) &&
-           std::get<std::unique_ptr<scan_info>>(materialization_info) != nullptr;
+    return std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info) &&
+           std::get<std::shared_ptr<scan_info>>(materialization_info) != nullptr;
   }
 
-  [[nodiscard]] std::vector<op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
+  /// This split's prefetch hints.  A view onto the scan_info's memoized list —
+  /// building them walks every row group and projected column, so callers must
+  /// not treat this as cheap enough to rebuild per stage.
+  [[nodiscard]] std::span<const op::scan::scan_info::fadvise_entry> get_fadvise_hints() const
   {
     if (!has_scan_metadata()) { return {}; }
-    return std::get<std::unique_ptr<scan_info>>(materialization_info)->fadvise_entries();
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->fadvise_hints();
   }
 
-  void prefetch(io::cache::prefetching_stage site) const
+  /// The datasources this split reads through.  Stage reporting wants only
+  /// these; going through @ref get_fadvise_hints for it would drag every byte
+  /// range along.
+  [[nodiscard]] std::span<const std::shared_ptr<sirius::io::sirius_datasource>> get_datasources()
+    const
   {
-    if (!has_scan_metadata()) { return; }
-    auto hints = get_fadvise_hints();
-    for (auto& hint : hints) {
-      hint.datasource->prefetch(site);
-    }
+    if (!has_scan_metadata()) { return {}; }
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->datasources();
   }
+
+  /// Report @p site to the readahead manager and to every hinted datasource.
+  void update(io::cache::scan_stage site) const;
 
   /**
    * @brief Prepare this split for execution in the requested memory space.
@@ -185,7 +213,7 @@ class scan_operator_input : public op::operator_data {
         "[scan_operator_input::get_scan_info] no scan metadata present; check has_scan_metadata() "
         "first.");
     }
-    return *std::get<std::unique_ptr<scan_info>>(materialization_info);
+    return *std::get<std::shared_ptr<scan_info>>(materialization_info);
   }
 
   [[nodiscard]] std::string get_origin_tiers() const override
@@ -210,7 +238,7 @@ class scan_operator_input : public op::operator_data {
   }
 
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
-  std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
+  std::variant<std::monostate, std::shared_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
   /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =
   /// every row visible (no upload, no kernel). Attached by
@@ -286,6 +314,13 @@ class scan_operator_input : public op::operator_data {
   /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
   /// conservative maximum-expansion bound.
   std::size_t conversion_destination_bytes{0};
+
+ private:
+  /// Per-query readahead bookkeeping this split reports into; null when the
+  /// producer does not track readahead.
+  std::shared_ptr<scan_manager::readahead_scan_manager> _readahead;
+  /// Operator id this split was emitted under, the key @ref _readahead uses.
+  std::size_t _operator_id{0};
 };
 
 }  // namespace sirius::op::scan

@@ -254,6 +254,15 @@ struct sirius_config {
 
   [[nodiscard]] const scan_manager::scan_manager_config& get_scan_manager_config() const noexcept;
 
+  /// The read path's caching configuration (the
+  /// @c sirius.executor.scan_manager.cache YAML block).  Stored inside the
+  /// scan_manager config, which is its only consumer, so the two can never
+  /// disagree.
+  [[nodiscard]] const io::cache::config& get_cache_config() const noexcept
+  {
+    return _scan_manager_config.cache;
+  }
+
   /// Overwrite the stored scan_manager_config. Allows callers (e.g.
   /// SiriusContext::initialize()) to persist runtime-derived wiring so a later
   /// get_scan_manager_config() reflects the actual scan_manager state.
@@ -293,10 +302,24 @@ struct sirius_config {
 
  private:
   /// When @c _memory_space_configs contains more than one GPU memory space,
-  /// force @c _scan_manager_config.use_sirius_datasource to true (sirius
-  /// datasource is required for multi-GPU IO routing). Emits a WARNING when
+  /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
+  /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
   /// the override takes effect. Called from the end of @ref load_from_file.
-  void enforce_sirius_datasource_for_multi_gpu();
+  void enforce_sirius_backend_for_multi_gpu();
+
+  /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
+  /// CONFIGURED pipeline pool size. The struct default can only use the
+  /// compile-time thread count, so resizing the pipeline in config would
+  /// otherwise leave the readahead budget behind. Called from the end of
+  /// @ref load_from_file; an explicit config value is left alone.
+  void derive_uring_scan_budget();
+
+  /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
+  /// multiple of the configured pipeline pool size. Object-store reads are
+  /// latency-bound, so the readahead needs several splits in flight per pipeline
+  /// thread to stay ahead of demand. Called from the end of @ref load_from_file;
+  /// an explicit config value is left alone.
+  void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   int _gpus_per_query = 0;

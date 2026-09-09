@@ -26,6 +26,7 @@
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <scan_manager/readahead_scan_manager.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -115,12 +116,91 @@ membership_snapshot snapshot_membership_probes(sirius::op::sirius_dynamic_filter
   return snap;
 }
 
+scan_operator_input::scan_operator_input(
+  std::shared_ptr<scan_info> metadata,
+  std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
+  std::size_t operator_id,
+  std::optional<int> preferred_device)
+  : materialization_info(std::move(metadata)),
+    _readahead(std::move(readahead)),
+    _operator_id(operator_id)
+{
+  auto const& stored = std::get<std::shared_ptr<scan_info>>(materialization_info);
+  if (!stored) { return; }
+
+  if (preferred_device.has_value() && *preferred_device >= 0) {
+    set_preferred_device_id(*preferred_device);
+  }
+
+  // Hint BEFORE publishing.  Registration below is what makes this split
+  // eligible for prefetching, and the readahead worker can act on it the moment
+  // it returns -- so a split published before its datasources carry prefetch
+  // handles is one the worker collects, finds nothing to issue for, and retires
+  // from the prefetch order for good.
+  for (auto const& hint : stored->fadvise_hints()) {
+    if (hint.datasource && !hint.ranges.empty()) {
+      hint.datasource->fadvise(hint.ranges, preferred_device);
+    }
+  }
+
+  // The publication barrier.  register_scan_task takes the readahead's mutex,
+  // which the worker also takes to collect, so the hints above are ordered
+  // before any read of them on the worker's side.  Keep this last.
+  if (_readahead) { _readahead->register_scan_task(stored, _operator_id); }
+}
+
+scan_operator_input::~scan_operator_input()
+{
+  // The split is done: its slot is free and the readahead worker should pull
+  // the next scan off the prefetching order.  Nothing else reports `disposed` —
+  // queued/preparing/reading are all reported on the way in — so without this
+  // the scheduler would never retire an operator and the budget would never
+  // refill.
+  try {
+    update(io::cache::scan_stage::disposed);
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // A destructor must not throw; a lost dispose costs a delayed refill, and
+    // the next split's update recomputes the same state anyway.
+  }
+}
+
+scan_operator_input::scan_operator_input(
+  std::shared_ptr<cucascade::data_batch> cached_batch,
+  std::shared_ptr<scan_manager::readahead_scan_manager> readahead,
+  std::size_t operator_id)
+  : materialization_info(std::move(cached_batch)),
+    _readahead(std::move(readahead)),
+    _operator_id(operator_id)
+{
+}
+
+void scan_operator_input::update(io::cache::scan_stage site) const
+{
+  // The manager tracks progress per split, not per operator: one operator emits
+  // many splits and they advance independently, so it needs to know which one
+  // moved.  Null for a resident cached batch, which has no scan_info.
+  scan_info const* task = has_scan_metadata()
+                            ? std::get<std::shared_ptr<scan_info>>(materialization_info).get()
+                            : nullptr;
+  if (_readahead) { _readahead->update_scan_state(_operator_id, task, site); }
+  if (task == nullptr) { return; }
+  // The split's own record of where its consumer is, which is what the readahead
+  // asks when deciding whether prefetching it is still worth anything.
+  std::get<std::shared_ptr<scan_info>>(materialization_info)->set_scan_stage(site);
+  // Datasources only, not the fadvise hints: this runs on every stage
+  // transition of every split, and the hints carry the split's entire
+  // byte-range list with them.
+  for (auto const& ds : get_datasources()) {
+    ds->update(site);
+  }
+}
+
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
-    prefetch(io::cache::prefetching_stage::just_in_time);
+    update(io::cache::scan_stage::preparing);
     return;
   }
   auto batch = std::get<std::shared_ptr<cucascade::data_batch>>(materialization_info);
@@ -351,8 +431,8 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
 
 std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 {
-  if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
-    return std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_bytes();
+  if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
+    return std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_bytes();
   }
   if (std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
     // Once prepare_for_processing has taken the wrapper's table the batch only
@@ -378,9 +458,9 @@ std::size_t scan_operator_input::get_estimated_size_in_bytes() const
 
 std::size_t scan_operator_input::get_estimated_working_set_size_in_bytes() const
 {
-  if (std::holds_alternative<std::unique_ptr<scan_info>>(materialization_info)) {
+  if (std::holds_alternative<std::shared_ptr<scan_info>>(materialization_info)) {
     auto const decode_bytes =
-      std::get<std::unique_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
+      std::get<std::shared_ptr<scan_info>>(materialization_info)->estimated_working_set_bytes();
     if (mvcc_keep_mask.has_mask()) {
       // A partially visible insert-delta split is mask-filtered right after
       // decode: the decoded input and the compacted output (up to input-sized)

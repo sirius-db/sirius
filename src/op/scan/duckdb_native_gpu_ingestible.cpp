@@ -121,10 +121,9 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     // turns an empty row-group list into a schema-correct 0-row table. Without this,
     // zero splits mean zero tasks and the pipeline-completion signal never fires.
     if (!_produced_any && _have_template) {
-      auto split           = std::make_unique<duckdb_native_scan_info>();
-      split->datasource    = _datasource->duplicate();
-      split->block_manager = _block_manager;
-      _produced_any        = true;
+      auto split = std::make_unique<duckdb_native_scan_info>(
+        std::vector<duckdb_row_group_metadata>{}, _datasource->duplicate(), _block_manager);
+      _produced_any = true;
       out.push_back(std::move(split));
     }
     return out;
@@ -133,10 +132,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(_acc);
-    split->datasource    = _datasource->duplicate();
-    split->block_manager = _block_manager;
+    auto split = std::make_unique<duckdb_native_scan_info>(
+      std::move(_acc), _datasource->duplicate(), _block_manager);
     _acc.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
@@ -270,10 +267,8 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
                                std::to_string(rg_begin) + ", " + std::to_string(rg_end) +
                                ")): " + range.viability_failure_reason);
     }
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(range.row_groups);
-    split->datasource    = io_ctx->open_datasource(_info->db_path);
-    split->block_manager = _block_manager;
+    auto split = std::make_unique<duckdb_native_scan_info>(
+      std::move(range.row_groups), io_ctx->open_datasource(_info->db_path), _block_manager);
     return split;
   };
 }

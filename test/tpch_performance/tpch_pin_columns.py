@@ -12,7 +12,7 @@ duckdb there is no path: the table is resolved from the attached catalog by name
 and the source is selected with format='duckdb'.
 
 Pin tier: defaults to 'gpu'; both 'gpu' and 'host' are supported. Set
-SIRIUS_PIN_TIER=host to select the host tier, which converts the pinned
+SIRIUS_PIN_TIER=host|parquet to select another tier; host converts the pinned
 table into NUMA-local pinned host memory. Any other tier raises
 NotImplementedException at bind time (src/sirius_extension.cpp).
 """
@@ -261,9 +261,10 @@ def detect_pin_glob(parquet_dir: str, table: str) -> str:
 def _pin_call(table: str, cols: list[str], source: str, data_source: str) -> str:
     """Emit a single `CALL pin_table(...)` for `table` in the given data source.
 
-    Tier defaults to 'gpu'; SIRIUS_PIN_TIER=host selects the host tier (both are
-    supported — see src/sirius_extension.cpp). Any other tier throws
-    NotImplementedException at bind time.
+    Tier defaults to 'gpu'; SIRIUS_PIN_TIER selects 'host' or 'parquet' instead
+    (see src/sirius_extension.cpp). Any other tier throws NotImplementedException
+    at bind time. 'parquet' is parquet-only — it pins undecoded column chunks
+    into the prefetching cache, which a duckdb-native table does not have.
 
     parquet: a positional glob path whose FileSystem::GlobFiles expansion must
              match the corresponding CREATE VIEW read_parquet([...]) file list.
@@ -352,7 +353,7 @@ def main(argv: list[str]) -> int:
             "\n"
             "Source: --format parquet (default) needs <parquet_dir>; --format duckdb\n"
             "pins native catalog tables by name (no path).\n"
-            "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host for the host tier\n"
+            "Tier: defaults to 'gpu'; set SIRIUS_PIN_TIER=host|parquet for the others\n"
             "(both 'gpu' and 'host' are supported).",
             file=sys.stderr,
         )
