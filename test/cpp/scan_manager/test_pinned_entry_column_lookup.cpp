@@ -186,10 +186,10 @@ TEST_CASE("split pin: a request only the wide entry covers lands on the wide ent
   split_pin_fixture fixture;
 
   auto const wide_only = request({2, 3});
-  auto const* chosen =
+  auto const chosen =
     fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &wide_only);
   REQUIRE(chosen != nullptr);
-  REQUIRE(is_wide_entry(chosen));
+  REQUIRE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(wide_only).empty());
 }
 
@@ -199,10 +199,10 @@ TEST_CASE("split pin: a request only the split entry covers lands on the split e
   split_pin_fixture fixture;
 
   auto const split_only = request({1, 8});
-  auto const* chosen =
+  auto const chosen =
     fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &split_only);
   REQUIRE(chosen != nullptr);
-  REQUIRE_FALSE(is_wide_entry(chosen));
+  REQUIRE_FALSE(is_wide_entry(chosen.get()));
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(split_only).empty());
 }
 
@@ -213,7 +213,7 @@ TEST_CASE("split pin: a request both entries cover returns a serving entry",
 
   // {c0, c1} is a subset of both entries; either answer is valid if it serves.
   auto const both = request({0, 1});
-  auto const* chosen =
+  auto const chosen =
     fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &both);
   REQUIRE(chosen != nullptr);
   REQUIRE_FALSE(chosen->cache_info.column_projection_for(both).empty());
@@ -226,7 +226,7 @@ TEST_CASE("split pin: no covering entry falls back to a non-null identity match"
 
   // No entry covers {c1, c7, c8}; the guard declines the scan on the fallback.
   auto const uncovered = request({1, 7, 8});
-  auto const* chosen =
+  auto const chosen =
     fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, &uncovered);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
@@ -241,7 +241,7 @@ TEST_CASE("split pin: null or empty requested ids keep the first-identity-match 
 {
   split_pin_fixture fixture;
 
-  auto const* chosen =
+  auto chosen =
     fixture.manager.find_pinned_entry_for_duckdb_table(kCatalog, kSchema, kTable, nullptr);
   REQUIRE(chosen != nullptr);
   REQUIRE(chosen->cache_info.table_name == kTable);
@@ -264,9 +264,9 @@ TEST_CASE("type match: a covering entry whose recorded types no longer match los
   type_match_fixture fixture{matching_name};
 
   auto const both    = request({0, 1});
-  auto const* chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
+  auto const chosen = fixture.manager.find_pinned_entry_for_duckdb_table(
     kCatalog, kSchema, kTable, &both, &fixture.returned_types);
-  REQUIRE(type_match_fixture::types_match(chosen));
+  REQUIRE(type_match_fixture::types_match(chosen.get()));
 }
 
 TEST_CASE("type match: when no covering entry still matches, one is returned anyway",
