@@ -651,7 +651,7 @@ target_link_options(sirius_loadable_extension PRIVATE
 
 if(SIRIUS_BUILD_SHARED_LIBRARY)
   add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
-  add_library(Sirius::sirius ALIAS sirius_shared)
+  add_library(sirius::sirius ALIAS sirius_shared)
   set_target_properties(
     sirius_shared
     PROPERTIES OUTPUT_NAME sirius
@@ -747,7 +747,7 @@ if(SIRIUS_BUILD_SHARED_LIBRARY)
   install(
     EXPORT SiriusTargets
     FILE SiriusTargets.cmake
-    NAMESPACE Sirius::
+    NAMESPACE sirius::
     DESTINATION "lib/cmake/Sirius"
     COMPONENT SiriusLibrary)
   install(
