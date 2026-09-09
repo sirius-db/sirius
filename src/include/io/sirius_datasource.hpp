@@ -52,7 +52,7 @@ using cudf_datasource_stream_t = rmm::cuda_stream_view;
  * Ownership model: one scan owns one @c sirius_datasource.  The underlying
  * @c io_object can be shared across multiple datasources (e.g. when
  * the same file is scanned in different pipelines), but the datasource
- * itself stores per-scan state (notably the @c prefetching_handle returned
+ * itself stores per-scan state (notably the @c cache_handle returned
  * by an @c fadvise call) and is therefore not safe to share.
  */
 class sirius_datasource : public cudf::io::datasource {
@@ -116,7 +116,7 @@ class sirius_datasource : public cudf::io::datasource {
 
   /// \brief Return a fresh datasource that shares this one's @c ioctx and
   /// @c io_object (so it points at the same file) but carries an
-  /// empty @c prefetching_handle.
+  /// empty @c cache_handle.
   ///
   /// \note Used when a single file is split across multiple scans (e.g. several
   /// row_group_slices from the same parquet file).  Each split owns its
@@ -132,7 +132,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// @c preferred_prefetching_stage:
   ///   - @c speculative / @c immediate: only honored when @p site matches
   ///     the ioctx's preferred mode.  Hands @p ranges to the prefetching
-  ///     cache and stashes the returned @c prefetching_handle on this
+  ///     cache and stashes the returned @c cache_handle on this
   ///     datasource so a later @c fadvise(disposable) can cancel.
   ///   - @c disposable: always honored.  If a handle is stored (i.e. a
   ///     prior speculative/immediate call enqueued work), cancel it so the
@@ -156,7 +156,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// Handle of the most recent speculative/immediate insert into the
   /// prefetching cache, or empty if none was made.  fadvise(disposable)
   /// uses this to cancel still-pending work.
-  cache::prefetching_handle _prefetch_handle;
+  cache::cache_handle _cache_handle;
 };
 
 }  // namespace sirius::io
