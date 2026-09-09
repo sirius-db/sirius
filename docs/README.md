@@ -38,8 +38,6 @@ TPC-H hot runs on AWS, 22 queries · best Sirius g7e size vs DuckDB on m9g.16xla
 
 For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-For the shared library and CMake consumer interface, see [LIBRARY.md](LIBRARY.md).
-
 Quick start:
 
 ```bash
