@@ -120,6 +120,20 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 **Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
 
+### Shared hash-partition allocation families
+
+Hash partition output can expose offset-zero views into one combined allocation for eligible
+fixed-width columns. Each batch is charged its logical slice size (row count times element width)
+plus the actual size of any unsupported columns copied for that partition. Charging the complete
+shared allocation to every sibling would multiply accounting by the partition count, so logical
+size intentionally differs from immediately reclaimable physical memory.
+
+A surviving sibling can therefore pin the complete fixed-width allocation family. Downgrading or
+destroying one partition may report its logical bytes released while the shared allocation remains
+resident, and the periodic pressure monitor can stop one request early and retry on a later cycle.
+Task-driven downgrade remains guarded by its attempt to obtain a real allocator reservation. This
+is a known limitation until allocation-family-aware accounting or family-level downgrade exists.
+
 ### Candidate Selection Strategy
 
 Candidates are fetched lazily via `convertible_data_provider` implementations:

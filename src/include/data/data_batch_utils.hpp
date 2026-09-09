@@ -176,6 +176,14 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * memory referenced by @p view (the caller is responsible for inserting any cudaStreamWaitEvent
  * needed to establish that ordering before calling this helper).
  *
+ * @warning Do not materialize a view-backed batch through
+ * `cucascade::gpu_table_representation::release_table()`: its view branch enqueues the deep copy on
+ * the release stream and then destroys @p owner inline, so if that was the last reference the
+ * source buffers free -- stream-ordered on their own stream -- while the copy may still be in
+ * flight. A caller can check neither condition, so treat it as always unsafe; this holds for any
+ * `owning_table_view` representation, not only the ones built here. Read through
+ * `get_table_view()`, or use `clone()` when an owned table is required.
+ *
  * @tparam Owner Copy-constructible type that keeps @p view's device memory alive.
  * @param view The table view to expose (data ownership lives in @p owner).
  * @param owner The owner keeping the viewed memory alive (moved/copied into std::any).

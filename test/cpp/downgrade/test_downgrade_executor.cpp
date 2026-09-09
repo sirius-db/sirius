@@ -20,6 +20,7 @@
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 // data utilities
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
@@ -31,6 +32,8 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
@@ -41,7 +44,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -93,6 +99,40 @@ std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_mem
   return manager;
 }
 
+// `memory_space` compares its memory limit minus available bytes with its downgrade thresholds. For
+// this fixed-capacity allocator, available bytes equal capacity minus allocated bytes, so the
+// equivalent allocated-byte boundary is capacity minus memory limit plus threshold.
+constexpr size_t kPressureGpuCapacity = 256ull << 20;
+constexpr size_t kPressureGpuLimit    = kPressureGpuCapacity * 9 / 10;
+constexpr size_t kPressureStartBytes  = kPressureGpuCapacity / 10;
+constexpr size_t kPressureStopBytes   = kPressureGpuCapacity / 20;
+constexpr size_t kPartitionRows       = 1ull << 20;
+constexpr int kPartitionCount         = 4;
+constexpr size_t kPressureTriggerAllocated =
+  kPressureGpuCapacity - kPressureGpuLimit + kPressureStartBytes;
+constexpr size_t kPressureStoppedAllocated =
+  kPressureGpuCapacity - kPressureGpuLimit + kPressureStopBytes;
+
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager>
+make_partition_pressure_memory_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(kPressureGpuCapacity)
+    .set_reservation_fraction_per_gpu(0.9)
+    .set_downgrade_fractions_per_gpu(0.1, 0.05)
+    .set_per_numa_region_capacity(512ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.9);
+
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
+}
+
 cucascade::memory::memory_space* get_gpu_space(
   sirius::memory::sirius_memory_reservation_manager& mgr)
 {
@@ -131,6 +171,85 @@ downgrade_executor make_test_executor(sirius::data::data_repository_manager_regi
     .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade"},
     .monitor_period = std::chrono::milliseconds{0}};
   return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
+}
+
+// Captures a fixed-only partition family after its input is destroyed. `logical_bytes` is the sum
+// charged to sibling batches; allocator snapshots show when shared column allocations are
+// reclaimed.
+struct fixed_partition_family {
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  size_t allocated_before{};
+  size_t allocated_with_family{};
+  size_t logical_bytes{};
+};
+
+fixed_partition_family make_fixed_partition_family(
+  cucascade::memory::memory_space& gpu_space,
+  cucascade::memory::reservation_aware_resource_adaptor& allocator)
+{
+  auto stream = cudf::get_default_stream();
+  // Synchronize around allocation snapshots so pending writes and input deallocation do not
+  // contaminate the family-level physical-memory measurement.
+  stream.synchronize();
+  auto const allocated_before = allocator.get_total_allocated_bytes();
+
+  std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT64},
+                                                            cudf::data_type{cudf::type_id::INT64}};
+  std::vector<std::optional<std::pair<int, int>>> ranges = {std::make_pair(0, 1000000),
+                                                            std::make_pair(0, 1000000)};
+  auto input_table = sirius::create_cudf_table_with_random_data(
+    kPartitionRows, column_types, ranges, stream, gpu_space.get_default_allocator());
+  auto input = sirius::make_data_batch(
+    std::move(input_table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  {
+    auto ro = input->to_read_only();
+    batches =
+      sirius::op::gpu_partition_impl::hash_partition(ro, {0}, kPartitionCount, stream, gpu_space);
+  }
+  stream.synchronize();
+  input.reset();
+  stream.synchronize();
+
+  REQUIRE(batches.size() == static_cast<size_t>(kPartitionCount));
+  size_t logical_bytes = 0;
+  for (auto const& batch : batches) {
+    auto ro         = batch->to_read_only();
+    auto const view = sirius::get_cudf_table_view(ro);
+    REQUIRE(view.num_rows() > 0);
+    REQUIRE(view.num_columns() == 2);
+    REQUIRE(view.column(0).offset() == 0);
+    REQUIRE(view.column(1).offset() == 0);
+    logical_bytes += ro.get_data()->get_size_in_bytes();
+  }
+  REQUIRE(logical_bytes == kPartitionRows * 2 * sizeof(int64_t));
+
+  auto const allocated_with_family = allocator.get_total_allocated_bytes();
+  REQUIRE(allocated_with_family >= allocated_before + logical_bytes);
+  return {std::move(batches), allocated_before, allocated_with_family, logical_bytes};
+}
+
+size_t count_batches_in_tier(const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
+                             cucascade::memory::Tier tier)
+{
+  size_t count = 0;
+  for (auto const& batch : batches) {
+    if (get_batch_tier(*batch) == tier) { ++count; }
+  }
+  return count;
+}
+
+// Treat a batch locked by an in-flight conversion as not yet converted so monitor polling never
+// blocks the test thread.
+bool all_batches_in_tier_nonblocking(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches, cucascade::memory::Tier tier)
+{
+  for (auto const& batch : batches) {
+    auto ro = batch->try_to_read_only();
+    if (!ro || ro->get_memory_space()->get_tier() != tier) { return false; }
+  }
+  return true;
 }
 
 }  // namespace
@@ -497,4 +616,181 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
 
   executor.stop();
+}
+
+TEST_CASE("shared fixed hash partitions release physical GPU bytes only with the last sibling",
+          "[downgrade_executor][hash_partition][memory_pressure]")
+{
+  auto mem_mgr    = make_partition_pressure_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  auto* allocator =
+    gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator != nullptr);
+
+  auto family = make_fixed_partition_family(*gpu_space, *allocator);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  for (size_t partition = 0; partition < family.batches.size(); ++partition) {
+    repo->add_data_batch(family.batches[partition], partition);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  size_t previous_allocated = family.allocated_with_family;
+  size_t logical_freed      = 0;
+  for (size_t expected_host_count = 1; expected_host_count <= family.batches.size();
+       ++expected_host_count) {
+    auto const freed = executor.request_free_memory_and_wait(1);
+    logical_freed += freed;
+    REQUIRE(freed > 0);
+    REQUIRE(count_batches_in_tier(family.batches, cucascade::memory::Tier::HOST) ==
+            expected_host_count);
+
+    auto const allocated = allocator->get_total_allocated_bytes();
+    REQUIRE(previous_allocated >= allocated);
+    auto const physically_reclaimed = previous_allocated - allocated;
+    if (expected_host_count < family.batches.size()) {
+      // Logical bytes were reported as freed, but a remaining sibling still owns the two
+      // combined fixed-width allocations.
+      REQUIRE(physically_reclaimed < freed);
+    } else {
+      // Destroying the final GPU representation drops the shared owner and reclaims both
+      // complete combined columns, not merely the last partition's logical slice.
+      REQUIRE(physically_reclaimed >= family.logical_bytes);
+    }
+    previous_allocated = allocated;
+  }
+
+  executor.stop();
+  REQUIRE(logical_freed == family.logical_bytes);
+  REQUIRE(previous_allocated + family.logical_bytes <= family.allocated_with_family);
+}
+
+TEST_CASE("task reservation predicate retries until a shared partition family is reclaimed",
+          "[downgrade_executor][hash_partition][memory_pressure]")
+{
+  auto mem_mgr    = make_partition_pressure_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  auto* allocator =
+    gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator != nullptr);
+
+  auto family = make_fixed_partition_family(*gpu_space, *allocator);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  for (size_t partition = 0; partition < family.batches.size(); ++partition) {
+    repo->add_data_batch(family.batches[partition], partition);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  // Request current reservation headroom plus half the family's payload. Partial sibling downgrades
+  // cannot satisfy it because shared columns remain allocated until the final sibling leaves GPU.
+  auto const currently_allocated = allocator->get_total_allocated_bytes();
+  REQUIRE(currently_allocated < gpu_space->get_max_memory());
+  auto const reservation_bytes =
+    gpu_space->get_max_memory() - currently_allocated + family.logical_bytes / 2;
+  REQUIRE(gpu_space->make_reservation_or_null(reservation_bytes) == nullptr);
+
+  std::mutex reservation_mutex;
+  std::unique_ptr<cucascade::memory::reservation> acquired_reservation;
+  std::vector<size_t> allocated_at_attempt;
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+  auto future = executor.request_downgrade([&]() {
+    std::lock_guard<std::mutex> lock(reservation_mutex);
+    allocated_at_attempt.push_back(allocator->get_total_allocated_bytes());
+    if (!acquired_reservation) {
+      auto reservation = gpu_space->make_reservation_or_null(reservation_bytes);
+      if (reservation && reservation->size() >= reservation_bytes) {
+        acquired_reservation = std::move(reservation);
+      }
+    }
+    return acquired_reservation != nullptr;
+  });
+
+  auto const logical_freed = future.get();
+  executor.stop();
+
+  REQUIRE(acquired_reservation != nullptr);
+  REQUIRE(allocated_at_attempt.size() == family.batches.size());
+  REQUIRE(allocated_at_attempt.size() > 1);
+  for (size_t attempt = 0; attempt + 1 < allocated_at_attempt.size(); ++attempt) {
+    REQUIRE(family.allocated_with_family >= allocated_at_attempt[attempt]);
+    REQUIRE(family.allocated_with_family - allocated_at_attempt[attempt] <
+            family.logical_bytes / family.batches.size());
+  }
+  REQUIRE(allocated_at_attempt.back() + family.logical_bytes <= family.allocated_with_family);
+  REQUIRE(logical_freed == family.logical_bytes);
+  REQUIRE(count_batches_in_tier(family.batches, cucascade::memory::Tier::HOST) ==
+          family.batches.size());
+
+  acquired_reservation.reset();
+  REQUIRE(allocator->get_total_allocated_bytes() + family.logical_bytes <=
+          family.allocated_with_family);
+}
+
+TEST_CASE("partition-family pressure monitor completes one bounded sweep and becomes quiescent",
+          "[downgrade_executor][hash_partition][memory_pressure]")
+{
+  auto mem_mgr    = make_partition_pressure_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  auto* allocator =
+    gpu_space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+  REQUIRE(allocator != nullptr);
+
+  auto family = make_fixed_partition_family(*gpu_space, *allocator);
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  for (size_t partition = 0; partition < family.batches.size(); ++partition) {
+    repo->add_data_batch(family.batches[partition], partition);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  // Hold enough reservation-only pressure to cross the trigger while the family is resident, while
+  // keeping baseline plus held pressure below the stop boundary after the family is reclaimed.
+  constexpr size_t kPressureMargin = 1ull << 20;
+  auto const target_allocated      = kPressureTriggerAllocated + kPressureMargin;
+  REQUIRE(family.allocated_with_family < target_allocated);
+  auto const pressure_bytes = target_allocated - family.allocated_with_family;
+  REQUIRE(family.allocated_before + pressure_bytes <= kPressureStoppedAllocated);
+  auto pressure_reservation = gpu_space->make_reservation_or_null(pressure_bytes);
+  REQUIRE(pressure_reservation != nullptr);
+  REQUIRE(gpu_space->should_downgrade_memory());
+
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads = 1, .thread_name_prefix = "downgrade-family"},
+    .monitor_period = std::chrono::milliseconds{10}};
+  downgrade_executor executor(config, repo_registry, GPU_SPACE_ID, gpu_space, *mem_mgr);
+  executor.start();
+
+  auto const deadline = std::chrono::steady_clock::now() + 5s;
+  bool completed      = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (all_batches_in_tier_nonblocking(family.batches, cucascade::memory::Tier::HOST)) {
+      completed = true;
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+
+  std::this_thread::sleep_for(100ms);
+  auto const requests_before = executor.monitor_requests_issued_for_testing();
+  std::this_thread::sleep_for(100ms);
+  auto const requests_after = executor.monitor_requests_issued_for_testing();
+  executor.stop();
+
+  REQUIRE(completed);
+  REQUIRE(gpu_space->should_stop_downgrading_memory());
+  REQUIRE(requests_before >= 1);
+  REQUIRE(requests_before <= 2);
+  REQUIRE(requests_after == requests_before);
 }
