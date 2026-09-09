@@ -90,7 +90,7 @@ chunk_iter gallop_lower_bound(chunk_iter first, chunk_iter last, size_t off)
 
 }  // namespace
 
-class prefetching_handle::prefetch_lifecycle_manager {
+class cache_handle::prefetch_lifecycle_manager {
  public:
   explicit prefetch_lifecycle_manager(
     prefetching_cache::prefetch_request ctx,
@@ -110,17 +110,17 @@ class prefetching_handle::prefetch_lifecycle_manager {
   void activate() noexcept
   {
     if (!_ctx) { return; }
-    prefetching_handle_state expected = prefetching_handle_state::idle;
-    if (_user_state->compare_exchange_strong(expected, prefetching_handle_state::active)) {
+    cache_handle_state expected = cache_handle_state::idle;
+    if (_user_state->compare_exchange_strong(expected, cache_handle_state::active)) {
       if (_ctx and _prefetching_state->mark_loading()) { _prefetch_queue.enqueue(_ctx); }
     }
   }
 
-  void cancel() noexcept { _user_state->store(prefetching_handle_state::cancelled); }
+  void cancel() noexcept { _user_state->store(cache_handle_state::cancelled); }
 
   [[nodiscard]] bool is_active() const noexcept
   {
-    return _user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
+    return _user_state->load(std::memory_order_acquire) == cache_handle_state::active;
   }
 
   [[nodiscard]] std::shared_ptr<prefetch_request_context> get_context() const noexcept
@@ -136,41 +136,41 @@ class prefetching_handle::prefetch_lifecycle_manager {
 
  private:
   std::shared_ptr<prefetch_request_context> _ctx;
-  std::shared_ptr<std::atomic<prefetching_handle_state>> _user_state;
+  std::shared_ptr<std::atomic<cache_handle_state>> _user_state;
   std::shared_ptr<entry_state> _prefetching_state;
   prefetching_cache::request_queue_type& _eviction_queue;
   prefetching_cache::request_queue_type& _prefetch_queue;
 };
 
-prefetching_handle::prefetching_handle() noexcept = default;
-prefetching_handle::~prefetching_handle()         = default;
+cache_handle::cache_handle() noexcept = default;
+cache_handle::~cache_handle()         = default;
 
-prefetching_handle::prefetching_handle(prefetching_handle&& o) noexcept            = default;
-prefetching_handle& prefetching_handle::operator=(prefetching_handle&& o) noexcept = default;
+cache_handle::cache_handle(cache_handle&& o) noexcept            = default;
+cache_handle& cache_handle::operator=(cache_handle&& o) noexcept = default;
 
-void prefetching_handle::activate() noexcept
+void cache_handle::activate() noexcept
 {
   if (_state) { _state->activate(); }
 }
 
-void prefetching_handle::cancel() noexcept
+void cache_handle::cancel() noexcept
 {
   if (_state) { _state->cancel(); }
 }
 
-bool prefetching_handle::is_active() const noexcept { return _state && _state->is_active(); }
+bool cache_handle::is_active() const noexcept { return _state && _state->is_active(); }
 
-std::shared_ptr<prefetch_request_context> prefetching_handle::get_context() const noexcept
+std::shared_ptr<prefetch_request_context> cache_handle::get_context() const noexcept
 {
   return _state ? _state->get_context() : nullptr;
 }
 
-prefetching_handle::prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept
+cache_handle::cache_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept
   : _state(std::move(mgr))
 {
 }
 
-prefetching_handle::operator bool() const noexcept { return _state != nullptr; }
+cache_handle::operator bool() const noexcept { return _state != nullptr; }
 
 std::vector<cached_chunk*> prefetching_cache::file_entry::update_and_get_chunks(
   std::span<size_t> incoming, uint32_t ticker)
@@ -321,11 +321,11 @@ prefetching_cache::file_entry& prefetching_cache::get_or_create_file_entry(const
   return *it->second;
 }
 
-prefetching_handle prefetching_cache::insert(const io_object& obj,
-                                             std::span<const byte_range> ranges,
-                                             std::optional<int> gpu_id)
+cache_handle prefetching_cache::insert(const io_object& obj,
+                                       std::span<const byte_range> ranges,
+                                       std::optional<int> gpu_id)
 {
-  if (!_armed) { return prefetching_handle(nullptr); }
+  if (!_armed) { return cache_handle(nullptr); }
 
   auto& file = get_or_create_file_entry(obj);
 
@@ -359,7 +359,7 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
   // topology; -1 (no preference) when no GPU hint or the GPU is out of scope.
   if (gpu_id && _topology_index) { work->preferred_numa = _topology_index->numa_node_of(*gpu_id); }
 
-  prefetching_handle handle(std::make_unique<prefetching_handle::prefetch_lifecycle_manager>(
+  cache_handle handle(std::make_unique<cache_handle::prefetch_lifecycle_manager>(
     work, _eviction_queue, _prefetch_queue));
   _preparation_queue.enqueue(std::move(work));
 
@@ -367,13 +367,13 @@ prefetching_handle prefetching_cache::insert(const io_object& obj,
 }
 
 bool prefetching_cache::host_read_from_cache_only(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
 {
   if (size == 0) return true;
 
   std::vector<cached_chunk*> chunks;
-  if (out_handle && *out_handle) {
-    if (auto ctx = out_handle->get_context()) {
+  if (handle && *handle) {
+    if (auto ctx = handle->get_context()) {
       chunks = find_entry(ctx->chunks, offset, size, coverage_policy::full, _chunk_size);
     }
   }
@@ -415,9 +415,9 @@ bool prefetching_cache::host_read_from_cache_only(
 }
 
 exec::semi_future<std::size_t> prefetching_cache::host_read_async(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
 {
-  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
+  bool status = host_read_from_cache_only(obj, offset, size, dst, handle);
   if (status) { return exec::make_semi_future<std::size_t>(size); }
   size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
@@ -425,9 +425,9 @@ exec::semi_future<std::size_t> prefetching_cache::host_read_async(
 }
 
 std::size_t prefetching_cache::host_read(
-  const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle)
+  const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle)
 {
-  bool status = host_read_from_cache_only(obj, offset, size, dst, out_handle);
+  bool status = host_read_from_cache_only(obj, offset, size, dst, handle);
   if (status) { return size; }
   size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   _counters.misses.fetch_add(n_chunks, std::memory_order_relaxed);
@@ -439,7 +439,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
                                                                     size_t size,
                                                                     uint8_t* dst,
                                                                     rmm::cuda_stream_view stream,
-                                                                    prefetching_handle* out_handle)
+                                                                    cache_handle* handle)
 {
   if (size == 0 || dst == nullptr) { return std::size_t{0}; }
 
@@ -451,8 +451,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
   size_t n_chunks = (size + _chunk_size - 1) / _chunk_size;
   std::vector<cached_chunk*> chunks;
   chunks.reserve(n_chunks);
-  if (out_handle && *out_handle) {
-    if (auto ctx = out_handle->get_context()) {
+  if (handle && *handle) {
+    if (auto ctx = handle->get_context()) {
       chunks = find_entry(ctx->chunks, offset, size, policy, _chunk_size);
     }
   }
