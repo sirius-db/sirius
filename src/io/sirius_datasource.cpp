@@ -101,7 +101,7 @@ size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    return cache->host_read(*_io_object, offset, size, dst, &_prefetch_handle);
+    return cache->host_read(*_io_object, offset, size, dst, &_cache_handle);
   }
   return _io_ctx->host_read_io(*_io_object, offset, size, dst);
 }
@@ -120,7 +120,7 @@ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t siz
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_prefetch_handle);
+    semi        = cache->host_read_async(*_io_object, offset, size, dst, &_cache_handle);
   } else {
     semi = _io_ctx->host_read_async_io(*_io_object, offset, size, dst);
   }
@@ -173,7 +173,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
-    semi = cache->device_read_async(*_io_object, offset, size, dst, stream, &_prefetch_handle);
+    semi        = cache->device_read_async(*_io_object, offset, size, dst, stream, &_cache_handle);
   } else {
     semi = _io_ctx->device_read_async_io(*_io_object, offset, size, dst, stream);
   }
@@ -184,7 +184,7 @@ std::unique_ptr<sirius_datasource> sirius_datasource::duplicate() const
 {
   // Share the io_ctx and io_object — both are shared_ptr-managed and
   // deliberately reused across splits of the same file.  The new
-  // datasource starts with a default-constructed prefetching_handle so
+  // datasource starts with a default-constructed cache_handle so
   // its fadvise() calls can't accidentally cancel the original's work.
   return std::make_unique<sirius_datasource>(_io_ctx, _io_object);
 }
@@ -199,34 +199,34 @@ void sirius_datasource::fadvise(std::span<const cudf::io::text::byte_range_info>
   // speculative/immediate fadvise on a datasource that already carries a
   // handle is a caller bug.  Warn loudly; cancel the stale handle so the
   // worker drops the old request and we don't leak both into the cache.
-  if (_prefetch_handle) {
-    if (_prefetch_handle.is_active()) {
+  if (_cache_handle) {
+    if (_cache_handle.is_active()) {
       SIRIUS_LOG_WARN(
-        "sirius_datasource::fadvise: a prefetching_handle was already stored on "
+        "sirius_datasource::fadvise: a cache_handle was already stored on "
         "this datasource (path={}); cancelling the stale request.  Each scan "
         "should own a unique datasource.",
         _io_object->object_path());
       return;
     }
-    _prefetch_handle.cancel();
+    _cache_handle.cancel();
   }
 
   // Hand the ranges to the cache.  insert() returns an empty handle when
   // it didn't enqueue any new work (dormant cache, every range coalesced
   // with an existing entry); we only stash a real handle.
   auto handle = cache->insert(*_io_object, ranges, dev_id);
-  if (handle) { _prefetch_handle = std::move(handle); }
+  if (handle) { _cache_handle = std::move(handle); }
 }
 
 void sirius_datasource::prefetch(cache::prefetching_stage site)
 {
   auto const preferred = _io_ctx->preferred_prefetching_stage();
   if (preferred == cache::prefetching_stage::none) { return; }
-  if (_prefetch_handle) {
+  if (_cache_handle) {
     if (site == cache::prefetching_stage::disposable) {
-      _prefetch_handle.cancel();
+      _cache_handle.cancel();
     } else if (site == preferred) {
-      _prefetch_handle.activate();
+      _cache_handle.activate();
     }
   }
 }

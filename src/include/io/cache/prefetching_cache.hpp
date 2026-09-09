@@ -51,49 +51,47 @@ class memory_reservation_manager;
 
 namespace sirius::io::cache {
 
-enum class prefetching_handle_state { idle, active, cancelled };
+enum class cache_handle_state { idle, active, cancelled };
 
 struct prefetch_request_context {
   explicit prefetch_request_context(const io_object& file, std::uint32_t ts) noexcept
     : timestamp(ts),
       obj(file.shared_from_this()),
       state(std::make_shared<entry_state>()),
-      user_state(
-        std::make_shared<std::atomic<prefetching_handle_state>>(prefetching_handle_state::idle))
+      user_state(std::make_shared<std::atomic<cache_handle_state>>(cache_handle_state::idle))
   {
   }
 
   [[nodiscard]] bool is_active() const noexcept
   {
-    return user_state &&
-           user_state->load(std::memory_order_acquire) == prefetching_handle_state::active;
+    return user_state && user_state->load(std::memory_order_acquire) == cache_handle_state::active;
   }
 
   [[nodiscard]] bool is_cancelled() const noexcept
   {
     return !user_state ||
-           user_state->load(std::memory_order_acquire) == prefetching_handle_state::cancelled;
+           user_state->load(std::memory_order_acquire) == cache_handle_state::cancelled;
   }
 
   const std::uint32_t timestamp;
   const std::shared_ptr<const io_object> obj;
   std::shared_ptr<entry_state> state;
-  std::shared_ptr<std::atomic<prefetching_handle_state>> user_state;
+  std::shared_ptr<std::atomic<cache_handle_state>> user_state;
   std::vector<cached_chunk*> chunks;
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
 };
 
-class prefetching_handle {
+class cache_handle {
  public:
-  prefetching_handle() noexcept;
-  ~prefetching_handle();
-  prefetching_handle(prefetching_handle const&)            = delete;
-  prefetching_handle& operator=(prefetching_handle const&) = delete;
+  cache_handle() noexcept;
+  ~cache_handle();
+  cache_handle(cache_handle const&)            = delete;
+  cache_handle& operator=(cache_handle const&) = delete;
 
-  prefetching_handle(prefetching_handle&& o) noexcept;
-  prefetching_handle& operator=(prefetching_handle&& o) noexcept;
+  cache_handle(cache_handle&& o) noexcept;
+  cache_handle& operator=(cache_handle&& o) noexcept;
 
   void activate() noexcept;
 
@@ -109,7 +107,7 @@ class prefetching_handle {
   friend class prefetching_cache;
   class prefetch_lifecycle_manager;
 
-  prefetching_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
+  cache_handle(std::unique_ptr<prefetch_lifecycle_manager> mgr) noexcept;
 
   std::unique_ptr<prefetch_lifecycle_manager> _state;
 };
@@ -130,9 +128,9 @@ class prefetching_cache {
   // datasource keeps insert() out of the public API while still letting
   // fadvise dispatch through it.
   friend class sirius::io::sirius_datasource;
-  // prefetching_handle calls notify_disposed() on cancel — needs access to
+  // cache_handle calls notify_disposed() on cancel — needs access to
   // the private method.
-  friend class prefetching_handle;
+  friend class cache_handle;
 
  public:
   using byte_range         = cudf::io::text::byte_range_info;
@@ -150,26 +148,18 @@ class prefetching_cache {
 
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
 
-  [[nodiscard]] std::size_t host_read(const io_object& obj,
-                                      size_t offset,
-                                      size_t size,
-                                      uint8_t* dst,
-                                      prefetching_handle* out_handle = nullptr);
+  [[nodiscard]] std::size_t host_read(
+    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
 
   [[nodiscard]] exec::semi_future<std::size_t> host_read_async(
-    const io_object& obj,
-    size_t offset,
-    size_t size,
-    uint8_t* dst,
-    prefetching_handle* out_handle = nullptr);
+    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
 
-  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(
-    const io_object& obj,
-    size_t offset,
-    size_t size,
-    uint8_t* device_ptr,
-    rmm::cuda_stream_view stream,
-    prefetching_handle* out_handle = nullptr);
+  [[nodiscard]] exec::semi_future<std::size_t> device_read_async(const io_object& obj,
+                                                                 size_t offset,
+                                                                 size_t size,
+                                                                 uint8_t* device_ptr,
+                                                                 rmm::cuda_stream_view stream,
+                                                                 cache_handle* handle = nullptr);
 
   [[nodiscard]] std::string summary() const;
 
@@ -181,12 +171,12 @@ class prefetching_cache {
   }
 
  private:
-  [[nodiscard]] prefetching_handle insert(const io_object& obj,
-                                          std::span<const byte_range> ranges,
-                                          std::optional<int> gpu_id = {});
+  [[nodiscard]] cache_handle insert(const io_object& obj,
+                                    std::span<const byte_range> ranges,
+                                    std::optional<int> gpu_id = {});
 
   [[nodiscard]] bool host_read_from_cache_only(
-    const io_object& obj, size_t offset, size_t size, uint8_t* dst, prefetching_handle* out_handle);
+    const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle);
 
   struct file_entry {
     std::vector<cached_chunk*> update_and_get_chunks(std::span<size_t> incoming, uint32_t ticker);

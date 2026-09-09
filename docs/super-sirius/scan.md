@@ -416,7 +416,7 @@ Only statically-known DuckDB `TableFilter`s participate in this DuckDB-native me
 
 | Component | File | Role |
 |-----------|------|------|
-| `sirius_datasource` | `io/sirius_datasource.{hpp,cpp}` | `cudf::io::datasource` implementation. Thin per-scan delegate: every read forwards to the bound `ioctx`, passing the shared `io_object` by reference. Also carries the per-scan `prefetching_handle` used by `fadvise`. |
+| `sirius_datasource` | `io/sirius_datasource.{hpp,cpp}` | `cudf::io::datasource` implementation. Thin per-scan delegate: every read forwards to the bound `ioctx`, passing the shared `io_object` by reference. Also carries the per-scan `cache_handle` used by `fadvise`. |
 | `ioctx` | `io/io_context.{hpp,cpp}` | Abstract shared backend context. Owns the optional `prefetching_cache` and an always-present `metadata_store`, exposes the backend read API (`host_read_io`, `host_read_async_io`, `device_read_async_io`, `host_to_device_read_async_io`, `host_read_ranges_async_io`) and capability queries, and opens datasources via `open_datasource(path)`. |
 | `templated_ioctx<Reactor>` | `io/templated_ioctx.hpp` | Generic ioctx implementation parameterized on a backend reactor. Owns a pool of reactors, splits each caller request across the pool, dispatches via the reactor's `prep_*`/`enqueue`, and derives its capabilities structurally from the reactor (see [Backend Seam](#backend-seam)). |
 | `io_context_registry` | `io/datasource_factory.{hpp,cpp}` | Scheme→backend registry. Each backend registers a scheme checker (the reactor's static `supports()`) and a factory; `lookup(scheme)` resolves a URI scheme to a backend type, `make_ioctx(type)` builds one. |
@@ -502,7 +502,7 @@ The cache does two things beyond classic prefetch:
 
 Separately from the prefetching cache, the ioctx always exposes a `metadata_store` so parsed file metadata (e.g. a parquet footer) survives across scans of the same path regardless of whether prefetching is wired up.
 
-**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: a `speculative`/`immediate` call (honored only when it matches the ioctx's `preferred_prefetching_stage`) hands the ranges to the cache and stashes the returned `prefetching_handle`; a `disposable` call at consume time cancels any still-pending work via that handle.
+**fadvise protocol.** `sirius_datasource::fadvise(ranges, dev_id)` is the single entry point for inserting prefetch work: a `speculative`/`immediate` call (honored only when it matches the ioctx's `preferred_prefetching_stage`) hands the ranges to the cache and stashes the returned `cache_handle`; a `disposable` call at consume time cancels any still-pending work via that handle.
 
 ### Cache Internals
 
