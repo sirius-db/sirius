@@ -1845,8 +1845,12 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu}};
 
   auto& scan_mgr = sirius_ctx->get_scan_manager();
-  const auto* pin =
+  // OWNING: chunk_views below holds raw column views straight into pin's data for the whole
+  // build, so pin_owner must outlive it — a concurrent unpin on another connection must not
+  // invalidate the entry mid-build.
+  auto pin_owner =
     scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
+  const auto* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
                                 "' must be pinned on the GPU tier before building an index");
@@ -2253,11 +2257,13 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (!sirius_ctx) {
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
-  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
-  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  // The slot serializes the current-device-resource swap the build does. pin_owner keeps the
+  // entry itself alive across the build regardless — a concurrent unpin on another connection
+  // must not invalidate it mid-search.
   duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
-  const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+  auto pin_owner = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
     req.catalog, req.schema, req.table_name);
+  const auto* pin = pin_owner.get();
   if (pin == nullptr) {
     throw BinderException("sirius_knn_search: table '" + req.table_name +
                           "' must be pinned before it can be searched");

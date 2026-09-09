@@ -22,10 +22,12 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/multi_index_priority_queue.hpp"
+#include "exec/query_lifecycle_registry.hpp"
 #include "exec/queue_priority.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
 
@@ -127,10 +129,22 @@ class task_creator {
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
 
+  /// \brief Bind the per-query lifecycle gate consulted before every enqueue.
+  ///
+  /// Without one (the default, and what most unit tests use) every query is treated as accepting
+  /// work, i.e. the pre-gate behaviour.
+  void set_query_lifecycle_registry(sirius::exec::query_lifecycle_registry* registry) noexcept
+  {
+    _query_lifecycle = registry;
+  }
+
   /// \brief Register the per-query state for @p query's pipelines.
   ///
   /// Adds an entry; it does NOT clear other queries' entries. Call reset(query_id) to drop one.
-  void prepare_for_query(const sirius::planner::query& query);
+  ///
+  /// \param handler The query's completion signal
+  void prepare_for_query(const sirius::planner::query& query,
+                         std::shared_ptr<pipeline::completion_handler> handler);
 
   /// \brief Drop everything held for @p query_id: pending creation requests, in-flight creation
   /// work, and the per-query state entry. Other queries are untouched.
@@ -187,23 +201,26 @@ class task_creator {
   /// \brief Overload for callers that already know the query; avoids re-deriving it.
   void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
 
-  void schedule_lookahead(sirius::query_id_t query_id,
-                          std::optional<int> device_id_hint = std::nullopt);
+  /// \brief Warm up one not-yet-activated scan of the oldest live query.
+  /// No-op when no query is registered.
+  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail the running query with @p error.
+  /// \brief Fail @p query_id with @p error, touching no shared subsystem.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
-  /// surfaces the error rather than the process terminating.
+  /// surfaces the error rather than the process terminating. The error goes to that query's own
+  /// completion handler and nothing else; other in-flight queries keep running, and the failing
+  /// query is unwound by sirius_engine::execute's drain_after_error(query_id).
   ///
   /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
   /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
   /// ~gpu_pipeline_task), and synchronously stopping/draining a pool from its own worker is a
   /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
-  /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
-  /// called by the query thread once it observes the error, does the actual draining.
-  void report_fatal_error(std::exception_ptr error);
+  /// occupying). Only fulfills the completion future; drain_after_error(query_id), called by the
+  /// query thread once it observes the error, does the actual draining.
+  void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
 
   /**
    * @brief Get the next task id.
@@ -228,6 +245,13 @@ class task_creator {
   compute_pipeline_priorities(const sirius::planner::query& query) const;
 
  protected:
+  /**
+   * @brief Whether the lifecycle gate still accepts work for @p query_id.
+   *
+   * True when no registry is bound (the unit-test default), preserving pre-gate behaviour.
+   */
+  [[nodiscard]] bool accepts_work(sirius::query_id_t query_id) const noexcept;
+
   /**
    * @brief Stop the worker thread pool.
    *
@@ -255,6 +279,11 @@ class task_creator {
     op::sirius_physical_operator* node,
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
+  /// \brief report_fatal_error for callers that already hold the query's handler (the creation
+  /// worker), avoiding a second lookup of a state it has in scope.
+  void report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
+                          std::exception_ptr error);
+
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
    *
@@ -270,6 +299,8 @@ class task_creator {
   ::duckdb::ClientContext* _client_context;
   // Non-owning; SiriusContext stops and joins this creator before destroying the scheduler.
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Non-owning; owned by SiriusContext and outlives this creator. Null in unit tests.
+  sirius::exec::query_lifecycle_registry* _query_lifecycle{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
@@ -291,6 +322,10 @@ class task_creator {
     //! Client context of the connection running this query. Per query because two concurrent
     //! queries on different connections have different contexts.
     ::duckdb::ClientContext* client_context{nullptr};
+
+    //! This query's completion signal, for the creation-failure path (which has this state in
+    //! scope but no task). Same handler every pipeline's global state carries.
+    std::shared_ptr<pipeline::completion_handler> completion_handler;
 
     std::mutex lookahead_mutex;
     std::size_t index_of_next_lookahead{0};
@@ -325,15 +360,17 @@ class task_creator {
   //! One entry per in-flight query. Guarded by _global_state_mutex.
   std::map<sirius::query_id_t, std::shared_ptr<query_task_global_state>> _query_task_global_states;
   mutable std::mutex _global_state_mutex;  // Protect concurrent access to _query_task_global_states
-
-  //! Serializes start_thread_pool()/stop_thread_pool() against each other and guards
-  //! _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
+  //! Serializes pool/manager-thread lifecycle (start_thread_pool / stop_thread_pool / stop) and
+  //! guards _bounded_pool/_manager_thread. Deliberately separate from _global_state_mutex:
   //! do_stop_thread_pool() joins _manager_thread while holding this lock, and manager_loop()
   //! (running on that thread) takes _global_state_mutex on every request via
   //! get_query_task_global_state(). Sharing one mutex between the two let a worker thread's
-  //! error-triggered stop_thread_pool() call block on the join while holding the very lock
-  //! manager_loop() needed to reach its own exit check -- a real deadlock, not a theoretical one,
-  //! since manager_loop() passes through that lock on every iteration.
+  //! error-triggered stop_thread_pool() call (fired whenever a query takes the error path --
+  //! drain_after_error() -> stop_thread_pool() -- while the creator is still running) block on
+  //! the join while holding the very lock manager_loop() needed to reach its own exit check -- a
+  //! real deadlock, not a theoretical one, since manager_loop() passes through that lock on every
+  //! iteration. The two mutexes guard disjoint state -- this one covers _bounded_pool /
+  //! _manager_thread / _running, the other covers _query_task_global_states and _task_scheduler.
   std::mutex _thread_pool_mutex;
 
   /// Shared GPU<->NUMA topology index for NUMA-aware GPU routing (may be null).
