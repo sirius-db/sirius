@@ -23,6 +23,7 @@ Read this first; the rest of the document is the reasoning and the measurements 
 | whole-chunk pruning on compressed pins | **−8.1%** (host, 2 GB batches) |
 | the per-group index on top | **−2.20%** (44.6e9 further rows dropped) |
 | range-skipped **fetch** on a host pin | **−1.33%** at SF1000 / 2 GB, dictionary strings included (§6.5.6) |
+| **pin-time clustering on UNSORTED data** | **−8.57%** at SF1000 / 2 GB for **+1.6% pin cost** (§5.4) |
 | GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
 
 Two findings that stand on their own, independent of the remaining work:
@@ -68,9 +69,10 @@ VALUES rather than gathering byte ranges — see §6.5.6 for why that is a diffe
   `pinned_zone_maps::append_column_from` provides. It keeps whole-chunk pruning.
 - `max_gap_bytes` (the coalescing knob the network path needs) is plumbed but never tested
   non-zero, and there is no policy for choosing it.
-- Every pruning number here is on **clustered** data. TPC-H as generated prunes 0.00%, and the pin
-  discards file order anyway (§3.8), so pin-time clustering (§5) is what makes any of this pay in
-  production.
+- ~~Every pruning number here is on **clustered** data.~~ **Fixed (§5.4):** `pin_table(...,
+  cluster_by=['l_shipdate'])` sorts each chunk as it is pinned, and on the UNSORTED SF1000 dataset
+  that is worth −8.57% for +1.6% pin cost. The remaining gap is choosing the key — today it is an
+  explicit argument, not a heuristic.
 
 ---
 
@@ -868,6 +870,49 @@ Reordering rows is not free of consequences — flag before implementing:
    (`src/scan_manager/sirius_scan_manager.cpp:312-318` already special-cases them).
 3. Any consumer relying on scan order matching file order. There should be none, but it is worth
    an explicit check.
+
+### 5.4 Built and measured (2026-09-09): strategy (a), and it is what makes the project pay
+
+`CALL pin_table(..., cluster_by=['l_shipdate'])` sorts each chunk in
+`materialize_pin_batches` — a `cudf::sort_by_key` immediately after materialization and before
+anything observes the chunk, since the zone maps must describe the order the rows are stored in and
+every id handed out downstream is positional against it.
+
+**On the UNSORTED SF1000 dataset — the one a user actually has — host tier, 2 GB batches:**
+
+| | suite (best-of-3) |
+|---|---|
+| no clustering | 9.7569 s |
+| `cluster_by` lineitem/`l_shipdate`, orders/`o_orderdate` | **8.9210 s** |
+| | **−8.57%** |
+
+Pin cost: whole-process wall 127 s → 129 s, **+1.6%**, against §5.1's ~2.3 s / ~1.5% prediction.
+
+The movers are the scan-bound queries, and several roughly halve: q6 0.2350 → 0.1183, q15 0.2562 →
+0.1293, q14 0.2590 → 0.1491, q20 0.3522 → 0.2153, q1 1.0119 → 0.8315. 22/22 byte-exact at SF100.
+
+Three things worth recording:
+
+- **§5.2's central claim holds end to end.** A local sort prunes nothing at chunk granularity and
+  everything through the group index. At SF10 a one-month predicate drops **59.1M of 60.0M rows**
+  with `cluster_by`, in **19 row ranges over 19 surviving chunks** — one contiguous run per chunk,
+  and *zero* chunks pruned coarsely. Without `cluster_by` the same query drops nothing at all.
+- **It beats the pre-sorted dataset** (8.92 s vs 9.54 s on `tpch_sf1000_sorted`), which is not a
+  paradox: §3.8 showed the coalescer interleaves row groups, so a globally sorted FILE still yields
+  pin chunks spanning the key range. Sorting after coalescing is strictly better than sorting
+  before it, and it needs no dataset rewrite.
+- **It is not free for every query.** q17 +0.080 s and q12 +0.038 s. Clustering on `l_shipdate`
+  scatters the other columns, and `l_orderkey`'s ratio degrades 6.03x → 2.17x under clustering
+  (§10), so those queries fetch and decode more bytes. Net is strongly positive; a per-column
+  re-explore against the clustered layout is the open follow-up.
+
+Refused by design: **duckdb-native pins**, whose rows stay addressable by DuckDB row id — the
+deleted-row keep-masks are positional against the pinned order, so reordering would misapply them
+silently. `cluster_by` on `format='duckdb'` is an error rather than a silent no-op.
+
+Still open: **choosing the key automatically.** Today it is an explicit argument
+(`SIRIUS_PIN_CLUSTER_<TABLE>` in the benchmark harness), which is honest but leaves the win to
+whoever knows the workload.
 
 ## 6. Skipping the *fetch*, not just the decode
 
@@ -1703,6 +1748,12 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Two things had to be fixed to get there, both in §6.5: a table cannot mix a compacted column
   with a whole one (§6.5.4), and the shipped row-range serving duplicated rows on three of the
   four serve paths (§6.5.5, a real wrong-answer bug).
+- **2026-09-09** — **Pin-time clustering landed, and it is the result that makes the project pay
+  in production (§5.4).** `pin_table(..., cluster_by=[...])` sorts each chunk as it is pinned:
+  **−8.57%** at SF1000 host/2 GB on the UNSORTED dataset for **+1.6%** pin cost, 22/22 byte-exact.
+  It beats the pre-sorted dataset (8.92 s vs 9.54 s) because sorting AFTER the coalescer is
+  strictly better than sorting the files before it. Confirms §5.2 exactly: at SF10 a one-month
+  predicate drops 59.1M of 60.0M rows through the group index while pruning zero chunks coarsely.
 - **2026-09-09** — **Dictionary-encoded strings are now chunk-addressable (§6.5.6).** The blocker
   was a conflation: a dictionary's keys are fetched whole like an lz4 payload, but unlike it they
   do not depend on WHICH rows are served. `ChannelLayout::column_state` names that, and the
@@ -1781,9 +1832,10 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   ranges for 6,152 chunks). **Open:** the string-column ceiling above is what it now costs.
 - **Open:** the §3/§5 pruning numbers are still *rows/bytes not decoded*, not query time. Need one end-to-end datapoint —
   cheapest is W2 on a GPU-compressed lineitem pin with an artificially clustered SF100.
-- **Answered (§5.1):** sorting 6e9 rows at pin time costs ~2.3 s on the GPU for a per-chunk local
-  sort — ~1.5% of the existing ~151 s pin. **Open:** where exactly the sort goes in
-  `materialize_pin_batches`, and how the sort key gets chosen.
+- **Answered (§5.1, §5.4):** sorting 6e9 rows at pin time costs ~2.3 s on the GPU (measured
+  +1.6% of the pin wall), and the sort goes in `materialize_pin_batches` immediately after
+  materialization, before the zone-map capture. **Open:** how the sort key gets chosen — it is an
+  explicit `cluster_by` argument today.
 - **Open:** does clustering help or hurt the *net* compression ratio across all 16 columns?
   `l_shipdate` improves 2.651x → 426x but `l_orderkey` degrades 6.03x → 2.17x; needs a full
   re-explore and a re-picked plan file.
