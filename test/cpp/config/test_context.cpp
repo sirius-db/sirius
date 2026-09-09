@@ -897,6 +897,9 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 2, 2) == 13);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(32, 2, 3, 4, 3, 1, 2) == 16);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(64, 1, 3, 1, 4, 2, 1) == 50);
+  CHECK(sirius::scan_manager::active_uring_reactor_count(false, 2) == 0);
+  CHECK(sirius::scan_manager::active_uring_reactor_count(true, 2) == 2);
+  CHECK(sirius::scan_manager::active_uring_reactor_count(true, 4096) == 4096);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(8, 1, 1, 1, 1, 1, 0) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(7, 1, 1, 1, 1, 1, 0) == 4);
   CHECK(sirius::scan_manager::derived_scan_manager_num_threads(
@@ -990,6 +993,16 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
     CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
   }
 
+  SECTION("single-GPU KvikIO does not reserve inactive uring reactors")
+  {
+    sirius::sirius_config config;
+    REQUIRE_NOTHROW(config.load_from_file(data_dir / "executor_scan_threads_derived_kvikio.yaml"));
+    auto const expected = sirius::scan_manager::derived_scan_manager_num_threads(
+      std::thread::hardware_concurrency(), 2, 2, 4, 3, 1, 0);
+    CHECK_FALSE(config.get_scan_manager_config().use_sirius_datasource);
+    CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
+  }
+
   SECTION("multi-GPU plus host counts every downgrade executor")
   {
     sirius::sirius_config config;
@@ -997,6 +1010,7 @@ TEST_CASE("Sirius derives scan-manager threads from configured sibling pools", "
       config.load_from_file(data_dir / "executor_scan_threads_derived_multi_gpu.yaml"));
     auto const expected = sirius::scan_manager::derived_scan_manager_num_threads(
       std::thread::hardware_concurrency(), 2, 3, 4, 3, 2, 2);
+    CHECK(config.get_scan_manager_config().use_sirius_datasource);
     CHECK(config.get_scan_manager_config().thread_pool.num_threads == expected);
   }
 

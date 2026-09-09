@@ -639,7 +639,8 @@ int derived_scan_manager_threads_for(
     task_creator.thread_pool.num_threads,
     pipeline.num_threads,
     pipeline_executor_count_for(memory_space_configs),
-    scan_manager.uring_n_reactors);
+    scan_manager::active_uring_reactor_count(scan_manager.use_sirius_datasource,
+                                             scan_manager.uring_n_reactors));
 }
 
 }  // namespace
@@ -802,6 +803,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       _memory_space_configs = builder.build(_hw_topology);
     }
 
+    enforce_sirius_datasource_for_multi_gpu();
+
     if (!scan_manager_num_threads_explicit) {
       _scan_manager_config.thread_pool.num_threads =
         derived_scan_manager_threads_for(_memory_space_configs,
@@ -821,8 +824,6 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
       operator_defaults_for(_memory_space_configs, use_effective_gpu_capacity);
     if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
     _operator_params = std::move(resolved_operator_params);
-
-    enforce_sirius_datasource_for_multi_gpu();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +

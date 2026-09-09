@@ -51,6 +51,13 @@ inline constexpr int max_scan_manager_num_threads =
   return configured_threads + scan_manager_internal_worker_count;
 }
 
+/// Configured reactor workers that are active for the selected local-data-source backend.
+[[nodiscard]] constexpr std::size_t active_uring_reactor_count(
+  bool use_sirius_datasource, std::size_t configured_reactors) noexcept
+{
+  return use_sirius_datasource ? configured_reactors : 0;
+}
+
 /// Scan-manager pool size from the live sibling-pool configuration: every core left after the
 /// internal scan-manager worker, per-space downgrade, task-creator, per-GPU pipeline, and io_uring
 /// pools, never below 4.
