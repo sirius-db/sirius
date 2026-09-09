@@ -45,6 +45,14 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: git submodule update --init --depth=1 --jobs 2 experimental/starrocks/starrocks experimental/starrocks/brpc
 
+      # The CN's build.rs refuses to build unless internal_service.proto declares the Sirius
+      # exchange RPCs, which are not upstream. `git submodule update` above resets the tree, so
+      # the patch has to be applied here. The script is idempotent (a no-op on a tree that
+      # already carries the patch), and running it rather than an inline `git apply` keeps CI
+      # and developers on the same code path.
+      - name: Patch starrocks proto
+        run: bash scripts/apply-starrocks-patches.sh
+
       - uses: prefix-dev/setup-pixi@f00437f565399d418b0acc85936d12c1fb668347 # v0.10.1
         with:
           cache: false
