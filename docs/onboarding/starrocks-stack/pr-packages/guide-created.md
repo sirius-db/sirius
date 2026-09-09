@@ -1,58 +1,65 @@
 ## Description
 
-The StarRocks integration spans C++ streaming, Rust FFI, scan ownership, plan
-translation, compute-node dispatch and GPU exchange memory, but its draft PRs
-and integration commits have no single onboarding or landing map. This adds an
-offline interactive guide with source links, PR dependencies, a staging-ownership
-stepper, a MIG memory calculator, searchable PR/commit inventories, and a reading
-path for new team members.
+The StarRocks integration spans C++ streaming, Rust FFI, scanning, plan
+translation, compute-node execution and GPU exchange memory. New contributors
+need a readable map of these modules and the PRs that introduce their contracts.
 
-The reviewed snapshot is `bench/sf500-2-mig-gpus` at `7610840c`, compared with
-`dev` at `ea1c2783`: 19 original drafts, 59 non-merge commits and 21 integration
-merges. All 40 commits outside the original drafts are accounted for. Nine are
-in the benchmark/runbook extractions, and 31 are mapped into 20 core review
-packages; P20 is now #1739 and P01-P19 remain proposed. Mixed repair commits are
-split by file/function in the prepared PR descriptions.
+This adds a plain-English README and 13 topic guides, grouped by feature and
+module: project overview, C++ streaming, Rust FFI/DuckDB, Parquet scans/cache,
+plan translation, compute node, staging area, exchange transport, memory/MIG,
+benchmarks, PR landing, verified findings and a glossary. Each guide explains
+its purpose, gives an example, names the relevant code and PRs, and states the
+limits of the reviewed version. Staging ownership receives particular detail.
 
-The guide distinguishes upstream-merged streaming foundations, unmerged drafts,
-integration-only work and capabilities described in other performance worktrees.
-It highlights source-confirmed remote-lease and InboundStore lifetime findings,
-the reproduced NaN comparator false pass, and the unadmitted-ingress capacity
-limit. The page runs without a server or external JavaScript/CSS dependencies.
-Its checked-in JSON snapshot and template rebuild with the included Python script.
+The optional interactive guide provides architecture and staging diagrams,
+searchable PR/commit inventories, and a memory calculator. Its native fragment
+links support Back/Forward, scroll reset and direct PR/package navigation. It
+includes static content for readers without JavaScript and embeds the Markdown
+research and topic guides; larger raw developer artifacts link to the repository.
+The build uses only Python's standard library.
 
-Validation: all applicable pre-commit hooks pass on the new documentation files.
-Playwright Chromium passed navigation, filters, search, ownership steps and memory
-calculation at 360/736/1024/1440 px in light and dark themes, with no JavaScript
-errors or horizontal overflow. The generated page is deterministic; principal
-source anchors and all commit assignments were checked. A temporary comparator
-probe reproduces the NaN false-MATCH and verifies wrong-cold/correct-warm rejection.
+The source snapshot is bench/sf500-2-mig-gpus at 7610840c, compared with dev at
+ea1c2783: 19 original draft heads, 59 non-merge commits and 21 integration merges.
+All 40 commits outside those original drafts are accounted for. Ten source
+commits were extracted into #1737, #1738 and #1739; the remaining 30 are organized
+into 19 proposed core packages. Two mixed repairs have explicit file/function
+splits. #1740 is this additional documentation work.
 
-Navigation uses real fragment links with browser Back/Forward and chapter scroll
-restoration. PR/package/diagram deep links open their target. Static content keeps
-the full guide readable without JavaScript, and research/PR-package links open
-embedded documents when only the HTML file is shared. Large raw source artifacts
-link to the published repository. Ten additional navigation scenarios passed,
-including a sandboxed srcdoc preview and a file copied without its siblings.
+The documents distinguish merged foundations, current draft work, source-confirmed
+findings, locally reproduced behavior, historical benchmarks and proposed work
+in other branches. They do not present receive-credit or spilling candidates as
+already implemented fixes. PR status was checked again on 9 September 2026:
+the original 19 and the four review-created PRs were all still drafts.
 
-This is a source review and documentation change. Rust/CN test attempts stopped
-before execution because StarRocks Thrift submodule sources were uninitialized;
-no new GPU, NIXL or SF500 run is claimed. Reported historical benchmark results
-retain their provenance. Keep this documentation PR Draft for factual review by
-the component owners; no existing PR is marked ready or merged by this change.
+## Validation
+
+- Checked 147 local Markdown file/heading links and 72 immutable source links
+  against Git objects and source line ranges; recorded the results.
+- Rechecked the 23 PRs' status and heads and retained the API evidence.
+- All applicable pre-commit checks pass for the documentation and build helpers.
+- The browser checks cover four widths in light/dark mode and ten navigation
+  scenarios, including a lone HTML file, disabled JavaScript and a sandboxed preview.
+- The existing comparator probe reproduces the NaN false-MATCH and correctly
+  rejects a wrong cold result followed by a correct warm result.
+
+This is documentation and source review. Earlier translator/CN test attempts
+stopped before execution because StarRocks Thrift submodule sources were missing.
+No new GPU, NIXL or SF500 campaign is claimed. The source-confirmed lease leak
+and InboundStore lifetime race remain unresolved engine findings; this PR does
+not fix them or the comparator. Keep Draft for component-owner factual review.
 
 ## Checklist
 
-- [x] Read CONTRIBUTING.md and use the self-contained fork-to-dev path.
-- [x] Include motivation, scope, reproducible document build and validation.
-- [x] Preserve immutable source links and snapshot semantics.
-- [x] Distinguish confirmed findings from capacity limits and unexecuted tests.
+- [x] Follow CONTRIBUTING.md and the self-contained fork-to-dev path.
+- [x] Provide a linked README and plain-English module/feature documents.
+- [x] Keep source version, PR status and validation limits explicit.
+- [x] Validate links, formatting, the document build and navigation.
 - [ ] Component owners review the technical map and proposed package boundaries.
 
 ## References
 
 - Source branch: https://github.com/aocsa/sirius/tree/7610840c03f9086edfa072be72a0eb4c96e03d60
-- Staging arena: https://github.com/sirius-db/sirius/pull/1693
-- Runbook extraction: https://github.com/sirius-db/sirius/pull/1737
-- Benchmark extraction: https://github.com/sirius-db/sirius/pull/1738
-- Concurrent PRPC extraction: https://github.com/sirius-db/sirius/pull/1739
+- Staging allocator: https://github.com/sirius-db/sirius/pull/1693
+- Runbook: https://github.com/sirius-db/sirius/pull/1737
+- Benchmark harness: https://github.com/sirius-db/sirius/pull/1738
+- Concurrent PRPC: https://github.com/sirius-db/sirius/pull/1739

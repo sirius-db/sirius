@@ -1,0 +1,291 @@
+{
+  "author": "aocsa",
+  "checked_at": "2026-09-09T20:54:09.011367+00:00",
+  "prs": [
+    {
+      "baseRefName": "dev",
+      "headRefOid": "08f901ed1915e6fe8d4e9d7efb973668e55d3c99",
+      "isDraft": true,
+      "labels": [
+        {
+          "color": "0075ca",
+          "description": "Improvements or additions to documentation",
+          "id": "LA_kwDOMLor8M8AAAABp2BT4w",
+          "name": "documentation"
+        },
+        {
+          "color": "327D8C",
+          "description": "",
+          "id": "LA_kwDOMLor8M8AAAAClEAIgw",
+          "name": "starrocks"
+        }
+      ],
+      "number": 1740,
+      "state": "OPEN",
+      "title": "docs(starrocks): add interactive stack onboarding and landing guide"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "a9869aee4fc43d923fdc1d758b70786eaddcfa50",
+      "isDraft": true,
+      "labels": [
+        {
+          "color": "327D8C",
+          "description": "",
+          "id": "LA_kwDOMLor8M8AAAAClEAIgw",
+          "name": "starrocks"
+        },
+        {
+          "color": "000000",
+          "description": "Pull requests that update rust code",
+          "id": "LA_kwDOMLor8M8AAAACnw4aJw",
+          "name": "rust"
+        },
+        {
+          "color": "044b1c",
+          "description": "Performance related work",
+          "id": "LA_kwDOMLor8M8AAAACvuCIew",
+          "name": "perf"
+        }
+      ],
+      "number": 1739,
+      "state": "OPEN",
+      "title": "fix(cn): serve concurrent PRPC requests on one connection"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "a101880cf582cc699b8edcd70e370d56bb1d0529",
+      "isDraft": true,
+      "labels": [
+        {
+          "color": "08d901",
+          "description": "Work related to benchmarking",
+          "id": "LA_kwDOMLor8M8AAAACdzB1NA",
+          "name": "benchmarking"
+        },
+        {
+          "color": "60ed43",
+          "description": "",
+          "id": "LA_kwDOMLor8M8AAAAChBV77w",
+          "name": "multi-gpu"
+        },
+        {
+          "color": "327D8C",
+          "description": "",
+          "id": "LA_kwDOMLor8M8AAAAClEAIgw",
+          "name": "starrocks"
+        }
+      ],
+      "number": 1738,
+      "state": "OPEN",
+      "title": "chore(bench): add TPC-H harness and GPU/MIG placement"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "b4f5d420d711d5f3e31a2c3287b7d3aac61614f6",
+      "isDraft": true,
+      "labels": [
+        {
+          "color": "0075ca",
+          "description": "Improvements or additions to documentation",
+          "id": "LA_kwDOMLor8M8AAAABp2BT4w",
+          "name": "documentation"
+        },
+        {
+          "color": "08d901",
+          "description": "Work related to benchmarking",
+          "id": "LA_kwDOMLor8M8AAAACdzB1NA",
+          "name": "benchmarking"
+        },
+        {
+          "color": "60ed43",
+          "description": "",
+          "id": "LA_kwDOMLor8M8AAAAChBV77w",
+          "name": "multi-gpu"
+        },
+        {
+          "color": "B51842",
+          "description": "Sirius config changes",
+          "id": "LA_kwDOMLor8M8AAAACvwAvpg",
+          "name": "config"
+        }
+      ],
+      "number": 1737,
+      "state": "OPEN",
+      "title": "docs(bench): add the SF500 two-MIG memory and reproduction runbook"
+    },
+    {
+      "baseRefName": "stacked/scan-byte-range-ingestible",
+      "headRefOid": "6c0b83a18cebfddb3530def59ec38cb6b1f3e669",
+      "isDraft": true,
+      "labels": [],
+      "number": 1717,
+      "state": "OPEN",
+      "title": "feat(scan): serve pinned parquet tables to file-subset scans"
+    },
+    {
+      "baseRefName": "stacked/cn-cluster-bringup",
+      "headRefOid": "a1ac4c58d0c36a8bdddfba7842fd4f20f8a7d76a",
+      "isDraft": true,
+      "labels": [],
+      "number": 1715,
+      "state": "OPEN",
+      "title": "feat(cn): fail the result instances the frontend polls when an intermediate fragment fails"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "9738b2560756a2591e9c0eba704aa69d84ad0610",
+      "isDraft": true,
+      "labels": [],
+      "number": 1714,
+      "state": "OPEN",
+      "title": "feat(cn): run one compute node per GPU with explicit memory carve-outs and a readiness gate"
+    },
+    {
+      "baseRefName": "stacked/translator-avg-expansion",
+      "headRefOid": "268b7592ffa67d97ddff2d83666cd7fcfb3273ea",
+      "isDraft": true,
+      "labels": [],
+      "number": 1713,
+      "state": "OPEN",
+      "title": "feat(starrocks): carry consumed common-expr slots past the project that computes them"
+    },
+    {
+      "baseRefName": "stacked/translator-wire-order",
+      "headRefOid": "5f9349d529a03030ae8e1d41d8d5744742694b08",
+      "isDraft": true,
+      "labels": [],
+      "number": 1711,
+      "state": "OPEN",
+      "title": "feat(starrocks): expand a two-phase avg into sum and count states"
+    },
+    {
+      "baseRefName": "stacked/translator-two-phase-agg",
+      "headRefOid": "50f6636a941aa024a769cf623d668acc6d3a7032",
+      "isDraft": true,
+      "labels": [],
+      "number": 1710,
+      "state": "OPEN",
+      "title": "fix(starrocks): emit aggregation keys and sort tuples in materialized slot order"
+    },
+    {
+      "baseRefName": "stacked/translator-exchange-stream-read",
+      "headRefOid": "ce41439da9fe21f4b026725b983a7da66d5b3890",
+      "isDraft": true,
+      "labels": [],
+      "number": 1709,
+      "state": "OPEN",
+      "title": "feat(starrocks): translate both halves of a two-phase aggregation"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "4389e3f9ceac24b9abb57a794348054fed75ae25",
+      "isDraft": true,
+      "labels": [],
+      "number": 1708,
+      "state": "OPEN",
+      "title": "feat(starrocks): translate EXCHANGE_NODE as a stream read of the engine's exchange view"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "a04bf5bcff343157d6d21c485a352c3fb7d7e988",
+      "isDraft": true,
+      "labels": [],
+      "number": 1707,
+      "state": "OPEN",
+      "title": "build(cn): carry the Sirius exchange RPCs as a checked-in StarRocks proto patch"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "e2d6058d20a6fb71ca0b815df4000ce8063218a0",
+      "isDraft": true,
+      "labels": [],
+      "number": 1706,
+      "state": "OPEN",
+      "title": "feat(cn): a validated registry for the CN's transport tunables"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "3056cda5b8efff2c613cd4e4835b6f3b16155957",
+      "isDraft": true,
+      "labels": [],
+      "number": 1705,
+      "state": "OPEN",
+      "title": "fix(cn): infer a FILES() schema across every assigned range"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "275283856619885783b77978c82234f8dd1042d3",
+      "isDraft": true,
+      "labels": [],
+      "number": 1704,
+      "state": "OPEN",
+      "title": "fix(starrocks): unwrap CLONE_EXPR and cast FE-narrowed builtins to their declared type"
+    },
+    {
+      "baseRefName": "stacked/ffi-transaction-scope",
+      "headRefOid": "14386a7777fbb9e7944f708e29656d39c2eef5b6",
+      "isDraft": true,
+      "labels": [],
+      "number": 1702,
+      "state": "OPEN",
+      "title": "feat(ffi): Rust bindings for sirius::ffi::Fragment and Context"
+    },
+    {
+      "baseRefName": "stacked/scan-byte-range-rule",
+      "headRefOid": "a22235e10d2d4f1824db0b51539b9cab4ff8bc98",
+      "isDraft": true,
+      "labels": [],
+      "number": 1700,
+      "state": "OPEN",
+      "title": "feat(scan): the parquet ingestible honors a per-file byte range"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "d53b44b19f9573b231d8d179399f862630ede42b",
+      "isDraft": true,
+      "labels": [],
+      "number": 1699,
+      "state": "OPEN",
+      "title": "feat(pipeline): opt-in stall watchdog (SIRIUS_QUERY_WATCHDOG_SECS)"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "98661d7d748b3b73c067fb795377e93e588b4fc5",
+      "isDraft": true,
+      "labels": [],
+      "number": 1697,
+      "state": "OPEN",
+      "title": "fix(ffi): own a transaction while lowering a fragment's Substrait plan"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "94a77836bb5cb3f8520875aabf179dd7fe1d5787",
+      "isDraft": true,
+      "labels": [],
+      "number": 1696,
+      "state": "OPEN",
+      "title": "feat(scan): a deterministic byte-range -> row-group ownership rule"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "f1e8fb17de7e113cf59640d3b60e7ba0dd79c387",
+      "isDraft": true,
+      "labels": [],
+      "number": 1694,
+      "state": "OPEN",
+      "title": "feat(exec): declare stream input cardinality to DuckDB's optimizer"
+    },
+    {
+      "baseRefName": "dev",
+      "headRefOid": "1e61c16c0b79d1afd9dc55ff16a8fce25bb9fe81",
+      "isDraft": true,
+      "labels": [],
+      "number": 1693,
+      "state": "OPEN",
+      "title": "feat(exec): exchange staging arena for cross-node batch transfer"
+    }
+  ],
+  "repository": "sirius-db/sirius",
+  "source_branch_commit": "7610840c03f9086edfa072be72a0eb4c96e03d60"
+}

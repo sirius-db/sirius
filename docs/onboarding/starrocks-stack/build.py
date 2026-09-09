@@ -124,6 +124,8 @@ def build_references(root, data):
             "research/github-pr-snapshot.json",
             "guide-data.json",
             "index.template.html",
+            "build.py",
+            "render_static.py",
         }:
             # Keep the all-in-one reading guide below the repository's 500 KiB
             # file limit. These full developer artifacts also live in the PR.
@@ -135,6 +137,10 @@ def build_references(root, data):
                 f'<p><a href="{url}">View {escape(name)} on GitHub</a> (internet connection required).</p>'
             )
         else:
+            if name.endswith(".json"):
+                # Keep evidence complete without duplicating its source-file
+                # indentation in the portable HTML reader.
+                contents = json.dumps(json.loads(contents), separators=(",", ":"))
             body = (
                 markdown(contents, name)
                 if name.endswith(".md")
