@@ -22,8 +22,11 @@ Read this first; the rest of the document is the reasoning and the measurements 
 | **Best host-tier configuration** | 10.44 s → **9.48 s** at SF1000 (~−9.2%), 22/22 byte-exact |
 | whole-chunk pruning on compressed pins | **−8.1%** (host, 2 GB batches) |
 | the per-group index on top | **−2.20%** (44.6e9 further rows dropped) |
-| range-skipped **fetch** on a host pin | **−1.33%** at SF1000 / 2 GB, dictionary strings included (§6.5.6) |
-| **pin-time clustering on UNSORTED data** | **−8.57%** at SF1000 / 2 GB for **+1.6% pin cost** (§5.4) |
+| **the whole chain on UNSORTED SF1000** | 9.6544 s → **8.7972 s, −8.88%**, for +1.6% pin cost (§3.13) |
+| — of which pin-time clustering | −2.2% on its own (§5.4) |
+| — of which the per-group index | +0.2% on its own; it locates rows, it does not save work |
+| — of which range-skipped fetch | **−7.0%**, and only once the other two exist (§3.13) |
+| without clustering, the same machinery | **+1.39%** — it prunes 0.00%, so it is pure overhead |
 | GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
 
 Two findings that stand on their own, independent of the remaining work:
@@ -629,6 +632,68 @@ Worth being precise about what this is and is not:
   once resident. The value of skipping is dominated by what it lets you *not move*.
 - The prediction that a G = 8 index sees through the coalescer's row-group interleaving (§3.9) is
   confirmed — the pruning materialises without any pin-time clustering.
+
+### 3.13 The full ladder, on unsorted SF1000 (2026-09-09)
+
+Every mechanism this project built, added one at a time, on the dataset a user actually has
+(`/datasets/tpch_sf1000`, unsorted), all eight tables pinned HOST tier, 2 GB batches, best-of-3:
+
+| arm | what it adds | suite | vs prev | vs none |
+|---|---|---|---|---|
+| `none` | nothing — zone-map pruning off | 9.6544 | — | — |
+| `coarse` | whole-chunk zone maps | 9.7090 | +0.56% | +0.56% |
+| `group` | + the per-group index (G = 8) | 9.7179 | +0.09% | +0.66% |
+| `subset` | + range-skipped fetch | 9.7885 | +0.73% | +1.39% |
+| `cluster` | + pin-time clustering | **8.7972** | **−10.13%** | **−8.88%** |
+| `allplans` | + compression for the other four tables | 8.7739 | −0.27% | −9.12% |
+
+**Read the top half first: on TPC-H as generated, every pruning mechanism is a small net LOSS.**
+Zone maps, the group index and the fetch skip together cost **+1.39%**, because they prune 0.00%
+(§3.1) and the machinery is not free. This is a sharper statement than §3.1's: the metadata is not
+merely useless without clustering, it is mildly negative, and clustering is the switch that turns
+all of it on.
+
+**And the three are a package.** Holding clustering fixed and removing the other two:
+
+| arm | suite | vs `cluster` |
+|---|---|---|
+| clustering + whole-chunk pruning only (`group_rows = 0`) | 9.4441 | +7.35% |
+| clustering + the per-group index, fetch skip OFF | 9.4617 | +7.55% |
+| clustering + index + fetch skip | **8.7972** | — |
+
+So **clustering alone is worth −2.2%; the group index on top of it is worth nothing (+0.2%); the
+fetch skip is worth −7.0%** — and only once the other two exist. The index locates the surviving
+rows but changes nothing about what is moved; the fetch skip is what converts that knowledge into
+work not done. This supersedes §3.12's "the group index is worth −2.20%", which was measured on the
+pre-sorted dataset with the §6.5.5 duplicate-rows bug live.
+
+### 3.14 Plan selection: ratio beats decode throughput on this path (2026-09-09)
+
+`src/compression/simpatico_codegen/plans/tpch_sf1000/` carries `*_disabled.txt` plans for `part`,
+`partsupp`, `customer` and `supplier` — the four tables that pin UNCOMPRESSED today. Three
+candidate plan sets, each pinned end to end (clustered, fetch skip on, mean of two runs):
+
+| plan set | selection rule | suite |
+|---|---|---|
+| explored | max ratio with decode ≥ 250 GB/s (the documented policy) | **8.8211** |
+| the `_disabled` originals | same policy, explored earlier | 8.9089 (+1.00%) |
+| cost-model | minimise `1/(ratio×370 GB/s) + 1/decode` | 9.0023 (+2.05%) |
+
+The third row is the interesting one, because it is a **refuted hypothesis**. On the host tier a
+column plausibly costs transfer plus decode per byte, so weighting decode throughput over ratio
+looks obviously right: the max-ratio pick for `p_partkey` is 193x at 136 GB/s, which that model
+scores at 7.36 ms/GB against 2.70 for not compressing at all. The model predicted its picks would
+be 34–40% cheaper per table. They measured **2.05% slower**, consistently across both runs.
+
+The error is the model's serial assumption. The decode has 18 scan threads and many concurrent
+batches to hide behind; the host→device copy is a shared resource on the critical path. So ratio
+buys more than the model credits and decode costs less, and the committed **"max ratio with decode
+≥ 250 GB/s" floor is closer to right than a throughput-weighted rule**. Worth writing down because
+the throughput argument is intuitively compelling and wrong.
+
+Note also what the top two rows say: enabling those four tables' plans at all is worth −0.27%
+against leaving them uncompressed, i.e. **nothing measurable**. That is a reasonable explanation
+for why they were disabled, and there is no case for re-enabling them on this workload.
 
 ## 4. Granularity, and whether to compress the index
 
@@ -1782,6 +1847,18 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Two things had to be fixed to get there, both in §6.5: a table cannot mix a compacted column
   with a whole one (§6.5.4), and the shipped row-range serving duplicated rows on three of the
   four serve paths (§6.5.5, a real wrong-answer bug).
+- **2026-09-09** — **Full ladder measured on unsorted SF1000 (§3.13), and it reorders the
+  project's own story.** Without clustering, zone maps + group index + fetch skip cost **+1.39%**
+  — they prune nothing, so they are overhead. With clustering the same chain is **−8.88%**. The
+  attribution is not what the project assumed: clustering alone −2.2%, the group index +0.2% (it
+  locates surviving rows but moves nothing), the fetch skip **−7.0%**. All three are required; none
+  pays alone.
+- **2026-09-09** — **Ratio beats decode throughput when picking plans on this path (§3.14).** A
+  host-tier cost model (`1/(ratio×link) + 1/decode`) predicted throughput-weighted picks would be
+  34–40% cheaper per table; they measured **2.05% slower**, twice. The decode hides behind 18 scan
+  threads while the host→device copy does not, so the committed "max ratio with decode ≥ 250 GB/s"
+  floor is closer to right. Also: enabling the four `*_disabled.txt` plans is worth −0.27%, i.e.
+  nothing — no case for re-enabling them.
 - **2026-09-09** — **The clustered layout needs no new compression plans (§5.5).** Clustering is
   footprint-neutral overall (lineitem −2.4%, orders +1.2%); it only moves bytes from the date
   columns to the order keys, whose `delta -> bitpack` collapses 12.39x → 2.74x. Re-exploring
