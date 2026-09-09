@@ -1,0 +1,154 @@
+{
+  "area": "engine",
+  "contracts": [
+    "sender-set EOS",
+    "poison-dominant errors",
+    "source nonblocking re-nomination",
+    "no stream credit/backpressure",
+    "arena retains only in-flight wire data",
+    "partial files bypass pins; pin file subsets use provenance"
+  ],
+  "draft_prs": [
+    {
+      "commit": "1e61c16c",
+      "feature": "staging arena",
+      "number": 1693
+    },
+    {
+      "commit": "f1e8fb17",
+      "feature": "stream cardinality",
+      "number": 1694
+    },
+    {
+      "commit": "94a77836",
+      "feature": "byte-range ownership",
+      "number": 1696
+    },
+    {
+      "commit": "a22235e1",
+      "feature": "range-aware parquet ingest",
+      "number": 1700
+    },
+    {
+      "commit": "98661d7d",
+      "feature": "lowering transaction",
+      "number": 1697
+    },
+    {
+      "commit": "14386a77",
+      "feature": "Rust Fragment bindings",
+      "number": 1702
+    },
+    {
+      "commit": "d53b44b1",
+      "feature": "watchdog",
+      "number": 1699
+    },
+    {
+      "commit": "6c0b83a1",
+      "feature": "pinned file subsets",
+      "number": 1717
+    }
+  ],
+  "findings": [
+    {
+      "evidence": "u64 start=4,length=UINT64_MAX gives end=3; valid row-group offset 8 is excluded",
+      "file": "src/op/scan/parquet_byte_range.cpp",
+      "fix": "Reject length > UINT64_MAX - start; test exception. P2 absent evidence that normal FE tilings emit overflow.",
+      "line": 56,
+      "priority": "P2",
+      "title": "Malformed byte-range end overflow is accepted"
+    },
+    {
+      "evidence": "stage snapshots raw gpu_space, close clears it then Context destroys memory manager while stage dereferences it at line 451",
+      "file": "src/sirius_ffi.cpp",
+      "fix": "in-flight guard/teardown wait or shared owner; controlled interleaving test",
+      "line": 435,
+      "priority": "P1",
+      "title": "InboundStore stage races Context destruction"
+    },
+    {
+      "evidence": "git diff --check upstream/dev...HEAD",
+      "file": "experimental/starrocks/patches/nixl-exchange-proto.patch",
+      "fix": "clean/regenerate patch",
+      "lines": [
+        8,
+        52,
+        56
+      ],
+      "priority": "P2",
+      "title": "NIXL proto patch trailing whitespace"
+    }
+  ],
+  "followups": [
+    "92e91adf FFI byte ranges",
+    "b7452f67 packed leases and declared cardinality",
+    "d88265aa translator byte-range split emission",
+    "85da8f6f parked local output",
+    "37b48a46 receiver-first rendezvous",
+    "86b3f9a6 PRPC client",
+    "36072ef8 NIXL agent and arena canary",
+    "9e547c89 NIXL GPU-to-GPU exchange",
+    "49d23e8a NIXL peer warmup",
+    "698312a1 inbound pool copy",
+    "b00334cb sequence claim before staging",
+    "37360a1b cancellation",
+    "c91d0a84 FE failure report"
+  ],
+  "historical_prs": [
+    {
+      "commit": "23a76741..367fa9d6",
+      "merged": "2026-07-13",
+      "number": 1094,
+      "title": "streaming source operator plus exchange channel"
+    },
+    {
+      "commit": "4a2d8cd6",
+      "merged": "2026-08-11",
+      "number": 1320,
+      "title": "repository-backed source, sender-aware EOS, and producer-error plane"
+    },
+    {
+      "commit": "cfac11dc",
+      "merged": "2026-08-17",
+      "number": 1479,
+      "title": "partitioned streaming sink over output repositories"
+    },
+    {
+      "commit": "42ed7f3a",
+      "merged": "2026-08-18",
+      "number": 1480,
+      "title": "stream_session, id-addressed streaming router"
+    },
+    {
+      "merged": "2026-08-24",
+      "number": 1481,
+      "title": "streaming fragment builder/runner and Fragment FFI"
+    }
+  ],
+  "scope": {
+    "base": "upstream/dev@98fe1a84335616b8674eec7e9ed2594073503fd0",
+    "head": "7610840c",
+    "worktree": "/home/ubuntu/sirius-wt/s500-mig"
+  },
+  "tests": {
+    "not_run": [
+      "C++ unit/integration",
+      "Rust",
+      "GPU/NIXL multi-node"
+    ],
+    "present": [
+      "test/cpp/exec/test_exchange_staging_arena.cpp",
+      "test/cpp/exec/test_sirius_ffi_fragment.cpp",
+      "test/cpp/exec/test_stream_bind_catalog.cpp",
+      "test/cpp/exec/test_streaming_fragment.cpp",
+      "test/cpp/scan/test_parquet_byte_range.cpp",
+      "test/cpp/integration/test_pin_table_file_subset.cpp",
+      "rust/crates/sirius/src/lib.rs packed/inbound tests"
+    ],
+    "run": [
+      "git diff --check upstream/dev...HEAD (failed: trailing whitespace)"
+    ]
+  },
+  "title": "Super Sirius streaming, FFI, staging arena, scan ownership"
+}

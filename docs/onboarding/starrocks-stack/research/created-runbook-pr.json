@@ -1,0 +1,34 @@
+{
+  "baseRefName": "dev",
+  "headRefOid": "b4f5d420d711d5f3e31a2c3287b7d3aac61614f6",
+  "isDraft": true,
+  "labels": [
+    {
+      "color": "0075ca",
+      "description": "Improvements or additions to documentation",
+      "id": "LA_kwDOMLor8M8AAAABp2BT4w",
+      "name": "documentation"
+    },
+    {
+      "color": "08d901",
+      "description": "Work related to benchmarking",
+      "id": "LA_kwDOMLor8M8AAAACdzB1NA",
+      "name": "benchmarking"
+    },
+    {
+      "color": "60ed43",
+      "description": "",
+      "id": "LA_kwDOMLor8M8AAAAChBV77w",
+      "name": "multi-gpu"
+    },
+    {
+      "color": "B51842",
+      "description": "Sirius config changes",
+      "id": "LA_kwDOMLor8M8AAAACvwAvpg",
+      "name": "config"
+    }
+  ],
+  "number": 1737,
+  "title": "docs(bench): add the SF500 two-MIG memory and reproduction runbook",
+  "url": "https://github.com/sirius-db/sirius/pull/1737"
+}

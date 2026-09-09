@@ -1,0 +1,60 @@
+{
+  "additional_commit": {
+    "sha": "a101880cf582cc699b8edcd70e370d56bb1d0529",
+    "subject": "docs(bench): state distributed runtime prerequisites"
+  },
+  "base": "sirius-db:sirius/dev",
+  "created_at": "2026-09-09T17:22:14Z",
+  "draft": true,
+  "head": "aocsa:codex/tpch-mig-benchmark-harness",
+  "labels": [
+    "benchmarking",
+    "starrocks",
+    "multi-gpu"
+  ],
+  "number": 1738,
+  "runtime_scope": "README states #1714 CN bring-up flags, #1693 staging arena, and follow-on distributed exchange runtime are prerequisites. UUID-only MIG_DEVICES is explicitly unsupported on the current engine because its NVML device-count check fails; use GPU_DEVICES=0,1 on that box until fixed. Each CN uses GPU_MEM plus STAGING outside that limit plus CUDA context overhead.",
+  "source_baseline": "upstream/dev ea1c2783191c0a5a2480665f8a18217dc9d9cba3",
+  "source_commits": [
+    {
+      "pr": "5bcff2d918c5adf0432c09f060cf0709cb017022",
+      "source": "1e163623374f1b370a2fad8a4f23ca452911a0e1",
+      "subject": "chore(bench): TPC-H q01/q06 harness, DuckDB oracle and one-CN-per-GPU launcher"
+    },
+    {
+      "pr": "1bfcc8caf16ca898cbc3a964f2bbdf51a0d95740",
+      "source": "41c31ec55598417bfbf7b98c50847f57434dd2df",
+      "subject": "bench(tpch): ship all 22 queries, scale q11 by SF, compare every run"
+    },
+    {
+      "pr": "a80f2dd8c66962e41d707583d4de0afe5a719308",
+      "source": "7c30489d560f0994144ab3096b7f4b80fbde0e60",
+      "subject": "bench(tpch): make q11's order total with ps_partkey as the tie-break"
+    },
+    {
+      "pr": "d83783fa9bf26a84484318afaef8153d4492d7d4",
+      "source": "29df50efb91614789e37188dd09ecb545041d7dd",
+      "subject": "docs(bench): how to make the FE compute a CTE once"
+    },
+    {
+      "pr": "78987440f26159d125cdbfcc989ce09d652f5924",
+      "source": "92b7eed424c060f9b18b697c7c0c5beea3f29ce3",
+      "subject": "bench(cluster8): GPU_DEVICES override so N CNs can share one GPU"
+    },
+    {
+      "pr": "036b6eacbed47e17e6cbb7508beb773933de92d7",
+      "source": "59ab07c391263fd7f8c9bf7ac2f3e5a399cc8a92",
+      "subject": "bench(cluster8): MIG_DEVICES places each CN on a MIG instance via CUDA_VISIBLE_DEVICES"
+    }
+  ],
+  "state": "open",
+  "title": "chore(bench): add TPC-H harness and GPU/MIG placement",
+  "url": "https://github.com/sirius-db/sirius/pull/1738",
+  "validation": {
+    "bash_syntax": "PASS: pixi run bash -n for gen-tpch.sh, cluster8.sh, bench.sh",
+    "compare_cold_warm_fixture": "PASS: oracle=1.0, cold r0=2.0, warm r1=1.0; compare.py reported r0 VALUES-DIFFER, r1 MATCH, and exited 1.",
+    "known_gate_limitation": "REPRODUCED, not fixed: oracle=1.0 versus Sirius=nan is reported MATCH because NaN makes d > tolerance false. PR body records this as a follow-up requirement before treating the comparator as a strict gate.",
+    "non_issue": "An oracle-only query is expected subset-comparator behavior without an expected-query manifest; it is not claimed as a defect.",
+    "python_compile": "PASS: pixi run python -m py_compile for cn-distribution.py, compare.py, oracle.py"
+  }
+}

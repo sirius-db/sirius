@@ -1,0 +1,4720 @@
+[
+  {
+    "baseRefName": "stacked/scan-byte-range-ingestible",
+    "files": [
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "CMakeLists.txt"
+      },
+      {
+        "additions": 11,
+        "deletions": 3,
+        "path": "src/include/op/scan/parquet_gpu_ingestible.hpp"
+      },
+      {
+        "additions": 10,
+        "deletions": 0,
+        "path": "src/include/pin_table.hpp"
+      },
+      {
+        "additions": 78,
+        "deletions": 16,
+        "path": "src/include/scan_manager/sirius_scan_manager.hpp"
+      },
+      {
+        "additions": 9,
+        "deletions": 3,
+        "path": "src/op/scan/parquet_gpu_ingestible.cpp"
+      },
+      {
+        "additions": 32,
+        "deletions": 5,
+        "path": "src/pin_table.cpp"
+      },
+      {
+        "additions": 185,
+        "deletions": 34,
+        "path": "src/scan_manager/sirius_scan_manager.cpp"
+      },
+      {
+        "additions": 10,
+        "deletions": 3,
+        "path": "src/sirius_extension.cpp"
+      },
+      {
+        "additions": 309,
+        "deletions": 0,
+        "path": "test/cpp/integration/test_pin_table_file_subset.cpp"
+      },
+      {
+        "additions": 42,
+        "deletions": 1,
+        "path": "test/cpp/scan/test_can_serve_with_columns.cpp"
+      },
+      {
+        "additions": 64,
+        "deletions": 0,
+        "path": "test/cpp/scan/test_parquet_scan_sizing.cpp"
+      },
+      {
+        "additions": 170,
+        "deletions": 0,
+        "path": "test/cpp/scan_manager/test_cached_serving_hardening.cpp"
+      }
+    ],
+    "headRefName": "stacked/scan-pinned-file-subset",
+    "headRefOid": "6c0b83a18cebfddb3530def59ec38cb6b1f3e669",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1717,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:02Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048932/job/100507386647",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T03:05:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:03Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049740/job/100507388989",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T03:05:03Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:06:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048945/job/100507386497",
+        "name": "lint",
+        "startedAt": "2026-09-03T03:05:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:11:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049006/job/100507386196",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T03:05:14Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:10Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048942/job/100507385975",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:05:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710696013/job/100509325151",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:15:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711128921/job/100510633837",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:11:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048945/job/100507385952",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T03:05:15Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:33:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049006/job/100508635856",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T03:11:39Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:11Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048942/job/100507385761",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:05:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710696013/job/100509325051",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:15:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711128921/job/100510634088",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048945/job/100507385749",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T03:05:15Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048945/job/100509370686",
+        "name": "check",
+        "startedAt": "2026-09-03T03:15:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:33:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049006/job/100512651990",
+        "name": "test",
+        "startedAt": "2026-09-03T03:33:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710048942/job/100507415523",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:05:14Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710696013/job/100509350652",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:15:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:23:04Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711128921/job/100510686045",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:59Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:03Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049740/job/100507408518",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T03:05:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:05:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710049740/job/100507388511",
+        "name": "distribution",
+        "startedAt": "2026-09-03T03:05:05Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(scan): serve pinned parquet tables to file-subset scans",
+    "url": "https://github.com/sirius-db/sirius/pull/1717"
+  },
+  {
+    "baseRefName": "stacked/cn-cluster-bringup",
+    "files": [
+      {
+        "additions": 405,
+        "deletions": 15,
+        "path": "experimental/starrocks/src/result_store.rs"
+      }
+    ],
+    "headRefName": "stacked/cn-result-store-failure-propagation",
+    "headRefOid": "a1ac4c58d0c36a8bdddfba7842fd4f20f8a7d76a",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1715,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:28Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709325414/job/100505250543",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T02:53:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:30Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709327465/job/100505256834",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T02:53:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:54:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326713/job/100505253529",
+        "name": "lint",
+        "startedAt": "2026-09-03T02:53:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:21Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326722/job/100505253742",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T02:53:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:58:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326734/job/100505253801",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:54:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709325419/job/100505249527",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T02:53:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127988/job/100510631218",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:39Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:01:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326713/job/100505253607",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T02:54:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326722/job/100505773158",
+        "name": "experimental",
+        "startedAt": "2026-09-03T02:56:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:21:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326734/job/100506103245",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:59:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709325419/job/100505249747",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T02:53:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127988/job/100510630991",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:59:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326713/job/100505253608",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T02:54:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:01:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326713/job/100506654495",
+        "name": "check",
+        "startedAt": "2026-09-03T03:01:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:10Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709326734/job/100510472269",
+        "name": "test",
+        "startedAt": "2026-09-03T03:22:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709325419/job/100505274567",
+        "name": "validate",
+        "startedAt": "2026-09-03T02:53:39Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:53Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127988/job/100510663154",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:49Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:30Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709327465/job/100505287440",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T02:53:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709327465/job/100505256186",
+        "name": "distribution",
+        "startedAt": "2026-09-03T02:53:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(cn): fail the result instances the frontend polls when an intermediate fragment fails",
+    "url": "https://github.com/sirius-db/sirius/pull/1715"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 4,
+        "deletions": 0,
+        "path": "experimental/starrocks/.gitignore"
+      },
+      {
+        "additions": 54,
+        "deletions": 6,
+        "path": "experimental/starrocks/src/engine.rs"
+      },
+      {
+        "additions": 384,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/engine_settings.rs"
+      },
+      {
+        "additions": 272,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/gpu_affinity.rs"
+      },
+      {
+        "additions": 287,
+        "deletions": 9,
+        "path": "experimental/starrocks/src/lib.rs"
+      },
+      {
+        "additions": 367,
+        "deletions": 26,
+        "path": "experimental/starrocks/src/main.rs"
+      }
+    ],
+    "headRefName": "stacked/cn-cluster-bringup",
+    "headRefOid": "9738b2560756a2591e9c0eba704aa69d84ad0610",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1714,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322164/job/100505239952",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T02:53:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:25Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322840/job/100505242563",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T02:53:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:54:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321934/job/100505238381",
+        "name": "lint",
+        "startedAt": "2026-09-03T02:53:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:49Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321984/job/100505238737",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T02:53:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:58:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321922/job/100505239096",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:54:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322220/job/100505239429",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T02:53:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127136/job/100510628964",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:00:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321934/job/100505238488",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T02:54:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:56Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321984/job/100505855439",
+        "name": "experimental",
+        "startedAt": "2026-09-03T02:56:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:21:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321922/job/100506090534",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:59:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322220/job/100505239610",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T02:53:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127136/job/100510629087",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:59:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321934/job/100505238559",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T02:54:49Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:01:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321934/job/100506614832",
+        "name": "check",
+        "startedAt": "2026-09-03T03:01:03Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709321922/job/100510504061",
+        "name": "test",
+        "startedAt": "2026-09-03T03:21:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322220/job/100505273681",
+        "name": "validate",
+        "startedAt": "2026-09-03T02:53:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711127136/job/100510653370",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:25Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322840/job/100505272678",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T02:53:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709322840/job/100505242134",
+        "name": "distribution",
+        "startedAt": "2026-09-03T02:53:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(cn): run one compute node per GPU with explicit memory carve-outs and a readiness gate",
+    "url": "https://github.com/sirius-db/sirius/pull/1714"
+  },
+  {
+    "baseRefName": "stacked/translator-avg-expansion",
+    "files": [
+      {
+        "additions": 267,
+        "deletions": 10,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/expr_translator.rs"
+      },
+      {
+        "additions": 17,
+        "deletions": 7,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"
+      },
+      {
+        "additions": 316,
+        "deletions": 16,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs"
+      },
+      {
+        "additions": 450,
+        "deletions": 5,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      }
+    ],
+    "headRefName": "stacked/translator-carried-common-slots",
+    "headRefOid": "268b7592ffa67d97ddff2d83666cd7fcfb3273ea",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1713,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:16Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709314119/job/100505233314",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T02:53:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709316280/job/100505244504",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T02:53:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:54:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315401/job/100505218616",
+        "name": "lint",
+        "startedAt": "2026-09-03T02:53:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315449/job/100505218878",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T02:53:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:58:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315503/job/100505219600",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:54:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709314137/job/100505215372",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T02:53:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711124898/job/100510622632",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:00:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315401/job/100505218693",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T02:54:43Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:56:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315449/job/100505715499",
+        "name": "experimental",
+        "startedAt": "2026-09-03T02:56:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:21:11Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315503/job/100506104156",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T02:59:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709314137/job/100505215264",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T02:53:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711124898/job/100510622894",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:59:07Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315401/job/100505218810",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T02:54:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:01:07Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315401/job/100506616388",
+        "name": "check",
+        "startedAt": "2026-09-03T03:01:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:21:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709315503/job/100510376170",
+        "name": "test",
+        "startedAt": "2026-09-03T03:21:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709314137/job/100505240163",
+        "name": "validate",
+        "startedAt": "2026-09-03T02:53:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711124898/job/100510650196",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709316280/job/100505222210",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T02:53:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T02:53:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33709316280/job/100505221711",
+        "name": "distribution",
+        "startedAt": "2026-09-03T02:53:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(starrocks): carry consumed common-expr slots past the project that computes them",
+    "url": "https://github.com/sirius-db/sirius/pull/1713"
+  },
+  {
+    "baseRefName": "stacked/translator-wire-order",
+    "files": [
+      {
+        "additions": 9,
+        "deletions": 2,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/expr_translator.rs"
+      },
+      {
+        "additions": 32,
+        "deletions": 3,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"
+      },
+      {
+        "additions": 352,
+        "deletions": 63,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs"
+      },
+      {
+        "additions": 0,
+        "deletions": 3,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/partial_state.rs"
+      },
+      {
+        "additions": 456,
+        "deletions": 8,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      }
+    ],
+    "headRefName": "stacked/translator-avg-expansion",
+    "headRefOid": "5f9349d529a03030ae8e1d41d8d5744742694b08",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1711,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:25Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701460534/job/100481457811",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T00:54:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:29Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701464233/job/100481499378",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T00:54:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:55:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463270/job/100481465127",
+        "name": "lint",
+        "startedAt": "2026-09-03T00:54:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:56:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463362/job/100481465370",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T00:54:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:59:15Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463274/job/100481465587",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T00:55:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701460470/job/100481457307",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T00:54:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710695024/job/100509321958",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:15:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711123352/job/100510617744",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:03Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463270/job/100481465308",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T00:55:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:56:46Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463362/job/100481915826",
+        "name": "experimental",
+        "startedAt": "2026-09-03T00:56:43Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463274/job/100482439523",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T01:00:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701460470/job/100481456977",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T00:54:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710695024/job/100509322077",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:15:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:23:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711123352/job/100510617550",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:00:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463270/job/100481465325",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T00:55:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:12Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463270/job/100483046301",
+        "name": "check",
+        "startedAt": "2026-09-03T01:02:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:49Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701463274/job/100487278044",
+        "name": "test",
+        "startedAt": "2026-09-03T01:22:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701460470/job/100481492169",
+        "name": "validate",
+        "startedAt": "2026-09-03T00:54:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710695024/job/100509361818",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:15:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:23:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711123352/job/100510811037",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:23:39Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:29Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701464233/job/100481469855",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T00:54:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701464233/job/100481469003",
+        "name": "distribution",
+        "startedAt": "2026-09-03T00:54:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(starrocks): expand a two-phase avg into sum and count states",
+    "url": "https://github.com/sirius-db/sirius/pull/1711"
+  },
+  {
+    "baseRefName": "stacked/translator-two-phase-agg",
+    "files": [
+      {
+        "additions": 177,
+        "deletions": 14,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs"
+      },
+      {
+        "additions": 593,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      }
+    ],
+    "headRefName": "stacked/translator-wire-order",
+    "headRefOid": "50f6636a941aa024a769cf623d668acc6d3a7032",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1710,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:22Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457309/job/100481447533",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T00:54:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701458821/job/100481482004",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T00:54:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:55:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457733/job/100481448029",
+        "name": "lint",
+        "startedAt": "2026-09-03T00:54:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457580/job/100481447718",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T00:54:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:59:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457732/job/100481448089",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T00:55:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457430/job/100481448218",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T00:54:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711121916/job/100510613861",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:01:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457733/job/100481447831",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T00:55:48Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457580/job/100482064501",
+        "name": "experimental",
+        "startedAt": "2026-09-03T00:57:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457732/job/100482447567",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T01:00:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457430/job/100481448062",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T00:54:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711121916/job/100510613605",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:00:01Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457733/job/100481447992",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T00:55:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457733/job/100483031338",
+        "name": "check",
+        "startedAt": "2026-09-03T01:02:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:23:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457732/job/100487329120",
+        "name": "test",
+        "startedAt": "2026-09-03T01:23:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701457430/job/100481474307",
+        "name": "validate",
+        "startedAt": "2026-09-03T00:54:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:23:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711121916/job/100510640672",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:23:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701458821/job/100481453440",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T00:54:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701458821/job/100481452523",
+        "name": "distribution",
+        "startedAt": "2026-09-03T00:54:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "fix(starrocks): emit aggregation keys and sort tuples in materialized slot order",
+    "url": "https://github.com/sirius-db/sirius/pull/1710"
+  },
+  {
+    "baseRefName": "stacked/translator-exchange-stream-read",
+    "files": [
+      {
+        "additions": 80,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/agg_phase.rs"
+      },
+      {
+        "additions": 41,
+        "deletions": 27,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/expr_translator.rs"
+      },
+      {
+        "additions": 5,
+        "deletions": 2,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"
+      },
+      {
+        "additions": 409,
+        "deletions": 63,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs"
+      },
+      {
+        "additions": 280,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/partial_state.rs"
+      },
+      {
+        "additions": 11,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/type_mapper.rs"
+      },
+      {
+        "additions": 401,
+        "deletions": 15,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      }
+    ],
+    "headRefName": "stacked/translator-two-phase-agg",
+    "headRefOid": "ce41439da9fe21f4b026725b983a7da66d5b3890",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1709,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:19Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701453964/job/100481437964",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T00:54:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:21Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701455208/job/100481475424",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T00:54:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:55:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454153/job/100481437252",
+        "name": "lint",
+        "startedAt": "2026-09-03T00:54:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454022/job/100481436901",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T00:54:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:59:10Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454058/job/100481437221",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T00:55:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701453892/job/100481436437",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T00:54:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711120976/job/100510610671",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:01:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454153/job/100481437443",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T00:55:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454022/job/100481990054",
+        "name": "experimental",
+        "startedAt": "2026-09-03T00:57:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454058/job/100482423372",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T01:00:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701453892/job/100481436662",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T00:54:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711120976/job/100510610892",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:00:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454153/job/100481437459",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T00:55:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:12Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454153/job/100483028373",
+        "name": "check",
+        "startedAt": "2026-09-03T01:02:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701454058/job/100487216077",
+        "name": "test",
+        "startedAt": "2026-09-03T01:22:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701453892/job/100481466549",
+        "name": "validate",
+        "startedAt": "2026-09-03T00:54:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:23:04Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711120976/job/100510695493",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:23:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:21Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701455208/job/100481442573",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T00:54:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701455208/job/100481441768",
+        "name": "distribution",
+        "startedAt": "2026-09-03T00:54:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(starrocks): translate both halves of a two-phase aggregation",
+    "url": "https://github.com/sirius-db/sirius/pull/1709"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 80,
+        "deletions": 20,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/descriptor_table.rs"
+      },
+      {
+        "additions": 140,
+        "deletions": 6,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"
+      },
+      {
+        "additions": 173,
+        "deletions": 6,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs"
+      },
+      {
+        "additions": 39,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/type_mapper.rs"
+      },
+      {
+        "additions": 475,
+        "deletions": 14,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      },
+      {
+        "additions": 4,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/engine.rs"
+      },
+      {
+        "additions": 2,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/fragment_executor.rs"
+      }
+    ],
+    "headRefName": "stacked/translator-exchange-stream-read",
+    "headRefOid": "4389e3f9ceac24b9abb57a794348054fed75ae25",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1708,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:16Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450209/job/100481426305",
+        "name": "assign-author",
+        "startedAt": "2026-09-03T00:54:16Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:17Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701451045/job/100481429113",
+        "name": "cuda-13",
+        "startedAt": "2026-09-03T00:54:17Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:55:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450263/job/100481425136",
+        "name": "lint",
+        "startedAt": "2026-09-03T00:54:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450253/job/100481425086",
+        "name": "starrocks",
+        "startedAt": "2026-09-03T00:54:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:59:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450210/job/100481425455",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T00:55:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450243/job/100481424839",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T00:54:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710691939/job/100509312743",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:15:17Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711119470/job/100510606690",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450263/job/100481425130",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-03T00:55:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:57:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450253/job/100481984538",
+        "name": "experimental",
+        "startedAt": "2026-09-03T00:57:03Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450210/job/100482447105",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-03T01:00:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450243/job/100481424942",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T00:54:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710691939/job/100509312463",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:15:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711119470/job/100510606480",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:59:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450263/job/100481425181",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-03T00:55:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:02:11Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450263/job/100483035563",
+        "name": "check",
+        "startedAt": "2026-09-03T01:02:05Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T01:22:53Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450210/job/100487297320",
+        "name": "test",
+        "startedAt": "2026-09-03T01:22:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701450243/job/100481466934",
+        "name": "validate",
+        "startedAt": "2026-09-03T00:54:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:15:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33710691939/job/100509360495",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:15:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711119470/job/100510631409",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:17Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701451045/job/100481429492",
+        "name": "cuda-12",
+        "startedAt": "2026-09-03T00:54:17Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T00:54:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33701451045/job/100481428373",
+        "name": "distribution",
+        "startedAt": "2026-09-03T00:54:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(starrocks): translate EXCHANGE_NODE as a stream read of the engine's exchange view",
+    "url": "https://github.com/sirius-db/sirius/pull/1708"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 8,
+        "deletions": 0,
+        "path": ".github/workflows/experimental.yml"
+      },
+      {
+        "additions": 3,
+        "deletions": 0,
+        "path": ".gitmodules"
+      },
+      {
+        "additions": 56,
+        "deletions": 0,
+        "path": "experimental/starrocks/build.rs"
+      },
+      {
+        "additions": 64,
+        "deletions": 0,
+        "path": "experimental/starrocks/patches/nixl-exchange-proto.patch"
+      },
+      {
+        "additions": 9,
+        "deletions": 4,
+        "path": "experimental/starrocks/pixi.toml"
+      },
+      {
+        "additions": 34,
+        "deletions": 0,
+        "path": "experimental/starrocks/scripts/apply-starrocks-patches.sh"
+      }
+    ],
+    "headRefName": "cn-exchange-proto-patch",
+    "headRefOid": "a04bf5bcff343157d6d21c485a352c3fb7d7e988",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1707,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:28Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924615/job/100458609189",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T23:11:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:29Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693925875/job/100458587739",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T23:11:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:12:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924585/job/100458582317",
+        "name": "lint",
+        "startedAt": "2026-09-02T23:11:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:13:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924555/job/100458582754",
+        "name": "starrocks",
+        "startedAt": "2026-09-02T23:11:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:15:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924528/job/100458582249",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:11:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924602/job/100458582361",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T23:11:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:46Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711118165/job/100510602734",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:19:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924585/job/100458582442",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T23:12:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:14:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924555/job/100459182482",
+        "name": "experimental",
+        "startedAt": "2026-09-02T23:14:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:39:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924528/job/100459549153",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:16:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924602/job/100458582477",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T23:11:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711118165/job/100510602451",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:17:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924585/job/100458582459",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T23:12:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:19:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924585/job/100460432452",
+        "name": "check",
+        "startedAt": "2026-09-02T23:19:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:39:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924528/job/100465032169",
+        "name": "test",
+        "startedAt": "2026-09-02T23:39:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693924602/job/100458620804",
+        "name": "validate",
+        "startedAt": "2026-09-02T23:11:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:53Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711118165/job/100510659626",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:29Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693925875/job/100458617695",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T23:11:37Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693925875/job/100458587130",
+        "name": "distribution",
+        "startedAt": "2026-09-02T23:11:37Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "build(cn): carry the Sirius exchange RPCs as a checked-in StarRocks proto patch",
+    "url": "https://github.com/sirius-db/sirius/pull/1707"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 26,
+        "deletions": 0,
+        "path": "experimental/starrocks/docs/TUNABLES.md"
+      },
+      {
+        "additions": 2,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/lib.rs"
+      },
+      {
+        "additions": 7,
+        "deletions": 1,
+        "path": "experimental/starrocks/src/main.rs"
+      },
+      {
+        "additions": 461,
+        "deletions": 0,
+        "path": "experimental/starrocks/src/tunable.rs"
+      }
+    ],
+    "headRefName": "cn-transport-tunables",
+    "headRefOid": "e2d6058d20a6fb71ca0b815df4000ce8063218a0",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1706,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:23Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693918866/job/100458566304",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T23:11:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919946/job/100458570731",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T23:11:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:13:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919076/job/100458565707",
+        "name": "lint",
+        "startedAt": "2026-09-02T23:11:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:14:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919116/job/100458566114",
+        "name": "starrocks",
+        "startedAt": "2026-09-02T23:11:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:15:20Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919100/job/100458565919",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:11:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693918851/job/100458565418",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T23:11:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711116258/job/100510596770",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:17:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919076/job/100458565558",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T23:11:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:14:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919116/job/100459281249",
+        "name": "experimental",
+        "startedAt": "2026-09-02T23:14:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:37:20Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919100/job/100459516355",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:15:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693918851/job/100458565007",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T23:11:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711116258/job/100510596590",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:16:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919076/job/100458565815",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T23:11:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:18:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919076/job/100460125007",
+        "name": "check",
+        "startedAt": "2026-09-02T23:18:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:37:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919100/job/100464633304",
+        "name": "test",
+        "startedAt": "2026-09-02T23:37:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:12:57Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693918851/job/100458627855",
+        "name": "validate",
+        "startedAt": "2026-09-02T23:12:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711116258/job/100510626862",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919946/job/100458608805",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T23:11:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693919946/job/100458569885",
+        "name": "distribution",
+        "startedAt": "2026-09-02T23:11:27Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(cn): a validated registry for the CN's transport tunables",
+    "url": "https://github.com/sirius-db/sirius/pull/1706"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 124,
+        "deletions": 21,
+        "path": "experimental/starrocks/src/compute_node_service.rs"
+      },
+      {
+        "additions": 145,
+        "deletions": 5,
+        "path": "experimental/starrocks/src/file_schema.rs"
+      }
+    ],
+    "headRefName": "cn-files-schema-multi-range",
+    "headRefOid": "3056cda5b8efff2c613cd4e4835b6f3b16155957",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1705,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:20Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914854/job/100458592660",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T23:11:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:21Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693916208/job/100458592966",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T23:11:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:12:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914815/job/100458553521",
+        "name": "lint",
+        "startedAt": "2026-09-02T23:11:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:14:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693915183/job/100458554609",
+        "name": "starrocks",
+        "startedAt": "2026-09-02T23:11:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:15:22Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693915096/job/100458554408",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:11:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914847/job/100458553534",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T23:11:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711114535/job/100510591341",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:17:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914815/job/100458553639",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T23:11:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:14:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693915183/job/100459303325",
+        "name": "experimental",
+        "startedAt": "2026-09-02T23:14:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:39:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693915096/job/100459526155",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:16:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914847/job/100458553766",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T23:11:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711114535/job/100510591451",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:16:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914815/job/100458553248",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T23:11:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:17:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914815/job/100460114462",
+        "name": "check",
+        "startedAt": "2026-09-02T23:17:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:39:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693915096/job/100465057373",
+        "name": "test",
+        "startedAt": "2026-09-02T23:39:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693914847/job/100458589712",
+        "name": "validate",
+        "startedAt": "2026-09-02T23:11:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711114535/job/100510635501",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:21Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693916208/job/100458559428",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T23:11:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:11:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33693916208/job/100458558539",
+        "name": "distribution",
+        "startedAt": "2026-09-02T23:11:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "fix(cn): infer a FILES() schema across every assigned range",
+    "url": "https://github.com/sirius-db/sirius/pull/1705"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 41,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/expr_translator.rs"
+      },
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs"
+      },
+      {
+        "additions": 11,
+        "deletions": 0,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/src/type_mapper.rs"
+      },
+      {
+        "additions": 245,
+        "deletions": 2,
+        "path": "experimental/starrocks/crates/starrocks-plan-translator/tests/translate.rs"
+      }
+    ],
+    "headRefName": "translator-clone-expr-narrowed-builtins",
+    "headRefOid": "275283856619885783b77978c82234f8dd1042d3",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1704,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:58:56Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938197/job/100455564115",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T22:59:06Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:58:57Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692939092/job/100455529689",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T22:58:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:59:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938172/job/100455525297",
+        "name": "lint",
+        "startedAt": "2026-09-02T22:58:58Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:01:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938227/job/100455525566",
+        "name": "starrocks",
+        "startedAt": "2026-09-02T22:58:58Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:02:51Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938215/job/100455525366",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T22:59:06Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:59:04Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938015/job/100455525305",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:58:58Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113767/job/100510588941",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:26Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:06:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938172/job/100455525625",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T23:00:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:01:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938227/job/100456178142",
+        "name": "experimental",
+        "startedAt": "2026-09-02T23:01:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Experimental"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:25:51Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938215/job/100456489359",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T23:04:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:59:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938015/job/100455525076",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:58:58Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113767/job/100510588749",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:04:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938172/job/100455525622",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T23:00:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:06:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938172/job/100457421153",
+        "name": "check",
+        "startedAt": "2026-09-02T23:06:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T23:25:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938215/job/100461981955",
+        "name": "test",
+        "startedAt": "2026-09-02T23:25:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:59:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692938015/job/100455566956",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:59:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113767/job/100510624178",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:58:57Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692939092/job/100455529280",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T22:58:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:59:03Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33692939092/job/100455528543",
+        "name": "distribution",
+        "startedAt": "2026-09-02T22:58:59Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "fix(starrocks): unwrap CLONE_EXPR and cast FE-narrowed builtins to their declared type",
+    "url": "https://github.com/sirius-db/sirius/pull/1704"
+  },
+  {
+    "baseRefName": "stacked/ffi-transaction-scope",
+    "files": [
+      {
+        "additions": 115,
+        "deletions": 4,
+        "path": "rust/crates/sirius-sys/src/lib.rs"
+      },
+      {
+        "additions": 773,
+        "deletions": 35,
+        "path": "rust/crates/sirius/src/lib.rs"
+      },
+      {
+        "additions": 3,
+        "deletions": 0,
+        "path": "src/include/sirius_ffi.hpp"
+      }
+    ],
+    "headRefName": "stacked/ffi-fragment-rust",
+    "headRefOid": "14386a7777fbb9e7944f708e29656d39c2eef5b6",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1702,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:44Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233943/job/100427734475",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T21:16:44Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:45Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684234741/job/100427787271",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T21:16:55Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:18:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233847/job/100427732911",
+        "name": "lint",
+        "startedAt": "2026-09-02T21:17:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:21:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233838/job/100427732437",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T21:17:18Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:52Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233968/job/100427732966",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T21:16:46Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691148752/job/100449925573",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113165/job/100510587247",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:24:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233847/job/100427732914",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T21:18:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:43:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233838/job/100429085340",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T21:21:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233968/job/100427733199",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T21:16:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691148752/job/100449925793",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:56Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113165/job/100510587110",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:24Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:22:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233847/job/100427732738",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T21:18:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:24:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233847/job/100430114946",
+        "name": "check",
+        "startedAt": "2026-09-02T21:24:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:43:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233838/job/100435648925",
+        "name": "test",
+        "startedAt": "2026-09-02T21:43:16Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:17:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684233968/job/100427786123",
+        "name": "validate",
+        "startedAt": "2026-09-02T21:16:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691148752/job/100449968030",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:05Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711113165/job/100510614125",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:45Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684234741/job/100427783419",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T21:16:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:52Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684234741/job/100427737802",
+        "name": "distribution",
+        "startedAt": "2026-09-02T21:16:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(ffi): Rust bindings for sirius::ffi::Fragment and Context",
+    "url": "https://github.com/sirius-db/sirius/pull/1702"
+  },
+  {
+    "baseRefName": "stacked/scan-byte-range-rule",
+    "files": [
+      {
+        "additions": 25,
+        "deletions": 6,
+        "path": "src/include/op/scan/parquet_gpu_ingestible.hpp"
+      },
+      {
+        "additions": 5,
+        "deletions": 1,
+        "path": "src/include/scan_manager/sirius_scan_manager.hpp"
+      },
+      {
+        "additions": 29,
+        "deletions": 3,
+        "path": "src/op/scan/parquet_gpu_ingestible.cpp"
+      },
+      {
+        "additions": 6,
+        "deletions": 2,
+        "path": "src/scan_manager/sirius_scan_manager.cpp"
+      },
+      {
+        "additions": 36,
+        "deletions": 0,
+        "path": "test/cpp/scan/test_can_serve_with_columns.cpp"
+      },
+      {
+        "additions": 141,
+        "deletions": 0,
+        "path": "test/cpp/scan/test_parquet_byte_range.cpp"
+      }
+    ],
+    "headRefName": "stacked/scan-byte-range-ingestible",
+    "headRefOid": "a22235e10d2d4f1824db0b51539b9cab4ff8bc98",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1700,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:31Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684214663/job/100427670616",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T21:16:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:34Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684219334/job/100427724418",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T21:16:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:17:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218121/job/100427679822",
+        "name": "lint",
+        "startedAt": "2026-09-02T21:16:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:23:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218306/job/100427680773",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T21:16:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684214706/job/100427668814",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T21:16:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691144960/job/100449913377",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711111588/job/100510582759",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:22Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:24:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218121/job/100427680026",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T21:17:59Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:45:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218306/job/100429828358",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T21:23:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684214706/job/100427668476",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T21:16:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691144960/job/100449913682",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:52Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711111588/job/100510582585",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:23Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:28:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218121/job/100427680044",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T21:18:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:28:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218121/job/100431368985",
+        "name": "check",
+        "startedAt": "2026-09-02T21:28:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:45:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684218306/job/100436320146",
+        "name": "test",
+        "startedAt": "2026-09-02T21:45:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684214706/job/100427716855",
+        "name": "validate",
+        "startedAt": "2026-09-02T21:16:43Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691144960/job/100449958420",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711111588/job/100510608688",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:34Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684219334/job/100427686282",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T21:16:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:16:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33684219334/job/100427685168",
+        "name": "distribution",
+        "startedAt": "2026-09-02T21:16:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(scan): the parquet ingestible honors a per-file byte range",
+    "url": "https://github.com/sirius-db/sirius/pull/1700"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 10,
+        "deletions": 0,
+        "path": "docs/super-sirius/configuration.md"
+      },
+      {
+        "additions": 2,
+        "deletions": 0,
+        "path": "docs/super-sirius/task-creator.md"
+      },
+      {
+        "additions": 14,
+        "deletions": 0,
+        "path": "src/include/pipeline/task_scheduler.hpp"
+      },
+      {
+        "additions": 13,
+        "deletions": 0,
+        "path": "src/pipeline/task_scheduler.cpp"
+      },
+      {
+        "additions": 75,
+        "deletions": 1,
+        "path": "src/sirius_engine.cpp"
+      },
+      {
+        "additions": 108,
+        "deletions": 0,
+        "path": "test/cpp/exec/test_streaming_fragment.cpp"
+      }
+    ],
+    "headRefName": "pipeline-stall-watchdog",
+    "headRefOid": "d53b44b19f9573b231d8d179399f862630ede42b",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1699,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:34Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679395211/job/100412029280",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T20:27:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:39:57Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633211/job/100416068237",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T20:39:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:35Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679396683/job/100412064398",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T20:27:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:39:58Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633868/job/100416101884",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T20:40:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:28:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394800/job/100412027030",
+        "name": "lint",
+        "startedAt": "2026-09-02T20:27:36Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:41:12Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632949/job/100416065299",
+        "name": "lint",
+        "startedAt": "2026-09-02T20:39:59Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:33:57Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394824/job/100412027206",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:27:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:43:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632947/job/100416065428",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:40:08Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679395085/job/100412027264",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T20:27:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:04Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633145/job/100416065977",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T20:40:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:39Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680687803/job/100416242049",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T20:40:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691141439/job/100449903834",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711110673/job/100510579569",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:21Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:34:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394800/job/100412027673",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T20:27:48Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:46:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632949/job/100416065276",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T20:40:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:56:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394824/job/100414120565",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:34:03Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:06:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632947/job/100417354329",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:45:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:46Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679395085/job/100412027738",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T20:27:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:07Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633145/job/100416065760",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T20:40:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:57Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680687803/job/100416241918",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T20:40:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:58Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691141439/job/100449903596",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711110673/job/100510579754",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:38:10Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394800/job/100412027751",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T20:27:48Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:44:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632949/job/100416064980",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T20:40:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:38:21Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394800/job/100415493385",
+        "name": "check",
+        "startedAt": "2026-09-02T20:38:14Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:46:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632949/job/100418149285",
+        "name": "check",
+        "startedAt": "2026-09-02T20:46:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:56:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679394824/job/100421233316",
+        "name": "test",
+        "startedAt": "2026-09-02T20:56:09Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T21:06:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680632947/job/100424620111",
+        "name": "test",
+        "startedAt": "2026-09-02T21:06:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:28:01Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679395085/job/100412142628",
+        "name": "validate",
+        "startedAt": "2026-09-02T20:27:57Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:16Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633145/job/100416119998",
+        "name": "validate",
+        "startedAt": "2026-09-02T20:40:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:41:19Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680687803/job/100416393186",
+        "name": "validate",
+        "startedAt": "2026-09-02T20:41:13Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691141439/job/100449952045",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:48Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711110673/job/100510649633",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:44Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:35Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679396683/job/100412035018",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T20:27:35Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:39:58Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633868/job/100416120256",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T20:40:07Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:46Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679396683/job/100412034490",
+        "name": "distribution",
+        "startedAt": "2026-09-02T20:27:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:40:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33680633868/job/100416070871",
+        "name": "distribution",
+        "startedAt": "2026-09-02T20:40:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(pipeline): opt-in stall watchdog (SIRIUS_QUERY_WATCHDOG_SECS)",
+    "url": "https://github.com/sirius-db/sirius/pull/1699"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 7,
+        "deletions": 1,
+        "path": "CMakeLists.txt"
+      },
+      {
+        "additions": 58,
+        "deletions": 20,
+        "path": "src/sirius_ffi.cpp"
+      },
+      {
+        "additions": 61,
+        "deletions": 8,
+        "path": "test/cpp/exec/test_sirius_ffi_fragment.cpp"
+      }
+    ],
+    "headRefName": "stacked/ffi-transaction-scope",
+    "headRefOid": "98661d7d748b3b73c067fb795377e93e588b4fc5",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1697,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:25:40Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204316/job/100411450598",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T20:25:50Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:25:41Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679205965/job/100411402237",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T20:25:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:26:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204035/job/100411392519",
+        "name": "lint",
+        "startedAt": "2026-09-02T20:25:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:30:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204231/job/100411392963",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:26:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:25:56Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204018/job/100411391329",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T20:25:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691137935/job/100449893984",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711109036/job/100510575136",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:32:28Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204035/job/100411392728",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T20:25:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:53:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204231/job/100412886082",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:31:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:26:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204018/job/100411390965",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T20:26:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691137935/job/100449893802",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:48Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:27Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711109036/job/100510574955",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:30:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204035/job/100411392776",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T20:25:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:32:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204035/job/100413631740",
+        "name": "check",
+        "startedAt": "2026-09-02T20:32:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:53:51Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204231/job/100420489983",
+        "name": "test",
+        "startedAt": "2026-09-02T20:53:47Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:26:29Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679204018/job/100411604989",
+        "name": "validate",
+        "startedAt": "2026-09-02T20:26:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691137935/job/100449952963",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:01Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711109036/job/100510605490",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:25:41Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679205965/job/100411458231",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T20:25:51Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:26:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33679205965/job/100411401458",
+        "name": "distribution",
+        "startedAt": "2026-09-02T20:26:12Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "fix(ffi): own a transaction while lowering a fragment's Substrait plan",
+    "url": "https://github.com/sirius-db/sirius/pull/1697"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 2,
+        "deletions": 0,
+        "path": "CMakeLists.txt"
+      },
+      {
+        "additions": 60,
+        "deletions": 0,
+        "path": "src/include/op/scan/parquet_byte_range.hpp"
+      },
+      {
+        "additions": 64,
+        "deletions": 0,
+        "path": "src/op/scan/parquet_byte_range.cpp"
+      },
+      {
+        "additions": 229,
+        "deletions": 0,
+        "path": "test/cpp/scan/test_parquet_byte_range.cpp"
+      }
+    ],
+    "headRefName": "stacked/scan-byte-range-rule",
+    "headRefOid": "94a77836bb5cb3f8520875aabf179dd7fe1d5787",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1696,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:28Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678883906/job/100410330071",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T20:22:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:31Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678887994/job/100410344296",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T20:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:23:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886308/job/100410337515",
+        "name": "lint",
+        "startedAt": "2026-09-02T20:22:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:27:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886745/job/100410338398",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:23:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678884046/job/100410329426",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T20:22:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691133855/job/100449882349",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711107904/job/100510572669",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:19Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:30:09Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886308/job/100410337470",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T20:23:56Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:49:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886745/job/100411977790",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T20:27:54Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678884046/job/100410328881",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T20:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691133855/job/100449882588",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:34Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711107904/job/100510572612",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:28:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886308/job/100410337367",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T20:24:00Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:30:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886308/job/100412864413",
+        "name": "check",
+        "startedAt": "2026-09-02T20:30:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:50:05Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678886745/job/100419291712",
+        "name": "test",
+        "startedAt": "2026-09-02T20:50:02Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:44Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678884046/job/100410381067",
+        "name": "validate",
+        "startedAt": "2026-09-02T20:22:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691133855/job/100449992344",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:10Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711107904/job/100510625584",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:31Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678887994/job/100410344787",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T20:22:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T20:22:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33678887994/job/100410344148",
+        "name": "distribution",
+        "startedAt": "2026-09-02T20:22:33Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(scan): a deterministic byte-range -> row-group ownership rule",
+    "url": "https://github.com/sirius-db/sirius/pull/1696"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 20,
+        "deletions": 0,
+        "path": "docs/super-sirius/streaming-fragments.md"
+      },
+      {
+        "additions": 8,
+        "deletions": 0,
+        "path": "src/exec/stream_bind_catalog.cpp"
+      },
+      {
+        "additions": 26,
+        "deletions": 0,
+        "path": "src/exec/stream_plan_bindings.cpp"
+      },
+      {
+        "additions": 7,
+        "deletions": 4,
+        "path": "src/exec/streaming_fragment.cpp"
+      },
+      {
+        "additions": 15,
+        "deletions": 0,
+        "path": "src/include/exec/stream_bind_catalog.hpp"
+      },
+      {
+        "additions": 4,
+        "deletions": 0,
+        "path": "src/include/exec/streaming_fragment.hpp"
+      },
+      {
+        "additions": 37,
+        "deletions": 0,
+        "path": "test/cpp/exec/test_stream_bind_catalog.cpp"
+      },
+      {
+        "additions": 151,
+        "deletions": 0,
+        "path": "test/cpp/exec/test_streaming_fragment.cpp"
+      }
+    ],
+    "headRefName": "exec-stream-cardinality",
+    "headRefOid": "f1e8fb17de7e113cf59640d3b60e7ba0dd79c387",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1694,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:29Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605320/job/100135417585",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T05:25:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:30Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594606099/job/100135420435",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T05:25:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:26:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605490/job/100135416767",
+        "name": "lint",
+        "startedAt": "2026-09-02T05:25:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:29:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605520/job/100135416704",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T05:25:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605322/job/100135416438",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T05:25:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:56Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691130377/job/100449871453",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:45Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:26Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711106088/job/100510565678",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:20Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:31:55Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605490/job/100135416948",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T05:25:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:52:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605520/job/100136273268",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T05:31:11Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605322/job/100135416143",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T05:25:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:22Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691130377/job/100449871219",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:36:05Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:24Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711106088/job/100510565767",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:17Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:30:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605490/job/100135416978",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T05:25:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:32:14Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605490/job/100136682993",
+        "name": "check",
+        "startedAt": "2026-09-02T05:32:04Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:52:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605520/job/100140839115",
+        "name": "test",
+        "startedAt": "2026-09-02T05:52:56Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:46Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594605322/job/100135446771",
+        "name": "validate",
+        "startedAt": "2026-09-02T05:25:42Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:36:30Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691130377/job/100450052622",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:36:25Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:43Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711106088/job/100510601841",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:34Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:30Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594606099/job/100135420532",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T05:25:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594606099/job/100135419431",
+        "name": "distribution",
+        "startedAt": "2026-09-02T05:25:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(exec): declare stream input cardinality to DuckDB's optimizer",
+    "url": "https://github.com/sirius-db/sirius/pull/1694"
+  },
+  {
+    "baseRefName": "dev",
+    "files": [
+      {
+        "additions": 2,
+        "deletions": 0,
+        "path": "CMakeLists.txt"
+      },
+      {
+        "additions": 20,
+        "deletions": 0,
+        "path": "docs/super-sirius/configuration.md"
+      },
+      {
+        "additions": 344,
+        "deletions": 0,
+        "path": "src/exec/exchange_staging_arena.cpp"
+      },
+      {
+        "additions": 150,
+        "deletions": 0,
+        "path": "src/include/exec/exchange_staging_arena.hpp"
+      },
+      {
+        "additions": 444,
+        "deletions": 0,
+        "path": "test/cpp/exec/test_exchange_staging_arena.cpp"
+      }
+    ],
+    "headRefName": "exec-exchange-staging-arena",
+    "headRefOid": "1e61c16c0b79d1afd9dc55ff16a8fce25bb9fe81",
+    "isDraft": true,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "number": 1693,
+    "reviewDecision": "REVIEW_REQUIRED",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:27Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603165/job/100135443111",
+        "name": "assign-author",
+        "startedAt": "2026-09-02T05:25:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Auto Assign PR"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:28Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603999/job/100135414140",
+        "name": "cuda-13",
+        "startedAt": "2026-09-02T05:25:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:26:33Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603274/job/100135410387",
+        "name": "lint",
+        "startedAt": "2026-09-02T05:25:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:29:22Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603255/job/100135410181",
+        "name": "build (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T05:25:37Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603183/job/100135410091",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T05:25:30Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691127258/job/100449862805",
+        "name": "pr-title",
+        "startedAt": "2026-09-02T22:35:43Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:20Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711104465/job/100510561046",
+        "name": "pr-title",
+        "startedAt": "2026-09-03T03:22:15Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:31:54Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603274/job/100135410287",
+        "name": "build (x64, gcc, release, default, stable)",
+        "startedAt": "2026-09-02T05:25:40Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:50:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603255/job/100136169748",
+        "name": "test-run (13, default, ubuntu-24.04, true)",
+        "startedAt": "2026-09-02T05:29:28Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:35Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603183/job/100135410158",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T05:25:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691127258/job/100449862662",
+        "name": "pr-body",
+        "startedAt": "2026-09-02T22:35:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:23Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711104465/job/100510561117",
+        "name": "pr-body",
+        "startedAt": "2026-09-03T03:22:17Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:30:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603274/job/100135410406",
+        "name": "build (x64, clang, debug, default, stable)",
+        "startedAt": "2026-09-02T05:25:41Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:32:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603274/job/100136679431",
+        "name": "check",
+        "startedAt": "2026-09-02T05:31:56Z",
+        "status": "COMPLETED",
+        "workflowName": "Check"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:50:42Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603255/job/100140369162",
+        "name": "test",
+        "startedAt": "2026-09-02T05:50:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Test"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:41Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603183/job/100135436914",
+        "name": "validate",
+        "startedAt": "2026-09-02T05:25:38Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T22:35:57Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33691127258/job/100449917329",
+        "name": "validate",
+        "startedAt": "2026-09-02T22:35:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-03T03:22:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33711104465/job/100510591221",
+        "name": "validate",
+        "startedAt": "2026-09-03T03:22:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Validate"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:28Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603999/job/100135414068",
+        "name": "cuda-12",
+        "startedAt": "2026-09-02T05:25:29Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-02T05:25:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/sirius-db/sirius/actions/runs/33594603999/job/100135413544",
+        "name": "distribution",
+        "startedAt": "2026-09-02T05:25:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Distribution"
+      }
+    ],
+    "title": "feat(exec): exchange staging arena for cross-node batch transfer",
+    "url": "https://github.com/sirius-db/sirius/pull/1693"
+  }
+]

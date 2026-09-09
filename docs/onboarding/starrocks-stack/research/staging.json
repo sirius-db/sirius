@@ -1,0 +1,138 @@
+{
+  "architecture_flow": [
+    "sender Fragment::export_packed leases and packs into sender arena",
+    "sender requests a receiver arena lease over PRPC",
+    "NIXL WRITE copies sender lease to receiver lease",
+    "sender sends metadata, sequence, and EOS over transmit_packed",
+    "receiver claims sequence, copies fresh payload into InboundStore pool memory, and releases receiver lease",
+    "receiver dispatches only after every sender EOS; Fragment::push_inbound consumes tickets"
+  ],
+  "invariants": [
+    "leases are aligned, contiguous, and coalesced on release",
+    "sender releases source lease only after WRITE completion or send failure",
+    "receiver claims sequence before touching replayable payload offset",
+    "ticketed inbound data is released by ticket; legacy data by arena lease",
+    "receiver readiness requires EOS from every sender"
+  ],
+  "memory_domains": {
+    "host_disk": "available for normal downgrade but checked-tree inbound tickets are not registered as downgrade candidates",
+    "mig": "one CN per visible device; CUDA device 0 is the process-local registered NIXL device",
+    "pool": "inbound table after copy-out; normal GPU pool accounting, but no ingress admission/spill in checked tree",
+    "staging": "stable cudaMalloc/VMM device slab outside RMM and cuCascade accounting"
+  },
+  "pr_splits": [
+    {
+      "commit": "1e61c16c",
+      "name": "engine staging allocator",
+      "state": "draft PR #1693"
+    },
+    {
+      "commit": "b7452f67",
+      "name": "FFI lease/export/push bridge",
+      "state": "land after allocator"
+    },
+    {
+      "commit": "36072ef8, 9e547c89, 49d23e8a",
+      "name": "CN NIXL registration/transport/warmup",
+      "state": "transport stack"
+    },
+    {
+      "commit": "37360a1b, 698312a1, b00334cb",
+      "name": "receive lifecycle, cancellation, replay",
+      "state": "needs remote-abort fix"
+    },
+    {
+      "commit": "91c0370f",
+      "name": "receive credits",
+      "state": "non-ancestor performance-tree candidate; not audited as a fix"
+    },
+    {
+      "commit": "222b646a",
+      "name": "staged ingress spill",
+      "state": "non-ancestor performance-tree candidate; not audited as a fix"
+    },
+    {
+      "commit": "7412ef4d",
+      "name": "bounded frames and fair transfer",
+      "state": "non-ancestor performance-tree candidate; if adopted, split into protocol, FFI, CN pipeline, telemetry"
+    }
+  ],
+  "review_findings": [
+    {
+      "evidence": [
+        "experimental/starrocks/src/nixl_transport.rs:687-735",
+        "experimental/starrocks/src/compute_node_service.rs:751-758",
+        "experimental/starrocks/src/compute_node_service.rs:841-861"
+      ],
+      "impact": "Receiver arena capacity can be lost permanently; cancellation cannot discover a never-announced lease.",
+      "priority": "P1",
+      "recommended_fix": "Idempotent remote lease-abort keyed by lease identity; invoke it on every post-grant failure and fault-injection-test timeout cleanup.",
+      "title": "Remote lease leaks when WRITE fails after grant"
+    },
+    {
+      "evidence": [
+        "experimental/starrocks/src/compute_node_service.rs:1759-1764",
+        "src/sirius_ffi.cpp:418-469",
+        "plan-2mig/CHECKLIST-2mig.md:21-22"
+      ],
+      "impact": "The EOS barrier permits retained inbound frames to exhaust the normal pool before receiver execution; this is a workload-dependent production-readiness limit.",
+      "priority": "P2",
+      "recommended_fix": "Treat 91c0370f and 222b646a as separate performance-tree candidate designs, not accepted fixes. Rebase, independently review, and validate bounded progress, cancellation, and correctness before adoption.",
+      "title": "Copy-out is an unadmitted GPU-pool capacity gate"
+    },
+    {
+      "evidence": [
+        "src/sirius_ffi.cpp:316-319",
+        "src/sirius_ffi.cpp:435-465"
+      ],
+      "impact": "A stage that copied the raw memory-space pointer before close can use it while the Context is destructing.",
+      "priority": "P1",
+      "recommended_fix": "Track active stages through close or retain an owning lifetime guard; add concurrent teardown coverage.",
+      "title": "Inbound staging can race Context teardown"
+    },
+    {
+      "evidence": [
+        "experimental/starrocks/benchmarks/cluster8.sh:62-64",
+        "plan-2mig/CHECKLIST-2mig.md:15-16"
+      ],
+      "impact": "Documented launch mode currently fails on the target engine.",
+      "priority": "P2",
+      "recommended_fix": "Reject/label UUID mode until engine support exists; document ordinal workaround.",
+      "title": "MIG UUID launcher conflicts with recorded engine behavior"
+    },
+    {
+      "evidence": [
+        "src/include/exec/exchange_staging_arena.hpp:51-63",
+        "docs/super-sirius/configuration.md:569-584"
+      ],
+      "impact": "Cross-host transport support is opt-in without in-tree MNNVL/IMEX validation.",
+      "priority": "P2",
+      "recommended_fix": "Two-host integration test for mapping, transfer correctness, teardown, and partial bring-up failure.",
+      "title": "Fabric allocation is not integration-tested"
+    }
+  ],
+  "scope": {
+    "base_pr": 1693,
+    "branch": "bench/sf500-2-mig-gpus",
+    "commit": "7610840c03f9086edfa072be72a0eb4c96e03d60",
+    "review_type": "static code and history review",
+    "tests_executed": [
+      {
+        "command": "pixi run -e cn cargo test -p sirius-starrocks-cn --no-default-features",
+        "result": "blocked before tests: StarRocks thrift submodule path experimental/starrocks/starrocks/gensrc/thrift is absent"
+      }
+    ]
+  },
+  "tests": {
+    "ci_gap": "CI runs pure Rust no-default-features; C++ GPU and engine/NIXL transport paths are not exercised there.",
+    "executed_by_review": [
+      "Attempted pure-Rust CN test command; build blocked before tests because StarRocks thrift sources are not initialized."
+    ],
+    "present": [
+      "13 GPU Catch2 staging_arena tests",
+      "FFI/engine staging and inbound-store tests",
+      "CN Rust tests for sequence, cancellation, staging tickets, and canary",
+      "ignored GPU/libnixl cross-agent smoke"
+    ]
+  }
+}

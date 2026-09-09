@@ -1,0 +1,333 @@
+{
+  "available_repository_labels": [
+    "IO",
+    "benchmarking",
+    "config",
+    "enhancement",
+    "memory",
+    "multi-gpu",
+    "perf",
+    "rust",
+    "starrocks",
+    "test"
+  ],
+  "collected_date": "2026-09-09",
+  "evidence": {
+    "baseline": "upstream/dev ea1c2783191c0a5a2480665f8a18217dc9d9cba3",
+    "branch": "bench/sf500-2-mig-gpus at 7610840c03f9086edfa072be72a0eb4c96e03d60",
+    "github": "GitHub REST API: repos/sirius-db/sirius/pulls?state=open; filtered author=aocsa; individual PR, files, and check-runs endpoints"
+  },
+  "inventory_scope": "Original 19 drafts before #1737/#1738 publication; see guide-data.json for final assignment.",
+  "issue_context": [
+    {
+      "labels": [
+        "enhancement",
+        "IO",
+        "starrocks",
+        "! - P2"
+      ],
+      "number": 1635,
+      "topic": "split one parquet file by byte range across compute nodes"
+    },
+    {
+      "labels": [
+        "! - P2"
+      ],
+      "number": 1590,
+      "topic": "non-blocking fragment execution and push/pull FFI"
+    }
+  ],
+  "pr_stacks": [
+    {
+      "bases": [
+        "dev",
+        "stacked/scan-byte-range-rule",
+        "stacked/scan-byte-range-ingestible"
+      ],
+      "name": "scan",
+      "prs": [
+        1696,
+        1700,
+        1717
+      ]
+    },
+    {
+      "bases": [
+        "dev",
+        "stacked/ffi-transaction-scope"
+      ],
+      "name": "ffi",
+      "prs": [
+        1697,
+        1702
+      ]
+    },
+    {
+      "bases": [
+        "dev",
+        "stacked/translator-exchange-stream-read",
+        "stacked/translator-two-phase-agg",
+        "stacked/translator-wire-order",
+        "stacked/translator-avg-expansion"
+      ],
+      "name": "translator",
+      "prs": [
+        1708,
+        1709,
+        1710,
+        1711,
+        1713
+      ]
+    },
+    {
+      "bases": [
+        "dev",
+        "stacked/cn-cluster-bringup"
+      ],
+      "name": "compute-node",
+      "prs": [
+        1714,
+        1715
+      ]
+    }
+  ],
+  "prs": [
+    {
+      "additions": 960,
+      "area": "engine / staging arena",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 0,
+      "files": 5,
+      "head": "aocsa:exec-exchange-staging-arena",
+      "number": 1693,
+      "sha": "1e61c16c",
+      "title": "feat(exec): exchange staging arena for cross-node batch transfer"
+    },
+    {
+      "additions": 268,
+      "area": "engine / streaming",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 4,
+      "files": 8,
+      "head": "aocsa:exec-stream-cardinality",
+      "number": 1694,
+      "sha": "f1e8fb17",
+      "title": "feat(exec): declare stream input cardinality to DuckDB's optimizer"
+    },
+    {
+      "additions": 355,
+      "area": "scan",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 0,
+      "files": 4,
+      "head": "sirius-db:stacked/scan-byte-range-rule",
+      "number": 1696,
+      "sha": "94a77836",
+      "title": "feat(scan): a deterministic byte-range -> row-group ownership rule"
+    },
+    {
+      "additions": 126,
+      "area": "ffi",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 29,
+      "files": 3,
+      "head": "sirius-db:stacked/ffi-transaction-scope",
+      "number": 1697,
+      "sha": "98661d7d",
+      "title": "fix(ffi): own a transaction while lowering a fragment's Substrait plan"
+    },
+    {
+      "additions": 222,
+      "area": "engine / pipeline",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 1,
+      "files": 6,
+      "head": "aocsa:pipeline-stall-watchdog",
+      "number": 1699,
+      "sha": "d53b44b1",
+      "title": "feat(pipeline): opt-in stall watchdog (SIRIUS_QUERY_WATCHDOG_SECS)"
+    },
+    {
+      "additions": 242,
+      "area": "scan",
+      "base": "stacked/scan-byte-range-rule",
+      "commits": 1,
+      "deletions": 12,
+      "files": 6,
+      "head": "sirius-db:stacked/scan-byte-range-ingestible",
+      "number": 1700,
+      "sha": "a22235e1",
+      "title": "feat(scan): the parquet ingestible honors a per-file byte range"
+    },
+    {
+      "additions": 891,
+      "area": "ffi / Rust",
+      "base": "stacked/ffi-transaction-scope",
+      "commits": 1,
+      "deletions": 39,
+      "files": 3,
+      "head": "sirius-db:stacked/ffi-fragment-rust",
+      "number": 1702,
+      "sha": "14386a77",
+      "title": "feat(ffi): Rust bindings for sirius::ffi::Fragment and Context"
+    },
+    {
+      "additions": 298,
+      "area": "translator",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 2,
+      "files": 4,
+      "head": "aocsa:translator-clone-expr-narrowed-builtins",
+      "number": 1704,
+      "sha": "27528385",
+      "title": "fix(starrocks): unwrap CLONE_EXPR and cast FE-narrowed builtins to their declared type"
+    },
+    {
+      "additions": 269,
+      "area": "compute node",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 26,
+      "files": 2,
+      "head": "aocsa:cn-files-schema-multi-range",
+      "number": 1705,
+      "sha": "3056cda5",
+      "title": "fix(cn): infer a FILES() schema across every assigned range"
+    },
+    {
+      "additions": 496,
+      "area": "compute node",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 1,
+      "files": 4,
+      "head": "aocsa:cn-transport-tunables",
+      "number": 1706,
+      "sha": "e2d6058d",
+      "title": "feat(cn): a validated registry for the CN's transport tunables"
+    },
+    {
+      "additions": 174,
+      "area": "compute node / build",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 4,
+      "files": 6,
+      "head": "aocsa:cn-exchange-proto-patch",
+      "number": 1707,
+      "sha": "a04bf5bc",
+      "title": "build(cn): carry the Sirius exchange RPCs as a checked-in StarRocks proto patch"
+    },
+    {
+      "additions": 913,
+      "area": "translator",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 46,
+      "files": 7,
+      "head": "sirius-db:stacked/translator-exchange-stream-read",
+      "number": 1708,
+      "sha": "4389e3f9",
+      "title": "feat(starrocks): translate EXCHANGE_NODE as a stream read of the engine's exchange view"
+    },
+    {
+      "additions": 1227,
+      "area": "translator",
+      "base": "stacked/translator-exchange-stream-read",
+      "commits": 1,
+      "deletions": 107,
+      "files": 7,
+      "head": "sirius-db:stacked/translator-two-phase-agg",
+      "number": 1709,
+      "sha": "ce41439d",
+      "title": "feat(starrocks): translate both halves of a two-phase aggregation"
+    },
+    {
+      "additions": 770,
+      "area": "translator",
+      "base": "stacked/translator-two-phase-agg",
+      "commits": 1,
+      "deletions": 14,
+      "files": 2,
+      "head": "sirius-db:stacked/translator-wire-order",
+      "number": 1710,
+      "sha": "50f6636a",
+      "title": "fix(starrocks): emit aggregation keys and sort tuples in materialized slot order"
+    },
+    {
+      "additions": 849,
+      "area": "translator",
+      "base": "stacked/translator-wire-order",
+      "commits": 1,
+      "deletions": 79,
+      "files": 5,
+      "head": "sirius-db:stacked/translator-avg-expansion",
+      "number": 1711,
+      "sha": "5f9349d5",
+      "title": "feat(starrocks): expand a two-phase avg into sum and count states"
+    },
+    {
+      "additions": 1050,
+      "area": "translator",
+      "base": "stacked/translator-avg-expansion",
+      "commits": 1,
+      "deletions": 38,
+      "files": 4,
+      "head": "sirius-db:stacked/translator-carried-common-slots",
+      "number": 1713,
+      "sha": "268b7592",
+      "title": "feat(starrocks): carry consumed common-expr slots past the project that computes them"
+    },
+    {
+      "additions": 1368,
+      "area": "compute node",
+      "base": "dev",
+      "commits": 1,
+      "deletions": 41,
+      "files": 6,
+      "head": "sirius-db:stacked/cn-cluster-bringup",
+      "number": 1714,
+      "sha": "9738b256",
+      "title": "feat(cn): run one compute node per GPU with explicit memory carve-outs and a readiness gate"
+    },
+    {
+      "additions": 405,
+      "area": "compute node",
+      "base": "stacked/cn-cluster-bringup",
+      "commits": 1,
+      "deletions": 15,
+      "files": 1,
+      "head": "sirius-db:stacked/cn-result-store-failure-propagation",
+      "number": 1715,
+      "sha": "a1ac4c58",
+      "title": "feat(cn): fail the result instances the frontend polls when an intermediate fragment fails"
+    },
+    {
+      "additions": 921,
+      "area": "scan / pinned tables",
+      "base": "stacked/scan-byte-range-ingestible",
+      "commits": 1,
+      "deletions": 65,
+      "files": 12,
+      "head": "sirius-db:stacked/scan-pinned-file-subset",
+      "number": 1717,
+      "sha": "6c0b83a1",
+      "title": "feat(scan): serve pinned parquet tables to file-subset scans"
+    }
+  ],
+  "source_tip_committed_at": "2026-09-09T16:57:48Z",
+  "summary": {
+    "all_head_checks_successful": true,
+    "draft_prs": 19,
+    "labeled_prs": 0,
+    "note": "Every PR reported mergeable_state=blocked and rebaseable=false while Draft. This is status, not a merge-conflict finding.",
+    "open_prs_by_aocsa": 19,
+    "ready_prs": 0
+  }
+}

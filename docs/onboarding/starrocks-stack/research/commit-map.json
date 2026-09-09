@@ -1,0 +1,260 @@
+{
+  "baseline": "ea1c2783191c0a5a2480665f8a18217dc9d9cba3",
+  "collected_date": "2026-09-09",
+  "coverage_method": "Each of the 19 live PR head commits is an ancestor of the bench tip. git cherry -v upstream/dev HEAD reports every non-merge commit as '+', so no patch-equivalent landed commit was removed from the count. GitHub's commit-to-pulls endpoint returns no open PR for any uncovered commit.",
+  "covered_by_open_pr": [
+    {
+      "commit": "94a77836",
+      "pr": 1696
+    },
+    {
+      "commit": "f1e8fb17",
+      "pr": 1694
+    },
+    {
+      "commit": "1e61c16c",
+      "pr": 1693
+    },
+    {
+      "commit": "98661d7d",
+      "pr": 1697
+    },
+    {
+      "commit": "d53b44b1",
+      "pr": 1699
+    },
+    {
+      "commit": "a22235e1",
+      "pr": 1700
+    },
+    {
+      "commit": "14386a77",
+      "pr": 1702
+    },
+    {
+      "commit": "3056cda5",
+      "pr": 1705
+    },
+    {
+      "commit": "a04bf5bc",
+      "pr": 1707
+    },
+    {
+      "commit": "27528385",
+      "pr": 1704
+    },
+    {
+      "commit": "e2d6058d",
+      "pr": 1706
+    },
+    {
+      "commit": "4389e3f9",
+      "pr": 1708
+    },
+    {
+      "commit": "ce41439d",
+      "pr": 1709
+    },
+    {
+      "commit": "50f6636a",
+      "pr": 1710
+    },
+    {
+      "commit": "5f9349d5",
+      "pr": 1711
+    },
+    {
+      "commit": "9738b256",
+      "pr": 1714
+    },
+    {
+      "commit": "268b7592",
+      "pr": 1713
+    },
+    {
+      "commit": "6c0b83a1",
+      "pr": 1717
+    },
+    {
+      "commit": "a1ac4c58",
+      "pr": 1715
+    }
+  ],
+  "inventory_scope": "Original 19 drafts before #1737/#1738 publication; see guide-data.json for final assignment.",
+  "range": "upstream/dev..bench/sf500-2-mig-gpus",
+  "range_counts": {
+    "all_commits": 80,
+    "merge_commits": 21,
+    "non_merge_commits": 59,
+    "open_pr_head_commits": 19,
+    "uncovered_non_merge_commits": 40
+  },
+  "source_tip_committed_at": "2026-09-09T16:57:48Z",
+  "tip": "7610840c03f9086edfa072be72a0eb4c96e03d60",
+  "uncovered_groups": [
+    {
+      "commits": [
+        "1e163623",
+        "41c31ec5",
+        "7c30489d",
+        "29df50ef",
+        "92b7eed4",
+        "59ab07c3"
+      ],
+      "dependencies": "No file overlap with live aocsa PRs. The scripts exercise exchange features that still need the core transport series; describe that runtime prerequisite in the PR.",
+      "files": "bench/common/gen-tpch.sh; experimental/starrocks/benchmarks/**; experimental/starrocks/scripts/cn-distribution.py; experimental/starrocks/tools/{compare,oracle}.py",
+      "labels": [
+        "benchmarking",
+        "multi-gpu",
+        "starrocks",
+        "documentation"
+      ],
+      "name": "benchmark-harness-all22-and-GPU-MIG-placement",
+      "recommended_action": "new self-contained fork Draft PR"
+    },
+    {
+      "commits": [
+        "7c18ce8b",
+        "7092f445",
+        "7610840c"
+      ],
+      "dependencies": "None in the patch; its execution instructions depend on the benchmark harness and unlanded transport runtime.",
+      "files": "plan-2mig/** only",
+      "labels": [
+        "documentation",
+        "benchmarking",
+        "multi-gpu",
+        "config"
+      ],
+      "name": "SF500-two-MIG-execution-plan-docs",
+      "recommended_action": "new self-contained fork Draft PR"
+    },
+    {
+      "commits": [
+        "92e91adf",
+        "d88265aa"
+      ],
+      "dependencies": "#1696 then #1700; the translator side also assumes the StarRocks translation base.",
+      "labels": [
+        "starrocks",
+        "IO",
+        "rust"
+      ],
+      "name": "ranges-across-FFI-and-translator",
+      "recommended_action": "landing proposal after scan stack"
+    },
+    {
+      "commits": [
+        "b7452f67"
+      ],
+      "dependencies": "#1693, #1694, #1697, #1702; consumer is CN transport.",
+      "labels": [
+        "rust",
+        "memory"
+      ],
+      "name": "packed-staging-FFI",
+      "recommended_action": "landing proposal after engine/FFI stack"
+    },
+    {
+      "commits": [
+        "85da8f6f",
+        "37b48a46",
+        "86b3f9a6",
+        "36072ef8",
+        "9e547c89",
+        "49d23e8a"
+      ],
+      "dependencies": "#1707 proto patch, #1714/#1715 lifecycle, staging FFI, and exchange translation; order locally is park/dispatch -> PRPC -> NIXL agent -> NIXL transfer -> warm-up.",
+      "labels": [
+        "starrocks",
+        "multi-gpu",
+        "memory",
+        "config"
+      ],
+      "name": "CN-exchange-transport-foundation",
+      "recommended_action": "split into a stacked series, not one integration PR"
+    },
+    {
+      "commits": [
+        "9c002f97",
+        "5b4ee255",
+        "37360a1b"
+      ],
+      "dependencies": "OOM retry change is C++ independent; parked-output and cancellation need the CN exchange foundation.",
+      "labels": [
+        "starrocks",
+        "memory",
+        "stability"
+      ],
+      "name": "pipeline-failure-and-CN-cancellation",
+      "recommended_action": "landing proposals sequenced with CN transport"
+    },
+    {
+      "commits": [
+        "1289a33c",
+        "6f87c304",
+        "a0df9f43",
+        "1661eb5e",
+        "f29f96d4",
+        "73ce2805",
+        "281b13bc",
+        "9ec9df31"
+      ],
+      "dependencies": "Exchange translation and CN dispatch/parking; tests and fixes are part of this series rather than separate PRs.",
+      "labels": [
+        "starrocks",
+        "perf",
+        "test"
+      ],
+      "name": "deferred-fragment-fusion",
+      "recommended_action": "one later stacked series"
+    },
+    {
+      "commits": [
+        "441a03cf",
+        "72fd14af",
+        "c39da5eb",
+        "1e7d6020"
+      ],
+      "dependencies": "RIGHT_SEMI and distinct-state build on translator conventions; decimal aggregate rounding depends on the C++ decimal-cast rounding commit.",
+      "labels": [
+        "starrocks",
+        "rust",
+        "test"
+      ],
+      "name": "translator-and-expression-completeness",
+      "recommended_action": "small independently reviewable PRs after translator base"
+    },
+    {
+      "commits": [
+        "50f2691d",
+        "698312a1",
+        "c91d0a84",
+        "b00334cb",
+        "5e71059c",
+        "98b49df9"
+      ],
+      "dependencies": "CN exchange foundation; receive-pool additionally consumes packed-batch FFI. The last three are correctness/review fixes and should follow their feature commits.",
+      "labels": [
+        "starrocks",
+        "rust",
+        "perf",
+        "stability"
+      ],
+      "name": "multicast-reused-CTE-and-receive-pool",
+      "recommended_action": "later CN/FFI series"
+    },
+    {
+      "commits": [
+        "4496bfe9"
+      ],
+      "dependencies": "#98b49df9's descriptor/transaction correction must be folded or follow in the same review sequence.",
+      "labels": [
+        "perf",
+        "test"
+      ],
+      "name": "dense-count-join",
+      "recommended_action": "small C++ PR after its integration fix"
+    }
+  ]
+}

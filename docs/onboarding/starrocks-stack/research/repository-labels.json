@@ -1,0 +1,110 @@
+[
+  {
+    "name": "bug"
+  },
+  {
+    "name": "documentation"
+  },
+  {
+    "name": "duplicate"
+  },
+  {
+    "name": "enhancement"
+  },
+  {
+    "name": "good first issue"
+  },
+  {
+    "name": "help wanted"
+  },
+  {
+    "name": "invalid"
+  },
+  {
+    "name": "question"
+  },
+  {
+    "name": "wontfix"
+  },
+  {
+    "name": "dependencies"
+  },
+  {
+    "name": "github_actions"
+  },
+  {
+    "name": "ci"
+  },
+  {
+    "name": "doris"
+  },
+  {
+    "name": "memory"
+  },
+  {
+    "name": "IO"
+  },
+  {
+    "name": "duckdb"
+  },
+  {
+    "name": "benchmarking"
+  },
+  {
+    "name": "! - breaking"
+  },
+  {
+    "name": "quent"
+  },
+  {
+    "name": "multi-gpu"
+  },
+  {
+    "name": "stability"
+  },
+  {
+    "name": "starrocks"
+  },
+  {
+    "name": "telemetry"
+  },
+  {
+    "name": "rust"
+  },
+  {
+    "name": "dynamic-filters"
+  },
+  {
+    "name": "! - DO NOT MERGE"
+  },
+  {
+    "name": "! - depends"
+  },
+  {
+    "name": "chore"
+  },
+  {
+    "name": "cmake"
+  },
+  {
+    "name": "test"
+  },
+  {
+    "name": "perf"
+  },
+  {
+    "name": "config"
+  },
+  {
+    "name": "! - P0"
+  },
+  {
+    "name": "! - P1"
+  },
+  {
+    "name": "! - P2"
+  },
+  {
+    "name": "! - P3"
+  }
+]

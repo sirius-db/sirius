@@ -1,0 +1,212 @@
+{
+  "draft_prs": [
+    {
+      "area": "translator-expression",
+      "commit": "27528385",
+      "feature": "CLONE_EXPR and FE-narrowed builtin casts",
+      "pr": 1704
+    },
+    {
+      "area": "cn-scan",
+      "commit": "3056cda5",
+      "feature": "FILES schema across all ranges",
+      "pr": 1705
+    },
+    {
+      "area": "cn-config",
+      "commit": "e2d6058d",
+      "feature": "validated transport tunables",
+      "pr": 1706
+    },
+    {
+      "area": "cn-proto",
+      "commit": "a04bf5bc",
+      "feature": "checked-in exchange RPC patch",
+      "pr": 1707
+    },
+    {
+      "area": "translator-exchange",
+      "commit": "4389e3f9",
+      "feature": "EXCHANGE_NODE stream ReadRel",
+      "pr": 1708
+    },
+    {
+      "area": "translator-aggregation",
+      "commit": "ce41439d",
+      "feature": "two-phase phase/type model",
+      "pr": 1709
+    },
+    {
+      "area": "translator-layout",
+      "commit": "50f6636a",
+      "feature": "materialized-slot wire order",
+      "pr": 1710
+    },
+    {
+      "area": "translator-aggregation",
+      "commit": "5f9349d5",
+      "feature": "avg sum/count expansion",
+      "pr": 1711
+    },
+    {
+      "area": "translator-project",
+      "commit": "268b7592",
+      "feature": "carried common slots",
+      "pr": 1713
+    },
+    {
+      "area": "cn-deployment",
+      "commit": "9738b256",
+      "feature": "per-GPU CN readiness and carve-outs",
+      "pr": 1714
+    },
+    {
+      "area": "cn-results",
+      "commit": "a1ac4c58",
+      "feature": "intermediate failure reaches result poll",
+      "pr": 1715
+    }
+  ],
+  "follow_up_pr_groups": [
+    {
+      "commits": [
+        "85da8f6f",
+        "37b48a46",
+        "86b3f9a6",
+        "36072ef8",
+        "9e547c89",
+        "49d23e8a"
+      ],
+      "name": "CN exchange lifecycle"
+    },
+    {
+      "commits": [
+        "5b4ee255",
+        "37360a1b",
+        "a0df9f43",
+        "c91d0a84",
+        "5e71059c"
+      ],
+      "name": "CN cleanup and FE failure"
+    },
+    {
+      "commits": [
+        "1289a33c",
+        "6f87c304",
+        "1661eb5e",
+        "f29f96d4",
+        "73ce2805",
+        "281b13bc"
+      ],
+      "name": "Local fragment fusion"
+    },
+    {
+      "commits": [
+        "698312a1",
+        "b00334cb"
+      ],
+      "name": "Inbound pool staging"
+    },
+    {
+      "commits": [
+        "441a03cf",
+        "72fd14af",
+        "1e7d6020",
+        "98b49df9",
+        "4496bfe9"
+      ],
+      "name": "Translator coverage and numeric correctness"
+    },
+    {
+      "commits": [
+        "50f2691d",
+        "29df50ef",
+        "9ec9df31"
+      ],
+      "name": "Multicast CTE and async senders"
+    },
+    {
+      "commits": [
+        "92b7eed4",
+        "59ab07c3",
+        "7c18ce8b",
+        "7092f445",
+        "7610840c"
+      ],
+      "name": "MIG/SF500 operations"
+    }
+  ],
+  "key_sources": [
+    {
+      "line": 266,
+      "path": "experimental/starrocks/crates/starrocks-plan-translator/src/lib.rs",
+      "role": "fragment translation/root validation"
+    },
+    {
+      "line": 650,
+      "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs",
+      "role": "exchange stream read"
+    },
+    {
+      "line": 39,
+      "path": "experimental/starrocks/crates/starrocks-plan-translator/src/agg_phase.rs",
+      "role": "aggregation phase classifier"
+    },
+    {
+      "line": 1,
+      "path": "experimental/starrocks/crates/starrocks-plan-translator/src/partial_state.rs",
+      "role": "wire-state model"
+    },
+    {
+      "line": 2310,
+      "path": "experimental/starrocks/crates/starrocks-plan-translator/src/node_translator.rs",
+      "role": "common-slot carrying"
+    },
+    {
+      "line": 746,
+      "path": "experimental/starrocks/src/compute_node_service.rs",
+      "role": "remote receive and staging"
+    },
+    {
+      "line": 241,
+      "path": "experimental/starrocks/src/local_exchange.rs",
+      "role": "receiver-first rendezvous"
+    },
+    {
+      "line": 1083,
+      "path": "experimental/starrocks/src/compute_node_service.rs",
+      "role": "query failure lifecycle"
+    },
+    {
+      "line": 1860,
+      "path": "experimental/starrocks/src/compute_node_service.rs",
+      "role": "deferred-plan fusion"
+    }
+  ],
+  "review": {
+    "acceptance_priority": [
+      "initialize submodule and apply proto patch",
+      "translator/CN tests",
+      "two-phase aggregate",
+      "common slots",
+      "forced CTE reuse",
+      "remote replay/cancel",
+      "SF500 2-MIG run"
+    ],
+    "confirmed_findings": [],
+    "diff_check": "passed",
+    "known_boundaries": [
+      "ResultStore is deliberately single-batch and single-poller (experimental/starrocks/src/result_store.rs:281)."
+    ],
+    "test_status": "blocked: starrocks/gensrc/thrift missing from submodule; translator crate could not compile"
+  },
+  "reviewed": {
+    "base": "upstream/dev ea1c2783",
+    "branch": "bench/sf500-2-mig-gpus",
+    "head": "7610840c",
+    "scope": [
+      "experimental/starrocks/crates/starrocks-plan-translator",
+      "experimental/starrocks/src"
+    ]
+  }
+}

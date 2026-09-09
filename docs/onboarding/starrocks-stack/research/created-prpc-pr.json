@@ -1,0 +1,35 @@
+{
+  "base": "sirius-db:sirius/dev",
+  "changed_file": "experimental/starrocks/src/brpc.rs",
+  "created_at": "2026-09-09T17:38:12Z",
+  "diff": {
+    "additions": 135,
+    "deletions": 17
+  },
+  "draft": true,
+  "extraction": {
+    "cherry_pick": "clean",
+    "interface_prerequisite": "The code compiles/tests without the peer PRPC client. Its motivating FE-to-CN exchange/cancellation workflow needs #1707's exchange RPC interface or its landed equivalent, plus the later distributed CN runtime.",
+    "self_contained": true,
+    "stable_patch_id_source_and_extraction": "69e9aca3094dcf6ba5bc8fa7d625f9a49ea479cb"
+  },
+  "file_count": 1,
+  "head": "aocsa:codex/cn-concurrent-prpc",
+  "labels": [
+    "starrocks",
+    "rust",
+    "perf"
+  ],
+  "number": 1739,
+  "pr_commit": "a9869aee4fc43d923fdc1d758b70786eaddcfa50",
+  "source_baseline": "upstream/dev ea1c2783191c0a5a2480665f8a18217dc9d9cba3",
+  "source_commit": "5e71059cf0817285dfe01dcc3f77c62f10055c1b",
+  "state": "open",
+  "title": "fix(cn): serve concurrent PRPC requests on one connection",
+  "url": "https://github.com/sirius-db/sirius/pull/1739",
+  "validation": {
+    "diff_check": "PASS: git diff --check upstream/dev...HEAD",
+    "format": "PASS: pixi run cargo fmt --manifest-path /tmp/sirius-prpc-concurrency-pr/experimental/starrocks/Cargo.toml --check",
+    "tests": "Not run: standalone extraction clone has no initialized StarRocks submodule; no GPU build or rebuild was warranted."
+  }
+}

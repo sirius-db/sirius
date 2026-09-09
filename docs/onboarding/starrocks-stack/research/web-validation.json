@@ -1,0 +1,63 @@
+{
+  "browser": "Playwright Chromium",
+  "checkedAt": "2026-09-09T17:41:13.084Z",
+  "errors": [],
+  "results": [
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "light",
+      "width": 360
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "light",
+      "width": 736
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "light",
+      "width": 1024
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "light",
+      "width": 1440
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "dark",
+      "width": 360
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "dark",
+      "width": 736
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "dark",
+      "width": 1024
+    },
+    {
+      "chapters": 7,
+      "horizontalOverflow": "none",
+      "interactions": "PASS",
+      "theme": "dark",
+      "width": 1440
+    }
+  ]
+}
