@@ -30,6 +30,7 @@
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
 
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -155,6 +156,26 @@ cudf::data_type pin_native_type(cudf::data_type decoded_type,
   if (declared_type == nullptr) { return decoded_type; }
   auto const native = sirius::try_get_cudf_type(sirius::from_duckdb(*declared_type));
   return native.value_or(decoded_type);
+}
+
+std::unique_ptr<cudf::table> cluster_pin_chunk(std::unique_ptr<cudf::table> table,
+                                               std::span<std::size_t const> key_columns,
+                                               rmm::cuda_stream_view stream,
+                                               rmm::device_async_resource_ref mr)
+{
+  if (!table || table->num_rows() == 0) { return table; }
+  std::vector<cudf::size_type> keys;
+  keys.reserve(key_columns.size());
+  for (auto const column : key_columns) {
+    if (column < static_cast<std::size_t>(table->num_columns())) {
+      keys.push_back(static_cast<cudf::size_type>(column));
+    }
+  }
+  if (keys.empty()) { return table; }
+  nvtx3::scoped_range range{"sirius::pin::cluster"};
+  // Unstable: ties may land in any order, and clustering only cares that equal keys end up
+  // adjacent. Ascending with nulls first, which is what an unspecified order gives.
+  return cudf::sort_by_key(table->view(), table->view().select(keys), {}, {}, stream, mr);
 }
 
 namespace {
@@ -314,6 +335,13 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     auto const chunk_rows = static_cast<std::size_t>(tbl->num_rows());
     validate_duckdb_pin_chunk(*batch, chunk_rows, rows_materialized);
     rows_materialized += chunk_rows;
+    // Cluster BEFORE anything observes the chunk: the zone maps below must describe the order the
+    // rows are stored in, and every id handed out downstream (late-mat's, the compressor's chunk
+    // grid) is positional against it.
+    if (!options.cluster_key_columns.empty()) {
+      tbl = cluster_pin_chunk(
+        std::move(tbl), options.cluster_key_columns, stream, target->get_default_allocator());
+    }
     // Zone-map capture, while the decode device guard + stream are active and the
     // GPU table is alive. The scalar downloads inside are synchronous, so the
     // capture is complete before the sink converts or frees the table. Clean

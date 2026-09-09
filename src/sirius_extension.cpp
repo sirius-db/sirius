@@ -1176,6 +1176,16 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  auto cluster_it = input.named_parameters.find("cluster_by");
+  if (cluster_it != input.named_parameters.end() && !cluster_it->second.IsNull()) {
+    for (auto& val : ListValue::GetChildren(cluster_it->second)) {
+      if (val.IsNull()) {
+        throw BinderException("pin_table 'cluster_by' list cannot contain NULL entries");
+      }
+      result->args.cluster_by.push_back(val.ToString());
+    }
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1444,6 +1454,40 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
 
+  // cluster_by: sort each pin chunk on these columns so its zone maps describe a narrow range.
+  // Resolved here, where the pinned column list exists, so the materializer takes positions and
+  // never has to match names.
+  std::vector<std::size_t> cluster_key_columns;
+  if (!data.args.cluster_by.empty()) {
+    if (data.args.format == "duckdb") {
+      // A duckdb-native pin's rows stay addressable by DuckDB row id: the deleted-row keep-masks
+      // are positional against the pinned order (validate_duckdb_pin_chunk exists to keep each
+      // chunk a contiguous row-id range). Reordering rows would misapply those masks silently.
+      throw InvalidInputException(
+        "pin_table: 'cluster_by' is not supported for duckdb-native pins, whose rows must stay in "
+        "table order for deleted-row masks to apply");
+    }
+    for (auto const& key : data.args.cluster_by) {
+      auto const it = std::find(pinned_column_names.begin(), pinned_column_names.end(), key);
+      if (it == pinned_column_names.end()) {
+        throw InvalidInputException("pin_table: cluster_by column '" + key +
+                                    "' is not among the pinned columns of '" + data.args.name +
+                                    "'");
+      }
+      cluster_key_columns.push_back(
+        static_cast<std::size_t>(std::distance(pinned_column_names.begin(), it)));
+    }
+    if (zone_map_group_rows == 0) {
+      // A locally sorted chunk still spans the whole key range, so it prunes exactly nothing at
+      // chunk granularity -- the clustering only pays through the per-group index
+      // (CHUNK_SKIPPING_PLAN.md 5.2 measures 72.7% of chunks pruned at G=8 against 0.0% here).
+      SIRIUS_LOG_WARN(
+        "[pin_table] '{}': cluster_by is set but pinned_zone_map_group_rows is 0; a per-chunk "
+        "sort prunes nothing at chunk granularity, so this will cost the sort and save nothing",
+        data.args.name);
+    }
+  }
+
   // Record what the probe proved, by name (see attach_proven_unique_columns on
   // why not by position). A no-op when the probe was off.
   //
@@ -1510,7 +1554,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .group_rows                        = zone_map_group_rows,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .cluster_key_columns               = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
@@ -1544,7 +1589,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       {.capture_chunk_stats               = capture_chunk_stats,
        .group_rows                        = zone_map_group_rows,
        .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
+       .probe_unique_columns              = probe_unique_columns,
+       .cluster_key_columns               = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(dev_result.column_storage));
 
@@ -1568,7 +1614,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                                pinned_column_types,
                                                {.capture_chunk_stats = capture_chunk_stats,
                                                 .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
+                                                .probe_unique_columns = probe_unique_columns,
+                                                .cluster_key_columns  = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
@@ -2485,6 +2532,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table.named_parameters["cluster_by"]  = LogicalType::LIST(LogicalType::VARCHAR);
     pin_table_set.AddFunction(std::move(pin_table));
   };
   add_pin_table_overload({LogicalType::VARCHAR});

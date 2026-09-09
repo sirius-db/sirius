@@ -19,7 +19,11 @@
 #include "late_mat/pin_uniqueness.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -47,6 +51,13 @@ struct PinTableArgs {
   /// duckdb-native only: schema that contains the table named by `name`. Defaults
   /// to "main"; the catalog search path (current/USE'd database) still applies.
   std::string schema = "main";
+  /// Columns to cluster each pin chunk on, in sort-key order. Empty pins in source order.
+  ///
+  /// Zone maps only prune when a chunk's values are narrow, and TPC-H as generated prunes 0.00%
+  /// because every chunk spans the whole key range. Sorting the FILES does not fix that (the scan
+  /// coalescer interleaves row groups), so clustering has to happen here — see
+  /// CHUNK_SKIPPING_PLAN.md 5.
+  std::vector<std::string> cluster_by;
 };
 
 void pin_table_to(const PinTableArgs& args);
@@ -165,6 +176,31 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
 [[nodiscard]] cudf::data_type pin_native_type(cudf::data_type decoded_type,
                                               duckdb::LogicalType const* declared_type);
 
+/**
+ * @brief Sort one materialized pin chunk on @p key_columns, so its zone maps describe a narrow
+ * range of the key space instead of all of it.
+ *
+ * The cheapest clustering strategy there is: each chunk independently, no shuffle, one gather over
+ * bytes the pin is already moving. It leaves every chunk spanning the whole key range, so it
+ * prunes NOTHING at chunk granularity and everything it buys comes through the per-group index —
+ * see CHUNK_SKIPPING_PLAN.md 5.2, which measures 72.7% of chunks pruned at G=8 against 0.0% at
+ * chunk granularity.
+ *
+ * Declared here to be unit-testable; the pin drivers call it from materialize_pin_batches, before
+ * anything observes the chunk.
+ *
+ * @param table Chunk to reorder. Returned unchanged when it is empty or has no rows.
+ * @param key_columns Positions to sort on, in key order. Empty returns @p table unchanged; a
+ *                    position past the chunk's width is skipped, since pinning in source order is
+ *                    always correct.
+ * @return The chunk with every column gathered into the key's ascending order.
+ */
+[[nodiscard]] std::unique_ptr<cudf::table> cluster_pin_chunk(
+  std::unique_ptr<cudf::table> table,
+  std::span<std::size_t const> key_columns,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
 /// Per-pin materialization behavior, sampled from config at pin time.
 struct pin_materialization_options {
   bool capture_chunk_stats = true;  ///< capture zone-map statistics per chunk
@@ -180,6 +216,15 @@ struct pin_materialization_options {
   /// leaves the probe off, which is the default; the caller derives it from
   /// @c late_mat::pin_unique_probe_selection.
   std::vector<bool> probe_unique_columns;
+  /// Positions (into the pinned columns) to sort each materialized chunk on, in key order.
+  /// Empty leaves every chunk in source order, which is the default.
+  ///
+  /// A LOCAL sort — each chunk independently, no shuffle — because that is what fits the
+  /// streaming pin: measured at ~2.3 s for SF1000 lineitem against a ~151 s pin, and within 0.8
+  /// points of a global sort's pruning PROVIDED the zone-map index is per-group rather than
+  /// per-chunk (a locally sorted chunk still spans the whole key range, so it prunes exactly
+  /// nothing at chunk granularity). See CHUNK_SKIPPING_PLAN.md 5.2.
+  std::vector<std::size_t> cluster_key_columns;
 };
 
 /// Drive @p ingestible 's metadata walk + batch coalescer to completion on @p io_ctx,

@@ -348,6 +348,71 @@ sirius::op::scan::duckdb_row_group_metadata make_rg(duckdb::idx_t index,
 
 }  // namespace
 
+TEST_CASE_METHOD(PinMvccFixture,
+                 "pin_table cluster_by - a clustered parquet pin serves the same rows",
+                 "[integration][gpu_execution][pin_table][clustering]")
+{
+  // Clustering REORDERS the rows a pin stores. Nothing downstream may notice: the zone maps are
+  // captured after the sort, and every id handed out later is positional against the stored order.
+  // A shuffled key with a range predicate is the case where a mis-sorted chunk would show up as
+  // missing or duplicated rows rather than as an error.
+  namespace fs   = std::filesystem;
+  auto const dir = fs::temp_directory_path() / ("sirius_cluster_" + std::to_string(getpid()));
+  fs::create_directories(dir);
+  auto const parquet = (dir / "clustered.parquet").string();
+
+  run_ok(
+    "COPY (SELECT (range * 7919) % 100000 AS k, range AS payload FROM range(100000) "
+    "ORDER BY hash(range)) TO '" +
+    parquet + "' (FORMAT PARQUET);");
+  run_ok("CREATE VIEW cluster_t AS SELECT * FROM read_parquet('" + parquet + "');");
+  run_ok("CALL pin_table('" + parquet + "', tier='gpu', name='cluster_t', cluster_by=['k']);");
+
+  compare_gpu_vs_cpu("SELECT count(*), sum(k), sum(payload) FROM cluster_t;");
+  // The range predicate is what a zone map prunes on, and `payload` proves each surviving row
+  // kept its own value rather than another row's.
+  compare_gpu_vs_cpu(
+    "SELECT count(*), sum(payload) FROM cluster_t WHERE k BETWEEN 40000 AND 40999;");
+  compare_gpu_vs_cpu("SELECT k, payload FROM cluster_t WHERE k < 20;");
+
+  run_ok("CALL unpin_table('cluster_t');");
+  fs::remove_all(dir);
+}
+
+TEST_CASE_METHOD(PinMvccFixture,
+                 "pin_table cluster_by - refuses a key that is not pinned, and duckdb-native pins",
+                 "[integration][gpu_execution][pin_table][clustering]")
+{
+  namespace fs   = std::filesystem;
+  auto const dir = fs::temp_directory_path() / ("sirius_cluster_bad_" + std::to_string(getpid()));
+  fs::create_directories(dir);
+  auto const parquet = (dir / "bad.parquet").string();
+  run_ok("COPY (SELECT range AS k, range AS payload FROM range(1000)) TO '" + parquet +
+         "' (FORMAT PARQUET);");
+
+  // A key the pin does not carry would otherwise sort by nothing and silently pin unclustered.
+  auto missing =
+    con->Query("CALL pin_table('" + parquet + "', tier='gpu', name='bad_t', cluster_by=['nope']);");
+  REQUIRE(missing->HasError());
+  REQUIRE(missing->GetError().find("cluster_by") != std::string::npos);
+
+  // Only the columns actually pinned count as carried.
+  auto unpinned = con->Query("CALL pin_table('" + parquet +
+                             "', tier='gpu', name='bad_t', cols=['k'], cluster_by=['payload']);");
+  REQUIRE(unpinned->HasError());
+
+  // A duckdb-native pin keeps its rows addressable by DuckDB row id — the deleted-row keep-masks
+  // are positional against the pinned order, so reordering would misapply them silently.
+  run_ok("CREATE TABLE cluster_native_t AS SELECT range AS k FROM range(1000);");
+  run_ok("CHECKPOINT;");
+  auto native = con->Query(
+    "CALL pin_table(format='duckdb', name='cluster_native_t', tier='gpu', cluster_by=['k']);");
+  REQUIRE(native->HasError());
+  REQUIRE(native->GetError().find("duckdb-native") != std::string::npos);
+
+  fs::remove_all(dir);
+}
+
 TEST_CASE("pin_table mvcc - chunk validator accepts contiguous whole row groups",
           "[pin_table_mvcc]")
 {
