@@ -28,6 +28,7 @@
 
 #include <catch.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -158,6 +159,52 @@ std::vector<uint8_t> build_dv_blob(int32_t key)
   return blob;
 }
 
+/// A deletion-vector-v1 blob whose single container is a BITSET holding @p set_bits set bits,
+/// while its descriptive header DECLARES @p declared_cardinality values.
+///
+/// Roaring picks a bitset container above 4096 values, and the portable format stores that
+/// container's cardinality as a number rather than deriving it from the bits. So the two can
+/// disagree, and nothing in the container's own bytes is malformed when they do -- which is why
+/// `roaring_bitmap_portable_deserialize_size` and `readSafe` both accept this and the CRC is
+/// perfectly valid over it.
+std::vector<uint8_t> build_dv_blob_bitset(uint32_t declared_cardinality, uint32_t set_bits)
+{
+  constexpr uint32_t kSerialCookieNoRunContainer = 12346;
+  constexpr size_t kBitsetBytes                  = 8192;
+
+  std::vector<uint8_t> roaring32;
+  push_u32_le(roaring32, kSerialCookieNoRunContainer);
+  push_u32_le(roaring32, 1);  // one container
+  push_u16_le(roaring32, 0);  // container key (high 16 bits of the low word)
+  push_u16_le(roaring32, static_cast<uint16_t>(declared_cardinality - 1));
+  // Offset header: where the container's bytes start, counted from the cookie. cookie + size +
+  // one descriptive pair + one offset = 16.
+  push_u32_le(roaring32, 16);
+
+  std::vector<uint8_t> bitset(kBitsetBytes, 0);
+  if (set_bits == kBitsetBytes * 8) {
+    std::fill(bitset.begin(), bitset.end(), 0xFF);
+  } else {
+    // Bit 5 alone, so the container is legibly a single position and nothing else.
+    REQUIRE(set_bits == 1);
+    bitset[0] = 0x20;
+  }
+  roaring32.insert(roaring32.end(), bitset.begin(), bitset.end());
+
+  std::vector<uint8_t> checksummed = {0xD1, 0xD3, 0x39, 0x64};
+  for (int i = 0; i < 8; ++i) {
+    checksummed.push_back(i == 0 ? 1 : 0);  // num_bitmaps = 1, little-endian
+  }
+  push_u32_le(checksummed, 0);  // bitmap key 0
+  checksummed.insert(checksummed.end(), roaring32.begin(), roaring32.end());
+
+  std::vector<uint8_t> blob;
+  push_u32_be(blob, static_cast<uint32_t>(checksummed.size()));
+  blob.insert(blob.end(), checksummed.begin(), checksummed.end());
+  push_u32_be(blob, crc32_of(checksummed));
+  return blob;
+}
+
 /// Wraps @p blob in a real Puffin container whose footer agrees with it. @p fields_json is spelled
 /// out because it is the one descriptor field with no other way to get it wrong.
 std::string write_puffin(std::vector<uint8_t> const& blob,
@@ -191,13 +238,15 @@ std::string write_puffin(std::vector<uint8_t> const& blob,
 }
 
 /// A manifest entry pointing at a synthesized file, correct in every field.
-DeletionVectorRef synthetic_ref(std::string const& path, std::vector<uint8_t> const& blob)
+DeletionVectorRef synthetic_ref(std::string const& path,
+                                std::vector<uint8_t> const& blob,
+                                int64_t record_count = 1)
 {
   return {.puffin_path           = path,
           .content_offset        = 4,
           .content_size_in_bytes = static_cast<int64_t>(blob.size()),
           .referenced_data_file  = fixture_data_file_path(),
-          .record_count          = 1};
+          .record_count          = record_count};
 }
 
 }  // namespace
@@ -315,6 +364,33 @@ TEST_CASE("puffin reader rejects a bitmap key with bit 31 set", "[scan][iceberg]
   auto const bad_blob = build_dv_blob(std::numeric_limits<int32_t>::min());
   auto const bad_path = write_puffin(bad_blob, "key_int32_min", 1);
   REQUIRE_THROWS(read_deletion_vector(synthetic_ref(bad_path, bad_blob)));
+}
+
+TEST_CASE("puffin reader rejects a bitset declaring fewer values than it holds", "[scan][iceberg]")
+{
+  // Declared 4098, actually all 65,536 bits set. `bitset_container_read` trusts the declared
+  // number, so cardinality() answers 4098 and the destination is sized to 4098 -- then
+  // toUint32Array(), which takes no capacity argument, emits 65,536 values into it. The
+  // record_count cross-check only runs on what survives that write.
+  constexpr uint32_t kDeclared = 4098;
+  auto const blob              = build_dv_blob_bitset(kDeclared, 8192 * 8);
+  auto const path              = write_puffin(blob, "bitset_under_declared", kDeclared);
+
+  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(path, blob, kDeclared)));
+}
+
+TEST_CASE("puffin reader rejects a bitset declaring more values than it holds", "[scan][iceberg]")
+{
+  // The mirror image, and the one that returns a WRONG ANSWER rather than corrupting memory:
+  // declared 4098 with a single bit set. resize() leaves 4097 zero-initialized tail entries,
+  // extraction writes only the value 5, and every remaining zero reads as delete position 0. The
+  // list is still sorted and its size still equals record_count, so nothing downstream objects and
+  // row 0 is dropped from a table that keeps it.
+  constexpr uint32_t kDeclared = 4098;
+  auto const blob              = build_dv_blob_bitset(kDeclared, 1);
+  auto const path              = write_puffin(blob, "bitset_over_declared", kDeclared);
+
+  REQUIRE_THROWS(read_deletion_vector(synthetic_ref(path, blob, kDeclared)));
 }
 
 TEST_CASE("puffin reader rejects an entry with no record_count", "[scan][iceberg]")

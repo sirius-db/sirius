@@ -122,6 +122,23 @@ size_t deserialize_roaring32(const uint8_t* data,
   roaring::Roaring bitmap =
     roaring::Roaring::readSafe(reinterpret_cast<const char*>(data), bitmap_size);
 
+  // readSafe bounds the READ; it does not check the bitmap's internal invariants. A bitset
+  // container carries its cardinality as a stored number and `bitset_container_read` copies it
+  // without recomputing the popcount, so a declared cardinality that disagrees with the bits is
+  // accepted here and only discovered by what reads it. Both directions are live:
+  // over-declaring leaves a zero-filled tail that materializes as delete position 0 and removes a
+  // row the table keeps, and under-declaring sizes the destination below what `toUint32Array`
+  // emits -- and that call takes no output-capacity argument, so it writes past the end. The
+  // record_count cross-check runs after both.
+  //
+  // The Puffin CRC does not establish trust: the file supplies it alongside the bytes it covers.
+  const char* validation_failure = nullptr;
+  if (!roaring::api::roaring_bitmap_internal_validate(&bitmap.roaring, &validation_failure)) {
+    throw std::runtime_error(
+      "roaring: inconsistent bitmap in the deletion vector: " +
+      std::string(validation_failure == nullptr ? "unknown reason" : validation_failure));
+  }
+
   uint64_t const cardinality = bitmap.cardinality();
   if (cardinality > max_out || out.size() > max_out - cardinality) {
     throw std::runtime_error(
