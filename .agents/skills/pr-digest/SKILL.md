@@ -1,13 +1,13 @@
 ---
 name: pr-digest
-description: Create a navigable Markdown learning digest for a GitHub pull request, explaining what changed, why, and where it lives with line-accurate links and trimmed diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
+description: Create a context-first, navigable Markdown learning digest for a GitHub pull request, explaining the before/after behavior, change flow, key changes, and where they live with line-accurate links and trimmed diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
 ---
 
 # PR Digest
 
-Turns a GitHub PR link into a digest document a reviewer can actually learn from: ranked key
-changes, each with what/why/where-invoked/diff, all cross-referenced with clickable links into
-the actual checked-out source.
+Turns a GitHub PR link into a digest document a reviewer can actually learn from: an opening
+before/after example and flowchart establish the mental model, then ranked key changes explain
+what/why/where-invoked/diff with clickable links into the actual checked-out source.
 
 Comprehension is the whole job here. This skill does not judge the PR — no bug-hunting, no "is
 this a race condition" adversarial pass, no verdict on whether the change is good. That's a
@@ -122,11 +122,52 @@ important than a small new file that IS the actual feature.
   distinct *concepts* does it change? A 100-file PR implementing one idea can be 1–2 key changes;
   a 10-file PR bundling five unrelated fixes needs five.
 - Pure file-relocation diffs (moved with no logic change) don't deserve a key-change slot — they
-  get their own dedicated section instead (Step 8).
+  get their own dedicated section instead (Step 9).
 
-## Step 6 — Write the key-change overview list
+## Step 6 — Orient the reader with a before/after example and a diagram
 
-Immediately after the plain-language summary, before any detailed section, list the key changes
+Immediately after the plain-language summary, add two short orientation sections. Both are
+required and must appear before "Key changes at a glance" so a reader sees the behavior and flow
+before encountering implementation vocabulary.
+
+### Before and after
+
+Show one concrete scenario twice: the same query, plan shape, request, input rows, configuration,
+or error path before the PR and after it. Prefer an example supplied by the PR author or its tests.
+If none exists, synthesize the smallest example supported by code you traced, label it
+**Illustrative**, and cite the supporting code anchors. Never invent an API, benchmark result,
+production symptom, or semantic guarantee.
+
+Use a compact table or paired snippets. Make these four facts easy to find:
+
+- the unchanged starting condition;
+- what happened before;
+- what happens after;
+- what stays unchanged or what fallback still applies.
+
+Keep the example at the user-visible, query-plan-visible, or data-flow-visible level. Detailed
+class and function names belong in the later key-change sections.
+
+### Flow at a glance
+
+Add one Mermaid diagram using the diagram type that best explains the change: usually `flowchart`
+for control/data flow, `sequenceDiagram` for interactions over time, or `stateDiagram-v2` for a
+lifecycle. The diagram should:
+
+- contain roughly 4–10 nodes or participants and fit on one screen;
+- make the old stopping point and new path visible, or show the full new flow when a comparison
+  would be misleading;
+- use plain conceptual labels rather than filenames and full function signatures;
+- distinguish decisions/fallbacks that materially affect behavior;
+- avoid branches that were not verified from the PR description, diff, or checked-out code.
+
+Immediately below the diagram, add a short **Code anchors** list linking 2–5 diagram concepts to
+their exact source lines. The diagram is orientation, not evidence by itself; the links make its
+claims inspectable. Keep Mermaid labels simple and quoted so GitHub renders the block reliably.
+
+## Step 7 — Write the key-change overview list
+
+Immediately after the two orientation sections, before any detailed section, list the key changes
 you're about to cover — each as a heading-matching title plus **1–3 sentences**. This is the
 digest's table of contents in prose form: a reader should be able to stop after this list and
 already know what the PR does and roughly how it's structured, then choose which detailed sections
@@ -136,7 +177,8 @@ Keep each entry genuinely short. The temptation is to front-load explanation her
 detailed section redundant — resist it. The overview answers "what is this change and why should I
 care", the detailed section answers "how does it work and where does it live".
 
-...` heading), and link each entry to its section so the reader can jump straight there.
+Use a `## Key changes at a glance` heading. Make each entry's title match its detailed section and
+link it to that section so the reader can jump straight there.
 
 After the glance list, add a **"Suggested reading order"**: 5–8 numbered steps naming which
 files and functions to open, in which order, for someone reviewing this PR for the first time.
@@ -145,7 +187,7 @@ the guards. Tag the load-bearing line each step exists to protect ("this emit ma
 line the rest depends on") so the reader knows what to slow down for. This is pedagogy, not a
 verdict — no severity labels, no "must fix", no approval language.
 
-## Step 7 — Write each key change
+## Step 8 — Write each key change
 
 For every key change, in this order:
 
@@ -185,10 +227,14 @@ diff. Trimming is expected and good (a 300-line file diff in the middle of a dig
 purpose), but say so explicitly right before the fence: name what's elided (e.g. "license header
 and an ~90-case exhaustive switch elided") and mark cuts inline with a comment like
 `// ... elided: <what> ...`. Link the source file (with a line range if useful) immediately before
-the diff. The diff itself stays inside a normal ` ```diff ` fence — this is the one place a fence
-is correct, since real diffs need +/- coloring and don't contain links anyway.
+the diff. Put the diff inside a fenced code block whose info string is `diff`. Preserve the patch
+marker as the first character of every changed line: `+` for additions and `-` for removals, with
+one leading space for unchanged context. Do not use a plain code fence or strip the markers:
+rendered Markdown uses the `diff` language and those prefixes to color additions green and
+removals red. This is the one place a fence is correct, since diffs need syntax coloring and
+contain no links.
 
-## Step 8 — Audit moved code and files (its own section: "Relocations")
+## Step 9 — Audit moved code and files (its own section: "Relocations")
 
 Relocation is the single biggest source of wasted reviewer time on a large PR. A file moved from
 `src/op/foo.hpp` to `src/op/bar/foo.hpp` shows up as a 400-line delete plus a 400-line add, and a
@@ -223,7 +269,7 @@ If you couldn't verify a move (too large to diff carefully, ambiguous rename det
 here rather than claiming it's intact. An unverified "probably fine" that turns out to hide a logic
 change is worse than no claim at all.
 
-## Step 9 — Write "Not covered in this pass"
+## Step 10 — Write "Not covered in this pass"
 
 Close with an honest list of things you noticed but didn't trace through: a component only
 reachable via tests, gate/threshold logic the PR description mentions but you didn't read in
@@ -260,16 +306,18 @@ what keeps it honest instead of silently confident.
   3. Header table: PR number/link, title, author, branch (head → base), scope (commit/file
      count), closes, supersedes.
   4. The PR description, quoted.
-  5. A short plain-language summary in your own words — what problem this solves, one paragraph.
-     It must OPEN with a concrete, user-visible or plan-visible before/after taken from the PR —
-     a query, a row shape, a setting, an error message — and only then introduce type names,
-     file names, or API terms. A reader who knows nothing about this subsystem should get
-     the example before the vocabulary. If the PR contains no such example, say so explicitly and do not invent one.
-  6. "Key changes at a glance" — the numbered overview list, 1–3 sentences each, linked to the
-     detailed sections (Step 6).
-  7. Ranked key changes in detail (Steps 5, 7), separated by `---`.
-  8. "Relocations" — moved files/functions with intact-vs-changed classification (Step 8).
-  9. "Not covered in this pass" (Step 9).
+  5. A short plain-language summary in your own words — what problem this solves and the outcome,
+     in one paragraph without implementation detail.
+  6. "Before and after" — one grounded example comparing the same scenario on both sides of the
+     PR, including unchanged behavior or fallback (Step 6).
+  7. "Flow at a glance" — one compact Mermaid diagram plus 2–5 line-accurate code anchors
+     (Step 6).
+  8. "Key changes at a glance" — the numbered overview list, 1–3 sentences each, linked to the
+     detailed sections (Step 7).
+  9. "Suggested reading order" — the linked 5–8-step path through the code (Step 7).
+  10. Ranked key changes in detail (Steps 5, 8), separated by `---`.
+  11. "Relocations" — moved files/functions with intact-vs-changed classification (Step 9).
+  12. "Not covered in this pass" (Step 10).
 
 See `references/example_digest.md` in this skill directory for a full worked example (PR #1277 —
 sirius-db/sirius, "dynamic filters: SIP") showing the expected tone, link density, trimming style,

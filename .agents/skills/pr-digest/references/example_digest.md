@@ -44,6 +44,48 @@ prune a probe input that is itself the output of another join, aggregate, or CTE
 travel *sideways* through the plan tree to reach a fact-table scan that sits several operators
 below the join that actually produced the filter.
 
+## Before and after
+
+**Illustrative example, traced from the planner paths linked below:** suppose a selective build
+side produces the key domain `{17, 42}`, but the other side of its join is an intermediate join or
+aggregate rather than a leaf scan. The query and key domain are identical in both columns.
+
+| | Before PR #1277 | After PR #1277 |
+|---|---|---|
+| **Probe shape** | `fact input → intermediate join/aggregate/CTE → publishing join` | The same plan shape. |
+| **Filter route** | The scan-only route cannot carry `{17, 42}` through the intermediate operator. | Sirius traces the key ordinal through safe operators and places a consumer at a reachable scan or direct endpoint. |
+| **Plan effect** | The downstream fact input remains unpruned by this build-side domain. | Eligible rows outside `{17, 42}` can be removed before they reach the publishing join. |
+| **Safety boundary** | No cross-operator route is attempted. | Traversal still stops at outer-join, row-duplication, type, null, and other unsupported boundaries. |
+
+## Flow at a glance
+
+```mermaid
+flowchart TB
+  subgraph Before["Before PR #1277"]
+    B1["Build side yields keys 17 and 42"] --> J1["Join publishes a dynamic filter"]
+    J1 -. "scan-only route stops" .-> I1["Intermediate join, aggregate, or CTE"]
+    I1 --> F1["Fact input remains unpruned"]
+  end
+
+  subgraph After["After PR #1277"]
+    B2["Build side yields keys 17 and 42"] --> J2["Join publishes a dynamic filter"]
+    J2 --> T2["Trace the probe key through safe operators"]
+    T2 --> E2["Attach at a scan or direct endpoint"]
+    E2 --> F2["Prune eligible fact-side rows earlier"]
+  end
+```
+
+**Code anchors:**
+
+- [`plan_comparison_join`](../src/planner/sirius_plan_comparison_join.cpp#L399) coordinates key
+  admission, tracing, and endpoint placement.
+- [`trace_probe_key`](../src/planner/sirius_plan_comparison_join.cpp#L506) attempts the scan route.
+- [`place_endpoint`](../src/planner/sirius_plan_comparison_join.cpp#L555) inserts a direct-route
+  consumer when no scan terminal was found.
+- [`probe_block_is_value_preserving`](../src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp#L34)
+  and [`build_block_is_value_preserving`](../src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp#L53)
+  define key traversal safety boundaries.
+
 ## Key changes at a glance
 
 1. **[SIP-capable planning pipeline in `plan_comparison_join`](#key-change-1--sip-capable-planning-pipeline-in-plan_comparison_join-ranked-1-this-is-the-feature)** — Three new planner
