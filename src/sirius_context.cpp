@@ -1119,11 +1119,11 @@ duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
   // pipelines and raw operator pointers, both owned by the caller's plan). Returned rather than
   // stored so ownership sits with the sirius_engine, whose plan the query indexes.
   task_creator_->prepare_for_query(*query, std::move(handler));
-  // Reads the admitted subset back off task_creator, so this must run after
-  // initialize_internal has set it — otherwise scan_manager gets the full topology list.
+  // Reads this query's admitted subset back off task_creator, so this must run after
+  // initialize_internal has set it — otherwise scan_manager gets an empty (unnarrowed) set.
   scan_manager_->prepare_for_query(*query,
                                    config_.get_operator_params().enable_pinned_zone_map_pruning,
-                                   task_creator_->get_active_gpu_ids());
+                                   task_creator_->get_active_gpu_ids(query_id));
   return query;
 }
 
