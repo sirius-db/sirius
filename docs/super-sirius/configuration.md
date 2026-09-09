@@ -710,7 +710,6 @@ gate table, the mechanism, and results.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_duckdb_fallback` | true | Fall back to DuckDB CPU execution on Sirius errors. Gates both plan-time fallback (unsupported operator/type) and runtime fallback (GPU execution failure) on the transparent path, plus the legacy `CALL gpu_execution(...)` path. Set to `false` to surface Sirius errors instead of falling back. |
-| `enable_regex_jit_impl` | true | Use JIT regex implementation |
 | `like_swar_fastpath` | true | Dispatch `%lit1%lit2%...%` LIKE/NOT LIKE patterns to the SWAR digram fast-path kernel instead of `cudf::strings::like` |
 
 
@@ -718,10 +717,11 @@ gate table, the mechanism, and results.
 
 ### Legacy-release DuckDB settings
 
-The following settings only control the legacy `gpu_processing` path. Sirius registers them
-when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by
-`make legacy-release`. Normal builds omit them from `duckdb_settings()` and reject attempts to
-`SET` them.
+Sirius registers the following compatibility settings when built with
+`ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset used by `make legacy-release`.
+Normal builds omit them from `duckdb_settings()` and reject attempts to `SET` them. Most control
+only the legacy `gpu_processing` path; `enable_regex_jit_impl` remains available because both
+executors in a legacy build consume the same process-global value.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -734,6 +734,7 @@ when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset
 | `opt_table_scan_memcpy_size` | 64 MiB | Copy chunk size used by the legacy optimized scan |
 | `print_gpu_table_max_rows` | 1000 | Maximum rows rendered by the legacy GPU-table printer |
 | `enable_fallback_check` | false | Enable legacy fallback validation |
+| `enable_regex_jit_impl` | true | Select the specialized implementation for its supported regex in a legacy build |
 | `modified_pipeline` | false | Enable legacy modified-pipeline scheduling |
 
 ### Static flags
