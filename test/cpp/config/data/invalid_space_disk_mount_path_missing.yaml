@@ -1,0 +1,5 @@
+sirius:
+  space:
+    disk:
+      - disk_id: 0
+        memory_capacity: 1Gi
