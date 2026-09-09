@@ -18,6 +18,12 @@ cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
 project(sirius LANGUAGES CXX CUDA)
 
+set(SIRIUS_PACKAGE_VERSION
+    "0.1.0"
+    CACHE STRING "Version used for installable Sirius library artifacts")
+option(SIRIUS_BUILD_SHARED_LIBRARY
+       "Build the standalone libsirius shared library" ON)
+
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -644,6 +650,38 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 target_link_options(sirius_loadable_extension PRIVATE
                     "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
 
+if(SIRIUS_BUILD_SHARED_LIBRARY)
+  add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
+  add_library(Sirius::sirius ALIAS sirius_shared)
+  set_target_properties(
+    sirius_shared
+    PROPERTIES OUTPUT_NAME sirius
+               EXPORT_NAME sirius
+               VERSION "${SIRIUS_PACKAGE_VERSION}"
+               SOVERSION 0
+               INSTALL_RPATH "$ORIGIN"
+               INSTALL_REMOVE_ENVIRONMENT_RPATH ON
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               LINKER_TYPE BFD
+               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_include_directories(
+    sirius_shared
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+           $<INSTALL_INTERFACE:include/sirius>)
+  target_link_libraries(
+    sirius_shared
+    PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
+            "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
+  target_link_options(
+    sirius_shared PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/libsirius.map")
+  set_property(
+    TARGET sirius_shared
+    APPEND
+    PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libsirius.map")
+endif()
+
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
 # discovers the Sirius headers (repo + conda) and links the libsirius artifact
@@ -695,6 +733,37 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+if(SIRIUS_BUILD_SHARED_LIBRARY)
+  include(CMakePackageConfigHelpers)
+  configure_package_config_file(
+    cmake/SiriusConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfig.cmake"
+    INSTALL_DESTINATION "lib/cmake/Sirius")
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfigVersion.cmake"
+    VERSION "${SIRIUS_PACKAGE_VERSION}"
+    COMPATIBILITY SameMinorVersion)
+
+  install(
+    TARGETS sirius_shared
+    EXPORT SiriusTargets
+    LIBRARY DESTINATION lib COMPONENT SiriusLibrary)
+  install(
+    FILES src/include/sirius_ffi.hpp
+    DESTINATION include/sirius
+    COMPONENT SiriusLibrary)
+  install(
+    EXPORT SiriusTargets
+    FILE SiriusTargets.cmake
+    NAMESPACE Sirius::
+    DESTINATION "lib/cmake/Sirius"
+    COMPONENT SiriusLibrary)
+  install(
+    FILES "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfig.cmake"
+          "${CMAKE_CURRENT_BINARY_DIR}/SiriusConfigVersion.cmake"
+    DESTINATION "lib/cmake/Sirius"
+    COMPONENT SiriusLibrary)
+endif()
 
 if(ENABLE_STREAM_CHECK)
   message(

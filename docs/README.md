@@ -41,6 +41,8 @@ Running TPC-H on 1TB data, Sirius accelerates DuckDB by 5x on DGX Station (GB300
 
 For full build instructions, alternate build types, pre-commit setup, and testing, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
+For the shared library and CMake consumer interface, see [LIBRARY.md](LIBRARY.md).
+
 Quick start:
 
 ```bash
