@@ -1,0 +1,16 @@
+{
+  "checkedAt": "2026-09-09T19:00:25.468Z",
+  "errors": [],
+  "scenarios": [
+    "single HTML file with no sibling files",
+    "Back/Forward chapter history",
+    "chapter scroll reset",
+    "PR deep link after filters",
+    "package deep link and embedded source",
+    "embedded research and README links",
+    "diagram deep links",
+    "all 19 PRs and 59 commits without JavaScript",
+    "native navigation without JavaScript",
+    "sandboxed srcdoc preview navigation"
+  ]
+}

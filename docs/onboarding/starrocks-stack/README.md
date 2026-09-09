@@ -2,8 +2,12 @@
 
 Open [index.html](index.html) in a browser. It is a standalone, offline web
 document: no server, package installation, CDN, or network request is needed to
-read it. Source and PR links open GitHub. To share the detailed research and PR
-packages as well, share this whole directory.
+read the chapters, research notes and PR packages: they are embedded in the HTML.
+Engine source, PRs, the full raw GitHub snapshot, curated JSON and page template
+link to GitHub. Share the whole directory if those raw artifacts are also needed
+offline. Chapter links support browser Back/Forward and direct PR/package links.
+When a preview disables JavaScript, native anchor links and the full static
+content remain available; filters and diagram controls require JavaScript.
 
 The guide contains an interactive query-path diagram, a seven-step staging-memory
 ownership diagram, a MIG memory-envelope calculator, searchable PR and commit
@@ -99,6 +103,11 @@ engine also rejects UUID-based `MIG_DEVICES`; its documented working route is
 - The lease leak and lifetime race are independently confirmed source-level
   findings, not fault-injection or sanitizer reproductions.
 - Browser validation results are recorded in [web-validation.json](research/web-validation.json).
+- The navigation regression check is [validate-navigation.cjs](research/validate-navigation.cjs)
+  (Node.js, Playwright and Chromium). It covers Back/Forward, chapter scroll,
+  PR/package/diagram deep links, a lone copied HTML file, disabled JavaScript,
+  embedded references, and a sandboxed preview. Results are in
+  [navigation-validation.json](research/navigation-validation.json).
 
 Research scripts create only temporary fixtures. The comparator probe is a
 review reproduction, not an assertion that the current source is fixed:

@@ -28,6 +28,13 @@ errors or horizontal overflow. The generated page is deterministic; principal
 source anchors and all commit assignments were checked. A temporary comparator
 probe reproduces the NaN false-MATCH and verifies wrong-cold/correct-warm rejection.
 
+Navigation uses real fragment links with browser Back/Forward and chapter scroll
+restoration. PR/package/diagram deep links open their target. Static content keeps
+the full guide readable without JavaScript, and research/PR-package links open
+embedded documents when only the HTML file is shared. Large raw source artifacts
+link to the published repository. Ten additional navigation scenarios passed,
+including a sandboxed srcdoc preview and a file copied without its siblings.
+
 This is a source review and documentation change. Rust/CN test attempts stopped
 before execution because StarRocks Thrift submodule sources were uninitialized;
 no new GPU, NIXL or SF500 run is claimed. Reported historical benchmark results
