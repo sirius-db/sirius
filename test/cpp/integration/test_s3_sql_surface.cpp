@@ -8,9 +8,9 @@
 #include "catch.hpp"
 #include "io/io_context.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/s3_object_ref.hpp"
 #include "io/s3/sirius_httpfs.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
@@ -2663,10 +2663,11 @@ TEST_CASE("S3 direct and glob routes share the literal object cache identity",
   REQUIRE(glob_datasource != nullptr);
 
   CHECK(glob_files.front().path == direct_uri);
-  CHECK(glob_datasource->io_object().object_path() == direct_datasource->io_object().object_path());
-  CHECK(glob_datasource->io_object().raw_file_cache_id() ==
-        direct_datasource->io_object().raw_file_cache_id());
-  CHECK(glob_datasource->io_object().size() == direct_datasource->io_object().size());
+  CHECK(glob_datasource->get_io_object().object_path() ==
+        direct_datasource->get_io_object().object_path());
+  CHECK(glob_datasource->get_io_object().raw_file_cache_id() ==
+        direct_datasource->get_io_object().raw_file_cache_id());
+  CHECK(glob_datasource->get_io_object().size() == direct_datasource->get_io_object().size());
 }
 
 TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",

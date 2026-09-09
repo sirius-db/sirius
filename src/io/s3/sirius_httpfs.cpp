@@ -59,7 +59,7 @@ class sirius_httpfs_file_handle : public duckdb::FileHandle {
                             std::shared_ptr<sirius::io::sirius_datasource> datasource)
     : duckdb::FileHandle(fs, std::move(path), flags),
       datasource_(std::move(datasource)),
-      version_tag_(datasource_->io_object().validation_etag())
+      version_tag_(datasource_->get_io_object().validation_tag())
   {
   }
 

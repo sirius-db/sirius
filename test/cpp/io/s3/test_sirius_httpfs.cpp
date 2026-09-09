@@ -543,7 +543,7 @@ TEST_CASE("sirius_httpfs opens through FileOpener and reads positional ranges",
   auto datasource = require_rest_datasource(fixture, uri);
   auto const size = handle->GetFileSize();
   REQUIRE(size > 16);
-  CHECK(static_cast<std::size_t>(size) == datasource->io_object().size());
+  CHECK(static_cast<std::size_t>(size) == datasource->get_io_object().size());
   CHECK_FALSE(handle->OnDiskFile());
 
   std::vector<std::uint8_t> fs_bytes(8);

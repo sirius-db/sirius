@@ -16,9 +16,8 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
 #include "log/logging.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <condition_variable>
 #include <latch>
@@ -91,9 +90,9 @@ class bounded_thread_pool {
   };
 
   explicit bounded_thread_pool(int capacity,
-                               const std::string& name                             = "btp",
-                               std::vector<int> cpu_ids                            = {},
-                               absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+                               const std::string& name                                  = "btp",
+                               std::vector<int> cpu_ids                                 = {},
+                               sirius::exec::invocable<void() noexcept> per_thread_init = nullptr)
     : capacity_(capacity)
   {
     threads_.reserve(capacity);
@@ -202,7 +201,7 @@ class bounded_thread_pool {
    * Consumes the slot (it becomes invalid). The function runs on a worker thread;
    * the slot is released automatically when the task completes.
    */
-  void dispatch(slot&& s, absl::AnyInvocable<void()> fn)
+  void dispatch(slot&& s, sirius::exec::invocable<void()> fn)
   {
     if (not s) { return; }
     {
@@ -240,7 +239,7 @@ class bounded_thread_pool {
   void work_loop()
   {
     while (true) {
-      absl::AnyInvocable<void() noexcept> fn;
+      sirius::exec::invocable<void() noexcept> fn;
       {
         std::unique_lock lock(mu_);
         cv_work_.wait(lock, [&] { return !work_queue_.empty() || stop_requested_; });
@@ -263,7 +262,7 @@ class bounded_thread_pool {
   bool interrupted_{false};
   bool stop_requested_{false};
 
-  std::queue<absl::AnyInvocable<void() noexcept>> work_queue_;
+  std::queue<sirius::exec::invocable<void() noexcept>> work_queue_;
   std::vector<std::thread> threads_;
 };
 

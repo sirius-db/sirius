@@ -46,7 +46,7 @@ constexpr std::size_t DUCKDB_BLOCK_START =
 /// Returns the byte offset of @p block_id's payload in the .db file — the
 /// pointer @c BufferManager::Pin(handle).Ptr() would return, but without
 /// going through DuckDB's buffer cache (we want raw bytes via
-/// @c sirius_ioctx::host_read).
+/// @c ioctx::host_read).
 ///
 /// @throws std::invalid_argument on negative @p block_id (DuckDB uses
 ///         @c INVALID_BLOCK = -1 as a sentinel; callers must filter).
