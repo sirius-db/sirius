@@ -974,10 +974,28 @@ host path is the cheap way to prove the mechanism first, not a different mechani
    (or the stored-table equivalent); `whole_column` → the whole range, and its presence means the
    column is not subsettable at all.
 
-   Bookkeeping that must move with it: each buffer's `size_bytes` and `num_rows`, each leaf's
-   `num_rows`, and the column's `num_rows` (the sum of surviving chunks' rows, where the last
-   chunk of a column is short). `leaf_desc::num_rows` is explicitly the *node's own* output length,
-   not the column's (`leaf_desc.hpp:106-110`), so the two must be recomputed separately.
+   **Exactly three numeric fields need to change**, which is fewer than it first looks. Per buffer
+   the writer emits `name, type_tag, size_bytes, payload_offset`
+   (`src/api/compressed_table_io.cpp:798-801`) — `leaf_buffer_desc::num_rows` is **not serialized**,
+   it is derived on read. So:
+
+   | field | new value |
+   |---|---|
+   | buffer `size_bytes` | `buffer_subset::compacted_size` |
+   | buffer `payload_offset` | dense re-layout of the compacted payload |
+   | leaf `num_rows` (`:789`) | the node's own output length over surviving chunks |
+   | column `num_rows` | sum of surviving chunks' rows (the last chunk is short) |
+
+   `leaf_desc::num_rows` is explicitly the *node's own* output length rather than the column's
+   (`leaf_desc.hpp:106-110`), so the last two are different quantities and must be recomputed
+   separately.
+
+   **Patch in place rather than re-emitting.** All four are fixed-width fields at computable
+   offsets, so recording their byte positions during the parse and overwriting them keeps the
+   output structurally identical to what the writer produces. Re-emitting from parsed records
+   would mean a second writer that can drift from `build_compressed_table_header` — the kind of
+   duplication that fails silently years later. `parse_hpln_header` is static in that file, so an
+   optional offset-recording out-parameter is the natural place.
 
    **Why this deserves its own careful pass rather than being appended to a long session:** it is
    binary-format rewriting where a wrong `size_bytes` does not fault — the reader allocates what
