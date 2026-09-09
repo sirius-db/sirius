@@ -113,18 +113,14 @@ class task_creator {
 
   /// \brief Narrow @p query_id to a GPU subset. Called once per query by
   /// sirius_engine::initialize_internal, before prepare_for_query() runs for that query.
-  ///
-  /// Written into that query's own state (see query_task_global_state::active_gpu_ids), never a
-  /// field shared across queries: a worker for one query must never be able to observe another
-  /// query's admission, whether racily (unsynchronized concurrent access) or logically (reading
-  /// a value a later call for a different query overwrote).
+  /// Written into that query's own state (see query_task_global_state::active_gpu_ids)
   ///
   /// @param full_count how many GPUs existed before narrowing. Passed in rather than inferred
   /// so it and @p ids are cut from the same list.
   ///
-  /// No-op (not an error) when @p query_id has no state yet: sirius_engine::initialize() is a
+  /// No-op when @p query_id has no state yet: sirius_engine::initialize() is a
   /// standalone entry point some tests use to build/inspect a plan without opening a real
-  /// execution window, so nothing here needs the admitted subset either.
+  /// execution window.
   void set_active_gpu_ids(sirius::query_id_t query_id,
                           std::vector<int> ids,
                           std::size_t full_count);
@@ -318,15 +314,8 @@ class task_creator {
     //! scope but no task). Same handler every pipeline's global state carries.
     std::shared_ptr<pipeline::completion_handler> completion_handler;
 
-    //! This query's admitted GPU subset (sorted, deduped) and the pre-admission GPU count, set
-    //! once by set_active_gpu_ids() before prepare_for_query() runs and never mutated after.
-    //! Per-query so a worker for query A can never observe query B's later admission -- neither
-    //! racily (unsynchronized concurrent access to a shared field) nor logically (reading a
-    //! value a later call for a different query overwrote). Partition affinity indexes
-    //! active_gpu_ids as `active_gpu_ids[partition_idx % size]` and must stay in the same sorted
-    //! order sirius_physical_partition uses for its device->slot map, so the two stay inverse.
-    //! full_gpu_count is the GPU count before narrowing, from the same list active_gpu_ids was
-    //! cut from; `active_gpu_ids.size() < full_gpu_count` means this query is on a strict subset.
+    //! This query's admitted GPU subset (sorted, deduped), set once by set_active_gpu_ids() before
+    //! prepare_for_query() runs and never mutated after.
     std::vector<int> active_gpu_ids;
     std::size_t full_gpu_count{0};
 

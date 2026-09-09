@@ -78,14 +78,14 @@ void task_creator::set_active_gpu_ids(sirius::query_id_t query_id,
                                       std::vector<int> ids,
                                       std::size_t full_count)
 {
-  // Silently no-op for an unregistered query rather than throw: sirius_engine::initialize()
-  // (which calls this) is a legitimate standalone entry point for tests that build/inspect a
-  // plan without ever opening a real execution window (no set_client_context call), and
-  // therefore never dispatch a task that would need the admitted subset either. A real
-  // execute() always opens the window first, so production callers are unaffected.
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   auto it = _query_task_global_states.find(query_id);
-  if (it == _query_task_global_states.end()) { return; }
+  if (it == _query_task_global_states.end()) {
+    // this should never happen in practice, but happens often in unit tests.
+    SIRIUS_LOG_WARN("task_creator::set_active_gpu_ids: no state registered for query {}; ",
+                    query_id);
+    return;
+  }
   it->second->active_gpu_ids = std::move(ids);
   it->second->full_gpu_count = full_count;
 }
