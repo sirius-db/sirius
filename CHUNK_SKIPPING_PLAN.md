@@ -11,6 +11,62 @@ This file is the living record for the project. Keep the *Measurements* numbers 
 
 ---
 
+## 0. Where this stands (2026-09-09)
+
+Read this first; the rest of the document is the reasoning and the measurements behind it.
+
+### Shipped and measured
+
+| | |
+|---|---|
+| **Best host-tier configuration** | 10.44 s → **9.48 s** at SF1000 (~−9.2%), 22/22 byte-exact |
+| whole-chunk pruning on compressed pins | **−8.1%** (host, 2 GB batches) |
+| the per-group index on top | **−2.20%** (44.6e9 further rows dropped) |
+| GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
+
+Two findings that stand on their own, independent of the remaining work:
+
+1. **Zone-map capture was off for GPU-tier compressed pins.** The path that wins the suite was the
+   one configuration with no zone maps at all. Fixed; it is what makes every number above possible.
+2. **Host-tier pins should use a 2 GB batch, not the tuned 8 GB.** Reproducible across runs. The
+   8 GB value was tuned on unclustered data with no pruning, and the trade reverses at the margin.
+
+### Working end to end
+
+Per-group min/max capture at pin time → contiguous column-major arena → filter lowered once and
+evaluated over packed bounds (24× faster than the `BaseStatistics` path) → surviving row ranges in
+the scan plan → the scan serves those ranges for **uncompressed** chunks (zero-copy `cudf::slice`).
+
+### Built, tested, and NOT yet connected
+
+The compressed *fetch* path: operator classification (`buffer_layout`, `supports_chunk_subset`),
+byte-range arithmetic (`plan_buffer_subset`), and header synthesis
+(`build_chunk_subset_header`). All have host tests; **nothing calls them.**
+
+> **The next step is wiring them into `decompress_host_to_gpu`, plus the scan-level row-count
+> bookkeeping.** Until then this is inert — and inert machinery passing its unit tests is exactly
+> how the per-group index sat unused for a day before anyone noticed nothing populated
+> `pinned_entry::group_bounds`. Integration is what makes it real; §6.5 has the design.
+
+### Known gaps, in the order they will bite
+
+- Only a **plain bitpack** plan is exercised end to end through the header synthesis. `delta ->
+  bitpack`, `for` and `zigzag` should work per the registry but have no fixture.
+- `plan_bitpack_packed_subset` computes 0 words for a `chunk_count == 0` chunk where the decode's
+  own scan computes 1. Unreachable at top level (every column chunk has ≥1 row) and caught by a
+  self-check that demotes the column to a whole fetch, but **worked around rather than fixed** — it
+  will matter if a nested channel ever becomes subsettable.
+- The **uncompressed GPU pin path has no group bounds**: it inserts through the merge-capable
+  `insert_pinned_entry`, which would need the merge and degradation handling
+  `pinned_zone_maps::append_column_from` provides. It keeps whole-chunk pruning.
+- `max_gap_bytes` (the coalescing knob the network path needs) is plumbed but never tested
+  non-zero, and there is no policy for choosing it.
+- Every pruning number here is on **clustered** data. TPC-H as generated prunes 0.00%, and the pin
+  discards file order anyway (§3.8), so pin-time clustering (§5) is what makes any of this pay in
+  production.
+
+---
+
 ## 1. Where we start from
 
 ### 1.1 What already exists (verified in `dev` @ `5201d9c3`)
@@ -948,7 +1004,7 @@ host path is the cheap way to prove the mechanism first, not a different mechani
    missing zone-map cell. Per the shipped plans this covers the bitpack- and delta-rooted columns;
    `ans`/`snappy`/`lz4`/`bitcomp` refuse.
 
-3. **Header synthesis — the next piece, and the one to be careful with.**
+3. **Header synthesis — DONE (`804aa986`).**
 
    `read_compressed_table_subset_from_memory` allocates each leaf buffer at its *declared* size and
    fills it via `payload_fetch_fn(offset, size, dst, stream)`. So serving a compacted table means
@@ -1004,8 +1060,21 @@ host path is the cheap way to prove the mechanism first, not a different mechani
    "every chunk surviving" reproduces the original header byte-for-byte, so the subset path
    provably degrades to the existing one.
 
-   Everything it needs already exists in one place: `parse_hpln_header` and the header writer are
-   both in `src/api/compressed_table_io.cpp`, and the arithmetic is done (`073dd5e1`).
+   Implemented as `build_chunk_subset_header` with `parse_hpln_header` gaining an optional
+   offset-recording out-parameter; the four fields are patched, nothing is re-emitted. Two
+   requirements emerged that this design had not anticipated, both of which would have produced
+   silently wrong data:
+
+   - **A leaf whose `num_rows` differs from its column's disables subsetting for that column.**
+     Survivor ids name the *column's* chunk grid; a nested node (an rle `values` channel, say)
+     chunks on a different grid, so chunk *c* there is not the same rows.
+   - **A per-buffer self-check**: with every chunk surviving, the layout model must reproduce the
+     `size_bytes` the writer declared, else the column is demoted to a whole fetch. This makes the
+     byte-for-byte property hold *by construction* rather than by test, and it is what caught the
+     `chunk_count == 0` divergence noted in §0.
+
+   A column that cannot be subsetted is emitted whole (only its payload offsets shift to keep the
+   payload dense), so a mixed table degrades per column rather than failing.
 
 4. **Row-count bookkeeping at the scan level.** The served batch has fewer rows than its chunk. The scan's row
    accounting must follow, and late-mat must stay gated off for such a batch for the reason in
