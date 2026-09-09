@@ -901,10 +901,44 @@ Three things worth recording:
   paradox: §3.8 showed the coalescer interleaves row groups, so a globally sorted FILE still yields
   pin chunks spanning the key range. Sorting after coalescing is strictly better than sorting
   before it, and it needs no dataset rewrite.
-- **It is not free for every query.** q17 +0.080 s and q12 +0.038 s. Clustering on `l_shipdate`
-  scatters the other columns, and `l_orderkey`'s ratio degrades 6.03x → 2.17x under clustering
-  (§10), so those queries fetch and decode more bytes. Net is strongly positive; a per-column
-  re-explore against the clustered layout is the open follow-up.
+- **One query really regresses: q12, +0.027 / +0.038 s** across two runs (~+7% of q12). q17 looked
+  like a second one at +0.080 s, but a same-config repeat put it at +0.002 s — it was noise, and
+  the per-query verdicts below are taken from two independent clustered runs for exactly that
+  reason. Everything else moves the right way.
+
+### 5.5 What clustering costs the compression, and why re-exploring does not help (2026-09-09)
+
+Clustering reorders rows, so every column's compressibility changes. Measured directly: one 16.8M-row
+pin chunk of SF1000, compressed with the committed plans in file order and again sorted by the
+cluster key (`simpatico benchmark --mode per-column`).
+
+**The damage is one column per table, and it is the key the data used to be ordered by:**
+
+| column | plan | unclustered | clustered | bytes |
+|---|---|---|---|---|
+| `l_orderkey` | `delta -> bitpack` | 12.393x | **2.739x** | 10.8 MB → **49.0 MB** |
+| `o_orderkey` | `delta -> bitpack` | 12.393x | **2.521x** | 10.8 MB → **53.2 MB** |
+| `l_shipdate` | `bitpack` | 2.651x | 142.932x | 25.3 MB → 0.5 MB |
+| `l_linestatus` | `dictionary -> bitpack` | 37.372x | 568.295x | 2.2 MB → 0.1 MB |
+| `o_orderstatus` | `dictionary -> bitpack` | 19.321x | 235.044x | 4.3 MB → 0.4 MB |
+
+Every other column is unchanged to three decimals — they were uncorrelated with the sort key before
+and after. **Net per table: lineitem 613.7 → 598.9 MB (−2.4%), orders 1091.3 → 1104.8 MB (+1.2%).**
+So clustering is roughly footprint-neutral overall, and strictly better for lineitem; it just moves
+the bytes from the date columns to the order keys.
+
+**Re-exploring does not recover the orderkey.** `simpatico explore --score pareto --rerank-top 16`
+on a clustered chunk returns plain `bitpack` for both keys — 2.706x for `l_orderkey` against the
+committed cascade's 2.739x. The loss is intrinsic: sorting on shipdate scatters the order key, and
+no cascade compresses a scattered 64-bit key. What the re-explore does find is that the `delta` is
+now **dead weight** — it costs 0.1% more bytes and buys nothing, while removing it takes decode from
+1126 → 1435 GB/s (`l_orderkey`) and 1135 → 1496 GB/s (`o_orderkey`).
+
+That decode win does not reach the suite: clustered SF1000 with the re-explored plans measures
+8.9547 s against 8.8539 s with the committed ones, i.e. **+1.14%, inside the ~0.8% noise floor**.
+**Conclusion: keep the committed plans.** The follow-up is closed as a negative result rather than
+left open — worth knowing, because "the plans were tuned on unclustered data" is an obvious
+objection to clustering and it turns out not to matter.
 
 Refused by design: **duckdb-native pins**, whose rows stay addressable by DuckDB row id — the
 deleted-row keep-masks are positional against the pinned order, so reordering would misapply them
@@ -1748,6 +1782,12 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   Two things had to be fixed to get there, both in §6.5: a table cannot mix a compacted column
   with a whole one (§6.5.4), and the shipped row-range serving duplicated rows on three of the
   four serve paths (§6.5.5, a real wrong-answer bug).
+- **2026-09-09** — **The clustered layout needs no new compression plans (§5.5).** Clustering is
+  footprint-neutral overall (lineitem −2.4%, orders +1.2%); it only moves bytes from the date
+  columns to the order keys, whose `delta -> bitpack` collapses 12.39x → 2.74x. Re-exploring
+  returns plain `bitpack` — the loss is intrinsic — and the re-picked plans measure **+1.14%** on
+  the suite, inside noise. Keep the committed plans. Also: **q17's +0.080 s was noise** (a
+  same-config repeat gives +0.002 s); q12's +0.03 s is the one real regression.
 - **2026-09-09** — **Pin-time clustering landed, and it is the result that makes the project pay
   in production (§5.4).** `pin_table(..., cluster_by=[...])` sorts each chunk as it is pinned:
   **−8.57%** at SF1000 host/2 GB on the UNSORTED dataset for **+1.6%** pin cost, 22/22 byte-exact.
@@ -1836,9 +1876,10 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   +1.6% of the pin wall), and the sort goes in `materialize_pin_batches` immediately after
   materialization, before the zone-map capture. **Open:** how the sort key gets chosen — it is an
   explicit `cluster_by` argument today.
-- **Open:** does clustering help or hurt the *net* compression ratio across all 16 columns?
-  `l_shipdate` improves 2.651x → 426x but `l_orderkey` degrades 6.03x → 2.17x; needs a full
-  re-explore and a re-picked plan file.
+- **Answered (§5.5):** clustering is roughly footprint-neutral — lineitem −2.4%, orders +1.2% —
+  because the only columns that change are those correlated with the sort key. The orderkey loss
+  (12.39x → 2.74x) is intrinsic and no re-explored plan recovers it; the re-picked plan file
+  measures +1.14% on the suite, i.e. no better. Keep the committed plans.
 - **Open:** how much of the suite's time is scan/decode on the winning GPU-compressed config?
   Without that, §3's 40% "of scanned bytes" cannot be converted into an expected speedup.
   `docs/super-sirius/compressed-pinning.md:93` has the closest existing measurement.
