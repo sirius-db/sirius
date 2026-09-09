@@ -56,6 +56,13 @@ class ingestible_table_info {
    */
   [[nodiscard]] virtual std::span<std::string const> file_paths() const = 0;
 
+  /// Human-readable identity for diagnostics (logging, error messages). Parquet
+  /// tables use the first resolved file path; duckdb-native tables use the
+  /// qualified catalog/schema/table name, since @ref file_paths for them is the
+  /// shared .db path and would collapse every table in that database to the
+  /// same string.
+  [[nodiscard]] virtual std::string display_name() const = 0;
+
  protected:
   ingestible_table_info() = default;
 };
