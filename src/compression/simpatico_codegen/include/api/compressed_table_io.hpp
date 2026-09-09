@@ -174,9 +174,15 @@ using payload_host_read_fn =
 ///
 /// A column that cannot be subsetted -- a whole_column buffer such as a snappy root, an
 /// unclassified operator, a nested node whose length differs from the column's, or missing sizing
-/// metadata -- is emitted WHOLE (all its buffers at full size). Fetching whole is always correct,
-/// merely less selective, so this never fails for a well-formed table. An error string is returned
-/// only for genuinely malformed input.
+/// metadata -- is emitted WHOLE (all its buffers at full size). Fetching whole is always correct
+/// for that COLUMN, so this never fails for a well-formed table; an error string is returned only
+/// for genuinely malformed input.
+///
+/// It is not automatically correct for the TABLE, and a caller must not ignore it: a subsetted
+/// column and a whole one have different row counts, and assembling them into one cudf::table
+/// throws (or, in a consumer that does not check, silently misaligns rows). @p
+/// out_column_subsetted reports the outcome per column, in header column order, so a caller can
+/// fall back to fetching the whole chunk when any column it actually reads was emitted whole.
 ///
 /// @p read_payload supplies the values of a bitpack leaf's chunk_count/chunk_bits, which live in
 /// the payload and are the only way to size its `packed` chunks. A null or failing reader demotes
@@ -185,12 +191,15 @@ using payload_host_read_fn =
 /// simpatico::append_coalesced): moving a few pruned bytes beats paying for another request.
 /// @p out_payload_bytes, when non-null, receives the compacted payload's total size, which can
 /// exceed the gathered bytes (a bitpack `packed` buffer's decode guard words).
+/// @p out_column_subsetted, when non-null, receives one entry per column of @p header: 1 when the
+/// column was compacted to the surviving chunks, 0 when it was emitted whole.
 std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::span<const std::uint32_t> surviving_chunks,
                                       payload_host_read_fn const& read_payload,
                                       std::vector<std::uint8_t>& out_header,
                                       std::vector<gather_range>& out_gather,
-                                      std::uint64_t max_gap_bytes      = 0,
-                                      std::uint64_t* out_payload_bytes = nullptr);
+                                      std::uint64_t max_gap_bytes                     = 0,
+                                      std::uint64_t* out_payload_bytes                = nullptr,
+                                      std::vector<std::uint8_t>* out_column_subsetted = nullptr);
 
 }  // namespace simpatico

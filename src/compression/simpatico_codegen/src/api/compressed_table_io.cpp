@@ -963,12 +963,14 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::vector<std::uint8_t>& out_header,
                                       std::vector<gather_range>& out_gather,
                                       std::uint64_t max_gap_bytes,
-                                      std::uint64_t* out_payload_bytes)
+                                      std::uint64_t* out_payload_bytes,
+                                      std::vector<std::uint8_t>* out_column_subsetted)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::io::build_chunk_subset_header"};
   out_header.clear();
   out_gather.clear();
   if (out_payload_bytes) *out_payload_bytes = 0;
+  if (out_column_subsetted) out_column_subsetted->clear();
 
   for (std::size_t i = 1; i < surviving_chunks.size(); ++i) {
     if (surviving_chunks[i] <= surviving_chunks[i - 1]) {
@@ -989,6 +991,7 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
     return parse_err.empty() ? std::string("build_chunk_subset_header: malformed header")
                              : parse_err;
   }
+  if (out_column_subsetted) out_column_subsetted->assign(recs.size(), 0);
 
   // Copy only the bytes the parse consumed: a caller may hand us a span covering the whole file,
   // and the header the reader gets back must be exactly a header.
@@ -1133,6 +1136,8 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
       }
       continue;
     }
+
+    if (out_column_subsetted) (*out_column_subsetted)[ci] = 1;
 
     // The column's row count over the survivors. Distinct from any leaf's, and not a multiple of
     // the chunk size: the column's last chunk is short.

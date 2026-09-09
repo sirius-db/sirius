@@ -385,6 +385,27 @@ struct cached_scan_plan {
   std::size_t rows_pruned_within_chunks{0};
 };
 
+/// The 1024-row simpatico decode chunks that @p ranges cover within one pinned chunk holding
+/// @p rows rows: batch-local ids, strictly ascending, as
+/// simpatico::build_chunk_subset_header expects them.
+///
+/// This is the translation between the two chunk sizes the system has — the pin chunk a zone map
+/// describes, and the decode chunk a compressed column can be addressed at. Group bounds are
+/// captured at a whole number of decode chunks per group, so a row range maps onto decode-chunk
+/// boundaries exactly and no partially covered chunk can arise; a range is nonetheless clamped to
+/// @p rows, since the final group of a chunk may be short.
+///
+/// Returns EMPTY when the ranges cover every decode chunk, when @p ranges is empty, or when the
+/// chunk has no rows — all of which mean "serve the chunk whole", the behaviour a caller that
+/// cannot subset falls back to anyway.
+[[nodiscard]] std::vector<std::uint32_t> surviving_decode_chunks(
+  std::span<chunk_row_range const> ranges, std::size_t rows);
+
+/// Rows the decode chunks @p chunks hold within a pinned chunk of @p rows rows — what a batch
+/// serving them contains. The last decode chunk of the pinned chunk is short.
+[[nodiscard]] std::size_t surviving_decode_chunk_rows(std::span<std::uint32_t const> chunks,
+                                                      std::size_t rows);
+
 /// Build the cached-serving databatch_provider for @p entry over
 /// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
 /// scan's materialized order). @p plan lists the zone-map survivor chunks the

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -77,6 +78,30 @@ void copy_pinned_blocks_to_device(
     const std::size_t chunk = std::min(size - copied, bs - s_off);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
       dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value()));
+    copied += chunk;
+    s_off += chunk;
+    if (s_off == bs) {
+      ++s_idx;
+      s_off = 0;
+    }
+  }
+}
+
+void copy_pinned_blocks_to_host(
+  const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& src,
+  std::uint64_t src_offset,
+  void* dst_host,
+  std::size_t size)
+{
+  if (size == 0) return;
+  const std::size_t bs = src.block_size();
+  std::size_t s_idx    = src_offset / bs;
+  std::size_t s_off    = src_offset % bs;
+  auto* dst            = static_cast<std::byte*>(dst_host);
+  std::size_t copied   = 0;
+  while (copied < size) {
+    const std::size_t chunk = std::min(size - copied, bs - s_off);
+    std::memcpy(dst + copied, src.at(s_idx).data() + s_off, chunk);
     copied += chunk;
     s_off += chunk;
     if (s_off == bs) {
@@ -145,6 +170,9 @@ std::unique_ptr<cucascade::idata_representation> compressed_host_representation:
                                        _column_sizes));
   // The request is indexed by the selected column list, which the clone shares.
   copy->set_pushdown_scan(_pushdown_scan);
+  // The chunk subset is already reflected in the sizes and row count copied above, so it is
+  // carried as-is rather than re-applied.
+  copy->_surviving_chunks = _surviving_chunks;
   return copy;
 }
 
@@ -216,6 +244,29 @@ std::unique_ptr<compressed_host_representation> compressed_host_representation::
     _num_rows,
     std::move(absolute),
     _column_sizes));
+}
+
+void compressed_host_representation::set_surviving_chunks(std::vector<std::uint32_t> chunks,
+                                                          std::int64_t rows)
+{
+  if (chunks.empty() || rows <= 0 || _num_rows <= 0 || rows >= _num_rows) { return; }
+  // Footprints follow the rows actually served: the fetch moves only the surviving chunks' bytes
+  // and the decode produces only their rows, so a reservation sized off this representation would
+  // otherwise reserve for rows nobody asked for. Scaling is exact enough — compressed bytes are
+  // not uniform across chunks, but every consumer of these numbers treats them as an estimate,
+  // and rounding up keeps an under-reservation off the table.
+  // A pin chunk is bounded by the pin batch size (a few GB) and by its row count (~1e8), so the
+  // product stays far inside 64 bits.
+  auto const total_rows = static_cast<std::uint64_t>(_num_rows);
+  auto const kept_rows  = static_cast<std::uint64_t>(rows);
+  auto const scale      = [&](std::size_t bytes) {
+    return static_cast<std::size_t>(
+      (static_cast<std::uint64_t>(bytes) * kept_rows + total_rows - 1) / total_rows);
+  };
+  _compressed_bytes   = scale(_compressed_bytes);
+  _uncompressed_bytes = scale(_uncompressed_bytes);
+  _num_rows           = rows;
+  _surviving_chunks   = std::make_shared<const std::vector<std::uint32_t>>(std::move(chunks));
 }
 
 // ── compressed_device_representation ─────────────────────────────────────────

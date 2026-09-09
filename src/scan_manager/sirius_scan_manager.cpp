@@ -63,6 +63,7 @@
 #include <rmm/cuda_device.hpp>
 
 #include <api/simpatico_codegen.hpp>
+#include <codegen/jit/fused_tree.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -83,6 +84,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -115,6 +117,21 @@ std::size_t pinned_chunk_count(pinned_entry const& entry)
   if (names.empty()) { return 0; }
   auto const it = entry.data_batches_by_column.find(names.front());
   return it == entry.data_batches_by_column.end() ? 0 : it->second.size();
+}
+
+/// SIRIUS_EXP_CHUNK_SUBSET_FETCH — serve a compressed chunk's SURVIVING decode chunks rather
+/// than the whole chunk, so the pruned rows cost neither the payload H2D nor the decode.
+///
+/// On by default; "0" turns it off, which is both the kill switch and the A/B arm that says what
+/// the fetch skip is worth (whole-chunk and sub-chunk pruning still apply either way). Read once —
+/// this sits on the per-batch path.
+bool chunk_subset_fetch_enabled()
+{
+  static bool const enabled = [] {
+    auto const* value = std::getenv("SIRIUS_EXP_CHUNK_SUBSET_FETCH");
+    return value == nullptr || std::string_view{value} != "0";
+  }();
+  return enabled;
 }
 
 /// Rows in one chunk of a GPU-tier entry. Every column of a chunk shares its
@@ -163,9 +180,75 @@ struct cached_databatch_provider : public databatch_provider {
       _column_indices.push_back(idx);
     });
     prepare_origin_annotation();
-    // Serving a mid-chunk slice is only sound once nothing downstream assumes batch == chunk.
-    // prepare_origin_annotation() sets _origin_columns exactly when late-mat has that assumption.
-    _serve_row_ranges = !_plan.survivor_row_ranges.empty() && _origin_columns == nullptr;
+    build_served_positions();
+  }
+
+  /// Lay out the batches this provider will serve, one entry per batch.
+  ///
+  /// Without per-group bounds this is just the surviving chunks. With them, a chunk is narrowed to
+  /// the row ranges its groups could not rule out — but HOW those ranges become batches depends on
+  /// what the chunk can serve, and getting that wrong duplicates rows rather than failing:
+  ///
+  ///  - An uncompressed device chunk slices, and slicing is a view operation, so each range is its
+  ///    own batch.
+  ///  - A compressed chunk cannot be sliced; its ranges become ONE batch that carries them all,
+  ///    which the decode turns into a subset of the chunk's 1024-row decode chunks. Emitting one
+  ///    batch per range would serve the whole chunk once per range.
+  ///  - A chunk carrying an MVCC keep-mask serves whole: the mask is positional against the whole
+  ///    chunk, so any narrowing misaligns it. The GPU filter still removes its rows.
+  ///
+  /// Serving a mid-chunk slice at all is only sound once nothing downstream assumes batch ==
+  /// chunk; prepare_origin_annotation() sets _origin_columns exactly when late-mat has that
+  /// assumption, so a stamped scan serves whole chunks.
+  void build_served_positions()
+  {
+    auto const& ranges = _plan.survivor_row_ranges;
+    if (ranges.empty() || _origin_columns != nullptr) {
+      _served.reserve(_plan.survivor_chunk_indices.size());
+      for (auto const chunk : _plan.survivor_chunk_indices) {
+        _served.push_back({chunk, 0, 0});
+      }
+      return;
+    }
+    // Ranges are in chunk-then-row order, so one pass groups them by chunk.
+    for (std::size_t i = 0; i < ranges.size();) {
+      auto const chunk = ranges[i].chunk;
+      std::size_t j    = i;
+      while (j < ranges.size() && ranges[j].chunk == chunk) {
+        ++j;
+      }
+      if (chunk < _mvcc_masks.size() && chunk_has_mvcc_mask(chunk)) {
+        _served.push_back({chunk, 0, 0});
+      } else if (chunk_slices_per_range(chunk)) {
+        for (std::size_t k = i; k < j; ++k) {
+          _served.push_back(
+            {chunk, static_cast<std::uint32_t>(k), static_cast<std::uint32_t>(k + 1)});
+        }
+      } else {
+        _served.push_back({chunk, static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(j)});
+      }
+      i = j;
+    }
+  }
+
+  /// True when chunk @p index can serve one arbitrary row range per batch.
+  ///
+  /// Only a materialized DEVICE column can: cudf::slice narrows the view with no copy. Everything
+  /// else serves one batch per chunk —
+  ///   - a compressed chunk narrows inside the decode (it is served the whole range list, which
+  ///     becomes the decode chunks to fetch), and
+  ///   - a pinned HOST column can only be sliced by COLUMN (host_data_representation::slice takes
+  ///     column indices), so it is served whole and the GPU filter drops its pruned rows.
+  ///
+  /// Getting this wrong is not a missed optimization: a range the serve path ignores means the
+  /// whole chunk is served once PER RANGE, which duplicates rows.
+  [[nodiscard]] bool chunk_slices_per_range(std::size_t index) const
+  {
+    if (_entry.tier != cucascade::memory::Tier::GPU) { return false; }
+    if (!_entry.device_chunks.empty()) {
+      return index < _entry.device_chunks.size() && !_entry.device_chunks[index].compressed;
+    }
+    return true;  // per-column device storage: data_batches_by_column
   }
 
   /// Precompute what every served batch's origin annotation shares: the column
@@ -250,10 +333,8 @@ struct cached_databatch_provider : public databatch_provider {
     // index; positions past the survivors yield the insert-delta splits.
     // The cursor hands out unique positions, so each split is moved out once.
     auto const cursor = _index.fetch_add(1);
-    auto const served_count =
-      _serve_row_ranges ? _plan.survivor_row_ranges.size() : _plan.survivor_chunk_indices.size();
-    if (cursor >= served_count) {
-      auto const delta_idx = cursor - served_count;
+    if (cursor >= _served.size()) {
+      auto const delta_idx = cursor - _served.size();
       if (delta_idx >= _delta_splits.size()) { return {}; }
       auto& delta = _delta_splits[delta_idx];
       databatch_provider::batch out;
@@ -262,24 +343,18 @@ struct cached_databatch_provider : public databatch_provider {
       out.preferred_device = delta.preferred_device;
       return out;
     }
-    // A served position is either a whole chunk or one of its surviving row ranges.
-    std::optional<chunk_row_range> range;
-    std::size_t index = 0;
-    if (_serve_row_ranges) {
-      range = _plan.survivor_row_ranges[cursor];
-      index = range->chunk;
-    } else {
-      index = _plan.survivor_chunk_indices[cursor];
-    }
-    // An MVCC keep-mask is positional against the whole chunk, so a slice would misalign it.
-    // Fall back to the whole chunk for that chunk only; the GPU filter still removes its rows.
-    if (range && index < _mvcc_masks.size() && chunk_has_mvcc_mask(index)) { range.reset(); }
+    // A served position is a chunk plus the row ranges of it to serve; an empty span is the
+    // whole chunk. build_served_positions() decided which shape this chunk can take.
+    auto const& position = _served[cursor];
+    auto const index     = position.chunk;
+    auto const ranges    = std::span<chunk_row_range const>{_plan.survivor_row_ranges}.subspan(
+      position.range_begin, position.range_end - position.range_begin);
 
     std::shared_ptr<cucascade::data_batch> data;
     if (_entry.tier == cucascade::memory::Tier::GPU) {
-      data = get_device_databatch(index, range);
+      data = get_device_databatch(index, ranges);
     } else if (_entry.tier == cucascade::memory::Tier::HOST) {
-      data = get_host_databatch(index);
+      data = get_host_databatch(index, ranges);
     }
     if (!data) { return {}; }
     auto mask             = index < _mvcc_masks.size() ? _mvcc_masks[index] : mvcc_chunk_mask{};
@@ -297,16 +372,35 @@ struct cached_databatch_provider : public databatch_provider {
   std::shared_ptr<std::vector<late_mat::column_origin> const> _origin_columns;
   /// Exclusive scan of per-chunk rows over ALL the entry's chunks.
   std::vector<std::int64_t> _chunk_row_start;
-  /// True when this scan may serve a chunk's surviving row ranges instead of the whole chunk.
-  bool _serve_row_ranges{false};
+  /// One batch this provider serves: a chunk, and a [begin, end) span into
+  /// @c _plan.survivor_row_ranges naming the rows of it to serve. An empty span is the whole
+  /// chunk. See build_served_positions().
+  struct served_position {
+    std::size_t chunk{0};
+    std::uint32_t range_begin{0};
+    std::uint32_t range_end{0};
+  };
+  std::vector<served_position> _served;
 
-  std::shared_ptr<cucascade::data_batch> get_host_databatch(std::size_t index)
+  std::shared_ptr<cucascade::data_batch> get_host_databatch(
+    std::size_t index, std::span<chunk_row_range const> ranges = {})
   {
     if (index >= _entry.host_chunks.size()) { return nullptr; }
     const auto& chunk = _entry.host_chunks.at(index);
     if (!chunk) { return nullptr; }
     if (auto* compressed = dynamic_cast<sirius::compressed_host_representation*>(chunk.get())) {
       auto projected = compressed->select_columns(_column_indices);
+      // Hand the decode the chunk's surviving 1024-row decode chunks: it fetches only their bytes
+      // out of the pinned payload, so the pruned rows cross neither PCIe nor the decode. Attached
+      // to this projection alone — which chunks survive is this query's filter, not a property of
+      // the shared pin.
+      auto const rows = static_cast<std::size_t>(compressed->num_rows());
+      auto survivors  = chunk_subset_fetch_enabled() ? surviving_decode_chunks(ranges, rows)
+                                                     : std::vector<std::uint32_t>{};
+      if (!survivors.empty()) {
+        auto const kept = surviving_decode_chunk_rows(survivors, rows);
+        projected->set_surviving_chunks(std::move(survivors), static_cast<std::int64_t>(kept));
+      }
       return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
     }
     auto& host          = chunk->cast<cucascade::host_data_representation>();
@@ -319,8 +413,12 @@ struct cached_databatch_provider : public databatch_provider {
   }
 
   std::shared_ptr<cucascade::data_batch> get_device_databatch(
-    std::size_t index, std::optional<chunk_row_range> const& range = std::nullopt)
+    std::size_t index, std::span<chunk_row_range const> ranges = {})
   {
+    // An uncompressed chunk is served one range per batch, so at most one range reaches the slice
+    // below; anything else serves whole, which is always correct.
+    std::optional<chunk_row_range> const range =
+      ranges.size() == 1 ? std::optional<chunk_row_range>{ranges.front()} : std::nullopt;
     // GPU-tier compression-enabled pin: one device_pin_chunk per batch, in
     // emission order. Dispatch per chunk on the populated form — a single pin may
     // interleave compressed and uncompressed chunks.
@@ -444,7 +542,19 @@ struct cached_databatch_provider : public databatch_provider {
       const auto& col_chunks = _entry.data_batches_by_column.at(col_idx);
       if (index >= col_chunks.size()) { return nullptr; }
       columns.push_back(col_chunks.at(index));
-      column_views.emplace_back(columns.back()->view());
+      auto full = columns.back()->view();
+      // Same view narrowing as the device_pin_chunk path above, and it must be the same: a range
+      // the serve ignores is a range served WHOLE, once per range.
+      if (range) {
+        auto const rows  = static_cast<std::size_t>(full.size());
+        auto const begin = std::min(range->begin_row, rows);
+        auto const end   = std::min(range->end_row, rows);
+        if (begin >= end) { return nullptr; }
+        full = cudf::slice(full,
+                           {static_cast<cudf::size_type>(begin), static_cast<cudf::size_type>(end)})
+                 .front();
+      }
+      column_views.emplace_back(full);
       alloc_size += columns.back()->alloc_size();
     }
     cudf::table_view view(column_views);
@@ -2769,6 +2879,44 @@ std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
                                                      has_physical_overrides,
                                                      std::move(pushdown_req),
                                                      std::move(dynamic_filters));
+}
+
+std::vector<std::uint32_t> surviving_decode_chunks(std::span<chunk_row_range const> ranges,
+                                                   std::size_t rows)
+{
+  constexpr std::size_t decode_chunk_rows = static_cast<std::size_t>(::codegen::kChunkSize);
+  if (ranges.empty() || rows == 0) { return {}; }
+  auto const n_chunks = (rows + decode_chunk_rows - 1) / decode_chunk_rows;
+
+  std::vector<std::uint32_t> ids;
+  ids.reserve(n_chunks);
+  for (auto const& r : ranges) {
+    auto const begin = std::min(r.begin_row, rows);
+    auto const end   = std::min(r.end_row, rows);
+    if (begin >= end) { continue; }
+    auto const first = begin / decode_chunk_rows;
+    auto const last  = (end + decode_chunk_rows - 1) / decode_chunk_rows;
+    for (auto c = first; c < last; ++c) {
+      // Ranges are group-aligned and ascending, so this is already sorted; the guard only keeps a
+      // caller that ignored that from emitting a duplicate id, which the subset builder rejects.
+      if (!ids.empty() && ids.back() >= static_cast<std::uint32_t>(c)) { continue; }
+      ids.push_back(static_cast<std::uint32_t>(c));
+    }
+  }
+  if (ids.size() == n_chunks) { return {}; }  // nothing pruned: serve the chunk whole
+  return ids;
+}
+
+std::size_t surviving_decode_chunk_rows(std::span<std::uint32_t const> chunks, std::size_t rows)
+{
+  constexpr std::size_t decode_chunk_rows = static_cast<std::size_t>(::codegen::kChunkSize);
+  std::size_t kept                        = 0;
+  for (auto const id : chunks) {
+    auto const begin = static_cast<std::size_t>(id) * decode_chunk_rows;
+    if (begin >= rows) { continue; }
+    kept += std::min(decode_chunk_rows, rows - begin);
+  }
+  return kept;
 }
 
 namespace {
