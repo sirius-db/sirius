@@ -16,10 +16,9 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
 #include "exec/thread_util.hpp"
 #include "log/logging.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <concepts>
 #include <condition_variable>
@@ -38,9 +37,9 @@ namespace sirius::exec {
 class static_thread_pool {
  public:
   explicit static_thread_pool(int num_threads,
-                              const std::string& name                             = "thread_pool",
-                              std::vector<int> cpu_ids                            = {},
-                              absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+                              const std::string& name  = "thread_pool",
+                              std::vector<int> cpu_ids = {},
+                              sirius::exec::invocable<void() noexcept> per_thread_init = nullptr)
   {
     threads_.reserve(num_threads);
 
@@ -115,7 +114,7 @@ class static_thread_pool {
   void work_loop()
   {
     while (!stop_requested_) {
-      absl::AnyInvocable<void() noexcept> func;
+      sirius::exec::invocable<void() noexcept> func;
       {
         std::unique_lock<std::mutex> l(mu_);
         cv_.wait(l, [this] { return has_work_or_stopped(); });
@@ -130,7 +129,7 @@ class static_thread_pool {
 
   std::mutex mu_;
   std::condition_variable cv_;
-  std::queue<absl::AnyInvocable<void() noexcept>> queue_;
+  std::queue<sirius::exec::invocable<void() noexcept>> queue_;
   std::atomic<bool> stop_requested_{false};
   std::vector<std::thread> threads_;
 };

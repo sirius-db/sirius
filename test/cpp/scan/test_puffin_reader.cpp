@@ -18,7 +18,7 @@
 //
 // Every iceberg fixture in this repo stores relative paths, so none of them can tell whether
 // this reader handles the URIs that Apache writers actually put in manifests. It opens the file
-// directly rather than through sirius_ioctx, so the scheme stripping done at the datasource
+// directly rather than through ioctx, so the scheme stripping done at the datasource
 // boundary does not reach it — and a failure here does not surface as an error: the table
 // declines to CPU and the V3 path merely appears never to engage.
 //

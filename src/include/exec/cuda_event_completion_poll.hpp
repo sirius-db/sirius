@@ -92,9 +92,9 @@
 //       if (auto e = sub.commit(); e != cudaSuccess) { /* already recovered */ }
 //     }
 //
-#include <cuda_runtime.h>
+#include "exec/invocable.hpp"
 
-#include <absl/functional/any_invocable.h>
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -133,10 +133,10 @@ inline constexpr std::size_t cacheline_v = 64;
 // Receives the stream's completion status for the batch it was staged with.
 // Must be noexcept: these run on the allocation path.
 //
-// @c absl::AnyInvocable rather than std::move_only_function:
+// @c exec::invocable (absl::AnyInvocable) rather than std::move_only_function:
 // the project targets C++20, and this is the move-only callable the rest of
 // the pipeline and future primitives already use.
-using retire_fn = absl::AnyInvocable<void(cudaError_t) noexcept>;
+using retire_fn = invocable<void(cudaError_t) noexcept>;
 
 inline constexpr std::uint64_t no_pending_v = ~std::uint64_t{0};
 
