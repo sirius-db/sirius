@@ -673,13 +673,6 @@ if(SIRIUS_BUILD_SHARED_LIBRARY)
     sirius_shared
     PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
             "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
-  target_link_options(
-    sirius_shared PRIVATE
-    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/libsirius.map")
-  set_property(
-    TARGET sirius_shared
-    APPEND
-    PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libsirius.map")
 endif()
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
