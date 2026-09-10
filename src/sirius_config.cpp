@@ -161,6 +161,20 @@ static void from_yaml(const YAML::Node& node, creator::task_creator_config& opt)
   r.reject_unknown();
 }
 
+static void from_yaml(const YAML::Node& node,
+                      sirius::io::object_store_config::s3_data_endpoint& opt)
+{
+  yaml::reader r(node, "s3_rdma_data");
+  r.optional("endpoint", opt.endpoint);
+  r.optional("region", opt.region);
+  r.optional("access_key", opt.access_key);
+  r.optional("secret_key", opt.secret_key);
+  r.optional("signing_mode", opt.s3_signing_mode);
+  r.optional("ca_bundle_path", opt.ca_bundle_path);
+  r.optional("tls_verify", opt.tls_verify);
+  r.reject_unknown();
+}
+
 static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& opt)
 {
   yaml::reader r(node, "object_store");
@@ -170,6 +184,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::object_store_config& o
   r.optional("secret_key", opt.secret_key);
   r.optional("session_token", opt.session_token);
   r.optional("s3_transport", opt.s3_transport);
+  r.optional("s3_rdma_max_inflight", opt.s3_rdma_max_inflight);
+  r.optional("s3_rdma_arena_slot_size", opt.s3_rdma_arena_slot_size);
+  r.optional("s3_rdma_queue_cap", opt.s3_rdma_queue_cap);
+  if (auto n = r.optional_node("s3_rdma_data")) { sirius::from_yaml(*n, opt.s3_rdma_data); }
   r.optional("signing_mode", opt.s3_signing_mode);
   r.optional("ca_bundle_path", opt.ca_bundle_path);
   r.optional("tls_verify", opt.tls_verify);

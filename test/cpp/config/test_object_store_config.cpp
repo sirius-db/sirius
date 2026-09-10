@@ -15,7 +15,9 @@
  */
 
 #include "catch.hpp"
+#include "io/datasource_factory.hpp"
 #include "io/object_store_config.hpp"
+#include "io/rdma/cuobj_rdma_reactor.hpp"
 #include "io/rest/config.hpp"
 #include "sirius_config.hpp"
 
@@ -48,6 +50,8 @@ TEST_CASE("object_store_config defaults are inert", "[object_store_config]")
   CHECK(cfg.secret_key.empty());
   CHECK(cfg.session_token.empty());
   CHECK(cfg.s3_transport == object_store_config::transport::AUTO);
+  CHECK(cfg.s3_rdma_max_inflight == 8);
+  CHECK(cfg.s3_rdma_arena_slot_size == 4UL << 20);
   CHECK(cfg.s3_signing_mode == object_store_config::signing_mode::presigned);
 }
 
@@ -154,6 +158,106 @@ TEST_CASE("sirius_config loads object_store_config from YAML", "[object_store_co
   CHECK(os.s3_transport == object_store_config::transport::RDMA);
   CHECK(os.ca_bundle_path == "/tmp/test-ca.pem");
   CHECK_FALSE(os.tls_verify);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config parses S3 RDMA reactor knobs from YAML",
+          "[object_store_config][s3][rdma][reactor][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_s3_rdma_knobs.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        s3_transport: rdma\n"
+             "        s3_rdma_max_inflight: 2\n"
+             "        s3_rdma_arena_slot_size: 65536\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+
+  auto const& os = cfg.get_scan_manager_config().object_store;
+  CHECK(os.s3_transport == object_store_config::transport::RDMA);
+  CHECK(os.s3_rdma_max_inflight == 2);
+  CHECK(os.s3_rdma_arena_slot_size == 64UL << 10);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("sirius_config parses the S3 RDMA data endpoint and queue cap",
+          "[object_store_config][s3][rdma][config]")
+{
+  auto const path = std::filesystem::temp_directory_path() / "sirius_s3_rdma_data_endpoint.yaml";
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        endpoint: https://control.example.test\n"
+             "        region: us-west-2\n"
+             "        access_key: control-access\n"
+             "        secret_key: control-secret\n"
+             "        signing_mode: presigned\n"
+             "        s3_transport: rdma\n"
+             "        s3_rdma_queue_cap: 3\n"
+             "        s3_rdma_data:\n"
+             "          endpoint: https://data.example.test\n"
+             "          region: us-east-2\n"
+             "          access_key: data-access\n"
+             "          secret_key: data-secret\n"
+             "          signing_mode: header\n"
+             "          ca_bundle_path: /tmp/data-ca.pem\n"
+             "          tls_verify: false\n");
+
+  sirius::sirius_config cfg;
+  REQUIRE_NOTHROW(cfg.load_from_file(path));
+  auto const& os   = cfg.get_scan_manager_config().object_store;
+  auto const& data = os.s3_rdma_data;
+  CHECK(data.endpoint == "https://data.example.test");
+  CHECK(data.region == "us-east-2");
+  CHECK(data.access_key == "data-access");
+  CHECK(data.secret_key == "data-secret");
+  CHECK(data.s3_signing_mode == object_store_config::signing_mode::header);
+  CHECK(data.ca_bundle_path == "/tmp/data-ca.pem");
+  CHECK_FALSE(data.tls_verify);
+  REQUIRE(os.s3_rdma_queue_cap.has_value());
+  CHECK(*os.s3_rdma_queue_cap == 3);
+
+  sirius::io::rdma::cuobj_rdma_reactor::config reactor_cfg;
+  reactor_cfg.max_inflight    = os.s3_rdma_max_inflight;
+  reactor_cfg.arena_slot_size = os.s3_rdma_arena_slot_size;
+  reactor_cfg.queue_cap       = os.s3_rdma_queue_cap;
+  CHECK(sirius::io::rdma::sanitized(reactor_cfg).queue_cap == 3);
+  auto factory                                   = sirius::io::make_rdma_ioctx_factory();
+  auto invalid_cap_cfg                           = cfg.get_scan_manager_config();
+  invalid_cap_cfg.object_store.s3_rdma_queue_cap = 0;
+  CHECK(factory(invalid_cap_cfg) == nullptr);
+
+  write_yaml(path,
+             "sirius:\n"
+             "  executor:\n"
+             "    scan_manager:\n"
+             "      object_store:\n"
+             "        endpoint: https://control.example.test\n"
+             "        region: us-west-2\n"
+             "        access_key: inherited-access\n"
+             "        secret_key: inherited-secret\n"
+             "        s3_transport: rdma\n"
+             "        s3_rdma_data:\n"
+             "          endpoint: https://data.example.test\n"
+             "          region: us-west-2\n"
+             "          signing_mode: header\n");
+
+  sirius::sirius_config inherited_cfg;
+  REQUIRE_NOTHROW(inherited_cfg.load_from_file(path));
+  auto const& inherited = inherited_cfg.get_scan_manager_config().object_store;
+  CHECK(inherited.s3_rdma_data.access_key.empty());
+  CHECK(inherited.s3_rdma_data.secret_key.empty());
+  CHECK(factory(inherited_cfg.get_scan_manager_config()) != nullptr);
 
   std::error_code ec;
   std::filesystem::remove(path, ec);

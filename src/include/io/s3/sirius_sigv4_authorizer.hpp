@@ -115,6 +115,13 @@ class sirius_sigv4_header_authorizer final : public sirius_sigv4_authorizer_base
                                   s3_request_method method,
                                   std::chrono::seconds timeout) override;
 
+  /// Extra headers signed INTO SignedHeaders (data-plane token + Range).
+  s3_authorized_request authorize_with_headers(
+    s3_object_ref const& obj,
+    s3_request_method method,
+    std::chrono::seconds timeout,
+    std::vector<std::pair<std::string, std::string>> const& extra_headers) override;
+
   /// Header-signed bucket-level ListObjectsV2: returns a plain
   /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
   /// Authorization / x-amz-* headers. @c timeout is unused (header auth carries

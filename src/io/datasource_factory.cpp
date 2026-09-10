@@ -19,7 +19,9 @@
 #include "io/io_context.hpp"
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/object_store_config.hpp"
+#include "io/rdma/cuobj_rdma_client.hpp"
 #include "io/rest/rest_ioctx.hpp"
+#include "io/s3/s3_rdma_ioctx.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "io/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
@@ -165,6 +167,46 @@ factory_type make_rest_ioctx_factory(
   };
 }
 
+factory_type make_rdma_ioctx_factory()
+{
+  return [](const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+    try {
+      const auto& os    = config.object_store;
+      auto control_auth = make_s3_authorizer(os);
+      if (!control_auth) {
+        SIRIUS_LOG_ERROR(
+          "make_rdma_ioctx_factory: the control-plane object store is not configured");
+        return nullptr;
+      }
+      // Credential inheritance is all-or-nothing, keyed on whether the data
+      // endpoint supplies its own access key.  Inheriting only access+secret
+      // would strip an STS session token from a temporary control credential
+      // and every data-plane signature would then fail; and mixing a data
+      // access key with the control secret would sign with a mismatched pair.
+      const auto& data = os.s3_rdma_data;
+      s3::static_credentials data_creds;
+      if (data.access_key.empty()) {
+        data_creds = s3::static_credentials_from(os);  // carries session_token
+      } else {
+        data_creds.access_key_id     = data.access_key;
+        data_creds.secret_access_key = data.secret_key;
+      }
+      auto data_auth = std::make_shared<s3::sirius_sigv4_header_authorizer>(
+        std::move(data_creds), data.region.empty() ? os.region : data.region, data.endpoint);
+
+      rdma::rdma_transport_clients clients;
+      clients.control = std::make_shared<rdma::curl_s3_control_client>(
+        std::move(control_auth), os.ca_bundle_path, os.tls_verify);
+      clients.data_sessions =
+        std::make_shared<rdma::cuobj_rdma_data_session_factory>(std::move(data_auth));
+      return std::make_shared<s3::s3_rdma_ioctx>(os, std::move(clients));
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("make_rdma_ioctx_factory: construction failed: {}", e.what());
+      return nullptr;
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // datasource_registry
 // ---------------------------------------------------------------------------
@@ -186,10 +228,39 @@ io_context_registry::io_context_registry(
                    entry{io_context_type::uring,
                          &uring::uring_reactor::supports,
                          make_uring_ioctx_factory(_reservation_manager)});
-  _entries.emplace(io_context_type::restful,
-                   entry{io_context_type::restful,
-                         &rest::rest_reactor::supports,
-                         make_rest_ioctx_factory(_reservation_manager)});
+  // Exactly one backend may claim the s3 scheme: lookup_path iterates an
+  // unordered map and returns the first non-kvikio match, so registering both
+  // would make the winner nondeterministic.  s3_transport picks which one
+  // (AUTO resolves to HTTP; both entries use the same scheme checker).
+  if (_config.object_store.s3_transport == object_store_config::transport::RDMA) {
+    _entries.emplace(
+      io_context_type::rdma,
+      entry{io_context_type::rdma, &rest::rest_reactor::supports, make_rdma_ioctx_factory()});
+    // Explicit-RDMA config errors surface HERE, at registry construction:
+    // routing must never lazily discover an unusable transport.
+    if (_config.object_store.s3_rdma_data.endpoint.empty()) {
+      throw std::runtime_error(
+        "io_context_registry: s3_transport=RDMA requires the s3_rdma_data endpoint "
+        "(the data-plane endpoint) to be configured");
+    }
+    if (_config.object_store.s3_rdma_data.s3_signing_mode ==
+        object_store_config::signing_mode::presigned) {
+      throw std::runtime_error(
+        "io_context_registry: s3_rdma_data signing_mode=presigned is not supported — the "
+        "data plane signs per-request headers, so header signing is required");
+    }
+    // An explicit zero envelope cap is a config error, rejected here at
+    // construction — never deferred to a lazily-failing first routing.
+    if (_config.object_store.s3_rdma_queue_cap.has_value() &&
+        *_config.object_store.s3_rdma_queue_cap == 0) {
+      throw std::runtime_error("io_context_registry: s3_rdma_queue_cap must be positive when set");
+    }
+  } else {
+    _entries.emplace(io_context_type::restful,
+                     entry{io_context_type::restful,
+                           &rest::rest_reactor::supports,
+                           make_rest_ioctx_factory(_reservation_manager)});
+  }
 }
 
 void io_context_registry::register_ioctx(io_context_type type,
