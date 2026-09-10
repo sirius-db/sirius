@@ -36,6 +36,7 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <duckdb/common/types/decimal.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 
 #include <cstdint>
@@ -234,6 +235,96 @@ TEST_CASE("hpln ingest - zone maps survive the file and prune an ingested table"
   std::vector<std::uint32_t> survivors;
   lowered->select_survivors(cell, survivors);
   REQUIRE(survivors == std::vector<std::uint32_t>{0, 1, 2});
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln ingest - the engine's logical types survive the file", "[compression][hpln_ingest]")
+{
+  if (no_gpu()) { return; }
+  auto stream    = cudf::get_default_stream();
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_lt_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "lt.hpln").string();
+
+  constexpr int kRows = 2048;
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(int32_column(ramp(kRows, 1)));
+  cols.push_back(int32_column(ramp(kRows, 2)));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  // DECIMAL is the case that motivates the segment: cuDF tracks scale but not precision, so
+  // DECIMAL(12,2) and DECIMAL(18,2) are indistinguishable from the physical types alone.
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::DATE),
+                                            duckdb::LogicalType::DECIMAL(12, 2)};
+  REQUIRE(sirius::write_table_to_hpln(
+            table->view(),
+            types,
+            {"d", "amt"},
+            "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n"
+            "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+            /*group_rows=*/0,
+            path,
+            stream,
+            rmm::mr::get_current_device_resource_ref())
+            .empty());
+
+  auto const ingested = sirius::read_hpln_into_pinned(path, *env().host_space);
+  REQUIRE(ingested.column_types.size() == 2);
+  REQUIRE(ingested.column_types[0].id() == duckdb::LogicalTypeId::DATE);
+  REQUIRE(ingested.column_types[1].id() == duckdb::LogicalTypeId::DECIMAL);
+  REQUIRE(duckdb::DecimalType::GetWidth(ingested.column_types[1]) == 12);
+  REQUIRE(duckdb::DecimalType::GetScale(ingested.column_types[1]) == 2);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln ingest - a pre-trailer file still ingests", "[compression][hpln_ingest]")
+{
+  // The fallback path for files written before the trailer existed. Untested until now, which is
+  // how a fallback quietly stops working.
+  if (no_gpu()) { return; }
+  auto stream    = cudf::get_default_stream();
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_old_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "old.hpln").string();
+
+  constexpr int kRows = 3000;
+  auto const v        = ramp(kRows, 3);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(int32_column(v));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+  auto ct    = simpatico::compress_with_plan(
+    table->view(), "input -> bitpack\n", stream, rmm::mr::get_current_device_resource_ref());
+
+  // Write the pre-v7 shape by hand: header then payload, no postscript and no trailer.
+  std::vector<std::uint8_t> hdr;
+  std::vector<simpatico::payload_buffer_ref> refs;
+  std::uint64_t payload_bytes = 0;
+  REQUIRE(simpatico::build_compressed_table_header(ct, hdr, refs, payload_bytes, stream).empty());
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  for (auto const& b : refs) {
+    if (b.size_bytes > 0 && b.device_ptr) {
+      REQUIRE(cudaMemcpy(payload.data() + b.offset,
+                         b.device_ptr,
+                         static_cast<std::size_t>(b.size_bytes),
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    }
+  }
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<char const*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    f.write(reinterpret_cast<char const*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+  }
+
+  auto const ingested = sirius::read_hpln_into_pinned(path, *env().host_space);
+  REQUIRE(ingested.schema.columns.size() == 1);
+  REQUIRE(ingested.schema.columns[0].num_rows == kRows);
+  REQUIRE(ingested.blob->payload_bytes == payload_bytes);
+  // No segments, so no statistics and no declared types -- serve unpruned, do not fail.
+  REQUIRE(ingested.group_bounds.empty());
+  REQUIRE(ingested.column_types.empty());
 
   fs::remove_all(dir);
 }

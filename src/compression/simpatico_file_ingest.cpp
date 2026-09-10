@@ -169,24 +169,37 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
       tail = read_tail(f, need, file_size);
       err  = simpatico::read_hpln_postscript(tail, file_size, segs, nullptr);
     }
-    for (auto const& sg : segs) {
-      if (sg.kind != simpatico::hpln_segment::zone_maps || sg.bytes == 0) { continue; }
-      std::vector<std::uint8_t> zm(static_cast<std::size_t>(sg.bytes));
+    auto segment_bytes = [&](simpatico::hpln_segment_ref const& sg) {
+      std::vector<std::uint8_t> buf(static_cast<std::size_t>(sg.bytes));
       f.seekg(static_cast<std::streamoff>(sg.offset));
-      f.read(reinterpret_cast<char*>(zm.data()), static_cast<std::streamsize>(sg.bytes));
+      f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(sg.bytes));
       if (!f) {
-        SIRIUS_LOG_WARN("[hpln ingest] '{}': short read of the zone-map segment; serving unpruned",
-                        path);
         f.clear();
-        break;
+        buf.clear();
       }
-      std::string zerr;
-      out.group_bounds = scan_manager::group_bounds_arena::unpack(zm, &zerr);
-      if (!zerr.empty()) {
-        SIRIUS_LOG_WARN(
-          "[hpln ingest] '{}': zone maps unreadable ({}); serving unpruned", path, zerr);
+      return buf;
+    };
+    for (auto const& sg : segs) {
+      if (sg.bytes == 0) { continue; }
+      // Unknown segment kinds are skipped, which is what makes them additive.
+      if (sg.kind == simpatico::hpln_segment::zone_maps) {
+        std::string zerr;
+        out.group_bounds = scan_manager::group_bounds_arena::unpack(segment_bytes(sg), &zerr);
+        if (!zerr.empty()) {
+          SIRIUS_LOG_WARN(
+            "[hpln ingest] '{}': zone maps unreadable ({}); serving unpruned", path, zerr);
+        }
+      } else if (sg.kind == simpatico::hpln_segment::logical_types) {
+        std::string terr;
+        out.column_types = unpack_logical_types(segment_bytes(sg), &terr);
+        if (!terr.empty()) {
+          SIRIUS_LOG_WARN(
+            "[hpln ingest] '{}': logical types unreadable ({}); the caller has only "
+            "the cuDF physical types",
+            path,
+            terr);
+        }
       }
-      break;
     }
   }
 
@@ -197,6 +210,136 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                    header_bytes,
                    payload_bytes,
                    out.group_bounds.empty() ? "no zone maps" : "zone maps present");
+  return out;
+}
+
+namespace {
+
+// Stable wire tags for the engine's logical types. OUR numbering, not duckdb::LogicalTypeId's,
+// so a DuckDB upgrade that renumbers its enum cannot silently reinterpret existing files.
+enum class type_tag : std::uint8_t {
+  unknown = 0,
+  boolean,
+  i8,
+  i16,
+  i32,
+  i64,
+  u8,
+  u16,
+  u32,
+  u64,
+  f32,
+  f64,
+  decimal,
+  varchar,
+  date,
+  time,
+  timestamp,
+  timestamp_tz,
+  blob
+};
+
+type_tag tag_of(duckdb::LogicalType const& t)
+{
+  switch (t.id()) {
+    case duckdb::LogicalTypeId::BOOLEAN: return type_tag::boolean;
+    case duckdb::LogicalTypeId::TINYINT: return type_tag::i8;
+    case duckdb::LogicalTypeId::SMALLINT: return type_tag::i16;
+    case duckdb::LogicalTypeId::INTEGER: return type_tag::i32;
+    case duckdb::LogicalTypeId::BIGINT: return type_tag::i64;
+    case duckdb::LogicalTypeId::UTINYINT: return type_tag::u8;
+    case duckdb::LogicalTypeId::USMALLINT: return type_tag::u16;
+    case duckdb::LogicalTypeId::UINTEGER: return type_tag::u32;
+    case duckdb::LogicalTypeId::UBIGINT: return type_tag::u64;
+    case duckdb::LogicalTypeId::FLOAT: return type_tag::f32;
+    case duckdb::LogicalTypeId::DOUBLE: return type_tag::f64;
+    case duckdb::LogicalTypeId::DECIMAL: return type_tag::decimal;
+    case duckdb::LogicalTypeId::VARCHAR: return type_tag::varchar;
+    case duckdb::LogicalTypeId::DATE: return type_tag::date;
+    case duckdb::LogicalTypeId::TIME: return type_tag::time;
+    case duckdb::LogicalTypeId::TIMESTAMP: return type_tag::timestamp;
+    case duckdb::LogicalTypeId::TIMESTAMP_TZ: return type_tag::timestamp_tz;
+    case duckdb::LogicalTypeId::BLOB: return type_tag::blob;
+    default: return type_tag::unknown;
+  }
+}
+
+duckdb::LogicalType type_of(type_tag tag, std::uint8_t width, std::uint8_t scale)
+{
+  using L = duckdb::LogicalTypeId;
+  switch (tag) {
+    case type_tag::boolean: return duckdb::LogicalType(L::BOOLEAN);
+    case type_tag::i8: return duckdb::LogicalType(L::TINYINT);
+    case type_tag::i16: return duckdb::LogicalType(L::SMALLINT);
+    case type_tag::i32: return duckdb::LogicalType(L::INTEGER);
+    case type_tag::i64: return duckdb::LogicalType(L::BIGINT);
+    case type_tag::u8: return duckdb::LogicalType(L::UTINYINT);
+    case type_tag::u16: return duckdb::LogicalType(L::USMALLINT);
+    case type_tag::u32: return duckdb::LogicalType(L::UINTEGER);
+    case type_tag::u64: return duckdb::LogicalType(L::UBIGINT);
+    case type_tag::f32: return duckdb::LogicalType(L::FLOAT);
+    case type_tag::f64: return duckdb::LogicalType(L::DOUBLE);
+    // Precision is the field cuDF cannot carry: it tracks scale only, so DECIMAL(12,2) and
+    // DECIMAL(18,2) are indistinguishable once a table is compressed. This is why the segment
+    // exists.
+    case type_tag::decimal: return duckdb::LogicalType::DECIMAL(width, scale);
+    case type_tag::varchar: return duckdb::LogicalType(L::VARCHAR);
+    case type_tag::date: return duckdb::LogicalType(L::DATE);
+    case type_tag::time: return duckdb::LogicalType(L::TIME);
+    case type_tag::timestamp: return duckdb::LogicalType(L::TIMESTAMP);
+    case type_tag::timestamp_tz: return duckdb::LogicalType(L::TIMESTAMP_TZ);
+    case type_tag::blob: return duckdb::LogicalType(L::BLOB);
+    default: return duckdb::LogicalType(L::SQLNULL);
+  }
+}
+
+constexpr std::uint16_t kLogicalTypesWireVersion = 1;
+
+}  // namespace
+
+std::vector<std::uint8_t> pack_logical_types(duckdb::vector<duckdb::LogicalType> const& types)
+{
+  std::vector<std::uint8_t> out;
+  auto put16 = [&](std::uint16_t v) {
+    out.push_back(static_cast<std::uint8_t>(v & 0xFF));
+    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
+  };
+  put16(kLogicalTypesWireVersion);
+  put16(static_cast<std::uint16_t>(types.size()));
+  for (auto const& t : types) {
+    auto const tag = tag_of(t);
+    out.push_back(static_cast<std::uint8_t>(tag));
+    if (tag == type_tag::decimal) {
+      out.push_back(duckdb::DecimalType::GetWidth(t));
+      out.push_back(duckdb::DecimalType::GetScale(t));
+    } else {
+      out.push_back(0);
+      out.push_back(0);
+    }
+  }
+  return out;
+}
+
+duckdb::vector<duckdb::LogicalType> unpack_logical_types(std::span<const std::uint8_t> bytes,
+                                                         std::string* error)
+{
+  auto fail = [&](char const* why) {
+    if (error) *error = why;
+    return duckdb::vector<duckdb::LogicalType>{};
+  };
+  if (bytes.size() < 4) return fail("logical-types segment: truncated preamble");
+  auto const version = static_cast<std::uint16_t>(bytes[0] | (bytes[1] << 8));
+  auto const n       = static_cast<std::uint16_t>(bytes[2] | (bytes[3] << 8));
+  if (version != kLogicalTypesWireVersion) {
+    return fail("logical-types segment: unsupported version");
+  }
+  if (bytes.size() < 4u + 3u * n) return fail("logical-types segment: truncated column table");
+  duckdb::vector<duckdb::LogicalType> out;
+  out.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    auto const* p = bytes.data() + 4 + 3 * i;
+    out.push_back(type_of(static_cast<type_tag>(p[0]), p[1], p[2]));
+  }
   return out;
 }
 
@@ -228,10 +371,15 @@ std::string write_table_to_hpln(cudf::table_view const& table,
     packed = scan_manager::group_bounds_arena::from_capture(column_types, per_chunk).pack();
   }
 
-  std::array<simpatico::hpln_extra_segment, 1> extra{
-    simpatico::hpln_extra_segment{simpatico::hpln_segment::zone_maps, packed}};
-  return simpatico::write_compressed_table(
-    ct, path, stream, packed.empty() ? std::span<const simpatico::hpln_extra_segment>{} : extra);
+  // The engine's types always travel: without them a reader has only cuDF physical types and
+  // cannot reconstruct DECIMAL precision or nullability, so the file would not be self-describing.
+  auto const type_bytes = pack_logical_types(column_types);
+  std::vector<simpatico::hpln_extra_segment> extra;
+  if (!type_bytes.empty()) {
+    extra.push_back({simpatico::hpln_segment::logical_types, type_bytes});
+  }
+  if (!packed.empty()) { extra.push_back({simpatico::hpln_segment::zone_maps, packed}); }
+  return simpatico::write_compressed_table(ct, path, stream, extra);
 }
 
 }  // namespace sirius
