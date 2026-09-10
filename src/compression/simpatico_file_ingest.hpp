@@ -29,6 +29,7 @@
 // (CHUNK_SKIPPING_PLAN.md 6.5).
 
 #include "compressed_representation.hpp"
+#include "hpln_io.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -45,6 +46,24 @@
 #include <vector>
 
 namespace sirius {
+
+/// How a .hpln is opened and read.
+///
+/// The transport is the whole point of carrying this: with an @ref io_ctx every read -- the tail
+/// that locates the file, the metadata region, each chunk's payload -- goes through that backend,
+/// which is the only way an `s3://` path can be read at all. Without one the reads go through the
+/// local filesystem, and a scheme path is refused rather than silently read locally.
+struct hpln_open_options {
+  /// Backend serving this path. Null means the local filesystem.
+  std::shared_ptr<io::sirius_ioctx> io_ctx;
+  /// How reads are coalesced into requests; see @ref hpln_io_policy for where its defaults
+  /// come from.
+  hpln_io_policy policy{};
+  /// Filled with what the transport actually did, when non-null. The only way to observe that a
+  /// read went through the io_context and how many requests it cost -- the bytes are the same
+  /// either way.
+  hpln_io_stats* stats = nullptr;
+};
 
 /// One chunk of a .hpln staged into pinned host memory: the bytes and the row count.
 struct ingested_hpln_chunk {
@@ -97,7 +116,8 @@ struct hpln_bind_schema {
 /// written without that segment binds to approximate types rather than failing.
 ///
 /// Throws std::runtime_error if the file cannot be read or parsed.
-[[nodiscard]] hpln_bind_schema read_hpln_schema(std::string const& path);
+[[nodiscard]] hpln_bind_schema read_hpln_schema(std::string const& path,
+                                                hpln_open_options const& options = {});
 
 /// Pack @p types into the bytes a `logical_types` segment carries, and back.
 ///
@@ -120,7 +140,8 @@ struct hpln_bind_schema {
 /// silently truncated to its first chunk. Such a file is refused; use
 /// @ref read_hpln_chunks_into_pinned, which is what a scan over one drives.
 [[nodiscard]] ingested_hpln read_hpln_into_pinned(std::string const& path,
-                                                  cucascade::memory::memory_space& host_space);
+                                                  cucascade::memory::memory_space& host_space,
+                                                  hpln_open_options const& options = {});
 
 /// Read the chunks @p chunk_ids of @p path into pinned host memory, in the order named.
 ///
@@ -131,7 +152,8 @@ struct hpln_bind_schema {
 [[nodiscard]] std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
-  std::span<const std::size_t> chunk_ids);
+  std::span<const std::size_t> chunk_ids,
+  hpln_open_options const& options = {});
 
 /// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
 ///
