@@ -160,9 +160,15 @@ constexpr std::size_t ceil_div(std::size_t a, std::size_t b)
 // bind
 //===----------------------------------------------------------------------===//
 std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
-  std::string const& path, cucascade::memory::memory_space& host_space)
+  std::string const& path,
+  cucascade::memory::memory_space& host_space,
+  std::shared_ptr<io::sirius_ioctx> io_ctx)
 {
-  auto schema = sirius::read_hpln_schema(path);
+  // The bind reads through the same transport the scan will: an `s3://` file has to be bindable
+  // before it can be scanned, and binding it locally is not an option.
+  sirius::hpln_open_options options;
+  options.io_ctx = io_ctx;
+  auto schema    = sirius::read_hpln_schema(path, options);
 
   auto info                 = std::make_unique<simpatico_ingestible_table_info>();
   info->resolved_file_paths = {path};
@@ -173,6 +179,7 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->chunk_rows          = std::move(schema.chunk_rows);
   info->group_bounds        = std::move(schema.group_bounds);
   info->host_space          = &host_space;
+  info->io_ctx              = std::move(io_ctx);
   // Whole file by default; a caller with a narrower projection overwrites this.
   info->column_ids.resize(info->names.size());
   std::iota(info->column_ids.begin(), info->column_ids.end(), std::size_t{0});
@@ -403,7 +410,7 @@ bool simpatico_gpu_ingestible::has_processed_all_metadata() const
 }
 
 simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_split_provider(
-  io::ioctx_resolver /*resolve*/)
+  io::ioctx_resolver resolve)
 {
   // fetch_add rather than load-then-store: several dispatcher threads may reach here, and two of
   // them reading the same cursor would emit one chunk twice and skip another -- which lands as a
@@ -411,15 +418,28 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
   auto const cursor = _next_chunk.fetch_add(1, std::memory_order_relaxed);
   if (cursor >= _live_chunks.size()) { return nullptr; }
 
+  // Resolve the backend HERE, on the walk, the way the parquet source does: the resolver routes
+  // by path (`s3://` -> rest, local -> uring/kvikio), and resolving once per split keeps
+  // materialize free of the scan manager. The bind already resolved the same path, so this is a
+  // map lookup rather than a build.
+  auto io_ctx = _info->io_ctx;
+  if (resolve) {
+    io_ctx = resolve(_info->resolved_file_paths.front());
+  } else if (!io_ctx) {
+    // No scan manager wired (host tests drive the ingestible directly). A local file still reads
+    // through the filesystem; a scheme path is refused by the transport rather than read wrongly.
+    SIRIUS_LOG_DEBUG(
+      "[simpatico_gpu_ingestible] '{}': no ioctx resolver; reading through the filesystem",
+      _info->resolved_file_paths.front());
+  }
+
   // The walk is over the SURVIVING chunks, not over the file's: a chunk the zone maps ruled out
   // never becomes a split, so it is never read, fetched or decoded.
-  //
-  // The resolver is unused because the ingest reads the file through the filesystem rather than
-  // through an io_context datasource, which is also why a remote path cannot be read yet.
-  return [this, cursor]() -> std::unique_ptr<scan_info> {
+  return [this, cursor, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
     auto const& live     = _live_chunks[cursor];
     auto split           = std::make_unique<simpatico_scan_info>();
     split->path          = _info->resolved_file_paths.front();
+    split->io_ctx        = io_ctx;
     split->chunk_ids     = {live.id};
     split->decode_chunks = {live.decode_chunks};
     // The narrowed row count, so the reservation and the batch budget are sized by what the
@@ -449,8 +469,10 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // Stage byte-for-byte into pinned host memory, then fetch the leaf buffers the reader asks for
   // straight out of those blocks. Nothing is decoded on the way in, so a served table costs one
   // file read plus one decode rather than a decode and a re-compress.
+  sirius::hpln_open_options options;
+  options.io_ctx = split.io_ctx;
   auto ingested =
-    sirius::read_hpln_chunks_into_pinned(split.path, *_info->host_space, split.chunk_ids);
+    sirius::read_hpln_chunks_into_pinned(split.path, *_info->host_space, split.chunk_ids, options);
 
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;

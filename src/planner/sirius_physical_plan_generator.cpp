@@ -276,10 +276,17 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
       "[sirius_physical_plan_generator::build_simpatico_table_info] no HOST memory space "
       "available to stage the .hpln payload");
   }
+  // Route the file to its backend, exactly as a scan split will: `s3://` reaches the REST
+  // io_context and a local path the uring one. Without this the bind's own reads (trailer,
+  // headers, zone maps) would go through the filesystem, which cannot open a remote object at
+  // all. Null when no backend claims the path -- the transport then reads it locally, and
+  // refuses it outright if it names a scheme.
+  auto io_ctx = sirius_ctx->get_scan_manager().ioctx_for_path(path);
+
   // The payload stages into pinned host memory before its H2D copy; any host space serves, and
   // the first is the one every other single-space consumer takes.
   auto info = sirius::op::scan::bind_simpatico_file(
-    path, *const_cast<cucascade::memory::memory_space*>(host_spaces.front()));
+    path, *const_cast<cucascade::memory::memory_space*>(host_spaces.front()), std::move(io_ctx));
   // The file's chunks are bundled up to the same byte budget every other source batches to, so a
   // .hpln of many small chunks does not pay a decode per chunk.
   info->approximate_batch_size = op_params.scan_task_batch_size;

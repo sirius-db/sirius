@@ -273,7 +273,7 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 // costs two small reads even for a file that decodes to gigabytes. The path is echoed into bind
 // data purely for the cardinality callback; the plan generator reads it back out of
 // parameters[0].
-unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext&,
+unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
                                                  TableFunctionBindInput& input,
                                                  vector<LogicalType>& return_types,
                                                  vector<string>& names)
@@ -283,7 +283,15 @@ unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext&,
   }
   auto const path = input.inputs[0].GetValue<std::string>();
 
-  auto schema  = sirius::read_hpln_schema(path);
+  // Read through the backend that serves the path, so `read_simpatico('s3://...')` binds at all.
+  // The Sirius state is absent when the extension is loaded but the runtime was never brought up;
+  // a local file still binds through the filesystem then, and a scheme path fails with a clear
+  // message from the transport rather than as "no such file".
+  sirius::hpln_open_options options;
+  if (auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    options.io_ctx = state->get_scan_manager().ioctx_for_path(path);
+  }
+  auto schema  = sirius::read_hpln_schema(path, options);
   return_types = std::move(schema.types);
   names.assign(schema.names.begin(), schema.names.end());
   return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema.num_rows));

@@ -28,6 +28,7 @@
 #include <numeric>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius {
@@ -42,39 +43,6 @@ constexpr std::uint64_t kHeaderProbeBytes = 1u << 20;  // 1 MiB
 constexpr std::uint64_t kHeaderProbeMax = 64u << 20;  // 64 MiB
 /// Tail read that should contain the trailer and the whole postscript in one go.
 constexpr std::uint64_t kTailProbeBytes = 64u << 10;  // 64 KiB
-
-std::vector<std::uint8_t> read_prefix(std::ifstream& f, std::uint64_t want, std::uint64_t file_size)
-{
-  auto const n = static_cast<std::size_t>(std::min(want, file_size));
-  std::vector<std::uint8_t> buf(n);
-  f.seekg(0);
-  f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n));
-  if (!f) { throw std::runtime_error("[hpln ingest] short read while reading the header"); }
-  return buf;
-}
-
-std::vector<std::uint8_t> read_tail(std::ifstream& f, std::uint64_t want, std::uint64_t file_size)
-{
-  auto const n = static_cast<std::size_t>(std::min(want, file_size));
-  std::vector<std::uint8_t> buf(n);
-  f.seekg(static_cast<std::streamoff>(file_size - n));
-  f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n));
-  if (!f) { throw std::runtime_error("[hpln ingest] short read while reading the trailer"); }
-  return buf;
-}
-
-/// Read an exact byte range. Used for the small out-of-band segments, never for payload.
-std::vector<std::uint8_t> read_range(std::ifstream& f,
-                                     std::uint64_t offset,
-                                     std::uint64_t bytes,
-                                     char const* what)
-{
-  std::vector<std::uint8_t> buf(static_cast<std::size_t>(bytes));
-  f.seekg(static_cast<std::streamoff>(offset));
-  f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(bytes));
-  if (!f) { throw std::runtime_error(std::string("[hpln] short read of the ") + what); }
-  return buf;
-}
 
 /// A .hpln opened far enough to know where every chunk is.
 struct hpln_layout {
@@ -95,14 +63,20 @@ std::optional<simpatico::hpln_segment_ref> find_segment(hpln_layout const& layou
 }
 
 /// Locate the segments and resolve the chunk directory of an open file.
-hpln_layout locate_hpln(std::ifstream& f, std::uint64_t file_size, std::string const& path)
+///
+/// One tail read locates everything: the trailer names the postscript, the postscript names every
+/// segment, and the chunk directory subdivides them. That is what makes the format cheap to open
+/// over an object store, where a request costs more than the bytes it moves
+/// (CHUNK_SKIPPING_PLAN.md 7.6).
+hpln_layout locate_hpln(hpln_source& src, std::string const& path)
 {
+  auto const file_size = src.size();
   hpln_layout out;
   std::uint64_t need = 0;
-  auto tail          = read_tail(f, kTailProbeBytes, file_size);
+  auto tail          = src.read_tail(kTailProbeBytes, "trailer");
   auto err           = simpatico::read_hpln_postscript(tail, file_size, out.segs, &need);
   if (!err.empty() && need > tail.size() && need <= file_size) {
-    tail = read_tail(f, need, file_size);  // exact re-read, never a second guess
+    tail = src.read_tail(need, "trailer");  // exact re-read, never a second guess
     err  = simpatico::read_hpln_postscript(tail, file_size, out.segs, nullptr);
   }
   if (!err.empty()) {
@@ -116,7 +90,7 @@ hpln_layout locate_hpln(std::ifstream& f, std::uint64_t file_size, std::string c
   // exactly what makes that additive.
   if (auto const dir = find_segment(out, simpatico::hpln_segment::chunk_directory)) {
     auto const derr = simpatico::unpack_hpln_chunk_directory(
-      read_range(f, dir->offset, dir->bytes, "chunk directory"), out.chunks);
+      src.read_range(dir->offset, dir->bytes, "chunk directory"), out.chunks);
     if (!derr.empty()) { throw std::runtime_error("[hpln] '" + path + "': " + derr); }
     if (out.chunks.empty()) {
       throw std::runtime_error("[hpln] '" + path + "': chunk directory names no chunks");
@@ -162,19 +136,36 @@ bool same_schema(simpatico::hpln_schema const& a, simpatico::hpln_schema const& 
 /// rather than a seek per chunk. It also validates that the chunks agree, which has to happen
 /// HERE -- discovering mid-scan that chunk 7 has a different column order means a batch that
 /// cannot be concatenated, or worse one that can but is wrong.
-void describe_chunks(std::ifstream& f,
+void describe_chunks(hpln_source& src,
                      std::string const& path,
                      hpln_layout& layout,
+                     hpln_io_policy const& policy,
                      std::vector<std::vector<std::uint8_t>>& out_headers,
                      simpatico::hpln_schema& out_schema)
 {
   out_headers.clear();
-  out_headers.reserve(layout.chunks.size());
+  out_headers.resize(layout.chunks.size());
+
+  // Every chunk header in ONE planned read. The layout puts them contiguously, so the coalescer
+  // turns N chunks into one request rather than N -- which is the difference between a bind
+  // costing one round trip and costing one per chunk.
+  std::vector<hpln_extent> extents;
+  extents.reserve(layout.chunks.size());
+  for (std::size_t i = 0; i < layout.chunks.size(); ++i) {
+    auto const& chunk = layout.chunks[i];
+    out_headers[i].resize(static_cast<std::size_t>(chunk.header_bytes));
+    if (chunk.header_bytes == 0) { continue; }
+    hpln_extent e;
+    e.offset = chunk.header_offset;
+    e.dst.push_back({out_headers[i].data(), chunk.header_bytes});
+    extents.push_back(std::move(e));
+  }
+  src.read_extents(std::move(extents), policy, "header segment");
+
   for (std::size_t i = 0; i < layout.chunks.size(); ++i) {
     auto& chunk = layout.chunks[i];
-    auto bytes  = read_range(f, chunk.header_offset, chunk.header_bytes, "header segment");
     simpatico::hpln_schema schema;
-    auto const err = simpatico::describe_compressed_table_header(bytes, schema);
+    auto const err = simpatico::describe_compressed_table_header(out_headers[i], schema);
     if (!err.empty()) {
       throw std::runtime_error("[hpln] '" + path + "' chunk " + std::to_string(i) +
                                " header does not parse: " + err);
@@ -194,15 +185,18 @@ void describe_chunks(std::ifstream& f,
                                "describe the same table");
     }
     chunk.num_rows = schema.columns.empty() ? 0 : schema.columns.front().num_rows;
-    out_headers.push_back(std::move(bytes));
   }
 }
 
-/// Stage one chunk's payload straight into pinned blocks.
-std::shared_ptr<pinned_compressed_blob> stage_chunk(std::ifstream& f,
-                                                    std::vector<std::uint8_t> header,
-                                                    simpatico::hpln_chunk_ref const& chunk,
-                                                    cucascade::memory::memory_space& host_space)
+/// Allocate a chunk's pinned blocks and describe the read that fills them.
+///
+/// Allocating and reading are separated so a batch of chunks can be planned as ONE set of
+/// requests: the payloads of consecutive chunks are adjacent in the file, so the coalescer fuses
+/// them into large sequential reads instead of one request per chunk (and per block).
+std::shared_ptr<pinned_compressed_blob> allocate_chunk(std::vector<std::uint8_t> header,
+                                                       simpatico::hpln_chunk_ref const& chunk,
+                                                       cucascade::memory::memory_space& host_space,
+                                                       std::vector<hpln_extent>& out_extents)
 {
   auto* host_mr = host_space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
   if (host_mr == nullptr) {
@@ -215,39 +209,38 @@ std::shared_ptr<pinned_compressed_blob> stage_chunk(std::ifstream& f,
   auto payload_res    = host_space.make_reservation_or_null(nb);
   blob->payload       = host_mr->allocate_multiple_blocks(nb, payload_res.get());
   blob->payload_bytes = nb;
+  if (nb == 0) { return blob; }
 
-  // Straight into the pinned blocks, one block at a time -- the allocation is not contiguous, and
-  // going through an intermediate host buffer would double both the copy and the footprint.
-  f.seekg(static_cast<std::streamoff>(chunk.payload_offset));
+  // Straight into the pinned blocks -- the allocation is not contiguous, but the file range is,
+  // so it is one extent scattered across blocks rather than one read per block. Going through an
+  // intermediate host buffer would double both the copy and the footprint.
+  hpln_extent e;
+  e.offset           = chunk.payload_offset;
   auto const block   = blob->payload->block_size();
   std::uint64_t done = 0;
   std::size_t idx    = 0;
   while (done < nb) {
-    auto const n = static_cast<std::size_t>(std::min<std::uint64_t>(block, nb - done));
-    f.read(reinterpret_cast<char*>(blob->payload->at(idx).data()), static_cast<std::streamsize>(n));
-    if (!f) {
-      throw std::runtime_error("[hpln ingest] short read at payload offset " +
-                               std::to_string(chunk.payload_offset + done));
-    }
+    auto const n = std::min<std::uint64_t>(block, nb - done);
+    e.dst.push_back({reinterpret_cast<std::uint8_t*>(blob->payload->at(idx).data()), n});
     done += n;
     ++idx;
   }
+  out_extents.push_back(std::move(e));
   return blob;
 }
 
-/// Open @p path and stat it, or throw with @p who in the message.
-std::ifstream open_hpln(std::string const& path, char const* who, std::uint64_t& out_file_size)
+/// Open @p path for reading, through @p options's io_context when it has one.
+std::unique_ptr<hpln_source> open_hpln(std::string const& path,
+                                       char const* who,
+                                       hpln_open_options const& options)
 {
-  namespace fs = std::filesystem;
-  std::error_code ec;
-  out_file_size = static_cast<std::uint64_t>(fs::file_size(path, ec));
-  if (ec) {
-    throw std::runtime_error(std::string("[") + who + "] cannot stat '" + path +
-                             "': " + ec.message());
-  }
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { throw std::runtime_error(std::string("[") + who + "] cannot open '" + path + "'"); }
-  return f;
+  return open_hpln_source(path, options.io_ctx, who);
+}
+
+/// Publish what the transport did, for a caller that asked.
+void report(hpln_source const& src, hpln_open_options const& options)
+{
+  if (options.stats != nullptr) { *options.stats = src.stats(); }
 }
 
 }  // namespace
@@ -255,11 +248,11 @@ std::ifstream open_hpln(std::string const& path, char const* who, std::uint64_t&
 std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
-  std::span<const std::size_t> chunk_ids)
+  std::span<const std::size_t> chunk_ids,
+  hpln_open_options const& options)
 {
-  std::uint64_t file_size = 0;
-  auto f                  = open_hpln(path, "hpln ingest", file_size);
-  auto layout             = locate_hpln(f, file_size, path);
+  auto src    = open_hpln(path, "hpln ingest", options);
+  auto layout = locate_hpln(*src, path);
   if (!layout.located) {
     throw std::runtime_error("[hpln ingest] '" + path +
                              "' predates the trailer and has no chunk directory; it can only be "
@@ -267,28 +260,45 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   }
   std::vector<std::vector<std::uint8_t>> headers;
   simpatico::hpln_schema schema;
-  describe_chunks(f, path, layout, headers, schema);
+  describe_chunks(*src, path, layout, options.policy, headers, schema);
 
+  // Allocate every requested chunk first, then fill them all in one planned read: consecutive
+  // chunks are adjacent in the payload region, so the batch collapses to a few large sequential
+  // requests rather than one per chunk (7.7). No chunk outside `chunk_ids` is touched.
   std::vector<ingested_hpln_chunk> out;
+  std::vector<hpln_extent> extents;
   out.reserve(chunk_ids.size());
+  extents.reserve(chunk_ids.size());
+  // A chunk named twice is staged ONCE and served to both positions. The blob is read-only from
+  // here on, so sharing it is not just cheaper -- reading the same range into two buffers would
+  // mean two overlapping requests, which the read planner refuses precisely because overlapping
+  // destinations are how a range silently lands in the wrong place.
+  std::unordered_map<std::size_t, std::shared_ptr<pinned_compressed_blob>> staged;
   for (auto const id : chunk_ids) {
     if (id >= layout.chunks.size()) {
       throw std::runtime_error("[hpln ingest] '" + path + "': chunk " + std::to_string(id) +
                                " is out of range for a file with " +
                                std::to_string(layout.chunks.size()) + " chunks");
     }
-    out.push_back(
-      {stage_chunk(f, headers[id], layout.chunks[id], host_space), layout.chunks[id].num_rows});
+    auto it = staged.find(id);
+    if (it == staged.end()) {
+      it = staged.emplace(id, allocate_chunk(headers[id], layout.chunks[id], host_space, extents))
+             .first;
+    }
+    out.push_back({it->second, layout.chunks[id].num_rows});
   }
+  src->read_extents(std::move(extents), options.policy, "chunk payload");
+  report(*src, options);
   return out;
 }
 
 ingested_hpln read_hpln_into_pinned(std::string const& path,
-                                    cucascade::memory::memory_space& host_space)
+                                    cucascade::memory::memory_space& host_space,
+                                    hpln_open_options const& options)
 {
-  std::uint64_t file_size = 0;
-  auto f                  = open_hpln(path, "hpln ingest", file_size);
-  auto layout             = locate_hpln(f, file_size, path);
+  auto src             = open_hpln(path, "hpln ingest", options);
+  auto const file_size = src->size();
+  auto layout          = locate_hpln(*src, path);
 
   ingested_hpln out;
   std::vector<std::uint8_t> header;
@@ -299,7 +309,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                                " chunks; read_hpln_into_pinned serves a single chunk only");
     }
     std::vector<std::vector<std::uint8_t>> headers;
-    describe_chunks(f, path, layout, headers, out.schema);
+    describe_chunks(*src, path, layout, options.policy, headers, out.schema);
     header = std::move(headers.front());
   } else {
     // Pre-trailer file: grow a speculative prefix until the header parses, which is the round trip
@@ -307,7 +317,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
     std::vector<std::uint8_t> prefix;
     std::string err;
     for (std::uint64_t want = kHeaderProbeBytes;; want *= 2) {
-      prefix = read_prefix(f, want, file_size);
+      prefix = src->read_prefix(want, "header");
       err    = simpatico::describe_compressed_table_header(prefix, out.schema);
       if (err.empty()) { break; }
       if (prefix.size() >= file_size || want >= kHeaderProbeMax) {
@@ -328,7 +338,9 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                   prefix.begin() + static_cast<std::ptrdiff_t>(out.schema.header_bytes));
   }
 
-  out.blob = stage_chunk(f, std::move(header), layout.chunks.front(), host_space);
+  std::vector<hpln_extent> extents;
+  out.blob = allocate_chunk(std::move(header), layout.chunks.front(), host_space, extents);
+  src->read_extents(std::move(extents), options.policy, "chunk payload");
 
   // Zone maps, if the file carries them. A file written before the segment existed, or one whose
   // segment does not decode, simply serves unpruned -- so this never fails the ingest.
@@ -338,7 +350,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
     if (sg.kind == simpatico::hpln_segment::zone_maps) {
       std::string zerr;
       out.group_bounds = scan_manager::group_bounds_arena::unpack(
-        read_range(f, sg.offset, sg.bytes, "zone map segment"), &zerr);
+        src->read_range(sg.offset, sg.bytes, "zone map segment"), &zerr);
       if (!zerr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln ingest] '{}': zone maps unreadable ({}); serving unpruned", path, zerr);
@@ -346,7 +358,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
     } else if (sg.kind == simpatico::hpln_segment::logical_types) {
       std::string terr;
       out.column_types =
-        unpack_logical_types(read_range(f, sg.offset, sg.bytes, "logical types segment"), &terr);
+        unpack_logical_types(src->read_range(sg.offset, sg.bytes, "logical types segment"), &terr);
       if (!terr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln ingest] '{}': logical types unreadable ({}); the caller has only "
@@ -364,6 +376,7 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
                    out.schema.header_bytes,
                    out.schema.payload_bytes,
                    out.group_bounds.empty() ? "no zone maps" : "zone maps present");
+  report(*src, options);
   return out;
 }
 
@@ -527,15 +540,15 @@ duckdb::vector<duckdb::LogicalType> unpack_logical_types(std::span<const std::ui
   return out;
 }
 
-hpln_bind_schema read_hpln_schema(std::string const& path)
+hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options const& options)
 {
   // Reuses the ingest reader for locating and parsing, but stops before any payload is staged:
   // binding a query must not move data. Every chunk's header is parsed -- one sequential read of
   // the segregated metadata region -- both to sum the row counts the optimizer wants and to
   // refuse a file whose chunks disagree here rather than mid-scan.
-  std::uint64_t file_size = 0;
-  auto f                  = open_hpln(path, "hpln schema", file_size);
-  auto layout             = locate_hpln(f, file_size, path);
+  auto src             = open_hpln(path, "hpln schema", options);
+  auto const file_size = src->size();
+  auto layout          = locate_hpln(*src, path);
 
   simpatico::hpln_schema header_schema;
   duckdb::vector<duckdb::LogicalType> declared;
@@ -544,14 +557,14 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
 
   if (layout.located) {
     std::vector<std::vector<std::uint8_t>> headers;
-    describe_chunks(f, path, layout, headers, header_schema);
+    describe_chunks(*src, path, layout, options.policy, headers, header_schema);
     for (auto const& c : layout.chunks) {
       chunk_rows.push_back(c.num_rows);
     }
     if (auto const sg = find_segment(layout, simpatico::hpln_segment::logical_types);
         sg && sg->bytes > 0) {
-      declared = unpack_logical_types(read_range(f, sg->offset, sg->bytes, "logical types segment"),
-                                      nullptr);
+      declared = unpack_logical_types(
+        src->read_range(sg->offset, sg->bytes, "logical types segment"), nullptr);
     }
     // The zone maps are read HERE rather than at scan time because a bind is where a scan learns
     // what it may skip: the walk has to decide a chunk's fate before it emits a split for it, and
@@ -560,7 +573,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
         sg && sg->bytes > 0) {
       std::string zerr;
       bounds = scan_manager::group_bounds_arena::unpack(
-        read_range(f, sg->offset, sg->bytes, "zone map segment"), &zerr);
+        src->read_range(sg->offset, sg->bytes, "zone map segment"), &zerr);
       if (!zerr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln schema] '{}': zone maps unreadable ({}); binding unpruned", path, zerr);
@@ -570,7 +583,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
     // Pre-trailer file: parse the header from the front, growing the prefix as needed.
     std::string herr;
     for (std::uint64_t want = kHeaderProbeBytes;; want *= 2) {
-      auto const prefix = read_prefix(f, want, file_size);
+      auto const prefix = src->read_prefix(want, "header");
       herr              = simpatico::describe_compressed_table_header(prefix, header_schema);
       if (herr.empty()) { break; }
       if (prefix.size() >= file_size || want >= kHeaderProbeMax) {
@@ -610,6 +623,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
       out.types.push_back(duckdb_type_for_cudf(simpatico::tag_to_dtype(c.dtype_tag), c.scale));
     }
   }
+  report(*src, options);
   return out;
 }
 

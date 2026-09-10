@@ -766,6 +766,16 @@ class sirius_scan_manager {
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
+  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
+  /// — including the scan resolver, which forwards raw ingestible paths — may pass a raw
+  /// `file://` / `s3://` URI), building it once per backend on first use.  Routes by path
+  /// through the registry so an `s3://` URI reaches the rest_ioctx even when the local default
+  /// `_io_ctx` is uring/kvikio.  Returns nullptr when no backend supports the path.
+  ///
+  /// Public because binding is a routing decision too: a `.hpln` bind reads the file's trailer
+  /// and metadata before any split exists, so it needs the same backend the scan will use.
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
@@ -796,13 +806,6 @@ class sirius_scan_manager {
   /// via the sirius.executor.scan_manager.memory_prefetcher config block (see
   /// memory_prefetcher.hpp). No-op otherwise.
   void maybe_start_memory_prefetcher();
-
-  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
-  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
-  /// building it once per backend on first use.  Routes by path through the registry
-  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
