@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -510,6 +511,155 @@ std::size_t group_bounds_arena::groups_in_chunk(std::size_t chunk) const noexcep
 {
   if (chunk >= _n_chunks || _n_columns == 0) { return 0; }
   return _slices[chunk].count;  // column 0's slice for this chunk
+}
+
+namespace {
+
+// Wire tags for the types compute_pinned_group_stats can capture. Stable: do not renumber.
+// Anything else packs as `absent`, which prunes nothing rather than prunes wrongly.
+enum class packed_type : std::uint8_t {
+  absent = 0,
+  i8,
+  i16,
+  i32,
+  i64,
+  u8,
+  u16,
+  u32,
+  u64,
+  date,
+  timestamp
+};
+
+packed_type to_packed(duckdb::LogicalType const& t)
+{
+  switch (t.id()) {
+    case duckdb::LogicalTypeId::TINYINT: return packed_type::i8;
+    case duckdb::LogicalTypeId::SMALLINT: return packed_type::i16;
+    case duckdb::LogicalTypeId::INTEGER: return packed_type::i32;
+    case duckdb::LogicalTypeId::BIGINT: return packed_type::i64;
+    case duckdb::LogicalTypeId::UTINYINT: return packed_type::u8;
+    case duckdb::LogicalTypeId::USMALLINT: return packed_type::u16;
+    case duckdb::LogicalTypeId::UINTEGER: return packed_type::u32;
+    case duckdb::LogicalTypeId::UBIGINT: return packed_type::u64;
+    case duckdb::LogicalTypeId::DATE: return packed_type::date;
+    case duckdb::LogicalTypeId::TIMESTAMP: return packed_type::timestamp;
+    default: return packed_type::absent;
+  }
+}
+
+duckdb::LogicalType from_packed(packed_type p)
+{
+  switch (p) {
+    case packed_type::i8: return duckdb::LogicalType(duckdb::LogicalTypeId::TINYINT);
+    case packed_type::i16: return duckdb::LogicalType(duckdb::LogicalTypeId::SMALLINT);
+    case packed_type::i32: return duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
+    case packed_type::i64: return duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
+    case packed_type::u8: return duckdb::LogicalType(duckdb::LogicalTypeId::UTINYINT);
+    case packed_type::u16: return duckdb::LogicalType(duckdb::LogicalTypeId::USMALLINT);
+    case packed_type::u32: return duckdb::LogicalType(duckdb::LogicalTypeId::UINTEGER);
+    case packed_type::u64: return duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT);
+    case packed_type::date: return duckdb::LogicalType(duckdb::LogicalTypeId::DATE);
+    case packed_type::timestamp: return duckdb::LogicalType(duckdb::LogicalTypeId::TIMESTAMP);
+    default: return duckdb::LogicalType(duckdb::LogicalTypeId::SQLNULL);
+  }
+}
+
+template <typename T>
+void put(std::vector<std::uint8_t>& out, T v)
+{
+  auto const* p = reinterpret_cast<std::uint8_t const*>(&v);
+  out.insert(out.end(), p, p + sizeof(T));
+}
+
+template <typename T>
+bool take(std::span<const std::uint8_t>& in, T& v)
+{
+  if (in.size() < sizeof(T)) return false;
+  std::memcpy(&v, in.data(), sizeof(T));
+  in = in.subspan(sizeof(T));
+  return true;
+}
+
+constexpr std::uint16_t kZoneMapWireVersion = 1;
+
+}  // namespace
+
+std::vector<std::uint8_t> group_bounds_arena::pack() const
+{
+  std::vector<std::uint8_t> out;
+  put(out, kZoneMapWireVersion);
+  put(out, static_cast<std::uint32_t>(_group_rows));
+  put(out, static_cast<std::uint16_t>(_n_columns));
+  put(out, static_cast<std::uint32_t>(_n_chunks));
+  for (std::size_t c = 0; c < _n_columns; ++c) {
+    auto const t = c < _types.size() ? to_packed(_types[c]) : packed_type::absent;
+    put(out, static_cast<std::uint8_t>(t));
+    std::uint8_t flags = 0;
+    if (c < _is_unsigned.size() && _is_unsigned[c]) flags |= 1u;
+    if (c < _column_has_no_nulls.size() && _column_has_no_nulls[c]) flags |= 2u;
+    put(out, flags);
+    for (std::size_t k = 0; k < _n_chunks; ++k) {
+      auto const& sl = _slices[c * _n_chunks + k];
+      auto const n   = (t == packed_type::absent) ? std::size_t{0} : sl.count;
+      put(out, static_cast<std::uint32_t>(n));
+      if (n == 0) continue;
+      auto const* mins = _storage.data() + sl.offset;
+      out.insert(out.end(),
+                 reinterpret_cast<std::uint8_t const*>(mins),
+                 reinterpret_cast<std::uint8_t const*>(mins + 2 * n));  // mins then maxs
+      out.insert(out.end(), _valid.data() + sl.valid_offset, _valid.data() + sl.valid_offset + n);
+    }
+  }
+  return out;
+}
+
+group_bounds_arena group_bounds_arena::unpack(std::span<const std::uint8_t> bytes,
+                                              std::string* error)
+{
+  auto fail = [&](char const* why) {
+    if (error) *error = why;
+    return group_bounds_arena{};
+  };
+  std::uint16_t version = 0, n_columns = 0;
+  std::uint32_t group_rows = 0, n_chunks = 0;
+  if (!take(bytes, version) || !take(bytes, group_rows) || !take(bytes, n_columns) ||
+      !take(bytes, n_chunks)) {
+    return fail("zone-map segment: truncated preamble");
+  }
+  if (version != kZoneMapWireVersion) return fail("zone-map segment: unsupported version");
+
+  group_bounds_arena a;
+  a._group_rows = group_rows;
+  a._n_columns  = n_columns;
+  a._n_chunks   = n_chunks;
+  a._slices.assign(static_cast<std::size_t>(n_columns) * n_chunks, slice{});
+  a._types.reserve(n_columns);
+  for (std::size_t c = 0; c < n_columns; ++c) {
+    std::uint8_t tag = 0, flags = 0;
+    if (!take(bytes, tag) || !take(bytes, flags)) return fail("zone-map segment: truncated column");
+    a._types.push_back(from_packed(static_cast<packed_type>(tag)));
+    a._is_unsigned.push_back((flags & 1u) != 0);
+    a._column_has_no_nulls.push_back((flags & 2u) != 0);
+    for (std::size_t k = 0; k < n_chunks; ++k) {
+      std::uint32_t n = 0;
+      if (!take(bytes, n)) return fail("zone-map segment: truncated group count");
+      if (n == 0) continue;
+      if (bytes.size() < n * (2 * sizeof(std::int64_t) + 1)) {
+        return fail("zone-map segment: truncated bounds");
+      }
+      auto& sl        = a._slices[c * n_chunks + k];
+      sl.offset       = a._storage.size();
+      sl.valid_offset = a._valid.size();
+      sl.count        = n;
+      a._storage.resize(sl.offset + 2 * n);
+      std::memcpy(a._storage.data() + sl.offset, bytes.data(), 2 * n * sizeof(std::int64_t));
+      bytes = bytes.subspan(2 * n * sizeof(std::int64_t));
+      a._valid.insert(a._valid.end(), bytes.begin(), bytes.begin() + n);
+      bytes = bytes.subspan(n);
+    }
+  }
+  return a;
 }
 
 group_bounds_arena group_bounds_arena::from_capture(

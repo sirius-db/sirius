@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -231,6 +232,29 @@ class group_bounds_arena {
   [[nodiscard]] static group_bounds_arena from_capture(
     duckdb::vector<duckdb::LogicalType> const& column_types,
     std::vector<chunk_group_stats> const& per_chunk);
+
+  /**
+   * @brief Pack the arena into the engine-neutral bytes a .hpln `zone_maps` segment carries.
+   *
+   * An INGESTED file must be able to prune without decoding anything, which means the bounds have
+   * to travel with the data rather than being recomputed from it. The layout mirrors the arena's
+   * own — per column a type and two null flags, then per (column, chunk) the group count followed
+   * by mins, maxs and validity — so decoding is a copy rather than a rebuild.
+   *
+   * Only the types @ref compute_pinned_group_stats captures are representable (integers <= 8 B,
+   * DATE, TIMESTAMP); a column of any other type round-trips as "no statistics", which prunes
+   * nothing rather than pruning wrongly.
+   */
+  [[nodiscard]] std::vector<std::uint8_t> pack() const;
+
+  /**
+   * @brief Inverse of @ref pack. Returns an empty arena (and sets @p error) on malformed input.
+   *
+   * An empty arena means "no sub-chunk pruning", never a wrong answer, so a caller may treat a
+   * failure as non-fatal and serve the file unpruned.
+   */
+  [[nodiscard]] static group_bounds_arena unpack(std::span<const std::uint8_t> bytes,
+                                                 std::string* error = nullptr);
 
  private:
   struct slice {
