@@ -17,6 +17,7 @@
 #include "simpatico_file_ingest.hpp"
 
 #include <api/simpatico_codegen.hpp>
+#include <codegen/plan/leaf_desc.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
@@ -293,6 +294,36 @@ duckdb::LogicalType type_of(type_tag tag, std::uint8_t width, std::uint8_t scale
   }
 }
 
+/// cuDF physical type -> the closest DuckDB type, for files with no `logical_types` segment.
+/// Deliberately approximate: DECIMAL precision is set to the carrier's maximum because cuDF does
+/// not record the declared one, which is the loss the logical_types segment exists to prevent.
+duckdb::LogicalType duckdb_type_for_cudf(cudf::data_type dtype, std::int32_t scale)
+{
+  using L = duckdb::LogicalTypeId;
+  switch (dtype.id()) {
+    case cudf::type_id::INT8: return duckdb::LogicalType(L::TINYINT);
+    case cudf::type_id::INT16: return duckdb::LogicalType(L::SMALLINT);
+    case cudf::type_id::INT32: return duckdb::LogicalType(L::INTEGER);
+    case cudf::type_id::INT64: return duckdb::LogicalType(L::BIGINT);
+    case cudf::type_id::UINT8: return duckdb::LogicalType(L::UTINYINT);
+    case cudf::type_id::UINT16: return duckdb::LogicalType(L::USMALLINT);
+    case cudf::type_id::UINT32: return duckdb::LogicalType(L::UINTEGER);
+    case cudf::type_id::UINT64: return duckdb::LogicalType(L::UBIGINT);
+    case cudf::type_id::FLOAT32: return duckdb::LogicalType(L::FLOAT);
+    case cudf::type_id::FLOAT64: return duckdb::LogicalType(L::DOUBLE);
+    case cudf::type_id::STRING: return duckdb::LogicalType(L::VARCHAR);
+    case cudf::type_id::DECIMAL32: return duckdb::LogicalType::DECIMAL(9, -scale);
+    case cudf::type_id::DECIMAL64: return duckdb::LogicalType::DECIMAL(18, -scale);
+    case cudf::type_id::DECIMAL128: return duckdb::LogicalType::DECIMAL(38, -scale);
+    case cudf::type_id::TIMESTAMP_DAYS: return duckdb::LogicalType(L::DATE);
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return duckdb::LogicalType(L::TIMESTAMP);
+    default: return duckdb::LogicalType(L::SQLNULL);
+  }
+}
+
 constexpr std::uint16_t kLogicalTypesWireVersion = 1;
 
 }  // namespace
@@ -339,6 +370,81 @@ duckdb::vector<duckdb::LogicalType> unpack_logical_types(std::span<const std::ui
   for (std::size_t i = 0; i < n; ++i) {
     auto const* p = bytes.data() + 4 + 3 * i;
     out.push_back(type_of(static_cast<type_tag>(p[0]), p[1], p[2]));
+  }
+  return out;
+}
+
+hpln_bind_schema read_hpln_schema(std::string const& path)
+{
+  // Reuses the ingest reader for locating and parsing, but stops before any payload is staged:
+  // binding a query must not move data.
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  auto const file_size = static_cast<std::uint64_t>(fs::file_size(path, ec));
+  if (ec) { throw std::runtime_error("[hpln schema] cannot stat '" + path + "': " + ec.message()); }
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { throw std::runtime_error("[hpln schema] cannot open '" + path + "'"); }
+
+  simpatico::hpln_schema header_schema;
+  duckdb::vector<duckdb::LogicalType> declared;
+  std::vector<simpatico::hpln_segment_ref> segs;
+  std::uint64_t need = 0;
+  auto tail          = read_tail(f, kTailProbeBytes, file_size);
+  auto err           = simpatico::read_hpln_postscript(tail, file_size, segs, &need);
+  if (!err.empty() && need > tail.size() && need <= file_size) {
+    tail = read_tail(f, need, file_size);
+    err  = simpatico::read_hpln_postscript(tail, file_size, segs, nullptr);
+  }
+
+  auto read_seg = [&](simpatico::hpln_segment_ref const& sg) {
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(sg.bytes));
+    f.seekg(static_cast<std::streamoff>(sg.offset));
+    f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(sg.bytes));
+    if (!f) {
+      f.clear();
+      buf.clear();
+    }
+    return buf;
+  };
+
+  if (err.empty()) {
+    for (auto const& sg : segs) {
+      if (sg.bytes == 0) { continue; }
+      if (sg.kind == simpatico::hpln_segment::header) {
+        auto const bytes = read_seg(sg);
+        auto const herr  = simpatico::describe_compressed_table_header(bytes, header_schema);
+        if (!herr.empty()) { throw std::runtime_error("[hpln schema] '" + path + "': " + herr); }
+      } else if (sg.kind == simpatico::hpln_segment::logical_types) {
+        declared = unpack_logical_types(read_seg(sg), nullptr);
+      }
+    }
+  } else {
+    // Pre-trailer file: parse the header from the front, growing the prefix as needed.
+    std::string herr;
+    for (std::uint64_t want = kHeaderProbeBytes;; want *= 2) {
+      auto const prefix = read_prefix(f, want, file_size);
+      herr              = simpatico::describe_compressed_table_header(prefix, header_schema);
+      if (herr.empty()) { break; }
+      if (prefix.size() >= file_size || want >= kHeaderProbeMax) {
+        throw std::runtime_error("[hpln schema] '" + path + "' is not a readable .hpln: " + herr);
+      }
+    }
+  }
+
+  hpln_bind_schema out;
+  out.num_rows = header_schema.columns.empty() ? 0 : header_schema.columns.front().num_rows;
+  out.names.reserve(header_schema.columns.size());
+  out.types.reserve(header_schema.columns.size());
+  for (std::size_t i = 0; i < header_schema.columns.size(); ++i) {
+    auto const& c = header_schema.columns[i];
+    out.names.push_back(c.name.empty() ? "column" + std::to_string(i) : c.name);
+    if (i < declared.size() && declared[i].id() != duckdb::LogicalTypeId::SQLNULL) {
+      out.types.push_back(declared[i]);
+    } else {
+      // Fall back to the cuDF physical type. Lossy by construction -- see 7.9 -- but a file
+      // without declared types should still bind rather than refuse.
+      out.types.push_back(duckdb_type_for_cudf(simpatico::tag_to_dtype(c.dtype_tag), c.scale));
+    }
   }
   return out;
 }

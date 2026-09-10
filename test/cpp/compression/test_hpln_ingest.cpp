@@ -329,6 +329,72 @@ TEST_CASE("hpln ingest - a pre-trailer file still ingests", "[compression][hpln_
   fs::remove_all(dir);
 }
 
+TEST_CASE("hpln schema - binds a file without touching the payload", "[compression][hpln_ingest]")
+{
+  // What a read_simpatico() bind needs: names and engine types, from the file, with no payload
+  // staged and no GPU work. Everything downstream (the table function, an ingestible's
+  // table_info, a pin) asks the same question.
+  if (no_gpu()) { return; }
+  auto stream    = cudf::get_default_stream();
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_bind_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+
+  constexpr int kRows = 1024;
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(int32_column(ramp(kRows, 1)));
+  cols.push_back(int32_column(ramp(kRows, 5)));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+  auto const plan =
+    std::string("input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n---\n") +
+    "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+
+  SECTION("declared types win when the file carries them")
+  {
+    auto const path = (dir / "declared.hpln").string();
+    duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::DATE),
+                                              duckdb::LogicalType::DECIMAL(12, 2)};
+    REQUIRE(sirius::write_table_to_hpln(table->view(),
+                                        types,
+                                        {"d", "amt"},
+                                        plan,
+                                        0,
+                                        path,
+                                        stream,
+                                        rmm::mr::get_current_device_resource_ref())
+              .empty());
+
+    auto const schema = sirius::read_hpln_schema(path);
+    REQUIRE(schema.names == std::vector<std::string>{"d", "amt"});
+    REQUIRE(schema.num_rows == kRows);
+    REQUIRE(schema.types[0].id() == duckdb::LogicalTypeId::DATE);
+    REQUIRE(duckdb::DecimalType::GetWidth(schema.types[1]) == 12);
+    REQUIRE(duckdb::DecimalType::GetScale(schema.types[1]) == 2);
+  }
+
+  SECTION("a file with no declared types still binds, approximately")
+  {
+    // The physical types are all a pre-logical_types file has, so binding must degrade rather
+    // than refuse -- and the degradation is visible: INT32 rather than the DATE it was written as.
+    auto const path = (dir / "physical.hpln").string();
+    REQUIRE(sirius::write_table_to_hpln(table->view(),
+                                        {},
+                                        {"d", "amt"},
+                                        plan,
+                                        0,
+                                        path,
+                                        stream,
+                                        rmm::mr::get_current_device_resource_ref())
+              .empty());
+
+    auto const schema = sirius::read_hpln_schema(path);
+    REQUIRE(schema.names.size() == 2);
+    REQUIRE(schema.types[0].id() == duckdb::LogicalTypeId::INTEGER);
+    REQUIRE(schema.types[1].id() == duckdb::LogicalTypeId::INTEGER);
+  }
+
+  fs::remove_all(dir);
+}
+
 TEST_CASE("hpln ingest - refuses a file that is not a readable .hpln", "[compression][hpln_ingest]")
 {
   if (no_gpu()) { return; }
