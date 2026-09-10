@@ -1761,12 +1761,21 @@ over S3 (§7.6).
 
   `projection_pushdown` deliberately stays off: the scan then remains full width with a projection
   above it, which is what makes a filter key's batch position its own column index.
-- **C2. Filter during decode, on top of pruning** — the `.hpln` reader calls `simpatico::decompress`
-  directly and so bypasses `decompress_chunk`, which is the entry point taking a
-  `decompression_pushdown_scan`. The file path therefore has none of the fused decode-time
-  filtering the pin path has had since `77f1a71e`. Build a `pushdown_request` from the same
-  `TableFilterSet` milestone C already plumbs; when the decode reports `covers_whole_filter` the
-  outcome maps to `filter_state::ROW_FILTERED` and C's post-decode filter is skipped outright.
+- **C2. Filter during decode, on top of pruning** — **Done.** The reader builds a
+  `pushdown_request` from the same `TableFilterSet` milestone C plumbs
+  (`analyze_scan_filters` → `build_pushdown_request`, slot *k* being `column_ids[k]`), narrows it
+  per chunk with `for_chunk` and decodes through `decompress_chunk`. A batch whose every chunk
+  reported `row_filtered` is tagged `filter_state::ROW_FILTERED` and C's post-decode filter is
+  skipped for it; anything weaker keeps the filter, which is what a mixed batch, a dropped
+  conjunct or a declined compaction all land on. The first chunk to report
+  `selection_unprofitable` ends the attempt for the rest of the scan, as the pinned path does.
+
+  Two things the file path deliberately does NOT ask for. **Equality answers** off a dictionary:
+  they substitute a column's values with the BOOL8 answer, which only pays for a column the query
+  never emits, and this source declares no projection pushdown — every decoded column is an output
+  column. **Join filters**: nothing publishes a dynamic filter set into a `read_simpatico` scan
+  yet. Both are wiring, not design, but until they exist a `.hpln` scan's decode-time win is
+  ranges only.
 
   The three layers compose as skip → narrow → filter-in-decode, but the interesting part is that
   **they compete on the same column and complement on different ones.** A group survives if ANY of

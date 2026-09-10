@@ -16,11 +16,14 @@
 
 // sirius
 #include <compression/compressed_representation.hpp>
+#include <compression/compressed_scan.hpp>
+#include <compression/decompression_pushdown_policy.hpp>
 #include <compression/simpatico_file_ingest.hpp>
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/scan/owning_table_view.hpp>
+#include <op/scan/scan_filter_analysis.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/simpatico_gpu_ingestible.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
@@ -41,6 +44,7 @@
 // standard library
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -238,6 +242,32 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
     // a conjunct DuckDB deleted from the plan would return rows the query excluded.
     _filter_expression = sirius::op::convert_table_filters_to_expression(
       *_info->table_filters, _info->duckdb_column_ids, _info->returned_types, batch_position);
+
+    // The same filter once more, in the form a DECODE can act on: inclusive bounds per column,
+    // evaluated while that column decompresses, so a row the predicate rejects is never fully
+    // reconstructed. This is additive to the pruning above rather than a replacement for it --
+    // the two act on different columns. A group survives if ANY of its rows could match, so after
+    // pruning on a clustered column its survivors are nearly all matches and the decode declines
+    // to compact on that column alone; what pays here is the predicate on a column the file is
+    // NOT clustered by, which the zone maps cannot narrow at all.
+    //
+    // No equality set is requested: a dictionary-answered equality substitutes the column's
+    // values with the BOOL8 answer, which only pays for a column the query never emits, and this
+    // source declares no projection pushdown -- every decoded column is an output column.
+    // Requesting one would hand the plan a boolean where it expects values.
+    auto const analysis = sirius::op::analyze_scan_filters(
+      *_info->table_filters, _info->duckdb_column_ids, _info->returned_types);
+    // Slot k of the decode is _info->column_ids[k], which is exactly the primary index the
+    // analysis keyed its ranges by (the plan generator builds column_ids from the same
+    // duckdb_column_ids).
+    auto request = sirius::op::build_pushdown_request(analysis, _info->column_ids);
+    // Off-gate the request carries nothing this source can use: row dropping is gated, and the
+    // equality answers that are not are never asked for here. Dropping it entirely keeps the
+    // gate-off path byte-identical to the one before decode-time filtering existed.
+    if (!request.empty() && sirius::decompression_pushdown_enabled()) {
+      _pushdown_scan =
+        std::make_shared<const sirius::decompression_pushdown_scan>(std::move(request));
+    }
   }
 
   plan_pruning();
@@ -477,6 +507,8 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;
   decoded.reserve(ingested.size());
+  // Cleared by any chunk the decode did not fully filter; see the decision below.
+  bool row_filtered_batch = _pushdown_scan != nullptr;
   for (std::size_t i = 0; i < ingested.size(); ++i) {
     auto const& blob = *ingested[i].blob;
     simpatico::payload_fetch_fn whole_fetch =
@@ -561,11 +593,57 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     // `compressed` already holds only the projected columns, in the requested order.
     std::vector<std::size_t> selection(compressed.num_columns());
     std::iota(selection.begin(), selection.end(), std::size_t{0});
-    // Decode on the caller's stream rather than on the decode thread pool. The pool overlaps
-    // columns, but its buffers are freed on pool streams and would have to be re-bound to `stream`
-    // before anything downstream may read them. It also keeps the fetch above and the decode on
-    // one stream, so no synchronize is needed between them.
-    decoded.push_back(simpatico::decompress(compressed, selection, stream, mr));
+
+    // This scan's filter narrowed to what THIS chunk can answer. `compressed` is the table the
+    // decode will see -- the compacted subset when the zone maps narrowed the chunk to some of its
+    // decode chunks -- so the narrowing, and everything the decode decides off a plan tree, is
+    // about the rows that will actually decode rather than about the chunk they came from.
+    std::shared_ptr<const sirius::decompression_pushdown_scan> chunk_scan;
+    if (_pushdown_scan && !_row_selection_dropped.load(std::memory_order_relaxed)) {
+      chunk_scan = _pushdown_scan->for_chunk(compressed, selection);
+    }
+
+    if (!chunk_scan) {
+      // Decode on the caller's stream rather than on the decode thread pool. The pool overlaps
+      // columns, but its buffers are freed on pool streams and would have to be re-bound to
+      // `stream` before anything downstream may read them. It also keeps the fetch above and the
+      // decode on one stream, so no synchronize is needed between them.
+      decoded.push_back(simpatico::decompress(compressed, selection, stream, mr));
+      row_filtered_batch = false;
+      continue;
+    }
+
+    // The fetch above only ENQUEUED its H2D copies on `stream`, and decompress_chunk decodes on
+    // its own stream pool; sync so no pool stream reads bytes that have not landed yet.
+    stream.synchronize();
+    auto result = sirius::decompress_chunk(compressed, selection, chunk_scan.get(), stream, mr);
+    _pushdown_offered.fetch_add(1, std::memory_order_relaxed);
+    if (result.outcome.row_filtered) {
+      _pushdown_row_filtered.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // Anything less than the whole filter leaves rows the predicate rejects in this chunk, and
+      // the batch is one table: one such chunk makes the post-decode filter mandatory for all of
+      // it. Re-checking the conjuncts a compacted chunk already applied is idempotent.
+      row_filtered_batch = false;
+    }
+    if (result.outcome.selection_unprofitable) {
+      _pushdown_unprofitable.fetch_add(1, std::memory_order_relaxed);
+      _row_selection_dropped.store(true, std::memory_order_relaxed);
+    }
+    if (!result.outcome.predicate_columns.empty()) {
+      // A column answered in place arrives as the BOOL8 answer instead of its values, which this
+      // source cannot emit: it declares no projection pushdown, so every decoded column is an
+      // output column. The request is built without equality sets precisely so this cannot
+      // happen -- reaching it means the request grew a source whose output shape nothing here
+      // handles, and serving the batch would hand the plan a boolean where it expects values.
+      throw std::runtime_error(
+        "[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
+        std::to_string(split.chunk_ids[i]) +
+        " decoded a column as a predicate answer, which a .hpln scan never asks for");
+    }
+    // Re-point the decoded buffers onto `stream`: they were produced on pool streams, while the
+    // concatenate below and everything downstream are ordered by `stream`.
+    decoded.push_back(sirius::rebind_table_stream(std::move(result.table), stream));
   }
 
   // The fetches above only ENQUEUED their H2D copies, and the pinned staging blobs die with this
@@ -586,14 +664,22 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     table = cudf::concatenate(views, stream, mr);
   }
 
-  SIRIUS_LOG_DEBUG("[simpatico_gpu_ingestible] '{}' chunks={} decoded rows={} cols={}",
-                   split.path,
-                   split.chunk_ids.size(),
-                   table->num_rows(),
-                   table->num_columns());
+  SIRIUS_LOG_DEBUG(
+    "[simpatico_gpu_ingestible] '{}' chunks={} decoded rows={} cols={} row_filtered={}",
+    split.path,
+    split.chunk_ids.size(),
+    table->num_rows(),
+    table->num_columns(),
+    row_filtered_batch);
 
-  return filtered_table{.table = owning_table_view{std::move(table)},
-                        .state = filter_state::UNFILTERED};
+  // ROW_FILTERED only when EVERY chunk of this batch came back carrying the whole filter --
+  // decompress_chunk sets row_filtered only where the request covered the filter with no conjunct
+  // dropped and the compaction actually applied. post_filter_and_project then skips the filter
+  // for this batch, which is why anything weaker has to read as "not filtered": the scan is the
+  // only thing left that applies the predicate at all.
+  return filtered_table{
+    .table = owning_table_view{std::move(table)},
+    .state = row_filtered_batch ? filter_state::ROW_FILTERED : filter_state::UNFILTERED};
 }
 
 //===----------------------------------------------------------------------===//
