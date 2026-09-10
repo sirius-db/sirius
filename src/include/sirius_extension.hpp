@@ -65,6 +65,38 @@ struct SiriusReadParquetBindData : public FunctionData {
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext& context,
                                                         FunctionData const* bind_data);
 
+// Bind-time payload for the read_simpatico table function. The path also travels
+// in parameters[0] — the plan generator reads it from there, exactly as it does
+// for sirius_read_parquet — and the row count comes from the .hpln header, which
+// a bind already had to parse, so the optimizer gets an exact cardinality for
+// free.
+struct SiriusReadSimpaticoBindData : public FunctionData {
+  SiriusReadSimpaticoBindData(std::string path, std::size_t total_num_rows)
+    : path(std::move(path)), total_num_rows(total_num_rows)
+  {
+  }
+
+  std::string path;
+  std::size_t total_num_rows{0};
+
+  unique_ptr<FunctionData> Copy() const override
+  {
+    return make_uniq<SiriusReadSimpaticoBindData>(path, total_num_rows);
+  }
+
+  bool Equals(FunctionData const& other_p) const override
+  {
+    auto const& other = other_p.Cast<SiriusReadSimpaticoBindData>();
+    return path == other.path && total_num_rows == other.total_num_rows;
+  }
+};
+
+// Cardinality callback for read_simpatico. The .hpln header row count is exact,
+// so it serves as both the estimate and the maximum. Returns nullptr on a null
+// or wrong-type FunctionData so DuckDB falls back to its default behavior.
+unique_ptr<NodeStatistics> SiriusReadSimpaticoCardinality(ClientContext& context,
+                                                          FunctionData const* bind_data);
+
 class SiriusExtension : public Extension {
  public:
   void Load(ExtensionLoader& loader) override;

@@ -1734,6 +1734,7 @@ over S3 (§7.6).
 
 - **A. `SELECT * FROM read_simpatico('x.hpln')`** — table function + bind + a minimal ingestible
   decoding whole chunks. Single file, no pruning. Everything else hangs off this.
+  **Done** (`read_simpatico`).
 - **B. Multi-chunk container** — chunk directory, splits, coalescer. Unlocks real table sizes.
 - **C. Pruning** — zone maps → surviving chunks → `build_chunk_subset_header` → ranged fetch.
   Largely re-pointing the pin path at a file transport, and where §7.6's S3 result cashes in.
