@@ -1,14 +1,14 @@
 ---
 name: pr-digest
-description: Create a context-first, navigable GitHub pull-request learning digest as Markdown plus a self-contained HTML preview, explaining the before/after behavior, change flow, key changes, and where they live with line-accurate links, diagrams, and trimmed color-coded diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
+description: Explain a GitHub pull request in straightforward language as a navigable Markdown digest plus an HTML preview. Start with the behavior before and after the change, define unavoidable technical terms, then connect the explanation to exact code lines and trimmed color-coded diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
 ---
 
 # PR Digest
 
-Turns a GitHub PR link into two companion artifacts a reviewer can actually learn from: canonical
-Markdown for portability and a self-contained HTML preview for reliable rendering in Codex. An
-opening before/after example and flowchart establish the mental model, then ranked key changes
-explain what/why/where-invoked/diff with clickable links into the actual checked-out source.
+Turns a GitHub PR link into two companion files a reviewer can learn from: editable Markdown and
+an HTML preview that renders reliably in Codex. A before/after example and flowchart explain the
+behavior first. Detailed sections then show what changed, why it matters, where it happens, and
+the relevant code.
 
 Comprehension is the whole job here. This skill does not judge the PR — no bug-hunting, no "is
 this a race condition" adversarial pass, no verdict on whether the change is good. That's a
@@ -16,6 +16,35 @@ different kind of work with a different failure mode (a digest that editorialize
 the explanation the reader actually came for), and other review skills cover it. If the user
 seems to expect a full critique from this alone, say plainly that this produces the map, not the
 verdict, and offer a separate code-review pass for the rest.
+
+## Write for a reader who is new to this part of the codebase
+
+Assume the reader understands software engineering but does not know this subsystem's vocabulary.
+The digest should save them from stopping to ask what a phrase means. Use descriptive,
+straightforward language even when it takes a few more words.
+
+- Lead with the familiar concept or action, then give the code's technical name in parentheses if
+  the name helps the reader find it. For example: "a bitmap that marks which original row
+  positions remain visible (the positional mask)."
+- Expand acronyms on first use and explain what they mean in this PR. Do not assume terms such as
+  MVCC, pushdown, materialization, dispatch, snapshot coverage, or zero-copy are self-explanatory.
+- Prefer sentences with an actor, action, and consequence: "The decoder applies both filters, so
+  it creates only the rows that survive" is better than "decode-side compaction is recovered."
+- Avoid compressed noun phrases in headings and summaries. Name the observable behavior, such as
+  "Reuse row-visibility information when the table has not changed."
+- Keep exact class, function, field, and file names in code font and links. Explain their purpose
+  in ordinary language before relying on the identifier.
+- Use a technical term again only after defining it. If a plain phrase remains clear, keep using
+  the plain phrase instead.
+- Prefer "uses the older path" over "falls back," "reports that it applied the mask" over
+  "consumes the mask," and "creates the output rows" over "materializes," unless the technical
+  word itself is the subject being explained.
+- Do not remove necessary technical detail. Translate it, then connect the translation to the
+  exact code name or source line.
+
+Before drafting any digest, read `references/plain_language.md` for PR-specific rewrite patterns
+and the final jargon check. Apply that guide throughout the Markdown; the HTML is generated from
+the same prose.
 
 ## Input
 
@@ -122,7 +151,7 @@ important than a small new file that IS the actual feature.
 - Aim for roughly 1–6 key changes, but let the actual number follow the PR: how many genuinely
   distinct *concepts* does it change? A 100-file PR implementing one idea can be 1–2 key changes;
   a 10-file PR bundling five unrelated fixes needs five.
-- Pure file-relocation diffs (moved with no logic change) don't deserve a key-change slot — they
+- Files that only moved without changing behavior don't deserve a key-change slot — they
   get their own dedicated section instead (Step 9).
 
 ## Step 6 — Orient the reader with a before/after example and a diagram
@@ -144,7 +173,7 @@ Use a compact table or paired snippets. Make these four facts easy to find:
 - the unchanged starting condition;
 - what happened before;
 - what happens after;
-- what stays unchanged or what fallback still applies.
+- what stays unchanged or which older behavior still applies when the new path cannot run.
 
 Keep the example at the user-visible, query-plan-visible, or data-flow-visible level. Detailed
 class and function names belong in the later key-change sections.
@@ -160,7 +189,7 @@ most one edge on each source line. The diagram should:
 - make the old stopping point and new path visible, or show the full new flow when a comparison
   would be misleading;
 - use plain conceptual labels rather than filenames and full function signatures;
-- distinguish decisions/fallbacks that materially affect behavior;
+- distinguish decisions and older paths that materially affect behavior;
 - avoid branches that were not verified from the PR description, diff, or checked-out code.
 
 Immediately below the diagram, add a short **Code anchors** list linking 2–5 diagram concepts to
@@ -179,36 +208,39 @@ Keep each entry genuinely short. The temptation is to front-load explanation her
 detailed section redundant — resist it. The overview answers "what is this change and why should I
 care", the detailed section answers "how does it work and where does it live".
 
-Use a `## Key changes at a glance` heading. Make each entry's title match its detailed section and
-link it to that section so the reader can jump straight there.
+Use a `## Key changes at a glance` heading. Make every title a plain description of the behavior,
+not an internal mechanism or identifier. Match it to the detailed section and link it so the
+reader can jump straight there.
 
 After the glance list, add a **"Suggested reading order"**: 5–8 numbered steps naming which
 files and functions to open, in which order, for someone reviewing this PR for the first time.
 Start from the artifact that defines the target shape (often a test), then the mechanism, then
-the guards. Tag the load-bearing line each step exists to protect ("this emit mapping is the
-line the rest depends on") so the reader knows what to slow down for. This is pedagogy, not a
+the guards. Identify the important line each step exists to protect ("this mapping is the line the
+rest depends on") so the reader knows what to slow down for. This is pedagogy, not a
 verdict — no severity labels, no "must fix", no approval language.
 
 ## Step 8 — Write each key change
 
 For every key change, in this order:
 
-**What it does.** Plain description of the new feature/fix/modified class — write for someone
-unfamiliar with this part of the codebase, not for the PR author.
+**What changed.** Start with the behavior in plain language. Introduce classes and functions only
+after the reader knows their purpose.
 
-**Why.** Pull from the PR description or code comments wherever they state it, and label every
-causal claim and failure mode by its evidence:
+**Why it matters.** Describe the previous cost, limitation, or incorrect behavior and the practical
+effect of the change. Pull from the PR description or code comments wherever they state it, and
+label every causal claim and failure mode by its evidence:
 
-- **Author-stated** — quoted from the PR body, a commit message, or a review comment. Keep it
+- **From the PR author** — quoted from the PR body, a commit message, or a review comment. Keep it
   quoted and attributed; never paraphrase it into the digest's own voice as established fact.
-- **Traced** — you read the code (in-diff or related) that shows it.
-- **Unverified** — neither stated by the author nor traced. List it under "Not covered in this
+- **Confirmed in code** — you read the code (in-diff or related) that shows it.
+- **Not verified** — neither stated by the author nor traced. List it under "Not covered in this
   pass", phrased as "I did not check X". It must not appear in the opening summary.
 
 If the why is genuinely not stated, say so explicitly ("not stated in the PR description; best
 guess: ...") — never present a guess as a confirmed fact.
-**Where it's invoked.** The call chain from a recognizable entry point down to this
-function/class. Write this as a nested markdown bullet list with `→` for the tree structure —
+**Where it happens.** Explain the route through the code from a recognizable entry point down to
+this function or class. Introduce it with one plain sentence, then write the exact call chain as a
+nested markdown bullet list with `→` for the tree structure —
 **never inside a triple-backtick fence**, because fenced code blocks don't render markdown links,
 and clickable links are the entire point of this format. Every function or file named in the list
 must be a link (see Link rules below), and **every line must carry one of three tags**:
@@ -224,10 +256,10 @@ Don't guess from the function's vibe. Skip the tag on pure context that isn't Si
 (e.g. "DuckDB's own logical-plan dispatch" as an entry point). Put a one-line legend above the
 *first* such list in the digest so it doesn't need repeating in every section.
 
-**Diff.** A trimmed, relevant hunk — the changed function or class body, not the whole file's
-diff. Trimming is expected and good (a 300-line file diff in the middle of a digest defeats the
-purpose), but say so explicitly right before the fence: name what's elided (e.g. "license header
-and an ~90-case exhaustive switch elided") and mark cuts inline with a comment like
+**Relevant diff.** A trimmed, relevant hunk — the changed function or class body, not the whole
+file's diff. Trimming is expected and good (a 300-line file diff in the middle of a digest defeats
+the purpose), but say so explicitly right before the fence: name what's elided (e.g. "license
+header and an ~90-case exhaustive switch elided") and mark cuts inline with a comment like
 `// ... elided: <what> ...`. Link the source file (with a line range if useful) immediately before
 the diff. Put the diff inside a fenced code block whose info string is `diff`. Preserve the patch
 marker as the first character of every changed line: `+` for additions and `-` for removals, with
@@ -236,9 +268,9 @@ renderers can recognize the additions and removals. This is the one place a fenc
 since diffs need syntax coloring and contain no links. Markdown viewers may choose their own
 syntax colors; the companion HTML preview always renders additions green and removals red.
 
-## Step 9 — Audit moved code and files (its own section: "Relocations")
+## Step 9 — Audit moved code and files (its own section: "Moved and renamed code")
 
-Relocation is the single biggest source of wasted reviewer time on a large PR. A file moved from
+Moved code is one of the biggest sources of wasted reviewer time on a large PR. A file moved from
 `src/op/foo.hpp` to `src/op/bar/foo.hpp` shows up as a 400-line delete plus a 400-line add, and a
 reviewer who doesn't know it's a pure move will read all 800 lines looking for the change. The
 point of this section is to let them skip that entirely — but only where skipping is actually
@@ -316,14 +348,15 @@ what keeps it honest instead of silently confident.
   5. A short plain-language summary in your own words — what problem this solves and the outcome,
      in one paragraph without implementation detail.
   6. "Before and after" — one grounded example comparing the same scenario on both sides of the
-     PR, including unchanged behavior or fallback (Step 6).
+     PR, including unchanged behavior or the older path used when the new one cannot run (Step 6).
   7. "Flow at a glance" — one compact Mermaid diagram plus 2–5 line-accurate code anchors
      (Step 6).
   8. "Key changes at a glance" — the numbered overview list, 1–3 sentences each, linked to the
      detailed sections (Step 7).
   9. "Suggested reading order" — the linked 5–8-step path through the code (Step 7).
   10. Ranked key changes in detail (Steps 5, 8), separated by `---`.
-  11. "Relocations" — moved files/functions with intact-vs-changed classification (Step 9).
+  11. "Moved and renamed code" — moved files/functions with intact-vs-changed classification
+      (Step 9).
   12. "Not covered in this pass" (Step 10).
 
 After the Markdown is complete, render its companion preview with the repository-local script:
@@ -343,5 +376,6 @@ In the final response, link both files and identify Markdown as the editable sou
 the rendered preview. Also mention the branch/commit that was checked out to generate the links.
 
 See `references/example_digest.md` in this skill directory for a full worked example (PR #1277 —
-sirius-db/sirius, "dynamic filters: SIP") showing the expected tone, link density, trimming style,
-and tagging in practice. Read it before writing a digest if you want a concrete model to match.
+sirius-db/sirius, "dynamic filters: SIP") showing the expected structure, link density, trimming
+style, and tagging. Use `references/plain_language.md` as the authority for prose style when the
+worked example uses denser technical language.
