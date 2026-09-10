@@ -22,6 +22,7 @@
 #include <op/scan/simpatico_gpu_ingestible.hpp>
 
 // cudf
+#include <cudf/concatenate.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -34,6 +35,7 @@
 
 // standard library
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
@@ -48,9 +50,10 @@ namespace {
 /// variable-width column has no such answer without decoding it, so it contributes only its
 /// offsets -- a floor, not an estimate. A file with strings therefore under-reserves until the
 /// format records decoded sizes the way parquet's SizeStatistics do.
-std::size_t estimate_decoded_bytes(simpatico_ingestible_table_info const& info)
+std::size_t estimate_decoded_bytes(simpatico_ingestible_table_info const& info,
+                                   std::int64_t num_rows)
 {
-  auto const rows   = static_cast<std::size_t>(std::max<std::int64_t>(info.num_rows, 0));
+  auto const rows   = static_cast<std::size_t>(std::max<std::int64_t>(num_rows, 0));
   std::size_t total = 0;
   for (auto const column : info.column_ids) {
     auto const& dtype = info.physical_types[column];
@@ -59,21 +62,58 @@ std::size_t estimate_decoded_bytes(simpatico_ingestible_table_info const& info)
   return total;
 }
 
-/// Pass every split straight through.
+/// Bundle per-chunk splits into decode-sized batches.
 ///
-/// A coalescer earns its keep by bundling many small metadata units into one decode-sized batch;
-/// a file that holds one chunk offers exactly one unit, and splitting or merging it would change
-/// what a batch means without changing what is read.
+/// A chunk is whatever size the writer chose, and one decode per chunk is one launch, one pinned
+/// staging allocation and one reservation each -- so a file of many small chunks pays per chunk
+/// rather than per byte. This accumulates them the way parquet_batch_coalescer accumulates row
+/// groups: keep adding until the next one would exceed the byte budget, then seal. A chunk larger
+/// than the budget on its own still forms a batch, because splitting one is not possible -- a
+/// chunk is the smallest decodable unit of the file.
+///
+/// The cudf row ceiling is a hard limit rather than a preference: a batch whose chunks sum past
+/// size_type rows cannot be concatenated into one table at all.
 class simpatico_batch_coalescer : public batch_coalescer {
  public:
+  explicit simpatico_batch_coalescer(std::size_t cap) : _cap(cap) {}
+
   std::vector<std::unique_ptr<scan_info>> push(std::unique_ptr<scan_info> info) override
   {
     std::vector<std::unique_ptr<scan_info>> out;
-    if (info) { out.push_back(std::move(info)); }
+    auto* split = dynamic_cast<simpatico_scan_info*>(info.get());
+    if (split == nullptr) { return out; }
+
+    static constexpr std::int64_t kCudfMaxRows = std::numeric_limits<cudf::size_type>::max();
+    bool const byte_cap_hit =
+      _current && _cap > 0 && _current->decoded_bytes + split->decoded_bytes > _cap;
+    bool const row_cap_hit = _current && _current->num_rows + split->num_rows > kCudfMaxRows;
+    if (byte_cap_hit || row_cap_hit) { out.push_back(std::move(_current)); }
+
+    if (!_current) {
+      _current       = std::make_unique<simpatico_scan_info>();
+      _current->path = split->path;
+    }
+    // Ascending ids keep a batch's rows in file order and its reads sequential. The walk hands
+    // chunks out in order, but several dispatcher threads may claim them, so the coalescer can
+    // see them out of order and must not preserve that.
+    _current->chunk_ids.insert(
+      _current->chunk_ids.end(), split->chunk_ids.begin(), split->chunk_ids.end());
+    std::sort(_current->chunk_ids.begin(), _current->chunk_ids.end());
+    _current->num_rows += split->num_rows;
+    _current->decoded_bytes += split->decoded_bytes;
     return out;
   }
 
-  std::vector<std::unique_ptr<scan_info>> flush() override { return {}; }
+  std::vector<std::unique_ptr<scan_info>> flush() override
+  {
+    std::vector<std::unique_ptr<scan_info>> out;
+    if (_current) { out.push_back(std::move(_current)); }
+    return out;
+  }
+
+ private:
+  std::size_t _cap;
+  std::unique_ptr<simpatico_scan_info> _current;
 };
 
 /// Positions of `width` minus `elided`, ascending. Empty when nothing would be left: a zero-column
@@ -105,6 +145,7 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->types               = std::move(schema.types);
   info->physical_types      = std::move(schema.physical_types);
   info->num_rows            = schema.num_rows;
+  info->chunk_rows          = std::move(schema.chunk_rows);
   info->host_space          = &host_space;
   // Whole file by default; a caller with a narrower projection overwrites this.
   info->column_ids.resize(info->names.size());
@@ -129,6 +170,11 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
   if (_info->host_space == nullptr) {
     throw std::invalid_argument(
       "[simpatico_gpu_ingestible] table_info.host_space must be non-null");
+  }
+  if (_info->chunk_rows.empty()) {
+    throw std::invalid_argument(
+      "[simpatico_gpu_ingestible] table_info.chunk_rows must name at least one chunk; a walk over "
+      "no chunks emits no split and the pipeline waits forever for a completion that never fires");
   }
   if (_info->column_ids.empty()) {
     throw std::invalid_argument(
@@ -155,22 +201,26 @@ simpatico_gpu_ingestible::~simpatico_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool simpatico_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _split_claimed.load(std::memory_order_relaxed);
+  return _next_chunk.load(std::memory_order_relaxed) >= _info->chunk_rows.size();
 }
 
 simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_split_provider(
   io::ioctx_resolver /*resolve*/)
 {
-  // Exchange rather than load-then-store: several dispatcher threads may reach here and exactly
-  // one of them owns the file's single split.
-  if (_split_claimed.exchange(true, std::memory_order_relaxed)) { return nullptr; }
+  // fetch_add rather than load-then-store: several dispatcher threads may reach here, and two of
+  // them reading the same cursor would emit one chunk twice and skip another -- which lands as a
+  // wrong answer with a right-looking row count, not as a failure.
+  auto const chunk = _next_chunk.fetch_add(1, std::memory_order_relaxed);
+  if (chunk >= _info->chunk_rows.size()) { return nullptr; }
 
   // The resolver is unused because the ingest reads the file through the filesystem rather than
   // through an io_context datasource, which is also why a remote path cannot be read yet.
-  return [this]() -> std::unique_ptr<scan_info> {
+  return [this, chunk]() -> std::unique_ptr<scan_info> {
     auto split           = std::make_unique<simpatico_scan_info>();
     split->path          = _info->resolved_file_paths.front();
-    split->decoded_bytes = estimate_decoded_bytes(*_info);
+    split->chunk_ids     = {chunk};
+    split->num_rows      = _info->chunk_rows[chunk];
+    split->decoded_bytes = estimate_decoded_bytes(*_info, split->num_rows);
     return split;
   };
 }
@@ -186,39 +236,64 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
   auto const& split = static_cast<simpatico_scan_info const&>(info);
+  if (split.chunk_ids.empty()) {
+    throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path +
+                             "' split names no chunks");
+  }
 
   // Stage byte-for-byte into pinned host memory, then fetch the leaf buffers the reader asks for
   // straight out of those blocks. Nothing is decoded on the way in, so a served table costs one
   // file read plus one decode rather than a decode and a re-compress.
-  auto ingested = sirius::read_hpln_into_pinned(split.path, *_info->host_space);
-
-  simpatico::payload_fetch_fn fetch =
-    [&ingested](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
-      copy_pinned_blocks_to_device(*ingested.blob->payload, off, dst, sz, s);
-    };
+  auto ingested =
+    sirius::read_hpln_chunks_into_pinned(split.path, *_info->host_space, split.chunk_ids);
 
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
-  std::string read_error;
-  auto const compressed = simpatico::read_compressed_table_from_memory(
-    ingested.blob->header, fetch, stream, mr, &read_error);
-  if (!read_error.empty()) {
-    throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path +
-                             "' could not be reconstructed: " + read_error);
+  std::vector<std::unique_ptr<cudf::table>> decoded;
+  decoded.reserve(ingested.size());
+  for (std::size_t i = 0; i < ingested.size(); ++i) {
+    auto const& blob = *ingested[i].blob;
+    simpatico::payload_fetch_fn fetch =
+      [&blob](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+        copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
+      };
+
+    std::string read_error;
+    auto const compressed =
+      simpatico::read_compressed_table_from_memory(blob.header, fetch, stream, mr, &read_error);
+    if (!read_error.empty()) {
+      throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
+                               std::to_string(split.chunk_ids[i]) +
+                               " could not be reconstructed: " + read_error);
+    }
+
+    // Decode on the caller's stream rather than on the decode thread pool. The pool overlaps
+    // columns, but its buffers are freed on pool streams and would have to be re-bound to `stream`
+    // before anything downstream may read them. It also keeps the fetch above and the decode on
+    // one stream, so no synchronize is needed between them.
+    decoded.push_back(simpatico::decompress(compressed, _info->column_ids, stream, mr));
   }
 
-  // The fetch above only ENQUEUED its H2D copies, and the pinned staging blob dies with this
+  // The fetches above only ENQUEUED their H2D copies, and the pinned staging blobs die with this
   // scope -- a host free is not stream-ordered, so the bytes have to have landed first.
   stream.synchronize();
 
-  // Decode on the caller's stream rather than on the decode thread pool. The pool overlaps
-  // columns, but its buffers are freed on pool streams and would have to be re-bound to `stream`
-  // before anything downstream may read them; one chunk per file is not enough work to be worth
-  // that. It also keeps the fetch above and the decode on one stream, so no synchronize is needed
-  // between them.
-  auto table = simpatico::decompress(compressed, _info->column_ids, stream, mr);
+  // One table per chunk, concatenated in chunk-id order. The batch is a contiguous run of the
+  // file, so concatenating in any other order would silently reshuffle its rows.
+  std::unique_ptr<cudf::table> table;
+  if (decoded.size() == 1) {
+    table = std::move(decoded.front());
+  } else {
+    std::vector<cudf::table_view> views;
+    views.reserve(decoded.size());
+    for (auto const& t : decoded) {
+      views.push_back(t->view());
+    }
+    table = cudf::concatenate(views, stream, mr);
+  }
 
-  SIRIUS_LOG_DEBUG("[simpatico_gpu_ingestible] '{}' decoded rows={} cols={}",
+  SIRIUS_LOG_DEBUG("[simpatico_gpu_ingestible] '{}' chunks={} decoded rows={} cols={}",
                    split.path,
+                   split.chunk_ids.size(),
                    table->num_rows(),
                    table->num_columns());
 
@@ -231,7 +306,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
 //===----------------------------------------------------------------------===//
 std::unique_ptr<batch_coalescer> simpatico_gpu_ingestible::create_batch_coalescer() const
 {
-  return std::make_unique<simpatico_batch_coalescer>();
+  return std::make_unique<simpatico_batch_coalescer>(_info->approximate_batch_size);
 }
 
 //===----------------------------------------------------------------------===//

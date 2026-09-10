@@ -150,7 +150,117 @@ class ReadSimpaticoFixture : public sirius::test::GpuExecutionFixture {
   std::vector<std::vector<std::int32_t>> values;
 };
 
+constexpr int kMultiChunks       = 5;
+constexpr int kMultiRowsPerChunk = 1200;
+
+/// A five-chunk file. `k` encodes the chunk that holds the row (c*1'000'000 + i), so a GROUP BY
+/// over k/1'000'000 says exactly which chunks the scan produced and how many rows each
+/// contributed -- the questions a total row count cannot answer.
+void write_multi_fixture(std::string const& path)
+{
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> views;
+  for (int c = 0; c < kMultiChunks; ++c) {
+    std::vector<std::int32_t> keys(kMultiRowsPerChunk), vals(kMultiRowsPerChunk);
+    for (int i = 0; i < kMultiRowsPerChunk; ++i) {
+      keys[static_cast<std::size_t>(i)] = c * 1000000 + i;
+      vals[static_cast<std::size_t>(i)] = i * 3 + c;
+    }
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(int32_column(keys));
+    cols.push_back(int32_column(vals));
+    tables.push_back(std::make_unique<cudf::table>(std::move(cols)));
+    views.push_back(tables.back()->view());
+  }
+  duckdb::vector<duckdb::LogicalType> const types{
+    duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
+    duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER)};
+  auto const leaf = std::string("input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  auto const err  = sirius::write_tables_to_hpln(views,
+                                                types,
+                                                 {"k", "v"},
+                                                leaf + "---\n" + leaf,
+                                                /*group_rows=*/1024,
+                                                path,
+                                                cudf::get_default_stream(),
+                                                rmm::mr::get_current_device_resource_ref());
+  REQUIRE(err.empty());
+}
+
+class ReadSimpaticoMultiChunkFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  ReadSimpaticoMultiChunkFixture()
+  {
+    dir = fs::temp_directory_path() / ("sirius_read_simpatico_multi_" + std::to_string(::getpid()) +
+                                       "_" + std::to_string(::rand()));
+    fs::create_directories(dir);
+    path = (dir / "multi.hpln").string();
+    write_multi_fixture(path);
+    run_ok("SET gpu_execution = true;");
+    run_ok("SET enable_duckdb_fallback = false;");
+  }
+
+  ~ReadSimpaticoMultiChunkFixture() { fs::remove_all(dir); }
+
+  duckdb::unique_ptr<duckdb::MaterializedQueryResult> query_on_gpu(std::string const& sql)
+  {
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto result       = con->Query(sql);
+    auto const after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    return duckdb::unique_ptr<duckdb::MaterializedQueryResult>(
+      static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+  }
+
+  std::string from() const { return " FROM read_simpatico('" + path + "')"; }
+
+  fs::path dir;
+  std::string path;
+};
+
 }  // namespace
+
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a multi-chunk file returns every chunk exactly once",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // One row per chunk, so this fails differently for each way the walk can go wrong: a missing
+  // chunk drops a group, a duplicated one doubles its count, and a batch that read the wrong
+  // chunk shifts a group id.
+  auto result = query_on_gpu("SELECT k // 1000000 AS chunk, count(*), min(k), max(k), sum(v)" +
+                             from() + " GROUP BY 1 ORDER BY 1;");
+  REQUIRE(result->RowCount() == static_cast<duckdb::idx_t>(kMultiChunks));
+  for (int c = 0; c < kMultiChunks; ++c) {
+    auto const row = static_cast<duckdb::idx_t>(c);
+    REQUIRE(result->GetValue(0, row).GetValue<std::int32_t>() == c);
+    REQUIRE(result->GetValue(1, row).GetValue<std::int64_t>() == kMultiRowsPerChunk);
+    REQUIRE(result->GetValue(2, row).GetValue<std::int32_t>() == c * 1000000);
+    REQUIRE(result->GetValue(3, row).GetValue<std::int32_t>() ==
+            c * 1000000 + kMultiRowsPerChunk - 1);
+    std::int64_t expected_v = 0;
+    for (int i = 0; i < kMultiRowsPerChunk; ++i) {
+      expected_v += i * 3 + c;
+    }
+    REQUIRE(result->GetValue(4, row).GetValue<std::int64_t>() == expected_v);
+  }
+}
+
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a multi-chunk file's cardinality is the whole file",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // The bind sums the chunk row counts; reporting one chunk's would give the optimizer a
+  // cardinality five times too small, which is a plan-quality bug that returns right answers.
+  auto result = query_on_gpu("SELECT count(*)" + from() + ";");
+  REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() ==
+          static_cast<std::int64_t>(kMultiChunks) * kMultiRowsPerChunk);
+
+  auto filtered = query_on_gpu("SELECT count(*)" + from() + " WHERE k >= 2000000 AND k < 4000000;");
+  REQUIRE(filtered->GetValue(0, 0).GetValue<std::int64_t>() == 2 * kMultiRowsPerChunk);
+}
 
 TEST_CASE_METHOD(ReadSimpaticoFixture,
                  "read_simpatico - binds the file's names and declared types",

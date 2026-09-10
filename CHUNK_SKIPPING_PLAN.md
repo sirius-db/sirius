@@ -1736,6 +1736,14 @@ over S3 (§7.6).
   decoding whole chunks. Single file, no pruning. Everything else hangs off this.
   **Done** (`read_simpatico`).
 - **B. Multi-chunk container** — chunk directory, splits, coalescer. Unlocks real table sizes.
+  **Done** (`hpln_segment::chunk_directory` = 5, `write_compressed_tables`,
+  `read_hpln_chunks_into_pinned`). Layout is segregated as §7.5 argued: all headers contiguous,
+  then all payloads, with the directory recording each chunk's header/payload extent and row
+  count. The `header` and `payload` segments still bound their whole regions, so one range fetches
+  every chunk's metadata and the directory subdivides it. Chunks must share a schema; a file whose
+  chunks disagree is refused at bind rather than mid-scan. The `zone_maps` segment carries every
+  chunk's bounds in chunk order, so C is a wiring job. Not done here: nothing prunes yet, and the
+  per-chunk decode is serial on the caller's stream.
 - **C. Pruning** — zone maps → surviving chunks → `build_chunk_subset_header` → ranged fetch.
   Largely re-pointing the pin path at a file transport, and where §7.6's S3 result cashes in.
 - **D. Remote** — `payload_fetch_fn` over the io_context for `s3://`. The trailer makes one tail
