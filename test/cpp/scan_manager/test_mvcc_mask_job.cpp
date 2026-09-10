@@ -38,6 +38,7 @@
 #include <exec/thread_pool.hpp>
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_mvcc_visibility.hpp>
+#include <scan_manager/mvcc_mask_cache.hpp>
 #include <scan_manager/mvcc_mask_job.hpp>
 #include <unistd.h>
 
@@ -528,4 +529,72 @@ TEST_CASE("run_mvcc_mask_jobs handles two requests over the same table",
     }
   }
   exec_ok(*tdb.con, "ROLLBACK");
+}
+
+// A masks_ready request must skip staging entirely and leave the masks as installed.
+TEST_CASE("prepare_mvcc_mask_tasks skips requests served from the version cache",
+          "[mvcc_mask_job][scan_manager]")
+{
+  auto& e = env();
+  job_test_db tdb;
+  // Without the skip, this request would stage a carve + fill for chunk 0.
+  exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(50000)");
+  exec_ok(*tdb.con, "CHECKPOINT");
+  exec_ok(*tdb.con, "DELETE FROM t WHERE k < 10");
+
+  exec_ok(*tdb.con, "BEGIN TRANSACTION");
+  auto& storage = resolve_storage(*tdb.con, "t");
+  auto metadata = make_metadata(*tdb.con, storage);
+
+  auto* host_space = e.mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  mvcc_mask_job_request request;
+  request.masks        = mvcc_chunk_mask_set(1);
+  request.metadata     = metadata;
+  request.storage      = &storage;
+  request.context      = tdb.con->context.get();
+  request.chunk_spaces = {host_space};
+  request.entry_name   = "t";
+  auto const rows      = metadata.base_row_count_per_chunk[0];
+  auto const n_words   = (rows + 31) / 32;
+  auto canned          = std::make_shared<std::vector<std::uint32_t>>(n_words, 0xA5A5A5A5u);
+  request.masks[0]     = sirius::scan_manager::mvcc_chunk_mask{{canned, canned->data()}, rows};
+  request.masks_ready  = true;
+  std::vector<mvcc_mask_job_request> requests;
+  requests.push_back(std::move(request));
+
+  auto workset = prepare_mvcc_mask_tasks(requests, *e.mgr, e.topology);
+  REQUIRE(workset.works.empty());
+  REQUIRE(workset.fill_tasks.empty());
+  // Words untouched: the job never re-carved the slot.
+  REQUIRE(requests[0].masks[0].words.get() == canned->data());
+  REQUIRE(requests[0].masks[0].view()[0] == 0xA5A5A5A5u);
+  exec_ok(*tdb.con, "ROLLBACK");
+}
+
+// Publish requires a writer-free build whose snapshot covers every existing commit;
+// reuse also requires an unchanged last_commit and a covering query snapshot.
+// (transaction_t values are arbitrary; the rules only compare them.)
+TEST_CASE("mvcc mask version cache reuse rules", "[mvcc_mask_job][scan_manager]")
+{
+  using sirius::scan_manager::mvcc_mask_cache_publishable;
+  using sirius::scan_manager::mvcc_mask_cache_reusable;
+  using sirius::scan_manager::mvcc_mask_snapshot_key;
+
+  mvcc_mask_snapshot_key const built{/*last_commit=*/100, /*start_time=*/105, false};
+  REQUIRE(mvcc_mask_cache_publishable(built));
+  // A writer's set embeds its own uncommitted deletes: never publishable.
+  REQUIRE_FALSE(mvcc_mask_cache_publishable({100, 105, true}));
+  // A snapshot older than the newest commit misses what it never saw.
+  REQUIRE_FALSE(mvcc_mask_cache_publishable({100, 99, false}));
+
+  // Same committed state, covering snapshot, read-only query: reuse.
+  REQUIRE(mvcc_mask_cache_reusable(built, {100, 200, false}));
+  // The builder's own snapshot qualifies trivially.
+  REQUIRE(mvcc_mask_cache_reusable(built, built));
+  // A commit landed since the build: the cached set is a stale version.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {150, 200, false}));
+  // The querying transaction wrote: its visibility is private.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {100, 200, true}));
+  // Query snapshot below the cached version cannot see all of it.
+  REQUIRE_FALSE(mvcc_mask_cache_reusable(built, {100, 99, false}));
 }

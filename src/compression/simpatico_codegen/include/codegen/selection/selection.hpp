@@ -181,14 +181,16 @@ struct scan_filter_request {
   // the result so a caller that stopped using the filters can reconsider when a
   // later, tighter set arrives.
   uint64_t source_generation = 0;
+  // Host pointer to ceil(keep_mask_rows / 32) packed words in the selection_mask bit
+  // convention, zero at and past keep_mask_rows. Never a directive on its own, so a
+  // mask-only request is refused. Must outlive the decompress_scan_filter call.
+  uint32_t const* keep_mask_words = nullptr;
+  int64_t keep_mask_rows          = 0;
 };
 
-// Outcome of a decompress_scan_filter call. `declined_unselective` is worth
-// remembering per scan: selectivity is uniform across a scan's batches (SF1000
-// zone-map study: unclustered, <1% variance), so ONE such batch predicts the
-// rest — the caller drops the row selection from its remaining batches and
-// stops paying the wave-1 + count insurance cost. The orchestrator itself stays
-// stateless.
+// Outcome of a decompress_scan_filter call. `declined_unselective` is worth remembering
+// per scan: chunks are unclustered, so one such batch predicts the rest and the caller
+// drops row selection from its remaining batches. The orchestrator stays stateless.
 enum class scan_filter_status : uint8_t {
   refused = 0,               // gate off / nothing requested / a precondition failed
                              // (no device work was done)
@@ -206,6 +208,7 @@ struct scan_filter_result {
   bool applied               = false;  // false => output is the ordinary full-width decode
   scan_filter_status status  = scan_filter_status::refused;  // always applied ⇔ status==applied
   uint64_t source_generation = 0;                            // echo of the request
+  bool keep_mask_applied     = false;                        // true only when status == applied
   int64_t num_rows           = 0;                            // pre-filter batch rows
   int64_t survivor_count     = -1;
   std::vector<decode_route> routes;  // EFFECTIVE per-output route (a requested
