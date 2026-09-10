@@ -1134,12 +1134,11 @@ TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
   for (auto const row_count : {0, 1, 7}) {
     CAPTURE(row_count);
     std::vector<std::unique_ptr<cudf::column>> columns;
-    columns.push_back(cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32},
-      row_count,
-      cudf::mask_state::UNALLOCATED,
-      cudf::get_default_stream(),
-      get_resource_ref(*space)));
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                row_count,
+                                                cudf::mask_state::UNALLOCATED,
+                                                cudf::get_default_stream(),
+                                                get_resource_ref(*space)));
     auto input = std::make_unique<cudf::table>(std::move(columns));
 
     std::vector<std::unique_ptr<ast_node>> nodes;
@@ -1153,11 +1152,8 @@ TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
     for (auto const& node : nodes) {
       expressions.push_back(node.get());
     }
-    exp_executor executor(expressions,
-                          get_resource_ref(*space),
-                          cudf::get_default_stream(),
-                          TestType::value,
-                          1);
+    exp_executor executor(
+      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
     auto output     = executor.evaluate(input->view());
     auto const view = output->view();
     REQUIRE(view.num_rows() == row_count);
