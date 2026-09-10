@@ -40,6 +40,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,21 @@ struct ingested_hpln {
   /// carries none, or when the segment did not decode — both mean "serve unpruned", never
   /// "prune wrongly". This is what lets an ingested table prune without decoding anything.
   scan_manager::group_bounds_arena group_bounds;
+  /// The engine's logical type per column, from the file's `logical_types` segment. Empty when the
+  /// file carries none — a caller then has only the cuDF physical types, which cannot express
+  /// DECIMAL precision, nullability or a timestamp's zone.
+  duckdb::vector<duckdb::LogicalType> column_types;
 };
+
+/// Pack @p types into the bytes a `logical_types` segment carries, and back.
+///
+/// Positional with the header's columns. Only the types Sirius can pin are representable; an
+/// unrepresentable one packs as SQLNULL, which a reader treats as "this column has no declared
+/// type" rather than silently substituting a wrong one.
+[[nodiscard]] std::vector<std::uint8_t> pack_logical_types(
+  duckdb::vector<duckdb::LogicalType> const& types);
+[[nodiscard]] duckdb::vector<duckdb::LogicalType> unpack_logical_types(
+  std::span<const std::uint8_t> bytes, std::string* error = nullptr);
 
 /// Read @p path into pinned host memory belonging to @p host_space.
 ///

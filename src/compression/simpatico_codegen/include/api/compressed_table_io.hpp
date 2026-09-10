@@ -73,6 +73,10 @@ enum class hpln_segment : std::uint16_t {
   header    = 1,  ///< the structural header parse_hpln_header/describe_... consume
   payload   = 2,  ///< every leaf buffer, concatenated, at the offsets the header declares
   zone_maps = 3,  ///< per-column, per-group min/max for pruning
+  /// The ENGINE's logical schema, positional with the header's columns. The header carries cuDF
+  /// physical types, which cannot express DECIMAL precision, nullability, or a timestamp's time
+  /// zone -- a pin gets those from memory, a FILE has nowhere else to get them.
+  logical_types = 4,
 };
 
 struct hpln_segment_ref {

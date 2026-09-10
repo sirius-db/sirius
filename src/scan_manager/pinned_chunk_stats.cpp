@@ -565,18 +565,28 @@ duckdb::LogicalType from_packed(packed_type p)
   }
 }
 
+// Explicit little-endian, matching the .hpln header's own push_le/read_le convention. A memcpy of
+// the host representation agrees on every target this runs on and silently disagrees on a
+// big-endian one -- and it disagrees by producing wrong BOUNDS, which prune wrong rows rather
+// than failing.
 template <typename T>
 void put(std::vector<std::uint8_t>& out, T v)
 {
-  auto const* p = reinterpret_cast<std::uint8_t const*>(&v);
-  out.insert(out.end(), p, p + sizeof(T));
+  auto u = static_cast<std::make_unsigned_t<T>>(v);
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    out.push_back(static_cast<std::uint8_t>((u >> (8 * i)) & 0xFF));
+  }
 }
 
 template <typename T>
 bool take(std::span<const std::uint8_t>& in, T& v)
 {
   if (in.size() < sizeof(T)) return false;
-  std::memcpy(&v, in.data(), sizeof(T));
+  std::make_unsigned_t<T> u = 0;
+  for (std::size_t i = 0; i < sizeof(T); ++i) {
+    u |= static_cast<std::make_unsigned_t<T>>(in[i]) << (8 * i);
+  }
+  v  = static_cast<T>(u);
   in = in.subspan(sizeof(T));
   return true;
 }
@@ -605,9 +615,9 @@ std::vector<std::uint8_t> group_bounds_arena::pack() const
       put(out, static_cast<std::uint32_t>(n));
       if (n == 0) continue;
       auto const* mins = _storage.data() + sl.offset;
-      out.insert(out.end(),
-                 reinterpret_cast<std::uint8_t const*>(mins),
-                 reinterpret_cast<std::uint8_t const*>(mins + 2 * n));  // mins then maxs
+      for (std::size_t k2 = 0; k2 < 2 * n; ++k2) {
+        put(out, mins[k2]);
+      }  // mins then maxs
       out.insert(out.end(), _valid.data() + sl.valid_offset, _valid.data() + sl.valid_offset + n);
     }
   }
@@ -653,8 +663,11 @@ group_bounds_arena group_bounds_arena::unpack(std::span<const std::uint8_t> byte
       sl.valid_offset = a._valid.size();
       sl.count        = n;
       a._storage.resize(sl.offset + 2 * n);
-      std::memcpy(a._storage.data() + sl.offset, bytes.data(), 2 * n * sizeof(std::int64_t));
-      bytes = bytes.subspan(2 * n * sizeof(std::int64_t));
+      for (std::size_t k2 = 0; k2 < 2 * n; ++k2) {
+        if (!take(bytes, a._storage[sl.offset + k2])) {
+          return fail("zone-map segment: truncated bounds");
+        }
+      }
       a._valid.insert(a._valid.end(), bytes.begin(), bytes.begin() + n);
       bytes = bytes.subspan(n);
     }
