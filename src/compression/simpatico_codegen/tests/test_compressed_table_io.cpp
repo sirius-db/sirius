@@ -310,6 +310,60 @@ void test_alp_rd_f64()
 
 // Dictionary (STRING): variable channel set on a STRING column, exercising the
 // STRING column dtype tag and keys_offsets/keys_chars/indices channels.
+// An ingest path needs the schema and the byte budget BEFORE it moves any payload, and without a
+// GPU. The whole point is that it must not do what read_compressed_table does -- pull the entire
+// file into memory -- so the test feeds it a prefix and checks that a too-short one is reported
+// rather than silently mis-parsed.
+void test_describe_header()
+{
+  rmm::cuda_stream_view stream = cudf::get_default_stream();
+  auto t                       = make_int32_table(3, 4096, 11);
+  auto ct                      = simpatico::compress_with_plan(t->view(),
+                                          "input -> bitpack\n---\n"
+                                                               "input -> delta -> differences\n"
+                                                               "delta.differences -> bitpack\n---\n"
+                                                               "input -> for -> deltas, references\n",
+                                          stream,
+                                          rmm::mr::get_current_device_resource_ref());
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::payload_buffer_ref> refs;
+  std::uint64_t payload_bytes = 0;
+  auto err = simpatico::build_compressed_table_header(ct, header, refs, payload_bytes, stream);
+  expect(err.empty(), "header build failed");
+
+  simpatico::hpln_schema schema;
+  err = simpatico::describe_compressed_table_header(header, schema);
+  expect(err.empty(), err.empty() ? "describe failed" : err.c_str());
+  expect(schema.columns.size() == 3, "describe lost a column");
+  expect(schema.header_bytes == header.size(), "header_bytes must be the whole header");
+  expect(schema.payload_bytes == payload_bytes,
+         "payload_bytes must match what the writer laid out");
+  for (auto const& c : schema.columns) {
+    expect(c.num_rows == 4096, "wrong row count");
+    expect(c.compressed_bytes > 0, "column reported zero compressed bytes");
+  }
+  std::uint64_t summed = 0;
+  for (auto const& c : schema.columns)
+    summed += c.compressed_bytes;
+  expect(summed == payload_bytes, "per-column bytes must sum to the payload");
+
+  // Trailing bytes are ignored: a reader hands us a speculative prefix of a larger file.
+  std::vector<std::uint8_t> padded(header);
+  padded.insert(padded.end(), 4096, 0xAB);
+  simpatico::hpln_schema from_prefix;
+  err = simpatico::describe_compressed_table_header(padded, from_prefix);
+  expect(err.empty(), "describe must ignore bytes past the header");
+  expect(from_prefix.header_bytes == schema.header_bytes,
+         "header_bytes must not count the payload that follows");
+
+  // Too short must be an ERROR, not a partial parse -- that is how a remote reader learns to
+  // re-read with a longer prefix.
+  simpatico::hpln_schema truncated;
+  auto short_err = simpatico::describe_compressed_table_header(
+    std::span<const std::uint8_t>(header.data(), header.size() / 2), truncated);
+  expect(!short_err.empty(), "a truncated header must be reported, not silently accepted");
+}
+
 void test_dictionary()
 {
   auto t = make_string_table(4096, cudf::get_default_stream());
@@ -664,6 +718,7 @@ int main()
     {"bitextract_f32", test_bitextract_f32},
     {"bitjoin_f32", test_bitjoin_f32},
     {"alp_rd_f64", test_alp_rd_f64},
+    {"describe_header", test_describe_header},
     {"dictionary", test_dictionary},
     {"multi_column", test_multi_column},
     {"selective_decompression", test_selective_decompression},

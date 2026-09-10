@@ -957,6 +957,35 @@ std::uint64_t buffer_elem_size(std::uint8_t type_tag)
 
 }  // namespace
 
+std::string describe_compressed_table_header(std::span<const std::uint8_t> header, hpln_schema& out)
+{
+  out = {};
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  std::string err;
+  if (!parse_hpln_header(r, recs, &err)) {
+    return err.empty() ? std::string("describe_compressed_table_header: malformed header") : err;
+  }
+  out.header_bytes = header.size() - r.rem;
+  out.columns.reserve(recs.size());
+  for (auto const& cr : recs) {
+    hpln_column_desc d;
+    d.name      = cr.name;
+    d.dtype_tag = cr.dtype_tag;
+    d.scale     = cr.scale;
+    d.num_rows  = cr.num_rows;
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
+        auto const size = cr.leaf_descs[li].buffers[bi].size_bytes;
+        d.compressed_bytes += size;
+        out.payload_bytes = std::max(out.payload_bytes, cr.buf_offsets[li][bi] + size);
+      }
+    }
+    out.columns.push_back(std::move(d));
+  }
+  return {};
+}
+
 std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::span<const std::uint32_t> surviving_chunks,
                                       payload_host_read_fn const& read_payload,

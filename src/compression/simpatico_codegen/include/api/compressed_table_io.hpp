@@ -142,6 +142,41 @@ compressed_table read_compressed_table_subset_from_memory(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
+// ─── Reading a header without reading the data ──────────────────────────────
+//
+// An INGEST path needs the schema and the byte budget before it moves any payload: which columns
+// exist, how many rows, how much space to allocate. read_compressed_table() cannot answer that --
+// it reads the WHOLE file into host memory and reconstructs a device-resident table, which is the
+// opposite of what a reader wants when the file is large or remote.
+
+/// One column as the header describes it. No payload is touched and no GPU is involved.
+struct hpln_column_desc {
+  std::string name;
+  std::uint8_t dtype_tag         = 0;  ///< decoded column type; see tag_to_dtype()
+  std::int32_t scale             = 0;  ///< decimal scale, 0 otherwise
+  std::int64_t num_rows          = 0;
+  std::uint64_t compressed_bytes = 0;  ///< sum of this column's leaf buffers
+};
+
+struct hpln_schema {
+  std::vector<hpln_column_desc> columns;
+  /// Bytes the structural header occupies. In a .hpln FILE the payload starts here — which a
+  /// reader can only discover by parsing, since the format carries no length prefix or footer
+  /// (see CHUNK_SKIPPING_PLAN.md 7.5). A reader over a network therefore has to read a
+  /// speculative prefix and re-read if it was too short.
+  std::uint64_t header_bytes = 0;
+  /// End of the payload region, i.e. max(payload_offset + size_bytes) over every buffer.
+  std::uint64_t payload_bytes = 0;
+};
+
+/// Parse ONLY the structural header of @p header into @p out.
+///
+/// @p header may be a prefix of a larger file or buffer; everything past the header is ignored.
+/// Returns an empty string on success, or a human-readable error -- including the truncation case,
+/// which is how a caller learns its speculative prefix was too short.
+std::string describe_compressed_table_header(std::span<const std::uint8_t> header,
+                                             hpln_schema& out);
+
 // ─── Serving a subset of a column's 1024-row chunks ─────────────────────────
 //
 // A compressed column can be served as a compacted table containing only some of its 1024-row
