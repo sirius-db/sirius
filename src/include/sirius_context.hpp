@@ -753,6 +753,12 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
   SiriusContextExtensionCallback();
 
+  /// Finish runtime initialization after process-wide setup that must precede
+  /// the first NVTX/runtime-initialization call.
+  void initialize_context();
+
+  [[nodiscard]] bool is_disabled() const noexcept { return disabled_; }
+
   /// \brief Called when a new connection is opened.
   /// \param context The client context.
   void OnConnectionOpened(ClientContext& context) final;
@@ -783,6 +789,7 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
  private:
   void read_config_file_if_exists();
 
+  bool disabled_{false};
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
