@@ -1530,12 +1530,19 @@ the project: the bytes you skip really are free, and what you pay for is asking.
 
 ### 7.7 The coalescing policy, as a number (answers §7.3)
 
-The amortised cost of one extra request at concurrency 64, from three independent pairs of the
-rows above: 0.46, 0.21, 0.36 ms. At ~1 GB/s that is **200–460 KB of transfer per request**, so:
+The cost of a request is a LATENCY fact; the bytes it is worth dragging along to avoid one scale
+with achievable BANDWIDTH. So the policy is a formula, not a constant:
 
-> **Bridge a gap when it is smaller than ~256 KB; issue a separate request when it is larger.**
-> Coalesce until runs reach ~4–16 MB, and keep `concurrency x range >= cap x RTT` (~250 MB in
-> flight here) or the pipe starves regardless of how well the ranges are merged.
+> **`max_gap_bytes ≈ per_request_cost × achievable_bandwidth`**, both measurable at runtime.
+
+Measured with curl (§7.8), at equal volume and equal 256-way parallelism, 4 MB ranges against
+16 MB: **0.755 ms per extra request**, at 2.6 GB/s, giving **~2 MB**. Coalesce to **~16 MB runs**
+(4 MB costs +36% time for the same bytes) and keep ~1 GB in flight (64 x 16 MB) or the pipe
+starves regardless of how well the ranges are merged.
+
+**Do not hardcode the 2 MB.** Derived from the interpreter-bound python numbers the same formula
+gives 293 KB — a 7x error, and the kind of constant that gets baked in once and never revisited.
+It moves with the deployment: a faster link raises it proportionally.
 
 That is `max_gap_bytes`, which §7.3 has carried as "measured, not guessed" since the project
 opened. It also says a **G = 8 group is far too fine to address individually over S3** — 8192 rows
@@ -1549,11 +1556,39 @@ batch. That is far above the ~4 MB knee, so **range-skipped ingestion from S3 wo
 its byte fraction.** Clustering matters here for the same reason it matters everywhere else in
 this project (§3.13): it is what turns scattered survivors into long runs.
 
-**Caveats.** (a) Throughput plateaus at ~0.99 GB/s (7.9 Gb/s), which is the instance NIC, not S3 —
-so the large-range rows are all sitting at the cap and we cannot see whether they would separate
-above it. The small-range degradation is below the cap and therefore real. (b) The 64 MB and
-"1 contiguous run" rows in the raw output are concurrency-starved artifacts of a fixed byte budget
-(4 and 1 requests respectively), not findings. (c) One instance, one region, one object.
+**Caveats.** (a) **The ~0.99 GB/s plateau was the PYTHON PROBE, not the network** — see §7.8;
+curl on the same instance reached 2.85 GB/s. Every absolute throughput above is therefore a floor,
+and the *relative* comparisons (all arms equally interpreter-bound at equal concurrency) are what
+carry. (b) The 64 MB and "1 contiguous run" rows in the raw output are concurrency-starved
+artifacts of a fixed byte budget (4 and 1 requests respectively), not findings. (c) One instance,
+one region, one object, one sample.
+
+### 7.8 The first ceiling was the measuring instrument (2026-09-10)
+
+The python probe flattened at 0.99 GB/s regardless of concurrency (64 and 128 threads identical) and
+§7.6 first attributed that to the instance NIC. It was the **GIL**: every response body is copied
+through the interpreter. `curl --parallel` on the same instance, same object, same ranges:
+
+| parallelism | 16 MB ranges |
+|---|---|
+| 32 | 2.21 GB/s (17.7 Gb/s) |
+| 64 | **2.84 GB/s (22.7 Gb/s)** |
+| 128 | 2.85 GB/s |
+| 256 | 2.63 GB/s |
+
+**2.9x the python ceiling**, saturating at 64-way. A flat ceiling that ignores added concurrency is
+the signature to watch for — it looks exactly like a network cap.
+
+22.8 Gb/s is still ~2x under the instance's rated 50 Gb/s, so treat it as a **floor** rather than
+the ceiling: the box may have been busy, and a single object is a single S3 prefix, which is the
+classic way to leave object-store bandwidth on the table. A real scan spreads across many files, so
+per-object limits should bind less in practice. Worth re-running across several objects before
+anyone treats 2.85 GB/s as the machine's number.
+
+What this does NOT change: fragmentation costs request count, not skipped bytes (§7.6). That came
+from p50 latency FALLING as ranges shrink and from the model needing no extents term — both
+latency facts, independent of where the bandwidth ceiling sits. curl reproduces the same shape at
+2.9x the bandwidth: 4 MB ranges cost +36% against 16 MB at equal volume and parallelism.
 
 ## 7.5 Physical layout: keep the metadata segregated and scannable on its own
 
