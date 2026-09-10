@@ -183,6 +183,47 @@ TEST_CASE("cache_entry_info: a byte-range split scan neither serves nor is serve
   REQUIRE(whole_file_pin.can_serve_with_columns(unranged_scan) == std::vector<std::size_t>{0});
 }
 
+TEST_CASE("cache_entry_info: matches_parquet_file_set classifies exact, subset, and miss",
+          "[scan][can_serve]")
+{
+  using match = sirius::scan_manager::cache_entry_info::parquet_file_match;
+  auto cache  = parquet_cache({"a.parquet", "b.parquet", "c.parquet"}, {0});
+
+  std::vector<std::string> canonical;
+  REQUIRE(cache.matches_parquet_file_set(
+            std::vector<std::string>{"c.parquet", "a.parquet", "b.parquet"}, &canonical) ==
+          match::exact);
+  REQUIRE(canonical == std::vector<std::string>{"a.parquet", "b.parquet", "c.parquet"});
+
+  canonical.clear();
+  REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{"c.parquet", "a.parquet"},
+                                         &canonical) == match::subset);
+  REQUIRE(canonical == std::vector<std::string>{"a.parquet", "c.parquet"});
+
+  // A probe naming a file outside the pinned set misses even when others overlap.
+  REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet", "d.parquet"}) ==
+          match::miss);
+  // A superset of the pinned set misses (the pin cannot provide the extra file).
+  REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{
+            "a.parquet", "b.parquet", "c.parquet", "d.parquet"}) == match::miss);
+  REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{}) == match::miss);
+
+  // Duplicates on either side poison subset matching (a duplicated pinned path
+  // means the file's chunks were materialized twice; serving them once/twice
+  // would return the wrong row count) — but exact stays duplicate-symmetric.
+  auto dup_cache = parquet_cache({"a.parquet", "a.parquet", "b.parquet"}, {0});
+  REQUIRE(dup_cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet"}) == match::miss);
+  REQUIRE(dup_cache.matches_parquet_file_set(
+            std::vector<std::string>{"a.parquet", "a.parquet", "b.parquet"}) == match::exact);
+  REQUIRE(cache.matches_parquet_file_set(std::vector<std::string>{"a.parquet", "a.parquet"}) ==
+          match::miss);
+
+  // A duckdb-identity entry never matches any parquet probe.
+  auto duckdb_entry = duckdb_cache("db", "main", "t", {0});
+  REQUIRE(duckdb_entry.matches_parquet_file_set(std::vector<std::string>{"a.parquet"}) ==
+          match::miss);
+}
+
 TEST_CASE("cache_entry_info: duckdb same-table subset request hits with a gather projection",
           "[scan][can_serve]")
 {
@@ -250,7 +291,7 @@ TEST_CASE("cache_entry_info: matches_duckdb_table is the shared identity matcher
   REQUIRE_FALSE(parquet.matches_duckdb_table("", "", ""));  // parquet identity never matches
 }
 
-TEST_CASE("cache_entry_info: matches_parquet_files is the shared parquet identity matcher",
+TEST_CASE("cache_entry_info: matches_parquet_files is exact set equality over the canonical paths",
           "[scan][can_serve]")
 {
   auto cache = parquet_cache({"a.parquet", "b.parquet"}, {0});

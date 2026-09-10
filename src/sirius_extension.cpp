@@ -1001,6 +1001,10 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_p
   }
   info->scan_output_arity      = keep.size();
   info->approximate_batch_size = batch_size;
+  // Pin-only: never bundle two files' row groups into one chunk, so every pinned
+  // chunk has single-file provenance and a scan over a SUBSET of the pinned files
+  // can be served by whole-chunk selection.
+  info->batch_within_file_boundaries = true;
   return info;
 }
 
@@ -1520,7 +1524,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       *representative_host_space,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
-                                      std::move(host_result.column_storage));
+                                      std::move(host_result.column_storage),
+                                      std::move(host_result.chunk_file_paths));
     // The host path always REPLACES, so every pinned column holds this
     // materialization's values.
     attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
@@ -1546,7 +1551,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(cache_info),
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
-                                        std::move(dev_result.column_storage));
+                                        std::move(dev_result.column_storage),
+                                        std::move(dev_result.chunk_file_paths));
     // The compressed device path always REPLACES, as above.
     attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
@@ -1569,7 +1575,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                                      std::move(mat.chunk_memory_spaces),
                                                      std::move(pinned_column_types),
                                                      std::move(mat.chunk_stats),
-                                                     std::move(mat.column_storage));
+                                                     std::move(mat.column_storage),
+                                                     std::move(mat.chunk_file_paths));
     attach_proven_unique(mat.unique_verdicts, stored);
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
