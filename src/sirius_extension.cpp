@@ -3306,13 +3306,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
 
-  config.AddExtensionOption("pin_table_compression",
-                            "Default for pin_table calls that omit the compression named "
-                            "parameter. Takes effect only when pin_table_input_compression_plan_dir "
-                            "is non-empty and contains a matching table plan",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
-                            SetEnablePinTableCompression);
+  config.AddExtensionOption(
+    "pin_table_compression",
+    "Default for pin_table calls that omit the compression named "
+    "parameter. Takes effect only when pin_table_input_compression_plan_dir "
+    "is non-empty and contains a matching table plan",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
+    SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
