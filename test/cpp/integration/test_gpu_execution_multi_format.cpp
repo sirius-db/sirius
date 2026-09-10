@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -176,6 +177,121 @@ class MultiFormatFixtureBase {
   std::unique_ptr<duckdb::Connection> con;
   std::unique_ptr<sirius_config_env_guard> config_guard;
 };
+
+class ParquetCountCarrierFixture : public MultiFormatFixtureBase {
+ public:
+  ParquetCountCarrierFixture() : scratch{"parquet_count_carrier"}
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    std::string const rows =
+      "SELECT i::BIGINT AS id, (i * 0.25)::DOUBLE AS amount, "
+      "('label-' || i)::VARCHAR AS label, (i % 100)::SMALLINT AS small, "
+      "DATE '2024-01-01' + i::INTEGER AS day, "
+      "CASE WHEN i % 3 = 0 THEN NULL::BOOLEAN ELSE i % 2 = 0 END AS flag "
+      "FROM range(257) t(i)";
+    auto write = [&](std::string const& relative_path, std::string const& query) {
+      fs::create_directories((scratch.path() / relative_path).parent_path());
+      auto result = writer.Query("COPY (" + query + ") TO " + scratch.file_literal(relative_path) +
+                                 " (FORMAT PARQUET)");
+      INFO(relative_path);
+      REQUIRE(result);
+      if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(fs::file_size(scratch.path() / relative_path) > 0);
+    };
+    write("flat.parquet", rows);
+    write("parts/a.parquet", rows + " WHERE i < 129");
+    write("parts/b.parquet", rows + " WHERE i >= 129");
+    write("hive/part=2024/a.parquet", rows + " WHERE i < 129");
+    write("hive/part=2025/b.parquet", rows + " WHERE i >= 129");
+    write("evolved/part=2024/a.parquet", rows + " WHERE i < 129");
+    write("evolved/part=2025/b.parquet",
+          "SELECT id, amount, label, small, day FROM (" + rows + ") WHERE id >= 129");
+    write("strings.parquet", "SELECT 'a-' || i AS a, 'b-' || i AS b FROM range(257) t(i)");
+    write("null_carrier.parquet",
+          "SELECT CASE WHEN i % 4 = 0 THEN NULL::BIGINT ELSE i END AS id, "
+          "NULL::BOOLEAN AS flag FROM range(257) t(i)");
+    write("empty.parquet", rows + " WHERE false");
+    // Keep COUNT(*) in the scan instead of answering it from parquet statistics.
+    optimizer_guard =
+      std::make_unique<sirius::test::disabled_optimizers_guard>(*con, "statistics_propagation");
+  }
+
+  std::string scan(std::string const& relative_path, bool hive = false) const
+  {
+    return "read_parquet(" + scratch.file_literal(relative_path) +
+           (hive ? ", hive_partitioning=true)" : ", hive_partitioning=false)");
+  }
+
+  sirius::test::scratch_dir scratch;
+  std::unique_ptr<sirius::test::disabled_optimizers_guard> optimizer_guard;
+};
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet flat count star and filtered counts match the CPU oracle",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  SECTION("count star includes rows with a null carrier")
+  {
+    compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("flat.parquet"));
+  }
+  SECTION("predicate on a non-carrier column")
+  {
+    compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("flat.parquet") + " WHERE id >= 129");
+  }
+  SECTION("all-pruned data predicate")
+  {
+    compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("flat.parquet") + " WHERE id < 0");
+  }
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet counts remain correct with an entirely null carrier column",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("null_carrier.parquet"));
+  compare_gpu_vs_cpu("SELECT count(id) FROM " + scan("null_carrier.parquet"));
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet partition-only grouped counts match the CPU oracle",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  compare_gpu_vs_cpu("SELECT part, count(*) FROM " + scan("hive/part=*/*.parquet", true) +
+                     " GROUP BY part ORDER BY part");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet multi-file count star matches the CPU oracle",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("parts/*.parquet"));
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet partition counts tolerate a missing non-output carrier candidate",
+                 "[integration][scan][parquet][gpu][carrier][schema_evolution]")
+{
+  compare_gpu_vs_cpu("SELECT part, count(*) FROM read_parquet(" +
+                     scratch.file_literal("evolved/part=*/*.parquet") +
+                     ", hive_partitioning=true, union_by_name=true) GROUP BY part ORDER BY part");
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet all-varchar count star matches the CPU oracle",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("strings.parquet"));
+}
+
+TEST_CASE_METHOD(ParquetCountCarrierFixture,
+                 "parquet empty-file count star matches the CPU oracle",
+                 "[integration][scan][parquet][gpu][carrier]")
+{
+  compare_gpu_vs_cpu("SELECT count(*) FROM " + scan("empty.parquet"));
+}
 
 /**
  * @brief CSV test fixture.

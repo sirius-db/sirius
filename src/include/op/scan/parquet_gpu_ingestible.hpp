@@ -229,6 +229,11 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
+  /// When true, the plan's row-count carrier column (scan_plan::carrier_batch_index)
+  /// could not be resolved in this file — schema evolution, or no row groups —
+  /// so @ref reader_options carries no column projection and the file reads its
+  /// natural batch. Splits never mix files that differ on this.
+  bool carrier_unavailable = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -346,10 +351,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
-  // Shared reader options (column projection only — never set_filter, which is
-  // a per-split decision applied in materialize_table). Built once in the
-  // constructor and stamped onto every emitted split by the coalescer.
+  // Shared plan-level projection options. Filters are applied per split.
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
+  // The same options without a column projection: stamped onto files whose
+  // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
+  std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
