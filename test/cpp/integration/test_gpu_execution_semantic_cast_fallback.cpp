@@ -241,7 +241,11 @@ TEST_CASE_METHOD(SemanticCastFixture,
   run_ok("CREATE TABLE hits(ResolutionWidth INTEGER, grp INTEGER);");
   run_ok("INSERT INTO hits VALUES (1920, 1), (1280, 1), (NULL, 1), (-1, 2), (0, 2), (NULL, 3);");
   run_ok("CHECKPOINT;");
-  run_ok("SET disabled_optimizers = '';");
+  // Keep Sirius's optimizer exclusions; sum_rewriter is enabled by default.
+  auto disabled = con->Query("SELECT current_setting('disabled_optimizers');");
+  REQUIRE(disabled);
+  REQUIRE_FALSE(disabled->HasError());
+  REQUIRE(disabled->GetValue(0, 0).ToString().find("sum_rewriter") == std::string::npos);
   run_ok("SET enable_duckdb_fallback = false;");
 
   compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits;");
