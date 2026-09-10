@@ -1,13 +1,14 @@
 ---
 name: pr-digest
-description: Create a context-first, navigable Markdown learning digest for a GitHub pull request, explaining the before/after behavior, change flow, key changes, and where they live with line-accurate links and trimmed diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
+description: Create a context-first, navigable GitHub pull-request learning digest as Markdown plus a self-contained HTML preview, explaining the before/after behavior, change flow, key changes, and where they live with line-accurate links, diagrams, and trimmed color-coded diffs. Use when a user wants to understand, summarize, review, walk through, or get up to speed on a GitHub PR. This maps the change without critiquing it; use a separate code-review pass when findings or an approval recommendation are requested.
 ---
 
 # PR Digest
 
-Turns a GitHub PR link into a digest document a reviewer can actually learn from: an opening
-before/after example and flowchart establish the mental model, then ranked key changes explain
-what/why/where-invoked/diff with clickable links into the actual checked-out source.
+Turns a GitHub PR link into two companion artifacts a reviewer can actually learn from: canonical
+Markdown for portability and a self-contained HTML preview for reliable rendering in Codex. An
+opening before/after example and flowchart establish the mental model, then ranked key changes
+explain what/why/where-invoked/diff with clickable links into the actual checked-out source.
 
 Comprehension is the whole job here. This skill does not judge the PR — no bug-hunting, no "is
 this a race condition" adversarial pass, no verdict on whether the change is good. That's a
@@ -150,9 +151,10 @@ class and function names belong in the later key-change sections.
 
 ### Flow at a glance
 
-Add one Mermaid diagram using the diagram type that best explains the change: usually `flowchart`
-for control/data flow, `sequenceDiagram` for interactions over time, or `stateDiagram-v2` for a
-lifecycle. The diagram should:
+Add one Mermaid `flowchart` using `TD`, `TB`, `LR`, or `RL`, choosing the direction that best
+explains the control or data flow. Keep it to simple quoted nodes, decision nodes, labeled arrows,
+and optional `subgraph` groups so both GitHub and the bundled HTML renderer can display it. Put at
+most one edge on each source line. The diagram should:
 
 - contain roughly 4–10 nodes or participants and fit on one screen;
 - make the old stopping point and new path visible, or show the full new flow when a comparison
@@ -230,9 +232,9 @@ and an ~90-case exhaustive switch elided") and mark cuts inline with a comment l
 the diff. Put the diff inside a fenced code block whose info string is `diff`. Preserve the patch
 marker as the first character of every changed line: `+` for additions and `-` for removals, with
 one leading space for unchanged context. Do not use a plain code fence or strip the markers:
-rendered Markdown uses the `diff` language and those prefixes to color additions green and
-removals red. This is the one place a fence is correct, since diffs need syntax coloring and
-contain no links.
+renderers can recognize the additions and removals. This is the one place a fence is correct,
+since diffs need syntax coloring and contain no links. Markdown viewers may choose their own
+syntax colors; the companion HTML preview always renders additions green and removals red.
 
 ## Step 9 — Audit moved code and files (its own section: "Relocations")
 
@@ -294,8 +296,13 @@ what keeps it honest instead of silently confident.
 
 ## Output
 
-- Path: `PR_digests/PR_digest_<PR_NUMBER>.md`, relative to repo root. Create the `PR_digests/`
-  directory if it doesn't exist.
+- Produce both companion files, relative to the repo root:
+  - `PR_digests/PR_digest_<PR_NUMBER>.md` — canonical, editable source.
+  - `PR_digests/PR_digest_<PR_NUMBER>.html` — generated, self-contained preview with an inline SVG
+    flowchart and explicit green/red diff rows.
+- Create the `PR_digests/` directory if it doesn't exist. Write and verify the Markdown first,
+  then generate the HTML from it. Never hand-edit the HTML; regenerate it after every Markdown
+  change.
 - Add `PR_digests/` to the repo's `.gitignore` if it isn't already there — these are local review
   artifacts, not something to commit. Check once per run; don't ask the user about it each time.
 - Structure, top to bottom:
@@ -318,6 +325,22 @@ what keeps it honest instead of silently confident.
   10. Ranked key changes in detail (Steps 5, 8), separated by `---`.
   11. "Relocations" — moved files/functions with intact-vs-changed classification (Step 9).
   12. "Not covered in this pass" (Step 10).
+
+After the Markdown is complete, render its companion preview with the repository-local script:
+
+```sh
+pixi run python .agents/skills/pr-digest/scripts/render_digest_html.py \
+  PR_digests/PR_digest_<PR_NUMBER>.md \
+  PR_digests/PR_digest_<PR_NUMBER>.html
+```
+
+If `pixi` is unavailable, run the same script with `python3`; it uses only the Python standard
+library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
+reported counts against the Markdown's `diff` and Mermaid fences, confirm the HTML contains no
+remote assets, and open the HTML in Codex when a preview facility is available.
+
+In the final response, link both files and identify Markdown as the editable source and HTML as
+the rendered preview. Also mention the branch/commit that was checked out to generate the links.
 
 See `references/example_digest.md` in this skill directory for a full worked example (PR #1277 —
 sirius-db/sirius, "dynamic filters: SIP") showing the expected tone, link density, trimming style,
