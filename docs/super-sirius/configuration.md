@@ -26,7 +26,12 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. `0` explicitly
+enables initialization; other values are rejected so a misspelling cannot
+silently disable Sirius. This is **required** when using the legacy code path
+(`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and
+pinned host memory on startup, leaving insufficient memory for the legacy
+buffer manager. It is also useful for CPU-only benchmarks.
 
 ```bash
 export SIRIUS_DISABLE=1
