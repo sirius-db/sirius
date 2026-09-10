@@ -1710,6 +1710,77 @@ TEST_CASE("group_bounds_arena - refuses inconsistent captures", "[pinned_chunk_s
   }
 }
 
+TEST_CASE("group_bounds_arena - packs to bytes a .hpln can carry and back", "[pinned_chunk_stats]")
+{
+  // An INGESTED file has to prune without decoding anything, so the bounds must travel with the
+  // data. What matters is not that the bytes round-trip but that the DECODED arena prunes
+  // identically -- a bound that survives serialisation shifted by one is a silently wrong answer,
+  // not a crash.
+  using sirius::scan_manager::group_bounds_arena;
+
+  SECTION("bounds and validity survive, and the arena prunes the same afterwards")
+  {
+    std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+    for (std::size_t g = 0; g < 8; ++g) {
+      if (g == 5) {
+        cells.emplace_back(std::nullopt);
+      }  // absent cell must stay absent
+      else {
+        cells.emplace_back(std::pair<int64_t, int64_t>{10 * g, 10 * g + 9});
+      }
+    }
+    auto const original = make_arena(cells, 100);
+    REQUIRE_FALSE(original.empty());
+
+    auto const bytes = original.pack();
+    REQUIRE_FALSE(bytes.empty());
+    std::string err;
+    auto const restored = group_bounds_arena::unpack(bytes, &err);
+    REQUIRE(err.empty());
+
+    REQUIRE(restored.group_rows() == original.group_rows());
+    REQUIRE(restored.column_count() == original.column_count());
+    REQUIRE(restored.chunk_count() == original.chunk_count());
+    for (std::size_t c = 0; c < original.column_count(); ++c) {
+      for (std::size_t k = 0; k < original.chunk_count(); ++k) {
+        auto const a = original.cell(c, k);
+        auto const b = restored.cell(c, k);
+        REQUIRE(b.size() == a.size());
+        REQUIRE(b.type == a.type);
+        REQUIRE(b.is_unsigned == a.is_unsigned);
+        REQUIRE(b.column_has_no_nulls == a.column_has_no_nulls);
+        for (std::size_t g = 0; g < a.size(); ++g) {
+          REQUIRE(b.mins[g] == a.mins[g]);
+          REQUIRE(b.maxs[g] == a.maxs[g]);
+          REQUIRE(b.valid[g] == a.valid[g]);
+        }
+      }
+    }
+
+    // The property that actually matters: same pruning decisions.
+    auto filter = cmp(ExpressionType::COMPARE_LESSTHAN, Value::INTEGER(25));
+    auto lowered =
+      sirius::scan_manager::lowered_bound_filter::lower(*filter, restored.cell(0, 0).type);
+    REQUIRE(lowered.has_value());
+    std::vector<std::uint32_t> a_surv, b_surv;
+    lowered->select_survivors(original.cell(0, 0), a_surv);
+    lowered->select_survivors(restored.cell(0, 0), b_surv);
+    REQUIRE(b_surv == a_surv);
+  }
+
+  SECTION("malformed input yields an empty arena, which prunes nothing")
+  {
+    // Never a wrong answer: a caller may treat a bad segment as "serve the file unpruned".
+    std::string err;
+    REQUIRE(group_bounds_arena::unpack({}, &err).empty());
+    REQUIRE_FALSE(err.empty());
+
+    auto bytes = make_arena({std::pair<int64_t, int64_t>{0, 9}}, 100).pack();
+    bytes.resize(bytes.size() / 2);
+    REQUIRE(group_bounds_arena::unpack(bytes, &err).empty());
+  }
+}
+
 TEST_CASE("group_bounds_arena - chunks may differ in group count", "[pinned_chunk_stats]")
 {
   // The last chunk of a pin is usually short, so its group count legitimately differs.
