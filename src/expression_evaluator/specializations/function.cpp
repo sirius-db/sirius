@@ -186,13 +186,12 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
 
     auto const input_strings = cudf::strings_column_view(input.get_column_view());
 #if CUDF_VERSION_NUM >= 2610
-    auto result_column = cudf::strings::slice_strings(
-      input_strings,
-      std::optional<cudf::size_type>{start_val},
-      std::optional<cudf::size_type>{stop_val},
-      std::optional<cudf::size_type>{1},
-      _stream,
-      _mr);
+    auto result_column = cudf::strings::slice_strings(input_strings,
+                                                      std::optional<cudf::size_type>{start_val},
+                                                      std::optional<cudf::size_type>{stop_val},
+                                                      std::optional<cudf::size_type>{1},
+                                                      _stream,
+                                                      _mr);
 #else
     auto result_column =
       cudf::strings::slice_strings(input_strings,
