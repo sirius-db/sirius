@@ -1482,6 +1482,79 @@ Two things to settle before committing to the format, both experiments rather th
    measuring latency and throughput — settles it without touching Sirius at all, and should be run
    before any format work.
 
+### 7.6 MEASURED (2026-09-10): S3 charges for requests, not for skipped bytes
+
+§7.2 asked whether S3's internal striping means a pruned ranged GET costs the backend the same as
+an unpruned one. Measured directly: `g7e.2xlarge` in **us-east-2b**, bucket in **us-east-2** (same
+region, so this is S3's own behaviour and not an inter-region link), 4 GB object, stdlib HTTPS
+ranged GETs with keep-alive, one connection per worker.
+
+**Does reading less take proportionally less time?** (16 MB ranges, concurrency 64)
+
+| read | time vs full read | ideal | throughput |
+|---|---|---|---|
+| 100% | 1.000x | 1.00 | 994 MB/s |
+| 50% | **0.500x** | 0.50 | 994 MB/s |
+| 25% | **0.259x** | 0.25 | 957 MB/s |
+| 5% | 0.185x | 0.05 | 250 MB/s |
+
+Proportional down to 25%. The 5% point falls short for a reason that is **ours, not S3's**: 5% of
+1 GB in 16 MB ranges is only 3 requests, which cannot fill 64 threads. Keeping the pipe full is a
+concurrency problem, not a granularity one.
+
+**Fragmentation at equal volume** (268 MB every row, concurrency 64) — the §7.2 question:
+
+| pattern | requests | throughput |
+|---|---|---|
+| 16 x 16 MB | 16 | 0.96 GB/s |
+| 64 x 4 MB | 64 | 0.77 GB/s |
+| 256 x 1 MB | 256 | 0.70 GB/s |
+| 1024 x 256 KB | 1024 | 0.49 GB/s |
+| 4096 x 64 KB | 4096 | 0.16 GB/s |
+
+Fragmentation costs 6x from 16 MB down to 64 KB — but **entirely through request count, with no
+striping term**. The model `throughput = min(NIC cap, concurrency x range / RTT)` predicts every
+row to within 4–23% with no term for the number of distinct extents:
+
+| range | predicted | measured |
+|---|---|---|
+| 64 KB | 0.17 | 0.16 |
+| 256 KB | 0.60 | 0.49 |
+| 1 MB | 0.89 | 0.70 |
+| 4 MB | 1.00 | 0.77 |
+| 16 MB | 1.00 | 0.96 |
+
+Note the p50 latency FALLS as ranges shrink (254 ms → 24 ms): small ranges pay a fixed ~25 ms
+floor, not a per-byte penalty. **So the §7.2 hypothesis is refuted in the direction that favours
+the project: the bytes you skip really are free, and what you pay for is asking.**
+
+### 7.7 The coalescing policy, as a number (answers §7.3)
+
+The amortised cost of one extra request at concurrency 64, from three independent pairs of the
+rows above: 0.46, 0.21, 0.36 ms. At ~1 GB/s that is **200–460 KB of transfer per request**, so:
+
+> **Bridge a gap when it is smaller than ~256 KB; issue a separate request when it is larger.**
+> Coalesce until runs reach ~4–16 MB, and keep `concurrency x range >= cap x RTT` (~250 MB in
+> flight here) or the pipe starves regardless of how well the ranges are merged.
+
+That is `max_gap_bytes`, which §7.3 has carried as "measured, not guessed" since the project
+opened. It also says a **G = 8 group is far too fine to address individually over S3** — 8192 rows
+of a 4-byte column is 32 KB, deep in the 0.16 GB/s regime — while being exactly the right
+granularity to *decide* with and then coalesce. The index picks the rows; the coalescer picks the
+requests; they are different questions.
+
+**What this means for the project.** §6.5 measured what our fetch skip actually produces on
+clustered data: roughly one contiguous run per buffer covering ~32% of it, tens of MB at a 512 MB
+batch. That is far above the ~4 MB knee, so **range-skipped ingestion from S3 would pay close to
+its byte fraction.** Clustering matters here for the same reason it matters everywhere else in
+this project (§3.13): it is what turns scattered survivors into long runs.
+
+**Caveats.** (a) Throughput plateaus at ~0.99 GB/s (7.9 Gb/s), which is the instance NIC, not S3 —
+so the large-range rows are all sitting at the cap and we cannot see whether they would separate
+above it. The small-range degradation is below the cap and therefore real. (b) The 64 MB and
+"1 contiguous run" rows in the raw output are concurrency-starved artifacts of a fixed byte budget
+(4 and 1 requests respectively), not findings. (c) One instance, one region, one object.
+
 ## 7.5 Physical layout: keep the metadata segregated and scannable on its own
 
 The index is only useful if it can be read *without* reading the data it describes. That is the
@@ -1932,18 +2005,19 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
   pin-chunk granularity, which is the strongest argument yet for the fine index.
 - **Open (§6.5):** the operator-level "metadata channel vs bulk channel" split — the one
   requirement of range-skipped fetch that the earlier plan did not anticipate.
-- **Open (§7.2):** does S3 actually reward finer ranges, or does internal striping mean a pruned
-  ranged GET costs the backend the same as an unpruned one? A standalone probe against a real
-  bucket settles it without touching Sirius, and gates any simpatico-ingestion work.
+- **Answered (§7.6, 2026-09-10):** S3 rewards reading less, proportionally — 50% of an object
+  takes 0.500x the time, 25% takes 0.259x. There is no striping penalty: fragmentation costs
+  request count only, and `throughput = min(cap, concurrency x range / RTT)` explains every point.
+  **Open:** everything above the ~1 GB/s NIC cap of the test instance.
 - **Open (§6.1):** the group→byte table is new format surface. Confirm it can be added as an
   ordinary per-leaf buffer (the `.hpln` header is self-describing, so this should be additive and
   leave old files readable), and decide whether the encoder emits it always or only when asked.
 - **Open (§6.1):** should the compression explorer learn about fetch-skippability as a third
   objective alongside ratio and decode throughput? Today a ratio-optimal plan can silently pick a
   codec whose buffers cannot be group-addressed.
-- **Open (§7.3):** the coalescing policy — merge ranges whose gap is under G bytes, widen G until
-  the request count is acceptable. G and N need measuring; `align_and_coalesce` already takes a
-  caller-supplied alignment, so the mechanism exists and only the policy is missing.
+- **Answered (§7.7, 2026-09-10):** bridge gaps under ~256 KB (one request amortises to 200–460 KB
+  of transfer at concurrency 64); coalesce to ~4–16 MB runs; keep `concurrency x range >= cap x
+  RTT`. **Open:** wiring those constants into `align_and_coalesce`'s caller.
 - **Answered (§6):** range-skipped *fetch* on a host-tier pin is built, measured (−1.03% at
   SF1000/2 GB) and gated. Surviving groups DO merge into few large copies on clustered data (16
   ranges for 6,152 chunks). **Open:** the string-column ceiling above is what it now costs.
