@@ -1694,6 +1694,65 @@ columns), which is the kind of bug only a contiguity test finds.
 **Still to do:** a `rmm::device_buffer` mirror of the same bytes, so the layout is identical host
 and device and a GPU evaluator needs no repacking; and the persisted form (§7.5.4).
 
+## 7.9 What `.hpln` needs to be a source like parquet (2026-09-10)
+
+Scoping for making simpatico a readable FORMAT rather than only a pin-time representation. The
+requirement list is not a matter of taste: `op::scan::gpu_ingestible` is the interface every source
+implements, so it says exactly what is missing.
+
+| requirement | parquet | `.hpln` today |
+|---|---|---|
+| `table_info()` — column names + file paths (cache identity) | yes | schema **done**, paths trivial |
+| bind-time schema without reading data | footer | **done** (`describe_compressed_table_header` + `logical_types`) |
+| `next_split_provider()` — metadata walk emitting I/O tasks | row groups | missing |
+| `create_batch_coalescer()` | yes | missing |
+| `materialize_metadata_to_table()` — batch → GPU table | cuDF reader | **half** (`read_compressed_table_subset_from_memory` + `payload_fetch_fn`; no io_context transport) |
+| `post_filter_and_project()`, `materialized_column_order()` | yes | missing (mostly boilerplate) |
+| pruning from statistics | row-group min/max | **better than parquet**: per-group zone maps, already decoded from the file |
+| range-skipped fetch | none (row groups are all-or-nothing) | **done** (`build_chunk_subset_header`, wired for pins) |
+| SQL surface | `read_parquet` interception | missing |
+| writer | `COPY ... TO` | missing (C++ only) |
+
+### A real scan source removes the "identity segment" idea
+
+An earlier sketch had the file record the parquet dataset it caches, so a pinned `.hpln` could be
+matched to queries over that dataset. **Drop it.** With a `read_simpatico('x.hpln')` source,
+`cache_entry_info::resolved_file_paths` is simply the `.hpln` path and cache matching works exactly
+as it does for parquet. The segment was a workaround for not having a source; it is more total work
+and a worse model.
+
+### The blocking structural gap: one file is one chunk
+
+A `.hpln` holds a single `compressed_table`, but the scan model is "walk metadata → emit splits →
+coalesce into batches". With one chunk there is nothing to walk, so this blocks the **ingestible**,
+not merely the pin. Two ways out: a chunk directory segment (the zone-map packing already carries
+`n_chunks`), or one-file-per-chunk with a table as a directory, parquet-style. Prefer the
+directory: it keeps a table one object, which is what makes the trailer's single tail read pay off
+over S3 (§7.6).
+
+### Milestones
+
+- **A. `SELECT * FROM read_simpatico('x.hpln')`** — table function + bind + a minimal ingestible
+  decoding whole chunks. Single file, no pruning. Everything else hangs off this.
+- **B. Multi-chunk container** — chunk directory, splits, coalescer. Unlocks real table sizes.
+- **C. Pruning** — zone maps → surviving chunks → `build_chunk_subset_header` → ranged fetch.
+  Largely re-pointing the pin path at a file transport, and where §7.6's S3 result cashes in.
+- **D. Remote** — `payload_fetch_fn` over the io_context for `s3://`. The trailer makes one tail
+  read locate everything; §6.1's group→byte table becomes worth adding here.
+- **E. Writer** — `COPY ... TO 'x.hpln' (FORMAT simpatico)`, so files exist without C++.
+- **F. Pin integration** — `pin_table` over a `.hpln`, by then just "pin this source".
+
+**Do B before C.** Chunking decides what a surviving chunk means in a file; pruning first means
+designing it twice.
+
+### Honest state
+
+What exists is the bottom of the stack: the container is self-locating, carries logical types and
+per-group zone maps, and stages into pinned memory byte-for-byte. A is days; A–D is weeks. The
+format also still needs nullability (in flight separately) and checksums before anyone stores data
+they care about in it — a corrupt payload currently decodes to wrong values rather than an error,
+which is the same failure shape as every other bug this project has hit.
+
 ## 8. Where the index should live: device, host, spilled
 
 ### 8.1 Keep the index in device memory even when the data is pinned to host — yes
