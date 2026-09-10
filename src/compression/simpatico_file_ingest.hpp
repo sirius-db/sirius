@@ -46,6 +46,12 @@
 
 namespace sirius {
 
+/// One chunk of a .hpln staged into pinned host memory: the bytes and the row count.
+struct ingested_hpln_chunk {
+  std::shared_ptr<pinned_compressed_blob> blob;
+  std::int64_t num_rows = 0;
+};
+
 /// A .hpln file staged into pinned host memory, plus what its header says is in it.
 struct ingested_hpln {
   std::shared_ptr<pinned_compressed_blob> blob;
@@ -69,7 +75,11 @@ struct hpln_bind_schema {
   /// a DECIMAL(12,2) is INT64 to the engine but may be DECIMAL32 in the file. A reader sizing the
   /// decoded table has to size it by these.
   std::vector<cudf::data_type> physical_types;
+  /// Rows over the WHOLE file, i.e. summed over its chunks.
   std::int64_t num_rows = 0;
+  /// Rows in each chunk, in file order. One entry per chunk, so its size is the file's chunk
+  /// count -- which is how many splits a scan over the file emits.
+  std::vector<std::int64_t> chunk_rows;
 };
 
 /// Open @p path far enough to answer "what columns does this file have".
@@ -95,12 +105,45 @@ struct hpln_bind_schema {
 
 /// Read @p path into pinned host memory belonging to @p host_space.
 ///
-/// The header is located by reading a speculative prefix and growing it if the parse reports
-/// truncation -- .hpln carries no length prefix or footer, so its extent cannot be known without
-/// parsing (see CHUNK_SKIPPING_PLAN.md 7.5). Throws std::runtime_error on a missing, truncated or
-/// malformed file, since a partially ingested table must never become a pinned entry.
+/// The header is located from the trailer; a file written before the trailer existed falls back
+/// to reading a speculative prefix and growing it if the parse reports truncation (see
+/// CHUNK_SKIPPING_PLAN.md 7.5). Throws std::runtime_error on a missing, truncated or malformed
+/// file, since a partially ingested table must never become a pinned entry.
+///
+/// Single-chunk files only: the result is one blob, so a multi-chunk file would have to be
+/// silently truncated to its first chunk. Such a file is refused; use
+/// @ref read_hpln_chunks_into_pinned, which is what a scan over one drives.
 [[nodiscard]] ingested_hpln read_hpln_into_pinned(std::string const& path,
                                                   cucascade::memory::memory_space& host_space);
+
+/// Read the chunks @p chunk_ids of @p path into pinned host memory, in the order named.
+///
+/// The chunk directory says where each chunk's header and payload are, so a batch of chunks is
+/// this many ranged reads and nothing else -- no chunk outside @p chunk_ids is touched. Throws
+/// std::runtime_error if the file is unreadable or an id is out of range; a scan that decoded a
+/// neighbouring chunk instead would return plausible rows from the wrong place.
+[[nodiscard]] std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
+  std::string const& path,
+  cucascade::memory::memory_space& host_space,
+  std::span<const std::size_t> chunk_ids);
+
+/// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
+///
+/// Every chunk is compressed independently with the same plan, and all of them must share a
+/// schema -- the reader rejects a file whose chunks disagree, so building one is not useful.
+/// The `zone_maps` segment carries every chunk's per-group bounds, in chunk order, which is what
+/// makes pruning a wiring job rather than a format change.
+///
+/// @p group_rows of 0 writes no zone-map segment. Returns an empty string on success.
+[[nodiscard]] std::string write_tables_to_hpln(
+  std::vector<cudf::table_view> const& tables,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<std::string> const& column_names,
+  std::string const& plan_dsl,
+  std::size_t group_rows,
+  std::string const& path,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /// Compress @p table with @p plan_dsl and write it to @p path, carrying per-group zone maps.
 ///

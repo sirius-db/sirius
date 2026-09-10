@@ -414,3 +414,241 @@ TEST_CASE("hpln ingest - refuses a file that is not a readable .hpln", "[compres
 
   fs::remove_all(dir);
 }
+
+namespace {
+
+constexpr int kMultiChunks       = 3;
+constexpr int kMultiRowsPerChunk = 2000;
+
+/// Write @p n_chunks two-column chunks whose key column encodes its chunk id, and return the
+/// expected flattened columns. Chunk-identifying values are what make "which chunk did this
+/// split read" an assertable question -- a wrong offset returns neighbouring bytes, not an error.
+std::vector<std::vector<std::int32_t>> write_multi_chunk_file(std::string const& path, int n_chunks)
+{
+  auto stream = cudf::get_default_stream();
+  std::vector<std::vector<std::int32_t>> expected(2);
+  std::vector<std::unique_ptr<cudf::table>> tables;
+  std::vector<cudf::table_view> views;
+  for (int c = 0; c < n_chunks; ++c) {
+    std::vector<std::int32_t> keys(kMultiRowsPerChunk), vals(kMultiRowsPerChunk);
+    for (int i = 0; i < kMultiRowsPerChunk; ++i) {
+      keys[static_cast<std::size_t>(i)] = c * 1000000 + i;
+      vals[static_cast<std::size_t>(i)] = i * 3 + c;
+    }
+    expected[0].insert(expected[0].end(), keys.begin(), keys.end());
+    expected[1].insert(expected[1].end(), vals.begin(), vals.end());
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(int32_column(keys));
+    cols.push_back(int32_column(vals));
+    tables.push_back(std::make_unique<cudf::table>(std::move(cols)));
+    views.push_back(tables.back()->view());
+  }
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
+                                            duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER)};
+  auto const leaf = std::string("input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  REQUIRE(sirius::write_tables_to_hpln(views,
+                                       types,
+                                       {"k", "v"},
+                                       leaf + "---\n" + leaf,
+                                       /*group_rows=*/1024,
+                                       path,
+                                       stream,
+                                       rmm::mr::get_current_device_resource_ref())
+            .empty());
+  return expected;
+}
+
+/// Read the segment table of a written file, as a remote reader would: one tail read.
+std::vector<simpatico::hpln_segment_ref> segments_of(std::string const& path)
+{
+  auto const size = static_cast<std::uint64_t>(fs::file_size(path));
+  std::vector<std::uint8_t> tail(std::min<std::uint64_t>(size, 64u << 10));
+  std::ifstream f(path, std::ios::binary);
+  f.seekg(static_cast<std::streamoff>(size - tail.size()));
+  f.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(tail.size()));
+  std::vector<simpatico::hpln_segment_ref> segs;
+  REQUIRE(simpatico::read_hpln_postscript(tail, size, segs, nullptr).empty());
+  return segs;
+}
+
+}  // namespace
+
+TEST_CASE("hpln container - a multi-chunk file keeps its metadata segregated from its payload",
+          "[compression][hpln_ingest][simpatico_multichunk]")
+{
+  if (no_gpu()) { return; }
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_multi_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "t.hpln").string();
+  write_multi_chunk_file(path, kMultiChunks);
+
+  auto const segs = segments_of(path);
+  std::vector<simpatico::hpln_chunk_ref> chunks;
+  bool found_directory = false;
+  for (auto const& sg : segs) {
+    if (sg.kind != simpatico::hpln_segment::chunk_directory) { continue; }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(sg.bytes));
+    std::ifstream f(path, std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(sg.offset));
+    f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(sg.bytes));
+    REQUIRE(simpatico::unpack_hpln_chunk_directory(bytes, chunks).empty());
+    found_directory = true;
+  }
+  REQUIRE(found_directory);
+  REQUIRE(chunks.size() == static_cast<std::size_t>(kMultiChunks));
+
+  // The claim of CHUNK_SKIPPING_PLAN.md 7.5: every chunk's metadata is reachable in ONE
+  // sequential read, ahead of any bulk data. Interleaved [hdr][pay][hdr][pay] would satisfy the
+  // directory just as well and would cost a seek per chunk, so the layout is what is asserted.
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    REQUIRE(chunks[i].num_rows == kMultiRowsPerChunk);
+    REQUIRE(chunks[i].header_bytes > 0);
+    REQUIRE(chunks[i].payload_bytes > 0);
+    for (auto const& other : chunks) {
+      REQUIRE(chunks[i].header_offset + chunks[i].header_bytes <= other.payload_offset);
+    }
+    if (i + 1 < chunks.size()) {
+      REQUIRE(chunks[i].header_offset + chunks[i].header_bytes == chunks[i + 1].header_offset);
+      REQUIRE(chunks[i].payload_offset + chunks[i].payload_bytes == chunks[i + 1].payload_offset);
+    }
+  }
+
+  // The header and payload segments still bound their whole regions, so a reader that wants all
+  // the metadata fetches one range and subdivides it with the directory.
+  for (auto const& sg : segs) {
+    if (sg.kind == simpatico::hpln_segment::header) {
+      REQUIRE(sg.offset == chunks.front().header_offset);
+      REQUIRE(sg.offset + sg.bytes == chunks.back().header_offset + chunks.back().header_bytes);
+    } else if (sg.kind == simpatico::hpln_segment::payload) {
+      REQUIRE(sg.offset == chunks.front().payload_offset);
+      REQUIRE(sg.offset + sg.bytes == chunks.back().payload_offset + chunks.back().payload_bytes);
+    }
+  }
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln container - a named chunk stages only its own bytes",
+          "[compression][hpln_ingest][simpatico_multichunk]")
+{
+  if (no_gpu()) { return; }
+  auto stream = cudf::get_default_stream();
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_hpln_chunkrd_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path     = (dir / "t.hpln").string();
+  auto const expected = write_multi_chunk_file(path, kMultiChunks);
+
+  // Out of order and with a repeat: the reader must serve exactly what was asked for, positionally
+  // -- this is the contract the coalescer's batches depend on.
+  std::vector<std::size_t> const want{2, 0, 2};
+  auto ingested = sirius::read_hpln_chunks_into_pinned(path, *env().host_space, want);
+  REQUIRE(ingested.size() == want.size());
+
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(ingested[i].num_rows == kMultiRowsPerChunk);
+    auto const& blob = *ingested[i].blob;
+    simpatico::payload_fetch_fn fetch =
+      [&blob](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+        sirius::copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
+      };
+    std::string err;
+    auto const ct = simpatico::read_compressed_table_from_memory(
+      blob.header, fetch, stream, rmm::mr::get_current_device_resource_ref(), &err);
+    REQUIRE(err.empty());
+    auto table = ct.decompress(stream, rmm::mr::get_current_device_resource_ref());
+    stream.synchronize();
+    REQUIRE(table->num_rows() == kMultiRowsPerChunk);
+    auto const keys   = read_back(table->view().column(0));
+    auto const offset = static_cast<std::ptrdiff_t>(want[i] * kMultiRowsPerChunk);
+    REQUIRE(keys == std::vector<std::int32_t>(expected[0].begin() + offset,
+                                              expected[0].begin() + offset + kMultiRowsPerChunk));
+  }
+
+  REQUIRE_THROWS(sirius::read_hpln_chunks_into_pinned(
+    path, *env().host_space, std::vector<std::size_t>{kMultiChunks}));
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln container - a file whose chunks disagree about the schema is refused",
+          "[compression][hpln_ingest][simpatico_multichunk]")
+{
+  if (no_gpu()) { return; }
+  auto stream = cudf::get_default_stream();
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_hpln_mismatch_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "bad.hpln").string();
+
+  // Two chunks, one two columns wide and one three. Nothing below the container layer notices:
+  // each chunk parses, each decodes, and a scan would discover the disagreement only when a batch
+  // failed to concatenate -- or, with matching widths and different columns, not at all.
+  constexpr int kRows = 1024;
+  auto const leaf = std::string("input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  std::vector<std::unique_ptr<cudf::column>> narrow_cols;
+  narrow_cols.push_back(int32_column(ramp(kRows, 3)));
+  narrow_cols.push_back(int32_column(ramp(kRows, 5)));
+  cudf::table narrow(std::move(narrow_cols));
+  std::vector<std::unique_ptr<cudf::column>> wide_cols;
+  wide_cols.push_back(int32_column(ramp(kRows, 3)));
+  wide_cols.push_back(int32_column(ramp(kRows, 5)));
+  wide_cols.push_back(int32_column(ramp(kRows, 7)));
+  cudf::table wide(std::move(wide_cols));
+
+  auto mr = rmm::mr::get_current_device_resource_ref();
+  auto ct_narrow =
+    simpatico::compress_with_plan(narrow.view(), leaf + "---\n" + leaf, stream, mr, {"k", "v"});
+  auto ct_wide = simpatico::compress_with_plan(
+    wide.view(), leaf + "---\n" + leaf + "---\n" + leaf, stream, mr, {"k", "v", "w"});
+  std::vector<simpatico::compressed_table const*> refs{&ct_narrow, &ct_wide};
+  REQUIRE(simpatico::write_compressed_tables(refs, path, stream).empty());
+
+  // Refused at BIND, before a query commits to running: a file whose chunks disagree has no one
+  // schema to bind to, and discovering that mid-scan is a failed batch at best.
+  REQUIRE_THROWS(sirius::read_hpln_schema(path));
+  REQUIRE_THROWS(
+    sirius::read_hpln_chunks_into_pinned(path, *env().host_space, std::vector<std::size_t>{0}));
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln container - a multi-chunk file's zone maps cover every chunk, in chunk order",
+          "[compression][hpln_ingest][simpatico_multichunk]")
+{
+  if (no_gpu()) { return; }
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_hpln_multizm_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "t.hpln").string();
+  write_multi_chunk_file(path, kMultiChunks);
+
+  // Pruning is milestone C, but the statistics have to be written correctly NOW: a zone-map
+  // segment that carried only chunk 0's bounds would look fine until a pruner indexed it by
+  // chunk id and dropped live data.
+  auto const segs = segments_of(path);
+  sirius::scan_manager::group_bounds_arena arena;
+  for (auto const& sg : segs) {
+    if (sg.kind != simpatico::hpln_segment::zone_maps) { continue; }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(sg.bytes));
+    std::ifstream f(path, std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(sg.offset));
+    f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(sg.bytes));
+    std::string err;
+    arena = sirius::scan_manager::group_bounds_arena::unpack(bytes, &err);
+    REQUIRE(err.empty());
+  }
+  REQUIRE(arena.chunk_count() == static_cast<std::size_t>(kMultiChunks));
+  REQUIRE(arena.column_count() == 2);
+  for (std::size_t c = 0; c < static_cast<std::size_t>(kMultiChunks); ++c) {
+    auto const bounds = arena.cell(0, c);
+    REQUIRE(bounds.size() == kMultiRowsPerChunk / 1024 + 1);
+    // Chunk c's key column starts at c*1'000'000, so the bounds identify which chunk they
+    // describe: a sidecar written chunk-major but read chunk-minor would fail here.
+    REQUIRE(bounds.mins[0] == static_cast<std::int64_t>(c) * 1000000);
+    REQUIRE(bounds.maxs[bounds.size() - 1] ==
+            static_cast<std::int64_t>(c) * 1000000 + kMultiRowsPerChunk - 1);
+  }
+
+  fs::remove_all(dir);
+}

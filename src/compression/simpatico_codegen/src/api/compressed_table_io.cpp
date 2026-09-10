@@ -617,44 +617,123 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 // Public API
 // ---------------------------------------------------------------------------
 
-std::string write_compressed_table(compressed_table const& table,
-                                   std::string const& path,
-                                   rmm::cuda_stream_view stream,
-                                   std::span<const hpln_extra_segment> extra)
+namespace {
+
+constexpr std::uint16_t kChunkDirectoryVersion = 1;
+
+}  // namespace
+
+std::vector<std::uint8_t> pack_hpln_chunk_directory(std::span<const hpln_chunk_ref> chunks)
+{
+  std::vector<std::uint8_t> out;
+  push_le(out, kChunkDirectoryVersion);
+  push_le(out, static_cast<std::uint32_t>(chunks.size()));
+  for (auto const& c : chunks) {
+    push_le(out, c.header_offset);
+    push_le(out, c.header_bytes);
+    push_le(out, c.payload_offset);
+    push_le(out, c.payload_bytes);
+    push_le(out, c.num_rows);
+  }
+  return out;
+}
+
+std::string unpack_hpln_chunk_directory(std::span<const std::uint8_t> bytes,
+                                        std::vector<hpln_chunk_ref>& out)
+{
+  out.clear();
+  constexpr std::size_t kEntryBytes = 5 * sizeof(std::uint64_t);
+  if (bytes.size() < 6) return "chunk directory: truncated preamble";
+  std::uint16_t version = 0;
+  std::uint32_t n       = 0;
+  std::memcpy(&version, bytes.data(), sizeof(version));
+  std::memcpy(&n, bytes.data() + 2, sizeof(n));
+  if (version != kChunkDirectoryVersion) {
+    return "chunk directory: unsupported version " + std::to_string(version);
+  }
+  if (bytes.size() < 6 + static_cast<std::size_t>(n) * kEntryBytes) {
+    return "chunk directory: truncated entry table";
+  }
+  out.resize(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto const* p = bytes.data() + 6 + static_cast<std::size_t>(i) * kEntryBytes;
+    std::memcpy(&out[i].header_offset, p, 8);
+    std::memcpy(&out[i].header_bytes, p + 8, 8);
+    std::memcpy(&out[i].payload_offset, p + 16, 8);
+    std::memcpy(&out[i].payload_bytes, p + 24, 8);
+    std::memcpy(&out[i].num_rows, p + 32, 8);
+  }
+  return {};
+}
+
+std::string write_compressed_tables(std::span<compressed_table const* const> tables,
+                                    std::string const& path,
+                                    rmm::cuda_stream_view stream,
+                                    std::span<const hpln_extra_segment> extra)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
-  // Build the header + payload buffer list once (shared with the in-memory
-  // writer), then gather the payload into one contiguous blob for the file.
-  std::vector<std::uint8_t> hdr;
-  std::vector<payload_buffer_ref> buffers;
-  std::uint64_t payload_bytes = 0;
-  std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
-  if (!err.empty()) return err;
+  if (tables.empty()) return "write_compressed_tables: no chunks to write";
 
-  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
-  for (auto const& b : buffers) {
-    if (b.size_bytes > 0 && b.device_ptr) {
-      cudaMemcpyAsync(payload.data() + b.offset,
-                      b.device_ptr,
-                      static_cast<std::size_t>(b.size_bytes),
-                      cudaMemcpyDeviceToHost,
-                      stream.value());
-    }
+  // Build every chunk's header first. They are written as one contiguous region ahead of any
+  // payload, so all of them have to exist before the first byte goes out.
+  std::vector<std::vector<std::uint8_t>> headers(tables.size());
+  std::vector<std::vector<payload_buffer_ref>> buffers(tables.size());
+  std::vector<std::uint64_t> payload_sizes(tables.size(), 0);
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    if (tables[i] == nullptr)
+      return "write_compressed_tables: null chunk at index " + std::to_string(i);
+    std::string err =
+      build_compressed_table_header(*tables[i], headers[i], buffers[i], payload_sizes[i], stream);
+    if (!err.empty()) return err;
   }
-  stream.synchronize();  // D→H copies must complete before the file write
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
-  f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-  f.write(reinterpret_cast<const char*>(payload.data()),
-          static_cast<std::streamsize>(payload.size()));
 
-  // Segment table. header and payload are always present and always first, so a reader that only
-  // wants the schema can fetch exactly the header without parsing anything.
+  std::vector<hpln_chunk_ref> dir(tables.size());
+  std::uint64_t at = 0;
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    dir[i].header_offset = at;
+    dir[i].header_bytes  = headers[i].size();
+    dir[i].num_rows      = tables[i]->num_rows();
+    f.write(reinterpret_cast<const char*>(headers[i].data()),
+            static_cast<std::streamsize>(headers[i].size()));
+    at += headers[i].size();
+  }
+  auto const header_region_bytes = at;
+
+  // One chunk's payload is gathered, written and released before the next is staged: a file of N
+  // chunks would otherwise need every chunk's decompressed-to-host bytes resident at once.
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_sizes[i]));
+    for (auto const& b : buffers[i]) {
+      if (b.size_bytes > 0 && b.device_ptr) {
+        cudaMemcpyAsync(payload.data() + b.offset,
+                        b.device_ptr,
+                        static_cast<std::size_t>(b.size_bytes),
+                        cudaMemcpyDeviceToHost,
+                        stream.value());
+      }
+    }
+    stream.synchronize();  // D→H copies must complete before the file write
+    dir[i].payload_offset = at;
+    dir[i].payload_bytes  = payload_sizes[i];
+    f.write(reinterpret_cast<const char*>(payload.data()),
+            static_cast<std::streamsize>(payload.size()));
+    at += payload_sizes[i];
+  }
+
+  // Segment table. header and payload are always present and always first, and for a multi-chunk
+  // file they span the whole of their respective regions -- so a reader that only wants metadata
+  // still fetches exactly one range, and the directory subdivides it.
   std::vector<hpln_segment_ref> segs;
-  segs.push_back({hpln_segment::header, 0, hdr.size()});
-  segs.push_back({hpln_segment::payload, hdr.size(), payload_bytes});
-  std::uint64_t at = hdr.size() + payload_bytes;
+  segs.push_back({hpln_segment::header, 0, header_region_bytes});
+  segs.push_back({hpln_segment::payload, header_region_bytes, at - header_region_bytes});
+  auto const dir_bytes = pack_hpln_chunk_directory(dir);
+  f.write(reinterpret_cast<const char*>(dir_bytes.data()),
+          static_cast<std::streamsize>(dir_bytes.size()));
+  segs.push_back({hpln_segment::chunk_directory, at, dir_bytes.size()});
+  at += dir_bytes.size();
   for (auto const& e : extra) {
     if (e.bytes.empty()) continue;
     f.write(reinterpret_cast<const char*>(e.bytes.data()),
@@ -684,6 +763,15 @@ std::string write_compressed_table(compressed_table const& table,
   f.write(reinterpret_cast<const char*>(tr.data()), static_cast<std::streamsize>(tr.size()));
   if (!f) return "write error on '" + path + "'";
   return {};
+}
+
+std::string write_compressed_table(compressed_table const& table,
+                                   std::string const& path,
+                                   rmm::cuda_stream_view stream,
+                                   std::span<const hpln_extra_segment> extra)
+{
+  compressed_table const* one = &table;
+  return write_compressed_tables({&one, 1}, path, stream, extra);
 }
 
 std::string read_hpln_postscript(std::span<const std::uint8_t> tail,

@@ -37,6 +37,10 @@
 //           name (str16) + buf_type_tag (uint8) + size_bytes (uint64 LE) + payload_offset (uint64
 //           LE)
 //   [Payload]  — all buffer bytes concatenated in write order, copied D→H
+//
+// A file may hold N chunks, each an independently compressed table with its own header. The
+// headers are then written contiguously ahead of every payload and located by a `chunk_directory`
+// segment; see write_compressed_tables.
 
 #include "api/simpatico_codegen.hpp"
 
@@ -77,7 +81,40 @@ enum class hpln_segment : std::uint16_t {
   /// physical types, which cannot express DECIMAL precision, nullability, or a timestamp's time
   /// zone -- a pin gets those from memory, a FILE has nowhere else to get them.
   logical_types = 4,
+  /// Where each CHUNK's header and payload live. Written for every file, including a
+  /// single-chunk one, so the read path has one shape. A reader that finds no directory treats
+  /// the file as a single chunk spanning the `header` and `payload` segments -- which is what
+  /// every file written before this segment existed is.
+  chunk_directory = 5,
 };
+
+/// One chunk's extent within a multi-chunk .hpln.
+///
+/// A chunk is compressed independently, so it needs its own structural header -- but the headers
+/// are written CONTIGUOUSLY, ahead of every payload (see CHUNK_SKIPPING_PLAN.md 7.5), so a reader
+/// gets all of a file's metadata in one sequential read rather than a seek per chunk. That is
+/// what makes the trailer's single tail read pay off over a network, where request count is what
+/// costs (7.6). Offsets are absolute within the file.
+struct hpln_chunk_ref {
+  std::uint64_t header_offset  = 0;
+  std::uint64_t header_bytes   = 0;
+  std::uint64_t payload_offset = 0;
+  std::uint64_t payload_bytes  = 0;
+  /// Rows the chunk decodes to. An ingesting reader has to report split sizes before it decodes
+  /// anything, and the row count is otherwise only reachable by parsing the chunk's header.
+  std::int64_t num_rows = 0;
+};
+
+/// Serialize a chunk directory into the bytes a @c hpln_segment::chunk_directory segment carries.
+[[nodiscard]] std::vector<std::uint8_t> pack_hpln_chunk_directory(
+  std::span<const hpln_chunk_ref> chunks);
+
+/// Inverse of @ref pack_hpln_chunk_directory. Returns an empty string on success.
+///
+/// Unlike zone maps, a malformed directory is NOT recoverable by serving unpruned: it says where
+/// the data is, so a caller must fail rather than fall back.
+[[nodiscard]] std::string unpack_hpln_chunk_directory(std::span<const std::uint8_t> bytes,
+                                                      std::vector<hpln_chunk_ref>& out);
 
 struct hpln_segment_ref {
   hpln_segment kind{};
@@ -115,6 +152,21 @@ std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
                                    rmm::cuda_stream_view stream = cudf::get_default_stream(),
                                    std::span<const hpln_extra_segment> extra = {});
+
+/// Write @p tables to *path* as one multi-chunk file, in the order given.
+///
+/// The layout is SEGREGATED: every chunk's structural header first, contiguously, then every
+/// chunk's payload, then the extra segments and a `chunk_directory` locating both regions per
+/// chunk. Interleaving [hdr][pay][hdr][pay] would be simpler to write and would cost a seek per
+/// chunk to read the metadata of, which is the access pattern this format exists to avoid.
+///
+/// The chunks are NOT checked against each other here -- this layer has no notion of a table
+/// schema beyond one chunk. A reader assembling them into one table must validate that they
+/// agree.
+std::string write_compressed_tables(std::span<compressed_table const* const> tables,
+                                    std::string const& path,
+                                    rmm::cuda_stream_view stream = cudf::get_default_stream(),
+                                    std::span<const hpln_extra_segment> extra = {});
 
 /// Read a compressed_table from *path*.
 /// On failure writes an error to *error_out (if non-null) and returns an empty

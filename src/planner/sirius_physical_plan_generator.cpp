@@ -253,7 +253,9 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
 //! channel `sirius_read_parquet` uses, because the bind data is Sirius's own rather than a
 //! MultiFileBindData the plan generator could walk.
 std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpatico_table_info(
-  sirius::op::sirius_physical_table_scan const& scan_op, duckdb::SiriusContext* sirius_ctx)
+  sirius::op::sirius_physical_table_scan const& scan_op,
+  const sirius::operator_params& op_params,
+  duckdb::SiriusContext* sirius_ctx)
 {
   if (sirius_ctx == nullptr) {
     throw std::runtime_error(
@@ -278,6 +280,9 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
   // the first is the one every other single-space consumer takes.
   auto info = sirius::op::scan::bind_simpatico_file(
     path, *const_cast<cucascade::memory::memory_space*>(host_spaces.front()));
+  // The file's chunks are bundled up to the same byte budget every other source batches to, so a
+  // .hpln of many small chunks does not pay a decode per chunk.
+  info->approximate_batch_size = op_params.scan_task_batch_size;
 
   // The scan emits one column per entry of `column_ids`, in that order, because that is what the
   // projection this branch of create_plan(LogicalGet&) pushes above the scan references. Binding
@@ -416,8 +421,8 @@ void wrap_table_scan_source(
   } else if (fn == "read_simpatico") {
     // No dynamic-filter channel: the .hpln source has no membership filter to receive, so the
     // scan leaf is built directly rather than through make_gpu_scan_leaf.
-    auto ingestible =
-      sirius::op::scan::make_ingestible(build_simpatico_table_info(scan, sirius_ctx.get()));
+    auto ingestible = sirius::op::scan::make_ingestible(
+      build_simpatico_table_info(scan, op_params, sirius_ctx.get()));
     leaf = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
       scan.types, scan.estimated_cardinality, std::move(ingestible), sirius_ctx.get());
     if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }

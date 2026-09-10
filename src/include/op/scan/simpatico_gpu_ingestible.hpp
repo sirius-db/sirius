@@ -18,17 +18,18 @@
 
 // A .hpln file as a scan SOURCE rather than only a pin-time representation.
 //
-// A .hpln holds a single compressed chunk, so this source is one file, one chunk, one split: no
-// pruning and no row filter. Column projection is honoured -- an unread column is never decoded --
-// but it is chosen at bind time, not pushed down from a filter. The decode itself is the
-// pinned-chunk path unchanged
-// -- the payload stages into pinned host memory byte-for-byte (read_hpln_into_pinned) and is then
-// reconstructed and decompressed exactly as a pinned chunk is (compression_converters.cpp,
+// A .hpln holds N independently compressed chunks, and this source is one file, one split per
+// chunk, coalesced into decode-sized batches: no pruning and no row filter. Column projection is
+// honoured -- an unread column is never decoded -- but it is chosen at bind time, not pushed down
+// from a filter. The decode itself is the pinned-chunk path unchanged: a chunk's payload stages
+// into pinned host memory byte-for-byte (read_hpln_chunks_into_pinned) and is then reconstructed
+// and decompressed exactly as a pinned chunk is (compression_converters.cpp,
 // decompress_host_to_gpu). What this class supplies is the split-provider shape the scan operator
 // drives.
 
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
+#include <sirius_config.hpp>
 
 // cudf
 #include <cudf/types.hpp>
@@ -65,8 +66,8 @@ namespace sirius::op::scan {
  */
 class simpatico_ingestible_table_info : public ingestible_table_info {
  public:
-  /// The .hpln path, and the pinned-cache identity for this table. Exactly one entry: a .hpln
-  /// carries one chunk, so a table is one file.
+  /// The .hpln path, and the pinned-cache identity for this table. Exactly one entry: a table is
+  /// one file, however many chunks that file holds.
   std::vector<std::string> resolved_file_paths;
   std::vector<std::string> names;
   /// The engine's logical types, from the file when it declares them and derived from the cuDF
@@ -75,7 +76,16 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// What each column decodes to in cuDF. Sizing the decoded table needs these rather than
   /// @ref types: a DECIMAL is INT64 to the engine and may be DECIMAL32 in the file.
   std::vector<cudf::data_type> physical_types;
+  /// Rows over the whole file, summed over its chunks.
   std::int64_t num_rows = 0;
+  /// Rows in each chunk, in file order. Its size is the number of splits the walk emits, and its
+  /// entries size each split's reservation -- both of which have to be known before anything is
+  /// decoded.
+  std::vector<std::int64_t> chunk_rows;
+  /// Byte budget a batch of chunks is coalesced up to; 0 means no budget, as it does for every
+  /// other source. A chunk always forms at least one batch on its own, since a chunk is the
+  /// smallest decodable unit of the file.
+  std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
   /// File column indices to decode, in the order the scan emits them. A scan that reads two of
   /// ten columns must emit two: the plan projects by output POSITION, so emitting the file's full
@@ -108,15 +118,24 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
 // simpatico_scan_info
 //===----------------------------------------------------------------------===//
 /**
- * @brief One unit of .hpln scan work: the whole file.
+ * @brief One unit of .hpln scan work: a run of the file's chunks.
+ *
+ * The walk emits one chunk per split and the coalescer bundles them, so a batch carries several
+ * ids and decodes to their concatenation. Order within @ref chunk_ids is the order the rows are
+ * emitted in, so a batch that reordered them would return the file's rows shuffled between
+ * chunks.
  *
  * Carries no byte ranges to advise. Where parquet's split names row groups so the sequencer can
- * prefetch them, a .hpln has one chunk and its reader locates the payload from the trailer, so
- * there is nothing to hand the prefetcher that it does not already read in one pass.
+ * prefetch them, a .hpln reader locates every chunk from the trailer, so there is nothing to hand
+ * the prefetcher that it does not already read in one pass.
  */
 class simpatico_scan_info : public scan_info {
  public:
   std::string path;
+  /// File-order chunk ids this split decodes, ascending.
+  std::vector<std::size_t> chunk_ids;
+  /// Rows the split's chunks decode to, summed.
+  std::int64_t num_rows = 0;
   /// Decoded size of the columns this split produces; drives the memory reservation.
   std::size_t decoded_bytes = 0;
 
@@ -129,9 +148,9 @@ class simpatico_scan_info : public scan_info {
 /**
  * @brief Scan source over a .hpln file.
  *
- * The metadata walk emits exactly one split and the coalescer passes it straight through: with one
- * chunk in the file there is nothing to partition and nothing to bundle. The split decodes
- * @c simpatico_ingestible_table_info::column_ids and nothing else.
+ * The metadata walk emits one split per chunk of the file and the coalescer bundles consecutive
+ * chunks up to a byte budget, so a batch is decode-sized rather than chunk-sized. Every split
+ * decodes @c simpatico_ingestible_table_info::column_ids and nothing else.
  */
 class simpatico_gpu_ingestible : public gpu_ingestible {
  public:
@@ -167,9 +186,10 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
 
  private:
   std::unique_ptr<simpatico_ingestible_table_info> _info;
-  /// Claims the one split. An atomic for the same reason parquet's index is: the driver may call
-  /// @ref next_split_provider from several dispatcher threads and only one may win.
-  std::atomic<bool> _split_claimed{false};
+  /// Next unclaimed chunk. An atomic for the same reason parquet's file index is: the driver may
+  /// call @ref next_split_provider from several dispatcher threads, and a chunk handed to two of
+  /// them would be emitted twice -- which shows up as a plausible row count, not as a failure.
+  std::atomic<std::size_t> _next_chunk{0};
 };
 
 [[nodiscard]] std::shared_ptr<simpatico_gpu_ingestible> make_ingestible(
