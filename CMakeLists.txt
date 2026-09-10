@@ -246,6 +246,7 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/compression/compressed_representation.cpp
+    src/compression/simpatico_file_ingest.cpp
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
@@ -677,6 +678,7 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/test_hpln_ingest.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
