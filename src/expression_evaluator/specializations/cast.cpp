@@ -23,6 +23,7 @@
 #include <sirius/exception.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/unary.hpp>
 
@@ -82,7 +83,10 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::cast const& alt, eva
   //===----------3: MATERIALIZE Mode, evaluate node with unary/binary ops----------===//
   auto const return_type = sirius::get_cudf_type(alt.target_type);
   auto child             = evaluate(*alt.child, evaluation_mode::MATERIALIZE);
-  D_ASSERT(!child.is_scalar());  // CAST should never be called on a scalar
+  if (child.is_scalar()) {
+    child = evaluate_result(cudf::make_column_from_scalar(
+      child.get_scalar(), _input_table.num_rows(), _stream, _mr));
+  }
   // Only planner-certified carrier restoration may tunnel through the narrowed representation.
   // A semantic cast delegates to cuDF and is never reinterpreted as a physical DATE restore.
   auto result_column =
