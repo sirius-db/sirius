@@ -32,6 +32,16 @@ Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **requ
 export SIRIUS_DISABLE=1
 ```
 
+### `SIRIUS_QUERY_WATCHDOG_SECS`
+
+Opt-in query watchdog, **off by default**. Unset or `0` leaves `sirius_engine::execute()` blocking on the query future exactly as before. Set to `N` and the engine thread instead polls the future every 250 ms and fails the query — through the scheduler's completion handler, with a named `sirius query watchdog` error the client sees — once **no pipeline has made any scheduling progress** (no task created or completed, no pipeline finished) for `N` seconds. A wedged query becomes a loud failure in `N` seconds instead of a silent hang; in-flight GPU work is not cancelled, and a query that completes concurrently keeps its real outcome (first call wins).
+
+The watchdog watches scheduling counters, not GPU activity, so a single long-running kernel looks like a stall to it. Pick a value well above the longest single kernel or operator runtime the deployment can see, and below the client-side query timeout so the client receives the engine's error rather than its own. The multi-CN cluster environment uses `60`. The value must be a plain non-negative integer no larger than `86400` (one day); anything else — a sign, whitespace, a non-digit, or a larger number — is rejected when the query starts. The C++ integration tests that run under the watchdog (`watchdog_guard` in `test/cpp/exec/test_streaming_fragment.cpp`) hard-wire a threshold sized for a fast GPU; export `SIRIUS_TEST_WATCHDOG_SECS` to raise it on a slow CI machine.
+
+```bash
+export SIRIUS_QUERY_WATCHDOG_SECS=60
+```
+
 ### Byte Suffixes
 
 Any integer config value that represents bytes supports human-readable suffixes:
