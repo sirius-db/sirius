@@ -1761,6 +1761,22 @@ over S3 (§7.6).
 
   `projection_pushdown` deliberately stays off: the scan then remains full width with a projection
   above it, which is what makes a filter key's batch position its own column index.
+- **C2. Filter during decode, on top of pruning** — the `.hpln` reader calls `simpatico::decompress`
+  directly and so bypasses `decompress_chunk`, which is the entry point taking a
+  `decompression_pushdown_scan`. The file path therefore has none of the fused decode-time
+  filtering the pin path has had since `77f1a71e`. Build a `pushdown_request` from the same
+  `TableFilterSet` milestone C already plumbs; when the decode reports `covers_whole_filter` the
+  outcome maps to `filter_state::ROW_FILTERED` and C's post-decode filter is skipped outright.
+
+  The three layers compose as skip → narrow → filter-in-decode, but the interesting part is that
+  **they compete on the same column and complement on different ones.** A group survives if ANY of
+  its rows could match, so after pruning on a clustered column the surviving groups are nearly all
+  matches: selectivity approaches 1.0 and `decompression_pushdown_max_selectivity` (0.35) makes the
+  decode abandon compaction. Pruning has already taken pushdown's win on that column. What is left
+  for pushdown is the OTHER predicates — q6 prunes on `l_shipdate` and cannot prune `l_quantity` or
+  `l_discount` at all, which is exactly where decode-time filtering pays — plus dictionary-answered
+  equality/IN, which zone maps cannot do in principle. So expect the gains to be additive because
+  they act on different columns, not because they stack on one.
 - **D. Remote** — `payload_fetch_fn` over the io_context for `s3://`. The trailer makes one tail
   read locate everything; §6.1's group→byte table becomes worth adding here.
 - **E. Writer** — `COPY ... TO 'x.hpln' (FORMAT simpatico)`, so files exist without C++.
