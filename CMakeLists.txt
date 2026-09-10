@@ -347,6 +347,7 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/simpatico_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
@@ -679,6 +680,7 @@ endif()
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/compression/test_hpln_ingest.cpp
+    test/cpp/compression/test_simpatico_ingestible.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp

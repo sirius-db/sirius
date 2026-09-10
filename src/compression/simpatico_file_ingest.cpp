@@ -435,9 +435,11 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
   out.num_rows = header_schema.columns.empty() ? 0 : header_schema.columns.front().num_rows;
   out.names.reserve(header_schema.columns.size());
   out.types.reserve(header_schema.columns.size());
+  out.physical_types.reserve(header_schema.columns.size());
   for (std::size_t i = 0; i < header_schema.columns.size(); ++i) {
     auto const& c = header_schema.columns[i];
     out.names.push_back(c.name.empty() ? "column" + std::to_string(i) : c.name);
+    out.physical_types.push_back(simpatico::tag_to_dtype(c.dtype_tag));
     if (i < declared.size() && declared[i].id() != duckdb::LogicalTypeId::SQLNULL) {
       out.types.push_back(declared[i]);
     } else {

@@ -65,6 +65,10 @@ struct ingested_hpln {
 struct hpln_bind_schema {
   std::vector<std::string> names;
   duckdb::vector<duckdb::LogicalType> types;
+  /// The cuDF type each column DECODES to, which is not always the physical layout of @ref types:
+  /// a DECIMAL(12,2) is INT64 to the engine but may be DECIMAL32 in the file. A reader sizing the
+  /// decoded table has to size it by these.
+  std::vector<cudf::data_type> physical_types;
   std::int64_t num_rows = 0;
 };
 
