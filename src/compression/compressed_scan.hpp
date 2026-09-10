@@ -283,4 +283,18 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    rmm::cuda_stream_view stream,
                                    rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Re-point every buffer of @p table (recursively) onto @p stream.
+ *
+ * @ref decompress_chunk decodes on a long-lived thread-local stream pool, so the
+ * columns it hands back carry pool streams. The caller's pipeline stream is what
+ * orders the work that follows, and a free issued on a pool stream would not be
+ * ordered against it — re-pointing here makes teardown follow the batch.
+ *
+ * A null @p table passes through, since a caller that has nothing decoded has
+ * nothing to re-point.
+ */
+std::unique_ptr<cudf::table> rebind_table_stream(std::unique_ptr<cudf::table> table,
+                                                 rmm::cuda_stream_view stream);
+
 }  // namespace sirius

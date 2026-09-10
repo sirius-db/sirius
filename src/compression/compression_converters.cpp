@@ -54,32 +54,6 @@ namespace sirius {
 
 namespace {
 
-// Rebind a column's buffers (recursively) to `s` for ordered teardown.
-// The decode's stream pool is long-lived (thread-local), but the caller's
-// pipeline stream `s` is what orders the rest of the work downstream —
-// re-pointing frees here ensures deallocation is not racing concurrent pipeline
-// operations on `s`.
-std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
-                                                   rmm::cuda_stream_view s)
-{
-  if (!col) { return col; }
-  const auto type = col->type();
-  const auto size = col->size();
-  const auto nc   = col->null_count();
-  auto contents   = col->release();
-  if (contents.data) { contents.data->set_stream(s); }
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
-  null_mask.set_stream(s);
-  std::vector<std::unique_ptr<cudf::column>> children;
-  children.reserve(contents.children.size());
-  for (auto& ch : contents.children) {
-    children.push_back(rebind_column_stream(std::move(ch), s));
-  }
-  return std::make_unique<cudf::column>(
-    type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
-}
-
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
 // the byte transport (how `fetch` pulls the payload) differs between them.
@@ -126,10 +100,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
-  auto cols = decompressed->release();
-  for (auto& c : cols)
-    c = rebind_column_stream(std::move(c), stream);
-  decompressed = std::make_unique<cudf::table>(std::move(cols));
+  decompressed = rebind_table_stream(std::move(decompressed), stream);
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
@@ -288,10 +259,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
   auto decoded      = decompress_chunk(ct, selected, rep.pushdown_scan().get(), stream, mr);
   auto decompressed = std::move(decoded.table);
 
-  auto cols = decompressed->release();
-  for (auto& c : cols)
-    c = rebind_column_stream(std::move(c), stream);
-  decompressed = std::make_unique<cudf::table>(std::move(cols));
+  decompressed = rebind_table_stream(std::move(decompressed), stream);
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();

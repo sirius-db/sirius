@@ -926,6 +926,13 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/integration/test_s3_tpch.cpp)
 endif()
 
+# Appended after every other test source on purpose: these cases turn
+# SIRIUS_EXP_FUSED_SCAN_FILTER on, the knob is read once per process and cached,
+# and Catch2 runs cases in declaration order -- which is link order, which is
+# this list's order. Declared anywhere earlier, they would leave the
+# experimental decode-time filtering enabled for every case after them.
+list(APPEND TEST_SOURCES test/cpp/compression/test_simpatico_decode_filter.cpp)
+
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
 # caught by the check-orphan-tests pre-commit hook
 # (scripts/check_orphan_tests.py) rather than a configure-time glob — see

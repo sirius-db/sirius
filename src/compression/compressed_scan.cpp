@@ -21,6 +21,8 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/selection.hpp>
 #include <codegen/util/stream_pool.hpp>
@@ -59,6 +61,28 @@ constexpr std::size_t kDecodeStreams = 4;
 simpatico::stream_pool& decode_pool()
 {
   return simpatico::thread_device_stream_pool(kDecodeStreams);
+}
+
+/// Rebind a column's buffers (recursively) to `s` for ordered teardown.
+std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
+                                                   rmm::cuda_stream_view s)
+{
+  if (!col) { return col; }
+  const auto type = col->type();
+  const auto size = col->size();
+  const auto nc   = col->null_count();
+  auto contents   = col->release();
+  if (contents.data) { contents.data->set_stream(s); }
+  rmm::device_buffer null_mask =
+    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
+  null_mask.set_stream(s);
+  std::vector<std::unique_ptr<cudf::column>> children;
+  children.reserve(contents.children.size());
+  for (auto& ch : contents.children) {
+    children.push_back(rebind_column_stream(std::move(ch), s));
+  }
+  return std::make_unique<cudf::column>(
+    type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
 }
 
 //===----------------------------------------------------------------------===//
@@ -614,6 +638,17 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     if (predicates[i].active()) { out.outcome.predicate_columns.push_back(i); }
   }
   return out;
+}
+
+std::unique_ptr<cudf::table> rebind_table_stream(std::unique_ptr<cudf::table> table,
+                                                 rmm::cuda_stream_view stream)
+{
+  if (!table) { return table; }
+  auto columns = table->release();
+  for (auto& column : columns) {
+    column = rebind_column_stream(std::move(column), stream);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 }  // namespace sirius

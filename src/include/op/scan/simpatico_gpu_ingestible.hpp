@@ -31,6 +31,7 @@
 // drives.
 
 // sirius
+#include <compression/compressed_scan.hpp>
 #include <helper/logical_type.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
@@ -191,8 +192,11 @@ class simpatico_scan_info : public scan_info {
  * Every split decodes @c simpatico_ingestible_table_info::column_ids and nothing else.
  *
  * Which chunks survive, and which of a survivor's 1024-row decode chunks do, is decided once at
- * construction from the file's zone maps and this scan's filter. The filter is then applied
- * exactly in @ref post_filter_and_project -- bounds narrow what is read, they do not test rows.
+ * construction from the file's zone maps and this scan's filter. Bounds narrow what is READ; they
+ * do not test rows. Testing them is the decode's job where it can -- @c decompress_chunk evaluates
+ * the filter's bounds while a column decompresses and hands back only the surviving rows -- and
+ * @ref post_filter_and_project's otherwise, which covers every chunk whose decode did not carry
+ * the WHOLE filter. That fallback is not optional: DuckDB deleted the predicate from the plan.
  */
 class simpatico_gpu_ingestible : public gpu_ingestible {
  public:
@@ -248,6 +252,28 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
     return _subset_refusals.load(std::memory_order_relaxed);
   }
 
+  /// What the decode-time filtering did, counted over the chunks this scan decoded.
+  ///
+  /// Like @ref prune_stats, this exists because the layer is invisible in the answer: a decode
+  /// that filtered nothing returns the same rows as one that filtered everything, so counting is
+  /// the only way to tell that it ran at all.
+  struct pushdown_stats {
+    /// Chunks a decode-time request was attached to.
+    std::size_t chunks_offered{0};
+    /// ... of those, the ones whose decode carried the WHOLE filter and handed back compacted
+    /// columns, so the post-decode filter was skipped for them.
+    std::size_t chunks_row_filtered{0};
+    /// ... and the ones where too many rows survived for compaction to pay for itself. The decode
+    /// then returns ordinary full-width columns and the post-decode filter still applies.
+    std::size_t chunks_unprofitable{0};
+  };
+  [[nodiscard]] pushdown_stats decode_filtering() const noexcept
+  {
+    return {_pushdown_offered.load(std::memory_order_relaxed),
+            _pushdown_row_filtered.load(std::memory_order_relaxed),
+            _pushdown_unprofitable.load(std::memory_order_relaxed)};
+  }
+
  private:
   /// One chunk that survived the zone-map pass, with what of it is worth reading.
   struct live_chunk {
@@ -268,6 +294,19 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// The pushed-down filter as one conjunction over batch positions, or null when there is none.
   /// Applied in @ref post_filter_and_project: zone maps bound rows, they do not test them.
   duckdb::unique_ptr<duckdb::Expression> _filter_expression;
+  /// The same filter as the DECODE can use it -- bounds a column evaluates while it decompresses,
+  /// so a rejected row is never fully reconstructed. Null when nothing of the filter survived the
+  /// analysis, or when the experimental gate is off. Shared by every chunk and narrowed per chunk
+  /// by @c decompression_pushdown_scan::for_chunk, which is where a compression plan is consulted.
+  std::shared_ptr<const sirius::decompression_pushdown_scan> _pushdown_scan;
+  /// Set once a decode reports that too many rows survived for compaction to pay for itself.
+  /// Selectivity barely varies across one file's chunks, so one such chunk predicts the rest and
+  /// the remaining ones stop paying for the attempt -- the same conclusion the pinned path draws
+  /// from @c pushdown_outcome::selection_unprofitable.
+  std::atomic<bool> _row_selection_dropped{false};
+  std::atomic<std::size_t> _pushdown_offered{0};
+  std::atomic<std::size_t> _pushdown_row_filtered{0};
+  std::atomic<std::size_t> _pushdown_unprofitable{0};
   /// The chunks a split may be emitted for, ascending. Not simply 0..N: a pruned chunk is absent.
   std::vector<live_chunk> _live_chunks;
   prune_stats _prune_stats;
