@@ -60,6 +60,25 @@ struct ingested_hpln {
   duckdb::vector<duckdb::LogicalType> column_types;
 };
 
+/// The schema a reader binds against: column names and the engine's logical types, obtained
+/// without touching the payload and without a GPU.
+struct hpln_bind_schema {
+  std::vector<std::string> names;
+  duckdb::vector<duckdb::LogicalType> types;
+  std::int64_t num_rows = 0;
+};
+
+/// Open @p path far enough to answer "what columns does this file have".
+///
+/// This is what a `read_simpatico()` bind needs, and what an ingestible's table_info reports. The
+/// logical types come from the file's `logical_types` segment when it has one; otherwise they are
+/// derived from the cuDF physical types in the header, which is lossy in exactly the ways
+/// CHUNK_SKIPPING_PLAN.md 7.9 lists (DECIMAL precision, nullability, time zone) — so a file
+/// written without that segment binds to approximate types rather than failing.
+///
+/// Throws std::runtime_error if the file cannot be read or parsed.
+[[nodiscard]] hpln_bind_schema read_hpln_schema(std::string const& path);
+
 /// Pack @p types into the bytes a `logical_types` segment carries, and back.
 ///
 /// Positional with the header's columns. Only the types Sirius can pin are representable; an
