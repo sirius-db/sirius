@@ -39,6 +39,9 @@ struct PinTableArgs {
   std::string tier;
   std::string name;
   std::optional<std::vector<std::string>> cols;
+  /// Optional per-call request for Simpatico pin compression. When omitted,
+  /// the legacy session/config setting remains the default.
+  std::optional<bool> compression;
   /// Resolved at bind time: "parquet" or "duckdb". Chosen from an explicit
   /// `format` named parameter, else inferred from the path extension
   /// (.parquet -> parquet, .db/.duckdb -> duckdb).
