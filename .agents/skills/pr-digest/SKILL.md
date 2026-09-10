@@ -6,7 +6,7 @@ description: Explain a GitHub pull request in straightforward language as a navi
 # PR Digest
 
 Turns a GitHub PR link into two companion files a reviewer can learn from: editable Markdown and
-an HTML preview that renders reliably in a browser. A before/after example and flowchart explain the
+an HTML preview that renders reliably in Codex. A before/after example and flowchart explain the
 behavior first. Detailed sections then show what changed, why it matters, where it happens, and
 the relevant code.
 
@@ -51,8 +51,8 @@ the same prose.
 One required argument: a GitHub PR URL, e.g. `https://github.com/sirius-db/sirius/pull/1277`.
 Parse `owner`, `repo`, and PR number out of it.
 
-One optional flag: `--sandbox-bypass`. If the user passes it, disable the sandbox for every `gh`
-call from the start rather than probing inside the sandbox first.
+One optional flag: `--sandbox-bypass`. If the user passes it, request elevated execution for
+every `gh` call from the start rather than probing inside the sandbox first.
 
 ## Step 1 — Confirm `gh` access before doing anything else
 
@@ -63,20 +63,22 @@ Run `gh pr view <number> --repo <owner>/<repo> --json state`.
 
 - **Works** → continue to Step 2.
 - **Fails because network, sandbox, or OS-keyring access appears restricted** → rerun the exact
-  command with Claude Code's Bash sandbox disabled (`dangerouslyDisableSandbox: true`).
-  - Disabling the sandbox fixes it → tell the user plainly that this environment needs the
-    sandbox disabled for `gh`, and use the same mode for every `gh` call for the rest of this run.
+  command using Codex's elevated execution mode (`sandbox_permissions: "require_escalated"`) and
+  include a concise approval question in `justification`. Do not send a separate permission
+  message before the tool's approval request.
+  - Elevated execution fixes it → tell the user plainly that this environment needs elevated
+    execution for `gh`, and use the same mode for every `gh` call for the rest of this run.
     They can pass `--sandbox-bypass` next time to skip the failed probe.
   - It still fails with an authentication error (for example, `HTTP 401`) → stop here. Tell the
     user to run `gh auth login` or `gh auth status` to diagnose it. This skill cannot proceed
     without read access to the PR's description, linked issues/PRs, commits, and file list.
   - It still fails for a different reason → stop and report the exact failure without calling it
     an authentication problem.
-- **User passed `--sandbox-bypass`** → start with the Bash sandbox disabled and use that mode for
-  every `gh` call.
+- **User passed `--sandbox-bypass`** → start with elevated execution and use it for every `gh`
+  call.
 
-Do not disable the sandbox by default. Different environments authenticate and route network
-access differently, and probing first keeps the skill portable.
+Do not default to elevated execution for everyone. Different environments authenticate and route
+network access differently, and probing first keeps the skill portable.
 
 ## Step 2 — Resolve the PR
 
@@ -360,7 +362,7 @@ what keeps it honest instead of silently confident.
 After the Markdown is complete, render its companion preview with the repository-local script:
 
 ```sh
-pixi run python .claude/skills/pr-digest/scripts/render_digest_html.py \
+pixi run python .agents/skills/pr-digest/scripts/render_digest_html.py \
   PR_digests/PR_digest_<PR_NUMBER>.md \
   PR_digests/PR_digest_<PR_NUMBER>.html
 ```
@@ -368,7 +370,7 @@ pixi run python .claude/skills/pr-digest/scripts/render_digest_html.py \
 If `pixi` is unavailable, run the same script with `python3`; it uses only the Python standard
 library. Treat a renderer failure as an incomplete digest, not an optional preview. Check the
 reported counts against the Markdown's `diff` and Mermaid fences, confirm the HTML contains no
-remote assets, and open the HTML in a browser or HTML preview when one is available.
+remote assets, and open the HTML in Codex when a preview facility is available.
 
 In the final response, link both files and identify Markdown as the editable source and HTML as
 the rendered preview. Also mention the branch/commit that was checked out to generate the links.
