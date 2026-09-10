@@ -681,6 +681,7 @@ endif()
 set(TEST_SOURCES
     test/cpp/compression/test_hpln_ingest.cpp
     test/cpp/compression/test_simpatico_ingestible.cpp
+    test/cpp/compression/test_simpatico_pruning.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp

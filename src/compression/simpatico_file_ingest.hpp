@@ -80,6 +80,12 @@ struct hpln_bind_schema {
   /// Rows in each chunk, in file order. One entry per chunk, so its size is the file's chunk
   /// count -- which is how many splits a scan over the file emits.
   std::vector<std::int64_t> chunk_rows;
+  /// Per-(column, chunk, group) min/max, straight out of the file's `zone_maps` segment. This is
+  /// what makes a scan able to drop a chunk without reading it: the bounds travel with the data,
+  /// so deciding costs one small out-of-band read rather than a decode. Empty when the file
+  /// carries none or the segment did not decode -- both mean "serve unpruned", never "prune
+  /// wrongly". Positional with the FILE's columns, not with any projection.
+  scan_manager::group_bounds_arena group_bounds;
 };
 
 /// Open @p path far enough to answer "what columns does this file have".

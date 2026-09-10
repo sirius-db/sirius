@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <api/compressed_table_io.hpp>
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -100,6 +101,37 @@ void copy_pinned_blocks_to_host(
   std::uint64_t src_offset,
   void* dst_host,
   std::size_t size);
+
+/// Serve a COMPACTED payload out of the original pinned one.
+///
+/// The reader asks for byte ranges of the payload a synthesized subset header describes; @p gather
+/// says where each of those bytes lives in the ORIGINAL payload. Ranges are ascending and
+/// non-overlapping in destination order, so answering a request is a walk from the first range
+/// that reaches into it.
+///
+/// Destination bytes no gather range covers are real and deliberate: a bitpack `packed` buffer
+/// declares decode guard words past its last live word (simpatico::kBitpackDecodeGuardWords), and
+/// the decode loads them unconditionally without their values reaching an output row. They are
+/// zeroed rather than left undefined so a decode never reads uninitialized device memory.
+///
+/// Shared by every path that serves a chunk subset -- a pinned entry's converter and the .hpln
+/// scan source -- because the zero-fill rule above is not obvious and a second copy of it would
+/// diverge silently: a missing memset is uninitialized device memory, not a fault.
+class gathered_payload_fetch {
+ public:
+  gathered_payload_fetch(
+    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation const& payload,
+    std::vector<simpatico::gather_range> gather)
+    : _payload(payload), _gather(std::move(gather))
+  {
+  }
+
+  void operator()(std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) const;
+
+ private:
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation const& _payload;
+  std::vector<simpatico::gather_range> _gather;
+};
 
 /**
  * @brief HOST-tier idata_representation backed by a pinned Simpatico-compressed chunk.

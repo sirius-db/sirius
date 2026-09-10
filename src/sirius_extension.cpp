@@ -2550,13 +2550,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
   // A .hpln file as a query source. Unlike sirius_read_parquet this IS a user-facing surface:
-  // there is no DuckDB function that reads the format, so nothing else can bind it. No pushdown
-  // flags are set: the plan generator narrows the decode to the scan's column_ids itself, and the
-  // single-chunk ingestible applies no predicate, so accepting a filter pushdown would be a
-  // promise it does not keep.
+  // there is no DuckDB function that reads the format, so nothing else can bind it.
+  //
+  // filter_pushdown is on because the format's own zone maps are the point of the source: they
+  // let a chunk that cannot match be skipped before it is read at all. DuckDB DELETES a
+  // pushed-down predicate from the plan, so this is also a promise to apply it exactly --
+  // simpatico_gpu_ingestible::post_filter_and_project does, after the bounds have narrowed what
+  // was decoded. projection_pushdown stays off: the plan generator narrows the decode to the
+  // scan's column_ids itself, so the scan stays full width with a projection above it, which is
+  // what makes the filter's batch positions the file's own column order.
   TableFunction read_simpatico(
     "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
-  read_simpatico.cardinality = SiriusReadSimpaticoCardinality;
+  read_simpatico.cardinality     = SiriusReadSimpaticoCardinality;
+  read_simpatico.filter_pushdown = true;
   CreateTableFunctionInfo read_simpatico_info(read_simpatico);
   catalog.CreateTableFunction(transaction, read_simpatico_info);
 

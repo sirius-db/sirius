@@ -262,6 +262,75 @@ TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
   REQUIRE(filtered->GetValue(0, 0).GetValue<std::int64_t>() == 2 * kMultiRowsPerChunk);
 }
 
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a pruning predicate returns exactly the matching rows",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // The zone maps drop chunks 0-2 outright here, so this is the end-to-end check that pruning
+  // narrows what is READ without changing what is RETURNED. The GROUP BY names the surviving
+  // chunks, which a total row count cannot: dropping chunk 3 and emitting chunk 4 twice looks
+  // identical to a count.
+  auto result = query_on_gpu("SELECT k // 1000000 AS chunk, count(*), min(k), max(k)" + from() +
+                             " WHERE k >= 3000000 GROUP BY 1 ORDER BY 1;");
+  REQUIRE(result->RowCount() == 2);
+  for (int c = 3; c < kMultiChunks; ++c) {
+    auto const row = static_cast<duckdb::idx_t>(c - 3);
+    REQUIRE(result->GetValue(0, row).GetValue<std::int32_t>() == c);
+    REQUIRE(result->GetValue(1, row).GetValue<std::int64_t>() == kMultiRowsPerChunk);
+    REQUIRE(result->GetValue(2, row).GetValue<std::int32_t>() == c * 1000000);
+    REQUIRE(result->GetValue(3, row).GetValue<std::int32_t>() ==
+            c * 1000000 + kMultiRowsPerChunk - 1);
+  }
+}
+
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a predicate inside one chunk keeps only its rows",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // Narrower than a chunk and narrower than a 1024-row group, so it exercises the whole ladder:
+  // three chunks pruned, the survivor narrowed to one decode chunk, and the remainder removed
+  // after the decode. DuckDB deleted this predicate from the plan, so a scan that only pruned
+  // would return the whole surviving group.
+  auto result = query_on_gpu("SELECT count(*), min(k), max(k), sum(v)" + from() +
+                             " WHERE k >= 2001100 AND k < 2001150;");
+  REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() == 50);
+  REQUIRE(result->GetValue(1, 0).GetValue<std::int32_t>() == 2001100);
+  REQUIRE(result->GetValue(2, 0).GetValue<std::int32_t>() == 2001149);
+  std::int64_t expected_v = 0;
+  for (int i = 1100; i < 1150; ++i) {
+    expected_v += i * 3 + 2;
+  }
+  REQUIRE(result->GetValue(3, 0).GetValue<std::int64_t>() == expected_v);
+}
+
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a predicate no chunk can match returns no rows",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // Every chunk prunes. The scan must still run to completion -- a zero-split scan never fires
+  // the pipeline's completion and the query hangs -- and must not leak the sentinel chunk's rows.
+  auto result = query_on_gpu("SELECT count(*), sum(v)" + from() + " WHERE k > 9000000;");
+  REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() == 0);
+  REQUIRE(result->GetValue(1, 0).IsNull());
+}
+
+TEST_CASE_METHOD(ReadSimpaticoMultiChunkFixture,
+                 "read_simpatico - a predicate the zone maps cannot narrow is still exact",
+                 "[integration][read_simpatico][simpatico_multichunk]")
+{
+  // `v` is i*3 + c, so every chunk and every group spans the same range and nothing prunes. What
+  // remains is the promise the pushdown made: the scan applies the predicate itself.
+  std::int64_t expected_rows = 0;
+  for (int c = 0; c < kMultiChunks; ++c) {
+    for (int i = 0; i < kMultiRowsPerChunk; ++i) {
+      if (i * 3 + c < 100) { ++expected_rows; }
+    }
+  }
+  REQUIRE(expected_rows > 0);
+  auto result = query_on_gpu("SELECT count(*)" + from() + " WHERE v < 100;");
+  REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() == expected_rows);
+}
+
 TEST_CASE_METHOD(ReadSimpaticoFixture,
                  "read_simpatico - binds the file's names and declared types",
                  "[integration][read_simpatico]")
@@ -307,8 +376,8 @@ TEST_CASE_METHOD(ReadSimpaticoFixture,
 {
   // The scan emits only the columns the query touches, so this is where a projection that
   // confused file order with emission order shows up: it would filter on `a` and sum `a` too.
-  // Both the filter and the aggregate run above the scan -- the single-chunk ingestible declares
-  // no pushdown.
+  // The predicate is pushed INTO the scan (read_simpatico declares filter_pushdown), so nothing
+  // above it re-checks the rows it returns.
   std::int64_t expected_rows = 0;
   std::int64_t expected_sum  = 0;
   for (int i = 0; i < kRows; ++i) {

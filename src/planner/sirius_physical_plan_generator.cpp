@@ -318,6 +318,18 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
     }
     info->column_ids.push_back(file_column);
   }
+
+  // The filter is what makes the file's zone maps usable: it drives whole-chunk and sub-chunk
+  // pruning in the metadata walk, and is then applied exactly after the decode. Deep-copied
+  // because this scan operator is destroyed as the leaf replaces it in the plan.
+  if (scan_op.table_filters) {
+    info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    for (auto const& [col_idx, filt] : scan_op.table_filters->filters) {
+      info->table_filters->filters[col_idx] = filt->Copy();
+    }
+  }
+  info->duckdb_column_ids = scan_op.column_ids;
+  info->returned_types    = scan_op.returned_types;
   return info;
 }
 

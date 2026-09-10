@@ -21,12 +21,14 @@
 
 #include <cuda_runtime.h>
 
+#include <api/compressed_table_io.hpp>
 #include <cucascade/error.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <ranges>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -108,6 +110,38 @@ void copy_pinned_blocks_to_host(
       ++s_idx;
       s_off = 0;
     }
+  }
+}
+
+void gathered_payload_fetch::operator()(std::uint64_t off,
+                                        std::size_t sz,
+                                        void* dst,
+                                        rmm::cuda_stream_view s) const
+{
+  if (sz == 0) { return; }
+  auto* out                 = static_cast<std::byte*>(dst);
+  std::uint64_t const end   = off + sz;
+  std::uint64_t filled_upto = off;
+  // First range whose destination end is past `off`; the rest follow in order.
+  auto it = std::ranges::lower_bound(
+    _gather, off, {}, [](simpatico::gather_range const& g) { return g.dst_offset + g.size; });
+  for (; it != _gather.end() && it->dst_offset < end; ++it) {
+    std::uint64_t const seg_begin = std::max(it->dst_offset, off);
+    std::uint64_t const seg_end   = std::min(it->dst_offset + it->size, end);
+    if (seg_begin >= seg_end) { continue; }
+    if (seg_begin > filled_upto) {
+      CUCASCADE_CUDA_TRY(
+        cudaMemsetAsync(out + (filled_upto - off), 0, seg_begin - filled_upto, s.value()));
+    }
+    copy_pinned_blocks_to_device(_payload,
+                                 it->src_offset + (seg_begin - it->dst_offset),
+                                 out + (seg_begin - off),
+                                 seg_end - seg_begin,
+                                 s);
+    filled_upto = seg_end;
+  }
+  if (filled_upto < end) {
+    CUCASCADE_CUDA_TRY(cudaMemsetAsync(out + (filled_upto - off), 0, end - filled_upto, s.value()));
   }
 }
 

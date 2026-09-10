@@ -1745,7 +1745,22 @@ over S3 (§7.6).
   chunk's bounds in chunk order, so C is a wiring job. Not done here: nothing prunes yet, and the
   per-chunk decode is serial on the caller's stream.
 - **C. Pruning** — zone maps → surviving chunks → `build_chunk_subset_header` → ranged fetch.
-  Largely re-pointing the pin path at a file transport, and where §7.6's S3 result cashes in.
+  **Done.** Both levels landed: a chunk whose bounds cannot match never becomes a split, and a
+  surviving chunk is narrowed to the 1024-row decode chunks whose group bounds could match, served
+  through a synthesized subset header and a gathered fetch — the same mechanism
+  `decompress_host_to_gpu` uses for a pin, with `gathered_payload_fetch` now shared between them
+  rather than duplicated.
+
+  The wiring answer that was not obvious: **filters did not reach a `read_simpatico` scan at all.**
+  `TableFunction::filter_pushdown` was off, so DuckDB left the predicate as a `LogicalFilter` above
+  the get and `LogicalGet::table_filters` stayed empty. Turning it on is one line, but it is not
+  free: `FilterCombiner::TryPushdownConstantFilter` **erases** a pushed-down conjunct from the plan
+  (`filter_combiner.cpp:367`), so the source becomes responsible for applying it exactly. So the
+  ingestible now evaluates the filter after the decode, the way the duckdb-native source does.
+  Bounds narrow what is READ; they do not test rows, and nothing above the scan re-checks them.
+
+  `projection_pushdown` deliberately stays off: the scan then remains full width with a projection
+  above it, which is what makes a filter key's batch position its own column index.
 - **D. Remote** — `payload_fetch_fn` over the io_context for `s3://`. The trailer makes one tail
   read locate everything; §6.1's group→byte table becomes worth adding here.
 - **E. Writer** — `COPY ... TO 'x.hpln' (FORMAT simpatico)`, so files exist without C++.
