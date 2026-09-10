@@ -24,12 +24,10 @@
 
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
-#include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
-#include <cuda/std/bit>
 #include <cuda/std/cstddef>
-#include <cuda/std/limits>
 #include <cuda/stream>
+#include <cuda/utility>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
@@ -63,61 +61,11 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
-/**
- * @brief cuco-compatible Bloom policy using Lemire fast-range
- *
- * Arrow's policy caps filter size, while cuco's default uses costly 64-bit modulo. Construction
- * and lookup share this mapping, preserving the no-false-negative contract.
- */
-template <class KeyT>
-class sirius_bloom_policy {
- public:
-  using hasher             = cuco::xxhash_64<KeyT>;
-  using word_type          = std::uint32_t;
-  using hash_argument_type = typename hasher::argument_type;
-  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
-
-  static constexpr std::uint32_t words_per_block = 8;
-
- private:
-  static constexpr std::uint32_t word_bits       = cuda::std::numeric_limits<word_type>::digits;
-  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
-  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
-
-  static_assert(words_per_block * bit_index_width <=
-                  cuda::std::numeric_limits<hash_result_type>::digits,
-                "hash is too narrow to supply one fingerprint bit per word");
-
- public:
-  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
-  {
-    return hash_(key);
-  }
-
-  template <class Extent>
-  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
-                                                        Extent num_blocks) const
-  {
-    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
-                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
-    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
-  }
-
-  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
-                                                            std::uint32_t word_index) const
-  {
-    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
-  }
-
- private:
-  hasher hash_{};
-};
-
 template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
                                         cuda::thread_scope_device,
-                                        sirius_bloom_policy<KeyT>,
+                                        cuco::default_filter_policy<KeyT>,
                                         bloom_alloc>;
 
 template <class Filter>

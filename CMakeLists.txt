@@ -114,6 +114,15 @@ endif()
 # The pixi build has no such target and links the conda shared libnvrtc.so.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
+  find_package(nvjitlink CONFIG REQUIRED)
+  # FindCUDAToolkit also adds nvJitLink through cuSPARSE's link interface.
+  get_target_property(_cusparse_links CUDA::cusparse INTERFACE_LINK_LIBRARIES)
+  if(_cusparse_links)
+    list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink$"
+                                           "nvjitlink::nvjitlink_static")
+    set_target_properties(CUDA::cusparse PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                    "${_cusparse_links}")
+  endif()
 endif()
 
 # --- cuCollections (cuco) --- #
@@ -130,9 +139,9 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     cuco
-    URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+    URL https://github.com/NVIDIA/cuCollections/archive/0883368d39296f3bef3a058033141bcc642c5c54.tar.gz
     URL_HASH
-      SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+      SHA256=4ec8320a0372839b991f0b431c7f8bf0e770006cb3c8631c6e373c434471fd45
     SOURCE_SUBDIR do-not-build)
   FetchContent_MakeAvailable(cuco)
   # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
@@ -148,7 +157,14 @@ endif()
 
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+if(VCPKG_BUILD)
+  # The CMake target includes curl's private static dependencies.
+  find_package(CURL CONFIG REQUIRED)
+  set(SIRIUS_CURL_TARGET CURL::libcurl)
+else()
+  pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+  set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+endif()
 
 # cuCascade - GPU Memory Reservation Library (submodule)
 set(BUILD_TESTS
@@ -607,10 +623,10 @@ endforeach()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable)
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto)
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
@@ -956,7 +972,8 @@ link_extension_libraries(sirius_unittest "")
 # offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded
 # by SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
-  target_link_libraries(sirius_unittest testcontainers_native PkgConfig::CURL)
+  target_link_libraries(sirius_unittest testcontainers_native
+                        ${SIRIUS_CURL_TARGET})
   target_compile_definitions(sirius_unittest
                              PRIVATE SIRIUS_HAVE_TESTCONTAINERS=1)
 endif()

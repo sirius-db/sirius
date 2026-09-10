@@ -20,7 +20,12 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    {
+      "features": [
+        "http2"
+      ],
+      "name": "curl"
+    }
   ],
   "overrides": [
     {

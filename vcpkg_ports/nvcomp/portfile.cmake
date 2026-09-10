@@ -15,11 +15,11 @@ if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
   set(NVCOMP_PLATFORM "linux-x86_64")
   if(CUDA_VERSION STREQUAL "12")
     set(NVCOMP_SHA512
-        "376ecb4e17ab1e345f1f42168691f5471bab9bca95bebd35f0c6fb91e10172d42317f073e9f6a914ed3a9d01c0318755e3c1e36c920802f8047dad9c72ea3092"
+        "fcfc3702723255a541c9e253df0f4321ed6c82a7455d6df278abba3275f19c05226b779556c9021e6f873c40fb6a869a23fd2d5465eb572772490e745640e059"
     )
   elseif(CUDA_VERSION STREQUAL "13")
     set(NVCOMP_SHA512
-        "329f773003e2413b21bce65236bed8fbbeb62db3da4480c732af6769ea8a1901c893e150f7fc03dbce3a502ec290ccb8073cb379d50dabffd1caa0863ed21a8f"
+        "2f15a892bdc75b2fe7a9fe7b2b739b2968fb769928837d5bce879d2c8bef65c58895e5c4219777d78f08083f15b7d743c06b68fc33cf2d059fd0d773fba32614"
     )
   else()
     message(
@@ -30,11 +30,11 @@ elseif(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
   set(NVCOMP_PLATFORM "linux-sbsa")
   if(CUDA_VERSION STREQUAL "12")
     set(NVCOMP_SHA512
-        "8512fa10efb3eedf614ab68f176d08ff6cd167b2769812c042246c7e4b7699bdf82d4f4d701c983e326635aed4bc6e93f0202b5c4a215d1207656b30cc801f31"
+        "1373059689917b44146811c76b66941e9057d19affa80d81f9488eccb526da8e1712cd3a1874215c66817b2125e51e7f546a5838c9d330ce1d57fa1a9670ec7c"
     )
   elseif(CUDA_VERSION STREQUAL "13")
     set(NVCOMP_SHA512
-        "fbbaacf598a8051cbb9285369fd96056cf7971ebf53698b98e6d3baa8a7d8340ab5c6fe39b02ecd5c941d77dd12dafe889ef28f0ae7198014b282d4f54d5d26b"
+        "02727d9fc502bea346c2e70a98769e92fa70ad9e4dcd685e0bafcea6b1901142a2b08ae4be957f3078df779e4cc1be16450e392873b11baafb2a2818c7eb9c96"
     )
   else()
     message(
@@ -63,6 +63,15 @@ file(INSTALL ${HEADER_FILES} DESTINATION "${CURRENT_PACKAGES_DIR}/include")
 # Install libraries
 file(GLOB LIB_FILES "${SOURCE_PATH}/lib/*.a")
 file(INSTALL ${LIB_FILES} DESTINATION "${CURRENT_PACKAGES_DIR}/lib")
+
+# Keep nvCOMP's bundled logger ABI private to its static archives.
+vcpkg_cmake_get_vars(NVCOMP_CMAKE_VARS)
+include("${NVCOMP_CMAKE_VARS}")
+include("${CMAKE_CURRENT_LIST_DIR}/isolate-logging.cmake")
+file(GLOB NVCOMP_ARCHIVES "${CURRENT_PACKAGES_DIR}/lib/*.a")
+nvcomp_isolate_logging(
+  "${VCPKG_DETECTED_CMAKE_NM}" "${VCPKG_DETECTED_CMAKE_OBJCOPY}"
+  "${CURRENT_BUILDTREES_DIR}/logging-symbols.txt" ${NVCOMP_ARCHIVES})
 
 # Install CMake config files (targets only, we'll write a custom config.cmake)
 file(INSTALL "${SOURCE_PATH}/lib/cmake/nvcomp/nvcomp-config-version.cmake"

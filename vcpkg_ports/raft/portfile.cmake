@@ -11,9 +11,9 @@ vcpkg_from_github(
   REPO
   rapidsai/raft
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  b5c25d369f7e69941118b342ac581d0908a0f0c7763f4e42c6bc7af0afee4ab85306dfed057b28b115096bdf2799d8da5ce7eb3d2eb796468b210ea5f7724d41
+  cbfe6c618bac35b16f5b9313f1f0315c8c9e331dcb1bdc5038be772951e45798d644f4c602a4370552cd22778676f860b54ed489662d8ac2ac775ba5efe52cf5
   HEAD_REF
   main)
 
@@ -23,9 +23,9 @@ vcpkg_from_github(
   REPO
   rapidsai/rapids-cmake
   REF
-  v${VERSION}
+  v26.08.00
   SHA512
-  d3d7a1f807a9b71ed15c972742a4dbee0746cc65b1bfa7eef9a8e036a992a37fcfdfbff79fc27cf053dc5a37978abf86b93b56bc6f605f04244e8f6776595bdd
+  472e3bbc0aeedce6632c339f5a383a25524df8462a58891474523cd558b7d8d8bc09b24e8f75da6f2fbfcb83b302caa911fb5a38bc6c04871a570390e7b4a5b8
   HEAD_REF
   main)
 
