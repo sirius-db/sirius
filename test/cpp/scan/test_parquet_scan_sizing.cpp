@@ -250,17 +250,27 @@ struct carrier_file_fixture {
     return info;
   }
 
-  std::shared_ptr<scan::parquet_gpu_ingestible> partition_reader(
-    std::vector<std::string> const& files) const
+  std::unique_ptr<scan::parquet_ingestible_table_info> make_partition_info(
+    std::vector<std::string> const& files,
+    sirius::type_id partition_type = sirius::type_id::INTEGER,
+    std::size_t cap                = std::numeric_limits<std::size_t>::max()) const
   {
-    auto info                  = make_info(files);
+    auto info                  = make_info(files, cap);
     auto const partition_index = info->names.size();
     info->names.push_back("part");
-    info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+    info->returned_types.push_back(sirius::logical_type::make(partition_type));
     info->column_ids        = {duckdb::ColumnIndex(partition_index)};
     info->partition_indices = {duckdb::HivePartitioningIndex("2024", partition_index)};
     info->scan_output_arity = 1;
-    return scan::make_ingestible(std::move(info));
+    return info;
+  }
+
+  std::shared_ptr<scan::parquet_gpu_ingestible> partition_reader(
+    std::vector<std::string> const& files,
+    sirius::type_id partition_type = sirius::type_id::INTEGER,
+    std::size_t cap                = std::numeric_limits<std::size_t>::max()) const
+  {
+    return scan::make_ingestible(make_partition_info(files, partition_type, cap));
   }
 
   std::unique_ptr<scan::parquet_file_scan_info> read_file(scan::parquet_gpu_ingestible& reader)
@@ -296,6 +306,25 @@ std::vector<std::unique_ptr<scan::scan_info>> coalesce_files(
   }
   append(coalescer->flush());
   return splits;
+}
+
+void check_partition_byte_delta(scan::parquet_file_scan_info const& actual,
+                                scan::parquet_file_scan_info const& baseline,
+                                std::size_t bytes_per_row)
+{
+  REQUIRE(actual.file_path == baseline.file_path);
+  REQUIRE(actual.row_groups.size() == baseline.row_groups.size());
+  for (std::size_t i = 0; i < actual.row_groups.size(); ++i) {
+    auto const& group = actual.row_groups[i];
+    auto const& base  = baseline.row_groups[i];
+    CAPTURE(i, group.num_rows, bytes_per_row);
+    REQUIRE(group.index == base.index);
+    REQUIRE(group.num_rows == base.num_rows);
+    auto const partition_bytes = static_cast<std::size_t>(group.num_rows) * bytes_per_row;
+    CHECK(group.output_bytes == base.output_bytes + partition_bytes);
+    CHECK(group.decode_working_bytes == base.decode_working_bytes + partition_bytes);
+    CHECK(group.compressed_bytes == base.compressed_bytes);
+  }
 }
 
 }  // namespace
@@ -775,6 +804,173 @@ TEST_CASE_METHOD(carrier_file_fixture,
     CHECK(actual.output_bytes >= expected.output_bytes);
     CHECK(actual.compressed_bytes >= expected.compressed_bytes);
   }
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet integer partition output adds four bytes per row to carrier sizing",
+                 "[scan][parquet][sizing][carrier]")
+{
+  auto reader          = partition_reader({"a"});
+  auto baseline_reader = scan::make_ingestible(make_info({"a"}));
+  auto file            = read_file(*reader);
+  auto baseline        = read_file(*baseline_reader);
+  REQUIRE_FALSE(file->carrier_unavailable);
+  REQUIRE(file->reader_options->get_column_names().has_value());
+  CHECK(*file->reader_options->get_column_names() == std::vector<std::string>{"flag"});
+  CHECK(file->partition_values == std::vector<std::string>{"2024"});
+  CHECK(baseline->partition_values.empty());
+  check_partition_byte_delta(*file, *baseline, 4);
+  for (auto const& group : file->row_groups) {
+    CHECK(group.decode_working_bytes == group.output_bytes);
+  }
+}
+
+TEST_CASE_METHOD(
+  carrier_file_fixture,
+  "parquet varchar partition output includes characters and offsets in carrier sizing",
+  "[scan][parquet][sizing][carrier]")
+{
+  auto reader          = partition_reader({"a"}, sirius::type_id::VARCHAR);
+  auto baseline_reader = scan::make_ingestible(make_info({"a"}));
+  auto file            = read_file(*reader);
+  auto baseline        = read_file(*baseline_reader);
+  REQUIRE_FALSE(file->carrier_unavailable);
+  CHECK(file->partition_values == std::vector<std::string>{"2024"});
+  check_partition_byte_delta(*file, *baseline, 8);
+  for (auto const& group : file->row_groups) {
+    CHECK(group.decode_working_bytes == group.output_bytes);
+  }
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet projected data sizing also includes partition output",
+                 "[scan][parquet][sizing][carrier]")
+{
+  auto info                 = make_partition_info({"a"});
+  info->column_ids          = {duckdb::ColumnIndex(0), duckdb::ColumnIndex(info->names.size() - 1)};
+  info->scan_output_arity   = 2;
+  auto baseline_info        = make_info({"a"});
+  baseline_info->column_ids = {duckdb::ColumnIndex(0)};
+  baseline_info->scan_output_arity = 1;
+  auto reader                      = scan::make_ingestible(std::move(info));
+  auto baseline_reader             = scan::make_ingestible(std::move(baseline_info));
+  auto file                        = read_file(*reader);
+  auto baseline                    = read_file(*baseline_reader);
+  REQUIRE_FALSE(file->carrier_unavailable);
+  REQUIRE(file->reader_options->get_column_names().has_value());
+  REQUIRE(baseline->reader_options->get_column_names().has_value());
+  CHECK(*file->reader_options->get_column_names() == std::vector<std::string>{"id"});
+  CHECK(*baseline->reader_options->get_column_names() == std::vector<std::string>{"id"});
+  CHECK(file->partition_values == std::vector<std::string>{"2024"});
+  check_partition_byte_delta(*file, *baseline, 4);
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet partition bytes split carrier batches at the working set cap",
+                 "[scan][parquet][sizing][carrier]")
+{
+  auto probe_reader             = scan::make_ingestible(make_info({"a", "b"}));
+  std::size_t carrier_bytes     = 0;
+  std::size_t partitioned_bytes = 0;
+  std::size_t cap               = 0;
+  for (auto const& name : {"a", "b"}) {
+    auto file = read_file(*probe_reader);
+    REQUIRE(file->file_path == path(name));
+    REQUIRE_FALSE(file->carrier_unavailable);
+    std::size_t file_bytes = 0;
+    for (auto const& group : file->row_groups) {
+      carrier_bytes += group.decode_working_bytes;
+      file_bytes += group.decode_working_bytes + static_cast<std::size_t>(group.num_rows) * 4;
+    }
+    partitioned_bytes += file_bytes;
+    cap = std::max(cap, file_bytes);
+  }
+  // Fit one whole partitioned file, rather than splitting each of its row groups.
+  REQUIRE(carrier_bytes <= cap);
+  REQUIRE(cap < partitioned_bytes);
+  auto reader          = partition_reader({"a", "b"}, sirius::type_id::INTEGER, cap);
+  auto baseline_reader = scan::make_ingestible(make_info({"a", "b"}, cap));
+  std::vector<std::unique_ptr<scan::parquet_file_scan_info>> files;
+  std::vector<std::unique_ptr<scan::parquet_file_scan_info>> baseline_files;
+  std::vector<std::size_t> group_counts;
+  for (auto const& name : {"a", "b"}) {
+    auto file = read_file(*reader);
+    REQUIRE(file->file_path == path(name));
+    group_counts.push_back(file->row_groups.size());
+    files.push_back(std::move(file));
+    baseline_files.push_back(read_file(*baseline_reader));
+  }
+  auto baseline_splits = coalesce_files(*baseline_reader, std::move(baseline_files));
+  REQUIRE(baseline_splits.size() == 1);
+  CHECK(baseline_splits.front()->estimated_working_set_bytes() == carrier_bytes);
+  auto splits = coalesce_files(*reader, std::move(files));
+  REQUIRE(splits.size() == 2);
+  std::vector<std::string> const names{"a", "b"};
+  std::size_t total_working = 0;
+  for (std::size_t i = 0; i < splits.size(); ++i) {
+    auto* split = dynamic_cast<scan::parquet_split_info*>(splits[i].get());
+    REQUIRE(split);
+    REQUIRE(split->rg_slices.size() == 1);
+    CHECK(split->rg_slices.front().file_path == path(names[i]));
+    CHECK(split->rg_slices.front().row_group_indices.size() == group_counts[i]);
+    CHECK(split->estimated_working_set_bytes() <= cap);
+    total_working += split->estimated_working_set_bytes();
+  }
+  CHECK(total_working == partitioned_bytes);
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet carrier fallback sizing includes partition output",
+                 "[scan][parquet][sizing][carrier]")
+{
+  auto reader = partition_reader({"missing"});
+  auto identity_reader =
+    scan::make_ingestible(make_info({"missing"}, std::numeric_limits<std::size_t>::max(), true));
+  auto file     = read_file(*reader);
+  auto identity = read_file(*identity_reader);
+  REQUIRE(file->carrier_unavailable);
+  REQUIRE_FALSE(file->reader_options->get_column_names().has_value());
+  REQUIRE_FALSE(identity->reader_options->get_column_names().has_value());
+  CHECK(file->partition_values == std::vector<std::string>{"2024"});
+  REQUIRE(file->row_groups.size() == identity->row_groups.size());
+  for (std::size_t i = 0; i < file->row_groups.size(); ++i) {
+    auto const& actual   = file->row_groups[i];
+    auto const& expected = identity->row_groups[i];
+    CAPTURE(i, actual.num_rows);
+    REQUIRE(actual.index == expected.index);
+    REQUIRE(actual.num_rows == expected.num_rows);
+    auto const partition_bytes = static_cast<std::size_t>(actual.num_rows) * 4;
+    CHECK(actual.output_bytes >= expected.output_bytes + partition_bytes);
+    CHECK(actual.decode_working_bytes >= expected.decode_working_bytes + partition_bytes);
+    CHECK(actual.compressed_bytes == expected.compressed_bytes);
+  }
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet count star sizing does not charge unprojected hive partitions",
+                 "[scan][parquet][sizing][carrier]")
+{
+  auto info               = make_partition_info({"a"});
+  info->column_ids        = {duckdb::ColumnIndex(duckdb::COLUMN_IDENTIFIER_ROW_ID)};
+  info->scan_output_arity = 0;
+  auto reader             = scan::make_ingestible(std::move(info));
+  auto baseline_reader    = scan::make_ingestible(make_info({"a"}));
+  auto file               = read_file(*reader);
+  auto baseline           = read_file(*baseline_reader);
+  REQUIRE_FALSE(file->carrier_unavailable);
+  CHECK(file->partition_values.empty());
+  check_partition_byte_delta(*file, *baseline, 0);
+  std::vector<std::unique_ptr<scan::parquet_file_scan_info>> files;
+  files.push_back(std::move(file));
+  auto splits = coalesce_files(*reader, std::move(files));
+  REQUIRE(splits.size() == 1);
+  auto* split = dynamic_cast<scan::parquet_split_info*>(splits.front().get());
+  REQUIRE(split);
+  REQUIRE(split->plan);
+  CHECK_FALSE(split->plan->has_partitions());
+  CHECK(split->plan->partition_primary_indices.count(carrier_names().size()) == 1);
+  CHECK(split->plan->output_layout.empty());
+  CHECK(split->plan->carrier_batch_index.has_value());
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,

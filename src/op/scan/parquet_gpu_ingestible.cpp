@@ -921,6 +921,25 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
 
+  // Hive partition values for this file, in scan_plan::partition_columns order.
+  // Each split synthesizes one scalar-backed column per entry, so every row of
+  // the file also pays their width on top of the decoded batch.
+  std::vector<std::string> partition_values;
+  std::size_t partition_row_bytes = 0;
+  if (!_plan->partition_columns.empty()) {
+    partition_values.reserve(_plan->partition_columns.size());
+    auto parsed = duckdb::HivePartitioning::Parse(file_path);
+    for (auto const& pc : _plan->partition_columns) {
+      auto it = parsed.find(pc.name);
+      partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+      partition_row_bytes +=
+        pc.type.is_fixed_width()
+          ? pc.type.fixed_width_byte_size()
+          : duckdb::HivePartitioning::Unescape(partition_values.back()).size() +
+              sizeof(cudf::size_type);
+    }
+  }
+
   struct row_group_size_estimate {
     std::size_t output_bytes         = 0;
     std::size_t decode_working_bytes = 0;
@@ -1006,6 +1025,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
           static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
       }
     }
+    auto const partition_bytes = row_count * partition_row_bytes;
+    estimate.output_bytes += partition_bytes;
+    estimate.decode_working_bytes += partition_bytes;
     return estimate;
   };
 
@@ -1026,15 +1048,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                                metadata.row_groups[rg_idx].num_rows});
   }
 
-  // Hive partition values for this file, in scan_plan::partition_columns order.
-  if (!_plan->partition_columns.empty()) {
-    out->partition_values.reserve(_plan->partition_columns.size());
-    auto parsed = duckdb::HivePartitioning::Parse(file_path);
-    for (auto const& pc : _plan->partition_columns) {
-      auto it = parsed.find(pc.name);
-      out->partition_values.push_back(it != parsed.end() ? it->second : std::string{});
-    }
-  }
+  out->partition_values = std::move(partition_values);
 
   return out;
 }
