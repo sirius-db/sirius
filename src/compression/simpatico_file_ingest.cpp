@@ -16,9 +16,11 @@
 
 #include "simpatico_file_ingest.hpp"
 
+#include <api/simpatico_codegen.hpp>
 #include <log/logging.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -156,13 +158,80 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
     ++idx;
   }
 
-  SIRIUS_LOG_DEBUG("[hpln ingest] '{}': {} columns, {} rows, header {} B, payload {} B",
+  // Zone maps, if the file carries them. A file written before the segment existed, or one whose
+  // segment does not decode, simply serves unpruned -- so this never fails the ingest.
+  if (located) {
+    std::vector<simpatico::hpln_segment_ref> segs;
+    auto tail          = read_tail(f, kTailProbeBytes, file_size);
+    std::uint64_t need = 0;
+    auto err           = simpatico::read_hpln_postscript(tail, file_size, segs, &need);
+    if (!err.empty() && need > tail.size() && need <= file_size) {
+      tail = read_tail(f, need, file_size);
+      err  = simpatico::read_hpln_postscript(tail, file_size, segs, nullptr);
+    }
+    for (auto const& sg : segs) {
+      if (sg.kind != simpatico::hpln_segment::zone_maps || sg.bytes == 0) { continue; }
+      std::vector<std::uint8_t> zm(static_cast<std::size_t>(sg.bytes));
+      f.seekg(static_cast<std::streamoff>(sg.offset));
+      f.read(reinterpret_cast<char*>(zm.data()), static_cast<std::streamsize>(sg.bytes));
+      if (!f) {
+        SIRIUS_LOG_WARN("[hpln ingest] '{}': short read of the zone-map segment; serving unpruned",
+                        path);
+        f.clear();
+        break;
+      }
+      std::string zerr;
+      out.group_bounds = scan_manager::group_bounds_arena::unpack(zm, &zerr);
+      if (!zerr.empty()) {
+        SIRIUS_LOG_WARN(
+          "[hpln ingest] '{}': zone maps unreadable ({}); serving unpruned", path, zerr);
+      }
+      break;
+    }
+  }
+
+  SIRIUS_LOG_DEBUG("[hpln ingest] '{}': {} columns, {} rows, header {} B, payload {} B, {}",
                    path,
                    out.schema.columns.size(),
                    out.schema.columns.empty() ? 0 : out.schema.columns.front().num_rows,
                    header_bytes,
-                   payload_bytes);
+                   payload_bytes,
+                   out.group_bounds.empty() ? "no zone maps" : "zone maps present");
   return out;
+}
+
+std::string write_table_to_hpln(cudf::table_view const& table,
+                                duckdb::vector<duckdb::LogicalType> const& column_types,
+                                std::vector<std::string> const& column_names,
+                                std::string const& plan_dsl,
+                                std::size_t group_rows,
+                                std::string const& path,
+                                rmm::cuda_stream_view stream,
+                                rmm::device_async_resource_ref mr)
+{
+  simpatico::compressed_table ct;
+  try {
+    ct = simpatico::compress_with_plan(table, plan_dsl, stream, mr, column_names);
+  } catch (std::exception const& e) {
+    return std::string("[hpln export] compression failed: ") + e.what();
+  }
+
+  // Statistics come from the DECODED values, which is why they have to be computed here rather
+  // than recovered later: once the file holds compressed bytes the bounds are gone until someone
+  // decodes them, and the whole point of carrying them is to avoid that.
+  std::vector<std::uint8_t> packed;
+  if (group_rows > 0 && !column_types.empty()) {
+    auto stats =
+      scan_manager::compute_pinned_group_stats(table, column_types, group_rows, stream, mr);
+    std::vector<scan_manager::chunk_group_stats> per_chunk;
+    per_chunk.push_back(std::move(stats));
+    packed = scan_manager::group_bounds_arena::from_capture(column_types, per_chunk).pack();
+  }
+
+  std::array<simpatico::hpln_extra_segment, 1> extra{
+    simpatico::hpln_extra_segment{simpatico::hpln_segment::zone_maps, packed}};
+  return simpatico::write_compressed_table(
+    ct, path, stream, packed.empty() ? std::span<const simpatico::hpln_extra_segment>{} : extra);
 }
 
 }  // namespace sirius

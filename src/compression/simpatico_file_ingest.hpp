@@ -29,13 +29,19 @@
 // (CHUNK_SKIPPING_PLAN.md 6.5).
 
 #include "compressed_representation.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
+
+#include <cudf/table/table_view.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <duckdb/common/types.hpp>
+#include <duckdb/common/vector.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace sirius {
 
@@ -43,6 +49,10 @@ namespace sirius {
 struct ingested_hpln {
   std::shared_ptr<pinned_compressed_blob> blob;
   simpatico::hpln_schema schema;
+  /// Per-group min/max read straight out of the file's `zone_maps` segment. Empty when the file
+  /// carries none, or when the segment did not decode — both mean "serve unpruned", never
+  /// "prune wrongly". This is what lets an ingested table prune without decoding anything.
+  scan_manager::group_bounds_arena group_bounds;
 };
 
 /// Read @p path into pinned host memory belonging to @p host_space.
@@ -53,5 +63,22 @@ struct ingested_hpln {
 /// malformed file, since a partially ingested table must never become a pinned entry.
 [[nodiscard]] ingested_hpln read_hpln_into_pinned(std::string const& path,
                                                   cucascade::memory::memory_space& host_space);
+
+/// Compress @p table with @p plan_dsl and write it to @p path, carrying per-group zone maps.
+///
+/// The counterpart of read_hpln_into_pinned: without a writer that emits statistics there is
+/// nothing for an ingesting reader to prune with, since the bounds cannot be recovered from
+/// compressed bytes without decoding them. @p group_rows of 0 writes no zone-map segment.
+///
+/// Returns an empty string on success.
+[[nodiscard]] std::string write_table_to_hpln(
+  cudf::table_view const& table,
+  duckdb::vector<duckdb::LogicalType> const& column_types,
+  std::vector<std::string> const& column_names,
+  std::string const& plan_dsl,
+  std::size_t group_rows,
+  std::string const& path,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius

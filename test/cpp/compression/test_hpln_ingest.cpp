@@ -25,6 +25,7 @@
 #include "compression/compression_converters.hpp"
 #include "compression/simpatico_file_ingest.hpp"
 #include "operator/operator_test_utils.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -35,6 +36,7 @@
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -172,6 +174,66 @@ TEST_CASE("hpln ingest - a written file stages into pinned memory and decodes to
     REQUIRE(read_back(view.column(0)) == a);
     REQUIRE(read_back(view.column(1)) == b);
   }
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln ingest - zone maps survive the file and prune an ingested table",
+          "[compression][hpln_ingest]")
+{
+  if (no_gpu()) { return; }
+  auto stream    = cudf::get_default_stream();
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_zm_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "zm.hpln").string();
+
+  // Values ascend, so each group of 1024 covers a narrow, known range -- which is what makes the
+  // pruning assertion below exact rather than approximate.
+  constexpr int kRows = 8192;
+  std::vector<std::int32_t> v(kRows);
+  for (int i = 0; i < kRows; ++i)
+    v[static_cast<std::size_t>(i)] = i;
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(int32_column(v));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER)};
+  auto const err =
+    sirius::write_table_to_hpln(table->view(),
+                                types,
+                                {"v"},
+                                "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n",
+                                /*group_rows=*/1024,
+                                path,
+                                stream,
+                                rmm::mr::get_current_device_resource_ref());
+  REQUIRE(err.empty());
+
+  auto ingested = sirius::read_hpln_into_pinned(path, *env().host_space);
+
+  // The load-bearing claim: an ingested file prunes WITHOUT decoding anything. Nothing here
+  // decompresses; the bounds came out of the file.
+  REQUIRE_FALSE(ingested.group_bounds.empty());
+  REQUIRE(ingested.group_bounds.group_rows() == 1024);
+  REQUIRE(ingested.group_bounds.groups_in_chunk(0) == 8);
+
+  auto const cell = ingested.group_bounds.cell(0, 0);
+  REQUIRE(cell.size() == 8);
+  for (std::size_t g = 0; g < 8; ++g) {
+    REQUIRE(cell.valid[g] != 0);
+    REQUIRE(cell.mins[g] == static_cast<std::int64_t>(g * 1024));
+    REQUIRE(cell.maxs[g] == static_cast<std::int64_t>(g * 1024 + 1023));
+  }
+
+  // v < 2500 can only be in groups 0..2, so a filter evaluated against the file's own bounds
+  // must drop the other five.
+  auto filter  = duckdb::make_uniq<duckdb::ConstantFilter>(duckdb::ExpressionType::COMPARE_LESSTHAN,
+                                                          duckdb::Value::INTEGER(2500));
+  auto lowered = sirius::scan_manager::lowered_bound_filter::lower(*filter, cell.type);
+  REQUIRE(lowered.has_value());
+  std::vector<std::uint32_t> survivors;
+  lowered->select_survivors(cell, survivors);
+  REQUIRE(survivors == std::vector<std::uint32_t>{0, 1, 2});
 
   fs::remove_all(dir);
 }
