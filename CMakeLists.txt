@@ -408,6 +408,7 @@ set(EXTENSION_SOURCES
     src/op/scan/equality_delete_filter.cpp
     src/op/scan/iceberg_delete_pipeline.cpp
     src/op/scan/iceberg_gpu_ingestible.cpp
+    src/op/scan/simpatico_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
@@ -836,6 +837,7 @@ endif()
 # cmake-format: off
 set(TEST_SOURCES
     test/cpp/compression/test_hpln_ingest.cpp
+    test/cpp/compression/test_simpatico_ingestible.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
