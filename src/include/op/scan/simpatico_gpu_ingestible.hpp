@@ -19,16 +19,21 @@
 // A .hpln file as a scan SOURCE rather than only a pin-time representation.
 //
 // A .hpln holds N independently compressed chunks, and this source is one file, one split per
-// chunk, coalesced into decode-sized batches: no pruning and no row filter. Column projection is
-// honoured -- an unread column is never decoded -- but it is chosen at bind time, not pushed down
-// from a filter. The decode itself is the pinned-chunk path unchanged: a chunk's payload stages
-// into pinned host memory byte-for-byte (read_hpln_chunks_into_pinned) and is then reconstructed
-// and decompressed exactly as a pinned chunk is (compression_converters.cpp,
+// chunk, coalesced into decode-sized batches. Column projection is honoured -- an unread column is
+// never decoded. The query's pushed-down filter is used twice: the file's own per-group zone maps
+// drop chunks that cannot match before anything is read, and narrow a surviving chunk to the
+// 1024-row decode chunks whose bounds could match; what is left is applied exactly after the
+// decode, because DuckDB removes a pushed-down filter from the plan and holds the source
+// responsible for it. The decode itself is the pinned-chunk path unchanged: a chunk's payload
+// stages into pinned host memory byte-for-byte (read_hpln_chunks_into_pinned) and is then
+// reconstructed and decompressed exactly as a pinned chunk is (compression_converters.cpp,
 // decompress_host_to_gpu). What this class supplies is the split-provider shape the scan operator
 // drives.
 
 // sirius
+#include <helper/logical_type.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <scan_manager/pinned_chunk_stats.hpp>
 #include <sirius_config.hpp>
 
 // cudf
@@ -37,6 +42,8 @@
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
+#include <duckdb/planner/expression.hpp>
+#include <duckdb/planner/table_filter.hpp>
 
 // standard library
 #include <atomic>
@@ -87,6 +94,22 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// smallest decodable unit of the file.
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
+  /// The scan's pushed-down filter, keyed by POSITION into @ref duckdb_column_ids (the remapping
+  /// create_table_filter_set does). Owned rather than borrowed: the physical scan operator this
+  /// is built from is destroyed as the leaf replaces it. Null when the query has no filter.
+  ///
+  /// Accepting it is a promise to APPLY it: `read_simpatico` sets `filter_pushdown`, so DuckDB
+  /// deletes the predicate from the plan and no operator above the scan will re-check it.
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  /// The scan's columns as DuckDB names them, positional with @ref column_ids. Needed to resolve
+  /// a filter key onto a file column.
+  duckdb::vector<duckdb::ColumnIndex> duckdb_column_ids;
+  /// Types of ALL the file's columns, as the filter's constants are typed.
+  duckdb::vector<sirius::logical_type> returned_types;
+  /// Per-(column, chunk, group) min/max from the file's `zone_maps` segment, positional with the
+  /// FILE's columns. Empty means "serve unpruned"; see @ref sirius::hpln_bind_schema.
+  scan_manager::group_bounds_arena group_bounds;
+
   /// File column indices to decode, in the order the scan emits them. A scan that reads two of
   /// ten columns must emit two: the plan projects by output POSITION, so emitting the file's full
   /// width would silently shift every reference. Filled with the identity by
@@ -134,6 +157,11 @@ class simpatico_scan_info : public scan_info {
   std::string path;
   /// File-order chunk ids this split decodes, ascending.
   std::vector<std::size_t> chunk_ids;
+  /// Positional with @ref chunk_ids: the chunk's surviving 1024-row decode chunk ids, or an empty
+  /// vector meaning "decode the chunk whole". A subsetted chunk is fetched and decoded as a
+  /// smaller table describing only those rows (simpatico::build_chunk_subset_header), so the
+  /// pruned rows cross neither the file read nor PCIe nor the decode.
+  std::vector<std::vector<std::uint32_t>> decode_chunks;
   /// Rows the split's chunks decode to, summed.
   std::int64_t num_rows = 0;
   /// Decoded size of the columns this split produces; drives the memory reservation.
@@ -148,9 +176,13 @@ class simpatico_scan_info : public scan_info {
 /**
  * @brief Scan source over a .hpln file.
  *
- * The metadata walk emits one split per chunk of the file and the coalescer bundles consecutive
- * chunks up to a byte budget, so a batch is decode-sized rather than chunk-sized. Every split
- * decodes @c simpatico_ingestible_table_info::column_ids and nothing else.
+ * The metadata walk emits one split per SURVIVING chunk of the file and the coalescer bundles
+ * consecutive chunks up to a byte budget, so a batch is decode-sized rather than chunk-sized.
+ * Every split decodes @c simpatico_ingestible_table_info::column_ids and nothing else.
+ *
+ * Which chunks survive, and which of a survivor's 1024-row decode chunks do, is decided once at
+ * construction from the file's zone maps and this scan's filter. The filter is then applied
+ * exactly in @ref post_filter_and_project -- bounds narrow what is read, they do not test rows.
  */
 class simpatico_gpu_ingestible : public gpu_ingestible {
  public:
@@ -184,11 +216,56 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
 
   [[nodiscard]] std::vector<std::size_t> materialized_column_order() const override;
 
+  [[nodiscard]] bool has_row_filter() const noexcept override
+  {
+    return _filter_expression != nullptr;
+  }
+
+  /// Chunks the zone maps dropped outright, and decode chunks dropped inside a surviving one.
+  /// Reported for tests and for the log line: a scan that prunes nothing still returns the right
+  /// rows, so the only way to know pruning happened is to count it.
+  struct prune_stats {
+    std::size_t chunks_total{0};
+    std::size_t chunks_pruned{0};
+    std::size_t decode_chunks_total{0};
+    std::size_t decode_chunks_pruned{0};
+  };
+  [[nodiscard]] prune_stats pruning() const noexcept { return _prune_stats; }
+  /// Splits whose subset header was refused and served whole (see @ref
+  /// materialize_metadata_to_table).
+  [[nodiscard]] std::size_t subset_refusals() const noexcept
+  {
+    return _subset_refusals.load(std::memory_order_relaxed);
+  }
+
  private:
+  /// One chunk that survived the zone-map pass, with what of it is worth reading.
+  struct live_chunk {
+    std::size_t id{0};
+    /// Empty when every decode chunk survives: an unpruned chunk must take the ordinary whole-file
+    /// path rather than a subset header describing all of it, which would cost the synthesis for
+    /// nothing.
+    std::vector<std::uint32_t> decode_chunks;
+    /// Rows the chunk will actually produce -- fewer than the chunk's own when subsetted, which
+    /// is what the reservation and the batch budget have to be sized by.
+    std::int64_t num_rows{0};
+  };
+
+  /// Decide, once, which chunks survive the file's zone maps and which of their decode chunks do.
+  void plan_pruning();
+
   std::unique_ptr<simpatico_ingestible_table_info> _info;
-  /// Next unclaimed chunk. An atomic for the same reason parquet's file index is: the driver may
-  /// call @ref next_split_provider from several dispatcher threads, and a chunk handed to two of
-  /// them would be emitted twice -- which shows up as a plausible row count, not as a failure.
+  /// The pushed-down filter as one conjunction over batch positions, or null when there is none.
+  /// Applied in @ref post_filter_and_project: zone maps bound rows, they do not test them.
+  duckdb::unique_ptr<duckdb::Expression> _filter_expression;
+  /// The chunks a split may be emitted for, ascending. Not simply 0..N: a pruned chunk is absent.
+  std::vector<live_chunk> _live_chunks;
+  prune_stats _prune_stats;
+  std::atomic<std::size_t> _subset_refusals{0};
+  /// Next unclaimed entry of @ref _live_chunks. An atomic for the same reason parquet's file index
+  /// is: the driver may call @ref next_split_provider from several dispatcher threads, and a chunk
+  /// handed to two of them would be emitted twice -- which shows up as a plausible row count, not
+  /// as a failure.
   std::atomic<std::size_t> _next_chunk{0};
 };
 

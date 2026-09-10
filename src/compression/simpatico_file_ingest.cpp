@@ -540,6 +540,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
   simpatico::hpln_schema header_schema;
   duckdb::vector<duckdb::LogicalType> declared;
   std::vector<std::int64_t> chunk_rows;
+  scan_manager::group_bounds_arena bounds;
 
   if (layout.located) {
     std::vector<std::vector<std::uint8_t>> headers;
@@ -551,6 +552,19 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
         sg && sg->bytes > 0) {
       declared = unpack_logical_types(read_range(f, sg->offset, sg->bytes, "logical types segment"),
                                       nullptr);
+    }
+    // The zone maps are read HERE rather than at scan time because a bind is where a scan learns
+    // what it may skip: the walk has to decide a chunk's fate before it emits a split for it, and
+    // the bounds are one small segregated read whatever the file's size.
+    if (auto const sg = find_segment(layout, simpatico::hpln_segment::zone_maps);
+        sg && sg->bytes > 0) {
+      std::string zerr;
+      bounds = scan_manager::group_bounds_arena::unpack(
+        read_range(f, sg->offset, sg->bytes, "zone map segment"), &zerr);
+      if (!zerr.empty()) {
+        SIRIUS_LOG_WARN(
+          "[hpln schema] '{}': zone maps unreadable ({}); binding unpruned", path, zerr);
+      }
     }
   } else {
     // Pre-trailer file: parse the header from the front, growing the prefix as needed.
@@ -569,7 +583,18 @@ hpln_bind_schema read_hpln_schema(std::string const& path)
 
   hpln_bind_schema out;
   out.chunk_rows = std::move(chunk_rows);
-  out.num_rows   = std::accumulate(out.chunk_rows.begin(), out.chunk_rows.end(), std::int64_t{0});
+  // A capture whose chunk count disagrees with the file's is evidence of nothing, and pruning on
+  // it would drop the wrong chunks -- so it is discarded rather than used positionally.
+  if (!bounds.empty() && bounds.chunk_count() == out.chunk_rows.size()) {
+    out.group_bounds = std::move(bounds);
+  } else if (!bounds.empty()) {
+    SIRIUS_LOG_WARN(
+      "[hpln schema] '{}': zone maps describe {} chunks but the file has {}; binding unpruned",
+      path,
+      bounds.chunk_count(),
+      out.chunk_rows.size());
+  }
+  out.num_rows = std::accumulate(out.chunk_rows.begin(), out.chunk_rows.end(), std::int64_t{0});
   out.names.reserve(header_schema.columns.size());
   out.types.reserve(header_schema.columns.size());
   out.physical_types.reserve(header_schema.columns.size());

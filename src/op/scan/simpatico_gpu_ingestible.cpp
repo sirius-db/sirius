@@ -17,9 +17,13 @@
 // sirius
 #include <compression/compressed_representation.hpp>
 #include <compression/simpatico_file_ingest.hpp>
+#include <expression/ast/from_duckdb.hpp>
+#include <expression_evaluator/expression_evaluator.hpp>
 #include <log/logging.hpp>
 #include <op/scan/owning_table_view.hpp>
+#include <op/scan/scan_utils.hpp>
 #include <op/scan/simpatico_gpu_ingestible.hpp>
+#include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
 #include <cudf/concatenate.hpp>
@@ -32,11 +36,13 @@
 // simpatico
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
+#include <codegen/jit/fused_tree.hpp>
 
 // standard library
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -95,10 +101,20 @@ class simpatico_batch_coalescer : public batch_coalescer {
     }
     // Ascending ids keep a batch's rows in file order and its reads sequential. The walk hands
     // chunks out in order, but several dispatcher threads may claim them, so the coalescer can
-    // see them out of order and must not preserve that.
-    _current->chunk_ids.insert(
-      _current->chunk_ids.end(), split->chunk_ids.begin(), split->chunk_ids.end());
-    std::sort(_current->chunk_ids.begin(), _current->chunk_ids.end());
+    // see them out of order and must not preserve that. The surviving-decode-chunk list is
+    // inserted at the SAME position: it names rows of its own chunk, so a list that drifted onto
+    // a neighbour would decode the wrong rows and still return a plausible count.
+    for (std::size_t i = 0; i < split->chunk_ids.size(); ++i) {
+      auto const at = static_cast<std::size_t>(std::lower_bound(_current->chunk_ids.begin(),
+                                                                _current->chunk_ids.end(),
+                                                                split->chunk_ids[i]) -
+                                               _current->chunk_ids.begin());
+      _current->chunk_ids.insert(_current->chunk_ids.begin() + static_cast<std::ptrdiff_t>(at),
+                                 split->chunk_ids[i]);
+      _current->decode_chunks.insert(
+        _current->decode_chunks.begin() + static_cast<std::ptrdiff_t>(at),
+        i < split->decode_chunks.size() ? split->decode_chunks[i] : std::vector<std::uint32_t>{});
+    }
     _current->num_rows += split->num_rows;
     _current->decoded_bytes += split->decoded_bytes;
     return out;
@@ -129,6 +145,15 @@ std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t
   return kept;
 }
 
+/// Rows of one simpatico decode chunk -- the granularity a chunk subset addresses.
+constexpr std::size_t kDecodeChunkRows = static_cast<std::size_t>(::codegen::kChunkSize);
+
+/// Ceiling division that does not overflow for the sizes involved here.
+constexpr std::size_t ceil_div(std::size_t a, std::size_t b)
+{
+  return b == 0 ? 0 : (a + b - 1) / b;
+}
+
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -146,6 +171,7 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->physical_types      = std::move(schema.physical_types);
   info->num_rows            = schema.num_rows;
   info->chunk_rows          = std::move(schema.chunk_rows);
+  info->group_bounds        = std::move(schema.group_bounds);
   info->host_space          = &host_space;
   // Whole file by default; a caller with a narrower projection overwrites this.
   info->column_ids.resize(info->names.size());
@@ -192,6 +218,178 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
                                   std::to_string(_info->names.size()) + " columns");
     }
   }
+
+  // The decode emits _info->column_ids in order, so the batch position of filter key `i` (a
+  // position into duckdb_column_ids, which create_table_filter_set already remapped to) is `i`.
+  if (_info->table_filters != nullptr && !_info->table_filters->filters.empty()) {
+    std::vector<std::optional<std::size_t>> batch_position(_info->duckdb_column_ids.size());
+    for (std::size_t i = 0; i < batch_position.size(); ++i) {
+      batch_position[i] = i;
+    }
+    // Throws for a predicate shape Sirius cannot lower, which fails the query over to DuckDB --
+    // where read_simpatico has no CPU reader. That is still the right failure: silently dropping
+    // a conjunct DuckDB deleted from the plan would return rows the query excluded.
+    _filter_expression = sirius::op::convert_table_filters_to_expression(
+      *_info->table_filters, _info->duckdb_column_ids, _info->returned_types, batch_position);
+  }
+
+  plan_pruning();
+}
+
+//===----------------------------------------------------------------------===//
+// pruning
+//===----------------------------------------------------------------------===//
+void simpatico_gpu_ingestible::plan_pruning()
+{
+  auto const n_chunks       = _info->chunk_rows.size();
+  _prune_stats              = prune_stats{};
+  _prune_stats.chunks_total = n_chunks;
+  for (auto const rows : _info->chunk_rows) {
+    _prune_stats.decode_chunks_total +=
+      ceil_div(static_cast<std::size_t>(std::max<std::int64_t>(rows, 0)), kDecodeChunkRows);
+  }
+
+  auto const serve_everything = [&] {
+    _live_chunks.clear();
+    _live_chunks.reserve(n_chunks);
+    for (std::size_t c = 0; c < n_chunks; ++c) {
+      _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
+    }
+  };
+
+  auto const& arena = _info->group_bounds;
+  if (_info->table_filters == nullptr || _info->table_filters->filters.empty() || arena.empty() ||
+      arena.group_rows() == 0 || arena.chunk_count() != n_chunks) {
+    serve_everything();
+    return;
+  }
+
+  // Lower each filter once for the whole file rather than once per group cell -- the same reason
+  // build_survivor_row_ranges does: this is the release-mode line for dropping data, and it is
+  // cross-checked against chunk_provably_empty by a randomized test.
+  struct lowered_entry {
+    scan_manager::lowered_bound_filter filter;
+    std::size_t file_column;
+  };
+  std::vector<lowered_entry> lowered;
+  for (auto const& [key, filter] : _info->table_filters->filters) {
+    if (!filter) { continue; }
+    if (key >= _info->duckdb_column_ids.size()) { continue; }
+    auto const& column_id = _info->duckdb_column_ids[key];
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsEmptyColumn() ||
+        column_id.IsVirtualColumn()) {
+      continue;
+    }
+    auto const file_column = static_cast<std::size_t>(column_id.GetPrimaryIndex());
+    // The type the BOUNDS are in, not the type the file declares: a column the capture could not
+    // represent round-trips as "no statistics", and lowering against the declared type would
+    // build a filter with nothing to evaluate it on.
+    std::optional<duckdb::LogicalType> stats_type;
+    for (std::size_t c = 0; c < n_chunks && !stats_type.has_value(); ++c) {
+      auto const cell = arena.cell(file_column, c);
+      if (!cell.empty()) { stats_type = cell.type; }
+    }
+    if (!stats_type.has_value()) { continue; }
+    // A filter this cannot lower simply does not prune; the post-decode pass still applies it.
+    if (auto low = scan_manager::lowered_bound_filter::lower(*filter, *stats_type)) {
+      lowered.push_back({std::move(*low), file_column});
+    }
+  }
+  if (lowered.empty()) {
+    serve_everything();
+    return;
+  }
+
+  std::size_t const group_rows = arena.group_rows();
+  // Sub-chunk narrowing addresses 1024-row decode chunks, so a group that is not a whole number of
+  // them cannot be turned into a chunk-id list. Whole-chunk pruning is unaffected.
+  std::size_t const groups_per_decode_span =
+    (group_rows % kDecodeChunkRows == 0) ? group_rows / kDecodeChunkRows : 0;
+
+  _live_chunks.clear();
+  _live_chunks.reserve(n_chunks);
+  for (std::size_t c = 0; c < n_chunks; ++c) {
+    auto const rows     = static_cast<std::size_t>(std::max<std::int64_t>(_info->chunk_rows[c], 0));
+    auto const n_groups = ceil_div(rows, group_rows);
+    auto const n_decode = ceil_div(rows, kDecodeChunkRows);
+
+    // A group survives unless SOME filter proves it empty -- the same AND-over-filters the
+    // chunk-level pass applies.
+    std::vector<bool> keep(n_groups, true);
+    bool any_evidence = false;
+    for (auto const& le : lowered) {
+      auto const bounds = arena.cell(le.file_column, c);
+      // A cell whose shape disagrees with the chunk's own row count describes different rows;
+      // using it would drop rows there is no evidence about.
+      if (bounds.size() != n_groups) { continue; }
+      any_evidence        = true;
+      bool const has_null = !bounds.column_has_no_nulls;
+      for (std::size_t g = 0; g < n_groups; ++g) {
+        if (!keep[g] || bounds.valid[g] == 0) { continue; }  // an absent cell never prunes
+        if (le.filter.provably_empty(bounds.mins[g], bounds.maxs[g], has_null, false)) {
+          keep[g] = false;
+        }
+      }
+    }
+    if (!any_evidence || n_groups == 0) {
+      _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
+      continue;
+    }
+
+    auto const kept_groups = static_cast<std::size_t>(std::count(keep.begin(), keep.end(), true));
+    if (kept_groups == 0) {
+      // Nothing in this chunk can match: it is never read, never fetched and never decoded.
+      ++_prune_stats.chunks_pruned;
+      _prune_stats.decode_chunks_pruned += n_decode;
+      continue;
+    }
+    if (kept_groups == n_groups || groups_per_decode_span == 0) {
+      _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
+      continue;
+    }
+
+    std::vector<std::uint32_t> decode_chunks;
+    decode_chunks.reserve(kept_groups * groups_per_decode_span);
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      if (!keep[g]) { continue; }
+      auto const first = g * groups_per_decode_span;
+      auto const last  = std::min((g + 1) * groups_per_decode_span, n_decode);
+      for (auto d = first; d < last; ++d) {
+        decode_chunks.push_back(static_cast<std::uint32_t>(d));
+      }
+    }
+    if (decode_chunks.empty()) {
+      // Every surviving group lies past the chunk's decode chunks -- impossible for consistent
+      // metadata, and dropping the chunk on it would be dropping rows on no evidence.
+      _live_chunks.push_back({c, {}, _info->chunk_rows[c]});
+      continue;
+    }
+    _prune_stats.decode_chunks_pruned += n_decode - decode_chunks.size();
+    auto const kept_rows = scan_manager::surviving_decode_chunk_rows(decode_chunks, rows);
+    _live_chunks.push_back({c, std::move(decode_chunks), static_cast<std::int64_t>(kept_rows)});
+  }
+
+  // An all-pruned scan must not become a zero-split scan: zero splits means zero tasks, and the
+  // pipeline waits for a completion that never fires. Keep chunk 0 whole and let the post-decode
+  // filter empty it -- the same sentinel build_cached_scan_plan keeps.
+  if (_live_chunks.empty()) {
+    _live_chunks.push_back({0, {}, _info->chunk_rows.front()});
+    _prune_stats.chunks_pruned = n_chunks - 1;
+    _prune_stats.decode_chunks_pruned =
+      _prune_stats.decode_chunks_total -
+      ceil_div(static_cast<std::size_t>(std::max<std::int64_t>(_info->chunk_rows.front(), 0)),
+               kDecodeChunkRows);
+  }
+
+  if (_prune_stats.chunks_pruned > 0 || _prune_stats.decode_chunks_pruned > 0) {
+    SIRIUS_LOG_INFO(
+      "[simpatico_gpu_ingestible] '{}' zone maps pruned {}/{} chunks and {}/{} decode chunks",
+      _info->resolved_file_paths.front(),
+      _prune_stats.chunks_pruned,
+      _prune_stats.chunks_total,
+      _prune_stats.decode_chunks_pruned,
+      _prune_stats.decode_chunks_total);
+  }
 }
 
 simpatico_gpu_ingestible::~simpatico_gpu_ingestible() = default;
@@ -201,7 +399,7 @@ simpatico_gpu_ingestible::~simpatico_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool simpatico_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_chunk.load(std::memory_order_relaxed) >= _info->chunk_rows.size();
+  return _next_chunk.load(std::memory_order_relaxed) >= _live_chunks.size();
 }
 
 simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_split_provider(
@@ -210,16 +408,23 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
   // fetch_add rather than load-then-store: several dispatcher threads may reach here, and two of
   // them reading the same cursor would emit one chunk twice and skip another -- which lands as a
   // wrong answer with a right-looking row count, not as a failure.
-  auto const chunk = _next_chunk.fetch_add(1, std::memory_order_relaxed);
-  if (chunk >= _info->chunk_rows.size()) { return nullptr; }
+  auto const cursor = _next_chunk.fetch_add(1, std::memory_order_relaxed);
+  if (cursor >= _live_chunks.size()) { return nullptr; }
 
+  // The walk is over the SURVIVING chunks, not over the file's: a chunk the zone maps ruled out
+  // never becomes a split, so it is never read, fetched or decoded.
+  //
   // The resolver is unused because the ingest reads the file through the filesystem rather than
   // through an io_context datasource, which is also why a remote path cannot be read yet.
-  return [this, chunk]() -> std::unique_ptr<scan_info> {
+  return [this, cursor]() -> std::unique_ptr<scan_info> {
+    auto const& live     = _live_chunks[cursor];
     auto split           = std::make_unique<simpatico_scan_info>();
     split->path          = _info->resolved_file_paths.front();
-    split->chunk_ids     = {chunk};
-    split->num_rows      = _info->chunk_rows[chunk];
+    split->chunk_ids     = {live.id};
+    split->decode_chunks = {live.decode_chunks};
+    // The narrowed row count, so the reservation and the batch budget are sized by what the
+    // decode will actually return rather than by the chunk it came from.
+    split->num_rows      = live.num_rows;
     split->decoded_bytes = estimate_decoded_bytes(*_info, split->num_rows);
     return split;
   };
@@ -252,25 +457,93 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   decoded.reserve(ingested.size());
   for (std::size_t i = 0; i < ingested.size(); ++i) {
     auto const& blob = *ingested[i].blob;
-    simpatico::payload_fetch_fn fetch =
+    simpatico::payload_fetch_fn whole_fetch =
       [&blob](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
         copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
       };
 
+    // Zone maps ruled some of this chunk's 1024-row decode chunks out. Synthesize a header
+    // describing only the survivors and gather only their bytes: the reader and the decode see an
+    // ordinary, smaller table and need no knowledge that a subset is in play. Every failure here
+    // degrades to decoding the chunk whole, which is correct -- just less selective -- so nothing
+    // below throws on a refusal.
+    std::vector<std::uint8_t> subset_header;
+    std::vector<simpatico::gather_range> gather;
+    bool use_subset = false;
+    if (i < split.decode_chunks.size() && !split.decode_chunks[i].empty()) {
+      simpatico::payload_host_read_fn read_metadata =
+        [&blob](std::uint64_t off, std::uint64_t size, void* dst) {
+          copy_pinned_blocks_to_host(*blob.payload, off, dst, size);
+          return true;
+        };
+      std::vector<std::uint8_t> subsetted;
+      auto const error = simpatico::build_chunk_subset_header(blob.header,
+                                                              split.decode_chunks[i],
+                                                              read_metadata,
+                                                              subset_header,
+                                                              gather,
+                                                              /*max_gap_bytes=*/0,
+                                                              /*out_payload_bytes=*/nullptr,
+                                                              &subsetted);
+      // A column the format cannot address per chunk is emitted WHOLE, and a whole column beside
+      // a compacted one has a different row count -- the two cannot be one cudf::table. So the
+      // subset is usable only when every column this scan READS was compacted. Unread columns may
+      // be whole: their buffers are never fetched.
+      auto const refusing_column = [&]() -> std::optional<std::size_t> {
+        for (auto const column : _info->column_ids) {
+          if (column >= subsetted.size() || subsetted[column] == 0) { return column; }
+        }
+        return std::nullopt;
+      }();
+      use_subset = error.empty() && !refusing_column.has_value();
+      if (!use_subset) {
+        _subset_refusals.fetch_add(1, std::memory_order_relaxed);
+        if (error.empty()) {
+          SIRIUS_LOG_DEBUG(
+            "[simpatico_gpu_ingestible] '{}' chunk {}: column {} ({}) is not chunk-addressable; "
+            "decoding the chunk whole",
+            split.path,
+            split.chunk_ids[i],
+            *refusing_column,
+            *refusing_column < _info->names.size() ? _info->names[*refusing_column] : "?");
+        } else {
+          SIRIUS_LOG_WARN(
+            "[simpatico_gpu_ingestible] '{}' chunk {}: chunk subset refused ({}); decoding the "
+            "chunk whole",
+            split.path,
+            split.chunk_ids[i],
+            error);
+        }
+      }
+    }
+
+    simpatico::payload_fetch_fn const gathered_fetch =
+      gathered_payload_fetch{*blob.payload, std::move(gather)};
+
     std::string read_error;
-    auto const compressed =
-      simpatico::read_compressed_table_from_memory(blob.header, fetch, stream, mr, &read_error);
+    // Reconstruct only the columns this scan reads: a projection of a wide file then never pulls
+    // the other columns' compressed bytes across PCIe at all.
+    auto const compressed = simpatico::read_compressed_table_subset_from_memory(
+      use_subset ? std::span<const std::uint8_t>{subset_header} : blob.header,
+      use_subset ? gathered_fetch : whole_fetch,
+      _info->column_ids,
+      stream,
+      mr,
+      &read_error);
     if (!read_error.empty()) {
       throw std::runtime_error("[simpatico_gpu_ingestible] '" + split.path + "' chunk " +
                                std::to_string(split.chunk_ids[i]) +
                                " could not be reconstructed: " + read_error);
     }
 
+    // `compressed` already holds only the projected columns, in the requested order.
+    std::vector<std::size_t> selection(compressed.num_columns());
+    std::iota(selection.begin(), selection.end(), std::size_t{0});
     // Decode on the caller's stream rather than on the decode thread pool. The pool overlaps
     // columns, but its buffers are freed on pool streams and would have to be re-bound to `stream`
     // before anything downstream may read them. It also keeps the fetch above and the decode on
     // one stream, so no synchronize is needed between them.
-    decoded.push_back(simpatico::decompress(compressed, _info->column_ids, stream, mr));
+    decoded.push_back(simpatico::decompress(compressed, selection, stream, mr));
   }
 
   // The fetches above only ENQUEUED their H2D copies, and the pinned staging blobs die with this
@@ -316,16 +589,40 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   cucascade::memory::memory_space const& mem_space,
   rmm::cuda_stream_view stream,
-  bool /*like_swar_fastpath*/,
-  std::shared_ptr<const like_multiliteral_cache> /*like_cache*/,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,
   std::span<std::size_t const> elided)
 {
-  // Every column the decode emitted is an output column and there is no filter to apply, so the
-  // only work left is dropping the positions the caller is about to overwrite. `survivors` stays
-  // untouched, which is what can_report_survivors() == false promises.
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   auto table = std::move(input.table);
+
+  // The zone maps BOUNDED the rows -- they did not test them, and a surviving group still holds
+  // rows the predicate rejects. This is where the filter is actually applied, and it must be:
+  // read_simpatico declares filter_pushdown, so DuckDB deleted the predicate from the plan and
+  // nothing above the scan re-checks it.
+  //
+  // Every column the decode emitted is an output column (the source declares no projection
+  // pushdown, so the scan is full-width and a projection sits above it), which is why the filter's
+  // batch positions are the file's column order and no projection is folded in here.
+  if (_filter_expression && input.state != filter_state::ROW_FILTERED &&
+      input.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
+    auto filter_ast = sirius::ast::from_duckdb(*_filter_expression);
+    sirius::expression_evaluator exec(filter_ast.get(),
+                                      mr,
+                                      stream,
+                                      strategy_from_config(),
+                                      sirius::expression_evaluator::default_min_ast_size,
+                                      like_swar_fastpath,
+                                      std::move(like_cache));
+    auto filtered = owning_table_view{exec.select(table.view())};
+    // The select only ENQUEUED its reads; record before the input's read-lock owner is dropped.
+    table.record_reader_event(stream);
+    table = std::move(filtered);
+  }
+
+  // Drop the positions the caller is about to overwrite. `survivors` stays untouched, which is
+  // what can_report_survivors() == false promises.
   if (auto const kept =
         kept_positions(static_cast<std::size_t>(table.view().num_columns()), elided);
       !kept.empty()) {
