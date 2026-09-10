@@ -36,6 +36,7 @@
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -65,6 +66,8 @@
 #include "sirius_context.hpp"
 
 #include <cudf/cudf_utils.hpp>
+
+#include <helper/type_conversions.hpp>
 
 #include <numeric>
 #include <utility>
@@ -242,6 +245,77 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   return info;
 }
 
+//! Build a `simpatico_ingestible_table_info` from a `read_simpatico` TABLE_SCAN.
+//!
+//! The bind is redone here rather than carried over from `SiriusReadSimpaticoBind`: a .hpln bind
+//! is two small reads with no GPU, and the ingestible additionally needs a host memory space,
+//! which only exists once the Sirius runtime is up. The path travels in `parameters[0]`, the same
+//! channel `sirius_read_parquet` uses, because the bind data is Sirius's own rather than a
+//! MultiFileBindData the plan generator could walk.
+std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpatico_table_info(
+  sirius::op::sirius_physical_table_scan const& scan_op, duckdb::SiriusContext* sirius_ctx)
+{
+  if (sirius_ctx == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] read_simpatico requires the "
+      "Sirius runtime; there is no CPU reader for .hpln");
+  }
+  if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] read_simpatico scan has no "
+      "path parameter");
+  }
+  auto const path = scan_op.parameters.front().GetValue<std::string>();
+
+  auto host_spaces =
+    sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (host_spaces.empty()) {
+    throw std::runtime_error(
+      "[sirius_physical_plan_generator::build_simpatico_table_info] no HOST memory space "
+      "available to stage the .hpln payload");
+  }
+  // The payload stages into pinned host memory before its H2D copy; any host space serves, and
+  // the first is the one every other single-space consumer takes.
+  auto info = sirius::op::scan::bind_simpatico_file(
+    path, *const_cast<cucascade::memory::memory_space*>(host_spaces.front()));
+
+  // The scan emits one column per entry of `column_ids`, in that order, because that is what the
+  // projection this branch of create_plan(LogicalGet&) pushes above the scan references. Binding
+  // the full file width instead would leave every reference pointing at the wrong column.
+  info->column_ids.clear();
+  info->column_ids.reserve(scan_op.column_ids.size());
+  for (auto const& column_id : scan_op.column_ids) {
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsVirtualColumn()) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: rowid and virtual columns have no backing in a .hpln file");
+    }
+    auto const file_column = static_cast<std::size_t>(column_id.GetPrimaryIndex());
+
+    // The file records what a column DECODES to and, separately, what it means to the engine.
+    // Nothing forces the two to agree -- a writer may store a DECIMAL(12,2) as DECIMAL32 where the
+    // engine carries it as DECIMAL64, or a DATE as a bare INT32 -- and a decoded column whose
+    // carrier is not the one the plan assumes is read as a different type without any conversion.
+    // Refuse here rather than hand the pipeline a mistyped column.
+    auto const carrier = sirius::try_get_cudf_type(sirius::from_duckdb(info->types[file_column]));
+    if (!carrier.has_value()) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: column '%s' has type %s, which has no native cuDF carrier",
+        info->names[file_column],
+        info->types[file_column].ToString());
+    }
+    if (*carrier != info->physical_types[file_column]) {
+      throw duckdb::NotImplementedException(
+        "read_simpatico: column '%s' is declared %s but the file decodes it as cuDF type id %d; "
+        "the .hpln reader does not convert carriers",
+        info->names[file_column],
+        info->types[file_column].ToString(),
+        static_cast<int>(info->physical_types[file_column].id()));
+    }
+    info->column_ids.push_back(file_column);
+  }
+  return info;
+}
+
 /**
  * @brief Builds a GPU scan, wrapping it when registered dynamic-filter producers exist
  *
@@ -338,6 +412,15 @@ void wrap_table_scan_source(
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
                               sirius_ctx.get());
+    replace_slot = true;
+  } else if (fn == "read_simpatico") {
+    // No dynamic-filter channel: the .hpln source has no membership filter to receive, so the
+    // scan leaf is built directly rather than through make_gpu_scan_leaf.
+    auto ingestible =
+      sirius::op::scan::make_ingestible(build_simpatico_table_info(scan, sirius_ctx.get()));
+    leaf = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      scan.types, scan.estimated_cardinality, std::move(ingestible), sirius_ctx.get());
+    if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
     replace_slot = true;
   } else {
     throw std::runtime_error(

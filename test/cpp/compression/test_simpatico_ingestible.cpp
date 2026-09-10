@@ -278,6 +278,45 @@ TEST_CASE("simpatico ingestible - a split materializes to the values that were w
   fs::remove_all(dir);
 }
 
+TEST_CASE("simpatico ingestible - a projection decodes only the columns it names",
+          "[compression][simpatico_ingestible]")
+{
+  if (no_gpu()) { return; }
+  auto stream = cudf::get_default_stream();
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_simp_ing_proj_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "t.hpln").string();
+  std::vector<std::vector<std::int32_t>> values;
+  REQUIRE(write_fixture(path, values).empty());
+
+  // Out of file order and skipping a column: the plan projects by output POSITION, so emission
+  // order has to be the order asked for rather than the file's.
+  auto info        = sirius::op::scan::bind_simpatico_file(path, *env().host_space);
+  info->column_ids = {2, 0};
+  auto ingestible  = sirius::op::scan::make_ingestible(std::move(info));
+
+  REQUIRE(ingestible->materialized_column_order() == std::vector<std::size_t>{2, 0});
+
+  auto batches = collect_splits(*ingestible);
+  REQUIRE(batches.size() == 1);
+  // Two columns' worth of decode, not three -- the reservation must not be sized for the file.
+  REQUIRE(batches[0]->estimated_bytes() ==
+          static_cast<std::size_t>(kRows) * 2 * sizeof(std::int32_t));
+
+  auto materialized = ingestible->materialize_metadata_to_table(
+    *batches[0], *env().gpu_space, stream, false, nullptr);
+  REQUIRE(materialized.table.view().num_columns() == 2);
+  auto table = ingestible->post_filter_and_project(
+    std::move(materialized), *env().gpu_space, stream, false, nullptr, nullptr, {});
+  stream.synchronize();
+  REQUIRE(table->num_columns() == 2);
+  REQUIRE(read_back(table->view().column(0)) == values[2]);
+  REQUIRE(read_back(table->view().column(1)) == values[0]);
+
+  fs::remove_all(dir);
+}
+
 TEST_CASE("simpatico ingestible - refuses what it cannot serve",
           "[compression][simpatico_ingestible]")
 {
@@ -303,6 +342,16 @@ TEST_CASE("simpatico ingestible - refuses what it cannot serve",
   auto info        = sirius::op::scan::bind_simpatico_file(path, *env().host_space);
   info->host_space = nullptr;
   REQUIRE_THROWS(sirius::op::scan::make_ingestible(std::move(info)));
+
+  // simpatico::decompress does not bounds-check its selection: an out-of-range column index would
+  // return a neighbouring column's buffers as data rather than fail.
+  auto out_of_range        = sirius::op::scan::bind_simpatico_file(path, *env().host_space);
+  out_of_range->column_ids = {0, 3};
+  REQUIRE_THROWS(sirius::op::scan::make_ingestible(std::move(out_of_range)));
+
+  auto no_columns        = sirius::op::scan::bind_simpatico_file(path, *env().host_space);
+  no_columns->column_ids = {};
+  REQUIRE_THROWS(sirius::op::scan::make_ingestible(std::move(no_columns)));
 
   fs::remove_all(dir);
 }

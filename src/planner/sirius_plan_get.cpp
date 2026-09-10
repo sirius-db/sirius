@@ -202,6 +202,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     "parquet_scan",
     "read_parquet",
     "sirius_read_parquet",
+    "read_simpatico",
     sirius::exec::kStreamSourceFunctionName};
   if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
     throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",

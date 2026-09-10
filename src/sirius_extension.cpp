@@ -46,6 +46,7 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/simpatico_file_ingest.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -267,6 +268,49 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
     "read_parquet('s3://...') inside gpu_execution()");
 }
 
+// Bind callback for read_simpatico. read_hpln_schema parses the trailer, the header and the
+// logical_types segment and stops there: no payload is staged and no GPU is touched, so a bind
+// costs two small reads even for a file that decodes to gigabytes. The path is echoed into bind
+// data purely for the cardinality callback; the plan generator reads it back out of
+// parameters[0].
+unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext&,
+                                                 TableFunctionBindInput& input,
+                                                 vector<LogicalType>& return_types,
+                                                 vector<string>& names)
+{
+  if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+    throw std::runtime_error("read_simpatico expects a single non-null .hpln path");
+  }
+  auto const path = input.inputs[0].GetValue<std::string>();
+
+  auto schema  = sirius::read_hpln_schema(path);
+  return_types = std::move(schema.types);
+  names.assign(schema.names.begin(), schema.names.end());
+  return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema.num_rows));
+}
+
+// Execute callback for read_simpatico -- the CPU path, which cannot exist.
+//
+// .hpln has no DuckDB reader: the payload is a cuDF-shaped compressed table that only the GPU
+// decode path understands. So this function is reached exactly when the query did NOT run on the
+// GPU, and the only useful thing it can do is say so. It deliberately does not attempt a
+// fallback: silently returning nothing, or erroring somewhere deeper, would read as a bug in the
+// file rather than as "this query never reached the GPU".
+//
+// The consequence for enable_duckdb_fallback is worth stating plainly: with it on (the default) a
+// GPU failure on a read_simpatico query is replayed on the CPU, lands here, and the error the
+// user sees is this one rather than the GPU error that actually caused it. Setting
+// enable_duckdb_fallback = false surfaces the underlying GPU error directly, which is what the
+// message points at.
+void SiriusReadSimpaticoFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "read_simpatico requires GPU execution: the .hpln format has no DuckDB CPU reader, so this "
+    "query cannot run on the CPU. Either GPU execution is disabled (SET gpu_execution = true) or "
+    "the GPU plan failed and was replayed on the CPU -- run with SET enable_duckdb_fallback = "
+    "false to see the underlying GPU error");
+}
+
 }  // namespace
 
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
@@ -274,6 +318,15 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
 {
   if (bind_data_p == nullptr) { return nullptr; }
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
+
+unique_ptr<NodeStatistics> SiriusReadSimpaticoCardinality(ClientContext&,
+                                                          FunctionData const* bind_data_p)
+{
+  if (bind_data_p == nullptr) { return nullptr; }
+  auto const* typed = dynamic_cast<SiriusReadSimpaticoBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
   return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
 }
@@ -2495,6 +2548,17 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   sirius_read_parquet.filter_prune        = true;
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
+
+  // A .hpln file as a query source. Unlike sirius_read_parquet this IS a user-facing surface:
+  // there is no DuckDB function that reads the format, so nothing else can bind it. No pushdown
+  // flags are set: the plan generator narrows the decode to the scan's column_ids itself, and the
+  // single-chunk ingestible applies no predicate, so accepting a filter pushdown would be a
+  // promise it does not keep.
+  TableFunction read_simpatico(
+    "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
+  read_simpatico.cardinality = SiriusReadSimpaticoCardinality;
+  CreateTableFunctionInfo read_simpatico_info(read_simpatico);
+  catalog.CreateTableFunction(transaction, read_simpatico_info);
 
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},

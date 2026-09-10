@@ -42,17 +42,18 @@ namespace sirius::op::scan {
 
 namespace {
 
-/// Decoded footprint of the whole file, for the reservation.
+/// Decoded footprint of the columns this scan emits, for the reservation.
 ///
-/// Exact for fixed-width columns: the header carries the row count and the decoded type, and
-/// nothing is projected away. A variable-width column has no such answer without decoding it, so
-/// it contributes only its offsets -- a floor, not an estimate. A file with strings therefore
-/// under-reserves until the format records decoded sizes the way parquet's SizeStatistics do.
+/// Exact for fixed-width columns: the header carries the row count and the decoded type. A
+/// variable-width column has no such answer without decoding it, so it contributes only its
+/// offsets -- a floor, not an estimate. A file with strings therefore under-reserves until the
+/// format records decoded sizes the way parquet's SizeStatistics do.
 std::size_t estimate_decoded_bytes(simpatico_ingestible_table_info const& info)
 {
   auto const rows   = static_cast<std::size_t>(std::max<std::int64_t>(info.num_rows, 0));
   std::size_t total = 0;
-  for (auto const& dtype : info.physical_types) {
+  for (auto const column : info.column_ids) {
+    auto const& dtype = info.physical_types[column];
     total += rows * (cudf::is_fixed_width(dtype) ? cudf::size_of(dtype) : sizeof(std::int32_t));
   }
   return total;
@@ -105,6 +106,9 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->physical_types      = std::move(schema.physical_types);
   info->num_rows            = schema.num_rows;
   info->host_space          = &host_space;
+  // Whole file by default; a caller with a narrower projection overwrites this.
+  info->column_ids.resize(info->names.size());
+  std::iota(info->column_ids.begin(), info->column_ids.end(), std::size_t{0});
   return info;
 }
 
@@ -125,6 +129,22 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
   if (_info->host_space == nullptr) {
     throw std::invalid_argument(
       "[simpatico_gpu_ingestible] table_info.host_space must be non-null");
+  }
+  if (_info->column_ids.empty()) {
+    throw std::invalid_argument(
+      "[simpatico_gpu_ingestible] table_info.column_ids must name at "
+      "least one column");
+  }
+  // An out-of-range index would otherwise reach simpatico::decompress, whose selection is
+  // unchecked -- it reads a neighbouring column's buffers and returns them as data.
+  for (auto const column : _info->column_ids) {
+    if (column >= _info->names.size()) {
+      throw std::invalid_argument("[simpatico_gpu_ingestible] column index " +
+                                  std::to_string(column) +
+                                  " is out of range "
+                                  "for a file with " +
+                                  std::to_string(_info->names.size()) + " columns");
+    }
   }
 }
 
@@ -195,9 +215,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // before anything downstream may read them; one chunk per file is not enough work to be worth
   // that. It also keeps the fetch above and the decode on one stream, so no synchronize is needed
   // between them.
-  std::vector<std::size_t> selection(static_cast<std::size_t>(compressed.num_columns()));
-  std::iota(selection.begin(), selection.end(), std::size_t{0});
-  auto table = simpatico::decompress(compressed, selection, stream, mr);
+  auto table = simpatico::decompress(compressed, _info->column_ids, stream, mr);
 
   SIRIUS_LOG_DEBUG("[simpatico_gpu_ingestible] '{}' decoded rows={} cols={}",
                    split.path,
@@ -228,9 +246,9 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
   std::unique_ptr<cudf::column>* /*survivors*/,
   std::span<std::size_t const> elided)
 {
-  // Every column of the file is an output column and there is no filter to apply, so the only work
-  // left is dropping the positions the caller is about to overwrite. `survivors` stays untouched,
-  // which is what can_report_survivors() == false promises.
+  // Every column the decode emitted is an output column and there is no filter to apply, so the
+  // only work left is dropping the positions the caller is about to overwrite. `survivors` stays
+  // untouched, which is what can_report_survivors() == false promises.
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   auto table = std::move(input.table);
   if (auto const kept =
@@ -246,11 +264,9 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
 //===----------------------------------------------------------------------===//
 std::vector<std::size_t> simpatico_gpu_ingestible::materialized_column_order() const
 {
-  // The decode emits the file's columns in file order and nothing is projected away, so storage
-  // index and emission position are the same number.
-  std::vector<std::size_t> order(_info->names.size());
-  std::iota(order.begin(), order.end(), std::size_t{0});
-  return order;
+  // The decode emits exactly the requested columns, in the order requested, so the selection is
+  // already the answer.
+  return _info->column_ids;
 }
 
 std::shared_ptr<simpatico_gpu_ingestible> make_ingestible(

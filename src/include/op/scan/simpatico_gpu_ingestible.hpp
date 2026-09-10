@@ -19,7 +19,9 @@
 // A .hpln file as a scan SOURCE rather than only a pin-time representation.
 //
 // A .hpln holds a single compressed chunk, so this source is one file, one chunk, one split: no
-// pruning, no projection and no row filter. The decode itself is the pinned-chunk path unchanged
+// pruning and no row filter. Column projection is honoured -- an unread column is never decoded --
+// but it is chosen at bind time, not pushed down from a filter. The decode itself is the
+// pinned-chunk path unchanged
 // -- the payload stages into pinned host memory byte-for-byte (read_hpln_into_pinned) and is then
 // reconstructed and decompressed exactly as a pinned chunk is (compression_converters.cpp,
 // decompress_host_to_gpu). What this class supplies is the split-provider shape the scan operator
@@ -75,6 +77,12 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   std::vector<cudf::data_type> physical_types;
   std::int64_t num_rows = 0;
 
+  /// File column indices to decode, in the order the scan emits them. A scan that reads two of
+  /// ten columns must emit two: the plan projects by output POSITION, so emitting the file's full
+  /// width would silently shift every reference. Filled with the identity by
+  /// @ref bind_simpatico_file, so a caller that wants the whole file need not set it.
+  std::vector<std::size_t> column_ids;
+
   /// Where the payload stages before it is fetched to the GPU. Pinned, so the H2D copy is a DMA
   /// rather than a staged bounce, and so a pin can adopt the same blob untouched. Required: an
   /// ingest with nowhere to stage cannot be served, and refusing at construction beats failing on
@@ -122,7 +130,8 @@ class simpatico_scan_info : public scan_info {
  * @brief Scan source over a .hpln file.
  *
  * The metadata walk emits exactly one split and the coalescer passes it straight through: with one
- * chunk in the file there is nothing to partition and nothing to bundle.
+ * chunk in the file there is nothing to partition and nothing to bundle. The split decodes
+ * @c simpatico_ingestible_table_info::column_ids and nothing else.
  */
 class simpatico_gpu_ingestible : public gpu_ingestible {
  public:
