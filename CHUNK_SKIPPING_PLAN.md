@@ -1535,14 +1535,22 @@ with achievable BANDWIDTH. So the policy is a formula, not a constant:
 
 > **`max_gap_bytes ≈ per_request_cost × achievable_bandwidth`**, both measurable at runtime.
 
-Measured with curl (§7.8), at equal volume and equal 256-way parallelism, 4 MB ranges against
-16 MB: **0.755 ms per extra request**, at 2.6 GB/s, giving **~2 MB**. Coalesce to **~16 MB runs**
-(4 MB costs +36% time for the same bytes) and keep ~1 GB in flight (64 x 16 MB) or the pipe
-starves regardless of how well the ranges are merged.
+Measured with curl (§7.8) at equal volume and equal 256-way parallelism, 4 MB ranges against
+16 MB, on a **busy** and then an **idle** instance:
 
-**Do not hardcode the 2 MB.** Derived from the interpreter-bound python numbers the same formula
-gives 293 KB — a 7x error, and the kind of constant that gets baked in once and never revisited.
-It moves with the deployment: a faster link raises it proportionally.
+| instance | per extra request | max_gap_bytes | 4 MB vs 16 MB |
+|---|---|---|---|
+| busy | 0.755 ms | 1.99 MB | +36% |
+| **idle** | **0.286 ms** | **0.75 MB** | **+13%** |
+
+Take the idle row as the estimate and the spread as the error bar: **~0.75 MB, and load-sensitive
+by 2.6x**. Coalesce to ~16 MB runs and keep ~1 GB in flight (64 x 16 MB) or the pipe starves
+regardless of how well the ranges are merged. Note the fragmentation penalty at 4 MB is modest
+(+13% idle) — it is the sub-MB ranges that collapse.
+
+**Do not hardcode it.** The same formula gives 293 KB from the interpreter-bound python numbers,
+0.75 MB idle and 1.99 MB busy — a 7x span, and exactly the kind of constant that gets baked in once
+and never revisited. It moves with the link AND with instantaneous load.
 
 That is `max_gap_bytes`, which §7.3 has carried as "measured, not guessed" since the project
 opened. It also says a **G = 8 group is far too fine to address individually over S3** — 8192 rows
@@ -1579,11 +1587,18 @@ through the interpreter. `curl --parallel` on the same instance, same object, sa
 **2.9x the python ceiling**, saturating at 64-way. A flat ceiling that ignores added concurrency is
 the signature to watch for — it looks exactly like a network cap.
 
-22.8 Gb/s is still ~2x under the instance's rated 50 Gb/s, so treat it as a **floor** rather than
-the ceiling: the box may have been busy, and a single object is a single S3 prefix, which is the
-classic way to leave object-store bandwidth on the table. A real scan spreads across many files, so
-per-object limits should bind less in practice. Worth re-running across several objects before
-anyone treats 2.85 GB/s as the machine's number.
+**Repeated on an idle instance**, and the ceiling did not move: 2.65 / 2.70 / 2.51 / 2.63 GB/s at
+32 / 64 / 128 / 256-way, against 2.21 / 2.84 / 2.85 / 2.63 busy. Same plateau either way, and it
+saturates by 32-way. **So contention was not the limit** — ~21 Gb/s is the real behaviour of this
+path, and the ~2.4x gap to the instance's rated 50 Gb/s is structural.
+
+The prime suspect is that **one object is one S3 prefix**: per-prefix throughput is the classic way
+to leave object-store bandwidth unclaimed, and a real scan spreads reads over many files. Until
+someone runs the multi-object variant, treat 2.6 GB/s as this path's number rather than the
+machine's.
+
+What DID move with load is the per-request cost (0.29 ms idle vs 0.76 ms busy), which is why §7.7
+records a range rather than a constant.
 
 What this does NOT change: fragmentation costs request count, not skipped bytes (§7.6). That came
 from p50 latency FALLING as ranges shrink and from the model needing no extents term — both
