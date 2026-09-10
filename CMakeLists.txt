@@ -602,6 +602,14 @@ foreach(_target sirius_extension sirius_loadable_extension)
     parquet_extension
     simpatico)
 
+  # Corrosion exposes telemetry_bridge as an INTERFACE target whose concrete
+  # Rust archive is telemetry_bridge-static. Apply WHOLE_ARCHIVE to that real
+  # archive so the unreferenced NVTX static-injection shim reaches the final
+  # loadable extension instead of being dropped at the nested archive boundary.
+  set_property(
+    TARGET ${_target} PROPERTY "LINK_LIBRARY_OVERRIDE_telemetry_bridge-static"
+                               WHOLE_ARCHIVE)
+
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
@@ -609,8 +617,32 @@ endforeach()
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
 
+# `sirius_extension` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
+# perform a final link. Carry the concrete Rust archive as a transitive
+# WHOLE_ARCHIVE item instead; DuckDB and every other final consumer then retain
+# the static NVTX pointer shim as well.
+target_link_libraries(sirius_extension
+                      "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
+
+# A statically embedded Sirius cannot give NVTX a DSO path. Its private dlopen
+# interposer maps one sentinel path to the running executable instead. Carry
+# both symbols into the final executable's dynamic symbol table so dependency
+# images such as libcudf can resolve the Quent initializer from that handle.
+target_link_options(
+  sirius_extension INTERFACE
+  "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2"
+  "LINKER:--export-dynamic-symbol=dlopen")
+
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
                       PkgConfig::CURL OpenSSL::Crypto)
+
+# NVTX's runtime injection lookup dlopens the path named by
+# NVTX_INJECTION64_PATH and resolves InitializeInjectionNvtx2 from it. Export
+# the statically embedded Quent entry point from the loadable extension so
+# Sirius can point NVTX at its own already-loaded DSO without deploying a second
+# injection library.
+target_link_options(sirius_loadable_extension PRIVATE
+                    "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs

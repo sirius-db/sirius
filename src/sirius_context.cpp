@@ -1654,6 +1654,10 @@ void install_configured_log_sink(DatabaseInstance* db)
 }
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
+  : disabled_([] {
+      auto const* value = std::getenv("SIRIUS_DISABLE");
+      return value != nullptr && std::string_view{value} != "0";
+    }())
 {
   auto const previous_log_backend = Config::LOG_BACKEND;
   auto const previous_log_dir     = Config::LOG_DIR;
@@ -1688,6 +1692,15 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
     throw;
   }
   read_config_file_if_exists();
+}
+
+void SiriusContextExtensionCallback::initialize_context()
+{
+  if (disabled_ || context_) { return; }
+
+  auto context = duckdb::make_shared_ptr<SiriusContext>();
+  context->initialize(config_);
+  context_ = std::move(context);
 }
 
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
@@ -1736,7 +1749,7 @@ void SiriusContextExtensionCallback::OnExtensionLoadFail(DatabaseInstance& db,
 void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
   // Check for explicit disable (used by benchmarks/tests that need pure CPU execution)
-  if (auto* val = std::getenv("SIRIUS_DISABLE"); val != nullptr && std::string(val) != "0") {
+  if (disabled_) {
     SIRIUS_LOG_INFO("Sirius disabled via SIRIUS_DISABLE environment variable.");
     return;
   }
@@ -1768,9 +1781,6 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
       "set SIRIUS_DISABLE=1 to prevent this.");
     config_.apply_defaults();
   }
-
-  context_ = duckdb::make_shared_ptr<SiriusContext>();
-  context_->initialize(config_);
 }
 
 }  // namespace duckdb

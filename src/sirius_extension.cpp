@@ -111,6 +111,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -138,6 +139,8 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <dlfcn.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -147,6 +150,39 @@ extern "C" int cudaProfilerStop();
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+
+// Statically embedded by telemetry_bridge. Rust archives are localized by the
+// extension link (`--exclude-libs,ALL`), so this regular C++ object supplies the
+// public NVTX entry point and forwards it into the same Quent hook state used by
+// Sirius's static-injection pointer.
+extern "C" int quent_InitializeInjectionNvtx2(void* get_export_table);
+extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
+  void* get_export_table)
+{
+  return quent_InitializeInjectionNvtx2(get_export_table);
+}
+
+#ifndef DUCKDB_BUILD_LOADABLE_EXTENSION
+// NVTX v3 discovers an injector independently in each ELF image. libcudf's
+// injection pointer is local to libcudf.so and its process-global preinjection
+// lookup is compiled out, so it can only reach Quent through its dlopen path.
+// A statically linked Sirius has no DSO to name. Interpose just our private
+// sentinel and turn that request into dlopen(NULL), whose handle exposes the
+// initializer exported by the running DuckDB executable. Every other request
+// is forwarded unchanged to libc.
+extern "C" __attribute__((visibility("default"))) void* dlopen(const char* filename, int flags)
+{
+  using dlopen_fn   = void* (*)(const char*, int);
+  auto* real_dlopen = reinterpret_cast<dlopen_fn>(::dlsym(RTLD_NEXT, "dlopen"));
+  if (real_dlopen == nullptr) { return nullptr; }
+
+  if (filename != nullptr &&
+      std::string_view{filename} == sirius::telemetry::detail::static_injection_path) {
+    return real_dlopen(nullptr, flags);
+  }
+  return real_dlopen(filename, flags);
+}
+#endif
 
 namespace duckdb {
 
@@ -3490,6 +3526,66 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
+/// Configure NVTX runtime discovery before the process's first NVTX call.
+///
+/// An existing NVTX_INJECTION64_PATH remains authoritative. Otherwise, an
+/// explicit nvtx_injection_lib from the Sirius config is used. If neither is
+/// present, the loadable extension points NVTX at its own DSO. A statically
+/// linked Sirius instead uses a private dlopen token which resolves to the
+/// running executable. In both cases Quent's injector is embedded in the same
+/// image as Sirius, so dependency images such as libcudf attach to the same hook
+/// without requiring a separately deployed injection library.
+///
+/// NVTX initialises lazily and per image, on that image's first NVTX call, so
+/// setting the variable here — after libcudf is mapped but before any NVTX call
+/// — still reaches it. That holds only while libcudf makes no NVTX call from a
+/// static constructor; should it ever do so, its image initialises during dlopen
+/// and this path becomes invisible to it. Set NVTX_INJECTION64_PATH in the
+/// environment instead if that happens.
+static void maybe_set_nvtx_injection_path(const sirius::telemetry_config& telemetry) noexcept
+{
+  if (std::getenv("NVTX_INJECTION64_PATH") != nullptr || !telemetry.enable_quent) { return; }
+
+  if (!telemetry.nvtx_injection_lib.empty()) {
+    ::setenv("NVTX_INJECTION64_PATH", telemetry.nvtx_injection_lib.c_str(), /*overwrite=*/0);
+    return;
+  }
+
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+  try {
+    Dl_info self{};
+    // Use a private function as the anchor: unlike the public NVTX initializer,
+    // its address cannot be interposed by another ELF image.
+    if (::dladdr(reinterpret_cast<void*>(&maybe_set_nvtx_injection_path), &self) == 0 ||
+        self.dli_fname == nullptr) {
+      return;
+    }
+
+    std::error_code error;
+    auto self_path = std::filesystem::canonical(self.dli_fname, error);
+    if (error) { return; }
+    ::setenv("NVTX_INJECTION64_PATH", self_path.c_str(), /*overwrite=*/0);
+  } catch (...) {
+    // NVTX capture is optional; self-path discovery must not prevent Sirius
+    // from loading.
+  }
+#else
+  // Probe the interposition path before publishing it. NVTX does not fall
+  // back to static injection after a dynamic lookup failure, so a broken
+  // final link must leave the environment unset.
+  auto* handle = ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+  if (handle == nullptr) { return; }
+  auto* initializer = ::dlsym(handle, "InitializeInjectionNvtx2");
+  bool const usable = initializer == reinterpret_cast<void*>(&InitializeInjectionNvtx2);
+  ::dlclose(handle);
+  if (!usable) { return; }
+
+  ::setenv("NVTX_INJECTION64_PATH",
+           sirius::telemetry::detail::static_injection_path,
+           /*overwrite=*/0);
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3499,8 +3595,16 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
-  auto* callback_ptr = callback.get();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr         = callback.get();
+  bool const sirius_disabled = callback_ptr->is_disabled();
+
+  if (!sirius_disabled) {
+    // Config loading above must remain NVTX-free. Publish discovery after its
+    // validation, but before SiriusContext can make any NVTX call.
+    maybe_set_nvtx_injection_path(callback_ptr->get_loaded_config().get_telemetry_config());
+    callback_ptr->initialize_context();
+  }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the
@@ -3544,10 +3648,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
   // extension binary itself may still be loaded).
-  bool const sirius_disabled = [] {
-    auto* val = std::getenv("SIRIUS_DISABLE");
-    return val != nullptr && std::string(val) != "0";
-  }();
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 

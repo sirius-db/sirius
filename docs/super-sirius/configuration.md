@@ -26,11 +26,23 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+`SIRIUS_DISABLE` is a process-startup kill switch for the **Super Sirius runtime**, not a query-fallback setting. Set `SIRIUS_DISABLE=1` before starting DuckDB to prevent that runtime from initializing and transparently routing queries to the GPU. The extension binary still loads and registers its SQL surface; legacy functions therefore remain available in builds that include them. Sirius also skips creating its Quent telemetry context and does not publish an automatic NVTX injection path. A caller-supplied `NVTX_INJECTION64_PATH` remains untouched.
+
+This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks. An unset value or `SIRIUS_DISABLE=0` enables normal Super Sirius initialization; any other set value disables it.
 
 ```bash
 export SIRIUS_DISABLE=1
 ```
+
+These related modes have different behavior:
+
+| Mode | Query execution | NVTX/Quent behavior |
+|------|-----------------|---------------------|
+| `SIRIUS_DISABLE=1` | Ordinary SQL runs in DuckDB; Super Sirius is never attempted | Sirius does not create its Quent context or configure automatic NVTX injection |
+| `SET gpu_execution = false` | Ordinary SQL runs in DuckDB for that connection | The process-wide Sirius runtime remains initialized and, when Quent is enabled, NVTX injection remains armed because the setting is reversible and other connections may use Sirius; DuckDB emits no NVTX events unless DuckDB or another loaded component explicitly calls NVTX |
+| Automatic CPU fallback | Sirius first rejects the GPU plan or fails during GPU execution, then DuckDB executes the CPU plan | NVTX remains active so any Sirius/libcudf work before the fallback is retained; the DuckDB portion emits events only if the executing code calls NVTX |
+
+Use `SIRIUS_DISABLE=1` for a pure DuckDB CPU baseline in a process that contains the Sirius extension. Use `SET gpu_execution = false` when the initialized Sirius runtime must remain available to turn back on later.
 
 ### Byte Suffixes
 
@@ -446,6 +458,7 @@ sirius:
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named

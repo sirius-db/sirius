@@ -330,6 +330,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
     if (!value.empty()) return true;
     throw std::runtime_error("must not be empty");
   });
+  r.optional("nvtx_injection_lib", opt.nvtx_injection_lib);
   r.reject_unknown();
 }
 
