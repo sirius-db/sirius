@@ -91,6 +91,11 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   {
     return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
   }
+
+  [[nodiscard]] std::string display_name() const override
+  {
+    return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
+  }
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching

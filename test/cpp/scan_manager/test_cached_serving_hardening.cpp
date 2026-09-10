@@ -336,6 +336,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
 struct stub_table_info final : sirius::op::scan::ingestible_table_info {
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
