@@ -1,13 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "dependencies": [
-    {
-      "host": true,
-      "name": "vcpkg-cmake-get-vars"
-    }
-  ],
+  "description": "NVIDIA JIT linker static redistributable.",
   "license": "LicenseRef-Proprietary",
-  "name": "nvcomp",
+  "name": "nvjitlink",
   "supports": "linux",
-  "version": "5.3.0.16"
+  "version": "13.2.51"
 }
