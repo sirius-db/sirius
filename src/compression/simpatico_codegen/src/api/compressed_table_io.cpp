@@ -619,7 +619,8 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 
 std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
-                                   rmm::cuda_stream_view stream)
+                                   rmm::cuda_stream_view stream,
+                                   std::span<const hpln_extra_segment> extra)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
   // Build the header + payload buffer list once (shared with the in-memory
@@ -647,7 +648,89 @@ std::string write_compressed_table(compressed_table const& table,
   f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
   f.write(reinterpret_cast<const char*>(payload.data()),
           static_cast<std::streamsize>(payload.size()));
+
+  // Segment table. header and payload are always present and always first, so a reader that only
+  // wants the schema can fetch exactly the header without parsing anything.
+  std::vector<hpln_segment_ref> segs;
+  segs.push_back({hpln_segment::header, 0, hdr.size()});
+  segs.push_back({hpln_segment::payload, hdr.size(), payload_bytes});
+  std::uint64_t at = hdr.size() + payload_bytes;
+  for (auto const& e : extra) {
+    if (e.bytes.empty()) continue;
+    f.write(reinterpret_cast<const char*>(e.bytes.data()),
+            static_cast<std::streamsize>(e.bytes.size()));
+    segs.push_back({e.kind, at, e.bytes.size()});
+    at += e.bytes.size();
+  }
+
+  std::vector<std::uint8_t> ps;
+  push_le(ps, static_cast<std::uint16_t>(segs.size()));
+  for (auto const& sg : segs) {
+    push_le(ps, static_cast<std::uint16_t>(sg.kind));
+    push_le(ps, sg.offset);
+    push_le(ps, sg.bytes);
+  }
+  f.write(reinterpret_cast<const char*>(ps.data()), static_cast<std::streamsize>(ps.size()));
+
+  // Fixed 16-byte trailer, magic LAST so a reader validates by reading the tail.
+  std::vector<std::uint8_t> tr;
+  push_le(tr, at);                                     // postscript offset (u64)
+  push_le(tr, static_cast<std::uint16_t>(ps.size()));  // postscript length (u16)
+  push_le(tr, kHplnFileVersion);                       // version (u16)
+  tr.push_back('H');
+  tr.push_back('P');
+  tr.push_back('L');
+  tr.push_back('N');
+  f.write(reinterpret_cast<const char*>(tr.data()), static_cast<std::streamsize>(tr.size()));
   if (!f) return "write error on '" + path + "'";
+  return {};
+}
+
+std::string read_hpln_postscript(std::span<const std::uint8_t> tail,
+                                 std::uint64_t file_size,
+                                 std::vector<hpln_segment_ref>& out,
+                                 std::uint64_t* need_bytes)
+{
+  out.clear();
+  if (need_bytes) *need_bytes = kHplnTrailerBytes;
+  if (tail.size() < kHplnTrailerBytes || file_size < kHplnTrailerBytes) {
+    return "read_hpln_postscript: need at least the trailer";
+  }
+  auto const* t = tail.data() + tail.size() - kHplnTrailerBytes;
+  if (t[12] != 'H' || t[13] != 'P' || t[14] != 'L' || t[15] != 'N') {
+    return "read_hpln_postscript: no trailer magic (a pre-v7 file: parse the header from the "
+           "front)";
+  }
+  std::uint64_t ps_off = 0;
+  std::memcpy(&ps_off, t, sizeof(ps_off));
+  std::uint16_t ps_len = 0, version = 0;
+  std::memcpy(&ps_len, t + 8, sizeof(ps_len));
+  std::memcpy(&version, t + 10, sizeof(version));
+  if (version != kHplnFileVersion) {
+    return "read_hpln_postscript: unsupported file version " + std::to_string(version);
+  }
+  if (ps_off + ps_len + kHplnTrailerBytes > file_size) {
+    return "read_hpln_postscript: postscript runs past the file";
+  }
+  // Is the postscript inside the tail we were given? If not, say exactly how much would do.
+  auto const tail_start = file_size - tail.size();
+  if (ps_off < tail_start) {
+    if (need_bytes) *need_bytes = file_size - ps_off;
+    return "read_hpln_postscript: tail too short for the postscript";
+  }
+  Reader r{tail.data() + (ps_off - tail_start), ps_len};
+  std::uint16_t n = 0;
+  if (!r.read_le(n)) return "read_hpln_postscript: truncated postscript";
+  out.reserve(n);
+  for (std::uint16_t i = 0; i < n; ++i) {
+    std::uint16_t kind = 0;
+    std::uint64_t off = 0, len = 0;
+    if (!r.read_le(kind) || !r.read_le(off) || !r.read_le(len)) {
+      return "read_hpln_postscript: truncated segment table";
+    }
+    if (off + len > file_size) return "read_hpln_postscript: segment runs past the file";
+    out.push_back({static_cast<hpln_segment>(kind), off, len});
+  }
   return {};
 }
 

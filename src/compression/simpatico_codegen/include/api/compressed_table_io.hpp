@@ -53,11 +53,64 @@
 
 namespace simpatico {
 
+// ─── Self-locating files: trailer + postscript ──────────────────────────────
+//
+// The original layout was [header][payload] with nothing saying where the header ends, so a
+// reader could not locate anything without parsing the header, and could not parse the header
+// without already holding it -- over a network that is a speculative read and a re-read.
+//
+// A file now ends with a fixed trailer pointing at a postscript, which is a locator table for
+// segments:
+//
+//     [header][payload][segment...][postscript][trailer]
+//
+// Read the last few KB and you know where everything is, in one round trip. New segment kinds are
+// ADDITIVE and a reader skips kinds it does not know, so null masks (in flight separately) or the
+// group->byte table of CHUNK_SKIPPING_PLAN.md 6.1 can be added without another format break.
+// Same shape as Vortex's postscript, for the same reasons.
+
+enum class hpln_segment : std::uint16_t {
+  header    = 1,  ///< the structural header parse_hpln_header/describe_... consume
+  payload   = 2,  ///< every leaf buffer, concatenated, at the offsets the header declares
+  zone_maps = 3,  ///< per-column, per-group min/max for pruning
+};
+
+struct hpln_segment_ref {
+  hpln_segment kind{};
+  std::uint64_t offset = 0;
+  std::uint64_t bytes  = 0;
+};
+
+/// An extra segment to append when writing. The bytes are opaque here; the KIND is what a reader
+/// dispatches on.
+struct hpln_extra_segment {
+  hpln_segment kind{};
+  std::span<const std::uint8_t> bytes;
+};
+
+inline constexpr std::size_t kHplnTrailerBytes  = 16;
+inline constexpr std::uint16_t kHplnFileVersion = 7;
+
+/// Locate a .hpln's segments from a TAIL of the file.
+///
+/// @p tail must be the last `tail.size()` bytes of a file of @p file_size bytes. When the tail is
+/// long enough to hold the trailer and the postscript, @p out is filled and an empty string
+/// returned. When it is not, @p need_bytes receives a sufficient tail length so a remote reader
+/// can re-read exactly once instead of guessing -- which is the whole point of the trailer.
+///
+/// A file written before the trailer existed has no magic and is reported as such; the caller can
+/// fall back to parsing [header][payload] from the front.
+std::string read_hpln_postscript(std::span<const std::uint8_t> tail,
+                                 std::uint64_t file_size,
+                                 std::vector<hpln_segment_ref>& out,
+                                 std::uint64_t* need_bytes = nullptr);
+
 /// Write a compressed_table to *path*.
 /// Returns an empty string on success; a human-readable error message otherwise.
 std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
-                                   rmm::cuda_stream_view stream = cudf::get_default_stream());
+                                   rmm::cuda_stream_view stream = cudf::get_default_stream(),
+                                   std::span<const hpln_extra_segment> extra = {});
 
 /// Read a compressed_table from *path*.
 /// On failure writes an error to *error_out (if non-null) and returns an empty

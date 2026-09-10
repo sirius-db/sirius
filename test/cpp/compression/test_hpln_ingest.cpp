@@ -144,7 +144,10 @@ TEST_CASE("hpln ingest - a written file stages into pinned memory and decodes to
     // Ingest stages, it does not re-encode: the pinned payload is the file's payload.
     REQUIRE(ingested.blob->payload_bytes == ingested.schema.payload_bytes);
     REQUIRE(ingested.blob->header.size() == ingested.schema.header_bytes);
-    REQUIRE(fs::file_size(path) == ingested.schema.header_bytes + ingested.schema.payload_bytes);
+    // The file is header + payload + postscript + trailer, so it is strictly larger than the
+    // data it carries; what must hold is that the data region fits inside it.
+    REQUIRE(fs::file_size(path) >= ingested.schema.header_bytes + ingested.schema.payload_bytes +
+                                     simpatico::kHplnTrailerBytes);
   }
 
   SECTION("it serves through the ordinary pinned-compressed path, values intact")
