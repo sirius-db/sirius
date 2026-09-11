@@ -1,0 +1,11 @@
+sirius:
+  space:
+    gpu:
+      - device_id: 0
+        memory_capacity: 1GiB
+    host:
+      - numa_id: -1
+        memory_capacity: 1GiB
+  executor:
+    scan_manager:
+      num_threads: 2147483647
