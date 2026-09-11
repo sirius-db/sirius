@@ -1813,6 +1813,42 @@ over S3 (§7.6).
 **Do B before C.** Chunking decides what a surviving chunk means in a file; pruning first means
 designing it twice.
 
+### Where clustering belongs (2026-09-11)
+
+Clustering has to happen at the last point where rows are decoded and reorderable, and that point
+differs per entry path. The three are complementary, not competing:
+
+| entry path | where it clusters | strategy |
+|---|---|---|
+| parquet / duckdb → pin | `materialize_pin_batches` (`cluster_by` on `pin_table`, §5.4) | local sort per chunk — streaming, no shuffle |
+| anything → `.hpln` file | the `COPY … TO` writer | local sort, or a global `ORDER BY` in the SELECT |
+| `.hpln` → pin | nowhere — it inherits the file's order | — |
+
+**A `.hpln` pin cannot cluster by construction.** Ingest stages the payload byte-for-byte and never
+decodes, which is the entire reason it is an I/O copy rather than the ~151 s decode-and-recompress.
+So `pin_table(format='simpatico', cluster_by=[…])` must REFUSE, as it already does for
+duckdb-native pins, rather than accept the argument and ignore it.
+
+**Keep pin-time clustering.** It is the project's largest measured win (−8.57% at SF1000 host,
+§5.4) and it applies exactly where `.hpln` does not: data that arrives as parquet and would
+otherwise have to be rewritten to be clustered at all. §3.13 showed it is the switch that makes
+every other mechanism pay, so removing it would turn the rest of the chain back into a net loss.
+
+**The trade-off inverts for files.** For a pin, local sort was clearly right: streaming, ~1.5% of
+pin cost, and within 0.8 points of a global sort at G=8 (§5.2). Its weakness — 0.0% pruning at
+pin-chunk granularity, because every locally sorted chunk still spans the whole key range — barely
+mattered because the group index recovered it. For a file on object storage it matters much more:
+a globally ordered file partitions the key space across chunks, so whole chunks prune (~69–71%),
+and a chunk that prunes is **a network request never issued** (§7.6). Paying once at write for an
+ordering that is reused by every reader is a different calculus from paying on every pin.
+
+### Follow-ups
+
+- **Refuse `cluster_by` on a simpatico pin** rather than silently ignoring it (see above).
+- **Add `cluster_by` to the `COPY … TO` writer.** Small: the writer already holds each chunk as a
+  `cudf::table` before compressing, so it is a `sort_by_key` in the right place. This is what moves
+  clustering from a per-pin cost to a write-once property of the data.
+
 ### Honest state
 
 What exists is the bottom of the stack: the container is self-locating, carries logical types and
