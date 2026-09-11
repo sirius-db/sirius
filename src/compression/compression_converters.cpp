@@ -487,6 +487,13 @@ std::string default_plan_for(cudf::column_view const& col, rmm::cuda_stream_view
   const auto type = col.type();
   if (type.id() == cudf::type_id::STRING) { return default_string_plan(col, stream); }
   if (!cudf::is_fixed_width(type)) { return kPassthroughDsl; }
+  // DECIMAL128 takes `ans`, not bitpack. bitpack can encode it since the __int128
+  // codegen support landed, and on a favourable column it reaches 14.14x against
+  // ans's 5.02x -- but it is a lottery: across every explore measured on
+  // q18/SF3000 it chose a 1.00x plan three times out of five, and every run where
+  // it was available finished at 2.25-2.34x aggregate against 3.34x for ans. A
+  // reliable 5x beats an unreliable 14x when the downside fills the host tier.
+  if (type.id() == cudf::type_id::DECIMAL128) { return "input -> ans\n"; }
   return "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
 }
 
