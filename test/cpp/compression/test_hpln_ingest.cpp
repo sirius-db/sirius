@@ -44,7 +44,9 @@
 #include <fstream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -471,7 +473,189 @@ std::vector<simpatico::hpln_segment_ref> segments_of(std::string const& path)
   return segs;
 }
 
+/// Flip one bit at @p offset, in place. Corruption a reader cannot distinguish from data.
+void flip_byte(std::string const& path, std::uint64_t offset)
+{
+  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+  REQUIRE(f);
+  f.seekg(static_cast<std::streamoff>(offset));
+  char byte = 0;
+  f.read(&byte, 1);
+  byte ^= 0x01;
+  f.seekp(static_cast<std::streamoff>(offset));
+  f.write(&byte, 1);
+  REQUIRE(f);
+}
+
+std::optional<simpatico::hpln_segment_ref> segment_of(std::string const& path,
+                                                      simpatico::hpln_segment kind)
+{
+  for (auto const& sg : segments_of(path)) {
+    if (sg.kind == kind) { return sg; }
+  }
+  return std::nullopt;
+}
+
+/// Make @p path look like a file written before checksums existed: the postscript's entry count
+/// is decremented so its last segment (the checksum table) is never seen. The bytes stay where
+/// they are, which is what a reader of an older file would find -- segments it does not know
+/// about are simply not in the table.
+void drop_checksum_segment(std::string const& path)
+{
+  auto const size = static_cast<std::uint64_t>(fs::file_size(path));
+  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+  REQUIRE(f);
+  f.seekg(static_cast<std::streamoff>(size - simpatico::kHplnTrailerBytes));
+  std::uint64_t ps_off = 0;
+  f.read(reinterpret_cast<char*>(&ps_off), sizeof(ps_off));
+  f.seekg(static_cast<std::streamoff>(ps_off));
+  std::uint16_t n = 0;
+  f.read(reinterpret_cast<char*>(&n), sizeof(n));
+  REQUIRE(n > 1);
+  n -= 1;
+  f.seekp(static_cast<std::streamoff>(ps_off));
+  f.write(reinterpret_cast<char const*>(&n), sizeof(n));
+  REQUIRE(f);
+}
+
 }  // namespace
+
+TEST_CASE("hpln checksums - the CRC is CRC32C, and the same split any way",
+          "[compression][hpln_ingest][hpln_checksums]")
+{
+  // The standard's check value. Writer and reader share one implementation, so a file would
+  // self-verify even with a wrong polynomial or a byte-swapped hardware path -- this is what says
+  // the bytes on disk mean what the format claims they mean.
+  std::string_view const check = "123456789";
+  REQUIRE(simpatico::hpln_crc32c(
+            {reinterpret_cast<std::uint8_t const*>(check.data()), check.size()}) == 0xE3069283u);
+
+  // A staged payload is checksummed block by block, so the running form has to equal the one-shot
+  // form for ANY split -- including one that does not land on the hardware path's 8-byte stride.
+  std::vector<std::uint8_t> data(4099);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>((i * 37) ^ (i >> 5));
+  }
+  auto const whole = simpatico::hpln_crc32c(data);
+  for (std::size_t cut :
+       {std::size_t{1}, std::size_t{7}, std::size_t{8}, std::size_t{1024}, std::size_t{4098}}) {
+    auto crc = simpatico::hpln_crc32c({data.data(), cut});
+    crc      = simpatico::hpln_crc32c({data.data() + cut, data.size() - cut}, crc);
+    REQUIRE(crc == whole);
+  }
+}
+
+TEST_CASE("hpln checksums - a corrupt payload is an error, not wrong values",
+          "[compression][hpln_ingest][hpln_checksums]")
+{
+  if (no_gpu()) { return; }
+  auto const dir = fs::temp_directory_path() / ("sirius_hpln_crc_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path = (dir / "t.hpln").string();
+  write_multi_chunk_file(path, kMultiChunks);
+
+  auto const payload = segment_of(path, simpatico::hpln_segment::payload);
+  REQUIRE(payload.has_value());
+  REQUIRE(segment_of(path, simpatico::hpln_segment::checksums).has_value());
+
+  // A byte inside chunk 1's payload. Nothing structural: it decodes, and without a checksum it
+  // decodes to a value that is simply wrong -- which is the failure this feature exists to turn
+  // into an error.
+  std::vector<simpatico::hpln_chunk_ref> chunks;
+  {
+    auto const dir_seg = segment_of(path, simpatico::hpln_segment::chunk_directory);
+    REQUIRE(dir_seg.has_value());
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(dir_seg->bytes));
+    std::ifstream f(path, std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(dir_seg->offset));
+    f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(dir_seg->bytes));
+    REQUIRE(simpatico::unpack_hpln_chunk_directory(bytes, chunks).empty());
+  }
+  flip_byte(path, chunks[1].payload_offset + chunks[1].payload_bytes / 2);
+
+  std::vector<std::size_t> const want{0, 1};
+  sirius::hpln_open_options verifying;
+  verifying.verify_payload = true;
+  REQUIRE_THROWS_WITH(
+    sirius::read_hpln_chunks_into_pinned(path, *env().host_space, want, verifying),
+    Catch::Matchers::Contains("payload of chunk 1") && Catch::Matchers::Contains("CRC32C"));
+
+  // The policy, stated as a test rather than as a comment: verification costs a pass over every
+  // byte read, so it is off by default and the same corrupt file stages without complaint. The
+  // metadata checks below are the ones that are always on.
+  sirius::hpln_open_options unverified;
+  unverified.verify_payload = false;
+  REQUIRE_NOTHROW(sirius::read_hpln_chunks_into_pinned(path, *env().host_space, want, unverified));
+
+  // Chunk 0 is untouched, so the check is per chunk rather than over the whole payload region --
+  // a file-wide checksum would condemn every chunk for one bad byte.
+  std::vector<std::size_t> const clean{0};
+  REQUIRE_NOTHROW(sirius::read_hpln_chunks_into_pinned(path, *env().host_space, clean, verifying));
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln checksums - corrupt metadata is refused without being asked",
+          "[compression][hpln_ingest][hpln_checksums]")
+{
+  if (no_gpu()) { return; }
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_hpln_crc_meta_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+
+  // Metadata is small and decides WHERE the payload is read from, so it is verified on every
+  // open, whatever verify_payload says. Each of these is a separate file: the first failure
+  // aborts the open, so corrupting them together would only ever exercise one.
+  auto corrupt_segment = [&](char const* name, simpatico::hpln_segment kind, char const* expected) {
+    auto const path = (dir / (std::string(name) + ".hpln")).string();
+    write_multi_chunk_file(path, kMultiChunks);
+    auto const sg = segment_of(path, kind);
+    REQUIRE(sg.has_value());
+    REQUIRE(sg->bytes > 0);
+    flip_byte(path, sg->offset + sg->bytes / 2);
+    REQUIRE_THROWS_WITH(sirius::read_hpln_schema(path), Catch::Matchers::Contains(expected));
+  };
+
+  corrupt_segment("hdr", simpatico::hpln_segment::header, "header of chunk");
+  corrupt_segment("zm", simpatico::hpln_segment::zone_maps, "zone_maps segment");
+  corrupt_segment("lt", simpatico::hpln_segment::logical_types, "logical_types segment");
+  corrupt_segment("dir", simpatico::hpln_segment::chunk_directory, "chunk_directory segment");
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("hpln checksums - a file carrying none still reads",
+          "[compression][hpln_ingest][hpln_checksums]")
+{
+  if (no_gpu()) { return; }
+  auto const dir =
+    fs::temp_directory_path() / ("sirius_hpln_crc_old_" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  auto const path     = (dir / "t.hpln").string();
+  auto const expected = write_multi_chunk_file(path, kMultiChunks);
+
+  // Every file written before the segment existed looks like this. Refusing it -- or refusing to
+  // verify anything else because one segment is missing -- would be a version bump in disguise.
+  drop_checksum_segment(path);
+  REQUIRE_FALSE(segment_of(path, simpatico::hpln_segment::checksums).has_value());
+
+  auto const schema = sirius::read_hpln_schema(path);
+  REQUIRE(schema.num_rows == static_cast<std::int64_t>(kMultiChunks) * kMultiRowsPerChunk);
+  REQUIRE(schema.chunk_rows.size() == static_cast<std::size_t>(kMultiChunks));
+  REQUIRE_FALSE(schema.group_bounds.empty());
+
+  std::vector<std::size_t> const want{0, 1, 2};
+  sirius::hpln_open_options verifying;
+  verifying.verify_payload = true;
+  auto const ingested =
+    sirius::read_hpln_chunks_into_pinned(path, *env().host_space, want, verifying);
+  REQUIRE(ingested.size() == want.size());
+  // ... and a corrupt payload in such a file is exactly what it always was: unnoticed. Stated so
+  // that the compatibility story is not mistaken for coverage.
+  static_cast<void>(expected);
+
+  fs::remove_all(dir);
+}
 
 TEST_CASE("hpln container - a multi-chunk file keeps its metadata segregated from its payload",
           "[compression][hpln_ingest][simpatico_multichunk]")

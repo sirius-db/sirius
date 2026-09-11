@@ -53,12 +53,26 @@ namespace sirius {
 /// that locates the file, the metadata region, each chunk's payload -- goes through that backend,
 /// which is the only way an `s3://` path can be read at all. Without one the reads go through the
 /// local filesystem, and a scheme path is refused rather than silently read locally.
+/// Whether payload checksums are verified unless a caller says otherwise;
+/// `SIRIUS_HPLN_VERIFY_PAYLOAD` in the environment, read once.
+[[nodiscard]] bool hpln_verify_payload_default();
+
 struct hpln_open_options {
   /// Backend serving this path. Null means the local filesystem.
   std::shared_ptr<io::sirius_ioctx> io_ctx;
   /// How reads are coalesced into requests; see @ref hpln_io_policy for where its defaults
   /// come from.
   hpln_io_policy policy{};
+  /// Verify each staged chunk payload against the file's CRC32C.
+  ///
+  /// Off by default, and the default is a policy rather than a constant: a payload checksum costs
+  /// a full pass over every byte read, on the hot path, to catch something the metadata checks
+  /// (which are always on, and cover the offsets that decide WHERE the payload is read from) do
+  /// not. Set `SIRIUS_HPLN_VERIFY_PAYLOAD=1` to turn it on for a process, or set this directly.
+  ///
+  /// Only whole-chunk reads are covered -- the checksum is per chunk, and a scan that narrows a
+  /// chunk to a few decode chunks has no way to check part of one.
+  bool verify_payload = hpln_verify_payload_default();
   /// Filled with what the transport actually did, when non-null. The only way to observe that a
   /// read went through the io_context and how many requests it cost -- the bytes are the same
   /// either way.

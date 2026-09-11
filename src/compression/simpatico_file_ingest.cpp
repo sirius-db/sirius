@@ -48,6 +48,10 @@ constexpr std::uint64_t kTailProbeBytes = 64u << 10;  // 64 KiB
 struct hpln_layout {
   std::vector<simpatico::hpln_segment_ref> segs;
   std::vector<simpatico::hpln_chunk_ref> chunks;
+  /// What the file says its own segments hash to. Empty for a file written before the segment
+  /// existed, which reads exactly as it always did -- nothing is verified, and nothing is
+  /// refused for lacking a checksum.
+  std::vector<simpatico::hpln_checksum_entry> checksums;
   /// False for a file written before the trailer existed, whose extent can only be found by
   /// parsing a speculative prefix. Such a file is always one chunk.
   bool located = false;
@@ -60,6 +64,71 @@ std::optional<simpatico::hpln_segment_ref> find_segment(hpln_layout const& layou
     if (sg.kind == kind) { return sg; }
   }
   return std::nullopt;
+}
+
+/// Name a segment as an error message should: `payload` alone is ambiguous in a file of chunks.
+std::string segment_name(simpatico::hpln_segment kind, std::uint32_t index)
+{
+  switch (kind) {
+    case simpatico::hpln_segment::header: return "header of chunk " + std::to_string(index);
+    case simpatico::hpln_segment::payload: return "payload of chunk " + std::to_string(index);
+    case simpatico::hpln_segment::zone_maps: return "zone_maps segment";
+    case simpatico::hpln_segment::logical_types: return "logical_types segment";
+    case simpatico::hpln_segment::chunk_directory: return "chunk_directory segment";
+    case simpatico::hpln_segment::checksums: return "checksums segment";
+  }
+  return "segment kind " + std::to_string(static_cast<int>(kind));
+}
+
+/// Check @p crc against what the file recorded for (@p kind, @p index).
+///
+/// A region the checksum table does not cover passes: that is a file written before checksums
+/// existed, and refusing it would be a version bump wearing another hat. A region it DOES cover
+/// and disagrees with throws -- never a warning, never a repair. Wrong bytes that decode are the
+/// failure this exists to convert into an error.
+void verify_crc(hpln_layout const& layout,
+                std::string const& path,
+                simpatico::hpln_segment kind,
+                std::uint32_t index,
+                std::uint64_t bytes,
+                std::uint32_t crc)
+{
+  for (auto const& e : layout.checksums) {
+    if (e.kind != kind || e.index != index) { continue; }
+    if (e.bytes != bytes) {
+      throw std::runtime_error("[hpln] '" + path + "': " + segment_name(kind, index) + " is " +
+                               std::to_string(bytes) + " bytes but the checksum table records " +
+                               std::to_string(e.bytes) + "; the file is corrupt");
+    }
+    if (e.crc != crc) {
+      throw std::runtime_error("[hpln] '" + path + "': " + segment_name(kind, index) +
+                               " fails its CRC32C (" + std::to_string(crc) + " read, " +
+                               std::to_string(e.crc) + " recorded); the file is corrupt");
+    }
+    return;
+  }
+}
+
+void verify_bytes(hpln_layout const& layout,
+                  std::string const& path,
+                  simpatico::hpln_segment kind,
+                  std::uint32_t index,
+                  std::span<const std::uint8_t> bytes)
+{
+  if (layout.checksums.empty()) { return; }
+  verify_crc(layout, path, kind, index, bytes.size(), simpatico::hpln_crc32c(bytes));
+}
+
+/// Read a metadata segment and check it against the file's own record of it.
+std::vector<std::uint8_t> read_verified_segment(hpln_source& src,
+                                                hpln_layout const& layout,
+                                                std::string const& path,
+                                                simpatico::hpln_segment_ref const& sg,
+                                                char const* what)
+{
+  auto bytes = src.read_range(sg.offset, sg.bytes, what);
+  verify_bytes(layout, path, sg.kind, 0, bytes);
+  return bytes;
 }
 
 /// Locate the segments and resolve the chunk directory of an open file.
@@ -85,12 +154,36 @@ hpln_layout locate_hpln(hpln_source& src, std::string const& path)
   }
   out.located = true;
 
+  // The trailing segments -- the directory and the checksum table -- are almost always inside the
+  // tail that was just read, because they are written last. Slicing them out of it keeps opening
+  // a file at ONE request, which is the property the whole trailer design exists for; a fresh
+  // read_range per segment would quietly make it three.
+  auto const tail_start = file_size - tail.size();
+  auto const read_region =
+    [&](std::uint64_t off, std::uint64_t bytes, char const* what) -> std::vector<std::uint8_t> {
+    if (off >= tail_start && off + bytes <= file_size) {
+      auto const* at = tail.data() + (off - tail_start);
+      return std::vector<std::uint8_t>(at, at + bytes);
+    }
+    return src.read_range(off, bytes, what);
+  };
+
   // A directory is authoritative when present. Without one the file predates chunking and is a
   // single chunk covering the whole header and payload segments -- unknown kinds being skipped is
   // exactly what makes that additive.
+  // Before anything is trusted: the checksum table, so every segment read below is checked as it
+  // is read. A file that carries none reads exactly as it did before checksums existed.
+  if (auto const sums = find_segment(out, simpatico::hpln_segment::checksums);
+      sums && sums->bytes > 0) {
+    auto const serr = simpatico::unpack_hpln_checksums(
+      read_region(sums->offset, sums->bytes, "checksum table"), out.checksums);
+    if (!serr.empty()) { throw std::runtime_error("[hpln] '" + path + "': " + serr); }
+  }
+
   if (auto const dir = find_segment(out, simpatico::hpln_segment::chunk_directory)) {
-    auto const derr = simpatico::unpack_hpln_chunk_directory(
-      src.read_range(dir->offset, dir->bytes, "chunk directory"), out.chunks);
+    auto const dir_bytes = read_region(dir->offset, dir->bytes, "chunk directory");
+    verify_bytes(out, path, dir->kind, 0, dir_bytes);
+    auto const derr = simpatico::unpack_hpln_chunk_directory(dir_bytes, out.chunks);
     if (!derr.empty()) { throw std::runtime_error("[hpln] '" + path + "': " + derr); }
     if (out.chunks.empty()) {
       throw std::runtime_error("[hpln] '" + path + "': chunk directory names no chunks");
@@ -164,6 +257,10 @@ void describe_chunks(hpln_source& src,
 
   for (std::size_t i = 0; i < layout.chunks.size(); ++i) {
     auto& chunk = layout.chunks[i];
+    // Checked before it is parsed: a corrupt header does not usually fail to parse, it parses
+    // into offsets that read a neighbour's bytes as values.
+    verify_bytes(
+      layout, path, simpatico::hpln_segment::header, static_cast<std::uint32_t>(i), out_headers[i]);
     simpatico::hpln_schema schema;
     auto const err = simpatico::describe_compressed_table_header(out_headers[i], schema);
     if (!err.empty()) {
@@ -245,6 +342,31 @@ std::unique_ptr<hpln_source> open_hpln(std::string const& path,
   return open_hpln_source(path, options.io_ctx, who);
 }
 
+/// CRC32C over a staged chunk payload, walking the pinned blocks in file order.
+///
+/// The payload is not contiguous in memory -- it lands in the host allocator's blocks -- but it
+/// IS contiguous in the file, so the running checksum has to visit the blocks in exactly the
+/// order allocate_chunk filled them.
+std::uint32_t crc_of_staged_payload(pinned_compressed_blob const& blob)
+{
+  std::uint32_t crc = 0;
+  auto const nb     = blob.payload_bytes;
+  if (nb == 0 || !blob.payload) { return simpatico::hpln_crc32c({}, crc); }
+  auto const block   = blob.payload->block_size();
+  std::uint64_t done = 0;
+  std::size_t idx    = 0;
+  while (done < nb) {
+    auto const n = std::min<std::uint64_t>(block, nb - done);
+    crc =
+      simpatico::hpln_crc32c({reinterpret_cast<std::uint8_t const*>(blob.payload->at(idx).data()),
+                              static_cast<std::size_t>(n)},
+                             crc);
+    done += n;
+    ++idx;
+  }
+  return crc;
+}
+
 /// Publish what the transport did, for a caller that asked.
 void report(hpln_source const& src, hpln_open_options const& options)
 {
@@ -252,6 +374,16 @@ void report(hpln_source const& src, hpln_open_options const& options)
 }
 
 }  // namespace
+
+bool hpln_verify_payload_default()
+{
+  // Read once: this is consulted per open, and the answer cannot change within a process.
+  static bool const enabled = [] {
+    char const* v = std::getenv("SIRIUS_HPLN_VERIFY_PAYLOAD");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  return enabled;
+}
 
 std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
@@ -296,6 +428,18 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     out.push_back({it->second, layout.chunks[id].num_rows});
   }
   src->read_extents(std::move(extents), options.policy, "chunk payload");
+  if (options.verify_payload && !layout.checksums.empty()) {
+    // After the read, before the blob is handed to anyone: a caller that got a chunk back has
+    // already been told it is intact.
+    for (auto const& [id, blob] : staged) {
+      verify_crc(layout,
+                 path,
+                 simpatico::hpln_segment::payload,
+                 static_cast<std::uint32_t>(id),
+                 blob->payload_bytes,
+                 crc_of_staged_payload(*blob));
+    }
+  }
   report(*src, options);
   return out;
 }
@@ -349,6 +493,14 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
   std::vector<hpln_extent> extents;
   out.blob = allocate_chunk(std::move(header), layout.chunks.front(), host_space, extents);
   src->read_extents(std::move(extents), options.policy, "chunk payload");
+  if (options.verify_payload && !layout.checksums.empty()) {
+    verify_crc(layout,
+               path,
+               simpatico::hpln_segment::payload,
+               0,
+               out.blob->payload_bytes,
+               crc_of_staged_payload(*out.blob));
+  }
 
   // Zone maps, if the file carries them. A file written before the segment existed, or one whose
   // segment does not decode, simply serves unpruned -- so this never fails the ingest.
@@ -358,15 +510,15 @@ ingested_hpln read_hpln_into_pinned(std::string const& path,
     if (sg.kind == simpatico::hpln_segment::zone_maps) {
       std::string zerr;
       out.group_bounds = scan_manager::group_bounds_arena::unpack(
-        src->read_range(sg.offset, sg.bytes, "zone map segment"), &zerr);
+        read_verified_segment(*src, layout, path, sg, "zone map segment"), &zerr);
       if (!zerr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln ingest] '{}': zone maps unreadable ({}); serving unpruned", path, zerr);
       }
     } else if (sg.kind == simpatico::hpln_segment::logical_types) {
       std::string terr;
-      out.column_types =
-        unpack_logical_types(src->read_range(sg.offset, sg.bytes, "logical types segment"), &terr);
+      out.column_types = unpack_logical_types(
+        read_verified_segment(*src, layout, path, sg, "logical types segment"), &terr);
       if (!terr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln ingest] '{}': logical types unreadable ({}); the caller has only "
@@ -572,7 +724,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
     if (auto const sg = find_segment(layout, simpatico::hpln_segment::logical_types);
         sg && sg->bytes > 0) {
       declared = unpack_logical_types(
-        src->read_range(sg->offset, sg->bytes, "logical types segment"), nullptr);
+        read_verified_segment(*src, layout, path, *sg, "logical types segment"), nullptr);
     }
     // The zone maps are read HERE rather than at scan time because a bind is where a scan learns
     // what it may skip: the walk has to decide a chunk's fate before it emits a split for it, and
@@ -581,7 +733,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
         sg && sg->bytes > 0) {
       std::string zerr;
       bounds = scan_manager::group_bounds_arena::unpack(
-        src->read_range(sg->offset, sg->bytes, "zone map segment"), &zerr);
+        read_verified_segment(*src, layout, path, *sg, "zone map segment"), &zerr);
       if (!zerr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln schema] '{}': zone maps unreadable ({}); binding unpruned", path, zerr);

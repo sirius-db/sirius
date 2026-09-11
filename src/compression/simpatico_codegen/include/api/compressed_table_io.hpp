@@ -89,7 +89,46 @@ enum class hpln_segment : std::uint16_t {
   /// the file as a single chunk spanning the `header` and `payload` segments -- which is what
   /// every file written before this segment existed is.
   chunk_directory = 5,
+  /// CRC32C over the OTHER segments, per chunk for `header` and `payload` and once for each
+  /// metadata segment. Additive on purpose: a reader that does not know the kind skips it, and a
+  /// file written before it existed simply carries no checksums -- neither costs a version bump,
+  /// and a version bump would reject every file already written.
+  checksums = 6,
 };
+
+//===----------------------------------------------------------------------===//
+// checksums
+//===----------------------------------------------------------------------===//
+
+/// CRC32C (Castagnoli) over @p bytes, continuing from @p crc.
+///
+/// CRC32C rather than the CRC-32 of zlib because both aarch64 (`crc32c*`) and x86-64 (SSE4.2)
+/// implement this polynomial in hardware, which is what makes verifying a 16 MB payload a
+/// bandwidth cost rather than a table walk. @p crc is the running value, so a payload scattered
+/// across pinned blocks is checksummed without being made contiguous first.
+[[nodiscard]] std::uint32_t hpln_crc32c(std::span<const std::uint8_t> bytes, std::uint32_t crc = 0);
+
+/// One covered region: which segment, which chunk of it, where it is, and what it hashes to.
+struct hpln_checksum_entry {
+  hpln_segment kind{};
+  /// Chunk id for `header` and `payload`; 0 for a metadata segment, which is written once.
+  std::uint32_t index  = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t bytes  = 0;
+  std::uint32_t crc    = 0;
+};
+
+/// Serialize a checksum table into the bytes a @c hpln_segment::checksums segment carries.
+[[nodiscard]] std::vector<std::uint8_t> pack_hpln_checksums(
+  std::span<const hpln_checksum_entry> entries);
+
+/// Inverse of @ref pack_hpln_checksums. Returns an empty string on success.
+///
+/// A malformed checksum table is a hard error rather than "verify nothing": it is the one segment
+/// whose job is to say the file is intact, so failing open would defeat it. A file that carries
+/// no such segment at all is a different case, and reads normally.
+[[nodiscard]] std::string unpack_hpln_checksums(std::span<const std::uint8_t> bytes,
+                                                std::vector<hpln_checksum_entry>& out);
 
 /// One chunk's extent within a multi-chunk .hpln.
 ///
