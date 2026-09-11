@@ -34,7 +34,10 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -116,6 +119,29 @@ std::shared_ptr<cucascade::data_batch> make_gpu_batch(cucascade::memory::memory_
 
   return sirius::make_data_batch(
     std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+/// Zero-reclaimable view batch over shared column storage, the scan's pinned view-forward shape.
+std::shared_ptr<cucascade::data_batch> make_zero_reclaimable_alias_batch(
+  cucascade::memory::memory_space& gpu_space, size_t num_rows = 1000)
+{
+  auto stream = cudf::get_default_stream();
+  auto owned  = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                         static_cast<cudf::size_type>(num_rows),
+                                         cudf::mask_state::UNALLOCATED,
+                                         stream,
+                                         gpu_space.get_default_allocator());
+  std::shared_ptr<cudf::column> column(std::move(owned));
+  std::vector<cudf::column_view> views{column->view()};
+  auto const alloc_size = column->alloc_size();
+  return sirius::make_data_batch_from_view(
+    cudf::table_view{views},
+    std::vector<std::shared_ptr<cudf::column>>{std::move(column)},
+    alloc_size,
+    gpu_space,
+    stream,
+    sirius::telemetry::batch_telemetry_info{},
+    /*reclaimable_size=*/std::size_t{0});
 }
 
 /**
@@ -495,6 +521,35 @@ TEST_CASE("request_free_memory partial fulfillment returns actual bytes freed",
   // Should get only the one batch's worth
   REQUIRE(freed == batch_size);
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory credits only reclaimable bytes and leaves aliases on GPU",
+          "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr     = *repo_registry.create_for_query(kTestQueryId);
+  auto repo          = std::make_unique<cucascade::shared_data_repository>();
+  auto owning        = make_gpu_batch(*gpu_space);
+  auto alias         = make_zero_reclaimable_alias_batch(*gpu_space);
+  size_t owning_size = get_batch_size(*owning);
+  repo->add_data_batch(owning);
+  repo->add_data_batch(alias);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Request more than the repo holds: only the owning batch's bytes are creditable.
+  size_t freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed == owning_size);
+  REQUIRE(get_batch_tier(*owning) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*alias) == cucascade::memory::Tier::GPU);
 
   executor.stop();
 }

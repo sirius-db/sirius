@@ -78,14 +78,16 @@ class convertible_data {
     bool blocking) = 0;
 
   /**
-   * @brief Get the size in bytes of this data unit in the specified memory space.
+   * @brief Get the bytes actually freed in the specified memory space by converting this data
+   * unit away.
    *
-   * Returns 0 if the data does not currently reside in the given space.
+   * Returns 0 if the data does not currently reside in the given space or if nothing would be
+   * freed (e.g. an alias over storage that outlives the conversion).
    *
    * @param space The memory space to query.
-   * @return The size in bytes, or 0 if not in that space.
+   * @return The reclaimable bytes, or 0 if not in that space or nothing would be freed.
    */
-  virtual std::size_t bytes_in_space(cucascade::memory::memory_space* space) const = 0;
+  virtual std::size_t reclaimable_bytes_in_space(cucascade::memory::memory_space* space) const = 0;
 };
 
 /**

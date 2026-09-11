@@ -24,6 +24,7 @@
 #include <memory/size_arithmetic.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/owning_table_view.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
@@ -35,6 +36,7 @@
 
 // cudf
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_stream.hpp>
 #include <cudf/cudf_utils.hpp>
@@ -51,9 +53,11 @@
 
 // standard library
 #include <algorithm>
+#include <any>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -298,6 +302,51 @@ void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan
   }
 }
 
+// Build one optional replacement per column against a view whose data is not owned here.
+// Validates the complete source/target shape before enqueuing any cast, so an invalid schema
+// cannot leave partially normalized output. `deferred` is null unless a late-materialization
+// deferral is installed; its positions are skipped, since substitute_deferred_columns overwrites
+// them with a rowid and placeholders.
+std::vector<std::unique_ptr<cudf::column>> normalize_physical_schema_casts(
+  cudf::table_view const& view,
+  const std::vector<cudf::data_type>& targets,
+  bool has_explicit_physical_schema,
+  late_mat::deferred_scan_output const* deferred,
+  duckdb::SiriusContext* observer,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  if (targets.empty()) { return {}; }
+
+  auto const plan =
+    preflight_physical_schema(view, targets, has_explicit_physical_schema, deferred, stream, mr);
+  auto casts = build_carrier_replacements(view, plan, stream, mr);
+  record_carrier_conversions(plan, observer);
+  return casts;
+}
+
+// Normalize an owned table by swapping in the prebuilt cast replacements, preserving it when
+// none apply.
+std::unique_ptr<cudf::table> normalize_physical_schema(
+  std::unique_ptr<cudf::table> table,
+  std::vector<std::unique_ptr<cudf::column>> casts,
+  rmm::cuda_stream_view stream)
+{
+  if (std::all_of(casts.begin(), casts.end(), [](auto const& cast) { return cast == nullptr; })) {
+    return table;
+  }
+  auto columns = table->release();
+  for (std::size_t column_idx = 0; column_idx < casts.size(); column_idx++) {
+    if (!casts[column_idx]) { continue; }
+    // The replaced source's buffers may be dealloc-bound to another stream (the pinned-cache
+    // upload or the decode stream); rebind them to `stream` so the free queues behind the cast
+    // still reading them. The unique_ptr moves never relocate the columns the casts read from.
+    auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
+    columns[column_idx] = std::move(casts[column_idx]);
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 /// `deferred` is null unless a late-materialization deferral is installed for this scan; passed
 /// through to preflight_physical_schema so deferred positions are skipped rather than cast (they
 /// hold a rowid/placeholder by the time this runs -- see execute()).
@@ -316,21 +365,82 @@ std::unique_ptr<cudf::table> normalize_physical_schema(
   // only widen a narrow stored carrier to its native type. An explicit sidecar may also narrow a
   // freshly decoded carrier, but only after exact materialized bounds confirm that its values fit
   // the planned target.
-  auto const plan = preflight_physical_schema(
-    table->view(), targets, has_explicit_physical_schema, deferred, stream, mr);
+  auto casts = normalize_physical_schema_casts(
+    table->view(), targets, has_explicit_physical_schema, deferred, observer, stream, mr);
+  return normalize_physical_schema(std::move(table), std::move(casts), stream);
+}
 
-  auto columns = table->release();
-  for (std::size_t column_idx = 0; column_idx < columns.size(); column_idx++) {
-    if (plan[column_idx].kind == carrier_conversion_kind::NONE) { continue; }
-    // The source's buffers may be dealloc-bound to the pinned-cache upload stream; rebind them
-    // to `stream` so the free replacing the column queues behind the cast still reading them.
-    auto casted =
-      cast_through_rep(columns[column_idx]->view(), plan[column_idx].target, stream, mr);
-    auto source         = cudf::rebind_stream(std::move(*columns[column_idx]), stream);
-    columns[column_idx] = std::move(casted);
+// Keeps both the surrendered pinned input and newly cast columns alive for a mixed output view.
+// This must remain copy-constructible because make_data_batch_from_view stores it in std::any.
+struct mixed_scan_owner {
+  std::any pinned;
+  std::shared_ptr<std::vector<std::unique_ptr<cudf::column>>> casted;
+};
+
+// Emit a pure forwarded view when no cast is needed, or combine forwarded and cast columns under a
+// composite owner. Cast allocations are attributed exactly; forwarded columns are estimated via
+// estimate_referenced_column_bytes — exact for fixed-width columns, a count-average of the input's
+// variable-width residual otherwise, so dropped variable-width bytes shift onto kept ones pro
+// rata.
+std::shared_ptr<::cucascade::data_batch> emit_view_forward(
+  owning_table_view::released_view forwarded,
+  std::vector<std::unique_ptr<cudf::column>> casts,
+  std::size_t total_input_bytes,
+  ::cucascade::memory::memory_space& mem_space,
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry,
+  std::size_t& emitted_bytes)
+{
+  auto const num_casted = static_cast<std::size_t>(
+    std::count_if(casts.begin(), casts.end(), [](auto const& cast) { return cast != nullptr; }));
+
+  if (num_casted == 0) {
+    std::vector<cudf::size_type> all_columns(
+      static_cast<std::size_t>(forwarded.view.num_columns()));
+    std::iota(all_columns.begin(), all_columns.end(), 0);
+    auto const referenced_bytes =
+      sirius::estimate_referenced_column_bytes(forwarded.view, all_columns, total_input_bytes);
+    emitted_bytes = referenced_bytes;
+    // Conversion frees nothing while the entry stays pinned; post-unpin undercredit is the safe
+    // direction.
+    return sirius::make_data_batch_from_view(forwarded.view,
+                                             std::move(forwarded.owner),
+                                             referenced_bytes,
+                                             mem_space,
+                                             stream,
+                                             telemetry,
+                                             /*reclaimable_size=*/std::size_t{0});
   }
-  record_carrier_conversions(plan, observer);
-  return std::make_unique<cudf::table>(std::move(columns));
+
+  // Views are taken before the cast vector is moved (unique_ptr moves never relocate the
+  // columns).
+  std::vector<cudf::column_view> views;
+  views.reserve(casts.size());
+  std::vector<cudf::size_type> forwarded_columns;
+  forwarded_columns.reserve(casts.size() - num_casted);
+  std::size_t casted_bytes = 0;
+  for (std::size_t column_idx = 0; column_idx < casts.size(); column_idx++) {
+    if (casts[column_idx]) {
+      views.push_back(casts[column_idx]->view());
+      casted_bytes += casts[column_idx]->alloc_size();
+    } else {
+      views.push_back(forwarded.view.column(static_cast<cudf::size_type>(column_idx)));
+      forwarded_columns.push_back(static_cast<cudf::size_type>(column_idx));
+    }
+  }
+  auto const alloc_size = casted_bytes + sirius::estimate_referenced_column_bytes(
+                                           forwarded.view, forwarded_columns, total_input_bytes);
+  emitted_bytes = alloc_size;
+  auto casted   = std::make_shared<std::vector<std::unique_ptr<cudf::column>>>(std::move(casts));
+  // Only the exclusively owned cast columns are freed by converting this batch away.
+  return sirius::make_data_batch_from_view(
+    cudf::table_view{views},
+    mixed_scan_owner{std::move(forwarded.owner), std::move(casted)},
+    alloc_size,
+    mem_space,
+    stream,
+    telemetry,
+    /*reclaimable_size=*/casted_bytes);
 }
 
 }  // namespace
@@ -450,10 +560,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   }
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
+  auto const total_input_bytes                 = scan_input->get_estimated_size_in_bytes();
   auto const has_explicit_physical_schema      = has_physical_overrides();
   auto const& targets                          = normalization_targets();
   std::vector<carrier_conversion_plan> transactional_plan;
   std::unique_ptr<cudf::table> output_table;
+  std::shared_ptr<::cucascade::data_batch> batch;
+  std::size_t emitted_rows  = 0;
+  std::size_t emitted_bytes = 0;
   // A deferral needs to know which rows survived a filter applied here; asking
   // for them costs one gather over a row-index sequence, so only a deferring
   // scan asks.
@@ -497,18 +611,75 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     auto like_pattern_cache       = like_cache();
     auto materialized_table =
       _ingestible->materialize_table(*scan_input, stream, like_swar_fastpath, like_pattern_cache);
-    if (materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
-      // Elide the deferred columns from the projection: realizing the batch would
-      // copy values this scan is about to replace with a rowid.
-      output_table = _ingestible->post_filter_and_project(std::move(materialized_table),
-                                                          *mem_space,
-                                                          stream,
-                                                          like_swar_fastpath,
-                                                          std::move(like_pattern_cache),
-                                                          wants_survivors ? &survivors : nullptr,
-                                                          deferred_output().output_positions);
+    owning_table_view result =
+      materialized_table.state != filter_state::ROW_FILTERED_AND_PROJECTED
+        // Elide the deferred columns from the projection: realizing the batch would
+        // copy values this scan is about to replace with a rowid.
+        ? _ingestible->post_filter_and_project(std::move(materialized_table),
+                                               *mem_space,
+                                               stream,
+                                               like_swar_fastpath,
+                                               std::move(like_pattern_cache),
+                                               wants_survivors ? &survivors : nullptr,
+                                               deferred_output().output_positions)
+        : std::move(materialized_table.table);
+
+    auto const needs_normalization = has_explicit_physical_schema || scan_input->is_resident();
+
+    // A deferral rewrites the output positions and restores the elided arity, both of which need
+    // an owned table, so it keeps the materializing path below. Every other scan can hand the
+    // pinned owner straight to the batch instead of copying the values out of it.
+    if (!wants_survivors) {
+      // Cast each mismatched column to its planned carrier, reading the live handle's view. A
+      // resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with
+      // the feature on, queried with it off) and must then restore to native. Both branches below
+      // consume the same casts.
+      std::vector<std::unique_ptr<cudf::column>> casts;
+      if (needs_normalization) {
+        try {
+          casts = normalize_physical_schema_casts(result.view(),
+                                                  targets,
+                                                  has_explicit_physical_schema,
+                                                  /*deferred=*/nullptr,
+                                                  _compressed_materialization_observer,
+                                                  stream,
+                                                  mem_space->get_default_allocator());
+        } catch (...) {
+          // A throw mid-normalization (e.g. a cast OOM) can leave reads already enqueued on
+          // `stream`; they must be recorded before unwinding drops this handle's read lock, or a
+          // reclaim of the backing cached batch could free storage those reads still touch.
+          result.record_reader_event(stream);
+          throw;
+        }
+      }
+      // The preflight bounds checks and the casts read the view on `stream`. Record before the
+      // owner can leave this handle, so a reclaim of the backing cached batch is ordered after
+      // those reads (no-op unless the owner tracks reader events).
+      result.record_reader_event(stream);
+
+      if (auto forwarded = result.release_view()) {
+        // A copy-requiring view can transfer its owner instead of materializing; raw GPU-pinned
+        // inputs are the production path that does so. Preserve that owner and forward every
+        // column whose stored carrier already agrees with the plan.
+        emitted_rows = static_cast<std::size_t>(forwarded->view.num_rows());
+        batch        = emit_view_forward(std::move(*forwarded),
+                                  std::move(casts),
+                                  total_input_bytes,
+                                  *mem_space,
+                                  stream,
+                                  batch_telemetry(),
+                                  emitted_bytes);
+      } else {
+        auto forwarded_table = result.release(stream, mem_space->get_default_allocator());
+        forwarded_table =
+          normalize_physical_schema(std::move(forwarded_table), std::move(casts), stream);
+        emitted_rows  = static_cast<std::size_t>(forwarded_table->num_rows());
+        emitted_bytes = forwarded_table->alloc_size();
+        batch         = sirius::make_data_batch(
+          std::move(forwarded_table), *mem_space, stream, batch_telemetry());
+      }
     } else {
-      output_table = materialized_table.table.release(stream, mem_space->get_default_allocator());
+      output_table = result.release(stream, mem_space->get_default_allocator());
     }
 
     // Late materialization, producing half. Installed only where a served batch is
@@ -536,8 +707,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     // A resident chunk is normalized even without a sidecar: it may be stored narrow (pinned with
     // the feature on, queried with it off) and must then restore to native. AFTER substitution:
     // the deferred positions then hold a rowid and placeholders, which it skips, and the elided
-    // columns are back so the arity check holds.
-    if (has_explicit_physical_schema || scan_input->is_resident()) {
+    // columns are back so the arity check holds. The forwarding path normalized against the view
+    // instead, so it arrives here with no owned table to cast.
+    if (output_table && (has_explicit_physical_schema || scan_input->is_resident())) {
       output_table = normalize_physical_schema(std::move(output_table),
                                                targets,
                                                has_explicit_physical_schema,
@@ -548,15 +720,15 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     }
   }
 
-  // Read the size before moving the table into a batch to avoid locking the batch. Publish rows
-  // and bytes together because they form one sample.
-  auto const emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
-  auto const emitted_bytes = output_table->alloc_size();
-
-  auto batch =
-    sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
-  // Published only after make_data_batch succeeds: an OOM there reschedules the task into
-  // re-running the same split, and these bytes floor total_source_output_bytes().
+  if (output_table) {
+    // Read the size before moving the table into a batch to avoid locking the batch.
+    emitted_rows  = static_cast<std::size_t>(output_table->num_rows());
+    emitted_bytes = output_table->alloc_size();
+    batch = sirius::make_data_batch(std::move(output_table), *mem_space, stream, batch_telemetry());
+  }
+  // Published only after the batch exists: an OOM building it reschedules the task into
+  // re-running the same split, and these bytes floor total_source_output_bytes(). Rows and bytes
+  // are published together because they form one sample.
   {
     std::lock_guard<std::mutex> guard(_emitted_mutex);
     _emitted_rows += emitted_rows;

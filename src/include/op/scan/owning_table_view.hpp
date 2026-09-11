@@ -28,12 +28,14 @@
 #include <rmm/resource_ref.hpp>
 
 #include <algorithm>
+#include <any>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -154,6 +156,13 @@ class my_view {
     return _model->materialize(_selection, stream, mr);
   }
 
+  /// Move a copy-requiring, copy-constructible owner out for release_view(). An engaged result
+  /// consumes the owner, so the caller must immediately discard this my_view.
+  [[nodiscard]] std::optional<std::any> try_surrender_owner()
+  {
+    return _model->try_surrender_owner();
+  }
+
   void record_reader_event(rmm::cuda_stream_view stream) { _model->record_reader_event(stream); }
 
  private:
@@ -166,6 +175,8 @@ class my_view {
       std::span<const cudf::size_type> selection,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) = 0;
+
+    [[nodiscard]] virtual std::optional<std::any> try_surrender_owner() = 0;
 
     virtual void record_reader_event(rmm::cuda_stream_view) {}
   };
@@ -213,6 +224,17 @@ class my_view {
       }
     }
 
+    [[nodiscard]] std::optional<std::any> try_surrender_owner() override
+    {
+      // Surrender only the owners whose materialize would copy; a no_alloc owner keeps its
+      // move-out path, and std::any storage additionally needs a copy-constructible owner.
+      if constexpr (!no_alloc_materializable<Owner> && std::copy_constructible<Owner>) {
+        return std::make_any<Owner>(std::move(_owner));
+      } else {
+        return std::nullopt;
+      }
+    }
+
     void record_reader_event([[maybe_unused]] rmm::cuda_stream_view stream) override
     {
       if constexpr (reader_event_recording<Owner>) { _owner.record_reader_event(stream); }
@@ -256,13 +278,11 @@ class my_view {
  * The handle is in one of three states: an owned @c cudf::table, a
  * @ref detail::my_view (type-erased owner + column selection), or empty.
  *
- * Only @ref materialize and @ref release may allocate device memory (the
- * view -> table transition). Every other mutating operation —
- * @ref reorder_columns and @ref drop_columns — is a pure view manipulation:
- * if the handle currently owns a @c cudf::table it is first demoted into a
- * @ref detail::my_view (a @c unique_ptr move, not a copy), after which the
- * column selection is permuted/subset in place. Because of this they are
- * @c const and operate on a @c mutable state member.
+ * @ref reorder_columns, @ref drop_columns, and @ref select_columns only change
+ * the stored column selection. If the handle owns a @c cudf::table, these
+ * operations first move it into a @ref detail::my_view without copying device
+ * data. Only @ref materialize and @ref release may allocate device memory;
+ * @ref release_view transfers a copy-requiring view and its owner instead.
  */
 class owning_table_view {
  public:
@@ -283,7 +303,10 @@ class owning_table_view {
    *        an explicit @p base_view naming its columns.
    *
    * If @p Owner is @ref detail::no_alloc_materializable, materialization will
-   * move column buffers out of the owner; otherwise it copies @p base_view.
+   * move column buffers out of the owner; otherwise it copies @p base_view. A
+   * copy-constructible @p Owner is additionally eligible for @ref release_view,
+   * which transfers the owner value out of the handle and requires that
+   * transfer to leave the viewed device memory alive and in place.
    */
   template <typename Owner>
     requires(!std::same_as<std::decay_t<Owner>, owning_table_view> &&
@@ -340,6 +363,40 @@ class owning_table_view {
   [[nodiscard]] std::unique_ptr<cudf::table> release(
     rmm::cuda_stream_view stream      = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+  /**
+   * @brief A selected table view and the owner that keeps its device memory alive
+   *
+   * The owner must remain alive while the view is used.
+   */
+  struct released_view {
+    cudf::table_view view;  ///< Selected columns at the time of release
+    std::any owner;         ///< Keeps the memory referenced by @ref view alive
+  };
+
+  /**
+   * @brief Surrender a copy-requiring view and its owner without copying device data
+   *
+   * This succeeds only for a view whose owner is copy-constructible and cannot materialize by
+   * moving columns. Success empties this handle. An owned table, an empty handle, a move-only
+   * owner, or a @ref detail::no_alloc_materializable owner leaves this handle unchanged so the
+   * caller can use @ref release instead.
+   *
+   * Surrendering transfers the owner value into the returned @c std::any — a move, or a copy when
+   * the owner has no move constructor — and then destroys the original owner along with this
+   * handle's state. The owner must keep the viewed device memory alive and in place across that
+   * transfer. Handle-like owners (e.g. @c std::shared_ptr, @c cucascade::read_only_data_batch)
+   * satisfy this; an owner whose transfer relocates or frees the viewed buffers would leave the
+   * returned view dangling.
+   *
+   * Reader events recorded through @ref record_reader_event are unaffected by the transfer:
+   * they live on the owner's underlying batch, which awaits them before any mutable access and
+   * on destruction.
+   *
+   * @return The selected view and its keep-alive owner on success, or @c std::nullopt when the
+   *         handle retains its materialization path
+   */
+  [[nodiscard]] std::optional<released_view> release_view();
 
   /// Release all held data, leaving the handle empty.
   void drop();
