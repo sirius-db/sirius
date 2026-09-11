@@ -754,6 +754,107 @@ std::string unpack_hpln_chunk_directory(std::span<const std::uint8_t> bytes,
   return {};
 }
 
+//===----------------------------------------------------------------------===//
+// checksums
+//===----------------------------------------------------------------------===//
+namespace {
+
+/// Castagnoli polynomial, reflected. Built once; the hardware path below never touches it.
+std::array<std::uint32_t, 256> const& crc32c_table()
+{
+  static std::array<std::uint32_t, 256> const table = [] {
+    std::array<std::uint32_t, 256> t{};
+    for (std::uint32_t i = 0; i < 256; ++i) {
+      std::uint32_t c = i;
+      for (int k = 0; k < 8; ++k) {
+        c = (c & 1u) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+      }
+      t[i] = c;
+    }
+    return t;
+  }();
+  return table;
+}
+
+}  // namespace
+
+std::uint32_t hpln_crc32c(std::span<const std::uint8_t> bytes, std::uint32_t crc)
+{
+  // The usual reflected-CRC convention: invert going in and coming out, so a run of zero bytes
+  // does not hash to zero and a truncation is visible.
+  std::uint32_t c = ~crc;
+  auto const* p   = bytes.data();
+  std::size_t n   = bytes.size();
+#if defined(__ARM_FEATURE_CRC32) || defined(__SSE4_2__)
+  while (n >= 8) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, p, 8);
+#if defined(__ARM_FEATURE_CRC32)
+    c = __builtin_aarch64_crc32cx(c, word);
+#else
+    c = static_cast<std::uint32_t>(__builtin_ia32_crc32di(c, word));
+#endif
+    p += 8;
+    n -= 8;
+  }
+#endif
+  auto const& table = crc32c_table();
+  for (std::size_t i = 0; i < n; ++i) {
+    c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+  }
+  return ~c;
+}
+
+std::vector<std::uint8_t> pack_hpln_checksums(std::span<const hpln_checksum_entry> entries)
+{
+  std::vector<std::uint8_t> out;
+  push_le(out, static_cast<std::uint16_t>(1));  // segment version
+  push_le(out, static_cast<std::uint16_t>(1));  // algorithm: 1 = CRC32C
+  push_le(out, static_cast<std::uint32_t>(entries.size()));
+  for (auto const& e : entries) {
+    push_le(out, static_cast<std::uint16_t>(e.kind));
+    push_le(out, static_cast<std::uint16_t>(0));  // reserved, keeps the entry 8-byte aligned
+    push_le(out, e.index);
+    push_le(out, e.offset);
+    push_le(out, e.bytes);
+    push_le(out, e.crc);
+    push_le(out, static_cast<std::uint32_t>(0));  // reserved
+  }
+  return out;
+}
+
+std::string unpack_hpln_checksums(std::span<const std::uint8_t> bytes,
+                                  std::vector<hpln_checksum_entry>& out)
+{
+  constexpr std::size_t kEntryBytes = 32;
+  out.clear();
+  if (bytes.size() < 8) { return "checksum table: truncated header"; }
+  std::uint16_t version = 0, algorithm = 0;
+  std::uint32_t n = 0;
+  std::memcpy(&version, bytes.data(), 2);
+  std::memcpy(&algorithm, bytes.data() + 2, 2);
+  std::memcpy(&n, bytes.data() + 4, 4);
+  if (version != 1) { return "checksum table: unsupported version " + std::to_string(version); }
+  if (algorithm != 1) {
+    return "checksum table: unsupported algorithm " + std::to_string(algorithm);
+  }
+  if (bytes.size() < 8 + static_cast<std::size_t>(n) * kEntryBytes) {
+    return "checksum table: truncated entry table";
+  }
+  out.resize(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto const* p      = bytes.data() + 8 + static_cast<std::size_t>(i) * kEntryBytes;
+    std::uint16_t kind = 0;
+    std::memcpy(&kind, p, 2);
+    out[i].kind = static_cast<hpln_segment>(kind);
+    std::memcpy(&out[i].index, p + 4, 4);
+    std::memcpy(&out[i].offset, p + 8, 8);
+    std::memcpy(&out[i].bytes, p + 16, 8);
+    std::memcpy(&out[i].crc, p + 24, 4);
+  }
+  return {};
+}
+
 std::string write_compressed_tables(std::span<compressed_table const* const> tables,
                                     std::string const& path,
                                     rmm::cuda_stream_view stream,
@@ -778,6 +879,11 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) return "failed to open '" + path + "' for writing";
 
+  // Checksums are computed as the bytes go out, never by reading the file back: a second pass
+  // would hash whatever landed on disk, so a bad write would be certified rather than caught.
+  std::vector<hpln_checksum_entry> sums;
+  sums.reserve(tables.size() * 2 + extra.size() + 1);
+
   std::vector<hpln_chunk_ref> dir(tables.size());
   std::uint64_t at = 0;
   for (std::size_t i = 0; i < tables.size(); ++i) {
@@ -786,6 +892,11 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
     dir[i].num_rows      = tables[i]->num_rows();
     f.write(reinterpret_cast<const char*>(headers[i].data()),
             static_cast<std::streamsize>(headers[i].size()));
+    sums.push_back({hpln_segment::header,
+                    static_cast<std::uint32_t>(i),
+                    at,
+                    headers[i].size(),
+                    hpln_crc32c(headers[i])});
     at += headers[i].size();
   }
   auto const header_region_bytes = at;
@@ -808,6 +919,13 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
     dir[i].payload_bytes  = payload_sizes[i];
     f.write(reinterpret_cast<const char*>(payload.data()),
             static_cast<std::streamsize>(payload.size()));
+    // Per chunk, not once for the whole region: a reader fetches a chunk at a time, and a
+    // checksum it cannot check without reading every other chunk is one it will never check.
+    sums.push_back({hpln_segment::payload,
+                    static_cast<std::uint32_t>(i),
+                    at,
+                    payload_sizes[i],
+                    hpln_crc32c(payload)});
     at += payload_sizes[i];
   }
 
@@ -821,14 +939,25 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
   f.write(reinterpret_cast<const char*>(dir_bytes.data()),
           static_cast<std::streamsize>(dir_bytes.size()));
   segs.push_back({hpln_segment::chunk_directory, at, dir_bytes.size()});
+  sums.push_back({hpln_segment::chunk_directory, 0, at, dir_bytes.size(), hpln_crc32c(dir_bytes)});
   at += dir_bytes.size();
   for (auto const& e : extra) {
     if (e.bytes.empty()) continue;
     f.write(reinterpret_cast<const char*>(e.bytes.data()),
             static_cast<std::streamsize>(e.bytes.size()));
     segs.push_back({e.kind, at, e.bytes.size()});
+    sums.push_back({e.kind, 0, at, e.bytes.size(), hpln_crc32c(e.bytes)});
     at += e.bytes.size();
   }
+
+  // Last of the segments, because it covers all of them and cannot cover itself. The postscript
+  // and the trailer are not covered either: they are read and validated structurally before
+  // anything else, and a reader that cannot parse them never gets as far as a checksum.
+  auto const sum_bytes = pack_hpln_checksums(sums);
+  f.write(reinterpret_cast<const char*>(sum_bytes.data()),
+          static_cast<std::streamsize>(sum_bytes.size()));
+  segs.push_back({hpln_segment::checksums, at, sum_bytes.size()});
+  at += sum_bytes.size();
 
   std::vector<std::uint8_t> ps;
   push_le(ps, static_cast<std::uint16_t>(segs.size()));
