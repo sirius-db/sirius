@@ -1352,14 +1352,6 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     if (result->args.path.empty()) {
       throw BinderException("pin_table: format 'simpatico' requires a positional .hpln path");
     }
-    // A .hpln arrives already compressed, and a compressed chunk holds every column of the file:
-    // a pin of a subset would store all of them but describe only some, so the serve-time
-    // projection -- which indexes the chunk by the entry's column POSITION -- would read the
-    // wrong columns. Refuse rather than pin something that returns plausible wrong values.
-    if (result->args.cols.has_value() && !result->args.cols->empty()) {
-      throw BinderException(
-        "pin_table: 'cols' is not supported for format 'simpatico'; a .hpln is pinned whole");
-    }
     if (!result->args.cluster_by.empty()) {
       // Clustering is a property of how the file was WRITTEN (COPY ... TO ... (FORMAT simpatico)
       // preserves the query's order); an ingest never reorders rows, because doing so would mean
@@ -1469,20 +1461,69 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // built from the same numbers the query side will present -- the reason a pinned .hpln is
     // matched at all (cache_entry_info::can_serve_with_columns).
     auto info = sirius::op::scan::bind_simpatico_file(data.args.path, *host_space, io_ctx);
-    // The whole file: a compressed chunk cannot be stored column-wise, and the bind above refuses
-    // a subset anyway.
+
+    // Which of the file's columns to pin. `cols` names them; without it the whole file is pinned.
+    // Ascending file order, not the order the caller listed: the header's column order is what
+    // every consumer indexes by, so a reordering subset would be a different table rather than a
+    // narrower one -- and the entry's positions line up with the chunk's only if both ascend.
+    std::vector<std::size_t> pinned_columns;
+    if (data.args.cols.has_value() && !data.args.cols->empty()) {
+      for (auto const& wanted : *data.args.cols) {
+        auto const it = std::find(info->names.begin(), info->names.end(), wanted);
+        if (it == info->names.end()) {
+          throw InvalidInputException("pin_table: '%s' has no column named '%s'",
+                                      data.args.path,
+                                      wanted);
+        }
+        pinned_columns.push_back(
+          static_cast<std::size_t>(std::distance(info->names.begin(), it)));
+      }
+      std::sort(pinned_columns.begin(), pinned_columns.end());
+      pinned_columns.erase(std::unique(pinned_columns.begin(), pinned_columns.end()),
+                           pinned_columns.end());
+    } else {
+      pinned_columns.resize(info->names.size());
+      std::iota(pinned_columns.begin(), pinned_columns.end(), std::size_t{0});
+    }
+
+    // The entry's identity is FILE column indices over the file's full name list -- the same
+    // convention a parquet pin uses, and the one cache_entry_info::from expects: it aligns the
+    // full names BY these ids. A query binds the whole file, so it asks for file indices; an entry
+    // numbering its columns 0..n-1 would match nothing.
     info->duckdb_column_ids.clear();
-    for (std::size_t col = 0; col < info->names.size(); ++col) {
+    for (auto const col : pinned_columns) {
       info->duckdb_column_ids.emplace_back(static_cast<duckdb::idx_t>(col));
     }
     auto cache_info = sirius::scan_manager::cache_entry_info::from(*info);
+
+    // Everything describing a CHUNK, on the other hand, is in entry order and covers only the
+    // pinned columns -- because that is what the chunks now physically hold. The zone maps are
+    // renumbered with them: the arena is keyed by column and the serve path indexes it by the
+    // entry's position, so leaving them file-keyed would evaluate a predicate against a
+    // neighbouring column's range and prune the wrong groups.
+    std::vector<std::string> pinned_names;
+    std::vector<cudf::data_type> pinned_physical_types;
+    pinned_names.reserve(pinned_columns.size());
+    pinned_physical_types.reserve(pinned_columns.size());
+    for (auto const col : pinned_columns) {
+      pinned_names.push_back(info->names[col]);
+      pinned_physical_types.push_back(info->physical_types[col]);
+    }
+    auto pinned_bounds = info->group_bounds
+                           ? info->group_bounds->select_columns(pinned_columns)
+                           : sirius::scan_manager::group_bounds_arena{};
 
     std::vector<std::size_t> chunk_ids(info->chunk_rows.size());
     std::iota(chunk_ids.begin(), chunk_ids.end(), std::size_t{0});
     sirius::hpln_open_options open_options;
     open_options.io_ctx = std::move(io_ctx);
-    auto ingested =
-      sirius::read_hpln_chunks_into_pinned(data.args.path, *host_space, chunk_ids, open_options);
+    auto ingested = sirius::read_hpln_chunks_into_pinned(
+      data.args.path,
+      *host_space,
+      chunk_ids,
+      open_options,
+      pinned_columns.size() == info->names.size() ? std::span<const std::size_t>{}
+                                                  : std::span<const std::size_t>{pinned_columns});
     if (ingested.size() != chunk_ids.size()) {
       // Silently serving fewer chunks than the file holds is missing rows, not a slow pin.
       throw InvalidInputException("pin_table: '" + data.args.path + "' staged " +
@@ -1493,7 +1534,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // Decoded footprint of a chunk, which is what the serve path reserves device memory by. The
     // file records the row count and the decoded type per column, so this is exact for
     // fixed-width columns and a floor for variable-width ones.
-    auto const& physical_types  = info->physical_types;
+    auto const& physical_types  = pinned_physical_types;
     auto const decoded_bytes_of = [&physical_types](std::int64_t rows) {
       std::size_t total = 0;
       for (auto const& dtype : physical_types) {
@@ -1512,15 +1553,15 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       host_chunks.push_back(std::make_shared<sirius::compressed_host_representation>(
         *host_space,
         std::move(chunk.blob),
-        info->names,
+        pinned_names,
         static_cast<std::size_t>(payload_bytes),
         decoded_bytes_of(chunk.num_rows),
         chunk.num_rows));
       // What the chunk DECODES to, per column: the recorded carrier is what the serve path sizes
       // a carrier conversion by, and a compressed chunk cannot be introspected for it.
       std::vector<sirius::pinned_column_storage_meta> row;
-      row.reserve(info->physical_types.size());
-      for (auto const& dtype : info->physical_types) {
+      row.reserve(pinned_physical_types.size());
+      for (auto const& dtype : pinned_physical_types) {
         row.push_back(
           sirius::pinned_column_storage_meta{.carrier = dtype, .narrowed = false, .native = dtype});
       }
@@ -1537,7 +1578,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       std::move(cache_info),
       std::move(host_chunks),
       *host_space,
-      info->group_bounds ? *info->group_bounds : sirius::scan_manager::group_bounds_arena{},
+      std::move(pinned_bounds),
       std::move(column_storage));
     SIRIUS_LOG_INFO("[pin_table] '{}': ingested {} chunk(s) of '{}' into the host tier",
                     data.args.name,

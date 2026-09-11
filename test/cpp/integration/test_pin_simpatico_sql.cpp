@@ -207,6 +207,80 @@ TEST_CASE_METHOD(PinSimpaticoFixture,
 }
 
 TEST_CASE_METHOD(PinSimpaticoFixture,
+                 "pin_table stages only the columns cols names, and serves from them",
+                 "[integration][pin_table][pin_simpatico]")
+{
+  auto const file = path("subset.hpln");
+  write_file(file, /*multiplier=*/2);
+  query("CALL pin_table('" + file + "', format => 'simpatico', tier => 'host', name => '" +
+        entry_name() + "', cols => ['v']);");
+
+  // The entry HAS one column, rather than holding two and describing one. That distinction is the
+  // whole correctness argument: every consumer indexes a chunk by the entry's column position, so
+  // a chunk still carrying `k` at position 0 would serve `k` where the query asked for `v`.
+  auto const& e = entry();
+  REQUIRE(e.cache_info.column_names() == std::vector<std::string>{"v"});
+  REQUIRE(e.host_chunks.size() == kChunkCount);
+  REQUIRE(e.num_rows == static_cast<std::size_t>(kRows));
+
+  // The zone maps were renumbered with the columns. Asking for column 0's bounds must give v's,
+  // not k's -- and v = k * 2, so the two are distinguishable by value rather than only by shape:
+  // whichever column landed at position 0 is named by the number, not merely by the shape.
+  // cell(column, chunk) spans the chunk's groups, so the last max is the chunk's last row.
+  REQUIRE(e.group_bounds.chunk_count() == kChunkCount);
+  auto const cell = e.group_bounds.cell(0, 0);
+  REQUIRE_FALSE(cell.mins.empty());
+  REQUIRE(cell.mins.front() == 0);
+  REQUIRE(cell.maxs.back() == static_cast<std::int64_t>(kChunkRows - 1) * 2);
+
+  REQUIRE(sum_v(file) == expected_sum(2));
+
+  // Served from the entry, not re-read: rewriting the file changes what a file scan would return.
+  write_file(file, /*multiplier=*/5);
+  REQUIRE(sum_v(file) == expected_sum(2));
+
+  // A query needing a column the pin does NOT hold cannot be served from it, and must fall back to
+  // the file rather than return whatever sits at that position. The file now holds multiplier 5.
+  auto const k_sum = query("SELECT sum(k) FROM read_simpatico('" + file + "');");
+  std::int64_t expected_k = 0;
+  for (int i = 0; i < kRows; ++i) {
+    expected_k += i;
+  }
+  REQUIRE(k_sum->GetValue(0, 0).GetValue<std::int64_t>() == expected_k);
+
+  query("CALL unpin_table('" + entry_name() + "');");
+}
+
+TEST_CASE_METHOD(PinSimpaticoFixture,
+                 "a cols pin stages less than a whole one",
+                 "[integration][pin_table][pin_simpatico]")
+{
+  // The point of the feature is footprint: a subset pin must actually read and hold fewer bytes,
+  // not merely present fewer columns. Compared against the whole-file pin of the same file.
+  auto const file = path("footprint.hpln");
+  write_file(file, /*multiplier=*/2);
+
+  query("CALL pin_table('" + file + "', format => 'simpatico', tier => 'host', name => '" +
+        entry_name() + "');");
+  std::size_t whole_bytes = 0;
+  for (auto const& chunk : entry().host_chunks) {
+    whole_bytes += chunk->get_size_in_bytes();
+  }
+  query("CALL unpin_table('" + entry_name() + "');");
+
+  query("CALL pin_table('" + file + "', format => 'simpatico', tier => 'host', name => '" +
+        entry_name() + "', cols => ['v']);");
+  std::size_t subset_bytes = 0;
+  for (auto const& chunk : entry().host_chunks) {
+    subset_bytes += chunk->get_size_in_bytes();
+  }
+  query("CALL unpin_table('" + entry_name() + "');");
+
+  REQUIRE(subset_bytes > 0);
+  REQUIRE(subset_bytes < whole_bytes);
+}
+
+TEST_CASE_METHOD(PinSimpaticoFixture,
                  "a pinned .hpln serves NULLs, and does not prune a group holding one",
                  "[integration][pin_table][pin_simpatico]")
 {
@@ -348,13 +422,11 @@ TEST_CASE_METHOD(PinSimpaticoFixture,
   auto const file = path("refused.hpln");
   write_file(file, /*multiplier=*/2);
 
-  // A compressed chunk holds every column of the file, so a subset pin would store all of them
-  // and describe only some -- and the serve-time projection indexes the chunk by the ENTRY's
-  // column position, which would then name the wrong column.
+  // A column the file does not have is refused by name rather than pinned as nothing.
   auto const cols_error =
     query_error("CALL pin_table('" + file + "', format => 'simpatico', tier => 'host', name => '" +
-                entry_name() + "', cols => ['k']);");
-  REQUIRE(cols_error.find("cols") != std::string::npos);
+                entry_name() + "', cols => ['nope']);");
+  REQUIRE(cols_error.find("nope") != std::string::npos);
 
   // cluster_by reorders rows, and a .hpln ingest never decodes -- it stages the payload
   // byte-for-byte, which is the entire reason it is an I/O copy. Accepting the argument would hand

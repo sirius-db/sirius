@@ -427,6 +427,28 @@ using payload_host_read_fn =
 /// exceed the gathered bytes (a bitpack `packed` buffer's decode guard words).
 /// @p out_column_subsetted, when non-null, receives one entry per column of @p header: 1 when the
 /// column was compacted to the surviving chunks, 0 when it was emitted whole.
+/// Synthesize a header describing only @p selected_columns of @p header, with the ranges to gather
+/// from the original payload into the compacted one.
+///
+/// The COLUMN counterpart of @ref build_chunk_subset_header, which narrows rows. The two differ in
+/// how much of the header survives: a row subset keeps every record and rewrites sizes in place,
+/// while dropping a column moves every record after it, so this copies each kept column's bytes
+/// verbatim and patches the payload offsets inside the copy. Both avoid re-serializing a header,
+/// which is what keeps them from drifting away from build_compressed_table_header.
+///
+/// Every buffer of a kept column is taken WHOLE, so unlike the row case no column can refuse: the
+/// result always describes exactly @p selected_columns, in the order given, and a reader handed it
+/// sees an ordinary narrower table. @p selected_columns must be strictly ascending -- the header's
+/// own column order is the one every consumer indexes by, so a reordering subset would be a
+/// different table rather than a narrower one.
+///
+/// @p out_payload_bytes receives the compacted payload's size, the sum of the kept buffers.
+std::string build_column_subset_header(std::span<const std::uint8_t> header,
+                                       std::span<const std::size_t> selected_columns,
+                                       std::vector<std::uint8_t>& out_header,
+                                       std::vector<gather_range>& out_gather,
+                                       std::uint64_t* out_payload_bytes = nullptr);
+
 std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::span<const std::uint32_t> surviving_chunks,
                                       payload_host_read_fn const& read_payload,

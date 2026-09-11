@@ -334,6 +334,76 @@ std::shared_ptr<pinned_compressed_blob> allocate_chunk(std::vector<std::uint8_t>
   return blob;
 }
 
+/// Segments of @p blocks covering `[offset, offset + size)`, for one ranged read's destination.
+///
+/// The pinned allocation is a list of fixed-size blocks, so a byte range that is contiguous in the
+/// FILE is not contiguous in memory; the reader takes a scatter list per extent, which is exactly
+/// this.
+void append_block_segments(cucascade::memory::fixed_size_host_memory_resource::
+                             multiple_blocks_allocation& blocks,
+                           std::uint64_t offset,
+                           std::uint64_t size,
+                           hpln_extent& out)
+{
+  auto const block = blocks.block_size();
+  while (size > 0) {
+    auto const idx    = static_cast<std::size_t>(offset / block);
+    auto const within = offset % block;
+    auto const n      = std::min<std::uint64_t>(block - within, size);
+    out.dst.push_back(
+      {reinterpret_cast<std::uint8_t*>(blocks.at(idx).data()) + within, n});
+    offset += n;
+    size -= n;
+  }
+}
+
+/// Stage only @p columns of @p chunk, as a chunk that genuinely HAS only those columns.
+///
+/// The alternative -- stage everything and describe a subset -- is what pin_table used to refuse,
+/// and rightly: every consumer indexes a chunk by the entry's column position, so a chunk holding
+/// 16 columns behind an entry declaring 4 reads the wrong ones. So the header is rebuilt to
+/// describe exactly @p columns and the payload is gathered to match, which makes the result an
+/// ordinary narrower chunk that nothing downstream has to know about.
+std::shared_ptr<pinned_compressed_blob> allocate_chunk_columns(
+  std::vector<std::uint8_t> const& header,
+  simpatico::hpln_chunk_ref const& chunk,
+  std::span<const std::size_t> columns,
+  cucascade::memory::memory_space& host_space,
+  std::vector<hpln_extent>& out_extents,
+  std::string const& path)
+{
+  std::vector<std::uint8_t> subset_header;
+  std::vector<simpatico::gather_range> gather;
+  std::uint64_t payload_bytes = 0;
+  if (auto const err = simpatico::build_column_subset_header(
+        header, columns, subset_header, gather, &payload_bytes);
+      !err.empty()) {
+    throw std::runtime_error("[hpln ingest] '" + path + "': " + err);
+  }
+
+  auto* host_mr = host_space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  if (host_mr == nullptr) {
+    throw std::runtime_error("[hpln ingest] target host space has no host memory resource");
+  }
+  auto blob           = std::make_shared<pinned_compressed_blob>();
+  blob->header        = std::move(subset_header);
+  auto payload_res    = host_space.make_reservation_or_null(payload_bytes);
+  blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, payload_res.get());
+  blob->payload_bytes = payload_bytes;
+  if (payload_bytes == 0) { return blob; }
+
+  // One extent per gather range. The ranges are already coalesced where a column's buffers are
+  // adjacent in the file -- which the writer makes true for every column, since it assigns payload
+  // offsets column by column -- so a subset of k columns is about k requests, not one per buffer.
+  for (auto const& g : gather) {
+    hpln_extent e;
+    e.offset = chunk.payload_offset + g.src_offset;
+    append_block_segments(*blob->payload, g.dst_offset, g.size, e);
+    out_extents.push_back(std::move(e));
+  }
+  return blob;
+}
+
 /// Open @p path for reading, through @p options's io_context when it has one.
 std::unique_ptr<hpln_source> open_hpln(std::string const& path,
                                        char const* who,
@@ -389,7 +459,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
   std::span<const std::size_t> chunk_ids,
-  hpln_open_options const& options)
+  hpln_open_options const& options,
+  std::span<const std::size_t> columns)
 {
   auto src    = open_hpln(path, "hpln ingest", options);
   auto layout = locate_hpln(*src, path);
@@ -422,13 +493,18 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     }
     auto it = staged.find(id);
     if (it == staged.end()) {
-      it = staged.emplace(id, allocate_chunk(headers[id], layout.chunks[id], host_space, extents))
-             .first;
+      auto blob = columns.empty()
+                    ? allocate_chunk(headers[id], layout.chunks[id], host_space, extents)
+                    : allocate_chunk_columns(
+                        headers[id], layout.chunks[id], columns, host_space, extents, path);
+      it = staged.emplace(id, std::move(blob)).first;
     }
     out.push_back({it->second, layout.chunks[id].num_rows});
   }
   src->read_extents(std::move(extents), options.policy, "chunk payload");
-  if (options.verify_payload && !layout.checksums.empty()) {
+  // A column subset cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
+  // and this read deliberately did not fetch all of it. Same limitation the row subset has.
+  if (options.verify_payload && columns.empty() && !layout.checksums.empty()) {
     // After the read, before the blob is handed to anyone: a caller that got a chunk back has
     // already been told it is intact.
     for (auto const& [id, blob] : staged) {

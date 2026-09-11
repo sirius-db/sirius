@@ -507,6 +507,48 @@ packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t ch
   return out;
 }
 
+group_bounds_arena group_bounds_arena::select_columns(
+  std::span<const std::size_t> columns) const
+{
+  group_bounds_arena out;
+  if (columns.empty() || _n_chunks == 0) { return out; }
+  for (auto const c : columns) {
+    if (c >= _n_columns) { return out; }
+  }
+
+  out._group_rows = _group_rows;
+  out._n_columns  = columns.size();
+  out._n_chunks   = _n_chunks;
+  out._slices.resize(columns.size() * _n_chunks);
+  out._types.reserve(columns.size());
+  out._is_unsigned.reserve(columns.size());
+  out._column_has_no_nulls.reserve(columns.size());
+
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    auto const c = columns[i];
+    out._types.push_back(_types[c]);
+    out._is_unsigned.push_back(_is_unsigned[c]);
+    out._column_has_no_nulls.push_back(_column_has_no_nulls[c]);
+    for (std::size_t chunk = 0; chunk < _n_chunks; ++chunk) {
+      auto const& src = _slices[c * _n_chunks + chunk];
+      auto& dst       = out._slices[i * _n_chunks + chunk];
+      dst.count       = src.count;
+      if (src.count == 0) { continue; }
+      // Mins and maxs are adjacent in the source and stay adjacent here; the copy is what makes
+      // the result standalone, so the subset outlives the arena it came from.
+      dst.offset = out._storage.size();
+      out._storage.insert(out._storage.end(),
+                          _storage.begin() + static_cast<std::ptrdiff_t>(src.offset),
+                          _storage.begin() + static_cast<std::ptrdiff_t>(src.offset + 2 * src.count));
+      dst.valid_offset = out._valid.size();
+      out._valid.insert(out._valid.end(),
+                        _valid.begin() + static_cast<std::ptrdiff_t>(src.valid_offset),
+                        _valid.begin() + static_cast<std::ptrdiff_t>(src.valid_offset + src.count));
+    }
+  }
+  return out;
+}
+
 duckdb::LogicalType group_bounds_arena::column_type(std::size_t column) const
 {
   if (column >= _types.size()) { return duckdb::LogicalType(duckdb::LogicalTypeId::SQLNULL); }

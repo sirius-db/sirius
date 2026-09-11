@@ -514,6 +514,12 @@ struct HeaderFieldOffsets {
     std::vector<Buffer> buffers;
   };
   struct Column {
+    // The column record's byte extent within the header. A COLUMN subset cannot patch offsets in
+    // place the way a row subset does -- it removes records, which moves everything after them --
+    // so it copies each kept column's bytes verbatim and patches those. Recorded here for the
+    // same reason the rest of this struct exists: a second header writer would be free to drift.
+    std::uint64_t begin_at    = 0;
+    std::uint64_t end_at      = 0;
     std::uint64_t num_rows_at = 0;  // int64
     // Where the validity mask's payload_offset sits; only meaningful when the
     // column's record is validity_kind::mask.
@@ -562,6 +568,7 @@ static bool parse_hpln_header(Reader& r,
 
   for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
     auto& cr = out[ci];
+    if (field_offsets) field_offsets->columns[ci].begin_at = field_at();
     if (!r.read_str16(cr.name)) return bad("truncated col name");
     if (!r.read_le(cr.dtype_tag)) return bad("truncated col dtype");
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
@@ -625,6 +632,7 @@ static bool parse_hpln_header(Reader& r,
             : 0;
       }
     }
+    if (field_offsets) field_offsets->columns[ci].end_at = field_at();
   }
   return true;
 }
@@ -1442,6 +1450,120 @@ std::string describe_compressed_table_header(std::span<const std::uint8_t> heade
     }
     out.columns.push_back(std::move(d));
   }
+  return {};
+}
+
+std::string build_column_subset_header(std::span<const std::uint8_t> header,
+                                       std::span<const std::size_t> selected_columns,
+                                       std::vector<std::uint8_t>& out_header,
+                                       std::vector<gather_range>& out_gather,
+                                       std::uint64_t* out_payload_bytes)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
+  out_header.clear();
+  out_gather.clear();
+  if (out_payload_bytes) *out_payload_bytes = 0;
+
+  if (selected_columns.empty()) {
+    return "build_column_subset_header: no columns selected";
+  }
+  for (std::size_t i = 1; i < selected_columns.size(); ++i) {
+    if (selected_columns[i] <= selected_columns[i - 1]) {
+      return "build_column_subset_header: selected_columns must be strictly ascending";
+    }
+  }
+
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  HeaderFieldOffsets offsets;
+  std::string parse_err;
+  if (!parse_hpln_header(r, recs, &parse_err, &offsets)) {
+    return parse_err.empty() ? std::string("build_column_subset_header: malformed header")
+                             : parse_err;
+  }
+  if (selected_columns.back() >= recs.size()) {
+    return "build_column_subset_header: column index out of range";
+  }
+
+  // The fixed prefix -- magic, version, column count -- copied verbatim and then corrected to the
+  // number of columns actually emitted. Everything after it is per column, so the rest of the
+  // header is assembled by copying each kept column's record and patching the payload offsets
+  // inside it; nothing is re-serialized, which is what keeps this from drifting away from
+  // build_compressed_table_header.
+  auto const prefix_bytes = offsets.columns.empty() ? std::size_t{0}
+                                                    : static_cast<std::size_t>(
+                                                        offsets.columns.front().begin_at);
+  if (prefix_bytes == 0 || prefix_bytes > header.size()) {
+    return "build_column_subset_header: header has no column records";
+  }
+  out_header.assign(header.begin(), header.begin() + static_cast<std::ptrdiff_t>(prefix_bytes));
+  {
+    auto const n     = static_cast<std::uint16_t>(selected_columns.size());
+    auto const bytes = std::bit_cast<std::array<std::uint8_t, sizeof(n)>>(n);
+    // The count is the last field of the prefix.
+    std::memcpy(out_header.data() + prefix_bytes - sizeof(n), bytes.data(), bytes.size());
+  }
+
+  auto patch = [&](std::uint64_t at, std::uint64_t value) -> bool {
+    if (at + sizeof(value) > out_header.size()) return false;
+    auto const bytes = std::bit_cast<std::array<std::uint8_t, sizeof(value)>>(value);
+    std::memcpy(out_header.data() + at, bytes.data(), bytes.size());
+    return true;
+  };
+
+  // Contiguous-on-both-sides ranges merge. A selection of every column therefore collapses to one
+  // range over the whole payload, i.e. degrades exactly to the existing whole-chunk copy.
+  auto append_gather = [&](std::uint64_t src, std::uint64_t size, std::uint64_t dst) {
+    if (size == 0) return;
+    if (!out_gather.empty()) {
+      auto& last = out_gather.back();
+      if (src == last.src_offset + last.size && dst == last.dst_offset + last.size) {
+        last.size += size;
+        return;
+      }
+    }
+    out_gather.push_back(gather_range{src, size, dst});
+  };
+
+  std::uint64_t dst_offset = 0;
+  for (auto const ci : selected_columns) {
+    auto const& cr       = recs[ci];
+    auto const& col_offs = offsets.columns[ci];
+    if (col_offs.end_at <= col_offs.begin_at || col_offs.end_at > header.size()) {
+      return "build_column_subset_header: column record extent out of range";
+    }
+    // Where this column's record lands in the output, and hence how far every offset recorded
+    // inside it has moved.
+    auto const new_begin = static_cast<std::uint64_t>(out_header.size());
+    out_header.insert(out_header.end(),
+                      header.begin() + static_cast<std::ptrdiff_t>(col_offs.begin_at),
+                      header.begin() + static_cast<std::ptrdiff_t>(col_offs.end_at));
+    auto const shift = new_begin - col_offs.begin_at;
+
+    // Every buffer is kept WHOLE -- this narrows columns, not rows -- so each one is a single
+    // range and the compacted payload is their concatenation. No decode guard words are involved:
+    // those exist only where a row subset slices within a buffer.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const size = cr.validity.size_bytes;
+      if (!patch(col_offs.validity_payload_offset_at + shift, dst_offset)) {
+        return "build_column_subset_header: header field offset out of range";
+      }
+      append_gather(cr.validity.payload_offset, size, dst_offset);
+      dst_offset += size;
+    }
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
+        auto const size = cr.leaf_descs[li].buffers[bi].size_bytes;
+        if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at + shift, dst_offset)) {
+          return "build_column_subset_header: header field offset out of range";
+        }
+        append_gather(cr.buf_offsets[li][bi], size, dst_offset);
+        dst_offset += size;
+      }
+    }
+  }
+
+  if (out_payload_bytes) *out_payload_bytes = dst_offset;
   return {};
 }
 

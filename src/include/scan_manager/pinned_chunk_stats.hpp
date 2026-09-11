@@ -272,6 +272,19 @@ class group_bounds_arena {
    */
   void mark_column_nullable(std::size_t column);
 
+  /**
+   * @brief A copy holding only @p columns, renumbered to their position in @p columns.
+   *
+   * The arena is keyed by column, and a pinned entry indexes it by the ENTRY's column position --
+   * so an entry that pins a subset of a file's columns needs the bounds renumbered to match, or
+   * every predicate would be evaluated against a neighbouring column's range. Silently wrong
+   * answers, not an error, which is why this exists rather than the caller indexing around it.
+   *
+   * An out-of-range entry in @p columns yields an empty arena: pruning nothing is the safe
+   * failure, and a partially built one would prune on the wrong column.
+   */
+  [[nodiscard]] group_bounds_arena select_columns(std::span<const std::size_t> columns) const;
+
  private:
   struct slice {
     std::size_t offset{0};        ///< index into _storage of this (column, chunk)'s mins
