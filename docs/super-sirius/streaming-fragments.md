@@ -79,6 +79,7 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   void erase(stream_id_t id);                                   // drop one; no-op if absent
 
   const stream_input_binding& get(stream_id_t id) const;        // @throws if undeclared
+  std::optional<std::uint64_t> estimated_rows(stream_id_t id) const;  // nullopt if undeclared
   void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
 };
 
@@ -119,6 +120,18 @@ otherwise return anything the fragment layer can see) gets back to the session t
   up registered with the session, so the earlier one never receives a push or a close and its
   pipeline waits forever with no error anywhere. Fan-out reads of one declared stream are not
   supported; if a plan genuinely needs that, feed each reader its own stream id instead.
+- **Declaring a stream's row count is optional, and the optimizer only sees it if you do.** A
+  `sirius_stream_source` relation has no rows behind it at bind time, so on its own DuckDB
+  estimates cardinality 1 for every input stream and picks hash-join build sides blind at every
+  fragment boundary. `stream_input_spec::estimated_rows` (forwarded into
+  `stream_input_binding::estimated_rows` by `build()`) lets the caller declare the count; the
+  table function's `cardinality` callback (`stream_source_cardinality`) reads it back through
+  `stream_bind_catalog::estimated_rows(id)` and feeds `LogicalGet::EstimateCardinality`, which is
+  what `create_streaming_source_plan()` already consumes for the `STREAMING_SOURCE` operator's
+  `estimated_cardinality`. Undeclared (`nullopt`) means the callback returns `nullptr` and the
+  optimizer keeps its default (cardinality 1) — exactly the pre-existing behavior. The reader
+  never throws, unlike `get()`, because DuckDB may ask for cardinality outside the window where a
+  fragment's declarations are alive.
 - **The catalog must exist before any bind can succeed.** Both the transparent (normal SQL)
   connection path and the FFI's own embedded connection install a `stream_bind_catalog` when the
   connection opens — `SiriusContextExtensionCallback::OnConnectionOpened` for the former,
@@ -132,6 +145,13 @@ Owns one fragment's complete life cycle: declares inputs into the catalog, plans
 sink, runs, and keeps the output pullable after `run()` returns.
 
 ```cpp
+struct stream_input_spec {
+  std::vector<std::string> names;
+  duckdb::vector<sirius::logical_type> types;
+  std::set<sender_id_t> expected_senders;             // sender-set EOS
+  std::optional<std::uint64_t> estimated_rows;        // optional: declared row count (optimizer)
+};
+
 struct fragment_spec {
   logical_plan_source plan_source;                    // ClientContext& -> LogicalOperator
   std::map<stream_id_t, stream_input_spec> inputs;     // schema + expected senders per input
