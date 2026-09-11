@@ -46,9 +46,6 @@ pub(crate) const COUNT_SUFFIX: &str = "__count";
 #[derive(Debug)]
 pub(crate) struct WireColumn {
     /// Suffix appended to the FE's intermediate slot name; empty for the measure's own column.
-    // Only avg's second column carries a suffix, and the layer that expands avg is the one that
-    // names the emitted row from it; until then nothing outside the tests reads it.
-    #[allow(dead_code)]
     pub suffix: &'static str,
     /// Modeled Substrait type of the column.
     pub ty: Type,

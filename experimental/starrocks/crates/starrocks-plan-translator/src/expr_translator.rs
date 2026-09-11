@@ -652,6 +652,12 @@ pub(crate) struct AggregateCall {
     pub name: String,
     /// Translated argument expressions over the aggregation input row.
     pub arguments: Vec<Expression>,
+    /// The same arguments before the decimal-to-FP64 lowering.
+    ///
+    /// A caller that expands one StarRocks measure into several Sirius measures needs the
+    /// argument without a cast that only fits one of them: a two-phase avg counts the raw
+    /// values and sums the cast ones.
+    pub raw_arguments: Vec<Expression>,
     /// Whether the aggregate applies to distinct inputs.
     pub distinct: bool,
 }
@@ -729,14 +735,15 @@ pub(crate) fn aggregate_call(
     // column; the decimal `ret_type` that drives this condition describes the original input,
     // not the child the measure actually reads.
     let arguments = if decimal_result && matches!(name, "sum" | "avg") && !merge {
-        raw_arguments.into_iter().map(cast_to_fp64).collect()
+        raw_arguments.iter().cloned().map(cast_to_fp64).collect()
     } else {
-        raw_arguments
+        raw_arguments.clone()
     };
 
     Ok(AggregateCall {
         name: name.to_string(),
         arguments,
+        raw_arguments,
         distinct,
     })
 }
