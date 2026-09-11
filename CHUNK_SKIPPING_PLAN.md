@@ -1846,19 +1846,32 @@ a globally ordered file partitions the key space across chunks, so whole chunks 
 and a chunk that prunes is **a network request never issued** (§7.6). Paying once at write for an
 ordering that is reused by every reader is a different calculus from paying on every pin.
 
-### Follow-ups
+### Follow-ups — all done (2026-09-11)
 
-- **Refuse `cluster_by` on a simpatico pin** rather than silently ignoring it (see above).
-- **Add `cluster_by` to the `COPY … TO` writer.** Small: the writer already holds each chunk as a
-  `cudf::table` before compressing, so it is a `sort_by_key` in the right place. This is what moves
-  clustering from a per-pin cost to a write-once property of the data.
+- ~~Refuse `cluster_by` on a simpatico pin~~ — the refusal shipped with the pin itself; what was
+  missing was a test, which is its own lesson.
+- ~~Add `cluster_by` to the `COPY … TO` writer~~ — the cheap streaming option. A local sort per
+  chunk narrows groups but leaves every chunk spanning the key range, so **whole chunks still do
+  not prune**; a global `ORDER BY` in the SELECT remains the stronger, more expensive alternative.
+- ~~`IS NULL` pruning~~ — DuckDB never lowers a standalone `IS NULL` into a `TableFilter`
+  (`IsNullFilter` is built in one optimizer path, inside an OR of `IS NOT DISTINCT FROM`), so it
+  arrived as a `LogicalFilter` above the scan and the ingestible was blameless. Harvested via
+  `pushdown_complex_filter` WITHOUT consuming the conjunct, so a mistake cannot produce a wrong
+  answer. Value is all-or-nothing: nullability is per column in the header, so `IS NULL` either
+  empties the file or prunes nothing.
+- ~~Checksums~~ — CRC32C per chunk for header and payload, once each for the other segments.
+  Metadata is verified on every open (it decides *where* the payload is read); payload verification
+  is opt-in via `SIRIUS_HPLN_VERIFY_PAYLOAD`, because checking 16 MB costs real bandwidth on the
+  hot path. No version bump — unknown segment kinds were already skipped. **A subsetted read
+  cannot be verified**: the checksum is per chunk, and pruning narrows a chunk to some of its
+  decode chunks.
 
 ### Honest state
 
 What exists is the bottom of the stack: the container is self-locating, carries logical types and
 per-group zone maps, and stages into pinned memory byte-for-byte. A is days; A–D is weeks. The
 format now carries nullability (merged from `feat/compression-nullable-columns`, file version 12)
-but still has no checksums before anyone stores data they care about in it — a corrupt payload currently decodes to wrong values rather than an error,
+and CRC32C checksums (segment kind 6), so corruption is an error rather than wrong values — a corrupt payload currently decodes to wrong values rather than an error,
 which is the same failure shape as every other bug this project has hit.
 
 ## 8. Where the index should live: device, host, spilled
