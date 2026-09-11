@@ -307,9 +307,7 @@ int main(int argc, char** argv)
                                                                1);               // initial_pools
 
     auto uring_ctx = std::make_shared<sirius::io::uring::uring_reactor::reactor_context>(
-      sirius::io::uring::uring_reactor::reactor_config_type{.bounce_size =
-                                                              host_mr.get_block_size()},
-      &host_mr);
+      sirius::io::uring::uring_reactor::reactor_config_type{}, &host_mr);
     auto io_ctx =
       std::make_shared<sirius::io::uring::uring_ioctx>(n_reactors, std::move(uring_ctx));
     io_ctx->start();
