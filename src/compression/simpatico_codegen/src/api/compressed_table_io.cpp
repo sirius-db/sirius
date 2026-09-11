@@ -258,11 +258,21 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // A fixed-point leaf is not a numeric column to cuDF, and make_numeric_column throws on one.
+    // The tag carries no scale (the column record does), but that does not matter here: the leaf
+    // holds the codec's integer storage, and apply_stored_dtype re-tags the decoded column with
+    // the column's real scale afterwards. Only the width has to be right.
+    auto col = cudf::is_fixed_point(dt)
+                 ? cudf::make_fixed_point_column(dt,
+                                                 static_cast<cudf::size_type>(bd.num_rows),
+                                                 cudf::mask_state::UNALLOCATED,
+                                                 stream,
+                                                 leaf_mr)
+                 : cudf::make_numeric_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }

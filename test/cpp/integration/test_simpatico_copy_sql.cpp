@@ -130,6 +130,43 @@ TEST_CASE_METHOD(SimpaticoCopyFixture,
 }
 
 TEST_CASE_METHOD(SimpaticoCopyFixture,
+                 "COPY to .hpln round-trips a DECIMAL at every carrier width",
+                 "[integration][simpatico_copy]")
+{
+  // A fixed-point column's scale lives beside its type tag in the header, not in the tag, so a
+  // reader that rebuilds the carrier from the tag alone gets DECIMAL64 scale 0 where the decode
+  // produces DECIMAL64 scale -2. That is a different cudf::data_type, and the plan generator
+  // refuses the column -- which made every TPC-H table unreadable while the writer was fine.
+  // One case per carrier: DECIMAL32, DECIMAL64 (what TPC-H money columns are), DECIMAL128.
+  //
+  // The fractional parts are added, not produced by a multiply: a cast that rounds differs
+  // between the engines by a last digit, which would make this test about rounding.
+  auto const projection = std::string(
+    "a, (a + 0.25)::DECIMAL(9, 2) AS d32, (b + 0.25)::DECIMAL(15, 2) AS d64, "
+    "(b + 0.0625)::DECIMAL(30, 4) AS d128");
+  auto const file = path("decimals.hpln");
+  query("COPY (SELECT " + projection + " FROM src ORDER BY a) TO '" + file +
+        "' (FORMAT simpatico);");
+
+  auto const schema = sirius::read_hpln_schema(file);
+  REQUIRE(schema.types.size() == 4);
+  REQUIRE(schema.types[1] == duckdb::LogicalType::DECIMAL(9, 2));
+  REQUIRE(schema.types[2] == duckdb::LogicalType::DECIMAL(15, 2));
+  REQUIRE(schema.types[3] == duckdb::LogicalType::DECIMAL(30, 4));
+
+  auto written   = query("SELECT " + projection + " FROM src ORDER BY a;");
+  auto read_back = query("SELECT a, d32, d64, d128 FROM read_simpatico('" + file + "') ORDER BY a;");
+  REQUIRE(read_back->RowCount() == static_cast<duckdb::idx_t>(kRows));
+  REQUIRE(ordered_rows(*read_back) == ordered_rows(*written));
+
+  // And the decimal must survive arithmetic on the GPU, not merely be emitted: a carrier whose
+  // scale is wrong by 100x sums to a wrong number while every row still "reads back".
+  auto sum = query("SELECT sum(d64) FROM read_simpatico('" + file + "');");
+  auto ref = query("SELECT sum((b + 0.25)::DECIMAL(15, 2)) FROM src;");
+  REQUIRE(sum->GetValue(0, 0).ToString() == ref->GetValue(0, 0).ToString());
+}
+
+TEST_CASE_METHOD(SimpaticoCopyFixture,
                  "COPY to .hpln cuts the stream into chunk_rows-sized chunks",
                  "[integration][simpatico_copy]")
 {
