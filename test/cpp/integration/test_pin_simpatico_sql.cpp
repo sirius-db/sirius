@@ -356,6 +356,16 @@ TEST_CASE_METHOD(PinSimpaticoFixture,
                 entry_name() + "', cols => ['k']);");
   REQUIRE(cols_error.find("cols") != std::string::npos);
 
+  // cluster_by reorders rows, and a .hpln ingest never decodes -- it stages the payload
+  // byte-for-byte, which is the entire reason it is an I/O copy. Accepting the argument would hand
+  // back an unclustered pin the caller believes is clustered, so it is refused and the message
+  // points at the writer, where a file's order is decided.
+  auto const cluster_error =
+    query_error("CALL pin_table('" + file + "', format => 'simpatico', tier => 'host', name => '" +
+                entry_name() + "', cluster_by => ['k']);");
+  REQUIRE(cluster_error.find("cluster_by") != std::string::npos);
+  REQUIRE(cluster_error.find("written") != std::string::npos);
+
   // The file IS the host representation; there is no GPU-tier form of it to pin without decoding.
   auto const tier_error =
     query_error("CALL pin_table('" + file + "', format => 'simpatico', tier => 'gpu', name => '" +
