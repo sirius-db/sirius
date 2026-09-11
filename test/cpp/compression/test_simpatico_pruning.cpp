@@ -281,6 +281,55 @@ TEST_CASE("simpatico pruning - no filter prunes nothing", "[compression][simpati
   REQUIRE(keys.back() == 3 * 1000000 + kRowsPerChunk - 1);
 }
 
+TEST_CASE("simpatico pruning - IS NULL on a never-null column empties the file",
+          "[compression][simpatico_pruning]")
+{
+  if (no_gpu()) { return; }
+  fixture_dir fx("isnull");
+  auto info = bind_with_filter(fx.path, nullptr);
+  // What the chunk headers record, not what the zone maps do: this holds for a file with no
+  // `zone_maps` segment at all.
+  REQUIRE(info->column_has_nulls.size() == 2);
+  REQUIRE_FALSE(info->column_has_nulls[1]);
+  // `WHERE v IS NULL`, as the scan's pushdown_complex_filter hook harvests it -- DuckDB never
+  // lowers a standalone IS NULL into a TableFilter, so it cannot arrive as one.
+  info->is_null_columns = {1};
+
+  auto ing = scan::make_ingestible(std::move(info));
+  // Everything but the sentinel chunk, which exists so the pipeline still sees one batch.
+  REQUIRE(ing->pruning().chunks_pruned == static_cast<std::size_t>(kChunks) - 1);
+  REQUIRE(ing->pruning().decode_chunks_pruned ==
+          ing->pruning().decode_chunks_total -
+            (static_cast<std::size_t>(kRowsPerChunk) + 1023) / 1024);
+
+  auto const batches = collect_splits(*ing);
+  auto const keys    = decode_keys(*ing, batches, /*apply_filter=*/false);
+  // Only chunk 0 was read. Its rows are emitted unfiltered: the IS NULL predicate was never taken
+  // out of the plan, so the filter above the scan is what empties them.
+  REQUIRE(keys.size() == static_cast<std::size_t>(kRowsPerChunk));
+  REQUIRE(keys.front() == 0);
+}
+
+TEST_CASE("simpatico pruning - IS NULL on a column that has nulls prunes nothing",
+          "[compression][simpatico_pruning]")
+{
+  if (no_gpu()) { return; }
+  fixture_dir fx("isnull_neg");
+  auto info             = bind_with_filter(fx.path, nullptr);
+  info->is_null_columns = {1};
+  // The negative control for the case above: the same predicate on a column the file says CAN
+  // hold a null must read every chunk. A group's bounds say nothing about which of its rows are
+  // null, so there is nothing finer to decide on.
+  info->column_has_nulls[1] = true;
+
+  auto ing = scan::make_ingestible(std::move(info));
+  REQUIRE(ing->pruning().chunks_pruned == 0);
+  REQUIRE(ing->pruning().decode_chunks_pruned == 0);
+  auto const batches = collect_splits(*ing);
+  REQUIRE(decode_keys(*ing, batches, /*apply_filter=*/false).size() ==
+          static_cast<std::size_t>(kChunks) * kRowsPerChunk);
+}
+
 TEST_CASE("simpatico pruning - a chunk that cannot match is never read",
           "[compression][simpatico_pruning]")
 {
