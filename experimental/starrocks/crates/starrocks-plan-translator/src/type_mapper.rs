@@ -33,6 +33,17 @@ pub(crate) fn fp64_type(nullable: bool) -> Type {
     }
 }
 
+/// Builds an I64 (BIGINT) type, the width the engine returns for builtins the frontend declares
+/// narrower (year/month/day, length/char_length).
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
 /// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
 /// an input stream's schema.
 ///

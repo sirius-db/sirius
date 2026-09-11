@@ -2763,33 +2763,399 @@ fn multi_distinct_count_translates_to_distinct_count() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
-/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
-#[test]
-fn merge_aggregation_is_rejected() {
-    let mut aggregate = aggregate_expr(
-        "sum",
-        scalar_type(TPrimitiveType::BIGINT),
-        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
-    );
-    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
-    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
-    // single aggregate output slot.
-    let desc = desc_table(
+/// Descriptor for the phase-classification tests: scan tuple 0 and an aggregation output
+/// tuple 1 with a single ungrouped aggregate slot.
+fn scalar_agg_desc() -> TDescriptorTable {
+    desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
             slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
             slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
             slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
         ],
+    )
+}
+
+/// A scalar `sum(id)` aggregation node with per-measure merge flags and the node's
+/// `need_finalize`, for driving the phase classifier from tests.
+fn phase_aggregation_node(merge_flags: &[bool], need_finalize: bool) -> TPlanNode {
+    let aggregates = merge_flags
+        .iter()
+        .map(|&is_merge| {
+            let mut aggregate = aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            );
+            aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(is_merge));
+            aggregate
+        })
+        .collect();
+    let mut node = aggregation_node(1, 1, Vec::new(), aggregates);
+    node.agg_node.as_mut().unwrap().need_finalize = need_finalize;
+    node
+}
+
+fn translate_phase_case(node: TPlanNode) -> Result<TranslatedPlan, TranslateError> {
+    translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(scalar_agg_desc()),
+        None,
+    ))
+}
+
+/// Verifies a merge aggregation whose child is not an exchange is rejected: its input columns
+/// would carry FE-declared types the wire-type override never corrected.
+#[test]
+fn merge_over_a_scan_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("exchange"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Builds the merge fragment of a two-phase `sum(decimal), count(*)` query: a merge
+/// aggregation (node 8, output tuple 3) over an exchange (node 7) carrying the intermediate
+/// tuple 2, whose FE-declared slot types are the ones the wire-type model must override.
+fn merge_fragment_params() -> TExecPlanFragmentParams {
+    let exchange = exchange_node_with(7, vec![2], None, None);
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        Some(slot_ref(
+            10,
+            2,
+            scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        )),
     );
-    let err = translate_fragment(&params(
-        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let mut count = aggregate_expr(
+        "count",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(11, 2, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let aggregate = aggregation_node(8, 3, Vec::new(), vec![sum, count]);
+
+    let desc = desc_table(
+        vec![(2, None), (3, None)],
+        vec![
+            // The FE declares the intermediate sum slot as DECIMAL128, the lie the override
+            // corrects; the wire column is the partial fragment's FP64 output.
+            slot(
+                10,
+                2,
+                "s",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(11, 2, "c", scalar_type(TPrimitiveType::BIGINT)),
+            slot(
+                12,
+                3,
+                "revenue",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(13, 3, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    params(
+        Some(TPlan::new(vec![aggregate, exchange])),
+        Some(desc),
+        None,
+    )
+}
+
+/// Verifies the merge fragment of a two-phase aggregation translates to a plain aggregate
+/// with the substituted merge functions (count merges as SUM of partial counts) over an
+/// exchange whose declared stream types are the modeled wire types, not the FE's
+/// DECIMAL128 intermediate slot type, and that the fragment leaves through the finalizing
+/// projection that casts every measure to its FE-declared output-slot type. The engine binds
+/// the merged count (a sum over BIGINT) as HUGEINT, so without the cast this fragment's output
+/// feeding a further downstream fragment would be refused by the hop's schema guard.
+#[test]
+fn merge_aggregation_translates_with_substituted_functions() {
+    let translated = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_fragment_params(),
+            &[stream_input(7, &["s", "c"])],
+        )
+        .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["revenue", "cnt"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the finalizing project over the merge aggregate");
+    };
+    // One throwing cast per measure, to the FE's output-slot types as the type mapper declares
+    // them: the DECIMAL128(38,2) sum slot lowers to FP64 (precision > 18), the same lowering a
+    // downstream exchange applies when it derives its stream schema from this very slot, and
+    // the count leaves as the BIGINT its slot declares (the engine binds it as HUGEINT).
+    assert_eq!(project.expressions.len(), 2);
+    let (sum_type, sum_input) = cast_parts(&project.expressions[0]);
+    assert!(
+        matches!(sum_type, substrait::proto::r#type::Kind::Fp64(_)),
+        "{sum_type:?}"
+    );
+    assert_eq!(field_index(sum_input), 0);
+    let (count_type, count_input) = cast_parts(&project.expressions[1]);
+    assert!(
+        matches!(count_type, substrait::proto::r#type::Kind::I64(_)),
+        "{count_type:?}"
+    );
+    assert_eq!(field_index(count_input), 1);
+
+    let aggregate = root_aggregate(&translated.plan);
+    assert_eq!(aggregate.measures.len(), 2);
+    for measure in &aggregate.measures {
+        assert_eq!(
+            measure.measure.as_ref().unwrap().phase,
+            substrait::proto::AggregationPhase::IntermediateToResult as i32
+        );
+    }
+    // count merged as count would count rows instead of summing partial counts; the only
+    // registered aggregate must be sum.
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(!names.contains(&"count".to_string()), "{names:?}");
+
+    // The engine declaration derives from the overridden types: DOUBLE, not DECIMAL(38,2).
+    assert_eq!(translated.stream_inputs.len(), 1);
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("s", "DOUBLE"), ("c", "BIGINT")]
+    );
+}
+
+/// Verifies both fragments of one two-phase query derive the same wire types: the partial
+/// fragment's measure output types match the merge fragment's declared stream columns
+/// column-for-column (FP64 <-> DOUBLE, I64 <-> BIGINT).
+#[test]
+fn two_phase_wire_types_agree_end_to_end() {
+    // Partial fragment: sum(decimal) + count(*) over a scan, need_finalize = false.
+    let mut sum = aggregate_expr(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+        Some(slot_ref(
+            1,
+            0,
+            scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+        )),
+    );
+    sum.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut count = aggregate_expr("count", scalar_type(TPrimitiveType::BIGINT), None);
+    count.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![sum, count]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(
+                1,
+                0,
+                "price",
+                scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(15), Some(2)),
+            ),
+            slot(
+                20,
+                1,
+                "s",
+                scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(2)),
+            ),
+            slot(21, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let partial = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
         Some(desc),
         None,
     ))
-    .unwrap_err();
-    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+    .unwrap();
+
+    let root = root(&partial.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    let partial_kinds: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|measure| {
+            match measure
+                .measure
+                .as_ref()
+                .unwrap()
+                .output_type
+                .as_ref()
+                .unwrap()
+                .kind
+                .as_ref()
+                .unwrap()
+            {
+                substrait::proto::r#type::Kind::Fp64(_) => "DOUBLE",
+                substrait::proto::r#type::Kind::I64(_) => "BIGINT",
+                other => panic!("unexpected partial state kind {other:?}"),
+            }
+        })
+        .collect();
+
+    // Merge fragment of the same query (identical FE-serialized functions).
+    let merge = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &merge_fragment_params(),
+            &[stream_input(7, &["s", "c"])],
+        )
+        .unwrap();
+    let merge_types: Vec<_> = merge.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| column.ty.as_str())
+        .collect();
+
+    assert_eq!(partial_kinds, merge_types);
+}
+
+/// Verifies a partial-phase ("update serialize") aggregation translates to a plain aggregate
+/// whose measure carries the InitialToIntermediate phase and the modeled partial-state type
+/// (I64 for an integer sum), not the FE's declared slot type.
+#[test]
+fn partial_aggregation_translates_with_the_modeled_state_type() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], false)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(
+        measure.phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
+    let output_type = measure.output_type.as_ref().unwrap();
+    assert!(
+        matches!(
+            output_type.kind.as_ref().unwrap(),
+            substrait::proto::r#type::Kind::I64(_)
+        ),
+        "{output_type:?}"
+    );
+    let names: Vec<_> = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+}
+
+/// Extracts the aggregate relation a plan roots at, through an optional finalizing project.
+fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
+    let mut input = root(plan).input.as_ref().unwrap();
+    if let rel::RelType::Project(project) = input.rel_type.as_ref().unwrap() {
+        input = project.input.as_ref().unwrap();
+    }
+    let rel::RelType::Aggregate(aggregate) = input.rel_type.as_ref().unwrap() else {
+        panic!("expected an aggregate relation, got {input:?}");
+    };
+    aggregate
+}
+
+/// Verifies a two-phase avg is refused with an error naming the layer that lands it: its
+/// Sirius state is a sum and a count, two columns for the one slot the FE allocates, and this
+/// layer emits exactly one column per measure.
+#[test]
+fn two_phase_avg_is_refused_until_the_next_layer() {
+    let mut aggregate = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let err = translate_phase_case(node).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("two-phase avg"), "{message}");
+    assert!(message.contains("next translator layer"), "{message}");
+    assert!(message.contains("new_planner_agg_stage"), "{message}");
+}
+
+/// Verifies grouped two-phase aggregation translates: the partial node keeps its grouping key
+/// and emits the modeled state type for the measure.
+#[test]
+fn grouped_two_phase_translates() {
+    let mut aggregate = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(false));
+    let mut node = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate],
+    );
+    node.agg_node.as_mut().unwrap().need_finalize = false;
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![node, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToIntermediate as i32
+    );
+}
+
+/// Verifies the one-shot path labels its measures InitialToResult (advisory; the engine
+/// ignores phases, but dumped plans should say what each aggregate is).
+#[test]
+fn one_shot_measures_are_labeled_initial_to_result() {
+    let translated = translate_phase_case(phase_aggregation_node(&[false], true)).unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(
+        aggregate.measures[0].measure.as_ref().unwrap().phase,
+        substrait::proto::AggregationPhase::InitialToResult as i32
+    );
+}
+
+/// Verifies the "merge serialize" combination (a 3/4-phase DISTINCT plan's middle stage) is
+/// rejected as such.
+#[test]
+fn merge_serialize_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true], false)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("merge-serialize"), "{message}");
+}
+
+/// Verifies a node mixing merge and update measures cannot be phase-classified and is rejected.
+#[test]
+fn mixed_phase_aggregation_is_rejected() {
+    let err = translate_phase_case(phase_aggregation_node(&[true, false], true)).unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedPlanNode { .. }));
+    let message = err.to_string();
+    assert!(message.contains("mixes merge and update"), "{message}");
 }
 
 /// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
@@ -3830,6 +4196,26 @@ fn function_calls_use_allowlist() {
     ))
     .unwrap_err();
     assert!(matches!(err, TranslateError::MalformedPlan(_)));
+}
+
+/// Splits a throwing cast into its target-type kind and input expression.
+fn cast_parts(
+    expr: &substrait::proto::Expression,
+) -> (
+    &substrait::proto::r#type::Kind,
+    &substrait::proto::Expression,
+) {
+    let expression::RexType::Cast(cast) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected cast, got {expr:?}");
+    };
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+    (
+        cast.r#type.as_ref().unwrap().kind.as_ref().unwrap(),
+        cast.input.as_ref().unwrap(),
+    )
 }
 
 /// Verifies CASE WHEN chains become Substrait if-then expressions with a null default.

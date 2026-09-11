@@ -416,7 +416,7 @@ fn translate_arithmetic(
 }
 
 /// Returns whether a StarRocks type descriptor is any decimal flavour.
-fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
+pub(crate) fn is_decimal(type_desc: &starrocks_thrift::types::TTypeDesc) -> Result<bool> {
     Ok(matches!(
         type_mapper::scalar_primitive(type_desc)?,
         TPrimitiveType::DECIMAL
@@ -658,7 +658,14 @@ pub(crate) struct AggregateCall {
 
 /// Decomposes a StarRocks aggregate-function expression (the root of a
 /// `TAggregationNode::aggregate_functions` entry) into name, arguments, and distinct-ness.
-pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<AggregateCall> {
+///
+/// `merge` marks a measure of a merge-phase aggregation, whose arguments are references to
+/// partial-state columns rather than raw rows.
+pub(crate) fn aggregate_call(
+    expr: &TExpr,
+    ctx: &mut ExprContext<'_>,
+    merge: bool,
+) -> Result<AggregateCall> {
     let root = expr
         .nodes
         .first()
@@ -673,18 +680,9 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "aggregate function root is not an aggregate expression",
         });
     }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
-        });
-    }
+    // No merge check here: the phase decision belongs to the node-level classifier
+    // (`agg_phase::classify`), which sees every measure at once. Rejecting merges in one
+    // place and classifying them in another is how the two guards would drift apart.
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
         context: "aggregate expression",
         field: "fn",
@@ -723,22 +721,18 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
     let mut cursor = ExprNodeCursor::new(&expr.nodes);
     // Consume the root marker; its children are the aggregate arguments.
     cursor.idx = 1;
-    let mut arguments = (0..root.num_children)
+    let raw_arguments = (0..root.num_children)
         .map(|_| cursor.translate_next(ctx))
         .collect::<Result<Vec<_>>>()?;
     cursor.ensure_consumed()?;
-    if decimal_result && matches!(name, "sum" | "avg") {
-        arguments = arguments
-            .into_iter()
-            .map(|input| Expression {
-                rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
-                    r#type: Some(type_mapper::fp64_type(true)),
-                    input: Some(Box::new(input)),
-                    failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
-                }))),
-            })
-            .collect();
-    }
+    // Not on the merge side: a merge measure's argument is already the FP64 partial-state
+    // column; the decimal `ret_type` that drives this condition describes the original input,
+    // not the child the measure actually reads.
+    let arguments = if decimal_result && matches!(name, "sum" | "avg") && !merge {
+        raw_arguments.into_iter().map(cast_to_fp64).collect()
+    } else {
+        raw_arguments
+    };
 
     Ok(AggregateCall {
         name: name.to_string(),
@@ -900,6 +894,26 @@ fn integer_literal_type(
             node_type: Some(starrocks_thrift::types::TTypeNodeType::SCALAR),
             reason: "INT_LITERAL has non-integer scalar type",
         }),
+    }
+}
+
+/// Wraps an expression in the throwing FP64 cast that lowers values Sirius cannot aggregate
+/// or divide in their declared type (decimals, and the inputs of a two-phase avg).
+pub(crate) fn cast_to_fp64(input: Expression) -> Expression {
+    cast_to(input, type_mapper::fp64_type(true))
+}
+
+/// Wraps an expression in a throwing cast to `ty`.
+///
+/// A cast to the type the expression already has is a no-op the consumer's binder elides, so
+/// this is safe to emit wherever the type has to be stated rather than inferred.
+pub(crate) fn cast_to(input: Expression, ty: Type) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Cast(Box::new(expression::Cast {
+            r#type: Some(ty),
+            input: Some(Box::new(input)),
+            failure_behavior: expression::cast::FailureBehavior::ThrowException as i32,
+        }))),
     }
 }
 
