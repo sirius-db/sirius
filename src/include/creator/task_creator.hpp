@@ -26,6 +26,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
 
@@ -110,15 +111,22 @@ class task_creator {
   task_creator(task_creator&&)                 = delete;
   task_creator& operator=(task_creator&&)      = delete;
 
-  /// \brief Narrow this query to a GPU subset, replacing the constructor's topology-derived
-  /// list. Called once per query by sirius_engine::initialize_internal.
+  /// \brief Narrow @p query_id to a GPU subset. Called once per query by
+  /// sirius_engine::initialize_internal, before prepare_for_query() runs for that query.
+  /// Written into that query's own state (see query_task_global_state::active_gpu_ids)
   ///
   /// @param full_count how many GPUs existed before narrowing. Passed in rather than inferred
   /// so it and @p ids are cut from the same list.
-  void set_active_gpu_ids(std::vector<int> ids, std::size_t full_count);
+  ///
+  /// No-op when @p query_id has no state yet: sirius_engine::initialize() is a
+  /// standalone entry point some tests use to build/inspect a plan without opening a real
+  /// execution window.
+  void set_active_gpu_ids(sirius::query_id_t query_id,
+                          std::vector<int> ids,
+                          std::size_t full_count);
 
-  /// \brief The GPU subset this query was admitted onto.
-  [[nodiscard]] const std::vector<int>& get_active_gpu_ids() const noexcept;
+  /// \brief The GPU subset @p query_id was admitted onto, or empty if unknown / never narrowed.
+  [[nodiscard]] std::vector<int> get_active_gpu_ids(sirius::query_id_t query_id) const;
 
   /// \brief Bind @p query_id to the connection that is running it.
   /// Called at execution-window begin, before prepare_for_query.
@@ -130,7 +138,10 @@ class task_creator {
   /// \brief Register the per-query state for @p query's pipelines.
   ///
   /// Adds an entry; it does NOT clear other queries' entries. Call reset(query_id) to drop one.
-  void prepare_for_query(const sirius::planner::query& query);
+  ///
+  /// \param handler The query's completion signal
+  void prepare_for_query(const sirius::planner::query& query,
+                         std::shared_ptr<pipeline::completion_handler> handler);
 
   /// \brief Drop everything held for @p query_id: pending creation requests, in-flight creation
   /// work, and the per-query state entry. Other queries are untouched.
@@ -187,15 +198,17 @@ class task_creator {
   /// \brief Overload for callers that already know the query; avoids re-deriving it.
   void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
 
-  void schedule_lookahead(sirius::query_id_t query_id,
-                          std::optional<int> device_id_hint = std::nullopt);
+  /// \brief Warm up one not-yet-activated scan of the oldest live query.
+  /// No-op when no query is registered.
+  void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
-  /// \brief Fail the running query with @p error.
+  /// \brief Fail @p query_id with @p error.
   ///
   /// schedule() throws on an operator that carries no pipeline. Callers on paths that must not
   /// propagate (sirius_pipeline::notify_downstream_pipelines runs from ~gpu_pipeline_task and
   /// from the streaming-source close callback) route the exception here instead, so the query
-  /// surfaces the error rather than the process terminating.
+  /// surfaces the error rather than the process terminating. The error goes to that query's own
+  /// completion handler, so no other in-flight query is failed by it.
   ///
   /// Deliberately does NOT stop any thread pool itself: this can run on a worker thread that is
   /// itself a member of one of those pools (this creator's own, or a GPU executor's, via
@@ -203,7 +216,7 @@ class task_creator {
   /// self-wait deadlock (bounded_thread_pool::wait_all() blocks on the very slot the caller is
   /// occupying). Only fulfills the completion future; task_scheduler::drain_after_error(),
   /// called by the query thread once it observes the error, does the actual draining.
-  void report_fatal_error(std::exception_ptr error);
+  void report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error);
 
   /**
    * @brief Get the next task id.
@@ -255,6 +268,11 @@ class task_creator {
     op::sirius_physical_operator* node,
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
+  /// \brief report_fatal_error for callers that already hold the query's handler (the creation
+  /// worker), avoiding a second lookup of a state it has in scope.
+  void report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
+                          std::exception_ptr error);
+
   /**
    * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
    *
@@ -291,6 +309,15 @@ class task_creator {
     //! Client context of the connection running this query. Per query because two concurrent
     //! queries on different connections have different contexts.
     ::duckdb::ClientContext* client_context{nullptr};
+
+    //! This query's completion signal, for the creation-failure path (which has this state in
+    //! scope but no task). Same handler every pipeline's global state carries.
+    std::shared_ptr<pipeline::completion_handler> completion_handler;
+
+    //! This query's admitted GPU subset (sorted, deduped), set once by set_active_gpu_ids() before
+    //! prepare_for_query() runs and never mutated after.
+    std::vector<int> active_gpu_ids;
+    std::size_t full_gpu_count{0};
 
     std::mutex lookahead_mutex;
     std::size_t index_of_next_lookahead{0};
@@ -351,14 +378,6 @@ class task_creator {
   /// sharing one counter advances it twice per task: against an even subset size the stride
   /// never changes parity and every clamped task lands on the same GPU.
   std::atomic<uint64_t> _admission_rr{0};
-  /// Sorted, deduped GPU device ids this query is admitted onto: every executor at
-  /// construction, narrowed per query by `set_active_gpu_ids()`. Partition affinity indexes
-  /// it (`_active_gpu_ids[partition_idx % size]`) and must stay in the same sorted order
-  /// sirius_physical_partition uses for its device->slot map, so the two stay inverse.
-  std::vector<int> _active_gpu_ids;
-  /// GPU count before this query was narrowed, from the same list the admitted set was cut
-  /// from; `_active_gpu_ids.size() < this` means the query is on a strict subset.
-  std::size_t _full_gpu_count{0};
 };
 
 }  // namespace sirius::creator

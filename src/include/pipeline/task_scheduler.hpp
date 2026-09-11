@@ -146,25 +146,14 @@ class task_scheduler {
   }
 
   /**
-   * @brief Prepare scheduler state for a query.
+   * @brief Kick off query execution by scheduling its first scan.
    *
-   * Drains tasks left by the previous query, installs the new query and completion handler,
-   * and resets per-query scheduler state.
+   * Completion is signalled through the query's own completion_handler, which its sirius_engine
+   * owns and already holds the future for, so nothing is returned here.
    *
-   * @param query Query whose tasks will be scheduled
+   * @param query The query to start; must have at least one schedulable scan source.
    */
-  void prepare_for_query(duckdb::shared_ptr<planner::query> query);
-
-  /**
-   * @brief Start query execution and return a future for completion.
-   *
-   * Sets up the completion handler and returns a future that will be satisfied
-   * when the query completes or errors. Note: prepare_for_query must be called
-   * before this method.
-   *
-   * @return A future that will be satisfied when the query completes.
-   */
-  std::future<void> start_query();
+  void start_query(const planner::query& query);
 
   /**
    * @brief Drop every queued task belonging to @p query_id.
@@ -189,7 +178,8 @@ class task_scheduler {
    *
    * @param error The error to report.
    */
-  void terminate_query(std::exception_ptr error);
+  void terminate_query(const std::shared_ptr<completion_handler>& handler,
+                       std::exception_ptr error);
 
   /**
    * @brief Drain all in-flight tasks after a query error.
@@ -200,7 +190,7 @@ class task_scheduler {
    * tasks.  Each GPU executor's manager thread is restarted so the executor is
    * ready for the next query.
    */
-  void drain_after_error();
+  void drain_after_error(sirius::query_id_t query_id);
 
   /**
    * @brief This function interrupts executors and waits for all in-flight tasks to complete.
@@ -209,17 +199,10 @@ class task_scheduler {
    * the plan.
    * @throws std::runtime_error if any tasks are still in flight.
    */
-  void wait_for_completion();
+  void wait_for_completion(sirius::query_id_t query_id);
 
  private:
   void management_eventloop();
-
-  /// The query currently installed by prepare_for_query, or nullopt between queries.
-  /// Per-query task_creator cleanup is keyed on it.
-  [[nodiscard]] std::optional<sirius::query_id_t> current_query_id() const;
-
-  mutable std::mutex _query_mutex;
-  duckdb::shared_ptr<planner::query> _query;
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
   exec::multi_index_priority_queue<sirius::parallel::itask> _task_queue;
@@ -239,10 +222,7 @@ class task_scheduler {
 
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
-
   sirius::creator::task_creator* _task_creator{nullptr};
-  /// Strong owner for the weak completion references held by terminal pipelines.
-  std::shared_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

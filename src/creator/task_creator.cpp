@@ -70,30 +70,30 @@ task_creator::task_creator(task_creator_config config,
   // numa_node -1 ("unknown", per the Linux /sys/bus/pci/devices/*/numa_node
   // convention on non-NUMA / single-NUMA hosts) is the index's grouping key and
   // is queried verbatim at routing time.
-  //
-  // Materialize the active executor set sorted+deduped (topology_index preserves
-  // manager order, not sorted order) so partition affinity below stays inverse
-  // to sirius_physical_partition's device->slot mapping.
-  if (_topology_index) {
-    auto ids        = _topology_index->gpu_ids();
-    _active_gpu_ids = std::vector<int>(ids.begin(), ids.end());
-    std::sort(_active_gpu_ids.begin(), _active_gpu_ids.end());
-    _active_gpu_ids.erase(std::unique(_active_gpu_ids.begin(), _active_gpu_ids.end()),
-                          _active_gpu_ids.end());
-  }
 }
 
 task_creator::~task_creator() { stop(); }
 
-void task_creator::set_active_gpu_ids(std::vector<int> ids, std::size_t full_count)
+void task_creator::set_active_gpu_ids(sirius::query_id_t query_id,
+                                      std::vector<int> ids,
+                                      std::size_t full_count)
 {
-  _active_gpu_ids = std::move(ids);
-  _full_gpu_count = full_count;
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
+  auto it = _query_task_global_states.find(query_id);
+  if (it == _query_task_global_states.end()) {
+    // this should never happen in practice, but happens often in unit tests.
+    SIRIUS_LOG_WARN("task_creator::set_active_gpu_ids: no state registered for query {}; ",
+                    query_id);
+    return;
+  }
+  it->second->active_gpu_ids = std::move(ids);
+  it->second->full_gpu_count = full_count;
 }
 
-const std::vector<int>& task_creator::get_active_gpu_ids() const noexcept
+std::vector<int> task_creator::get_active_gpu_ids(sirius::query_id_t query_id) const
 {
-  return _active_gpu_ids;
+  auto state = get_query_task_global_state(query_id);
+  return state ? state->active_gpu_ids : std::vector<int>{};
 }
 
 void task_creator::query_task_global_state::enter_in_flight()
@@ -143,7 +143,8 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
   _task_scheduler = &task_scheduler;
 }
 
-void task_creator::prepare_for_query(const sirius::planner::query& query)
+void task_creator::prepare_for_query(const sirius::planner::query& query,
+                                     std::shared_ptr<pipeline::completion_handler> handler)
 {
   const auto query_id = query.query_id();
 
@@ -162,6 +163,8 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context =
     sirius_ctx->get_telemetry_context();
 
+  state->completion_handler = handler;
+
   auto pipeline_priorities = compute_pipeline_priorities(query);
 
   // Filled once, here, and never mutated afterwards: task-creation workers read it without a
@@ -177,6 +180,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
     size_t operator_id = source_operator->get_operator_id();
     auto gs =
       std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline, telemetry_context);
+    gs->set_completion_handler(handler);
     if (auto it = pipeline_priorities.find(pipeline.get()); it != pipeline_priorities.end()) {
       gs->set_priority(it->second);
       // Mirror it onto the pipeline so schedule() can key a request without locking.
@@ -434,7 +438,8 @@ void task_creator::schedule(op::sirius_physical_operator* node, sirius::query_id
   _task_creation_queue.push(std::move(request));
 }
 
-void task_creator::report_fatal_error(std::exception_ptr error)
+void task_creator::report_fatal_error(const std::shared_ptr<pipeline::completion_handler>& handler,
+                                      std::exception_ptr error)
 {
   // Report-only: this can run on one of _bounded_pool's own worker threads (schedule() throws
   // from inside the dispatched task-creation lambda, or via notify_downstream_pipelines() called
@@ -444,14 +449,33 @@ void task_creator::report_fatal_error(std::exception_ptr error)
   // terminate_query() only fulfills the completion future; the query thread (sirius_engine.cpp,
   // future.get() catch block) observes the error and calls task_scheduler::drain_after_error(),
   // which drains and restarts every pool from a thread that is never one of their own workers.
-  if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(std::move(error)); }
+  if (_task_scheduler != nullptr) { _task_scheduler->terminate_query(handler, std::move(error)); }
 }
 
-void task_creator::schedule_lookahead(sirius::query_id_t query_id,
-                                      std::optional<int> device_id_hint)
+void task_creator::report_fatal_error(sirius::query_id_t query_id, std::exception_ptr error)
+{
+  // A query whose state was already dropped has no handler left to report to; the error is
+  // logged upstream by the caller and there is nothing further to signal.
+  auto state = get_query_task_global_state(query_id);
+  report_fatal_error(state ? state->completion_handler : nullptr, std::move(error));
+}
+
+void task_creator::schedule_lookahead(std::optional<int> device_id_hint)
 {
   if (_config.strategy != request_type::lookahead) { return; }
-  auto state = get_query_task_global_state(query_id);
+
+  // Select the first query, which is the implicit FIFO priority.
+  // TODO: Will want to revisit this, to have lookahead be able to schedule lookahead for the
+  // following query as well if needed.
+  sirius::query_id_t query_id{};
+  std::shared_ptr<query_task_global_state> state;
+  {
+    std::lock_guard<std::mutex> lock(_global_state_mutex);
+    if (_query_task_global_states.empty()) { return; }
+    auto it  = _query_task_global_states.begin();
+    query_id = it->first;
+    state    = it->second;
+  }
   if (!state) { return; }
 
   std::lock_guard lock(state->lookahead_mutex);
@@ -599,13 +623,14 @@ void task_creator::manager_loop()
               // built a single partition, so no other task shares its device requirement.
               if (auto* partitioned =
                     dynamic_cast<op::partitioned_operator_data*>(pipelineable_input);
-                  !preferred_device_id.has_value() && partitioned && !_active_gpu_ids.empty()) {
+                  !preferred_device_id.has_value() && partitioned &&
+                  !query_state->active_gpu_ids.empty()) {
                 // Index the active executor set so every task of a partition lands
                 // on the same real GPU (required for cuco tables); the physical
                 // topology would yield phantom pins when num_gpus < physical count.
                 if (auto const partition_idx = partitioned->get_partition_idx()) {
-                  auto idx            = *partition_idx % _active_gpu_ids.size();
-                  preferred_device_id = _active_gpu_ids[idx];
+                  auto idx            = *partition_idx % query_state->active_gpu_ids.size();
+                  preferred_device_id = query_state->active_gpu_ids[idx];
                 }
               }
               if (!preferred_device_id.has_value() && pipelineable_input &&
@@ -710,16 +735,18 @@ void task_creator::manager_loop()
               // escapes too: the scheduler gives those to whichever executor asks first. Pin
               // those as well, but only on a real subset, since a pin costs the scheduler's
               // freedom to place them wherever frees up first.
-              if (!_active_gpu_ids.empty()) {
+              if (!query_state->active_gpu_ids.empty()) {
                 bool const names_excluded_device =
                   preferred_device_id.has_value() &&
-                  std::find(_active_gpu_ids.begin(), _active_gpu_ids.end(), *preferred_device_id) ==
-                    _active_gpu_ids.end();
+                  std::find(query_state->active_gpu_ids.begin(),
+                            query_state->active_gpu_ids.end(),
+                            *preferred_device_id) == query_state->active_gpu_ids.end();
                 bool const unpinned_on_a_subset =
-                  !preferred_device_id.has_value() && _active_gpu_ids.size() < _full_gpu_count;
+                  !preferred_device_id.has_value() &&
+                  query_state->active_gpu_ids.size() < query_state->full_gpu_count;
                 if (names_excluded_device || unpinned_on_a_subset) {
-                  auto const idx      = _admission_rr.fetch_add(1) % _active_gpu_ids.size();
-                  preferred_device_id = _active_gpu_ids[idx];
+                  auto const idx = _admission_rr.fetch_add(1) % query_state->active_gpu_ids.size();
+                  preferred_device_id = query_state->active_gpu_ids[idx];
                 }
               }
               if (preferred_device_id.has_value()) {
@@ -747,7 +774,7 @@ void task_creator::manager_loop()
           pipeline->update_pipeline_status(false);
         } catch (const std::exception& e) {
           SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-          report_fatal_error(std::current_exception());
+          report_fatal_error(query_state->completion_handler, std::current_exception());
         }
       });
   }
