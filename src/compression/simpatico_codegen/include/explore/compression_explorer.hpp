@@ -99,6 +99,10 @@ size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view 
 struct operator_trial {
   bool success = false;
   std::string error_message;
+  /// Applied cleanly but is a bit-exact identity on this data. Advisory, unlike
+  /// `!success`: only ops that can tell report it, and a plan naming one still
+  /// compresses correctly.
+  bool no_benefit = false;
   std::vector<compressible_output> outputs;         ///< typed channels of the resulting rep
   std::size_t output_bytes = 0;                     ///< sum of logical channel byte sizes
   std::shared_ptr<compressed_representation> repr;  ///< keeps the outputs' views valid

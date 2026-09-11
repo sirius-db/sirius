@@ -73,7 +73,7 @@ inline double op_decode_cost(std::string_view op)
   if (op == "deflate" || op == "lz4" || op == "snappy" || op == "cascaded") return 5.0;
   if (op == "dictionary") return 3.0;
   if (op == "ans" || op == "bitcomp" || op == "alp" || op == "alp_rd") return 2.0;
-  return 1.0;  // bitpack, rle, delta, zigzag, for, bitextract — fast
+  return 1.0;  // bitpack, rle, delta, zigzag, for, factor, bitextract — fast
 }
 
 inline double weighted_score(double ratio, double comp, double decomp, double const w[3])
@@ -290,6 +290,60 @@ std::string format_output_names(std::vector<compressible_output> const& outs)
   return oss.str();
 }
 
+namespace {
+
+// Compares raw storage, so a DECIMAL column's mantissa works unchanged. Host
+// side: this TU is host-compiled, and the channel is one element per chunk.
+bool all_ones(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  auto const n = col.size();
+  if (n == 0) return true;
+  auto const width = cudf::size_of(col.type());
+  if (width == 0 || width > 8) return false;
+
+  std::vector<std::uint8_t> host(static_cast<std::size_t>(n) * width);
+  if (cudaMemcpyAsync(host.data(),
+                      col.head<std::uint8_t>() + static_cast<std::size_t>(col.offset()) * width,
+                      host.size(),
+                      cudaMemcpyDeviceToHost,
+                      stream.value()) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaStreamSynchronize(stream.value()) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+
+  auto scan = [n](auto const* p) {
+    for (cudf::size_type i = 0; i < n; ++i)
+      if (p[i] != 1) return false;
+    return true;
+  };
+  switch (width) {
+    case 1: return scan(reinterpret_cast<std::int8_t const*>(host.data()));
+    case 2: return scan(reinterpret_cast<std::int16_t const*>(host.data()));
+    case 4: return scan(reinterpret_cast<std::int32_t const*>(host.data()));
+    case 8: return scan(reinterpret_cast<std::int64_t const*>(host.data()));
+    default: return false;
+  }
+}
+
+// `factor`'s divisors are per-chunk GCDs, so all-ones means it divided by 1
+// everywhere. Reported rather than failed, so a plan naming `factor` still
+// compresses on a partition whose GCD happens to be 1.
+bool trial_is_identity(std::string const& name,
+                       std::vector<compressible_output> const& outputs,
+                       rmm::cuda_stream_view stream)
+{
+  if (name != "factor") return false;
+  for (auto const& o : outputs)
+    if (o.name == "divisors") return all_ones(o.view, stream);
+  return false;
+}
+
+}  // namespace
+
 operator_trial try_operator(std::string const& name,
                             cudf::column_view col,
                             rmm::cuda_stream_view stream,
@@ -319,7 +373,15 @@ operator_trial try_operator(std::string const& name,
     r.error_message = name + ": requires float32 input";
     return r;
   }
-  if ((name == "alp" || name == "alp_rd") && !is_float) {
+  // A DECIMAL mantissa is already an integer, so alp's scale search there is
+  // exact divisibility. alp_rd stays float-only; it splits an IEEE significand.
+  bool const is_decimal = cudf::is_fixed_point(col.type()) &&
+                          (tid == cudf::type_id::DECIMAL32 || tid == cudf::type_id::DECIMAL64);
+  if (name == "alp" && !is_float && !is_decimal) {
+    r.error_message = name + ": requires floating-point or DECIMAL32/64 input";
+    return r;
+  }
+  if (name == "alp_rd" && !is_float) {
     r.error_message = name + ": requires floating-point input";
     return r;
   }
@@ -328,8 +390,8 @@ operator_trial try_operator(std::string const& name,
     return r;
   }
   // Integer-only preprocessing operators
-  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" ||
-       name == "rle") &&
+  if ((name == "delta" || name == "for" || name == "zigzag" || name == "bitpack" || name == "rle" ||
+       name == "factor") &&
       !is_int && !is_float) {
     r.error_message = name + ": requires numeric input";
     return r;
@@ -358,7 +420,8 @@ operator_trial try_operator(std::string const& name,
     for (auto const& o : r.outputs) {
       r.output_bytes += column_size_bytes_ex(o.view, stream);
     }
-    r.success = true;
+    r.no_benefit = trial_is_identity(name, r.outputs, stream);
+    r.success    = true;
   } catch (std::exception const& e) {
     cudaGetLastError();  // clear any CUDA error state left by the exception
     r.error_message = e.what();
@@ -565,6 +628,10 @@ exploration_result explore_column_compression(cudf::column_view input,
                       << "x)\n";
           }
 
+          // The must-shrink waiver below only makes sense for an op that
+          // transformed something; an identity would ride the beam to the depth
+          // where it is finally revealed worthless.
+          if (trial.no_benefit) continue;
           bool is_pre = is_preprocessing_compressor(op_name);
           if (trial.output_bytes >= pend.size_bytes && !is_pre) continue;
 

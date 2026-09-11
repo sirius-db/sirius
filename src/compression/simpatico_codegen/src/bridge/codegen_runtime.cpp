@@ -1614,6 +1614,33 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           break;
         }
 
+        case cc::OpKind::Factor: {
+          // `divisors` holds num_chunks per-chunk GCDs. Its width follows the
+          // rendered buffer rather than a blanket original_type, for the same
+          // reason as For's `references`: Factor may sit under a channel whose
+          // width differs from the column's (e.g. rle's always-int32 "runs").
+          // Buffer layout is flat: divisors[chunk_id].
+          const auto i_divs = find_buffer_idx(spec.buffers, node_id, "divisors");
+          const std::int32_t divs_elem_size =
+            static_cast<std::int32_t>(spec.buffers[i_divs].elem_size);
+          const cudf::data_type divs_elem_type =
+            (divs_elem_size == static_cast<std::int32_t>(cudf::size_of(original_type)))
+              ? original_type
+            : (divs_elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
+            : (divs_elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
+                                    : cudf::data_type(cudf::type_id::INT32);
+          auto divs_col = std::make_unique<cudf::column>(divs_elem_type,
+                                                         static_cast<cudf::size_type>(num_chunks),
+                                                         std::move(bufs[i_divs]),
+                                                         rmm::device_buffer(0, stream),
+                                                         0);
+          auto rep      = std::make_unique<simpatico::codegen_fused_representation>(
+            simpatico::OpId::Factor, original_type, static_cast<cudf::size_type>(num_rows));
+          rep->buffers.emplace_back("divisors", std::move(divs_col));
+          builder->leaves.emplace(origin.plan_node, std::move(rep));
+          break;
+        }
+
         case cc::OpKind::Zigzag: {
           // Transformer mode (fused child on the `zigzag` channel): ZigZag
           // rewrote the lane value inline and stored NOTHING — the child owns
@@ -1682,7 +1709,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // width from a "is this channel literally named 'runs'" special
           // case plus original_type.
 
-          const bool is_fixed_stride = (origin.parent_op == "for" || origin.parent_op == "delta");
+          const bool is_fixed_stride = (origin.parent_op == "for" || origin.parent_op == "delta" ||
+                                        origin.parent_op == "factor");
 
           const auto i_data            = find_buffer_idx(spec.buffers, node_id, "data");
           const std::int32_t elem_size = static_cast<std::int32_t>(spec.buffers[i_data].elem_size);

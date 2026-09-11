@@ -256,11 +256,14 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // Not make_numeric_column: cudf classes fixed-point and chrono as
+    // non-numeric, and a leaf buffer can carry either (alp's `exceptions` on a
+    // DECIMAL column). Scale is 0 here; apply_stored_dtype restores the real one.
+    auto col = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -284,7 +287,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   };
 
   if (ld.kind == OpId::Delta || ld.kind == OpId::Rle || ld.kind == OpId::For ||
-      ld.kind == OpId::Zigzag || ld.kind == OpId::Bitpack) {
+      ld.kind == OpId::Factor || ld.kind == OpId::Zigzag || ld.kind == OpId::Bitpack) {
     return make_fused_rep(ld.kind);
   }
   if (ld.kind == OpId::Identity) {
@@ -323,7 +326,7 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+static constexpr std::uint8_t kVersion = 12;
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.

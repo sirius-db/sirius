@@ -49,6 +49,7 @@ inline void append_op_segment(std::ostringstream& oss, const FusedTree& node)
     case OpKind::Raw: oss << "rw"; break;
     case OpKind::For: oss << "fr"; break;
     case OpKind::Zigzag: oss << "zz"; break;
+    case OpKind::Factor: oss << "fc"; break;
     default: oss << "un"; break;
   }
   for (const auto& [k, child] : node.children) {
