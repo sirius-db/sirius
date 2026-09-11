@@ -172,17 +172,21 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   // before it can be scanned, and binding it locally is not an option.
   sirius::hpln_open_options options;
   options.io_ctx = io_ctx;
-  auto schema    = sirius::read_hpln_schema(path, options);
+  // Shared and cached: a query that names a table more than once binds it more than once, and the
+  // parse is dominated by unpacking the zone maps. Everything below is a copy of the small fields
+  // and a pointer to the big one.
+  auto schema = sirius::read_hpln_schema_shared(path, options);
 
   auto info                 = std::make_unique<simpatico_ingestible_table_info>();
   info->resolved_file_paths = {path};
-  info->names               = std::move(schema.names);
-  info->types               = std::move(schema.types);
-  info->physical_types      = std::move(schema.physical_types);
-  info->num_rows            = schema.num_rows;
-  info->chunk_rows          = std::move(schema.chunk_rows);
-  info->group_bounds        = std::move(schema.group_bounds);
-  info->column_has_nulls    = std::move(schema.column_has_nulls);
+  info->names               = schema->names;
+  info->types               = schema->types;
+  info->physical_types      = schema->physical_types;
+  info->num_rows            = schema->num_rows;
+  info->chunk_rows          = schema->chunk_rows;
+  info->group_bounds = std::shared_ptr<sirius::scan_manager::group_bounds_arena const>(
+    schema, &schema->group_bounds);
+  info->column_has_nulls = schema->column_has_nulls;
   info->host_space          = &host_space;
   info->io_ctx              = std::move(io_ctx);
   // Whole file by default; a caller with a narrower projection overwrites this.
@@ -361,7 +365,8 @@ void simpatico_gpu_ingestible::plan_pruning()
     }
   };
 
-  auto const& arena = _info->group_bounds;
+  static scan_manager::group_bounds_arena const kNoBounds;
+  auto const& arena = _info->group_bounds ? *_info->group_bounds : kNoBounds;
   if (_info->table_filters == nullptr || _info->table_filters->filters.empty() || arena.empty() ||
       arena.group_rows() == 0 || arena.chunk_count() != n_chunks) {
     serve_everything();

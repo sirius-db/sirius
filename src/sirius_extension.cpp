@@ -297,10 +297,13 @@ unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
   if (auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
     options.io_ctx = state->get_scan_manager().ioctx_for_path(path);
   }
-  auto schema  = sirius::read_hpln_schema(path, options);
-  return_types = std::move(schema.types);
-  names.assign(schema.names.begin(), schema.names.end());
-  return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema.num_rows));
+  // Shared and cached, like the plan generator's bind: DuckDB re-binds a view on every query, and
+  // a query naming the table more than once binds it more than once, so this runs several times
+  // per query over a schema that cannot have changed.
+  auto schema  = sirius::read_hpln_schema_shared(path, options);
+  return_types = schema->types;
+  names.assign(schema->names.begin(), schema->names.end());
+  return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema->num_rows));
 }
 
 // Harvest `x IS NULL` conjuncts for the .hpln scan's zone-map pruning.
@@ -1526,12 +1529,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
     // The bounds come out of the file's own `zone_maps` segment, already in the arena's packed
     // form -- so they are handed over as they are rather than rebuilt through BaseStatistics.
-    scan_mgr.insert_pinned_entry_host(data.args.name,
-                                      std::move(cache_info),
-                                      std::move(host_chunks),
-                                      *host_space,
-                                      std::move(info->group_bounds),
-                                      std::move(column_storage));
+    // Copied, not moved: the bind's arena is shared with the metadata cache and with every other
+    // scan of this file, while a pinned entry owns its own. A pin happens once, so the copy is
+    // not on any hot path.
+    scan_mgr.insert_pinned_entry_host(
+      data.args.name,
+      std::move(cache_info),
+      std::move(host_chunks),
+      *host_space,
+      info->group_bounds ? *info->group_bounds : sirius::scan_manager::group_bounds_arena{},
+      std::move(column_storage));
     SIRIUS_LOG_INFO("[pin_table] '{}': ingested {} chunk(s) of '{}' into the host tier",
                     data.args.name,
                     ingested.size(),
