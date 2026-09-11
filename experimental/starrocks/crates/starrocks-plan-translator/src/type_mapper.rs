@@ -33,6 +33,45 @@ pub(crate) fn fp64_type(nullable: bool) -> Type {
     }
 }
 
+/// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
+/// an input stream's schema.
+///
+/// A stream has no file to probe, so the engine cannot infer the schema; it is declared. Deriving
+/// the declaration from the very `Type` the plan's read carries is what keeps the two from
+/// drifting. The alternative, a second StarRocks-to-DuckDB mapping, would be a silent
+/// wrong-results bug the first time the two disagreed.
+pub fn duckdb_type_name(ty: &Type) -> Result<String> {
+    let kind = ty
+        .kind
+        .as_ref()
+        .ok_or_else(|| TranslateError::malformed("stream input column has no type"))?;
+    let name = match kind {
+        r#type::Kind::Bool(_) => "BOOLEAN".to_string(),
+        r#type::Kind::I8(_) => "TINYINT".to_string(),
+        r#type::Kind::I16(_) => "SMALLINT".to_string(),
+        r#type::Kind::I32(_) => "INTEGER".to_string(),
+        r#type::Kind::I64(_) => "BIGINT".to_string(),
+        r#type::Kind::Fp32(_) => "FLOAT".to_string(),
+        r#type::Kind::Fp64(_) => "DOUBLE".to_string(),
+        // DuckDB's CHAR is an alias of VARCHAR, so the declared length carries no information.
+        r#type::Kind::FixedChar(_) | r#type::Kind::Varchar(_) | r#type::Kind::String(_) => {
+            "VARCHAR".to_string()
+        }
+        r#type::Kind::Binary(_) | r#type::Kind::FixedBinary(_) => "BLOB".to_string(),
+        r#type::Kind::Date(_) => "DATE".to_string(),
+        r#type::Kind::PrecisionTimestamp(_) => "TIMESTAMP".to_string(),
+        r#type::Kind::Decimal(decimal) => {
+            format!("DECIMAL({},{})", decimal.precision, decimal.scale)
+        }
+        _ => {
+            return Err(TranslateError::malformed(
+                "stream input column type has no DuckDB name",
+            ));
+        }
+    };
+    Ok(name)
+}
+
 /// Maps a StarRocks type descriptor and slot nullability into a Substrait type.
 pub fn map_type_desc(type_desc: &TTypeDesc, nullable: bool) -> Result<Type> {
     let node = scalar_node(type_desc)?;
