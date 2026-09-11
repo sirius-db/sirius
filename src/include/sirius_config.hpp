@@ -284,7 +284,7 @@ struct compression_config {
   /// unrepresentative first batch could disable compression for an edge for the
   /// whole query. The default amortizes one explore over many batches, which is
   /// a small fraction of spill cost while still self-correcting.
-  std::uint64_t spill_replan_after_uses{128};
+  std::uint64_t spill_replan_after_uses{1024};
 
   /// Consecutive compression *errors* on one edge to absorb before treating the
   /// edge as not worth compressing. Minimum 1 (write off on the first error).

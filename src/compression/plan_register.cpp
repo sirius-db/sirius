@@ -327,6 +327,20 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
   }
 }
 
+bool plan_register::try_begin_async_explore(const cucascade::shared_data_repository* repo)
+{
+  if (repo == nullptr) { return false; }
+  std::unique_lock lock(_mutex);
+  return _async_explores.insert(repo).second;
+}
+
+void plan_register::end_async_explore(const cucascade::shared_data_repository* repo)
+{
+  if (repo == nullptr) { return; }
+  std::unique_lock lock(_mutex);
+  _async_explores.erase(repo);
+}
+
 std::optional<std::string> plan_register::cached_default_plan(
   const cucascade::shared_data_repository* repo, std::size_t column_index)
 {

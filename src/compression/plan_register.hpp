@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <map>
+#include <set>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -182,6 +183,22 @@ class plan_register {
   /// returning the same verdict.)
   /// Not const: a lookup advances the use counter and evicts on the recheck
   /// boundary, which is what makes the re-probe periodic rather than never.
+  /**
+   * @brief Claim the right to run one asynchronous exploration for @p repo.
+   *
+   * The beam search costs seconds and ran inline on the downgrade thread -- the
+   * only thread that can free memory. Run asynchronously, several batches reach
+   * the spill path before the first result lands, so without this guard each
+   * would launch its own duplicate search.
+   *
+   * @return true when the caller owns the in-flight slot and must call
+   *         end_async_explore() when done; false when one is already running.
+   */
+  bool try_begin_async_explore(const cucascade::shared_data_repository* repo);
+
+  /// Release the slot claimed by try_begin_async_explore().
+  void end_async_explore(const cucascade::shared_data_repository* repo);
+
   [[nodiscard]] std::optional<std::string> cached_default_plan(
     const cucascade::shared_data_repository* repo, std::size_t column_index);
   void cache_default_plan(const cucascade::shared_data_repository* repo,
@@ -568,6 +585,8 @@ class plan_register {
   std::map<std::pair<const cucascade::shared_data_repository*, std::size_t>, cached_plan>
     _default_plan_cache;
 
+  /// Edges with an asynchronous exploration currently in flight.
+  std::set<const cucascade::shared_data_repository*> _async_explores;
 
   /// Cached eager-output decision for one edge.
   struct output_edge_state {
