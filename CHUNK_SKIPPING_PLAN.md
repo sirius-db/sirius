@@ -1732,6 +1732,10 @@ over S3 (§7.6).
 
 ### Milestones
 
+**Milestones A–F and C2 are done (2026-09-11).** A `.hpln` can be written from SQL, queried
+directly with pruning and decode-time filtering, read over the io_context, and pinned as an I/O
+copy (4.4x faster than pinning the equivalent parquet). NULLs round-trip. What remains is below.
+
 - **A. `SELECT * FROM read_simpatico('x.hpln')`** — table function + bind + a minimal ingestible
   decoding whole chunks. Single file, no pruning. Everything else hangs off this.
   **Done** (`read_simpatico`).
@@ -1853,8 +1857,8 @@ ordering that is reused by every reader is a different calculus from paying on e
 
 What exists is the bottom of the stack: the container is self-locating, carries logical types and
 per-group zone maps, and stages into pinned memory byte-for-byte. A is days; A–D is weeks. The
-format also still needs nullability (in flight separately) and checksums before anyone stores data
-they care about in it — a corrupt payload currently decodes to wrong values rather than an error,
+format now carries nullability (merged from `feat/compression-nullable-columns`, file version 12)
+but still has no checksums before anyone stores data they care about in it — a corrupt payload currently decodes to wrong values rather than an error,
 which is the same failure shape as every other bug this project has hit.
 
 ## 8. Where the index should live: device, host, spilled
