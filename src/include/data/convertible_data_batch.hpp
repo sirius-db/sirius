@@ -149,7 +149,18 @@ class convertible_data_batch : public convertible_data {
       // host_data_representation, so the batch would be un-evictable for the
       // rest of the query and the downgrade executor would spin against it.
       const bool already_compressed =
-        dynamic_cast<const compressed_device_representation*>(mut.get_data()) != nullptr;
+        dynamic_cast<const compressed_device_representation*>(mut.get_data()) != nullptr ||
+        dynamic_cast<const compressed_host_representation*>(mut.get_data()) != nullptr;
+
+      // Compression runs on the GPU only, so a host-resident source can never be
+      // compressed on its way to disk -- it can only be re-staged (when it is
+      // already compressed, above) or written out as-is. Asking the registry to
+      // compress it produces a request no converter can serve, and the batch then
+      // cannot leave the host tier at all: measured on q18/SF3000, 514,340 failed
+      // compressed_host -> disk_data_representation conversions while the host tier
+      // sat full and its only relief valve, host -> disk, never drained.
+      const bool host_source =
+        dynamic_cast<const cucascade::host_data_representation*>(mut.get_data()) != nullptr;
 
       switch (space->get_tier()) {
         case cucascade::memory::Tier::GPU:
@@ -170,8 +181,8 @@ class convertible_data_batch : public convertible_data {
           if (already_compressed) {
             mut.convert_to<compressed_disk_representation>(
               converter_registry, *reservation, stream);
-          } else if (!try_convert_compressed<compressed_disk_representation>(
-                       mut, converter_registry, *reservation, stream)) {
+          } else if (host_source || !try_convert_compressed<compressed_disk_representation>(
+                                      mut, converter_registry, *reservation, stream)) {
             mut.convert_to<cucascade::disk_data_representation>(
               converter_registry, *reservation, stream);
           }
@@ -503,22 +514,32 @@ class convertible_data_batch_provider : public convertible_data_provider {
    * task.
    * @return A convertible_data_batch if the batch matches, nullptr otherwise.
    */
+ public:
+
   std::unique_ptr<convertible_data> try_get_batch(uint64_t batch_id,
                                                   std::size_t partition_idx,
                                                   cucascade::memory::memory_space* space,
                                                   bool ignore_subscribed = true) const
   {
     auto batch = _repo->get_data_batch_by_id(batch_id, partition_idx);
-    if (!batch) { return nullptr; }
+    if (!batch) {
+      return nullptr;
+    }
 
     // A subscribed batch is being held by a task (queued or preparing); skip it so we don't
     // downgrade data a task is about to use.
-    if (ignore_subscribed && batch->get_subscriber_count() > 0) { return nullptr; }
+    if (ignore_subscribed && batch->get_subscriber_count() > 0) {
+      return nullptr;
+    }
 
-    if (batch->get_state() != cucascade::batch_state::idle) { return nullptr; }
+    if (batch->get_state() != cucascade::batch_state::idle) {
+      return nullptr;
+    }
 
     auto ro = batch->try_to_read_only();
-    if (!ro) { return nullptr; }
+    if (!ro) {
+      return nullptr;
+    }
     if (ro->get_memory_space() == space) {
       return std::make_unique<convertible_data_batch>(std::move(batch), _repo);
     }
@@ -526,6 +547,7 @@ class convertible_data_batch_provider : public convertible_data_provider {
     return nullptr;
   }
 
+ private:
   cucascade::shared_data_repository* _repo;
 };
 
