@@ -847,6 +847,94 @@ hpln_bind_schema parse_hpln_schema(std::string const& path,
 
 }  // namespace
 
+struct hpln_table_writer::impl {
+  duckdb::vector<duckdb::LogicalType> column_types;
+  std::vector<std::string> column_names;
+  std::string plan_dsl;
+  std::size_t group_rows;
+  simpatico::hpln_stream_writer out;
+  // Every chunk's per-group bounds. Retained rather than written per chunk because the arena is
+  // one segment over the whole file, indexed by the same chunk id the directory uses. This is the
+  // only thing that grows with the file: ~187 MB of host memory for SF1000 lineitem at G=8192,
+  // against the ~214 GB of payload it describes.
+  std::vector<scan_manager::chunk_group_stats> per_chunk;
+
+  impl(std::string path,
+       duckdb::vector<duckdb::LogicalType> types,
+       std::vector<std::string> names,
+       std::string dsl,
+       std::size_t groups)
+    : column_types(std::move(types)),
+      column_names(std::move(names)),
+      plan_dsl(std::move(dsl)),
+      group_rows(groups),
+      out(std::move(path))
+  {
+  }
+};
+
+hpln_table_writer::hpln_table_writer(std::string path,
+                                     duckdb::vector<duckdb::LogicalType> column_types,
+                                     std::vector<std::string> column_names,
+                                     std::string plan_dsl,
+                                     std::size_t group_rows)
+  : _impl(std::make_unique<impl>(std::move(path),
+                                 std::move(column_types),
+                                 std::move(column_names),
+                                 std::move(plan_dsl),
+                                 group_rows))
+{
+}
+
+hpln_table_writer::~hpln_table_writer() = default;
+
+std::size_t hpln_table_writer::chunks_written() const noexcept
+{
+  return _impl->out.chunks_appended();
+}
+
+std::string hpln_table_writer::append(cudf::table_view const& table,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto& st = *_impl;
+  simpatico::compressed_table compressed;
+  try {
+    compressed = simpatico::compress_with_plan(table, st.plan_dsl, stream, mr, st.column_names);
+  } catch (std::exception const& e) {
+    return std::string("[hpln export] compression failed: ") + e.what();
+  }
+  // Statistics come from the DECODED values, which is why they have to be computed here rather
+  // than recovered later: once the file holds compressed bytes the bounds are gone until someone
+  // decodes them, and the whole point of carrying them is to avoid that.
+  if (st.group_rows > 0 && !st.column_types.empty()) {
+    st.per_chunk.push_back(
+      scan_manager::compute_pinned_group_stats(table, st.column_types, st.group_rows, stream, mr));
+  }
+  return st.out.append(compressed, stream);
+}
+
+std::string hpln_table_writer::finish()
+{
+  auto& st = *_impl;
+  // Every chunk's bounds, in chunk order, in one arena -- so a pruning reader indexes it by the
+  // same chunk id the directory uses.
+  std::vector<std::uint8_t> packed;
+  if (!st.per_chunk.empty()) {
+    packed = scan_manager::group_bounds_arena::from_capture(st.column_types, st.per_chunk).pack();
+  }
+
+  // The engine's types always travel: without them a reader has only cuDF physical types and
+  // cannot reconstruct DECIMAL precision or nullability, so the file would not be self-describing.
+  auto const type_bytes = pack_logical_types(st.column_types);
+  std::vector<simpatico::hpln_extra_segment> extra;
+  if (!type_bytes.empty()) {
+    extra.push_back({simpatico::hpln_segment::logical_types, type_bytes});
+  }
+  if (!packed.empty()) { extra.push_back({simpatico::hpln_segment::zone_maps, packed}); }
+  return st.out.finish(extra);
+}
+
 std::string write_tables_to_hpln(std::vector<cudf::table_view> const& tables,
                                  duckdb::vector<duckdb::LogicalType> const& column_types,
                                  std::vector<std::string> const& column_names,
@@ -858,46 +946,13 @@ std::string write_tables_to_hpln(std::vector<cudf::table_view> const& tables,
 {
   if (tables.empty()) { return "[hpln export] no chunks to write"; }
 
-  std::vector<simpatico::compressed_table> chunks;
-  chunks.reserve(tables.size());
-  std::vector<scan_manager::chunk_group_stats> per_chunk;
+  // The whole-table form is the streaming one with every chunk already in hand: one writer, one
+  // layout, one set of rules about where the bounds come from.
+  hpln_table_writer writer(path, column_types, column_names, plan_dsl, group_rows);
   for (auto const& t : tables) {
-    try {
-      chunks.push_back(simpatico::compress_with_plan(t, plan_dsl, stream, mr, column_names));
-    } catch (std::exception const& e) {
-      return std::string("[hpln export] compression failed: ") + e.what();
-    }
-    // Statistics come from the DECODED values, which is why they have to be computed here rather
-    // than recovered later: once the file holds compressed bytes the bounds are gone until someone
-    // decodes them, and the whole point of carrying them is to avoid that.
-    if (group_rows > 0 && !column_types.empty()) {
-      per_chunk.push_back(
-        scan_manager::compute_pinned_group_stats(t, column_types, group_rows, stream, mr));
-    }
+    if (auto err = writer.append(t, stream, mr); !err.empty()) { return err; }
   }
-
-  // Every chunk's bounds, in chunk order, in one arena -- so a pruning reader indexes it by the
-  // same chunk id the directory uses.
-  std::vector<std::uint8_t> packed;
-  if (!per_chunk.empty()) {
-    packed = scan_manager::group_bounds_arena::from_capture(column_types, per_chunk).pack();
-  }
-
-  // The engine's types always travel: without them a reader has only cuDF physical types and
-  // cannot reconstruct DECIMAL precision or nullability, so the file would not be self-describing.
-  auto const type_bytes = pack_logical_types(column_types);
-  std::vector<simpatico::hpln_extra_segment> extra;
-  if (!type_bytes.empty()) {
-    extra.push_back({simpatico::hpln_segment::logical_types, type_bytes});
-  }
-  if (!packed.empty()) { extra.push_back({simpatico::hpln_segment::zone_maps, packed}); }
-
-  std::vector<simpatico::compressed_table const*> refs;
-  refs.reserve(chunks.size());
-  for (auto const& c : chunks) {
-    refs.push_back(&c);
-  }
-  return simpatico::write_compressed_tables(refs, path, stream, extra);
+  return writer.finish();
 }
 
 std::string write_table_to_hpln(cudf::table_view const& table,

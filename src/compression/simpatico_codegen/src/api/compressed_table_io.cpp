@@ -865,109 +865,132 @@ std::string unpack_hpln_checksums(std::span<const std::uint8_t> bytes,
   return {};
 }
 
-std::string write_compressed_tables(std::span<compressed_table const* const> tables,
-                                    std::string const& path,
-                                    rmm::cuda_stream_view stream,
-                                    std::span<const hpln_extra_segment> extra)
-{
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
-  if (tables.empty()) return "write_compressed_tables: no chunks to write";
-
-  // Build every chunk's header first. They are written as one contiguous region ahead of any
-  // payload, so all of them have to exist before the first byte goes out.
-  std::vector<std::vector<std::uint8_t>> headers(tables.size());
-  std::vector<std::vector<payload_buffer_ref>> buffers(tables.size());
-  std::vector<std::uint64_t> payload_sizes(tables.size(), 0);
-  for (std::size_t i = 0; i < tables.size(); ++i) {
-    if (tables[i] == nullptr)
-      return "write_compressed_tables: null chunk at index " + std::to_string(i);
-    std::string err =
-      build_compressed_table_header(*tables[i], headers[i], buffers[i], payload_sizes[i], stream);
-    if (!err.empty()) return err;
-  }
-
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return "failed to open '" + path + "' for writing";
-
-  // Checksums are computed as the bytes go out, never by reading the file back: a second pass
-  // would hash whatever landed on disk, so a bad write would be certified rather than caught.
+struct hpln_stream_writer::impl {
+  std::string path;
+  std::ofstream f;
+  // Every chunk's header, kept until finish(). Kilobytes per chunk: this is what makes the whole
+  // file's worth affordable when its payloads are not.
+  std::vector<std::vector<std::uint8_t>> headers;
+  std::vector<hpln_chunk_ref> dir;
   std::vector<hpln_checksum_entry> sums;
-  sums.reserve(tables.size() * 2 + extra.size() + 1);
-
-  std::vector<hpln_chunk_ref> dir(tables.size());
   std::uint64_t at = 0;
-  for (std::size_t i = 0; i < tables.size(); ++i) {
-    dir[i].header_offset = at;
-    dir[i].header_bytes  = headers[i].size();
-    dir[i].num_rows      = tables[i]->num_rows();
-    f.write(reinterpret_cast<const char*>(headers[i].data()),
-            static_cast<std::streamsize>(headers[i].size()));
-    sums.push_back({hpln_segment::header,
-                    static_cast<std::uint32_t>(i),
-                    at,
-                    headers[i].size(),
-                    hpln_crc32c(headers[i])});
-    at += headers[i].size();
-  }
-  auto const header_region_bytes = at;
+  bool finished    = false;
 
-  // One chunk's payload is gathered, written and released before the next is staged: a file of N
-  // chunks would otherwise need every chunk's decompressed-to-host bytes resident at once.
-  for (std::size_t i = 0; i < tables.size(); ++i) {
-    std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_sizes[i]));
-    for (auto const& b : buffers[i]) {
-      if (b.size_bytes > 0 && b.device_ptr) {
-        cudaMemcpyAsync(payload.data() + b.offset,
-                        b.device_ptr,
-                        static_cast<std::size_t>(b.size_bytes),
-                        cudaMemcpyDeviceToHost,
-                        stream.value());
-      }
+  explicit impl(std::string p) : path(std::move(p)), f(path, std::ios::binary | std::ios::trunc) {}
+};
+
+hpln_stream_writer::hpln_stream_writer(std::string path)
+  : _impl(std::make_unique<impl>(std::move(path)))
+{
+}
+
+hpln_stream_writer::~hpln_stream_writer() = default;
+
+std::size_t hpln_stream_writer::chunks_appended() const noexcept { return _impl->dir.size(); }
+
+std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_stream_view stream)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[append]"};
+  auto& st = *_impl;
+  if (st.finished) return "hpln_stream_writer: append after finish on '" + st.path + "'";
+  if (!st.f) return "failed to open '" + st.path + "' for writing";
+
+  std::vector<std::uint8_t> header;
+  std::vector<payload_buffer_ref> buffers;
+  std::uint64_t payload_bytes = 0;
+  if (auto err = build_compressed_table_header(table, header, buffers, payload_bytes, stream);
+      !err.empty()) {
+    return err;
+  }
+
+  // Gather this chunk's payload out of device memory and write it. One chunk's worth of host
+  // staging is live at a time, and the caller may free the device table as soon as this returns.
+  std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
+  for (auto const& b : buffers) {
+    if (b.size_bytes > 0 && b.device_ptr) {
+      cudaMemcpyAsync(payload.data() + b.offset,
+                      b.device_ptr,
+                      static_cast<std::size_t>(b.size_bytes),
+                      cudaMemcpyDeviceToHost,
+                      stream.value());
     }
-    stream.synchronize();  // D→H copies must complete before the file write
-    dir[i].payload_offset = at;
-    dir[i].payload_bytes  = payload_sizes[i];
-    f.write(reinterpret_cast<const char*>(payload.data()),
-            static_cast<std::streamsize>(payload.size()));
-    // Per chunk, not once for the whole region: a reader fetches a chunk at a time, and a
-    // checksum it cannot check without reading every other chunk is one it will never check.
-    sums.push_back({hpln_segment::payload,
-                    static_cast<std::uint32_t>(i),
-                    at,
-                    payload_sizes[i],
-                    hpln_crc32c(payload)});
-    at += payload_sizes[i];
+  }
+  stream.synchronize();  // D→H copies must complete before the file write
+
+  auto const index = static_cast<std::uint32_t>(st.dir.size());
+  hpln_chunk_ref ref{};
+  ref.payload_offset = st.at;
+  ref.payload_bytes  = payload_bytes;
+  ref.num_rows       = table.num_rows();
+  st.f.write(reinterpret_cast<const char*>(payload.data()),
+             static_cast<std::streamsize>(payload.size()));
+  // Per chunk, not once for the whole region: a reader fetches a chunk at a time, and a checksum
+  // it cannot check without reading every other chunk is one it will never check.
+  st.sums.push_back({hpln_segment::payload, index, st.at, payload_bytes, hpln_crc32c(payload)});
+  st.at += payload_bytes;
+
+  st.dir.push_back(ref);
+  st.headers.push_back(std::move(header));
+  if (!st.f) return "write error on '" + st.path + "'";
+  return {};
+}
+
+std::string hpln_stream_writer::finish(std::span<const hpln_extra_segment> extra)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[finish]"};
+  auto& st = *_impl;
+  if (st.finished) return "hpln_stream_writer: finish called twice on '" + st.path + "'";
+  st.finished = true;
+  if (!st.f) return "failed to open '" + st.path + "' for writing";
+  if (st.dir.empty()) return "hpln_stream_writer: no chunks written to '" + st.path + "'";
+
+  auto const payload_region_bytes = st.at;
+
+  // The header region, contiguous, after the payloads. Contiguity is what 7.5 asked for; being
+  // first was never the requirement, and a reader locates it through the segment table.
+  auto const header_region_start = st.at;
+  for (std::size_t i = 0; i < st.headers.size(); ++i) {
+    st.dir[i].header_offset = st.at;
+    st.dir[i].header_bytes  = st.headers[i].size();
+    st.f.write(reinterpret_cast<const char*>(st.headers[i].data()),
+               static_cast<std::streamsize>(st.headers[i].size()));
+    st.sums.push_back({hpln_segment::header,
+                       static_cast<std::uint32_t>(i),
+                       st.at,
+                       st.headers[i].size(),
+                       hpln_crc32c(st.headers[i])});
+    st.at += st.headers[i].size();
   }
 
-  // Segment table. header and payload are always present and always first, and for a multi-chunk
-  // file they span the whole of their respective regions -- so a reader that only wants metadata
-  // still fetches exactly one range, and the directory subdivides it.
   std::vector<hpln_segment_ref> segs;
-  segs.push_back({hpln_segment::header, 0, header_region_bytes});
-  segs.push_back({hpln_segment::payload, header_region_bytes, at - header_region_bytes});
-  auto const dir_bytes = pack_hpln_chunk_directory(dir);
-  f.write(reinterpret_cast<const char*>(dir_bytes.data()),
-          static_cast<std::streamsize>(dir_bytes.size()));
-  segs.push_back({hpln_segment::chunk_directory, at, dir_bytes.size()});
-  sums.push_back({hpln_segment::chunk_directory, 0, at, dir_bytes.size(), hpln_crc32c(dir_bytes)});
-  at += dir_bytes.size();
+  segs.push_back({hpln_segment::payload, 0, payload_region_bytes});
+  segs.push_back({hpln_segment::header, header_region_start, st.at - header_region_start});
+
+  auto const dir_bytes = pack_hpln_chunk_directory(st.dir);
+  st.f.write(reinterpret_cast<const char*>(dir_bytes.data()),
+             static_cast<std::streamsize>(dir_bytes.size()));
+  segs.push_back({hpln_segment::chunk_directory, st.at, dir_bytes.size()});
+  st.sums.push_back(
+    {hpln_segment::chunk_directory, 0, st.at, dir_bytes.size(), hpln_crc32c(dir_bytes)});
+  st.at += dir_bytes.size();
+
   for (auto const& e : extra) {
     if (e.bytes.empty()) continue;
-    f.write(reinterpret_cast<const char*>(e.bytes.data()),
-            static_cast<std::streamsize>(e.bytes.size()));
-    segs.push_back({e.kind, at, e.bytes.size()});
-    sums.push_back({e.kind, 0, at, e.bytes.size(), hpln_crc32c(e.bytes)});
-    at += e.bytes.size();
+    st.f.write(reinterpret_cast<const char*>(e.bytes.data()),
+               static_cast<std::streamsize>(e.bytes.size()));
+    segs.push_back({e.kind, st.at, e.bytes.size()});
+    st.sums.push_back({e.kind, 0, st.at, e.bytes.size(), hpln_crc32c(e.bytes)});
+    st.at += e.bytes.size();
   }
 
   // Last of the segments, because it covers all of them and cannot cover itself. The postscript
   // and the trailer are not covered either: they are read and validated structurally before
   // anything else, and a reader that cannot parse them never gets as far as a checksum.
-  auto const sum_bytes = pack_hpln_checksums(sums);
-  f.write(reinterpret_cast<const char*>(sum_bytes.data()),
-          static_cast<std::streamsize>(sum_bytes.size()));
-  segs.push_back({hpln_segment::checksums, at, sum_bytes.size()});
-  at += sum_bytes.size();
+  auto const sum_bytes = pack_hpln_checksums(st.sums);
+  st.f.write(reinterpret_cast<const char*>(sum_bytes.data()),
+             static_cast<std::streamsize>(sum_bytes.size()));
+  segs.push_back({hpln_segment::checksums, st.at, sum_bytes.size()});
+  st.at += sum_bytes.size();
 
   std::vector<std::uint8_t> ps;
   push_le(ps, static_cast<std::uint16_t>(segs.size()));
@@ -976,20 +999,40 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
     push_le(ps, sg.offset);
     push_le(ps, sg.bytes);
   }
-  f.write(reinterpret_cast<const char*>(ps.data()), static_cast<std::streamsize>(ps.size()));
+  st.f.write(reinterpret_cast<const char*>(ps.data()), static_cast<std::streamsize>(ps.size()));
 
   // Fixed 16-byte trailer, magic LAST so a reader validates by reading the tail.
   std::vector<std::uint8_t> tr;
-  push_le(tr, at);                                     // postscript offset (u64)
+  push_le(tr, st.at);                                  // postscript offset (u64)
   push_le(tr, static_cast<std::uint16_t>(ps.size()));  // postscript length (u16)
   push_le(tr, kHplnFileVersion);                       // version (u16)
   tr.push_back('H');
   tr.push_back('P');
   tr.push_back('L');
   tr.push_back('N');
-  f.write(reinterpret_cast<const char*>(tr.data()), static_cast<std::streamsize>(tr.size()));
-  if (!f) return "write error on '" + path + "'";
+  st.f.write(reinterpret_cast<const char*>(tr.data()), static_cast<std::streamsize>(tr.size()));
+  st.f.flush();
+  if (!st.f) return "write error on '" + st.path + "'";
   return {};
+}
+
+std::string write_compressed_tables(std::span<compressed_table const* const> tables,
+                                    std::string const& path,
+                                    rmm::cuda_stream_view stream,
+                                    std::span<const hpln_extra_segment> extra)
+{
+  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
+  if (tables.empty()) return "write_compressed_tables: no chunks to write";
+
+  // The whole-file form is the streaming one with every chunk already in hand -- one writer, one
+  // layout. It differs only in that the caller cannot release a chunk between appends.
+  hpln_stream_writer writer(path);
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    if (tables[i] == nullptr)
+      return "write_compressed_tables: null chunk at index " + std::to_string(i);
+    if (auto err = writer.append(*tables[i], stream); !err.empty()) return err;
+  }
+  return writer.finish(extra);
 }
 
 std::string write_compressed_table(compressed_table const& table,

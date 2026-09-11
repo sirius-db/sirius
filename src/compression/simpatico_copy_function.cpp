@@ -284,8 +284,11 @@ struct simpatico_copy_global_state : public duckdb::GlobalFunctionData {
   std::string path;
   std::mutex lock;
   std::unique_ptr<sirius::duckdb_chunk_staging> staging;
-  /// One entry per closed chunk, device-resident until finalize hands them all to the writer.
-  std::vector<std::unique_ptr<cudf::table>> chunks;
+  /// Each chunk is compressed and written as it closes, so nothing accumulates on the device. The
+  /// COPY used to hold every closed chunk UNCOMPRESSED until finalize, which capped a file at what
+  /// fits in GPU memory -- ~780 GB for SF1000 lineitem, i.e. not a cap so much as a wall.
+  std::unique_ptr<sirius::hpln_table_writer> writer;
+  std::size_t chunks_written = 0;
 };
 
 duckdb::unique_ptr<duckdb::GlobalFunctionData> simpatico_copy_initialize_global(
@@ -304,6 +307,9 @@ duckdb::unique_ptr<duckdb::GlobalFunctionData> simpatico_copy_initialize_global(
   state->staging = std::make_unique<sirius::duckdb_chunk_staging>(
     bind.staging_types,
     static_cast<cudf::size_type>(std::min<std::size_t>(bind.chunk_rows, 1U << 20U)));
+  // The file is opened here, not at finalize: the writer streams into it as chunks close.
+  state->writer = std::make_unique<sirius::hpln_table_writer>(
+    file_path, bind.types, bind.names, bind.plan_dsl, bind.group_rows);
   return std::move(state);
 }
 
@@ -315,8 +321,12 @@ duckdb::unique_ptr<duckdb::LocalFunctionData> simpatico_copy_initialize_local(
   return duckdb::make_uniq_base<duckdb::LocalFunctionData, simpatico_copy_local_state>();
 }
 
-/// Upload what is staged as one chunk and start a fresh one.
-void close_chunk(simpatico_copy_global_state& state, std::span<std::size_t const> cluster_columns)
+/// Upload what is staged as one chunk, WRITE it, and start a fresh one.
+///
+/// Returns a writer error, or empty on success. The chunk's device memory is released before this
+/// returns, which is the whole point: peak device residency is one chunk, not one table.
+std::string close_chunk(simpatico_copy_global_state& state,
+                        std::span<std::size_t const> cluster_columns)
 {
   // Nulls need no special handling here: the staging carries each column's validity to the
   // cudf::table, and compress_column strips it into the plan tree's sidecar, which the container
@@ -334,8 +344,14 @@ void close_chunk(simpatico_copy_global_state& state, std::span<std::size_t const
                                       cudf::get_default_stream(),
                                       rmm::mr::get_current_device_resource_ref());
   }
-  state.chunks.push_back(std::move(table));
+  auto const error = state.writer->append(
+    table->view(), cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+  // Released here rather than at finalize. `table` owns the only reference, so this is where the
+  // chunk stops costing anything.
+  table.reset();
   state.staging->reset();
+  if (error.empty()) { ++state.chunks_written; }
+  return error;
 }
 
 void simpatico_copy_sink(duckdb::ExecutionContext&,
@@ -358,7 +374,9 @@ void simpatico_copy_sink(duckdb::ExecutionContext&,
     state.staging->append(input, offset, take);
     offset += take;
     if (static_cast<std::size_t>(state.staging->num_rows()) >= bind.chunk_rows) {
-      close_chunk(state, bind.cluster_columns);
+      if (auto const error = close_chunk(state, bind.cluster_columns); !error.empty()) {
+        throw duckdb::IOException("COPY (FORMAT simpatico) to '%s' failed: %s", state.path, error);
+      }
     }
   }
 }
@@ -380,34 +398,23 @@ void simpatico_copy_finalize(duckdb::ClientContext&,
 
   // A trailing partial chunk is a chunk; and a query that produced no rows still writes one empty
   // chunk, so the file carries its schema and binds like any other.
-  if (state.staging->num_rows() > 0 || state.chunks.empty()) {
-    close_chunk(state, bind.cluster_columns);
+  std::string error;
+  if (state.staging->num_rows() > 0 || state.chunks_written == 0) {
+    error = close_chunk(state, bind.cluster_columns);
   }
-
-  std::vector<cudf::table_view> views;
-  views.reserve(state.chunks.size());
-  for (auto const& chunk : state.chunks) {
-    views.push_back(chunk->view());
-  }
-
-  auto const error = sirius::write_tables_to_hpln(views,
-                                                  bind.types,
-                                                  bind.names,
-                                                  bind.plan_dsl,
-                                                  bind.group_rows,
-                                                  state.path,
-                                                  cudf::get_default_stream(),
-                                                  rmm::mr::get_current_device_resource_ref());
-  // Free the device tables before reporting either way: a failed COPY must not leave a file's
-  // worth of GPU memory held by a state that outlives the error.
-  state.chunks.clear();
+  // The metadata regions -- headers, directory, logical types, zone maps, checksums, trailer --
+  // go out here, after every payload. finish() is what makes the file readable at all, so it runs
+  // even when a chunk failed; its own error only wins if there was not already one to report.
+  if (auto const ferr = state.writer->finish(); error.empty()) { error = ferr; }
+  auto const written = state.chunks_written;
+  state.writer.reset();
   state.staging.reset();
   if (!error.empty()) {
     throw duckdb::IOException("COPY (FORMAT simpatico) to '%s' failed: %s", state.path, error);
   }
   SIRIUS_LOG_INFO("[hpln copy] wrote '{}': {} chunk(s), group_rows={}, cluster_by {} column(s)",
                   state.path,
-                  views.size(),
+                  written,
                   bind.group_rows,
                   bind.cluster_columns.size());
 }

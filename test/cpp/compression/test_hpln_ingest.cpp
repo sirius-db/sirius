@@ -682,20 +682,34 @@ TEST_CASE("hpln container - a multi-chunk file keeps its metadata segregated fro
   REQUIRE(chunks.size() == static_cast<std::size_t>(kMultiChunks));
 
   // The claim of CHUNK_SKIPPING_PLAN.md 7.5: every chunk's metadata is reachable in ONE
-  // sequential read, ahead of any bulk data. Interleaved [hdr][pay][hdr][pay] would satisfy the
-  // directory just as well and would cost a seek per chunk, so the layout is what is asserted.
+  // sequential read, never interleaved with bulk data. Interleaved [hdr][pay][hdr][pay] would
+  // satisfy the directory just as well and would cost a seek per chunk, so the layout is what is
+  // asserted -- but SEGREGATION is the property, not "headers first". The streaming writer emits
+  // payloads as chunks close and the metadata at the end, because a writer that must place the
+  // header region first cannot start writing until every chunk exists, which caps a file at what
+  // fits in GPU memory. Metadata at the tail is if anything better: one tail read now covers the
+  // trailer, the directory, the zone maps AND every chunk header.
   for (std::size_t i = 0; i < chunks.size(); ++i) {
     REQUIRE(chunks[i].num_rows == kMultiRowsPerChunk);
     REQUIRE(chunks[i].header_bytes > 0);
     REQUIRE(chunks[i].payload_bytes > 0);
+    // No header overlaps any payload, whichever side of it they fall.
     for (auto const& other : chunks) {
-      REQUIRE(chunks[i].header_offset + chunks[i].header_bytes <= other.payload_offset);
+      bool const disjoint =
+        chunks[i].header_offset + chunks[i].header_bytes <= other.payload_offset ||
+        other.payload_offset + other.payload_bytes <= chunks[i].header_offset;
+      REQUIRE(disjoint);
     }
     if (i + 1 < chunks.size()) {
       REQUIRE(chunks[i].header_offset + chunks[i].header_bytes == chunks[i + 1].header_offset);
       REQUIRE(chunks[i].payload_offset + chunks[i].payload_bytes == chunks[i + 1].payload_offset);
     }
   }
+
+  // And the metadata sits at the tail, past every payload byte -- what makes the single tail read
+  // cover it.
+  REQUIRE(chunks.front().header_offset >=
+          chunks.back().payload_offset + chunks.back().payload_bytes);
 
   // The header and payload segments still bound their whole regions, so a reader that wants all
   // the metadata fetches one range and subdivides it with the directory.

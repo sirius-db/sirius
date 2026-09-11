@@ -53,6 +53,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -209,6 +210,48 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
                                     std::string const& path,
                                     rmm::cuda_stream_view stream = cudf::get_default_stream(),
                                     std::span<const hpln_extra_segment> extra = {});
+
+/// Write a multi-chunk .hpln one chunk at a time, never holding more than one.
+///
+/// @ref write_compressed_tables needs every chunk resident before it emits a byte, because the
+/// header region goes out first and a header cannot be built without its chunk. That caps a file
+/// at what fits in GPU memory, which is fatal at TPC-H SF1000 -- lineitem's compressed chunks are
+/// ~214 GB, and the COPY that produces them holds the UNCOMPRESSED chunks, ~780 GB.
+///
+/// Here each chunk's payload is gathered and written as it arrives, and only its header bytes
+/// (kilobytes) and its directory entry are kept. The metadata regions go out at the end, so the
+/// file is laid out [payloads][headers][directory][extra][checksums][trailer] rather than
+/// headers-first. Nothing reads a .hpln positionally -- every region is located through the
+/// trailer's segment table and the per-chunk directory -- and the headers stay contiguous, which
+/// is the property 7.5 actually wanted. Over S3 it is strictly better: ONE tail read now covers
+/// the trailer, the directory, the zone maps and every chunk header.
+///
+/// Usage: construct, @ref append once per chunk in order, then @ref finish exactly once. An
+/// instance destroyed without finish() leaves an unreadable file, which is the right outcome for
+/// an aborted write -- there is no trailer, so nothing will mistake it for a complete one.
+class hpln_stream_writer {
+ public:
+  explicit hpln_stream_writer(std::string path);
+  ~hpln_stream_writer();
+
+  hpln_stream_writer(hpln_stream_writer const&)            = delete;
+  hpln_stream_writer& operator=(hpln_stream_writer const&) = delete;
+
+  /// Append @p table as the next chunk. Its payload is staged to host and written before this
+  /// returns, so the caller may release the chunk's device memory immediately afterwards.
+  /// Returns an empty string on success.
+  std::string append(compressed_table const& table, rmm::cuda_stream_view stream);
+
+  /// Emit the header region, the chunk directory, @p extra, the checksum table and the trailer.
+  /// Returns an empty string on success. Must be called exactly once.
+  std::string finish(std::span<const hpln_extra_segment> extra = {});
+
+  [[nodiscard]] std::size_t chunks_appended() const noexcept;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
 
 /// Read a compressed_table from *path*.
 /// On failure writes an error to *error_out (if non-null) and returns an empty
