@@ -125,6 +125,32 @@ struct hpln_bind_schema {
   std::vector<bool> column_has_nulls;
 };
 
+/// A parsed @ref hpln_bind_schema parked in the io_context's metadata store, so every scan of the
+/// file after the first skips the parse.
+///
+/// The parse is not cheap the way a parquet footer is: it reads and CRC-verifies every chunk's
+/// header and then UNPACKS the zone-map segment, which at SF100 lineitem is ~73k groups x 16
+/// columns of bounds -- 22 ms, paid once per scan, and TPC-H q21 scans lineitem four times. That
+/// was 153 ms of a 279 ms query spent before the first pipeline started, against parquet's 9 ms.
+///
+/// Held by shared_ptr and handed out by shared_ptr: the arena is the bulk of it and it is
+/// immutable once parsed, so no consumer needs its own copy.
+class hpln_metadata final : public sirius::io::sirius_io_object_metadata {
+ public:
+  explicit hpln_metadata(std::shared_ptr<hpln_bind_schema const> schema)
+    : _schema(std::move(schema))
+  {
+  }
+
+  [[nodiscard]] std::shared_ptr<hpln_bind_schema const> const& schema() const noexcept
+  {
+    return _schema;
+  }
+
+ private:
+  std::shared_ptr<hpln_bind_schema const> _schema;
+};
+
 /// Open @p path far enough to answer "what columns does this file have".
 ///
 /// This is what a `read_simpatico()` bind needs, and what an ingestible's table_info reports. The
@@ -136,6 +162,19 @@ struct hpln_bind_schema {
 /// Throws std::runtime_error if the file cannot be read or parsed.
 [[nodiscard]] hpln_bind_schema read_hpln_schema(std::string const& path,
                                                 hpln_open_options const& options = {});
+
+/// As @ref read_hpln_schema, but shared and CACHED.
+///
+/// The result is parked in the io_context's metadata store as an @ref hpln_metadata, so a second
+/// call for the same file returns the same object without reading or parsing anything. Callers
+/// that bind a file once per scan -- which is every query with more than one reference to a table
+/// -- should prefer this; @ref read_hpln_schema remains for callers that want an owned copy.
+///
+/// Falls back to an uncached parse when the transport has no metadata store (a local ifstream
+/// source, or a host test with no io_context), so the answer never depends on whether a cache
+/// exists.
+[[nodiscard]] std::shared_ptr<hpln_bind_schema const> read_hpln_schema_shared(
+  std::string const& path, hpln_open_options const& options = {});
 
 /// Pack @p types into the bytes a `logical_types` segment carries, and back.
 ///

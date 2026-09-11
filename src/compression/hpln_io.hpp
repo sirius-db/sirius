@@ -187,6 +187,27 @@ class hpln_source {
 
   [[nodiscard]] hpln_io_stats const& stats() const noexcept { return _stats; }
 
+  /// Metadata a previous open of this same file parked against it, or null.
+  ///
+  /// The transport owns this because the cache it consults is the io_context's, keyed by the
+  /// io_object's `raw_file_cache_id()` -- the same store and the same key parquet parks its parsed
+  /// footer under. Routing through the transport rather than keying on the path here is what makes
+  /// a backend that distinguishes otherwise-equal paths (a versioned S3 key) correct for free.
+  ///
+  /// The default is "no cache", which is what a local ifstream source and a host test get: they
+  /// re-parse, which is right rather than merely acceptable, since neither has an io_context whose
+  /// lifetime could bound the entry.
+  [[nodiscard]] virtual std::shared_ptr<io::sirius_io_object_metadata> metadata() const
+  {
+    return nullptr;
+  }
+
+  /// Park @p metadata against this file. False when the transport has nowhere to put it.
+  virtual bool store_metadata(std::shared_ptr<io::sirius_io_object_metadata> /*metadata*/)
+  {
+    return false;
+  }
+
  protected:
   hpln_source() = default;
   hpln_io_stats _stats;

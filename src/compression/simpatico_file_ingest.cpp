@@ -712,15 +712,51 @@ duckdb::vector<duckdb::LogicalType> unpack_logical_types(std::span<const std::ui
   return out;
 }
 
+namespace {
+
+/// The uncached parse. @ref read_hpln_schema and @ref read_hpln_schema_shared differ only in what
+/// they do around it.
+hpln_bind_schema parse_hpln_schema(std::string const& path,
+                                   hpln_open_options const& options,
+                                   hpln_source& src);
+
+}  // namespace
+
+std::shared_ptr<hpln_bind_schema const> read_hpln_schema_shared(std::string const& path,
+                                                                hpln_open_options const& options)
+{
+  auto src = open_hpln(path, "hpln schema", options);
+  if (auto cached = src->metadata()) {
+    if (auto const* hm = dynamic_cast<hpln_metadata const*>(cached.get()); hm && hm->schema()) {
+      return hm->schema();
+    }
+  }
+  auto schema = std::make_shared<hpln_bind_schema const>(parse_hpln_schema(path, options, *src));
+  // Best effort: a transport with nowhere to park it simply re-parses next time, which is slower
+  // and not wrong. Racing binds of the same file both parse and the last one wins -- the entries
+  // are equal, so there is nothing to reconcile.
+  src->store_metadata(std::make_shared<hpln_metadata>(schema));
+  return schema;
+}
+
 hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options const& options)
+{
+  auto src = open_hpln(path, "hpln schema", options);
+  return parse_hpln_schema(path, options, *src);
+}
+
+namespace {
+
+hpln_bind_schema parse_hpln_schema(std::string const& path,
+                                   hpln_open_options const& options,
+                                   hpln_source& src)
 {
   // Reuses the ingest reader for locating and parsing, but stops before any payload is staged:
   // binding a query must not move data. Every chunk's header is parsed -- one sequential read of
   // the segregated metadata region -- both to sum the row counts the optimizer wants and to
   // refuse a file whose chunks disagree here rather than mid-scan.
-  auto src             = open_hpln(path, "hpln schema", options);
-  auto const file_size = src->size();
-  auto layout          = locate_hpln(*src, path);
+  auto const file_size = src.size();
+  auto layout          = locate_hpln(src, path);
 
   simpatico::hpln_schema header_schema;
   duckdb::vector<duckdb::LogicalType> declared;
@@ -729,14 +765,14 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
 
   if (layout.located) {
     std::vector<std::vector<std::uint8_t>> headers;
-    describe_chunks(*src, path, layout, options.policy, headers, header_schema);
+    describe_chunks(src, path, layout, options.policy, headers, header_schema);
     for (auto const& c : layout.chunks) {
       chunk_rows.push_back(c.num_rows);
     }
     if (auto const sg = find_segment(layout, simpatico::hpln_segment::logical_types);
         sg && sg->bytes > 0) {
       declared = unpack_logical_types(
-        read_verified_segment(*src, layout, path, *sg, "logical types segment"), nullptr);
+        read_verified_segment(src, layout, path, *sg, "logical types segment"), nullptr);
     }
     // The zone maps are read HERE rather than at scan time because a bind is where a scan learns
     // what it may skip: the walk has to decide a chunk's fate before it emits a split for it, and
@@ -745,7 +781,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
         sg && sg->bytes > 0) {
       std::string zerr;
       bounds = scan_manager::group_bounds_arena::unpack(
-        read_verified_segment(*src, layout, path, *sg, "zone map segment"), &zerr);
+        read_verified_segment(src, layout, path, *sg, "zone map segment"), &zerr);
       if (!zerr.empty()) {
         SIRIUS_LOG_WARN(
           "[hpln schema] '{}': zone maps unreadable ({}); binding unpruned", path, zerr);
@@ -755,7 +791,7 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
     // Pre-trailer file: parse the header from the front, growing the prefix as needed.
     std::string herr;
     for (std::uint64_t want = kHeaderProbeBytes;; want *= 2) {
-      auto const prefix = src->read_prefix(want, "header");
+      auto const prefix = src.read_prefix(want, "header");
       herr              = simpatico::describe_compressed_table_header(prefix, header_schema);
       if (herr.empty()) { break; }
       if (prefix.size() >= file_size || want >= kHeaderProbeMax) {
@@ -805,9 +841,11 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
       out.types.push_back(duckdb_type_for_cudf(simpatico::tag_to_dtype(c.dtype_tag), c.scale));
     }
   }
-  report(*src, options);
+  report(src, options);
   return out;
 }
+
+}  // namespace
 
 std::string write_tables_to_hpln(std::vector<cudf::table_view> const& tables,
                                  duckdb::vector<duckdb::LogicalType> const& column_types,

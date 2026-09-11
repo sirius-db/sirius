@@ -302,6 +302,18 @@ class ioctx_hpln_source final : public hpln_source {
   [[nodiscard]] std::uint64_t size() const noexcept override { return _size; }
   [[nodiscard]] std::string_view transport() const noexcept override { return _stats.transport; }
 
+  /// Straight through to the datasource, which resolves the io_context's metadata store by the
+  /// io_object's cache id -- the same path parquet's footer cache takes.
+  [[nodiscard]] std::shared_ptr<io::sirius_io_object_metadata> metadata() const override
+  {
+    return _ds ? _ds->metadata() : nullptr;
+  }
+
+  bool store_metadata(std::shared_ptr<io::sirius_io_object_metadata> metadata) override
+  {
+    return _ds && _ds->store_metadata(std::move(metadata));
+  }
+
   void submit(std::span<hpln_request const> requests,
               hpln_io_policy const& policy,
               char const* what) override

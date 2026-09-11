@@ -258,10 +258,11 @@ TEST_CASE("simpatico pruning - the file's zone maps reach the walk",
   auto const info = scan::bind_simpatico_file(fx.path, *env().host_space);
   // Without these the scan has nothing to prune WITH, and everything below would pass by serving
   // the whole file.
-  REQUIRE_FALSE(info->group_bounds.empty());
-  REQUIRE(info->group_bounds.chunk_count() == static_cast<std::size_t>(kChunks));
-  REQUIRE(info->group_bounds.group_rows() == static_cast<std::size_t>(kGroupRows));
-  REQUIRE(info->group_bounds.column_count() == 2);
+  REQUIRE(info->group_bounds != nullptr);
+  REQUIRE_FALSE(info->group_bounds->empty());
+  REQUIRE(info->group_bounds->chunk_count() == static_cast<std::size_t>(kChunks));
+  REQUIRE(info->group_bounds->group_rows() == static_cast<std::size_t>(kGroupRows));
+  REQUIRE(info->group_bounds->column_count() == 2);
 }
 
 TEST_CASE("simpatico pruning - no filter prunes nothing", "[compression][simpatico_pruning]")

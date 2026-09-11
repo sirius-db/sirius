@@ -113,8 +113,13 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// Types of ALL the file's columns, as the filter's constants are typed.
   duckdb::vector<sirius::logical_type> returned_types;
   /// Per-(column, chunk, group) min/max from the file's `zone_maps` segment, positional with the
-  /// FILE's columns. Empty means "serve unpruned"; see @ref sirius::hpln_bind_schema.
-  scan_manager::group_bounds_arena group_bounds;
+  /// FILE's columns. Null or empty means "serve unpruned"; see @ref sirius::hpln_bind_schema.
+  ///
+  /// Shared rather than owned: the arena is the expensive half of a bind (it is what makes the
+  /// parse cost 22 ms on SF100 lineitem), it is immutable once parsed, and it is cached across
+  /// scans of the same file -- so every scan after the first points at the same one instead of
+  /// copying ~19 MB.
+  std::shared_ptr<scan_manager::group_bounds_arena const> group_bounds;
 
   /// Whether each FILE column can contain NULL, ORed over the file's chunks and positional with
   /// @ref names. Recorded in the chunk headers, so it exists even for a file that carries no
