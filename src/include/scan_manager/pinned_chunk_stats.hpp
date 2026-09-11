@@ -261,6 +261,17 @@ class group_bounds_arena {
   [[nodiscard]] static group_bounds_arena unpack(std::span<const std::uint8_t> bytes,
                                                  std::string* error = nullptr);
 
+  /**
+   * @brief Record that @p column can contain NULL, whatever the capture said.
+   *
+   * Only ever relaxes: a column marked nullable prunes strictly less, because a group whose
+   * bounds exclude a predicate's range may still hold a NULL the predicate cannot satisfy. This
+   * is for a caller that learns about nulls from a source the arena did not come from -- an
+   * ingested file's column headers versus its `zone_maps` segment, which are written together but
+   * need not have been written by the same version. Out-of-range columns are ignored.
+   */
+  void mark_column_nullable(std::size_t column);
+
  private:
   struct slice {
     std::size_t offset{0};        ///< index into _storage of this (column, chunk)'s mins

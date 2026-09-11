@@ -779,6 +779,11 @@ duckdb::Value carrier_to_value(duckdb::LogicalType const& type, std::int64_t raw
 
 }  // namespace
 
+void group_bounds_arena::mark_column_nullable(std::size_t column)
+{
+  if (column < _column_has_no_nulls.size()) { _column_has_no_nulls[column] = false; }
+}
+
 pinned_zone_maps chunk_zone_maps_from_group_bounds(group_bounds_arena const& bounds)
 {
   auto const n_columns = bounds.column_count();

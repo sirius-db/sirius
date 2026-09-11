@@ -207,6 +207,58 @@ TEST_CASE_METHOD(PinSimpaticoFixture,
 }
 
 TEST_CASE_METHOD(PinSimpaticoFixture,
+                 "a pinned .hpln serves NULLs, and does not prune a group holding one",
+                 "[integration][pin_table][pin_simpatico]")
+{
+  auto const file = path("nullable.hpln");
+  // Nulls SCATTERED inside their groups, not filling them. A group that is entirely null has no
+  // bounds at all, and an absent cell never prunes -- so it would pass this test whatever the
+  // reader believed about nulls. A group that holds both values and nulls has real bounds, which
+  // is what makes `column_has_no_nulls` the thing deciding whether `v IS NULL` can prune it.
+  query(
+    "COPY (SELECT i::INTEGER AS k,"
+    " CASE WHEN i BETWEEN 3072 AND 4095 AND i % 3 = 0 THEN NULL ELSE i * 2 END::INTEGER AS v"
+    " FROM range(" +
+    std::to_string(kRows) + ") t(i) ORDER BY k) TO '" + file + "' (FORMAT simpatico, chunk_rows " +
+    std::to_string(kChunkRows) + ", group_rows " + std::to_string(kGroupRows) + ");");
+  pin(file);
+
+  auto const& e = entry();
+  REQUIRE(e.num_rows == static_cast<std::size_t>(kRows));
+  REQUIRE(e.host_chunks.size() == kChunkCount);
+
+  std::int64_t null_rows    = 0;
+  std::int64_t null_key_sum = 0;
+  for (int i = 3072; i <= 4095; ++i) {
+    if (i % 3 != 0) { continue; }
+    ++null_rows;
+    null_key_sum += i;
+  }
+  REQUIRE(null_rows > 0);
+
+  // Every row is served, NULLs included: count(*) sees them, count(v) does not.
+  auto all = query("SELECT count(*), count(v) FROM read_simpatico('" + file + "');");
+  REQUIRE(all->GetValue(0, 0).GetValue<std::int64_t>() == kRows);
+  REQUIRE(all->GetValue(1, 0).GetValue<std::int64_t>() == kRows - null_rows);
+
+  // The load-bearing one. `v IS NULL` prunes a group exactly when the column is known to have no
+  // nulls, so a reader that lost that fact prunes EVERY group and this returns nothing. Summing a
+  // never-null key over the survivors pins which rows came back, not merely how many.
+  auto where =
+    query("SELECT count(*), sum(k) FROM read_simpatico('" + file + "') WHERE v IS NULL;");
+  REQUIRE(where->GetValue(0, 0).GetValue<std::int64_t>() == null_rows);
+  REQUIRE(where->GetValue(1, 0).GetValue<std::int64_t>() == null_key_sum);
+
+  // The complement, over the same groups: a NULL satisfies neither side of a range split, so the
+  // two halves account for every non-null row and no more.
+  auto lo = query("SELECT count(*) FROM read_simpatico('" + file + "') WHERE v < 6144;");
+  auto hi = query("SELECT count(*) FROM read_simpatico('" + file + "') WHERE v >= 6144;");
+  REQUIRE(lo->GetValue(0, 0).GetValue<std::int64_t>() +
+            hi->GetValue(0, 0).GetValue<std::int64_t>() ==
+          kRows - null_rows);
+}
+
+TEST_CASE_METHOD(PinSimpaticoFixture,
                  "a pinned .hpln serves every chunk's rows exactly once",
                  "[integration][pin_table][pin_simpatico]")
 {

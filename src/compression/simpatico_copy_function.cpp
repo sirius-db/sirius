@@ -261,17 +261,12 @@ duckdb::unique_ptr<duckdb::LocalFunctionData> simpatico_copy_initialize_local(
 }
 
 /// Upload what is staged as one chunk and start a fresh one.
-void close_chunk(simpatico_copy_global_state& state, simpatico_copy_bind_data const& bind)
+void close_chunk(simpatico_copy_global_state& state)
 {
-  if (auto const null_column = state.staging->first_column_with_nulls(); null_column.has_value()) {
-    // The format has no null mask, so a null would be written as whatever the column's zero value
-    // decodes to and read back as a real value. Refusing is the only honest answer until
-    // nullability lands in the container.
-    throw duckdb::InvalidInputException(
-      "COPY (FORMAT simpatico): column '%s' contains NULL, which the .hpln format cannot "
-      "represent; filter the nulls out or write the column as a non-null expression",
-      bind.names[*null_column]);
-  }
+  // Nulls need no special handling here: the staging carries each column's validity to the
+  // cudf::table, and compress_column strips it into the plan tree's sidecar, which the container
+  // serializes per column (see push_validity). A chunk that is entirely null costs no payload
+  // bytes at all.
   state.chunks.push_back(
     state.staging->build(cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref()));
   state.staging->reset();
@@ -297,7 +292,7 @@ void simpatico_copy_sink(duckdb::ExecutionContext&,
     state.staging->append(input, offset, take);
     offset += take;
     if (static_cast<std::size_t>(state.staging->num_rows()) >= bind.chunk_rows) {
-      close_chunk(state, bind);
+      close_chunk(state);
     }
   }
 }
@@ -319,7 +314,7 @@ void simpatico_copy_finalize(duckdb::ClientContext&,
 
   // A trailing partial chunk is a chunk; and a query that produced no rows still writes one empty
   // chunk, so the file carries its schema and binds like any other.
-  if (state.staging->num_rows() > 0 || state.chunks.empty()) { close_chunk(state, bind); }
+  if (state.staging->num_rows() > 0 || state.chunks.empty()) { close_chunk(state); }
 
   std::vector<cudf::table_view> views;
   views.reserve(state.chunks.size());

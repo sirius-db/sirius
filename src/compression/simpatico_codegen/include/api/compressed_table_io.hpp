@@ -267,7 +267,12 @@ struct hpln_column_desc {
   std::uint8_t dtype_tag         = 0;  ///< decoded column type; see tag_to_dtype()
   std::int32_t scale             = 0;  ///< decimal scale, 0 otherwise
   std::int64_t num_rows          = 0;
-  std::uint64_t compressed_bytes = 0;  ///< sum of this column's leaf buffers
+  std::uint64_t compressed_bytes = 0;  ///< sum of this column's leaf buffers and its null mask
+  /// Whether this column's record carries validity. A .hpln column is nullable per CHUNK, so a
+  /// FILE's column is nullable if ANY of its chunks says so -- a caller aggregating chunk headers
+  /// must OR this, not take chunk 0's.
+  bool has_nulls          = false;
+  std::int64_t null_count = 0;  ///< 0 when has_nulls is false
 };
 
 struct hpln_schema {

@@ -189,17 +189,101 @@ TEST_CASE_METHOD(SimpaticoCopyFixture,
   REQUIRE(ordered_rows(*read_back) == ordered_rows(*written));
 }
 
+/// A projection with a NULL in every position the writer supports: scattered over a fixed-width
+/// column, in a contiguous run that covers whole zone-map groups, in a VARCHAR, in a column that
+/// is entirely null, and -- as the control -- beside a column that has no nulls at all.
+///
+/// `i` is never null, so it can order the comparison and key the null positions.
+constexpr char const* kNullableProjection =
+  "SELECT i,"
+  "  CASE WHEN i % 100 = 0 THEN NULL ELSE i * 3 END::INTEGER   AS scattered,"
+  "  CASE WHEN i BETWEEN 2000 AND 2999 THEN NULL ELSE i END::BIGINT AS run,"
+  "  (i * 0.5)::DOUBLE                                         AS never_null,"
+  "  CASE WHEN i % 7 = 0 THEN NULL ELSE 'row-' || i::VARCHAR END AS text,"
+  "  NULL::INTEGER                                             AS always_null "
+  "FROM range(6000) t(i)";
+
 TEST_CASE_METHOD(SimpaticoCopyFixture,
-                 "COPY to .hpln refuses a NULL rather than losing it",
+                 "COPY to .hpln round-trips NULLs in every supported position",
                  "[integration][simpatico_copy]")
 {
   auto const file = path("nulls.hpln");
-  // The container has no null mask, so a NULL would be written as the column's zero value and
-  // read back as a real 0. Refusing is the contract until nullability lands in the format.
-  auto const error =
-    query_error("COPY (SELECT CASE WHEN a % 100 = 0 THEN NULL ELSE a END AS a FROM src) TO '" +
-                file + "' (FORMAT simpatico);");
-  REQUIRE(error.find("NULL") != std::string::npos);
+  query("CREATE TABLE nsrc AS " + std::string(kNullableProjection) + ";");
+  query("CHECKPOINT;");
+  // Three chunks, so a null run spans a chunk boundary and `always_null` produces a chunk whose
+  // column is entirely null -- the sidecar shape that stores no payload bytes at all.
+  query("COPY (SELECT * FROM nsrc ORDER BY i) TO '" + file +
+        "' (FORMAT simpatico, chunk_rows 2048);");
+
+  // Values AND null positions: Value::ToString() renders a NULL as "NULL", and no value in the
+  // fixture stringifies to that, so a dropped mask (NULL read back as 0 or '') changes a cell.
+  auto written   = query("SELECT * FROM nsrc ORDER BY i;");
+  auto read_back = query("SELECT * FROM read_simpatico('" + file + "') ORDER BY i;");
+  REQUIRE(ordered_rows(*read_back) == ordered_rows(*written));
+
+  // Belt: count(col) counts non-nulls, so this fails on a mask that survives but is misaligned in
+  // a way the row comparison above could conceivably tolerate.
+  auto counts = query(
+    "SELECT count(*), count(scattered), count(run), count(never_null),"
+    " count(text), count(always_null) FROM read_simpatico('" +
+    file + "');");
+  REQUIRE(counts->GetValue(0, 0).GetValue<std::int64_t>() == 6000);
+  REQUIRE(counts->GetValue(1, 0).GetValue<std::int64_t>() == 6000 - 60);
+  REQUIRE(counts->GetValue(2, 0).GetValue<std::int64_t>() == 6000 - 1000);
+  REQUIRE(counts->GetValue(3, 0).GetValue<std::int64_t>() == 6000);
+  REQUIRE(counts->GetValue(4, 0).GetValue<std::int64_t>() == 6000 - 858);
+  REQUIRE(counts->GetValue(5, 0).GetValue<std::int64_t>() == 0);
+}
+
+TEST_CASE_METHOD(SimpaticoCopyFixture,
+                 "a .hpln reports which of its columns carry NULLs",
+                 "[integration][simpatico_copy][hpln_io]")
+{
+  auto const file = path("nulls_schema.hpln");
+  query("CREATE TABLE nsrc AS " + std::string(kNullableProjection) + ";");
+  query("CHECKPOINT;");
+  query("COPY (SELECT * FROM nsrc ORDER BY i) TO '" + file +
+        "' (FORMAT simpatico, chunk_rows 2048);");
+
+  auto const schema = sirius::read_hpln_schema(file);
+  REQUIRE(schema.column_has_nulls.size() == schema.names.size());
+  REQUIRE(schema.names ==
+          std::vector<std::string>{"i", "scattered", "run", "never_null", "text", "always_null"});
+  // `run` is null only in the middle chunk, so reporting chunk 0's answer for the file would call
+  // it non-nullable -- which is the reading a caller would act on.
+  REQUIRE(schema.column_has_nulls == std::vector<bool>{false, true, true, false, true, true});
+}
+
+TEST_CASE_METHOD(SimpaticoCopyFixture,
+                 "a group holding a NULL is not pruned by a filter the NULL cannot satisfy",
+                 "[integration][simpatico_copy][simpatico_pruning]")
+{
+  auto const file = path("nulls_pruning.hpln");
+  // `v` climbs with i, so a range predicate leaves most groups provably empty -- except that one
+  // group's values are NULL. Zone-map bounds are computed over the non-null values, so the bounds
+  // of that group say nothing about the NULL, and pruning it would make the row vanish from a
+  // count that must still see it as a non-match rather than not see it at all.
+  query(
+    "CREATE TABLE psrc AS SELECT i,"
+    " CASE WHEN i BETWEEN 3000 AND 3063 THEN NULL ELSE i END::INTEGER AS v"
+    " FROM range(6000) t(i);");
+  query("COPY (SELECT * FROM psrc ORDER BY i) TO '" + file +
+        "' (FORMAT simpatico, chunk_rows 2048, group_rows 64);");
+
+  // The NULL group sits inside the filtered range. A pruned group would drop its rows entirely,
+  // so `count(*)` over the range would come back short even though none of those rows match `v`.
+  auto got = query("SELECT count(*), count(v), sum(v) FROM read_simpatico('" + file +
+                   "') WHERE i >= 2900 AND i < 3200;");
+  REQUIRE(got->GetValue(0, 0).GetValue<std::int64_t>() == 300);
+  REQUIRE(got->GetValue(1, 0).GetValue<std::int64_t>() == 300 - 64);
+
+  // And the same predicate on the nullable column itself: a NULL satisfies neither side, so the
+  // two halves must still account for every non-null row.
+  auto split = query("SELECT count(*) FROM read_simpatico('" + file + "') WHERE v < 3000;");
+  auto rest  = query("SELECT count(*) FROM read_simpatico('" + file + "') WHERE v >= 3000;");
+  REQUIRE(split->GetValue(0, 0).GetValue<std::int64_t>() +
+            rest->GetValue(0, 0).GetValue<std::int64_t>() ==
+          6000 - 64);
 }
 
 TEST_CASE_METHOD(SimpaticoCopyFixture,

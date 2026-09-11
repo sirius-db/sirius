@@ -1710,6 +1710,46 @@ TEST_CASE("group_bounds_arena - refuses inconsistent captures", "[pinned_chunk_s
   }
 }
 
+TEST_CASE("group_bounds_arena - marking a column nullable stops IS NULL pruning it",
+          "[pinned_chunk_stats]")
+{
+  // A .hpln's column headers and its `zone_maps` segment are separate records. Only the headers
+  // are authoritative about nulls, so a reader that finds them disagreeing has to relax the arena
+  // -- an arena claiming "no nulls" makes `IS NULL` provably empty for every group, and the rows
+  // holding the NULLs would be dropped by the one predicate that is looking for them.
+  using sirius::scan_manager::group_bounds_arena;
+  using sirius::scan_manager::lowered_bound_filter;
+
+  std::vector<std::optional<std::pair<int64_t, int64_t>>> cells;
+  for (std::size_t g = 0; g < 6; ++g) {
+    cells.emplace_back(
+      std::pair<int64_t, int64_t>{10 * static_cast<int64_t>(g), 10 * static_cast<int64_t>(g) + 9});
+  }
+  auto arena = make_arena(cells);
+  REQUIRE_FALSE(arena.empty());
+  REQUIRE(arena.cell(0, 0).column_has_no_nulls);
+
+  duckdb::IsNullFilter is_null;
+  auto lowered = lowered_bound_filter::lower(is_null, arena.cell(0, 0).type);
+  REQUIRE(lowered.has_value());
+
+  // Baseline: with the capture's own answer, every group is provably empty for IS NULL.
+  std::vector<std::uint32_t> survivors;
+  lowered->select_survivors(arena.cell(0, 0), survivors);
+  REQUIRE(survivors.empty());
+
+  // After relaxing, a NULL could be in any group, so none of them can be ruled out.
+  arena.mark_column_nullable(0);
+  REQUIRE_FALSE(arena.cell(0, 0).column_has_no_nulls);
+  lowered->select_survivors(arena.cell(0, 0), survivors);
+  REQUIRE(survivors.size() == cells.size());
+
+  // Only ever relaxes, and only the named column: an out-of-range index is ignored rather than
+  // corrupting a neighbour's flag.
+  arena.mark_column_nullable(99);
+  REQUIRE_FALSE(arena.cell(0, 0).column_has_no_nulls);
+}
+
 TEST_CASE("group_bounds_arena - packs to bytes a .hpln can carry and back", "[pinned_chunk_stats]")
 {
   // An INGESTED file has to prune without decoding anything, so the bounds must travel with the

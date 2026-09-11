@@ -1238,10 +1238,19 @@ std::string describe_compressed_table_header(std::span<const std::uint8_t> heade
   out.columns.reserve(recs.size());
   for (auto const& cr : recs) {
     hpln_column_desc d;
-    d.name      = cr.name;
-    d.dtype_tag = cr.dtype_tag;
-    d.scale     = cr.scale;
-    d.num_rows  = cr.num_rows;
+    d.name       = cr.name;
+    d.dtype_tag  = cr.dtype_tag;
+    d.scale      = cr.scale;
+    d.num_rows   = cr.num_rows;
+    d.has_nulls  = cr.validity.kind != validity_kind::all_valid;
+    d.null_count = d.has_nulls ? cr.validity.null_count : 0;
+    // The mask is a payload buffer like any other, so it counts toward both the column's size and
+    // the payload's extent. It hangs off no leaf, so the loop below would otherwise miss it.
+    if (cr.validity.kind == validity_kind::mask) {
+      d.compressed_bytes += cr.validity.size_bytes;
+      out.payload_bytes =
+        std::max(out.payload_bytes, cr.validity.payload_offset + cr.validity.size_bytes);
+    }
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         auto const size = cr.leaf_descs[li].buffers[bi].size_bytes;

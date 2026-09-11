@@ -105,6 +105,10 @@ struct hpln_bind_schema {
   /// carries none or the segment did not decode -- both mean "serve unpruned", never "prune
   /// wrongly". Positional with the FILE's columns, not with any projection.
   scan_manager::group_bounds_arena group_bounds;
+  /// Whether each FILE column can contain NULL, ORed over the file's chunks. Positional with
+  /// @ref names. A .hpln records validity per chunk, so a column with nulls in only one chunk is
+  /// still a nullable column to a reader binding the whole file.
+  std::vector<bool> column_has_nulls;
 };
 
 /// Open @p path far enough to answer "what columns does this file have".
