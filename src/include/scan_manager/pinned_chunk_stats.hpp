@@ -215,6 +215,11 @@ class group_bounds_arena {
   /// Contiguous bytes, for a single H2D copy or a single ranged write/read.
   [[nodiscard]] std::span<std::int64_t const> raw() const noexcept { return _storage; }
 
+  /// Declared type of column @p column, SQLNULL when out of range or when the capture carried no
+  /// statistics for it. Available separately from @ref cell because a column may have no cells at
+  /// all, and a consumer positional with the pinned columns still needs an entry for it.
+  [[nodiscard]] duckdb::LogicalType column_type(std::size_t column) const;
+
   /// Bounds of column @p column within chunk @p chunk; an empty view when absent.
   [[nodiscard]] packed_column_bounds cell(std::size_t column, std::size_t chunk) const noexcept;
 
@@ -273,6 +278,22 @@ class group_bounds_arena {
   std::size_t _n_columns{0};
   std::size_t _n_chunks{0};
 };
+
+/**
+ * @brief Reduce per-group bounds to the per-chunk sidecar, one cell per (column, chunk).
+ *
+ * A pin whose statistics arrive as a ready-made arena — an ingested .hpln, whose bounds were
+ * written by whoever produced the file — still needs the coarse sidecar, because
+ * @ref build_cached_scan_plan gates ALL pruning (including the sub-chunk pass, which reads the
+ * column types from it) on @c pinned_zone_maps::has_stats. Recomputing the coarse bounds from the
+ * data would mean decoding it, which is exactly what an ingest exists to avoid, so they are
+ * reduced from the groups instead: a chunk's min/max is the min/max over its groups' bounds,
+ * which is what a whole-chunk capture would have measured.
+ *
+ * Cells whose bounds are absent stay absent (never prune). A column whose type is outside the
+ * zone-map allowlist contributes no cells, which the filter gate rejects anyway.
+ */
+[[nodiscard]] pinned_zone_maps chunk_zone_maps_from_group_bounds(group_bounds_arena const& bounds);
 
 /**
  * @brief A @c TableFilter lowered once into bounds arithmetic, to be evaluated against many

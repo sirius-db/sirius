@@ -116,6 +116,10 @@ class cache_entry_info {
   std::string table_name;                          ///< duckdb identity: table
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
+  /// True when @c resolved_file_paths names .hpln files rather than parquet ones. Both formats
+  /// identify a table by its file set, so without this a parquet scan and a simpatico scan over
+  /// the same path would match each other's entries -- and the two decode incompatibly.
+  bool simpatico_files{false};
 
   /// Build the cache descriptor from a read-side ingestible_table_info (parquet
   /// or duckdb-native): captures the format's identity, the kept @c column_ids,
@@ -637,6 +641,27 @@ class sirius_scan_manager {
     std::vector<chunk_group_stats> group_stats,
     sirius::pinned_column_storage_matrix column_storage);
 
+  /// \brief Pin a host-tier entry whose statistics arrive as a ready-made @ref group_bounds_arena.
+  ///
+  /// The overload above takes a capture — per-chunk and per-group @c BaseStatistics — because a
+  /// pin MEASURES its statistics off the GPU table it just materialized. A pin ingested from a
+  /// file does not: the bounds were computed by whoever wrote the file and travel in it, already
+  /// in the arena's packed form. Handing them over as @c BaseStatistics would mean unpacking
+  /// millions of cells into heap objects for the sole purpose of @ref group_bounds_arena::
+  /// from_capture packing them straight back, and the round trip is lossy where the arena's type
+  /// tags and the capture's allowlist disagree. So this overload takes the arena as it stands and
+  /// reduces the coarse sidecar from it (@ref chunk_zone_maps_from_group_bounds), which is the
+  /// only derived form the pruning path still needs.
+  ///
+  /// Otherwise identical to the capture overload, including "always REPLACES".
+  void insert_pinned_entry_host(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space,
+    group_bounds_arena group_bounds,
+    sirius::pinned_column_storage_matrix column_storage);
+
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
   ///
   /// Each entry in @p chunks is one emitted batch, in emission order, holding all
@@ -833,6 +858,19 @@ class sirius_scan_manager {
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
+
+  /// Shared tail of both @ref insert_pinned_entry_host overloads: validate the chunk and
+  /// column-storage shapes, then build and publish the entry. Only how the two sidecars are
+  /// OBTAINED differs between the overloads — measured from a capture, or carried by a file — so
+  /// everything downstream of them lives here once.
+  void install_pinned_entry_host(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space,
+    pinned_zone_maps zone_maps,
+    group_bounds_arena group_bounds,
+    sirius::pinned_column_storage_matrix column_storage);
 
   /// Give the entry now living at @p name a fresh late-mat handle, and
   /// invalidate whatever handle it is replacing. Called after every insert;

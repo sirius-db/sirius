@@ -507,6 +507,12 @@ packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t ch
   return out;
 }
 
+duckdb::LogicalType group_bounds_arena::column_type(std::size_t column) const
+{
+  if (column >= _types.size()) { return duckdb::LogicalType(duckdb::LogicalTypeId::SQLNULL); }
+  return _types[column];
+}
+
 std::size_t group_bounds_arena::groups_in_chunk(std::size_t chunk) const noexcept
 {
   if (chunk >= _n_chunks || _n_columns == 0) { return 0; }
@@ -738,6 +744,95 @@ group_bounds_arena group_bounds_arena::from_capture(
     }
   }
   return out;
+}
+
+namespace {
+
+/// Inverse of @ref value_carrier: the 8-byte carrier back to a Value of @p type. Mirrors that
+/// function's allowlist exactly -- a type it cannot carry has no bound to reconstruct, and a
+/// mismatched pair here would produce bounds that prune the wrong rows rather than none.
+duckdb::Value carrier_to_value(duckdb::LogicalType const& type, std::int64_t raw)
+{
+  switch (type.id()) {
+    case duckdb::LogicalTypeId::TINYINT:
+      return duckdb::Value::TINYINT(static_cast<std::int8_t>(raw));
+    case duckdb::LogicalTypeId::SMALLINT:
+      return duckdb::Value::SMALLINT(static_cast<std::int16_t>(raw));
+    case duckdb::LogicalTypeId::INTEGER:
+      return duckdb::Value::INTEGER(static_cast<std::int32_t>(raw));
+    case duckdb::LogicalTypeId::BIGINT: return duckdb::Value::BIGINT(raw);
+    case duckdb::LogicalTypeId::UTINYINT:
+      return duckdb::Value::UTINYINT(static_cast<std::uint8_t>(raw));
+    case duckdb::LogicalTypeId::USMALLINT:
+      return duckdb::Value::USMALLINT(static_cast<std::uint16_t>(raw));
+    case duckdb::LogicalTypeId::UINTEGER:
+      return duckdb::Value::UINTEGER(static_cast<std::uint32_t>(raw));
+    case duckdb::LogicalTypeId::UBIGINT:
+      return duckdb::Value::UBIGINT(static_cast<std::uint64_t>(raw));
+    case duckdb::LogicalTypeId::DATE:
+      return duckdb::Value::DATE(duckdb::date_t{static_cast<std::int32_t>(raw)});
+    case duckdb::LogicalTypeId::TIMESTAMP:
+      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{raw});
+    default: return duckdb::Value();
+  }
+}
+
+}  // namespace
+
+pinned_zone_maps chunk_zone_maps_from_group_bounds(group_bounds_arena const& bounds)
+{
+  auto const n_columns = bounds.column_count();
+  auto const n_chunks  = bounds.chunk_count();
+  if (bounds.empty() || n_columns == 0 || n_chunks == 0) { return {}; }
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.reserve(n_columns);
+  std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats(n_chunks);
+  for (auto& row : chunk_stats) {
+    row.resize(n_columns);
+  }
+
+  for (std::size_t col = 0; col < n_columns; ++col) {
+    auto const type = bounds.column_type(col);
+    types.push_back(type);
+    bool const uns = type_is_unsigned(type);
+    for (std::size_t chunk = 0; chunk < n_chunks; ++chunk) {
+      auto const cell = bounds.cell(col, chunk);
+      if (cell.empty()) { continue; }
+      bool have       = false;
+      std::int64_t lo = 0;
+      std::int64_t hi = 0;
+      for (std::size_t g = 0; g < cell.size(); ++g) {
+        if (cell.valid[g] == 0) { continue; }  // absent cell: contributes no bound
+        if (!have) {
+          lo   = cell.mins[g];
+          hi   = cell.maxs[g];
+          have = true;
+          continue;
+        }
+        if (carrier_cmp(cell.mins[g], lo, uns) < 0) { lo = cell.mins[g]; }
+        if (carrier_cmp(cell.maxs[g], hi, uns) > 0) { hi = cell.maxs[g]; }
+      }
+      if (!have) { continue; }
+      auto const min_value = carrier_to_value(type, lo);
+      auto const max_value = carrier_to_value(type, hi);
+      if (min_value.IsNull() || max_value.IsNull()) { continue; }
+
+      auto column_stats = duckdb::NumericStats::CreateUnknown(type);
+      duckdb::NumericStats::SetMin(column_stats, min_value);
+      duckdb::NumericStats::SetMax(column_stats, max_value);
+      // The group capture only knows nulls at column granularity, so a chunk of a column that has
+      // any null is "may have nulls" -- conservative, and the same precision the fine pass uses.
+      if (cell.column_has_no_nulls) {
+        column_stats.Set(duckdb::StatsInfo::CANNOT_HAVE_NULL_VALUES);
+      } else {
+        column_stats.SetHasNull();
+      }
+      chunk_stats[chunk][col] = column_stats.ToUnique();
+    }
+  }
+  return pinned_zone_maps::from_capture(
+    std::move(types), std::move(chunk_stats), n_columns, n_chunks);
 }
 
 std::optional<lowered_bound_filter> lowered_bound_filter::lower(

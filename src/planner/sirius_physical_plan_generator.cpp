@@ -440,10 +440,21 @@ void wrap_table_scan_source(
   } else if (fn == "read_simpatico") {
     // No dynamic-filter channel: the .hpln source has no membership filter to receive, so the
     // scan leaf is built directly rather than through make_gpu_scan_leaf.
-    auto ingestible = sirius::op::scan::make_ingestible(
-      build_simpatico_table_info(scan, op_params, sirius_ctx.get()));
-    leaf = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      scan.types, scan.estimated_cardinality, std::move(ingestible), sirius_ctx.get());
+    auto info = build_simpatico_table_info(scan, op_params, sirius_ctx.get());
+    // The leaf's output is the columns it DECODES, not the file's full width. With projection
+    // pushdown off, create_plan(LogicalGet&) types the scan node by returned_types and pushes a
+    // projection that reads its positions 0..M-1 -- so for a query that reads some of the
+    // columns, scan.types is wider than anything the leaf emits. Nothing notices on the disk
+    // path, but a scan served from a pinned entry normalizes against these types and fails the
+    // arity check; a late-materialization deferral sizes its substitution by them too.
+    duckdb::vector<sirius::logical_type> leaf_types;
+    leaf_types.reserve(info->column_ids.size());
+    for (auto const file_column : info->column_ids) {
+      leaf_types.push_back(scan.returned_types[file_column]);
+    }
+    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
+      std::move(leaf_types), scan.estimated_cardinality, std::move(ingestible), sirius_ctx.get());
     if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
     replace_slot = true;
   } else {

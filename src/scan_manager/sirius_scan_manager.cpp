@@ -38,6 +38,7 @@
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
 #include "op/scan/scan_utils.hpp"
+#include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -741,6 +742,11 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
   } else if (auto const* p =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     return {p->table_filters.get(), &p->column_ids};
+  } else if (auto const* h =
+               dynamic_cast<op::scan::simpatico_ingestible_table_info const*>(&info)) {
+    // duckdb_column_ids, not column_ids: the filter's keys are positions into the DuckDB column
+    // list (create_table_filter_set remapped them), while column_ids holds FILE column indices.
+    return {h->table_filters.get(), &h->duckdb_column_ids};
   }
   return {};
 }
@@ -2050,6 +2056,16 @@ cache_entry_info cache_entry_info::from(const op::scan::ingestible_table_info& i
     op::scan::canonicalize_scan_file_paths(ci.resolved_file_paths);
     ci.column_ids = p->column_ids;
     ci.names      = aligned_column_names(p->names, p->column_ids);
+  } else if (auto const* h =
+               dynamic_cast<op::scan::simpatico_ingestible_table_info const*>(&info)) {
+    // A .hpln table is one file, and that path is its whole identity -- the same string a
+    // read_simpatico() bind resolves, so a pin and a query agree without anything else stored.
+    ci.resolved_file_paths = h->resolved_file_paths;
+    op::scan::canonicalize_scan_file_paths(ci.resolved_file_paths);
+    ci.simpatico_files = true;
+    ci.column_ids      = h->duckdb_column_ids;
+    duckdb::vector<std::string> names{h->names.begin(), h->names.end()};
+    ci.names = aligned_column_names(names, h->duckdb_column_ids);
   } else if (auto const* d =
                dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
     ci.catalog_name = d->catalog_name;
@@ -2069,8 +2085,16 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
+    // Both file formats identify a table by its path set, so the format has to be compared too:
+    // a .hpln pin holds Simpatico chunks a parquet scan would read as its own columns.
+    if (simpatico_files) { return {}; }
     if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);
+  }
+  if (auto const* h = dynamic_cast<op::scan::simpatico_ingestible_table_info const*>(&other)) {
+    if (!simpatico_files) { return {}; }
+    if (!matches_parquet_files(h->resolved_file_paths)) { return {}; }
+    return column_projection_for(h->duckdb_column_ids);
   }
   if (auto const* d = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&other)) {
     if (!matches_duckdb_table(d->catalog_name, d->schema_name, d->table_name)) { return {}; }
@@ -2421,7 +2445,72 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<chunk_group_stats> group_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
-  // The host-tier path captures one chunk per emitted batch; each chunk holds every
+  // Normalize the optional zone-map capture
+  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
+  // from_capture consumes column_types; the group arena needs the same list, so copy first.
+  auto const group_column_types = column_types;
+  auto pin_zone_maps            = pinned_zone_maps::from_capture(std::move(column_types),
+                                                      std::move(chunk_stats),
+                                                      cache_info.column_ids.size(),
+                                                      host_chunks.size());
+  if (stats_supplied && !pin_zone_maps.has_stats()) {
+    // Only reason stats failed to append is a shape mismatch between the captured stats and the
+    // pinned entry; warn but still pin the entry.
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry_host] zone-map capture shape mismatch; "
+      "pinning '{}' without statistics",
+      name);
+  }
+  // The finer sidecar. from_capture returns empty on any inconsistency, which simply means no
+  // sub-chunk pruning; the coarse zone_maps above are unaffected either way.
+  auto group_bounds = group_bounds_arena::from_capture(group_column_types, group_stats);
+
+  install_pinned_entry_host(name,
+                            std::move(cache_info),
+                            std::move(host_chunks),
+                            memory_space,
+                            std::move(pin_zone_maps),
+                            std::move(group_bounds),
+                            std::move(column_storage));
+}
+
+void sirius_scan_manager::insert_pinned_entry_host(
+  const std::string& name,
+  cache_entry_info cache_info,
+  std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+  cucascade::memory::memory_space& memory_space,
+  group_bounds_arena group_bounds,
+  sirius::pinned_column_storage_matrix column_storage)
+{
+  // The coarse sidecar is REDUCED from the bounds rather than measured: an ingested pin has no
+  // decoded table to measure, and build_cached_scan_plan gates every pruning pass -- the
+  // per-group one included -- on the coarse sidecar being present.
+  auto pin_zone_maps = chunk_zone_maps_from_group_bounds(group_bounds);
+  if (!group_bounds.empty() && !pin_zone_maps.has_stats()) {
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager::insert_pinned_entry_host] per-group bounds did not reduce to a "
+      "chunk-level sidecar; pinning '{}' without pruning",
+      name);
+  }
+  install_pinned_entry_host(name,
+                            std::move(cache_info),
+                            std::move(host_chunks),
+                            memory_space,
+                            std::move(pin_zone_maps),
+                            std::move(group_bounds),
+                            std::move(column_storage));
+}
+
+void sirius_scan_manager::install_pinned_entry_host(
+  const std::string& name,
+  cache_entry_info cache_info,
+  std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+  cucascade::memory::memory_space& memory_space,
+  pinned_zone_maps zone_maps,
+  group_bounds_arena group_bounds,
+  sirius::pinned_column_storage_matrix column_storage)
+{
+  // The host-tier path holds one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
   // are flipped.
@@ -2463,22 +2552,6 @@ void sirius_scan_manager::insert_pinned_entry_host(
       if (column >= host_columns.size()) { return std::nullopt; }
       return host_column_carrier(host_columns[column]);
     });
-  // Normalize the optional zone-map capture
-  bool const stats_supplied = !column_types.empty() && !chunk_stats.empty();
-  // from_capture consumes column_types; the group arena needs the same list, so copy first.
-  auto const group_column_types = column_types;
-  auto pin_zone_maps            = pinned_zone_maps::from_capture(std::move(column_types),
-                                                      std::move(chunk_stats),
-                                                      cache_info.column_ids.size(),
-                                                      host_chunks.size());
-  if (stats_supplied && !pin_zone_maps.has_stats()) {
-    // Only reason stats failed to append is a shape mismatch between the captured stats and the
-    // pinned entry; warn but still pin the entry.
-    SIRIUS_LOG_WARN(
-      "[sirius_scan_manager::insert_pinned_entry_host] zone-map capture shape mismatch; "
-      "pinning '{}' without statistics",
-      name);
-  }
 
   pinned_entry entry;
   entry.cache_info     = std::move(cache_info);
@@ -2487,10 +2560,8 @@ void sirius_scan_manager::insert_pinned_entry_host(
   entry.num_rows       = new_num_rows;
   entry.host_chunks    = std::move(host_chunks);
   entry.column_storage = std::move(column_storage);
-  entry.zone_maps      = std::move(pin_zone_maps);
-  // The finer sidecar. from_capture returns empty on any inconsistency, which simply means no
-  // sub-chunk pruning; the coarse zone_maps above are unaffected either way.
-  entry.group_bounds = group_bounds_arena::from_capture(group_column_types, group_stats);
+  entry.zone_maps      = std::move(zone_maps);
+  entry.group_bounds   = std::move(group_bounds);
 
   // Assigning over an existing name destroys that entry in place, so its
   // handle has to be invalidated FIRST — afterwards the entry is gone but the
