@@ -23,6 +23,7 @@
 // compare against.
 
 #include "compression/simpatico_file_ingest.hpp"
+#include "scan_manager/pinned_chunk_stats.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -284,6 +286,103 @@ TEST_CASE_METHOD(SimpaticoCopyFixture,
   REQUIRE(split->GetValue(0, 0).GetValue<std::int64_t>() +
             rest->GetValue(0, 0).GetValue<std::int64_t>() ==
           6000 - 64);
+}
+
+TEST_CASE_METHOD(SimpaticoCopyFixture,
+                 "COPY to .hpln clusters each chunk on cluster_by",
+                 "[integration][simpatico_copy]")
+{
+  // A key in an order the writer cannot have got for free: (i * 7919) % 6000 is a permutation of
+  // [0, 6000) (7919 is coprime with 6000) that arrives shuffled, so every zone-map group of an
+  // unclustered file spans nearly the whole domain. That is what makes narrow bounds evidence
+  // that the sort ran, rather than evidence that the query was already ordered.
+  // Built on the CPU: `range` has no GPU plan, and the shape of the source table is not what is
+  // under test here.
+  run_ok("SET enable_duckdb_fallback = true;");
+  run_ok(
+    "CREATE TABLE shuf AS SELECT ((i * 7919) % 6000)::INTEGER AS k, (i * 10)::BIGINT AS v"
+    " FROM range(" +
+    std::to_string(kRows) + ") t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET enable_duckdb_fallback = false;");
+  auto const shuffled               = std::string("SELECT k, v FROM shuf");
+  constexpr std::size_t kChunkRows  = 2048;
+  constexpr std::size_t kGroupRows  = 512;
+  constexpr std::size_t kChunkCount = 3;
+  auto const options = std::string(" (FORMAT simpatico, chunk_rows ") + std::to_string(kChunkRows) +
+                       ", group_rows " + std::to_string(kGroupRows);
+
+  auto const plain     = path("unclustered.hpln");
+  auto const clustered = path("clustered.hpln");
+  query("COPY (" + shuffled + ") TO '" + plain + "'" + options + ");");
+  query("COPY (" + shuffled + ") TO '" + clustered + "'" + options + ", cluster_by 'k');");
+
+  auto const plain_schema     = sirius::read_hpln_schema(plain);
+  auto const clustered_schema = sirius::read_hpln_schema(clustered);
+  REQUIRE(plain_schema.num_rows == kRows);
+  REQUIRE(clustered_schema.num_rows == kRows);
+  REQUIRE(clustered_schema.chunk_rows == plain_schema.chunk_rows);
+  REQUIRE(clustered_schema.group_bounds.chunk_count() == kChunkCount);
+
+  // Widest group in either file, and whether any chunk's groups overlap each other. Clustering is
+  // a LOCAL sort, so the claim is per chunk: within a chunk the groups partition the key range,
+  // while across chunks they still all span it.
+  auto inspect = [](sirius::scan_manager::group_bounds_arena const& bounds) {
+    std::int64_t widest_group = 0;
+    bool any_overlap          = false;
+    for (std::size_t chunk = 0; chunk < bounds.chunk_count(); chunk++) {
+      auto const cell = bounds.cell(/*column=*/0, chunk);
+      REQUIRE(cell.size() > 1);
+      for (std::size_t group = 0; group < cell.size(); group++) {
+        widest_group = std::max(widest_group, cell.maxs[group] - cell.mins[group]);
+        if (group > 0 && cell.mins[group] <= cell.maxs[group - 1]) { any_overlap = true; }
+      }
+    }
+    return std::pair<std::int64_t, bool>{widest_group, any_overlap};
+  };
+
+  auto const [plain_widest, plain_overlap]         = inspect(plain_schema.group_bounds);
+  auto const [clustered_widest, clustered_overlap] = inspect(clustered_schema.group_bounds);
+
+  // Unclustered: a 512-row sample of a shuffled permutation covers essentially the whole domain,
+  // and consecutive groups therefore overlap.
+  REQUIRE(plain_widest > 5000);
+  REQUIRE(plain_overlap);
+  // Clustered: a group holds 512 consecutive keys of a chunk that itself holds a 1-in-3 sample of
+  // the domain, so it spans roughly 6000 * 512 / 2048 = 1500 -- and the groups of one chunk are
+  // disjoint and ascending, which is the property pruning actually uses.
+  REQUIRE(clustered_widest < 2500);
+  REQUIRE_FALSE(clustered_overlap);
+
+  // Clustering reorders rows; it must not add, drop or alter one.
+  auto written   = query(shuffled + " ORDER BY k;");
+  auto read_back = query("SELECT k, v FROM read_simpatico('" + clustered + "') ORDER BY k;");
+  REQUIRE(read_back->RowCount() == static_cast<duckdb::idx_t>(kRows));
+  REQUIRE(ordered_rows(*read_back) == ordered_rows(*written));
+
+  // And the file still answers a filter on the clustered key exactly, now that far more groups
+  // can be skipped than before.
+  auto filtered =
+    query("SELECT count(*), sum(v) FROM read_simpatico('" + clustered + "') WHERE k >= 5000;");
+  auto expected = query("SELECT count(*), sum(v) FROM shuf WHERE k >= 5000;");
+  REQUIRE(ordered_rows(*filtered) == ordered_rows(*expected));
+}
+
+TEST_CASE_METHOD(SimpaticoCopyFixture,
+                 "COPY to .hpln refuses a cluster_by column the query does not produce",
+                 "[integration][simpatico_copy]")
+{
+  auto const file = path("bad_cluster.hpln");
+  // A typo must not write an unclustered file the caller believes is clustered.
+  auto const error = query_error("COPY (SELECT a, b FROM src) TO '" + file +
+                                 "' (FORMAT simpatico, cluster_by 'nope');");
+  REQUIRE(error.find("cluster_by") != std::string::npos);
+  REQUIRE(error.find("nope") != std::string::npos);
+  REQUIRE_FALSE(fs::exists(file));
+
+  // Names resolve the way SQL names do, case-insensitively, and several keys are accepted.
+  query("COPY (SELECT a, b FROM src) TO '" + file + "' (FORMAT simpatico, cluster_by ('B', 'A'));");
+  REQUIRE(sirius::read_hpln_schema(file).num_rows == kRows);
 }
 
 TEST_CASE_METHOD(SimpaticoCopyFixture,

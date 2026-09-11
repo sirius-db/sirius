@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "helper/duckdb_chunk_staging.hpp"
 #include "helper/type_conversions.hpp"
+#include "pin_table.hpp"
 #include "plan_register.hpp"
 #include "simpatico_file_ingest.hpp"
 #include "sirius_context.hpp"
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -91,6 +93,34 @@ std::size_t single_positive_option(const duckdb::vector<duckdb::Value>& values,
   return static_cast<std::size_t>(v);
 }
 
+/// Flatten a COPY option's values into strings: `cluster_by 'a'`, `cluster_by ('a', 'b')` and a
+/// LIST literal all arrive differently, and all three mean the same thing.
+std::vector<std::string> string_list_option(const duckdb::vector<duckdb::Value>& values,
+                                            const std::string& name)
+{
+  std::vector<std::string> out;
+  for (auto const& value : values) {
+    if (value.IsNull()) {
+      throw duckdb::BinderException("COPY (FORMAT simpatico): '%s' cannot contain NULL", name);
+    }
+    if (value.type().id() == duckdb::LogicalTypeId::LIST) {
+      for (auto const& child : duckdb::ListValue::GetChildren(value)) {
+        if (child.IsNull()) {
+          throw duckdb::BinderException("COPY (FORMAT simpatico): '%s' cannot contain NULL", name);
+        }
+        out.push_back(child.ToString());
+      }
+    } else {
+      out.push_back(value.ToString());
+    }
+  }
+  if (out.empty()) {
+    throw duckdb::BinderException("COPY (FORMAT simpatico): '%s' expects at least one column name",
+                                  name);
+  }
+  return out;
+}
+
 struct simpatico_copy_bind_data : public duckdb::TableFunctionData {
   std::vector<std::string> names;
   /// The types recorded in the file's `logical_types` segment. They must be the types the payload
@@ -102,6 +132,9 @@ struct simpatico_copy_bind_data : public duckdb::TableFunctionData {
   std::string plan_dsl;
   std::size_t chunk_rows = kDefaultHplnChunkRows;
   std::size_t group_rows = 0;
+  /// Positions to sort each chunk on before compressing it, in key order. Empty writes the
+  /// query's order verbatim.
+  std::vector<std::size_t> cluster_columns;
 };
 
 /// Refuse at bind anything the writer cannot represent, so a COPY fails before it has run its
@@ -159,6 +192,7 @@ duckdb::unique_ptr<duckdb::FunctionData> simpatico_copy_bind(
 
   std::string plan_table;
   std::string explicit_plan;
+  std::vector<std::string> cluster_names;
   for (auto const& option : input.info.options) {
     auto const key = duckdb::StringUtil::Lower(option.first);
     if (key == "chunk_rows") {
@@ -177,6 +211,8 @@ duckdb::unique_ptr<duckdb::FunctionData> simpatico_copy_bind(
         throw duckdb::BinderException("COPY (FORMAT simpatico): 'group_rows' cannot be negative");
       }
       result->group_rows = static_cast<std::size_t>(v);
+    } else if (key == "cluster_by") {
+      cluster_names = string_list_option(option.second, "cluster_by");
     } else if (key == "plan") {
       explicit_plan = single_string_option(option.second, "plan");
     } else if (key == "plan_table") {
@@ -186,6 +222,25 @@ duckdb::unique_ptr<duckdb::FunctionData> simpatico_copy_bind(
                                     option.first);
     }
   }
+  // Resolve the keys against the COPY's own output names. A name that is not one of them is a
+  // typo that would otherwise write an unclustered file the user believes is clustered, which is
+  // exactly the failure the pin path refuses -- so it is an error, not a silent no-op.
+  for (auto const& key_name : cluster_names) {
+    auto const it = std::find_if(
+      result->names.begin(), result->names.end(), [&key_name](std::string const& candidate) {
+        return duckdb::StringUtil::CIEquals(candidate, key_name);
+      });
+    if (it == result->names.end()) {
+      throw duckdb::BinderException(
+        "COPY (FORMAT simpatico): cluster_by column '%s' is not one of the query's columns (%s)",
+        key_name,
+        duckdb::StringUtil::Join(
+          result->names, result->names.size(), ", ", [](std::string const& n) { return n; }));
+    }
+    result->cluster_columns.push_back(
+      static_cast<std::size_t>(std::distance(result->names.begin(), it)));
+  }
+
   if (!explicit_plan.empty() && !plan_table.empty()) {
     throw duckdb::BinderException(
       "COPY (FORMAT simpatico): set either 'plan' or 'plan_table', not both");
@@ -261,14 +316,25 @@ duckdb::unique_ptr<duckdb::LocalFunctionData> simpatico_copy_initialize_local(
 }
 
 /// Upload what is staged as one chunk and start a fresh one.
-void close_chunk(simpatico_copy_global_state& state)
+void close_chunk(simpatico_copy_global_state& state, std::span<std::size_t const> cluster_columns)
 {
   // Nulls need no special handling here: the staging carries each column's validity to the
   // cudf::table, and compress_column strips it into the plan tree's sidecar, which the container
   // serializes per column (see push_validity). A chunk that is entirely null costs no payload
   // bytes at all.
-  state.chunks.push_back(
-    state.staging->build(cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref()));
+  auto table =
+    state.staging->build(cudf::get_default_stream(), rmm::mr::get_current_device_resource_ref());
+  // Clustering is a local sort per chunk -- the same one the pin path applies in
+  // materialize_pin_batches, reused rather than reimplemented. It narrows each zone-map group to a
+  // slice of the key space; whole-chunk pruning needs a GLOBAL order, which only an ORDER BY in
+  // the SELECT can give and which this streaming sort deliberately does not pay for.
+  if (!cluster_columns.empty()) {
+    table = sirius::cluster_pin_chunk(std::move(table),
+                                      cluster_columns,
+                                      cudf::get_default_stream(),
+                                      rmm::mr::get_current_device_resource_ref());
+  }
+  state.chunks.push_back(std::move(table));
   state.staging->reset();
 }
 
@@ -292,7 +358,7 @@ void simpatico_copy_sink(duckdb::ExecutionContext&,
     state.staging->append(input, offset, take);
     offset += take;
     if (static_cast<std::size_t>(state.staging->num_rows()) >= bind.chunk_rows) {
-      close_chunk(state);
+      close_chunk(state, bind.cluster_columns);
     }
   }
 }
@@ -314,7 +380,9 @@ void simpatico_copy_finalize(duckdb::ClientContext&,
 
   // A trailing partial chunk is a chunk; and a query that produced no rows still writes one empty
   // chunk, so the file carries its schema and binds like any other.
-  if (state.staging->num_rows() > 0 || state.chunks.empty()) { close_chunk(state); }
+  if (state.staging->num_rows() > 0 || state.chunks.empty()) {
+    close_chunk(state, bind.cluster_columns);
+  }
 
   std::vector<cudf::table_view> views;
   views.reserve(state.chunks.size());
@@ -337,10 +405,11 @@ void simpatico_copy_finalize(duckdb::ClientContext&,
   if (!error.empty()) {
     throw duckdb::IOException("COPY (FORMAT simpatico) to '%s' failed: %s", state.path, error);
   }
-  SIRIUS_LOG_INFO("[hpln copy] wrote '{}': {} chunk(s), group_rows={}",
+  SIRIUS_LOG_INFO("[hpln copy] wrote '{}': {} chunk(s), group_rows={}, cluster_by {} column(s)",
                   state.path,
                   views.size(),
-                  bind.group_rows);
+                  bind.group_rows,
+                  bind.cluster_columns.size());
 }
 
 }  // namespace
