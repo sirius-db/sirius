@@ -95,4 +95,21 @@ class plan_register {
 [[nodiscard]] std::optional<std::string> select_plan_blocks(
   const std::string& full_plan_dsl, const std::vector<std::size_t>& column_indices);
 
+/**
+ * @brief Resolve @p table_name's whole-table plan, loading it from @p plan_dir on first use.
+ *
+ * A plan file is named after the table it describes (`<table_name>.<anything>`) and holds the
+ * "---"-separated DSL for its columns in schema order. The registry is consulted first, so a plan
+ * set by hand (or loaded by an earlier call) wins over the directory and the file is read once per
+ * table per process.
+ *
+ * Returns nullopt when @p plan_dir is empty, unreadable, or holds no file for @p table_name --
+ * every one of which means "no plan", never a partial one. @p error, when non-null, receives the
+ * reason the directory could not be scanned, which is the only failure a caller may want to
+ * report rather than silently treat as absent.
+ */
+[[nodiscard]] std::optional<std::string> resolve_table_plan_from_dir(const std::string& plan_dir,
+                                                                     const std::string& table_name,
+                                                                     std::string* error = nullptr);
+
 }  // namespace sirius::compression

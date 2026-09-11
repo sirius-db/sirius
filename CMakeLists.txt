@@ -251,6 +251,7 @@ set(EXTENSION_SOURCES
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/compression/simpatico_copy_function.cpp
     src/late_mat/prepared_selection.cpp
     src/late_mat/materialize.cpp
     src/late_mat/defer_policy.cpp
@@ -261,6 +262,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/late_mat_resolver.cpp
     src/late_mat/multi_source_gather.cu
     src/config.cpp
+    src/helper/duckdb_chunk_staging.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
@@ -743,6 +745,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
     test/cpp/integration/test_read_simpatico_sql.cpp
+    test/cpp/integration/test_simpatico_copy_sql.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp

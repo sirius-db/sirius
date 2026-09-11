@@ -18,6 +18,9 @@
 
 #include <api/simpatico_codegen.hpp>
 
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <shared_mutex>
 #include <utility>
@@ -83,6 +86,31 @@ std::optional<std::string> select_plan_blocks(const std::string& full_plan_dsl,
     out += blocks[idx];
   }
   return out;
+}
+
+std::optional<std::string> resolve_table_plan_from_dir(const std::string& plan_dir,
+                                                       const std::string& table_name,
+                                                       std::string* error)
+{
+  if (auto registered = plan_register::global().resolve_table_plan(table_name);
+      registered.has_value()) {
+    return registered;
+  }
+  if (plan_dir.empty()) { return std::nullopt; }
+
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (auto const& entry : fs::directory_iterator(plan_dir, ec)) {
+    if (!entry.is_regular_file()) { continue; }
+    if (entry.path().stem() != table_name) { continue; }
+    std::ifstream f(entry.path());
+    std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (dsl.empty()) { break; }
+    plan_register::global().set_table_plan(table_name, dsl);
+    return dsl;
+  }
+  if (ec && error != nullptr) { *error = ec.message(); }
+  return std::nullopt;
 }
 
 }  // namespace sirius::compression

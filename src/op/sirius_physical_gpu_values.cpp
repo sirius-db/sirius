@@ -18,6 +18,7 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
+#include "helper/duckdb_chunk_staging.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -45,164 +46,6 @@
 namespace sirius::op {
 
 namespace {
-
-//===----------------------------------------------------------------------===//
-// Host-side column staging
-//===----------------------------------------------------------------------===//
-/// Host-side staging for one output column, accumulated across DataChunks
-/// before a single H2D upload. VALUES/materialized-subquery data is small,
-/// so pageable host staging + cudaMemcpyAsync is deliberate — no pinned
-/// allocation or IO machinery is warranted here.
-struct column_staging {
-  std::vector<uint8_t> fixed_data;             // fixed-width payload
-  std::vector<int32_t> offsets;                // varchar: num_rows + 1 entries
-  std::vector<char> chars;                     // varchar payload
-  std::vector<cudf::bitmask_type> mask_words;  // cudf validity bitmask (1 = valid)
-  cudf::size_type null_count = 0;
-  bool is_varchar            = false;
-};
-
-void init_staging(column_staging& s, const sirius::logical_type& type, cudf::size_type total_rows)
-{
-  s.is_varchar = type.is_varchar();
-  s.mask_words.assign(cudf::bitmask_allocation_size_bytes(total_rows) / sizeof(cudf::bitmask_type),
-                      0);
-  if (s.is_varchar) {
-    s.offsets.reserve(static_cast<size_t>(total_rows) + 1);
-    s.offsets.push_back(0);
-  } else {
-    s.fixed_data.reserve(static_cast<size_t>(total_rows) * type.fixed_width_byte_size());
-  }
-}
-
-void set_row_valid(column_staging& s, cudf::size_type row)
-{
-  s.mask_words[row / 32] |= (cudf::bitmask_type{1} << (row % 32));
-}
-
-/// Append one DataChunk's worth of rows for column @p c into its staging.
-/// @p row_base is the number of rows already staged from earlier chunks.
-void stage_chunk_column(column_staging& s,
-                        duckdb::Vector& vec,
-                        duckdb::idx_t chunk_rows,
-                        const sirius::logical_type& type,
-                        cudf::size_type row_base)
-{
-  vec.Flatten(chunk_rows);
-  auto const& validity = duckdb::FlatVector::Validity(vec);
-
-  if (s.is_varchar) {
-    auto* string_data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
-    for (duckdb::idx_t r = 0; r < chunk_rows; r++) {
-      if (validity.RowIsValid(r)) {
-        auto const& str = string_data[r];
-        if (s.chars.size() + str.GetSize() >
-            static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-          throw std::runtime_error(
-            "[sirius_physical_gpu_values] string column exceeds cudf int32 offset limit");
-        }
-        s.chars.insert(s.chars.end(), str.GetData(), str.GetData() + str.GetSize());
-        set_row_valid(s, row_base + static_cast<cudf::size_type>(r));
-      } else {
-        s.null_count++;
-      }
-      s.offsets.push_back(static_cast<int32_t>(s.chars.size()));
-    }
-    return;
-  }
-
-  auto const width = type.fixed_width_byte_size();
-  // Untyped GetData: the templated accessor type-checks the vector against T,
-  // and no single T matches every fixed-width type staged through here.
-  auto const* src = reinterpret_cast<const uint8_t*>(duckdb::FlatVector::GetData(vec));
-  for (duckdb::idx_t r = 0; r < chunk_rows; r++) {
-    if (validity.RowIsValid(r)) {
-      s.fixed_data.insert(s.fixed_data.end(), src + r * width, src + (r + 1) * width);
-      set_row_valid(s, row_base + static_cast<cudf::size_type>(r));
-    } else {
-      // DuckDB does not zero the backing storage of invalid rows; append
-      // zeros instead of the uninitialized bytes so nothing uninitialized
-      // ever reaches the GPU (keeps ASAN/MSAN and compute-sanitizer clean).
-      s.fixed_data.insert(s.fixed_data.end(), width, uint8_t{0});
-      s.null_count++;
-    }
-  }
-}
-
-/// Stage one all-null row for every column (DUMMY_SCAN behavior).
-void stage_null_row(column_staging& s, const sirius::logical_type& type)
-{
-  if (s.is_varchar) {
-    s.offsets.push_back(static_cast<int32_t>(s.chars.size()));
-  } else {
-    s.fixed_data.insert(s.fixed_data.end(), type.fixed_width_byte_size(), uint8_t{0});
-  }
-  s.null_count++;
-}
-
-rmm::device_buffer to_device(const void* host_data,
-                             std::size_t bytes,
-                             rmm::cuda_stream_view stream,
-                             rmm::device_async_resource_ref mr)
-{
-  rmm::device_buffer buf(bytes, stream, mr);
-  if (bytes > 0) {
-    CUDF_CUDA_TRY(
-      cudaMemcpyAsync(buf.data(), host_data, bytes, cudaMemcpyHostToDevice, stream.value()));
-  }
-  return buf;
-}
-
-std::unique_ptr<cudf::column> make_device_column(const column_staging& s,
-                                                 const sirius::logical_type& type,
-                                                 cudf::size_type num_rows,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr)
-{
-  rmm::device_buffer null_mask{};
-  if (s.null_count > 0) {
-    null_mask =
-      to_device(s.mask_words.data(), s.mask_words.size() * sizeof(cudf::bitmask_type), stream, mr);
-  }
-
-  if (s.is_varchar) {
-    auto offsets_col = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::INT32},
-      num_rows + 1,
-      to_device(s.offsets.data(), s.offsets.size() * sizeof(int32_t), stream, mr),
-      rmm::device_buffer{0, stream, mr},
-      0);
-    return cudf::make_strings_column(num_rows,
-                                     std::move(offsets_col),
-                                     to_device(s.chars.data(), s.chars.size(), stream, mr),
-                                     s.null_count,
-                                     std::move(null_mask));
-  }
-
-  return std::make_unique<cudf::column>(
-    sirius::get_cudf_type(type),
-    num_rows,
-    to_device(s.fixed_data.data(), s.fixed_data.size(), stream, mr),
-    std::move(null_mask),
-    s.null_count);
-}
-
-std::unique_ptr<cudf::table> staging_to_table(const std::vector<column_staging>& staging,
-                                              const duckdb::vector<sirius::logical_type>& types,
-                                              cudf::size_type num_rows,
-                                              rmm::cuda_stream_view stream,
-                                              rmm::device_async_resource_ref mr)
-{
-  std::vector<std::unique_ptr<cudf::column>> columns;
-  columns.reserve(staging.size());
-  for (size_t c = 0; c < staging.size(); c++) {
-    columns.push_back(make_device_column(staging[c], types[c], num_rows, stream, mr));
-  }
-  // The host staging vectors are destroyed when this call chain returns;
-  // the async H2D copies above must complete before then.
-  stream.synchronize();
-  return std::make_unique<cudf::table>(std::move(columns));
-}
 
 /// cuDF derives table cardinality from its columns, so a positive-row,
 /// zero-column DuckDB source needs a private sentinel column. Downstream
@@ -302,33 +145,26 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
       // DUMMY_SCAN.
       output_table = make_row_count_sentinel_table(total_rows, stream, mr);
     } else {
-      std::vector<column_staging> staging(types.size());
-      for (size_t c = 0; c < types.size(); c++) {
-        init_staging(staging[c], types[c], total_rows);
-      }
+      sirius::duckdb_chunk_staging staging(types, total_rows);
 
       duckdb::ColumnDataScanState scan_state;
       _collection->InitializeScan(scan_state);
       duckdb::DataChunk chunk;
       chunk.Initialize(duckdb::Allocator::DefaultAllocator(), _collection->Types());
-      cudf::size_type row_base = 0;
       while (_collection->Scan(scan_state, chunk)) {
         if (chunk.ColumnCount() != types.size()) {
           throw std::runtime_error(
             "[sirius_physical_gpu_values] collection chunk column count does not match operator "
             "output types");
         }
-        for (size_t c = 0; c < types.size(); c++) {
-          stage_chunk_column(staging[c], chunk.data[c], chunk.size(), types[c], row_base);
-        }
-        row_base += static_cast<cudf::size_type>(chunk.size());
+        staging.append(chunk);
         chunk.Reset();
       }
-      if (row_base != total_rows) {
+      if (staging.num_rows() != total_rows) {
         throw std::runtime_error(
           "[sirius_physical_gpu_values] collection scan row count does not match Count()");
       }
-      output_table = staging_to_table(staging, types, total_rows, stream, mr);
+      output_table = staging.build(stream, mr);
     }
   } else if (_produce_single_row) {
     // DUMMY_SCAN: one all-null row. A 0-output-column DUMMY_SCAN (e.g.
@@ -339,12 +175,9 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operato
     if (types.empty()) {
       output_table = make_row_count_sentinel_table(1, stream, mr);
     } else {
-      std::vector<column_staging> staging(types.size());
-      for (size_t c = 0; c < types.size(); c++) {
-        init_staging(staging[c], types[c], 1);
-        stage_null_row(staging[c], types[c]);
-      }
-      output_table = staging_to_table(staging, types, 1, stream, mr);
+      sirius::duckdb_chunk_staging staging(types, 1);
+      staging.append_null_row();
+      output_table = staging.build(stream, mr);
     }
   } else {
     // EMPTY_RESULT (or an empty collection): 0-row table with the declared

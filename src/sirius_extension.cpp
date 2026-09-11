@@ -46,6 +46,7 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/simpatico_copy_function.hpp"
 #include "compression/simpatico_file_ingest.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -69,6 +70,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
+#include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -1447,26 +1449,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   const bool comp_globally_enabled =
     comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
   if (comp_globally_enabled) {
-    namespace fs     = std::filesystem;
-    const auto& name = data.args.name;
-    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
-      std::error_code ec;
-      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-        if (!entry.is_regular_file()) { continue; }
-        if (entry.path().stem() == name) {
-          std::ifstream f(entry.path());
-          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-          if (!dsl.empty()) {
-            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
-          }
-          break;
-        }
-      }
-      if (ec) {
-        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
-                        comp_cfg.input_plan_dir,
-                        ec.message());
-      }
+    std::string scan_error;
+    static_cast<void>(sirius::compression::resolve_table_plan_from_dir(
+      comp_cfg.input_plan_dir, data.args.name, &scan_error));
+    if (!scan_error.empty()) {
+      SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                      comp_cfg.input_plan_dir,
+                      scan_error);
     }
   }
 
@@ -2573,6 +2562,14 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   read_simpatico.filter_pushdown = true;
   CreateTableFunctionInfo read_simpatico_info(read_simpatico);
   catalog.CreateTableFunction(transaction, read_simpatico_info);
+
+  // The writer for the format read_simpatico reads: `COPY (SELECT ...) TO 'x.hpln'
+  // (FORMAT simpatico)`. Registered as a copy function rather than a table function because that
+  // is the surface a bulk writer has in SQL -- it gets the query's schema and its rows streamed
+  // in, which is exactly what the container needs and what a table function would have to
+  // re-derive.
+  CreateCopyFunctionInfo simpatico_copy_info(sirius::compression::make_simpatico_copy_function());
+  catalog.CreateCopyFunction(transaction, simpatico_copy_info);
 
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
