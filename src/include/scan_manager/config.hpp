@@ -74,7 +74,8 @@ struct memory_prefetcher_config {
  * @c use_sirius_datasource selects the backend for local paths: @c uring_ioctx
  * when true, @c kvikio_context when false. Reads go through
  * @c sirius_datasource either way; the kvikio backend delegates to
- * @c cudf::io::datasource::create(). Multi-GPU forces this to true.
+ * @c cudf::io::datasource::create(). A false value is rejected when multiple
+ * GPUs are configured; Sirius never silently changes the selected backend.
  *
  * Sub-configs:
  *  - @c local   — uring reactor tunables (local-disk IO path).
