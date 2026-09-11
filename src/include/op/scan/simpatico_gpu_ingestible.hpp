@@ -34,6 +34,7 @@
 #include <compression/compressed_scan.hpp>
 #include <helper/logical_type.hpp>
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/scan_plan.hpp>
 #include <scan_manager/pinned_chunk_stats.hpp>
 #include <sirius_config.hpp>
 
@@ -58,6 +59,10 @@
 namespace cucascade::memory {
 class memory_space;
 }  // namespace cucascade::memory
+
+namespace sirius::op {
+class sirius_dynamic_filter_set;
+}  // namespace sirius::op
 
 namespace sirius::op::scan {
 
@@ -130,7 +135,24 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// ten columns must emit two: the plan projects by output POSITION, so emitting the file's full
   /// width would silently shift every reference. Filled with the identity by
   /// @ref bind_simpatico_file, so a caller that wants the whole file need not set it.
+  ///
+  /// Rewritten at construction to the decode order @ref scan_plan settled on -- output columns
+  /// first, then the columns read only so a filter can be evaluated.
   std::vector<std::size_t> column_ids;
+
+  /// Positions into @ref duckdb_column_ids the planner projects: the first @ref scan_output_arity
+  /// entries are the scan's output columns in output order, and the rest are columns read ONLY to
+  /// evaluate the filter. Empty means "every read column is an output column", which is what a
+  /// caller driving the ingestible without a plan above it gets.
+  duckdb::vector<duckdb::idx_t> projection_ids;
+
+  /// The scan operator's output arity -- what splits @ref projection_ids into output and
+  /// filter-only. Zero with an empty @ref projection_ids.
+  std::size_t scan_output_arity = 0;
+
+  /// Channel the join build sides publish membership filters into, consumed by the
+  /// @c sirius_physical_dynamic_filter above this scan. Null when no producer bound to it.
+  std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
 
   /// Where the payload stages before it is fetched to the GPU. Pinned, so the H2D copy is a DMA
   /// rather than a staged bounce, and so a pin can adopt the same blob untouched. Required: an
@@ -290,6 +312,15 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   }
 
  private:
+  /// Which file columns the decode emits and how that D-order batch is reshaped into the scan's
+  /// output -- the same abstraction the parquet source uses, so the two agree on what a
+  /// filter-only column is and where a filter's operand lands. Never null.
+  std::shared_ptr<scan_plan const> _plan;
+
+  /// True when @ref _plan's output layout is anything other than "the decode's columns, in
+  /// order": the batch then has to be reshaped after the filter has run.
+  bool _needs_assembly = false;
+
   /// One chunk that survived the zone-map pass, with what of it is worth reading.
   struct live_chunk {
     std::size_t id{0};

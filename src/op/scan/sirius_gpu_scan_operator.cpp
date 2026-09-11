@@ -25,6 +25,7 @@
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
+#include <op/scan/simpatico_gpu_ingestible.hpp>
 #include <op/scan/sirius_gpu_scan_operator.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <op/sirius_physical_operator.hpp>
@@ -359,6 +360,9 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
     } else if (auto const* native =
                  dynamic_cast<duckdb_native_ingestible_table_info const*>(&info)) {
       _dynamic_filters_channel = native->sirius_dynamic_filters;
+    } else if (auto const* simpatico =
+                 dynamic_cast<simpatico_ingestible_table_info const*>(&info)) {
+      _dynamic_filters_channel = simpatico->sirius_dynamic_filters;
     }
   }
   _native_physical_types.reserve(this->types.size());

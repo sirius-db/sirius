@@ -486,7 +486,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // might affect the types when we call ResolveOperatorTypes()
   duckdb::vector<duckdb::LogicalType> original_types = op.types;
 
-  if (table_filters) {
+  // Only when the planner already expressed a projection. Appending to an EMPTY projection_ids
+  // does not ADD a column, it removes every other one: empty means "column_ids is both the read
+  // list and the output", while a one-entry list means "output only that one". A filter column is
+  // already read and already output in the empty case, so there is nothing to add -- and doing it
+  // anyway narrows the scan to the filter's column alone, which is a wrong-arity scan rather than
+  // a wrong answer only because the operator above trips on it first.
+  if (table_filters && !projection_ids.empty()) {
     for (auto& entry : table_filters->filters) {
       // entry.first is the column index in the table_filters (after remapping by
       // create_table_filter_set) We need to ensure this column is in projection_ids so it gets

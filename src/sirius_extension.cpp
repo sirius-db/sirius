@@ -2731,13 +2731,19 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   // let a chunk that cannot match be skipped before it is read at all. DuckDB DELETES a
   // pushed-down predicate from the plan, so this is also a promise to apply it exactly --
   // simpatico_gpu_ingestible::post_filter_and_project does, after the bounds have narrowed what
-  // was decoded. projection_pushdown stays off: the plan generator narrows the decode to the
-  // scan's column_ids itself, so the scan stays full width with a projection above it, which is
-  // what makes the filter's batch positions the file's own column order.
+  // was decoded.
+  //
+  // projection_pushdown is on for the reason it is on everywhere else: without it the scan is
+  // typed by the file's FULL width and decodes every column, which measured 128.8 bytes/row on
+  // TPC-H lineitem where the query wanted 16 -- paid again by every operator above the scan. The
+  // filter's batch positions survive it because the decode still emits columns read only for the
+  // filter, and the projection that drops them runs AFTER the filter (scan_plan, shared with the
+  // parquet source).
   TableFunction read_simpatico(
     "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
   read_simpatico.cardinality     = SiriusReadSimpaticoCardinality;
-  read_simpatico.filter_pushdown = true;
+  read_simpatico.filter_pushdown     = true;
+  read_simpatico.projection_pushdown = true;
   // ... and this collects the one predicate filter_pushdown cannot deliver: a standalone IS NULL,
   // which DuckDB never lowers into a TableFilter. It prunes only; it consumes nothing.
   read_simpatico.pushdown_complex_filter = SiriusReadSimpaticoPushdownComplexFilter;

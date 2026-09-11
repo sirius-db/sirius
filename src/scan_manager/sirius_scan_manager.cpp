@@ -1749,6 +1749,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       } else if (auto const* native =
                    dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(&info)) {
         dynamic_filters = native->sirius_dynamic_filters;
+      } else if (auto const* simpatico =
+                   dynamic_cast<op::scan::simpatico_ingestible_table_info const*>(&info)) {
+        dynamic_filters = simpatico->sirius_dynamic_filters;
       }
       // Channel identity: this pointer must match the one the hash join
       // publishes into (both resolve through the generator's channel map, keyed

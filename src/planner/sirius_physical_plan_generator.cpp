@@ -338,6 +338,10 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
   }
   info->duckdb_column_ids = scan_op.column_ids;
   info->returned_types    = scan_op.returned_types;
+  // What the ingestible's scan_plan splits into output columns and columns read only so the
+  // filter can be evaluated. Both are decoded; only the first group is emitted.
+  info->projection_ids    = scan_op.projection_ids;
+  info->scan_output_arity = scan_op.types.size();
 
   // The IS NULL conjuncts the scan harvested for itself (see
   // SiriusReadSimpaticoPushdownComplexFilter). They ride in the bind data because no TableFilter
@@ -450,24 +454,16 @@ void wrap_table_scan_source(
                               sirius_ctx.get());
     replace_slot = true;
   } else if (fn == "read_simpatico") {
-    // No dynamic-filter channel: the .hpln source has no membership filter to receive, so the
-    // scan leaf is built directly rather than through make_gpu_scan_leaf.
-    auto info = build_simpatico_table_info(scan, op_params, sirius_ctx.get());
-    // The leaf's output is the columns it DECODES, not the file's full width. With projection
-    // pushdown off, create_plan(LogicalGet&) types the scan node by returned_types and pushes a
-    // projection that reads its positions 0..M-1 -- so for a query that reads some of the
-    // columns, scan.types is wider than anything the leaf emits. Nothing notices on the disk
-    // path, but a scan served from a pinned entry normalizes against these types and fails the
-    // arity check; a late-materialization deferral sizes its substitution by them too.
-    duckdb::vector<sirius::logical_type> leaf_types;
-    leaf_types.reserve(info->column_ids.size());
-    for (auto const file_column : info->column_ids) {
-      leaf_types.push_back(scan.returned_types[file_column]);
-    }
-    auto ingestible = sirius::op::scan::make_ingestible(std::move(info));
-    leaf            = duckdb::make_uniq<sirius::op::scan::sirius_gpu_scan_operator>(
-      std::move(leaf_types), scan.estimated_cardinality, std::move(ingestible), sirius_ctx.get());
-    if (scan.has_physical_overrides()) { leaf->set_physical_types(scan.get_physical_types()); }
+    // A .hpln decode applies the pushed-down filter itself, post-decode, so a membership mask
+    // from a join build side is the same kind of work and is applied the same way: AST row masks
+    // included, as the duckdb-native source does. The leaf's own output is now the scan's output
+    // (projection pushdown is on), which is what makes the dynamic filter's push ordinals -- which
+    // index scan.types -- line up with the columns the leaf actually emits.
+    leaf         = make_gpu_scan_leaf(build_simpatico_table_info(scan, op_params, sirius_ctx.get()),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
+                              sirius_ctx.get());
     replace_slot = true;
   } else {
     throw std::runtime_error(

@@ -231,13 +231,42 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
     }
   }
 
-  // The decode emits _info->column_ids in order, so the batch position of filter key `i` (a
-  // position into duckdb_column_ids, which create_table_filter_set already remapped to) is `i`.
-  if (_info->table_filters != nullptr && !_info->table_filters->filters.empty()) {
-    std::vector<std::optional<std::size_t>> batch_position(_info->duckdb_column_ids.size());
-    for (std::size_t i = 0; i < batch_position.size(); ++i) {
-      batch_position[i] = i;
+  // A caller that drove the ingestible directly (a host test, or a pin that wants the whole file)
+  // sets column_ids and nothing else. Give the plan below the DuckDB column list it would have
+  // had, so there is one code path rather than two.
+  if (_info->duckdb_column_ids.empty()) {
+    for (auto const column : _info->column_ids) {
+      _info->duckdb_column_ids.emplace_back(static_cast<duckdb::idx_t>(column));
     }
+  }
+
+  // The scan plan settles two things this source used to assume: which file columns the decode
+  // emits and IN WHICH ORDER (output columns first, then the ones read only so a filter can be
+  // evaluated), and how that batch is reshaped into the scan's output. With projection pushdown
+  // off the two were the same list and the assumption held; with it on they are not.
+  duckdb::vector<std::string> plan_names(_info->names.begin(), _info->names.end());
+  _plan = std::make_shared<scan_plan const>(
+    build_scan_plan(_info->duckdb_column_ids,
+                    _info->projection_ids,
+                    plan_names,
+                    _info->returned_types,
+                    _info->scan_output_arity,
+                    duckdb::vector<duckdb::HivePartitioningIndex>{}));
+  _needs_assembly = needs_output_assembly(*_plan);
+
+  // The decode's selection IS the plan's data columns: a pure-filter column has to be decoded to
+  // be tested even though no one downstream will see it.
+  _info->column_ids.clear();
+  _info->column_ids.reserve(_plan->data_columns.size());
+  for (auto const& data_column : _plan->data_columns) {
+    _info->column_ids.push_back(data_column.primary_idx);
+  }
+
+  // Where a filter's operand lands in the decoded batch. Not the identity any more: with a
+  // projection the decode's order is the plan's, and a filter naming an output column that the
+  // plan moved would otherwise be evaluated against a neighbouring column's values.
+  if (_info->table_filters != nullptr && !_info->table_filters->filters.empty()) {
+    auto const& batch_position = _plan->batch_position_by_column_id;
     // Throws for a predicate shape Sirius cannot lower, which fails the query over to DuckDB --
     // where read_simpatico has no CPU reader. That is still the right failure: silently dropping
     // a conjunct DuckDB deleted from the plan would return rows the query excluded.
@@ -253,9 +282,10 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
     // NOT clustered by, which the zone maps cannot narrow at all.
     //
     // No equality set is requested: a dictionary-answered equality substitutes the column's
-    // values with the BOOL8 answer, which only pays for a column the query never emits, and this
-    // source declares no projection pushdown -- every decoded column is an output column.
-    // Requesting one would hand the plan a boolean where it expects values.
+    // values with the BOOL8 answer, which only pays for a column the query never emits. The scan
+    // now HAS such columns -- the plan's pure-filter ones -- so this is the obvious next win, but
+    // it needs the request keyed by batch position so only those columns are answered rather than
+    // valued. Asking for it here would hand the plan a boolean where it expects values.
     auto const analysis = sirius::op::analyze_scan_filters(
       *_info->table_filters, _info->duckdb_column_ids, _info->returned_types);
     // Slot k of the decode is _info->column_ids[k], which is exactly the primary index the
@@ -731,9 +761,9 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
   // read_simpatico declares filter_pushdown, so DuckDB deleted the predicate from the plan and
   // nothing above the scan re-checks it.
   //
-  // Every column the decode emitted is an output column (the source declares no projection
-  // pushdown, so the scan is full-width and a projection sits above it), which is why the filter's
-  // batch positions are the file's column order and no projection is folded in here.
+  // Before the projection below, not after: a column read ONLY to evaluate the filter is in this
+  // batch and is about to be dropped, so a projection that ran first would take the filter's
+  // operand away from it.
   if (_filter_expression && input.state != filter_state::ROW_FILTERED &&
       input.state != filter_state::ROW_FILTERED_AND_PROJECTED) {
     auto filter_ast = sirius::ast::from_duckdb(*_filter_expression);
@@ -748,6 +778,13 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
     // The select only ENQUEUED its reads; record before the input's read-lock owner is dropped.
     table.record_reader_event(stream);
     table = std::move(filtered);
+  }
+
+  // Reshape the decode's order into the scan's output layout: drop the pure-filter columns and
+  // put the rest where the plan above expects them. A non-owning select, so nothing is copied --
+  // the dropped columns' buffers are freed when the result is materialized.
+  if (_needs_assembly) {
+    table = assemble_scan_output(*_plan, std::move(table), /*partition_values=*/{}, stream);
   }
 
   // Drop the positions the caller is about to overwrite. `survivors` stays untouched, which is
@@ -765,8 +802,9 @@ std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
 //===----------------------------------------------------------------------===//
 std::vector<std::size_t> simpatico_gpu_ingestible::materialized_column_order() const
 {
-  // The decode emits exactly the requested columns, in the order requested, so the selection is
-  // already the answer.
+  // The decode emits the plan's data columns in plan order -- output columns first, pure-filter
+  // columns trailing -- which is exactly what column_ids was rewritten to at construction. The
+  // pinned-cache path wants those as file column indices, which is what they are.
   return _info->column_ids;
 }
 
