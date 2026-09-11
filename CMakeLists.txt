@@ -712,6 +712,7 @@ set(TEST_SOURCES
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
+    test/cpp/config/test_cpu_affinity_config.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_topology_config.cpp
     test/cpp/creator/test_task_creator_query_state.cpp

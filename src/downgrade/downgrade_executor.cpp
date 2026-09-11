@@ -64,46 +64,62 @@ void downgrade_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
 
-  // HOST/DISK tier memory_spaces return device_id == -1; passing that to
-  // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
-  // Default the stream pool to GPU 0 for non-GPU tiers and skip per-thread
-  // CUDA binding entirely (the stream is ordering metadata; host/disk work
-  // is CPU-side).
-  {
-    int device_id = 0;
-    if (_space_id.tier == cucascade::memory::Tier::GPU && _memory_space) {
-      device_id = _memory_space->get_device_id();
-    }
-    _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
-      rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
-  }
-
-  _request_queue.reactivate();
-
-  absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
-  if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
-    auto device_id  = _memory_space->get_device_id();
-    per_thread_init = [device_id]() noexcept {
-      // Pin each worker to its GPU; silent failure leaks downgrade memcpys
-      // across contexts. Lambda is noexcept, so check inline.
-      cudaError_t err = cudaSetDevice(device_id);
-      if (err != cudaSuccess) {
-        SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
-                         device_id,
-                         cudaGetErrorString(err));
+  try {
+    // HOST/DISK tier memory_spaces return device_id == -1; passing that to
+    // rmm::cuda_device_id or cudaSetDevice fails with cudaErrorInvalidDevice.
+    // Default the stream pool to GPU 0 for non-GPU tiers and skip per-thread
+    // CUDA binding entirely (the stream is ordering metadata; host/disk work
+    // is CPU-side).
+    {
+      int device_id = 0;
+      if (_space_id.tier == cucascade::memory::Tier::GPU && _memory_space) {
+        device_id = _memory_space->get_device_id();
       }
-    };
-  }
+      _stream_pool = std::make_unique<cucascade::memory::exclusive_stream_pool>(
+        rmm::cuda_device_id{device_id}, _config.thread_pool.num_threads);
+    }
 
-  _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
-                                                      _config.thread_pool.thread_name_prefix,
-                                                      _config.thread_pool.cpu_affinity_list,
-                                                      std::move(per_thread_init));
+    _request_queue.reactivate();
 
-  _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+    absl::AnyInvocable<void() noexcept> per_thread_init = nullptr;
+    if (_memory_space && _space_id.tier == cucascade::memory::Tier::GPU) {
+      auto device_id  = _memory_space->get_device_id();
+      per_thread_init = [device_id]() noexcept {
+        // Pin each worker to its GPU; silent failure leaks downgrade memcpys
+        // across contexts. Lambda is noexcept, so check inline.
+        cudaError_t err = cudaSetDevice(device_id);
+        if (err != cudaSuccess) {
+          SIRIUS_LOG_ERROR("downgrade_executor per-thread init: cudaSetDevice({}) failed: {}",
+                           device_id,
+                           cudaGetErrorString(err));
+        }
+      };
+    }
 
-  if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
-    _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+    _pool = std::make_unique<exec::bounded_thread_pool>(_config.thread_pool.num_threads,
+                                                        _config.thread_pool.thread_name_prefix,
+                                                        _config.thread_pool.cpu_affinity_list,
+                                                        std::move(per_thread_init));
+
+    _processing_thread = std::thread(&downgrade_executor::processing_loop, this);
+
+    if (_memory_space && _config.monitor_period > std::chrono::milliseconds::zero()) {
+      _monitor_thread = std::thread(&downgrade_executor::monitor_loop, this);
+    }
+  } catch (...) {
+    _running = false;
+    if (_pool) { _pool->interrupt(); }
+    _request_queue.interrupt();
+    _monitor_cv.notify_one();
+    if (_monitor_thread.joinable()) { _monitor_thread.join(); }
+    if (_processing_thread.joinable()) { _processing_thread.join(); }
+    if (_pool) {
+      _pool->wait_all();
+      _pool->stop();
+      _pool.reset();
+    }
+    _stream_pool.reset();
+    throw;
   }
 }
 
@@ -112,6 +128,10 @@ void downgrade_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
 
+  if (!_pool) {
+    _stream_pool.reset();
+    return;
+  }
   _pool->interrupt();
   _request_queue.interrupt();
   _monitor_cv.notify_one();

@@ -26,6 +26,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <sched.h>
+
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -133,6 +135,53 @@ TEST_CASE("Task scheduler derives GPU executor affinity from topology", "[task_s
     ++visited;
   });
   REQUIRE(visited == 1);
+}
+
+TEST_CASE("Task scheduler rolls back topology-affinity startup failure",
+          "[task_scheduler][cpu_affinity]")
+{
+  // This regression needs two real executors: device 0 must start before the
+  // invalid topology mask fails device 1, so task_scheduler has something to
+  // roll back. start() orders lifecycle startup by device ID without changing
+  // the scheduler's unordered ready-device matcher. Do not construct a
+  // device-1 stream pool on a 1-GPU host.
+  int device_count = 0;
+  REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
+  if (device_count < 2) {
+    WARN("Task scheduler partial-start rollback test requires >=2 GPUs; skipping");
+    return;
+  }
+
+  auto manager = initialize_memory_manager(2);
+  sirius::exec::thread_pool_config gpu_config{2};
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 2;
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  REQUIRE(sched_getaffinity(0, sizeof(cpu_set_t), &allowed) == 0);
+  int allowed_cpu = -1;
+  for (int id = 0; id < CPU_SETSIZE; ++id) {
+    if (CPU_ISSET(id, &allowed)) {
+      allowed_cpu = id;
+      break;
+    }
+  }
+  REQUIRE(allowed_cpu >= 0);
+  for (int device_id = 0; device_id < 2; ++device_id) {
+    cucascade::memory::gpu_topology_info gpu;
+    gpu.id        = device_id;
+    gpu.numa_node = device_id;
+    gpu.cpu_cores = {device_id == 0 ? allowed_cpu : CPU_SETSIZE};
+    topology.gpus.push_back(std::move(gpu));
+  }
+
+  task_scheduler scheduler(
+    gpu_config, *manager, sirius::test::make_test_telemetry_context(), &topology);
+
+  CHECK_THROWS_WITH(scheduler.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(scheduler.stop());
+  CHECK_THROWS_WITH(scheduler.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(scheduler.stop());
 }
 
 TEST_CASE("Task scheduler executes tasks through pipeline_queue", "[task_scheduler]")
