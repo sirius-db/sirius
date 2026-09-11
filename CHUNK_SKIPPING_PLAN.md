@@ -1710,8 +1710,8 @@ implements, so it says exactly what is missing.
 | `post_filter_and_project()`, `materialized_column_order()` | yes | missing (mostly boilerplate) |
 | pruning from statistics | row-group min/max | **better than parquet**: per-group zone maps, already decoded from the file |
 | range-skipped fetch | none (row groups are all-or-nothing) | **done** (`build_chunk_subset_header`, wired for pins) |
-| SQL surface | `read_parquet` interception | missing |
-| writer | `COPY ... TO` | missing (C++ only) |
+| SQL surface | `read_parquet` interception | `read_simpatico()` **done** |
+| writer | `COPY ... TO` | `COPY ... TO ... (FORMAT simpatico)` **done** |
 
 ### A real scan source removes the "identity segment" idea
 
@@ -1789,6 +1789,25 @@ over S3 (§7.6).
 - **D. Remote** — `payload_fetch_fn` over the io_context for `s3://`. The trailer makes one tail
   read locate everything; §6.1's group→byte table becomes worth adding here.
 - **E. Writer** — `COPY ... TO 'x.hpln' (FORMAT simpatico)`, so files exist without C++.
+  **Done.** A DuckDB `CopyFunction` (`src/compression/simpatico_copy_function.cpp`) stages the
+  query's DataChunks on the host, uploads each chunk as a `cudf::table` and hands the lot to the
+  existing `write_tables_to_hpln` — the container writer is unchanged, this is only its SQL
+  surface. `chunk_rows` (default 1 Mi) cuts the stream at an exact row count rather than at a
+  DataChunk boundary, so a chunk never straddles a zone-map group; `group_rows` defaults to
+  `pinned_zone_map_group_rows`, so a file and a pin of the same data prune at the same
+  resolution. `plan_table` resolves a compression plan through the same registry and
+  `pin_table_input_compression_plan_dir` the pin path uses; with no plan the columns are stored
+  `input -> identity`, which is valid for every type and still produces a real (prunable) file.
+  The copy is single-threaded by DuckDB's default execution mode, which is what keeps the file's
+  row order equal to the query's — a clustered `ORDER BY` stays clustered, and the test asserts
+  consecutive chunks' bounds do not overlap.
+
+  What it refuses, loudly, rather than writing a file that lies: a **NULL** in any column (the
+  container has no null mask, so a null would read back as the column's zero value), HUGEINT /
+  UHUGEINT (no round-tripping cuDF carrier), nested types, and a remote path (the container
+  writer is local-only; reads go through the io_context but writes do not). Whole-file GPU
+  residency is the standing limitation: chunks are held as device tables until finalize, so a
+  COPY cannot write more than fits in GPU memory.
 - **F. Pin integration** — `pin_table` over a `.hpln`, by then just "pin this source".
 
 **Do B before C.** Chunking decides what a surviving chunk means in a file; pruning first means
