@@ -266,6 +266,24 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
     _info->column_ids.push_back(data_column.primary_idx);
   }
 
+  // What to stage per chunk, and how the decode then names its columns. Staging narrowly is what
+  // keeps a projection from paying the file's full width in I/O; the selection has to move with it,
+  // because a staged chunk's column 0 is the first column STAGED, not the first column of the file.
+  _staged_columns = _info->column_ids;
+  std::sort(_staged_columns.begin(), _staged_columns.end());
+  _staged_columns.erase(std::unique(_staged_columns.begin(), _staged_columns.end()),
+                        _staged_columns.end());
+  _decode_selection.clear();
+  _decode_selection.reserve(_info->column_ids.size());
+  for (auto const column : _info->column_ids) {
+    _decode_selection.push_back(static_cast<std::size_t>(
+      std::distance(_staged_columns.begin(),
+                    std::lower_bound(_staged_columns.begin(), _staged_columns.end(), column))));
+  }
+  // A scan that reads every column stages the chunk verbatim: no header is synthesized and the
+  // bytes are the file's, which is both faster and the path every existing test exercises.
+  if (_staged_columns.size() == _info->names.size()) { _staged_columns.clear(); }
+
   // Where a filter's operand lands in the decoded batch. Not the identity any more: with a
   // projection the decode's order is the plan's, and a filter naming an output column that the
   // plan moved would otherwise be evaluated against a neighbouring column's values.
@@ -557,8 +575,8 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // file read plus one decode rather than a decode and a re-compress.
   sirius::hpln_open_options options;
   options.io_ctx = split.io_ctx;
-  auto ingested =
-    sirius::read_hpln_chunks_into_pinned(split.path, *_info->host_space, split.chunk_ids, options);
+  auto ingested = sirius::read_hpln_chunks_into_pinned(
+    split.path, *_info->host_space, split.chunk_ids, options, _staged_columns);
 
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;
@@ -599,8 +617,9 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
       // a compacted one has a different row count -- the two cannot be one cudf::table. So the
       // subset is usable only when every column this scan READS was compacted. Unread columns may
       // be whole: their buffers are never fetched.
+      // Indexed by the STAGED chunk's columns, which is what `subsetted` describes.
       auto const refusing_column = [&]() -> std::optional<std::size_t> {
-        for (auto const column : _info->column_ids) {
+        for (auto const column : _decode_selection) {
           if (column >= subsetted.size() || subsetted[column] == 0) { return column; }
         }
         return std::nullopt;
@@ -615,7 +634,9 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
             split.path,
             split.chunk_ids[i],
             *refusing_column,
-            *refusing_column < _info->names.size() ? _info->names[*refusing_column] : "?");
+            *refusing_column < _info->column_ids.size()
+              ? _info->names[_info->column_ids[*refusing_column]]
+              : "?");
         } else {
           SIRIUS_LOG_WARN(
             "[simpatico_gpu_ingestible] '{}' chunk {}: chunk subset refused ({}); decoding the "
@@ -636,7 +657,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     auto const compressed = simpatico::read_compressed_table_subset_from_memory(
       use_subset ? std::span<const std::uint8_t>{subset_header} : blob.header,
       use_subset ? gathered_fetch : whole_fetch,
-      _info->column_ids,
+      _decode_selection,
       stream,
       mr,
       &read_error);

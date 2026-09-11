@@ -326,6 +326,20 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// order": the batch then has to be reshaped after the filter has run.
   bool _needs_assembly = false;
 
+  /// File columns this scan STAGES, ascending and unique. Empty means "the whole chunk", which is
+  /// what a scan reading every column gets -- the staged bytes are then byte-identical to the
+  /// file's and no header is synthesized.
+  ///
+  /// Reading a chunk whole and projecting afterwards costs the file's full width in I/O however
+  /// narrow the query is. At SF1000 that is what made an unpinned .hpln scan of partsupp read
+  /// 105 GB to answer a two-column query.
+  std::vector<std::size_t> _staged_columns;
+
+  /// @ref simpatico_ingestible_table_info::column_ids expressed as positions into
+  /// @ref _staged_columns -- which is what the decode selects by once the staged chunk holds only
+  /// those columns. Identical to column_ids when nothing is staged narrowly.
+  std::vector<std::size_t> _decode_selection;
+
   /// One chunk that survived the zone-map pass, with what of it is worth reading.
   struct live_chunk {
     std::size_t id{0};
