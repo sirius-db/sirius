@@ -54,11 +54,13 @@ mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+mod tunable;
 
 pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use tunable::Tunables;
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

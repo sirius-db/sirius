@@ -9,7 +9,7 @@ use sirius_starrocks_cn::SiriusEngine;
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
     BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
+    SharedHeartbeatState, Tunables, register_node, report_to_frontend_once, start_backend_server,
     start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
@@ -64,6 +64,12 @@ impl Args {
     /// Starts the CN listeners, registers with FE, and waits for shutdown.
     #[instrument(name = "compute_node", skip_all)]
     async fn run(self) -> Result<()> {
+        // FIRST, before a port is bound or a GPU pool is reserved: read and validate every
+        // transport tunable, and log what this CN actually got. A rejected value fails startup
+        // here rather than surfacing as an unexplained timeout mid-sweep, and the log line is
+        // the ground truth for the knobs.
+        Tunables::resolve().map_err(|err| anyhow!("invalid CN transport tunable: {err}"))?;
+
         // Build the fragment executor before serving any RPC. Compiled with the engine, this brings
         // up the GPU engine on its dedicated thread (fail-fast: a bad config or GPU failure exits
         // before FE can route work here); otherwise it is a stub. The handle is held for the
