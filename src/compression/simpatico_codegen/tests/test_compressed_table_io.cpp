@@ -684,6 +684,42 @@ void test_validity_sidecar_roundtrip()
 
 }  // namespace
 
+// DECIMAL128 through bitpack, over BOTH serialization seams.
+//
+// This is the only layer that can catch a meta channel whose cudf dtype is
+// narrower than its real elements. describe() derives a channel's serialized
+// length as size() * size_of(type), so a 16-byte chunk_min/chunk_divisors
+// mislabelled as INT32 ships a quarter of itself and decode reads the rest as
+// whatever follows. An in-memory roundtrip cannot see it: compress_with_plan ->
+// decompress binds those columns by pointer and never consults the dtype.
+//
+// The values are small multiples of 100 rather than magnitudes above 2^64, so
+// bitpack's `_gwide` flag stays clear and the folded-in GCD actually reduces --
+// the 128-bit divisor path is otherwise skipped entirely.
+void test_decimal128_bitpack_roundtrip()
+{
+  auto t = make_decimal128_table(1, 4096, 17);
+  io_roundtrip("decimal128_bitpack", t->view(), "input -> bitpack\n");
+  // The spill path stages through build_compressed_table_header, not the file
+  // writer, so cover that seam too.
+  memory_roundtrip("decimal128_bitpack_memory", t->view(), "input -> bitpack\n");
+}
+
+// The same column under the plan the spill path actually emits, which names the
+// four original channels and leaves `chunk_divisors` to ride along as a trailing
+// one. A channel that is written but not named is exactly where a width bug
+// hides, so pin it explicitly rather than relying on the bare-op form above.
+void test_decimal128_bitpack_named_channels()
+{
+  auto t = make_decimal128_table(1, 4096, 19);
+  io_roundtrip("decimal128_bitpack_named",
+               t->view(),
+               "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+  memory_roundtrip("decimal128_bitpack_named_memory",
+                   t->view(),
+                   "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n");
+}
+
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) {
@@ -718,6 +754,8 @@ int main()
     {"identity_string_roundtrip", test_identity_string_roundtrip},
     {"str_split_plan_shapes", test_str_split_plan_shapes_roundtrip},
     {"validity_sidecar", test_validity_sidecar_roundtrip},
+    {"decimal128_bitpack", test_decimal128_bitpack_roundtrip},
+    {"decimal128_bitpack_named_channels", test_decimal128_bitpack_named_channels},
   };
 
   int failures = 0;

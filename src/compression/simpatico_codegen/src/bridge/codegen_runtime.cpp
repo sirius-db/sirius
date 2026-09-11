@@ -711,8 +711,7 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
       const bool is_off     = (b.field == "rle_runs_offsets" || b.field == "bp_offsets");
       const bool is_perchk =
         (b.field == "chunk_min" || b.field == "chunk_divisors" || b.field == "chunk_bits" ||
-         b.field == "chunk_count" ||
-         b.field == "references" || b.field == "offsets" || is_off);
+         b.field == "chunk_count" || b.field == "references" || b.field == "offsets" || is_off);
       const std::size_t need = static_cast<std::size_t>(num_chunks) + (is_off ? 1u : 0u);
       if (is_perchk && len < need) {
         std::fprintf(stderr,
@@ -1458,8 +1457,19 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
           // the column's original_type.  For the values channel this matches
           // original_type, but for the runs channel (int32 counts) it must
           // be INT32 regardless of the column dtype.
+          //
+          // The dtype is not cosmetic: describe() derives a channel's serialized
+          // length from it as size() * size_of(type), so a dtype narrower than the
+          // buffer's real elements truncates the payload. A 16-byte channel with no
+          // arm here fell through to INT32 and shipped a quarter of chunk_min and
+          // chunk_divisors; decode then read them back as __int128 on a 16-byte
+          // stride and reconstructed chunk_min + divisor * residual from garbage.
+          // That is invisible to an in-memory roundtrip, which binds these columns
+          // by pointer and never consults the dtype -- only a serialized roundtrip
+          // (i.e. a spill) sees it.
           const cudf::data_type bp_elem_type =
-            (spec.buffers[i_min].elem_size == 8)   ? cudf::data_type(cudf::type_id::INT64)
+            (spec.buffers[i_min].elem_size == 16)  ? cudf::data_type(cudf::type_id::DECIMAL128, 0)
+            : (spec.buffers[i_min].elem_size == 8) ? cudf::data_type(cudf::type_id::INT64)
             : (spec.buffers[i_min].elem_size == 2) ? cudf::data_type(cudf::type_id::INT16)
             : (spec.buffers[i_min].elem_size == 1) ? cudf::data_type(cudf::type_id::UINT8)
                                                    : cudf::data_type(cudf::type_id::INT32);
