@@ -74,6 +74,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -298,6 +301,60 @@ unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
   return_types = std::move(schema.types);
   names.assign(schema.names.begin(), schema.names.end());
   return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema.num_rows));
+}
+
+// Harvest `x IS NULL` conjuncts for the .hpln scan's zone-map pruning.
+//
+// Worth stating why this hook exists at all, because it looks redundant next to filter_pushdown.
+// DuckDB's FilterCombiner lowers comparisons, IN lists and LIKE prefixes into a TableFilterSet,
+// but it builds an IsNullFilter only inside an OR of IS NOT DISTINCT FROM (filter_combiner.cpp)
+// -- a standalone `WHERE x IS NULL` is left as a LogicalFilter above the scan and the source
+// never sees it. The bounds evaluator has supported the op all along; the predicate simply never
+// arrived.
+//
+// The conjunct is deliberately NOT consumed: the expressions this leaves in @p filters are
+// rebuilt into the same LogicalFilter, which still applies the predicate. So this can only ever
+// skip data no query could have returned, and a mistake here cannot produce a wrong answer --
+// unlike a filter taken out of the plan, which the source then owes an exact application of.
+//
+// Writing into `get.table_filters` would be the more natural home, but it is a trap:
+// FilterPushdown::PushdownGet skips constant-filter generation entirely when table_filters is
+// already non-empty (pushdown_get.cpp), so populating it here would disable the range pruning
+// that pays for itself.
+void SiriusReadSimpaticoPushdownComplexFilter(ClientContext&,
+                                              LogicalGet& get,
+                                              FunctionData* bind_data_p,
+                                              vector<unique_ptr<Expression>>& filters)
+{
+  auto* bind = dynamic_cast<SiriusReadSimpaticoBindData*>(bind_data_p);
+  if (bind == nullptr) { return; }
+  auto const& column_ids = get.GetColumnIds();
+  // Recomputed, not accumulated: the optimizer may push filters into the same get more than once,
+  // and @p filters is the COMPLETE set of predicates still above the scan at each call. Appending
+  // would both duplicate entries and, worse, keep a column whose predicate a later pass dropped --
+  // which is the one way this could prune rows a query still wanted.
+  std::vector<std::size_t> harvested;
+  // Top-level conjuncts only. `a IS NULL OR b = 1` is satisfiable without a single NULL in a, so
+  // a nested IS NULL says nothing about what the file must contain.
+  for (auto const& filter : filters) {
+    if (!filter || filter->GetExpressionType() != ExpressionType::OPERATOR_IS_NULL) { continue; }
+    auto const& op = filter->Cast<BoundOperatorExpression>();
+    if (op.children.size() != 1 || !op.children[0] ||
+        op.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+      continue;
+    }
+    auto const& ref = op.children[0]->Cast<BoundColumnRefExpression>();
+    if (ref.binding.table_index != get.table_index ||
+        ref.binding.column_index >= column_ids.size()) {
+      continue;
+    }
+    auto const& column_id = column_ids[ref.binding.column_index];
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsVirtualColumn()) {
+      continue;
+    }
+    harvested.push_back(static_cast<std::size_t>(column_id.GetPrimaryIndex()));
+  }
+  bind->is_null_columns = std::move(harvested);
 }
 
 // Execute callback for read_simpatico -- the CPU path, which cannot exist.
@@ -2681,6 +2738,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
   read_simpatico.cardinality     = SiriusReadSimpaticoCardinality;
   read_simpatico.filter_pushdown = true;
+  // ... and this collects the one predicate filter_pushdown cannot deliver: a standalone IS NULL,
+  // which DuckDB never lowers into a TableFilter. It prunes only; it consumes nothing.
+  read_simpatico.pushdown_complex_filter = SiriusReadSimpaticoPushdownComplexFilter;
   CreateTableFunctionInfo read_simpatico_info(read_simpatico);
   catalog.CreateTableFunction(transaction, read_simpatico_info);
 

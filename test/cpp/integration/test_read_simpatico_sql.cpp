@@ -27,6 +27,7 @@
 // catches that where a row count does not.
 
 #include "compression/simpatico_file_ingest.hpp"
+#include "sirius_extension.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -36,12 +37,14 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -400,6 +403,58 @@ TEST_CASE_METHOD(ReadSimpaticoFixture,
 {
   auto result = query_on_gpu("SELECT count(*)" + from() + ";");
   REQUIRE(result->GetValue(0, 0).GetValue<std::int64_t>() == kRows);
+}
+
+TEST_CASE_METHOD(ReadSimpaticoFixture,
+                 "read_simpatico - an IS NULL predicate reaches the scan, without leaving the plan",
+                 "[integration][read_simpatico]")
+{
+  // DuckDB's filter combiner lowers comparisons, IN and LIKE prefixes into a TableFilterSet, but
+  // never a standalone IS NULL -- it stays a LogicalFilter above the scan, which is why the scan
+  // harvests it itself. ExtractPlan runs the optimizer, so this asks the real pushdown path what
+  // the scan was told, rather than asking whether the answer came out right (it does either way:
+  // the file holds no nulls, so the count is 0 whether or not anything was pruned).
+  auto const harvested = [this](std::string const& predicate) {
+    auto plan = con->ExtractPlan("SELECT count(*)" + from() + " WHERE " + predicate + ";");
+    REQUIRE(plan);
+    duckdb::LogicalGet const* get = nullptr;
+    bool filter_above             = false;
+    auto find                     = [&](auto&& self, duckdb::LogicalOperator const& op) -> void {
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER) { filter_above = true; }
+      if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+        get = &op.Cast<duckdb::LogicalGet>();
+      }
+      for (auto const& child : op.children) {
+        self(self, *child);
+      }
+    };
+    find(find, *plan);
+    REQUIRE(get != nullptr);
+    auto const* bind =
+      dynamic_cast<duckdb::SiriusReadSimpaticoBindData const*>(get->bind_data.get());
+    REQUIRE(bind != nullptr);
+    return std::pair<std::vector<std::size_t>, bool>{bind->is_null_columns, filter_above};
+  };
+
+  auto const [is_null_b, filter_b] = harvested("b IS NULL");
+  REQUIRE(is_null_b == std::vector<std::size_t>{1});
+  // The conjunct is harvested, NOT consumed: the filter that owns it is still in the plan and
+  // still applies it. That is what makes the harvest unable to produce a wrong answer -- unlike a
+  // pushed-down TableFilter, which DuckDB erases and the source then owes an exact application of.
+  REQUIRE(filter_b);
+
+  // Controls. A comparison is not an IS NULL; and `x IS NULL OR ...` is satisfiable without a
+  // single null in x, so a nested occurrence must not be read as one.
+  REQUIRE(harvested("b > 5").first.empty());
+  REQUIRE(harvested("b IS NULL OR a > 5").first.empty());
+  REQUIRE(harvested("b IS NOT NULL").first.empty());
+
+  // And the answer itself, which the pruning must not change: no column of this file holds a
+  // null, so the scan reads one sentinel chunk and the filter above it returns nothing.
+  auto none = query_on_gpu("SELECT count(*)" + from() + " WHERE b IS NULL;");
+  REQUIRE(none->GetValue(0, 0).GetValue<std::int64_t>() == 0);
+  auto all = query_on_gpu("SELECT count(*)" + from() + " WHERE b IS NOT NULL;");
+  REQUIRE(all->GetValue(0, 0).GetValue<std::int64_t>() == kRows);
 }
 
 TEST_CASE_METHOD(ReadSimpaticoFixture,

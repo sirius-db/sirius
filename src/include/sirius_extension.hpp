@@ -78,16 +78,24 @@ struct SiriusReadSimpaticoBindData : public FunctionData {
 
   std::string path;
   std::size_t total_num_rows{0};
+  // File columns an `x IS NULL` conjunct of the query names, harvested by
+  // SiriusReadSimpaticoPushdownComplexFilter. DuckDB never lowers a standalone IS NULL into a
+  // TableFilter, so this is the only way the predicate reaches the scan; it travels in the bind
+  // data because that is what the physical scan carries to the plan generator.
+  std::vector<std::size_t> is_null_columns;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadSimpaticoBindData>(path, total_num_rows);
+    auto copy             = make_uniq<SiriusReadSimpaticoBindData>(path, total_num_rows);
+    copy->is_null_columns = is_null_columns;
+    return std::move(copy);
   }
 
   bool Equals(FunctionData const& other_p) const override
   {
     auto const& other = other_p.Cast<SiriusReadSimpaticoBindData>();
-    return path == other.path && total_num_rows == other.total_num_rows;
+    return path == other.path && total_num_rows == other.total_num_rows &&
+           is_null_columns == other.is_null_columns;
   }
 };
 

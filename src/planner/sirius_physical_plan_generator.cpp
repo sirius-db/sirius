@@ -64,6 +64,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "sirius_extension.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
@@ -337,6 +338,17 @@ std::unique_ptr<sirius::op::scan::simpatico_ingestible_table_info> build_simpati
   }
   info->duckdb_column_ids = scan_op.column_ids;
   info->returned_types    = scan_op.returned_types;
+
+  // The IS NULL conjuncts the scan harvested for itself (see
+  // SiriusReadSimpaticoPushdownComplexFilter). They ride in the bind data because no TableFilter
+  // ever carries them, and they prune only -- the LogicalFilter that owns the predicate is still
+  // above this scan and still applies it.
+  if (auto const* bind =
+        dynamic_cast<duckdb::SiriusReadSimpaticoBindData const*>(scan_op.bind_data.get())) {
+    for (auto const column : bind->is_null_columns) {
+      if (column < info->names.size()) { info->is_null_columns.push_back(column); }
+    }
+  }
   return info;
 }
 

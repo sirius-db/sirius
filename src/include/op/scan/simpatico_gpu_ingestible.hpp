@@ -111,6 +111,21 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// FILE's columns. Empty means "serve unpruned"; see @ref sirius::hpln_bind_schema.
   scan_manager::group_bounds_arena group_bounds;
 
+  /// Whether each FILE column can contain NULL, ORed over the file's chunks and positional with
+  /// @ref names. Recorded in the chunk headers, so it exists even for a file that carries no
+  /// zone maps at all.
+  std::vector<bool> column_has_nulls;
+
+  /// FILE columns an `x IS NULL` conjunct of the query's WHERE clause names.
+  ///
+  /// These do NOT arrive as table filters: DuckDB's filter combiner lowers comparisons, IN and
+  /// LIKE prefixes into a `TableFilterSet` but leaves a standalone IS NULL as a `LogicalFilter`
+  /// above the scan, so the predicate would otherwise be invisible here. The scan harvests it
+  /// separately (`pushdown_complex_filter`) WITHOUT consuming it, which is what makes this
+  /// advisory: the filter above the scan still applies it, so a column recorded here can only
+  /// ever cause rows to be skipped that no query could have returned.
+  std::vector<std::size_t> is_null_columns;
+
   /// File column indices to decode, in the order the scan emits them. A scan that reads two of
   /// ten columns must emit two: the plan projects by output POSITION, so emitting the file's full
   /// width would silently shift every reference. Filled with the identity by
@@ -289,6 +304,15 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
 
   /// Decide, once, which chunks survive the file's zone maps and which of their decode chunks do.
   void plan_pruning();
+
+  /// Report what the walk dropped, once the decision is made.
+  void log_pruning() const;
+
+  /// Reduce the scan to chunk 0, for a file nothing in which can match.
+  ///
+  /// Not "reduce it to nothing": zero splits means zero tasks, and the pipeline then waits for a
+  /// completion that never fires. The surviving chunk is emptied by the filter above the scan.
+  void keep_only_sentinel_chunk();
 
   std::unique_ptr<simpatico_ingestible_table_info> _info;
   /// The pushed-down filter as one conjunction over batch positions, or null when there is none.

@@ -182,6 +182,7 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->num_rows            = schema.num_rows;
   info->chunk_rows          = std::move(schema.chunk_rows);
   info->group_bounds        = std::move(schema.group_bounds);
+  info->column_has_nulls    = std::move(schema.column_has_nulls);
   info->host_space          = &host_space;
   info->io_ctx              = std::move(io_ctx);
   // Whole file by default; a caller with a narrower projection overwrites this.
@@ -276,6 +277,30 @@ simpatico_gpu_ingestible::simpatico_gpu_ingestible(
 //===----------------------------------------------------------------------===//
 // pruning
 //===----------------------------------------------------------------------===//
+void simpatico_gpu_ingestible::log_pruning() const
+{
+  if (_prune_stats.chunks_pruned == 0 && _prune_stats.decode_chunks_pruned == 0) { return; }
+  SIRIUS_LOG_INFO("[simpatico_gpu_ingestible] '{}' pruned {}/{} chunks and {}/{} decode chunks",
+                  _info->resolved_file_paths.front(),
+                  _prune_stats.chunks_pruned,
+                  _prune_stats.chunks_total,
+                  _prune_stats.decode_chunks_pruned,
+                  _prune_stats.decode_chunks_total);
+}
+
+void simpatico_gpu_ingestible::keep_only_sentinel_chunk()
+{
+  auto const n_chunks = _info->chunk_rows.size();
+  if (n_chunks == 0) { return; }
+  _live_chunks.clear();
+  _live_chunks.push_back({0, {}, _info->chunk_rows.front()});
+  _prune_stats.chunks_pruned = n_chunks - 1;
+  _prune_stats.decode_chunks_pruned =
+    _prune_stats.decode_chunks_total -
+    ceil_div(static_cast<std::size_t>(std::max<std::int64_t>(_info->chunk_rows.front(), 0)),
+             kDecodeChunkRows);
+}
+
 void simpatico_gpu_ingestible::plan_pruning()
 {
   auto const n_chunks       = _info->chunk_rows.size();
@@ -284,6 +309,18 @@ void simpatico_gpu_ingestible::plan_pruning()
   for (auto const rows : _info->chunk_rows) {
     _prune_stats.decode_chunks_total +=
       ceil_div(static_cast<std::size_t>(std::max<std::int64_t>(rows, 0)), kDecodeChunkRows);
+  }
+
+  // `x IS NULL` on a column the file records as never-null: nothing in the file can match, and
+  // that is knowable from the chunk headers alone, so it holds for a file carrying no zone maps
+  // at all. This is the only direction of null pruning worth having -- `IS NOT NULL` survives any
+  // group holding one non-null row, which is nearly all of them.
+  for (auto const column : _info->is_null_columns) {
+    if (column < _info->column_has_nulls.size() && !_info->column_has_nulls[column]) {
+      keep_only_sentinel_chunk();
+      log_pruning();
+      return;
+    }
   }
 
   auto const serve_everything = [&] {
@@ -406,27 +443,11 @@ void simpatico_gpu_ingestible::plan_pruning()
     _live_chunks.push_back({c, std::move(decode_chunks), static_cast<std::int64_t>(kept_rows)});
   }
 
-  // An all-pruned scan must not become a zero-split scan: zero splits means zero tasks, and the
-  // pipeline waits for a completion that never fires. Keep chunk 0 whole and let the post-decode
-  // filter empty it -- the same sentinel build_cached_scan_plan keeps.
-  if (_live_chunks.empty()) {
-    _live_chunks.push_back({0, {}, _info->chunk_rows.front()});
-    _prune_stats.chunks_pruned = n_chunks - 1;
-    _prune_stats.decode_chunks_pruned =
-      _prune_stats.decode_chunks_total -
-      ceil_div(static_cast<std::size_t>(std::max<std::int64_t>(_info->chunk_rows.front(), 0)),
-               kDecodeChunkRows);
-  }
+  // An all-pruned scan must not become a zero-split scan -- the same sentinel
+  // build_cached_scan_plan keeps.
+  if (_live_chunks.empty()) { keep_only_sentinel_chunk(); }
 
-  if (_prune_stats.chunks_pruned > 0 || _prune_stats.decode_chunks_pruned > 0) {
-    SIRIUS_LOG_INFO(
-      "[simpatico_gpu_ingestible] '{}' zone maps pruned {}/{} chunks and {}/{} decode chunks",
-      _info->resolved_file_paths.front(),
-      _prune_stats.chunks_pruned,
-      _prune_stats.chunks_total,
-      _prune_stats.decode_chunks_pruned,
-      _prune_stats.decode_chunks_total);
-  }
+  log_pruning();
 }
 
 simpatico_gpu_ingestible::~simpatico_gpu_ingestible() = default;
