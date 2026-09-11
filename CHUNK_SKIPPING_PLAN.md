@@ -11,7 +11,7 @@ This file is the living record for the project. Keep the *Measurements* numbers 
 
 ---
 
-## 0. Where this stands (2026-09-09)
+## 0. Where this stands (2026-09-11)
 
 Read this first; the rest of the document is the reasoning and the measurements behind it.
 
@@ -27,6 +27,7 @@ Read this first; the rest of the document is the reasoning and the measurements 
 | — of which the per-group index | +0.2% on its own; it locates rows, it does not save work |
 | — of which range-skipped fetch | **−7.0%**, and only once the other two exist (§3.13) |
 | without clustering, the same machinery | **+1.39%** — it prunes 0.00%, so it is pure overhead |
+| **`.hpln` as a readable/writable FORMAT** | done end to end (§7.9) — `COPY … TO`, `read_simpatico`, pruning, decode-time filtering, io_context transport, pin as an I/O copy (**4.4x** faster than pinning the equivalent parquet), NULLs, CRC32C |
 | GPU-tier pins | −0.4%, and the ceiling there is ~2.4% — the suite is join-bound |
 
 Two findings that stand on their own, independent of the remaining work:
@@ -2142,6 +2143,23 @@ batching cost — which the Phase 1 table shows no batch size can deliver.
 
 ## 10. Open questions / log
 
+- **2026-09-11** — **`.hpln` is a first-class format (§7.9 A–F, C2).** Written from SQL
+  (`COPY … TO 'x.hpln' (FORMAT simpatico[, cluster_by 'k'])`), queried via `read_simpatico` with
+  whole-chunk and sub-chunk zone-map pruning plus decode-time filtering, read through the
+  io_context (so `s3://` works), and pinned as an I/O copy — **4.4x faster than pinning the
+  equivalent parquet**, and that is a lower bound since the parquet arm was the *uncompressed*
+  pin. Nullable columns round-trip (merged from `feat/compression-nullable-columns`, file version
+  12 — both lines had independently bumped to 11 for incompatible reasons). CRC32C closes the last
+  format gap.
+- **2026-09-11** — **Six real defects surfaced in code that was believed to work**, each found by
+  deliberately breaking an assertion and checking it failed: a heap-corruption bug in
+  `rest_reactor` (vectored segments flattened onto their first buffer — silent corruption, not a
+  fault); a silently wrong column projection (`SUM(b)` summing `a`); a `cache_entry_info` path that
+  could never have matched a Simpatico entry; a validity mask left pointing at stale bytes after
+  chunk-subset compaction; a decode gate cached per process so its test only passed in one
+  declaration order; and `groups_in_chunk()` reporting column 0's slice count, so a file whose
+  first column is a string can never prune. **The practice earns its keep — treat "it already
+  works" as a hypothesis.**
 - **2026-09-09** — **Range-skipped fetch runs end to end on a host-tier pin (§6.5).** The scan
   hands a compressed chunk its surviving 1024-row decode chunks, `build_chunk_subset_header`
   synthesizes a header for them, and the converter gathers only those bytes out of the pinned
