@@ -3053,6 +3053,26 @@ fn partial_aggregation_translates_with_the_modeled_state_type() {
     assert!(names.contains(&"sum".to_string()), "{names:?}");
 }
 
+/// Names a measure's declared output type the way the engine declares a stream column.
+fn measure_output_type(measure: &substrait::proto::aggregate_rel::Measure) -> &'static str {
+    match measure
+        .measure
+        .as_ref()
+        .unwrap()
+        .output_type
+        .as_ref()
+        .unwrap()
+        .kind
+        .as_ref()
+        .unwrap()
+    {
+        substrait::proto::r#type::Kind::Fp64(_) => "DOUBLE",
+        substrait::proto::r#type::Kind::I64(_) => "BIGINT",
+        substrait::proto::r#type::Kind::Varchar(_) => "VARCHAR",
+        other => panic!("unexpected measure output type {other:?}"),
+    }
+}
+
 /// Extracts the aggregate relation a plan roots at, through an optional finalizing project.
 fn root_aggregate(plan: &substrait::proto::Plan) -> &substrait::proto::AggregateRel {
     let mut input = root(plan).input.as_ref().unwrap();
@@ -3237,6 +3257,579 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected sort-tuple projection under sort");
     };
+}
+
+/// Descriptor for the cross-fragment sort-order tests: scan tuple 0 = {o_orderdate DATE,
+/// revenue DOUBLE}; sort tuple 1 re-materializes both, serialized in the order
+/// [3 o_orderdate, 5 revenue].
+fn sort_wire_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(2, 0, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 1, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+            slot(5, 1, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    )
+}
+
+/// Builds a SORT_NODE over sort tuple 1 with the given ordering and materialization exprs.
+fn sort_node_over_tuple_1(ordering: Vec<TExpr>, slot_exprs: Vec<TExpr>) -> TPlanNode {
+    let directions = vec![false; ordering.len()];
+    let sort_info = TSortInfo::new(ordering, directions.clone(), directions, Some(slot_exprs));
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    sort
+}
+
+/// The projected field indices of the sort-tuple materialization, in output order.
+fn sort_projection_fields(translated: &TranslatedPlan) -> Vec<i32> {
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    let rel::RelType::Project(project) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort-tuple projection under sort");
+    };
+    project.expressions.iter().map(field_index).collect()
+}
+
+/// An ORDER BY whose key (`revenue`, a measure) is not the sort tuple's leading slot: the FE
+/// lists the key's materialization first, but the wire row must ship in the tuple's
+/// materialized slot order, because that is the order the receiving fragment declares its
+/// stream with. This is the q03/q05 shape ("stream N column 0 is declared DATE but the source
+/// sink produces DOUBLE").
+#[test]
+fn order_by_on_a_non_leading_sort_slot_ships_tuple_slot_order() {
+    // FE list order: the ordering key `revenue` (child field 1) first, then `o_orderdate`.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(5, 1, scalar_type(TPrimitiveType::DOUBLE))],
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    // The sender ships materialized-slot order: o_orderdate (child field 0) leads.
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    // The ORDER BY key still resolves to `revenue`, now at column 1 of the shipped row.
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 1);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+
+    // The receiving fragment reads the same sort tuple through an exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(
+                Some(TPlan::new(vec![exchange])),
+                Some(sort_wire_desc()),
+                None,
+            ),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column: what the sender produces is what the receiver declares.
+    // Sender column types come from mapping each projected field into the scan row
+    // (field 0 = o_orderdate DATE, field 1 = revenue DOUBLE).
+    let scan_types = ["DATE", "DOUBLE"];
+    let produced = sort_projection_fields(&sender)
+        .into_iter()
+        .zip(&sender.output_names)
+        .map(|(field, name)| (name.as_str(), scan_types[field as usize]))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![("o_orderdate", "DATE"), ("revenue", "DOUBLE")]
+    );
+}
+
+/// Control: an ORDER BY on the leading sort-tuple slot already lists the materialization in
+/// slot order, so the projection is the identity mapping and nothing moves.
+#[test]
+fn order_by_on_the_leading_sort_slot_keeps_slot_order() {
+    // FE list order: the ordering key `o_orderdate` (child field 0) first -- which is also the
+    // sort tuple's leading materialized slot.
+    let sort = sort_node_over_tuple_1(
+        vec![slot_ref(3, 1, scalar_type(TPrimitiveType::DATE))],
+        vec![
+            slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)),
+            slot_ref(2, 0, scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    );
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_wire_desc()),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(sort_projection_fields(&sender), vec![0, 1]);
+    assert_eq!(sender.output_names, vec!["o_orderdate", "revenue"]);
+    let root = root(&sender.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 0);
+}
+
+/// Descriptor for the q03-shaped aggregation tests: scan tuple 0 lists the columns in query
+/// order (l_orderkey BIGINT, o_orderdate DATE, o_shippriority INT, price DOUBLE); the
+/// aggregation output tuple 1 and the sort tuple 2 both re-materialize the keys and the sum,
+/// serialized in ascending slot-id order [13, 16, 18, 35] -- so the tuples' wire order is not
+/// the GROUP BY order [18, 13, 16].
+fn q03_desc() -> TDescriptorTable {
+    let mut slots = vec![
+        slot(18, 0, "l_orderkey", scalar_type(TPrimitiveType::BIGINT)),
+        slot(13, 0, "o_orderdate", scalar_type(TPrimitiveType::DATE)),
+        slot(16, 0, "o_shippriority", scalar_type(TPrimitiveType::INT)),
+        slot(20, 0, "price", scalar_type(TPrimitiveType::DOUBLE)),
+    ];
+    for tuple_id in [1, 2] {
+        slots.extend([
+            slot(
+                13,
+                tuple_id,
+                "o_orderdate",
+                scalar_type(TPrimitiveType::DATE),
+            ),
+            slot(
+                16,
+                tuple_id,
+                "o_shippriority",
+                scalar_type(TPrimitiveType::INT),
+            ),
+            slot(
+                18,
+                tuple_id,
+                "l_orderkey",
+                scalar_type(TPrimitiveType::BIGINT),
+            ),
+            slot(35, tuple_id, "revenue", scalar_type(TPrimitiveType::DOUBLE)),
+        ]);
+    }
+    desc_table(vec![(0, Some(100)), (1, None), (2, None)], slots)
+}
+
+/// The q03 one-shot aggregation: GROUP BY l_orderkey, o_orderdate, o_shippriority (slot refs
+/// 18, 13, 16 -- not ascending) with one sum measure, over scan tuple 0 into output tuple 1.
+fn q03_aggregation_node(grouping_slots: &[i32]) -> TPlanNode {
+    let scan_types = BTreeMap::from([
+        (18, TPrimitiveType::BIGINT),
+        (13, TPrimitiveType::DATE),
+        (16, TPrimitiveType::INT),
+        (20, TPrimitiveType::DOUBLE),
+    ]);
+    aggregation_node(
+        1,
+        1,
+        grouping_slots
+            .iter()
+            .map(|slot_id| slot_ref(*slot_id, 0, scalar_type(scan_types[slot_id])))
+            .collect(),
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::DOUBLE),
+            Some(slot_ref(20, 0, scalar_type(TPrimitiveType::DOUBLE))),
+        )],
+    )
+}
+
+/// The grouping-key field indices an aggregate reads from its input, in emitted order.
+fn grouping_fields(aggregate: &substrait::proto::AggregateRel) -> Vec<i32> {
+    aggregate
+        .grouping_expressions
+        .iter()
+        .map(field_index)
+        .collect()
+}
+
+/// Scan-tuple-0 column types of [`q03_desc`], indexed by field.
+const Q03_SCAN_TYPES: [&str; 4] = ["BIGINT", "DATE", "INTEGER", "DOUBLE"];
+
+/// GROUP BY keys whose slot ids are not in ascending order (the q03 shape: l_orderkey=18,
+/// o_orderdate=13, o_shippriority=16): the FE lists the grouping exprs in GROUP BY order, but
+/// every consumer of the output tuple resolves the row through the descriptor's
+/// materialized-slot order, so the keys must be emitted in the tuple's order and the next
+/// hop's declared stream schema must match the sender column-for-column. This is the q03/q18
+/// shape ("stream 14 column 0 is declared DATE but the source sink produces BIGINT").
+#[test]
+fn group_by_keys_out_of_slot_order_ship_tuple_slot_order() {
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[18, 13, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+
+    // Keys in materialized order [13, 16, 18]: o_orderdate (scan field 1), o_shippriority
+    // (field 2), l_orderkey (field 0) -- not the GROUP BY order [0, 1, 2].
+    let aggregate = root_aggregate(&sender.plan);
+    let key_fields = grouping_fields(aggregate);
+    assert_eq!(key_fields, vec![1, 2, 0]);
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+
+    // The receiving fragment reads the aggregation output tuple through an exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![1]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![1],
+        None,
+        None,
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(q03_desc()), None),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column: what the aggregate produces is what the receiver declares.
+    let produced = key_fields
+        .iter()
+        .map(|&field| Q03_SCAN_TYPES[field as usize])
+        .chain(aggregate.measures.iter().map(measure_output_type))
+        .zip(&sender.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![
+            ("o_orderdate", "DATE"),
+            ("o_shippriority", "INTEGER"),
+            ("l_orderkey", "BIGINT"),
+            ("revenue", "DOUBLE")
+        ]
+    );
+}
+
+/// Builds the q03 TOP-N sort info: ORDER BY revenue DESC (nulls last), o_orderdate ASC (nulls
+/// first), ordering over `ordering_tuple` and materializing from `input_tuple` in the FE's
+/// list order (ordering keys first, then the leftover payload slots).
+fn q03_sort_info(ordering_tuple: i32, input_tuple: i32) -> TSortInfo {
+    TSortInfo::new(
+        vec![
+            slot_ref(35, ordering_tuple, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(13, ordering_tuple, scalar_type(TPrimitiveType::DATE)),
+        ],
+        vec![false, true],
+        vec![false, true],
+        Some(vec![
+            slot_ref(35, input_tuple, scalar_type(TPrimitiveType::DOUBLE)),
+            slot_ref(13, input_tuple, scalar_type(TPrimitiveType::DATE)),
+            slot_ref(16, input_tuple, scalar_type(TPrimitiveType::INT)),
+            slot_ref(18, input_tuple, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+    )
+}
+
+/// The full q03 sender shape: the one-shot aggregation (keys 18, 13, 16) under a TOP-N with
+/// two ordering keys (revenue DESC nulls-last, o_orderdate ASC nulls-first) and a limit. The
+/// two sender-side reorders compose: the aggregate emits its keys in tuple order, the sort
+/// projection re-materializes that row in the sort tuple's order, and each ordering key
+/// resolves to the field really holding its column -- so the wire row matches the receiving
+/// merging exchange's declared stream column-for-column.
+#[test]
+fn topn_over_group_by_keys_out_of_slot_order_resolves_both_sort_keys() {
+    let mut sort = base_plan_node(2, TPlanNodeType::SORT_NODE, 1, vec![2]);
+    sort.limit = 10;
+    sort.sort_node = Some(TSortNode::new(
+        q03_sort_info(2, 1),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            sort,
+            q03_aggregation_node(&[18, 13, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+
+    // Fetch(limit 10) over Sort over Project(sort tuple) over Aggregate.
+    let root = root(&sender.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the top-N fetch");
+    };
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            fetch.count_mode,
+            Some(substrait::proto::fetch_rel::CountMode::Count(10))
+        );
+    }
+    let rel::RelType::Sort(sort) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort under fetch");
+    };
+    // Both ordering keys resolve to the fields really holding their columns in the shipped
+    // row: revenue at field 3 (DESC nulls-last), o_orderdate at field 0 (ASC nulls-first).
+    assert_eq!(sort.sorts.len(), 2);
+    assert_eq!(field_index(sort.sorts[0].expr.as_ref().unwrap()), 3);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::DescNullsLast as i32
+        ))
+    );
+    assert_eq!(field_index(sort.sorts[1].expr.as_ref().unwrap()), 0);
+    assert_eq!(
+        sort.sorts[1].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::AscNullsFirst as i32
+        ))
+    );
+    let rel::RelType::Project(project) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected sort-tuple projection under sort");
+    };
+    // The aggregate row and the sort tuple order the same slots the same way, so the
+    // materialization projection is the identity.
+    let projection_fields = project
+        .expressions
+        .iter()
+        .map(field_index)
+        .collect::<Vec<_>>();
+    assert_eq!(projection_fields, vec![0, 1, 2, 3]);
+    let rel::RelType::Aggregate(aggregate) =
+        project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate under the sort projection");
+    };
+    let key_fields = grouping_fields(aggregate);
+    assert_eq!(key_fields, vec![1, 2, 0]);
+
+    // The receiving fragment merge-sorts the same tuple through a merging exchange.
+    let mut exchange = base_plan_node(14, TPlanNodeType::EXCHANGE_NODE, 0, vec![2]);
+    exchange.exchange_node = Some(TExchangeNode::new(
+        vec![2],
+        Some(q03_sort_info(2, 2)),
+        Some(0),
+        Some(TPartitionType::UNPARTITIONED),
+        Some(true),
+        None,
+    ));
+    let receiver = PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(
+            &params(Some(TPlan::new(vec![exchange])), Some(q03_desc()), None),
+            &[ExchangeInput {
+                node_id: 14,
+                stream_view: "sirius_stream_14".to_string(),
+                names: sender.output_names.clone(),
+            }],
+        )
+        .unwrap();
+
+    // Column-for-column across the hop: the sender's sink row (the sort projection over the
+    // aggregate row, whose key columns map into the scan) is what the receiver declares.
+    let agg_row_types = key_fields
+        .iter()
+        .map(|&field| Q03_SCAN_TYPES[field as usize])
+        .chain(aggregate.measures.iter().map(measure_output_type))
+        .collect::<Vec<_>>();
+    let produced = projection_fields
+        .iter()
+        .map(|&field| agg_row_types[field as usize])
+        .zip(&sender.output_names)
+        .map(|(ty, name)| (name.as_str(), ty))
+        .collect::<Vec<_>>();
+    let declared = receiver.stream_inputs[0]
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ty.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(produced, declared);
+    assert_eq!(
+        declared,
+        vec![
+            ("o_orderdate", "DATE"),
+            ("o_shippriority", "INTEGER"),
+            ("l_orderkey", "BIGINT"),
+            ("revenue", "DOUBLE")
+        ]
+    );
+    // The receiver's merge-sort keys resolve against the declared row the same way.
+    let receiver_root = crate::root(&receiver.plan);
+    let rel::RelType::Sort(merge_sort) = receiver_root
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected merging exchange sort");
+    };
+    assert_eq!(merge_sort.sorts.len(), 2);
+    assert_eq!(field_index(merge_sort.sorts[0].expr.as_ref().unwrap()), 3);
+    assert_eq!(field_index(merge_sort.sorts[1].expr.as_ref().unwrap()), 0);
+}
+
+/// Control: GROUP BY keys already listed in ascending slot-id order translate exactly as
+/// before -- the materialized order is the FE order, so nothing moves (the rewritten-q03
+/// shape that passes on a live cluster).
+#[test]
+fn group_by_keys_in_slot_order_keep_their_order() {
+    let sender = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[13, 16, 18]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap();
+    let aggregate = root_aggregate(&sender.plan);
+    // The FE-order translation and the materialized-order translation coincide.
+    assert_eq!(grouping_fields(aggregate), vec![1, 2, 0]);
+    assert_eq!(
+        sender.output_names,
+        vec!["o_orderdate", "o_shippriority", "l_orderkey", "revenue"]
+    );
+}
+
+/// A multi-key GROUP BY whose grouping expression is not a bare slot ref cannot be paired
+/// with the output key slots, so the key order is unrecoverable and the node must refuse
+/// rather than guess.
+#[test]
+fn non_slot_ref_grouping_expr_with_multiple_keys_is_rejected() {
+    let mut agg = q03_aggregation_node(&[18, 13, 16]);
+    agg.agg_node
+        .as_mut()
+        .unwrap()
+        .grouping_exprs
+        .as_mut()
+        .unwrap()[1] = cast_expr(
+        scalar_type(TPrimitiveType::DATE),
+        slot_ref(13, 0, scalar_type(TPrimitiveType::DATE)),
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TranslateError::UnsupportedPlanNode {
+                node_type: TPlanNodeType::AGGREGATION_NODE,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("bare slot ref"), "{err}");
+}
+
+/// Multi-key grouping refs whose ids do not pair with the output tuple's key slots (a layout
+/// the FE never serializes -- each output key slot reuses its grouping ref's id) must refuse
+/// loudly: reordering on a wrong pairing would ship wrong columns.
+#[test]
+fn group_by_keys_that_do_not_pair_with_output_slots_are_rejected() {
+    // Grouping refs [18, 20, 16]: slot 20 (the measure argument) is not an output key slot,
+    // and key slot 13 pairs with nothing.
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            q03_aggregation_node(&[18, 20, 16]),
+            scan_node(0, 0),
+        ])),
+        Some(q03_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::Descriptor(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("output key slot 13 pairs with no grouping expression"),
+        "{err}"
+    );
 }
 
 /// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
