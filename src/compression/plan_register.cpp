@@ -88,7 +88,18 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
 {
   std::shared_lock lock(_mutex);
   auto it = _spill_plans.find(repo);
-  if (it == _spill_plans.end()) { return {spill_plan_verdict::explore, {}}; }
+  if (it == _spill_plans.end()) { return {spill_plan_verdict::explore, {}, false, 0, 0, 0}; }
+
+  // Filled in on every return below so the caller can report why a beam search ran.
+  auto decorate = [&](spill_plan_decision d) {
+    d.had_entry     = true;
+    d.uses          = it->second.uses;
+    d.period        = it->second.replan_interval != 0 ? it->second.replan_interval
+                                                      : replan_after_uses;
+    d.entry_columns = it->second.columns.size();
+    d.mean_ratio    = it->second.mean_viable_ratio();
+    return d;
+  };
 
   if (it->second.columns.empty()) {
     // No plans yet — only a record of failed explorations. Keep asking for one
@@ -99,8 +110,8 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
     const std::uint64_t period =
       state.replan_interval != 0 ? state.replan_interval : replan_after_uses;
     const bool expired = period > 0 && state.uses >= period;
-    if (!expired && state.explore_exhausted) { return {spill_plan_verdict::skip, {}}; }
-    return {spill_plan_verdict::explore, {}};
+    if (!expired && state.explore_exhausted) { return decorate({spill_plan_verdict::skip, {}}); }
+    return decorate({spill_plan_verdict::explore, {}});
   }
 
   // An expired entry is re-explored whatever its verdict was, so a stale plan or
@@ -110,16 +121,21 @@ plan_register::spill_plan_decision plan_register::decide_spill_plan(
   const auto& state = it->second;
   const std::uint64_t period =
     state.replan_interval != 0 ? state.replan_interval : replan_after_uses;
-  if (period > 0 && state.uses >= period) { return {spill_plan_verdict::explore, {}}; }
+  if (period > 0 && state.uses >= period) { return decorate({spill_plan_verdict::explore, {}}); }
 
   // Nothing here compresses, so there is no point paying to find out again.
   // A partially viable edge still proceeds: its viable columns are compressed and
   // the rest stored raw.
-  if (state.viable_count() == 0) { return {spill_plan_verdict::skip, {}}; }
-  return {spill_plan_verdict::use, state.columns};
+  if (state.viable_count() == 0) { return decorate({spill_plan_verdict::skip, {}}); }
+  return decorate({spill_plan_verdict::use, state.columns});
 }
 
 namespace {
+
+/// Relative gain in achieved ratio a replan must deliver to be considered an
+/// improvement worth re-exploring on schedule for. Below this the edge backs off.
+constexpr double kMinReplanGain = 0.05;
+
 
 /// True when @p a and @p b differ by more than @p threshold, relative to the
 /// larger of the two. Using the larger as the denominator keeps the test
@@ -238,6 +254,7 @@ void plan_register::set_spill_plan(const cucascade::shared_data_repository* repo
   fresh.from_replan       = true;
   fresh.plan_changed      = adopted_any;
   fresh.prev_viable_count = prev.viable_count();
+  fresh.prev_mean_ratio   = prev.mean_viable_ratio();
   fresh.replan_interval   = prev.replan_interval;
 
   _spill_plans[repo] = std::move(fresh);
@@ -289,11 +306,17 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
       state.replan_interval != 0 ? state.replan_interval : base_interval;
     const std::size_t now_viable = state.viable_count();
 
-    // Only a change that actually compresses something is worth staying on
-    // schedule for. The same plans, or plans that still compress nothing, teach
-    // us nothing — back off so we stop paying for fruitless explores.
-    const bool changed = state.plan_changed || now_viable != state.prev_viable_count;
-    if (changed && now_viable > 0) {
+    // Only a replan that actually IMPROVED something is worth staying on schedule
+    // for. Testing merely that the plan *changed* means an edge whose two best
+    // candidates score alike resets the interval on every replan and re-explores
+    // forever: measured on TPC-H q18/SF3000, one edge re-explored every 31-51
+    // spills against a configured period of 128, and each beam search occupies
+    // the single downgrade thread for seconds while the GPU is out of memory.
+    const double now_ratio = state.mean_viable_ratio();
+    const bool improved =
+      now_viable > state.prev_viable_count ||
+      (now_viable > 0 && now_ratio > state.prev_mean_ratio * (1.0 + kMinReplanGain));
+    if (improved) {
       state.replan_interval = base_interval;
     } else if (current > 0) {
       state.replan_interval = current > max_interval / 2 ? max_interval : current * 2;
@@ -302,6 +325,32 @@ void plan_register::conclude_spill_attempt(const cucascade::shared_data_reposito
     state.from_replan  = false;
     state.plan_changed = false;
   }
+}
+
+std::optional<std::string> plan_register::cached_default_plan(
+  const cucascade::shared_data_repository* repo, std::size_t column_index)
+{
+  if (repo == nullptr) { return std::nullopt; }
+  std::unique_lock lock(_mutex);
+  auto it = _default_plan_cache.find({repo, column_index});
+  if (it == _default_plan_cache.end()) { return std::nullopt; }
+  // Miss deliberately on every kDefaultPlanRecheckBatches-th use so the caller
+  // re-probes and re-caches: the first batch off a port decides, and the
+  // decision is revisited periodically in case the column's shape changed.
+  if (++it->second.uses >= kDefaultPlanRecheckBatches) {
+    _default_plan_cache.erase(it);
+    return std::nullopt;
+  }
+  return it->second.dsl;
+}
+
+void plan_register::cache_default_plan(const cucascade::shared_data_repository* repo,
+                                       std::size_t column_index,
+                                       std::string dsl)
+{
+  if (repo == nullptr) { return; }
+  std::unique_lock lock(_mutex);
+  _default_plan_cache[std::make_pair(repo, column_index)] = cached_plan{std::move(dsl), 0};
 }
 
 void plan_register::set_spill_column_origins(const cucascade::shared_data_repository* repo,

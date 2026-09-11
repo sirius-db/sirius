@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <map>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -163,6 +164,29 @@ class plan_register {
   /// Origins for @p repo, or nullopt when none were resolved.
   [[nodiscard]] std::optional<spill_column_origins> resolve_spill_column_origins(
     const cucascade::shared_data_repository* repo) const;
+
+  /// How many batches a cached default plan serves before it is re-decided.
+  /// The estimate is a property of the column, but a column's distribution can
+  /// drift across an operator's output, so the decision is refreshed
+  /// periodically rather than pinned for the life of the query.
+  static constexpr std::size_t kDefaultPlanRecheckBatches = 64;
+
+  /// Cached default plan for a column with no offline plan, keyed by the edge
+  /// and column index.
+  ///
+  /// Deciding a STRING column's carrier needs a cardinality estimate, and that
+  /// estimate costs a device allocation and a host read-back on the downgrade
+  /// thread -- the critical path for relieving memory pressure. The answer is a
+  /// property of the column, not of the batch, so it is decided once per edge
+  /// column and reused. (Measured: 226 probes on one q18 run, every one
+  /// returning the same verdict.)
+  /// Not const: a lookup advances the use counter and evicts on the recheck
+  /// boundary, which is what makes the re-probe periodic rather than never.
+  [[nodiscard]] std::optional<std::string> cached_default_plan(
+    const cucascade::shared_data_repository* repo, std::size_t column_index);
+  void cache_default_plan(const cucascade::shared_data_repository* repo,
+                          std::size_t column_index,
+                          std::string dsl);
 
   /**
    * @brief Per-column plans for @p repo taken from the offline table plans.
@@ -321,6 +345,24 @@ class plan_register {
     bool from_replan{false};           ///< this entry replaced an earlier one
     bool plan_changed{false};          ///< ...and at least one column's DSL differs
     std::size_t prev_viable_count{0};  ///< ...and how many of its columns were viable
+    double prev_mean_ratio{0.0};       ///< ...and what those columns actually achieved
+
+    /// Mean achieved ratio over the columns worth compressing (0 when none are).
+    /// The backoff compares this across replans: a replan that merely swaps one
+    /// plan for an equally good one has taught us nothing and must not reset the
+    /// schedule, or an edge whose two best plans score alike re-explores forever.
+    [[nodiscard]] double mean_viable_ratio() const
+    {
+      double total = 0.0;
+      std::size_t n = 0;
+      for (auto const& c : columns) {
+        if (c.viable) {
+          total += c.compression_ratio;
+          ++n;
+        }
+      }
+      return n != 0 ? total / static_cast<double>(n) : 0.0;
+    }
 
     /// Columns currently worth compressing.
     [[nodiscard]] std::size_t viable_count() const
@@ -345,6 +387,14 @@ class plan_register {
     /// Per-column state, set when verdict == use. Columns whose `viable` is
     /// false should be stored with a passthrough plan rather than compressed.
     std::vector<column_plan_state> columns;
+    // Diagnostics: a beam search costs seconds on the downgrade thread, so when
+    // one is triggered the log should be able to say why rather than leaving the
+    // reader to infer it from the configured interval.
+    bool had_entry{false};        ///< an entry existed for this edge
+    std::uint64_t uses{0};        ///< uses recorded against it
+    std::uint64_t period{0};      ///< effective replan interval (adaptive or configured)
+    std::size_t entry_columns{0}; ///< column count the entry was explored for
+    double mean_ratio{0.0};       ///< mean achieved ratio over viable columns
   };
 
   /**
@@ -509,6 +559,15 @@ class plan_register {
   std::unordered_map<const cucascade::shared_data_repository*, spill_plan_state> _spill_plans;
   // repo* → per-column base-table origins, recorded once at plan-wiring time.
   std::unordered_map<const cucascade::shared_data_repository*, spill_column_origins> _spill_origins;
+  /// (edge, column index) -> default plan, so a per-column decision that needs a
+  /// GPU probe is paid once rather than per spilled batch.
+  struct cached_plan {
+    std::string dsl;
+    std::size_t uses{0};
+  };
+  std::map<std::pair<const cucascade::shared_data_repository*, std::size_t>, cached_plan>
+    _default_plan_cache;
+
 
   /// Cached eager-output decision for one edge.
   struct output_edge_state {
