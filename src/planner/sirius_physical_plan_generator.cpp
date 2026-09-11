@@ -25,6 +25,7 @@
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -32,9 +33,11 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/scan/sirius_physical_dynamic_filter.hpp"
@@ -82,7 +85,12 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
     if (parameters.empty() || parameters.front().IsNull()) { return {}; }
     return {parameters.front().GetValue<std::string>()};
   }
-  if (function_name == "parquet_scan" || function_name == "read_parquet") {
+  if (function_name == "parquet_scan" || function_name == "read_parquet" ||
+      function_name == "iceberg_scan") {
+    // iceberg_scan belongs here: the iceberg extension resolves its manifests into the same
+    // MultiFileBindData file list read_parquet produces, which is what lets the parquet
+    // ingestible read an iceberg table's data files unchanged.
+    //
     // dynamic_cast (never Cast<>, which asserts/throws): an unresolvable
     // identity must degrade to empty, not fail the caller.
     auto const* multi_file_bind = dynamic_cast<duckdb::MultiFileBindData const*>(bind_data);
@@ -132,10 +140,14 @@ void wrap_above(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slot,
 
 //! Build a `parquet_ingestible_table_info` from a TABLE_SCAN. Destructive: `table_filters`
 //! is moved out of the scan.
-std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
-  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+//! Fill the parquet bind data from a TABLE_SCAN. Split out from
+//! `build_parquet_table_info` so the iceberg path can populate the same fields into its own
+//! subclass — an iceberg table's data files are parquet, so every field here applies unchanged.
+void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info& out,
+                                 sirius::op::sirius_physical_table_scan& scan_op,
+                                 const sirius::operator_params& op_params)
 {
-  auto info                = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  auto* info               = &out;
   info->returned_types     = scan_op.returned_types;
   info->column_ids         = scan_op.column_ids;
   info->projection_ids     = scan_op.projection_ids;
@@ -163,6 +175,63 @@ std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_t
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
+}
+
+std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
+  sirius::op::sirius_physical_table_scan& scan_op, const sirius::operator_params& op_params)
+{
+  auto info = std::make_unique<sirius::op::scan::parquet_ingestible_table_info>();
+  populate_parquet_table_info(*info, scan_op, op_params);
+  return info;
+}
+
+//! Build an `iceberg_ingestible_table_info`: the parquet bind data plus the table's delete
+//! data, resolved here at plan time.
+//!
+//! Reading the deletes can fail — an unreadable manifest, a delete file that is not where the
+//! metadata says. Every such failure throws out of here, which the caller turns into a CPU
+//! fallback. It must never be softened into "no deletes": that is indistinguishable from an
+//! append-only table, and would return rows the table logically deleted.
+std::unique_ptr<sirius::op::scan::iceberg_ingestible_table_info> build_iceberg_table_info(
+  sirius::op::sirius_physical_table_scan& scan_op,
+  const sirius::operator_params& op_params,
+  duckdb::ClientContext& context)
+{
+  auto info = std::make_unique<sirius::op::scan::iceberg_ingestible_table_info>();
+  populate_parquet_table_info(*info, scan_op, op_params);
+
+  if (scan_op.parameters.empty() || scan_op.parameters.front().IsNull()) {
+    throw duckdb::NotImplementedException("iceberg_scan has no table path parameter");
+  }
+  info->table_path = scan_op.parameters.front().GetValue<std::string>();
+
+  // Second line of the gate in sirius_plan_get.cpp, which already declines an unpinned scan: a
+  // caller reaching here without an id must fail loudly rather than read "current" a third time.
+  // Deriving one here is not a fallback -- see that gate for why every derivation is unsound.
+  auto const sid_it = scan_op.named_parameters.find("snapshot_from_id");
+  if (sid_it == scan_op.named_parameters.end() || sid_it->second.IsNull()) {
+    throw duckdb::NotImplementedException(
+      "iceberg_scan reached GPU physical planning without 'snapshot_from_id': the snapshot its "
+      "delete files must be read from is unknown, and reading them from whatever is current now "
+      "risks pairing one snapshot's data files with another's deletes");
+  }
+  std::optional<uint64_t> const snapshot_id =
+    static_cast<uint64_t>(sid_it->second.GetValue<int64_t>());
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw duckdb::NotImplementedException(
+      "iceberg delete data cannot be read without a registered SiriusContext");
+  }
+
+  // Delete discovery opens its own Connection to run iceberg_metadata() and to read the
+  // positional-delete parquet files, which re-registers this same SiriusContext. Bracket the
+  // planning connection as an internal query so its lifecycle callbacks stay out of the way of
+  // the query being planned. Same guard the delete gate uses.
+  duckdb::SiriusContext::InternalQueryGuard guard(context);
+  info->delete_data = sirius::op::scan::read_iceberg_delete_data(
+    context, info->table_path, sirius_ctx->get_scan_manager().io_ctx(), snapshot_id);
+
   return info;
 }
 
@@ -330,6 +399,20 @@ void wrap_table_scan_source(
                               op_params,
                               sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
                               sirius_ctx.get());
+    replace_slot = true;
+  } else if (fn == "iceberg_scan") {
+    // `iceberg_scan` rides the parquet ingestible: an iceberg table's data files ARE parquet, and
+    // the iceberg extension resolves its manifests into the same MultiFileBindData file list
+    // read_parquet produces, so the parquet bind data is built from it unchanged. The iceberg
+    // subclass adds only the table's delete data, and its ingestible applies those deletes to
+    // each decoded batch. Equality deletes are still refused by create_plan(LogicalGet&) before
+    // this point.
+    leaf = make_gpu_scan_leaf(build_iceberg_table_info(scan, op_params, context),
+                              scan,
+                              op_params,
+                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
+                              sirius_ctx.get());
+    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
     replace_slot = true;
   } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
     // Parquet applies AST filters in the reader; post-decode uses membership only.

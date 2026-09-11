@@ -34,7 +34,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Expression Evaluator](expression-executor.md) | `expression_evaluator`, Sirius AST hierarchy, GPU expression translator, cuDF AST |
 | [Pipeline Execution](pipeline-execution.md) | GPU executor, task scheduling, completion, OOM handling, per-task-device contract under SCHED-RR |
 | [Task Creator](task-creator.md) | Task creation: hint chain, per-operator scheduling behavior |
-| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native), scan manager, pinned tables, DuckDB-native decode, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
+| [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
 | [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |

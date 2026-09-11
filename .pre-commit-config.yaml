@@ -42,11 +42,18 @@ repos:
           (?x)^(
             ^legacy/queries/.*|
             ^python/cudf/cudf/tests/data/vocab.txt|
-            .*version-hint\.text$
+            .*version-hint\.text$|
+            ^test/cpp/integration/data/iceberg_conformance/.*\.json$
           )
       - id: mixed-line-ending
       - id: pretty-format-json
         args: [--autofix]
+        # The iceberg conformance corpus is verbatim pyiceberg output, and that is the whole
+        # point of it: the expectations are Apache's, not ours. --autofix re-indents AND sorts
+        # keys, so formatting it would leave the in-tree copy differing from what gen_corpus.py
+        # writes — every regeneration would fail lint, and every lint fix would move the corpus
+        # further from the reference implementation. check-json still validates these files.
+        exclude: '^test/cpp/integration/data/iceberg_conformance/.*\.json$'
       - id: trailing-whitespace
         exclude: 'test/sql/clickbench-sirius\.test'
   - repo: https://github.com/psf/black
