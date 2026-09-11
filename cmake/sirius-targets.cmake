@@ -114,7 +114,8 @@ endforeach()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable
+                      kvikio::kvikio)
 
 # `sirius_extension` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
 # perform a final link. Carry the concrete Rust archive as a transitive
@@ -133,7 +134,8 @@ target_link_options(
   "LINKER:--export-dynamic-symbol=dlopen")
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable
+                      kvikio::kvikio)
 
 # NVTX's runtime injection lookup dlopens the path named by
 # NVTX_INJECTION64_PATH and resolves InitializeInjectionNvtx2 from it. Export

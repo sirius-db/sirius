@@ -198,3 +198,22 @@ add_subdirectory(rust/crates/telemetry/bridge)
 if(SIRIUS_BUILD_S3_TESTS)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/testcontainers_native.cmake")
 endif()
+
+find_package(kvikio REQUIRED CONFIG)
+
+# kvikio::kvikio's interface pulls in BS::thread_pool, whose
+# INTERFACE_COMPILE_FEATURES include `cuda_std_17`. That requirement propagates
+# through sirius_extension into duckdb_static, whose project() scope enables
+# only C/CXX, and CMake then fails to generate with "No known features for CUDA
+# compiler". Sirius only uses kvikIO's host-side API, so drop the CUDA feature
+# from the imported target.
+if(TARGET BS::thread_pool)
+  get_target_property(_bs_thread_pool_features BS::thread_pool
+                      INTERFACE_COMPILE_FEATURES)
+  if(_bs_thread_pool_features)
+    list(REMOVE_ITEM _bs_thread_pool_features cuda_std_17)
+    set_target_properties(
+      BS::thread_pool PROPERTIES INTERFACE_COMPILE_FEATURES
+                                 "${_bs_thread_pool_features}")
+  endif()
+endif()

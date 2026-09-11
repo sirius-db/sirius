@@ -106,6 +106,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_gpu_scan_operator_data.cpp
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
+    src/op/scan/parquet_materialize.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/puffin_reader.cpp
@@ -191,6 +192,8 @@ set(EXTENSION_SOURCES
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
     src/scan_manager/insert_delta_job.cpp
     src/scan_manager/mvcc_mask_job.cpp
+    src/scan_manager/prefetching_scheduler.cpp
+    src/scan_manager/readahead_scan_manager.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
     src/scan_manager/memory_prefetcher.cpp
