@@ -21,7 +21,6 @@
 #include <cudf/io/datasource.hpp>
 
 #include <cuda/stream>
-
 #include <cuda_runtime.h>
 
 #include <unistd.h>
@@ -205,9 +204,7 @@ struct host_buffer {
 struct device_buffer {
   device_buffer() noexcept = default;
 
-  explicit device_buffer(std::uint8_t* dst,
-                         ::cuda::stream_ref stream,
-                         int device_id = -1) noexcept
+  explicit device_buffer(std::uint8_t* dst, ::cuda::stream_ref stream, int device_id = -1) noexcept
     : data(dst), stream(stream), device_id(device_id)
   {
     assert(dst != nullptr);
