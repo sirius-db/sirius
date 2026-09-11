@@ -34,15 +34,37 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <format>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+/// State shared with a downgrade request's predicate. Heap-allocated and captured
+/// by VALUE, not by reference into the requesting frame: the wait is bounded, and
+/// on timeout the request stays queued in the downgrade executor still holding this
+/// predicate. Capturing the caller's locals would leave it dereferencing a dead
+/// stack frame the moment the caller stops waiting.
+struct pending_reservation {
+  std::mutex mutex;
+  std::unique_ptr<cucascade::memory::reservation> reservation;
+  //! Set when the caller has stopped waiting. The predicate then reports satisfied
+  //! so the downgrade executor stops spilling on behalf of a task that has already
+  //! given up, and takes no further reservation -- otherwise it could acquire a
+  //! second one that nobody ever consumes.
+  bool abandoned = false;
+};
+
+
+}  // namespace
 
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
@@ -138,6 +160,13 @@ void gpu_pipeline_executor::manager_loop()
       }
       break;
     }
+    // Bound the OOM retry floor by this space before it is read, not after: the
+    // floor is inherited by every rescheduled task and feeds straight into the
+    // estimate below, so an uncapped inherited value would size this attempt
+    // before the clamp further down ever ran.
+    if (auto* retry_local = dynamic_cast<gpu_pipeline_task_local_state*>(gpu_task->local_state())) {
+      retry_local->set_retry_reservation_floor_cap(_memory_space->get_max_memory());
+    }
     // Pass this executor's memory space so cross-space inputs (host/disk tiers and GPU data on
     // another device, which prepare clones into this space) are counted in the reservation.
     auto reservation_info = gpu_task->get_estimated_reservation_size_info(_memory_space);
@@ -202,9 +231,17 @@ void gpu_pipeline_executor::manager_loop()
           _memory_space != nullptr ? _memory_space->get_device_id() : -1,
           bytes_needs);
       }
-      reservation = _memory_space->make_reservation(bytes_needs);
+      // Deliberately NOT make_reservation() here. That call parks until the space
+      // frees up, but nothing in this thread has asked anyone to free anything, and
+      // the predicate-based downgrade below -- the thing that actually evicts -- was
+      // reachable only when a *partial* reservation came back. A space that returns
+      // null therefore blocked the single manager loop forever: measured on TPC-H
+      // q18/SF3000, 24 tasks sat queued while the only thread still logging was the
+      // occupancy monitor. Fall through with a null reservation instead and let the
+      // downgrade request drive eviction, exactly as the partial case does.
+      if (!_downgrade_executor) { reservation = _memory_space->make_reservation(bytes_needs); }
     }
-    if (!reservation) {
+    if (!reservation && !_downgrade_executor) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
       if (_completion_handler) {
@@ -213,9 +250,10 @@ void gpu_pipeline_executor::manager_loop()
           std::to_string(gpu_task->get_task_id()));
       }
       break;
-    } else if (reservation->size() < bytes_needs && _downgrade_executor) {
-      size_t shortfall    = bytes_needs - reservation->size();
-      size_t partial_size = reservation->size();
+    } else if (_downgrade_executor && (!reservation || reservation->size() < bytes_needs)) {
+      // A null reservation is a shortfall of the whole request, not a missing one.
+      size_t partial_size = reservation ? reservation->size() : 0;
+      size_t shortfall    = bytes_needs - partial_size;
 
       gpu_task->telemetry_handle().downgrading({
         .instance_name              = "",
@@ -254,30 +292,24 @@ void gpu_pipeline_executor::manager_loop()
       auto* mem_space = _memory_space;
       size_t freed    = 0;
 
-      // State shared with the request's predicate. Heap-allocated and captured by
-      // VALUE, not by reference into this frame: the wait below is bounded, and on
-      // timeout the request stays queued in the downgrade executor holding this
-      // predicate. Capturing `&new_reservation` / `&reservation_mutex` (as this did
-      // while the wait was unbounded) would leave the predicate dereferencing a dead
-      // stack frame the moment we stop waiting.
-      struct pending_reservation {
-        std::mutex mutex;
-        std::unique_ptr<cucascade::memory::reservation> reservation;
-        //! Set when the caller has stopped waiting. The predicate then reports
-        //! satisfied so the downgrade executor stops spilling on behalf of a task
-        //! that has already given up, and takes no further reservation — otherwise
-        //! it could acquire a second one that nobody ever consumes.
-        bool abandoned = false;
-      };
       auto pending = std::make_shared<pending_reservation>();
 
       auto downgrade_future =
         _downgrade_executor->request_downgrade([mem_space, bytes_needs, pending]() {
           std::lock_guard<std::mutex> lock(pending->mutex);
-          if (pending->abandoned || pending->reservation) { return true; }
-          auto res = mem_space->make_reservation_or_null(bytes_needs);
-          if (res && res->size() >= bytes_needs) { pending->reservation = std::move(res); }
-          return pending->reservation != nullptr;
+          if (pending->abandoned) { return true; }
+          if (pending->reservation && pending->reservation->size() >= bytes_needs) { return true; }
+          // Release whatever short grant is held before asking again. A reservation
+          // cannot span memory the asker is itself reserving, so holding a partial
+          // would cap every later attempt at its own size.
+          pending->reservation.reset();
+          // upto(), not or_null(): or_null() returned nothing whenever the space was
+          // even slightly short, and destroying that grant handed the memory straight
+          // back. Measured on TPC-H q18/SF3000 this discarded a 3,993,165,728-byte
+          // reservation for being 475,344 bytes (0.012%) shy of the request, 5375
+          // times, so the task saw exactly 0 bytes and the query died at the retry cap.
+          pending->reservation = mem_space->make_reservation_upto(bytes_needs);
+          return pending->reservation && pending->reservation->size() >= bytes_needs;
         });
 
       const auto wait_timeout = _downgrade_executor->config().downgrade_wait_timeout;
@@ -355,7 +387,7 @@ void gpu_pipeline_executor::manager_loop()
           gpu_task->get_pipeline_id(),
           gpu_task->get_task_id());
       }
-    } else if (reservation->size() < bytes_needs) {
+    } else if (reservation && reservation->size() < bytes_needs) {
       // No downgrade executor available -- warn and proceed (this should never happen)
       SIRIUS_LOG_WARN(
         "GPU Pipeline Executor: Acquired memory reservation does not match "

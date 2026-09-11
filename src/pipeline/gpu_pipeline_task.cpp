@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <string_view>
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
@@ -44,6 +45,33 @@
 #include <unordered_set>
 
 namespace sirius {
+
+namespace {
+
+/// Whether an OOM is attributable to the GPU space this task reserves from.
+///
+/// The retry floor raises a GPU reservation, so it may only be driven by a GPU
+/// OOM. The host tier throws a plain rmm::out_of_memory from
+/// fixed_size_host_memory_resource when it runs out of blocks or byte capacity;
+/// that reached the same handler and doubled the GPU reservation instead, which
+/// cannot free a single host block. Measured on TPC-H q18/SF3000 the floor walked
+/// 31.9 -> 63.9 -> 127.8 GB against an 83.3 GiB GPU tier while the shortage was
+/// entirely on the host side.
+///
+/// cucascade_out_of_memory carries the failing space, so it is a GPU OOM. Anything
+/// else is only excluded when it names the host resource: an unattributable device
+/// OOM keeps the previous behaviour rather than silently losing its floor bump.
+bool oom_is_attributable_to_gpu_space(const rmm::out_of_memory& oom)
+{
+  if (dynamic_cast<const cucascade::memory::cucascade_out_of_memory*>(&oom) != nullptr) {
+    return true;
+  }
+  constexpr std::string_view kHostResource = "fixed_size_host_memory_resource";
+  return std::string_view{oom.what()}.find(kHostResource) == std::string_view::npos;
+}
+
+}  // namespace
+
 namespace pipeline {
 
 namespace {
@@ -453,8 +481,19 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
       size_t reservation_bytes =
         _local_state->cast<gpu_pipeline_task_local_state>().get_reservation_bytes();
       auto const live_allocated_bytes = _allocator ? _allocator->get_allocated_bytes(stream) : 0;
-      local_state.update_retry_reservation_floor_after_oom(
-        reservation_bytes, live_allocated_bytes, retry_requested_bytes);
+      const bool gpu_attributable = oom_is_attributable_to_gpu_space(oom);
+      if (gpu_attributable) {
+        local_state.update_retry_reservation_floor_after_oom(
+          reservation_bytes, live_allocated_bytes, retry_requested_bytes);
+      } else {
+        SIRIUS_LOG_WARN(
+          "Pipeline {}: OOM at operator {} came from a non-GPU tier, so the GPU retry floor is "
+          "left at {} bytes -- reserving more device memory cannot relieve it: {}",
+          pipeline->get_pipeline_id(),
+          op.get_name(),
+          local_state.get_retry_reservation_floor(),
+          oom.what());
+      }
       SIRIUS_LOG_WARN(
         "Pipeline {}: OOM at operator {} (id={}, index {}/{}), "
         "requested {} bytes ({:.2f} MB), global usage {} bytes ({:.2f} MB), "
@@ -643,8 +682,17 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       retry_requested_bytes = cc_oom->requested_bytes;
     }
     auto const live_allocated_bytes = allocator->get_allocated_bytes(stream);
-    local_state.update_retry_reservation_floor_after_oom(
-      reservation_bytes, live_allocated_bytes, retry_requested_bytes);
+    if (oom_is_attributable_to_gpu_space(oom)) {
+      local_state.update_retry_reservation_floor_after_oom(
+        reservation_bytes, live_allocated_bytes, retry_requested_bytes);
+    } else {
+      SIRIUS_LOG_WARN(
+        "Pipeline {}: OOM preparing batches came from a non-GPU tier, so the GPU retry floor is "
+        "left at {} bytes: {}",
+        pipeline->get_pipeline_id(),
+        local_state.get_retry_reservation_floor(),
+        oom.what());
+    }
     const auto& res_info      = local_state.get_reservation_size_info();
     auto bytes_to_materialize = res_info->bytes_to_materialize_input;
     auto input_basis          = res_info->input_basis;
