@@ -37,7 +37,8 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::PASSTHROUGH_SINK;
 
-  //! @param types       Output schema; identical to the arm's own schema.
+  //! @param types       Output schema: the union's, since a materialized CTE arm declares its
+  //!                    materialization side rather than what it emits.
   //! @param port_label  The downstream port this arm feeds, `sirius_physical_union::port_label(i)`.
   explicit sirius_physical_passthrough_sink(duckdb::vector<sirius::logical_type> types,
                                             std::size_t estimated_cardinality,

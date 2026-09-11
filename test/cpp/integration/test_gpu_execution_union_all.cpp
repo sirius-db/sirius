@@ -242,3 +242,51 @@ TEST_CASE_METHOD(UnionAllFixture,
   expect_plan_fallback_matches_cpu("SELECT k FROM ua EXCEPT SELECT k FROM ub");
   expect_plan_fallback_matches_cpu("SELECT k FROM ua INTERSECT SELECT k FROM ub");
 }
+
+TEST_CASE_METHOD(UnionAllFixture,
+                 "gpu_execution UNION ALL over a materialized CTE arm",
+                 "[integration][gpu_execution][union_all]")
+{
+  // Regression for the arity guard in sirius_plan_set_operation.cpp, which used to read the arm's
+  // *physical* width. A materialized CTE declares its materialization side, so an arm whose
+  // definition and body differ in width was declined to the CPU.
+  //
+  // Two traps when reshaping these. The CTE must stay MATERIALIZED, or a single-reference one is
+  // inlined away and no CTE node reaches the planner. And the definition's width must be forced
+  // apart from the body's: DuckDB's unused-column optimizer prunes the materialization down to
+  // what the body reads, so a body that merely projects a subset leaves the two equal and tests
+  // nothing.
+
+  // Definition wider, 2 against 1. The self-join on v is what keeps v from being pruned.
+  compare_gpu_vs_cpu(
+    "SELECT k FROM ua "
+    "UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT k, v FROM ub) "
+    " SELECT m1.k FROM m m1 JOIN m m2 ON m1.v = m2.v)");
+
+  // Definition narrower, 1 against 2; the body widens with arithmetic. Direction does not matter.
+  compare_gpu_vs_cpu(
+    "SELECT k, k * 2 FROM ua "
+    "UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT k FROM ub) SELECT k, k * 2 FROM m)");
+
+  // Widths coincide at 2, so this passed before the fix too. Kept so the guard cannot regress into
+  // rejecting it.
+  compare_gpu_vs_cpu(
+    "SELECT k, v FROM ua "
+    "UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT k, v FROM ub) SELECT k, v FROM m)");
+
+  // The CTE as arm 0, mirroring the "arm order reversed" case above: arm position must not matter.
+  compare_gpu_vs_cpu(
+    "(WITH m AS MATERIALIZED (SELECT k FROM ub) SELECT k, k * 2 FROM m) "
+    "UNION ALL "
+    "SELECT k, k * 2 FROM ua");
+
+  // Control: written above the union, the CTE is its parent and never reaches the guard.
+  compare_gpu_vs_cpu(
+    "WITH m AS MATERIALIZED (SELECT k, v FROM ub) "
+    "SELECT k FROM ua "
+    "UNION ALL "
+    "SELECT k FROM m");
+}

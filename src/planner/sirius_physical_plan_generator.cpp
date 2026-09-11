@@ -646,14 +646,15 @@ void wrap_union_child(sirius::op::sirius_physical_operator& union_op, std::size_
   D_ASSERT(union_op.type == sirius::op::SiriusPhysicalOperatorType::UNION);
   wrap_child(
     union_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
-      // Capture types/cardinality before the child is moved into the sink.
-      auto child_types    = child_orig->types;
+      // Capture cardinality before the child is moved into the sink.
       auto est_card       = child_orig->estimated_cardinality;
       auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
                                                                  : std::vector<cudf::data_type>{};
 
+      // The union's schema, not the arm's: the binder has already cast every arm to it, and a
+      // materialized CTE's own `types` are its materialization side rather than what it emits.
       auto sink = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
-        std::move(child_types), est_card, sirius::op::sirius_physical_union::port_label(child_idx));
+        union_op.types, est_card, sirius::op::sirius_physical_union::port_label(child_idx));
       // Expected to be empty: the compressed-schema pass treats UNION as a native boundary and
       // restores every arm before this runs. Carried anyway so the sink never silently declares a
       // different carrier than the batches flowing through it, mirroring wrap_join_child.
