@@ -1,2 +1,6 @@
 target/
 .pixi/
+.cn1/
+.cn2/
+.cn*/
+sirius-cn-*/
