@@ -1119,6 +1119,59 @@ TEMPLATE_TEST_CASE("evaluate projects references, constants, and comparisons",
   }
 }
 
+TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
+                   "[expression_evaluator][scalar_cast]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const hugeint = logical_type::make(type_id::HUGEINT);
+  auto const bigint  = logical_type::make(type_id::BIGINT);
+  auto const integer = logical_type::make(type_id::INTEGER);
+
+  for (auto const row_count : {0, 1, 7}) {
+    CAPTURE(row_count);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                row_count,
+                                                cudf::mask_state::UNALLOCATED,
+                                                cudf::get_default_stream(),
+                                                get_resource_ref(*space)));
+    auto input = std::make_unique<cudf::table>(std::move(columns));
+
+    std::vector<std::unique_ptr<ast_node>> nodes;
+    nodes.push_back(make_cast(make_int_const(-42), hugeint, false));
+    // The outer AST cast consumes the materialized HUGEINT cast as a temporary column.
+    nodes.push_back(make_cast(make_cast(make_int_const(1), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_null_const(integer), hugeint, false));
+    nodes.push_back(make_cast(make_cast(make_null_const(integer), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_int_const(42), logical_type::make(type_id::DOUBLE), false));
+    std::vector<ast_node const*> expressions;
+    for (auto const& node : nodes) {
+      expressions.push_back(node.get());
+    }
+    exp_executor executor(
+      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
+    auto output     = executor.evaluate(input->view());
+    auto const view = output->view();
+    REQUIRE(view.num_rows() == row_count);
+    REQUIRE(view.num_columns() == 5);
+    for (int i = 0; i < 4; ++i) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
+    }
+    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
+    REQUIRE(view.column(0).null_count() == 0);
+    REQUIRE(view.column(1).null_count() == 0);
+    REQUIRE(view.column(2).null_count() == row_count);
+    REQUIRE(view.column(3).null_count() == row_count);
+    REQUIRE(view.column(4).type() == cudf::data_type{cudf::type_id::FLOAT64});
+    REQUIRE(copy_column_to_host<double>(view.column(4)) == std::vector<double>(row_count, 42.0));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // select() — basic filter + edge cases
 // ---------------------------------------------------------------------------
