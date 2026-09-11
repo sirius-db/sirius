@@ -16,11 +16,10 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/mvcc_chunk_mask.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <atomic>
 #include <cstddef>
@@ -65,7 +64,7 @@ namespace sirius::scan_manager {
  *         fewer than tasks.size() tasks ran (dispatcher stopped mid-fan-out).
  */
 void fan_out_and_join(exec::scoped_dispatcher& dispatcher,
-                      std::vector<absl::AnyInvocable<void()>> tasks,
+                      std::vector<sirius::exec::invocable<void()>> tasks,
                       std::string_view label);
 
 /**
@@ -123,7 +122,7 @@ struct mvcc_mask_work {
 struct mvcc_mask_workset {
   std::vector<op::scan::mvcc_visibility_plan> plans;
   std::vector<std::unique_ptr<mvcc_mask_work>> works;
-  std::vector<absl::AnyInvocable<void()>> fill_tasks;
+  std::vector<sirius::exec::invocable<void()>> fill_tasks;
 };
 
 /**

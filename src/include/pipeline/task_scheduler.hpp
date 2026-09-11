@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "event/query_event_publisher.hpp"
 #include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/multi_index_priority_queue.hpp"
@@ -122,6 +123,19 @@ class task_scheduler {
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
 
+  /// Attach the query-event observer, sharing ownership of it so the handle is
+  /// neither null nor dangling for as long as this scheduler can report.  Until
+  /// this is called the scheduler reports into its own private publisher, which
+  /// has no subscribers and so is a no-op.
+  void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+  {
+    _query_event_publisher = publisher.shared_from_this();
+    // The executors report memory downgrades into the same observer.
+    for (auto& [_, executor] : _gpu_executors) {
+      if (executor) { executor->set_query_event_publisher(publisher); }
+    }
+  }
+
   /**
    * @brief Get a pointer to the pipeline-level task queue.
    */
@@ -219,6 +233,10 @@ class task_scheduler {
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
 
   sirius::creator::task_creator* _task_creator{nullptr};
+  /// Observer of query event transitions.  Never null; see task_creator for
+  /// why it is seeded rather than left empty.
+  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
+    std::make_shared<sirius::event::query_event_publisher>()};
   std::unique_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
