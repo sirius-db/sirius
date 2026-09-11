@@ -179,7 +179,15 @@ void describe_chunks(hpln_source& src,
     }
     if (i == 0) {
       out_schema = schema;
-    } else if (!same_schema(out_schema, schema)) {
+    } else if (same_schema(out_schema, schema)) {
+      // Nullability is per chunk and same_schema deliberately ignores it: a column with nulls in
+      // only some chunks is one nullable column, not a schema disagreement. OR it in, so a caller
+      // that sees "no nulls" can rely on it for the whole file rather than for chunk 0.
+      for (std::size_t c = 0; c < out_schema.columns.size(); ++c) {
+        out_schema.columns[c].has_nulls |= schema.columns[c].has_nulls;
+        out_schema.columns[c].null_count += schema.columns[c].null_count;
+      }
+    } else {
       throw std::runtime_error("[hpln] '" + path + "' chunk " + std::to_string(i) +
                                " has a different schema from chunk 0; a file's chunks must all "
                                "describe the same table");
@@ -615,6 +623,12 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
     auto const& c = header_schema.columns[i];
     out.names.push_back(c.name.empty() ? "column" + std::to_string(i) : c.name);
     out.physical_types.push_back(simpatico::tag_to_dtype(c.dtype_tag));
+    out.column_has_nulls.push_back(c.has_nulls);
+    // The column headers and the zone-map segment are written together but are separate records,
+    // and only the headers are authoritative about nulls. If they disagree, believe the headers:
+    // an arena that claims a nullable column has no nulls would let a group holding a NULL be
+    // pruned by a predicate the NULL cannot satisfy, and the row would silently disappear.
+    if (c.has_nulls) { out.group_bounds.mark_column_nullable(i); }
     if (i < declared.size() && declared[i].id() != duckdb::LogicalTypeId::SQLNULL) {
       out.types.push_back(declared[i]);
     } else {
