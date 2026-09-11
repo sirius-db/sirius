@@ -620,6 +620,18 @@ duckdb::LogicalType type_of(type_tag tag, std::uint8_t width, std::uint8_t scale
   }
 }
 
+/// Re-attach @p scale to a fixed-point @p dtype. A non-decimal type carries no scale and is
+/// returned unchanged, so this is safe to apply to every column.
+cudf::data_type dtype_with_scale(cudf::data_type dtype, std::int32_t scale)
+{
+  switch (dtype.id()) {
+    case cudf::type_id::DECIMAL32:
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128: return cudf::data_type{dtype.id(), scale};
+    default: return dtype;
+  }
+}
+
 /// cuDF physical type -> the closest DuckDB type, for files with no `logical_types` segment.
 /// Deliberately approximate: DECIMAL precision is set to the carrier's maximum because cuDF does
 /// not record the declared one, which is the loss the logical_types segment exists to prevent.
@@ -774,7 +786,11 @@ hpln_bind_schema read_hpln_schema(std::string const& path, hpln_open_options con
   for (std::size_t i = 0; i < header_schema.columns.size(); ++i) {
     auto const& c = header_schema.columns[i];
     out.names.push_back(c.name.empty() ? "column" + std::to_string(i) : c.name);
-    out.physical_types.push_back(simpatico::tag_to_dtype(c.dtype_tag));
+    // The tag alone does not carry a fixed-point column's scale -- the header stores it beside the
+    // tag, and the decode rebuilds the column as `{id, scale}`. Reproduce that here: a carrier
+    // that says DECIMAL64 scale 0 where the decode produces DECIMAL64 scale -2 is a different
+    // cudf::data_type, and the plan generator's carrier check rejects the column outright.
+    out.physical_types.push_back(dtype_with_scale(simpatico::tag_to_dtype(c.dtype_tag), c.scale));
     out.column_has_nulls.push_back(c.has_nulls);
     // The column headers and the zone-map segment are written together but are separate records,
     // and only the headers are authoritative about nulls. If they disagree, believe the headers:
