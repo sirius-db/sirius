@@ -143,6 +143,13 @@ void task_creator::set_task_scheduler(sirius::pipeline::task_scheduler& task_sch
   _task_scheduler = &task_scheduler;
 }
 
+void task_creator::publish_pipeline_closure(sirius::query_id_t query_id,
+                                            std::size_t pipeline_id,
+                                            std::size_t source_operator_id) noexcept
+{
+  _query_event_publisher->publish_pipeline_closed(query_id, pipeline_id, source_operator_id);
+}
+
 void task_creator::prepare_for_query(const sirius::planner::query& query,
                                      std::shared_ptr<pipeline::completion_handler> handler)
 {
@@ -218,7 +225,7 @@ task_creator::compute_pipeline_priorities(const sirius::planner::query& query) c
   //     the branches that reach it, so it runs as soon as its earliest-needed branch wants it.
   std::unordered_map<const pipeline::sirius_pipeline*, exec::queue_priority> priorities;
 
-  auto options  = planner::build_index_options{.branch_order = planner::build_probe{}};
+  auto options  = planner::build_index_options{.branch_order = planner::barrier_order{}};
   auto index    = planner::query_index::build_index(query, options);
   auto branches = index->get_branches();
   if (branches.empty()) { return priorities; }
@@ -329,15 +336,16 @@ void task_creator::reset_all()
   }
 }
 
-op::sirius_physical_operator* task_creator::get_operator_for_next_task(
+next_task_result task_creator::get_operator_for_next_task(
   op::sirius_physical_operator* node,
   std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
 {
-  if (node == nullptr) { return nullptr; }
+  // The only case with nobody to blame: there was no operator to ask.
+  if (node == nullptr) { return {nullptr, next_task_state::depleted}; }
   if (auto pipeline = node->get_pipeline()) { visited_pipelines.push_back(std::move(pipeline)); }
 
   auto hint = node->get_next_task_hint();
-  if (!hint.has_value()) { return nullptr; }
+  if (!hint.has_value()) { return {node, next_task_state::depleted}; }
 
   if (hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
@@ -345,11 +353,19 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
-    return hint.value().producer;
-  } else if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer, visited_pipelines);
+    return {hint.value().producer, next_task_state::ready};
   }
-  return nullptr;
+
+  if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+    auto const deeper = get_operator_for_next_task(hint.value().producer, visited_pipelines);
+    // A null producer means the chain ran out below us, so this node is the last
+    // one that was actually asked -- keep it rather than propagating the null,
+    // or the failure loses its subject on the way back up.
+    if (deeper.op == nullptr) { return {node, next_task_state::depleted}; }
+    return deeper;
+  }
+
+  return {node, next_task_state::depleted};
 }
 
 void task_creator::stop()
@@ -512,7 +528,7 @@ void task_creator::manager_loop()
   while (_running.load()) {
     auto slot = _bounded_pool->reserve();  // block till a thread is available
     if (!slot) {
-      SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping manager loop");
+      SIRIUS_LOG_INFO("Task Creator: pool interrupted, stopping publisher loop");
       break;
     }
     auto request = _task_creation_queue.pop();
@@ -538,9 +554,10 @@ void task_creator::manager_loop()
     }
 
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
-    node = get_operator_for_next_task(node, visited_pipelines);
+    auto* requested_node = node;
+    auto const next      = get_operator_for_next_task(node, visited_pipelines);
 
-    if (node == nullptr) {
+    if (next.state != next_task_state::ready) {
       // Same re-evaluation the creation path does on exit: get_next_task_hint()
       // can have drained ports (hash join's discard sweep) in ANY pipeline the
       // hint walk visited, making it finishable. A visited upstream pipeline
@@ -552,15 +569,32 @@ void task_creator::manager_loop()
       for (auto& visited : visited_pipelines) {
         visited->update_pipeline_status(false);
       }
+
+      // Report both ends of the walk: the operator the request named, and the
+      // one that actually could not produce.  They differ whenever the walk
+      // descended through operators waiting on input, and it is the latter that
+      // says where the pipeline is actually stuck.
+      //
+      // Observation only, so an unnumbered operator is reported as the sentinel
+      // rather than throwing out of the publisher loop.
+      auto const id_of = [](op::sirius_physical_operator const* op) {
+        return op != nullptr && op->has_operator_id()
+                 ? op->get_operator_id()
+                 : op::sirius_physical_operator::invalid_operator_id;
+      };
+      _query_event_publisher->publish_failed_to_create_task(
+        query_id, id_of(requested_node), id_of(next.op != nullptr ? next.op : requested_node));
       continue;
     }
+    node = next.op;
 
     // Counted before dispatch so drain_pending_tasks(query_id) cannot observe zero in-flight
     // while this task creation is still queued to run.
     query_state->enter_in_flight();
     // Dispatch the task creation work to the pool
     _bounded_pool->dispatch(
-      std::move(slot), [this, node, request_kind, query_state = std::move(query_state)]() mutable {
+      std::move(slot),
+      [this, node, request_kind, query_id, query_state = std::move(query_state)]() mutable {
         // Released on every exit path, including the catch below, so a throwing creation can
         // never strand drain_pending_tasks() waiting forever.
         struct in_flight_guard {
@@ -762,6 +796,8 @@ void task_creator::manager_loop()
                                                             std::move(local_state),
                                                             gpu_pipeline_task_global_state);
             task_lock.unlock();
+            _query_event_publisher->publish_task_created(
+              query_id, operator_id, node->type, gpu_pipeline_task_global_state->get_priority());
             _task_scheduler->schedule(std::move(task));
 
             if (request_kind == request_type::lookahead) { break; }
