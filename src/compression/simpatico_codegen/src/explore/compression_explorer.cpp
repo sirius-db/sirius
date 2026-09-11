@@ -705,8 +705,13 @@ exploration_result explore_column_compression(cudf::column_view input,
   for (auto& c2 : beam)
     if (c2) add_finalist(c2->dsl, c2->compression_ratio, c2->total_leaf_bytes, c2->decode_cost);
   if (!best_dsl.empty()) add_finalist(best_dsl, best_ratio, best_leaf_bytes, 0.0);
-  if (best_ratio <= 1.0 || config.rerank_mode == score_mode::Pareto)
-    add_finalist("input -> identity", 1.0, original_size, 0.0);
+  // Identity is ALWAYS a candidate. It is the plan every other plan has to beat:
+  // storing the column as-is costs nothing to encode or decode and is exactly
+  // 1.0x, so any plan that measures 1.0x (zigzag, delta, a bare str_split -- all
+  // pure transforms with no entropy coding) is strictly worse than doing nothing.
+  // Gating identity on `best_ratio <= 1.0` hid it precisely when a transform had
+  // tied it on ratio but lost on throughput.
+  add_finalist("input -> identity", 1.0, original_size, 0.0);
   std::sort(finalists.begin(), finalists.end(), [](auto const& a, auto const& b) {
     return a.compression_ratio > b.compression_ratio;
   });
@@ -894,6 +899,26 @@ exploration_result explore_column_compression(cudf::column_view input,
       return std::any_of(
         finalists.begin(), finalists.end(), [&](auto const& f) { return f.plan_dsl == dsl; });
     };
+
+    // Time the finalists themselves before ranking them. add_finalist() records
+    // throughput as 0.0 because the beam never times its candidates, and
+    // weighted_score multiplies by throughput -- so every plan the beam actually
+    // found scored ~0 and could never win, leaving the winner to be whichever
+    // *neighbour* happened to be measured. That is how a 1.00x transform beat a
+    // compressing plan on a real q18/SF3000 column. It also made the sort below a
+    // no-op, since every seed scored the same ~0.
+    for (auto& f : finalists) {
+      if (f.compress_throughput_gbps > 0.0 || f.decompress_throughput_gbps > 0.0) { continue; }
+      ranked_candidate timed;
+      try {
+        if (measure_dsl(f.plan_dsl, timed)) {
+          f.compress_throughput_gbps   = timed.compress_throughput_gbps;
+          f.decompress_throughput_gbps = timed.decompress_throughput_gbps;
+        }
+      } catch (std::exception const&) {
+        // Leave it untimed; it simply cannot win against a timed candidate.
+      }
+    }
 
     // Refine best-scoring seeds first so the measurement budget goes where it counts.
     auto seeds = finalists;

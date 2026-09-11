@@ -35,7 +35,14 @@ struct exploration_config {
   bool verbose      = false;
 
   score_mode rerank_mode   = score_mode::Weighted;
-  double rerank_weights[3] = {1.0, 1.0, 1.0};  ///< (ratio, comp, decomp) exponents
+  /// (ratio, comp, decomp) exponents. The score is a product, so ranking is a
+  /// weighted sum of logs: absolute magnitudes cancel and only these exponents
+  /// decide how a relative gain in ratio trades against a relative loss in
+  /// throughput. At {1,1,1} a plan had to be as fast as it was compressive, which
+  /// let pure transforms (zigzag, delta) that compress 1.00x beat plans that
+  /// actually compress. Ratio is what a spill cares about -- the encode is under
+  /// 3% of the spill path, while the bytes written decide whether the tier fills.
+  double rerank_weights[3] = {2.0, 1.0, 1.0};  ///< (ratio, comp, decomp) exponents
   size_t rerank_top        = 8;                ///< finalists to time (selected by ratio)
   size_t simplicity_slots  = 4;  ///< top-N finalists injected per step-count depth level
 
