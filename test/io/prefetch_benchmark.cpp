@@ -133,7 +133,7 @@ void run_baseline(std::vector<file_info>& files,
   for (std::size_t k = 0; k < files.size(); ++k) {
     disp.enqueue([k, &files, &streams, &total_rows, &done] {
       auto stream = streams.acquire_stream(acquire_pol::GROW);
-      auto tbl    = parse_parquet(*files[k].ds, stream);
+      auto tbl    = parse_parquet(*files[k].ds, stream.get());
       total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()), std::memory_order_relaxed);
       done.count_down();
     });
@@ -194,7 +194,7 @@ void run_prefetch(std::vector<file_info>& files,
         }
         disp.enqueue([k, &files, &streams, &total_rows, &done] {
           auto stream = streams.acquire_stream(acquire_pol::GROW);
-          auto tbl    = parse_parquet(*files[k].ds, stream);
+          auto tbl    = parse_parquet(*files[k].ds, stream.get());
           total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()),
                                std::memory_order_relaxed);
           done.count_down();
