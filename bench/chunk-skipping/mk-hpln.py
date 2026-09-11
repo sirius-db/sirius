@@ -58,12 +58,78 @@ def resolve_files(parquet_dir, table):
     return sorted(set(candidates), key=key)
 
 
+def parse_bytes(text):
+    units = {"KB": 10**3, "MB": 10**6, "GB": 10**9, "K": 2**10, "M": 2**20, "G": 2**30}
+    t = text.strip().upper()
+    for suffix, mult in sorted(units.items(), key=lambda kv: -len(kv[0])):
+        if t.endswith(suffix):
+            return int(float(t[: -len(suffix)]) * mult)
+    return int(t)
+
+
+def decoded_bytes_per_row(con, source):
+    """Average cuDF footprint of one row of `source`.
+
+    Decoded, not compressed, because that is what the batch budget counts: a scan's coalescer
+    caps a batch at `approximate_batch_size` of "total decoded bytes"
+    (duckdb_native_batch_coalescer.hpp). A chunk is what a pinned .hpln serves as one batch, so
+    sizing chunks in decoded bytes is what makes a .hpln pin's batches the same size as a parquet
+    pin's at the same scan_task_batch_size.
+
+    Fixed-width columns are exact. A VARCHAR is its average byte length -- octet_length over a
+    BLOB cast, since DuckDB's length() counts characters -- plus the 4-byte offset cuDF carries
+    per row, sampled rather than scanned: the estimate only has to be right to within a factor,
+    and a full pass over lineitem to size a chunk would cost more than it saves.
+    """
+    fixed = {
+        "BOOLEAN": 1, "TINYINT": 1, "SMALLINT": 2, "INTEGER": 4, "BIGINT": 8,
+        "UTINYINT": 1, "USMALLINT": 2, "UINTEGER": 4, "UBIGINT": 8,
+        "FLOAT": 4, "DOUBLE": 8, "DATE": 4, "TIME": 8,
+        "TIMESTAMP": 8, "TIMESTAMP WITH TIME ZONE": 8,
+    }
+    schema = con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
+    total, varchars = 0, []
+    for name, dtype, *_ in schema:
+        base = dtype.split("(")[0].strip()
+        if base == "DECIMAL":
+            precision = int(dtype[dtype.index("(") + 1: dtype.index(",")])
+            total += 4 if precision <= 9 else (8 if precision <= 18 else 16)
+        elif base in ("VARCHAR", "BLOB"):
+            total += 4  # cuDF's per-row offset
+            varchars.append(name)
+        elif base in fixed:
+            total += fixed[base]
+        else:
+            total += 8  # unknown: assume a 64-bit carrier rather than refuse
+    if varchars:
+        avg = ", ".join(f"avg(octet_length(CAST({c} AS BLOB)))" for c in varchars)
+        row = con.execute(
+            f"SELECT {avg} FROM {source} USING SAMPLE 100000 ROWS"
+        ).fetchone()
+        total += sum(float(v or 0) for v in row)
+    return max(1.0, total)
+
+
+def chunk_rows_for(bytes_per_row, chunk_bytes):
+    """Rows whose decoded footprint is about `chunk_bytes`."""
+    return max(1, int(chunk_bytes / bytes_per_row))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="TPC-H parquet directory")
     ap.add_argument("--output", required=True, help="directory to write <table>.hpln into")
     ap.add_argument("--tables", default=",".join(TABLES))
     ap.add_argument("--chunk-rows", type=int, default=1 << 20)
+    ap.add_argument(
+        "--chunk-bytes",
+        type=str,
+        default=None,
+        help="target DECODED bytes per chunk (e.g. 2GB); overrides --chunk-rows per table. "
+        "A chunk is what a pinned entry serves as one batch, so this is the knob that makes a "
+        "pinned .hpln batch like a parquet pin's scan_task_batch_size rather than 573 times "
+        "smaller",
+    )
     ap.add_argument("--group-rows", type=int, default=8192)
     ap.add_argument(
         "--plan-dir",
@@ -101,18 +167,24 @@ def main():
         file_list = ",".join(f"'{f}'" for f in files)
         out = os.path.join(args.output, f"{table}.hpln")
 
+        chunk_rows = args.chunk_rows
+        bytes_per_row = None
+        if args.chunk_bytes:
+            bytes_per_row = decoded_bytes_per_row(con, f"read_parquet([{file_list}])")
+            chunk_rows = chunk_rows_for(bytes_per_row, parse_bytes(args.chunk_bytes))
+
         order = ""
         key = SORT_KEYS.get(table)
         if args.sort == "global" and key:
             order = f" ORDER BY {key}"
         select = f"SELECT * FROM read_parquet([{file_list}]){order}"
         opts = (
-            f"FORMAT simpatico, chunk_rows {args.chunk_rows}, "
+            f"FORMAT simpatico, chunk_rows {chunk_rows}, "
             f"group_rows {args.group_rows}, plan_table '{table}'"
         )
         has_plan = os.path.exists(os.path.join(args.plan_dir, f"{table}.txt"))
         if not has_plan:
-            opts = f"FORMAT simpatico, chunk_rows {args.chunk_rows}, group_rows {args.group_rows}"
+            opts = f"FORMAT simpatico, chunk_rows {chunk_rows}, group_rows {args.group_rows}"
 
         print(
             f"== {table}: {len(files)} parquet file(s), {parquet_bytes/1e9:.2f} GB"
@@ -127,17 +199,19 @@ def main():
         rows = con.execute(f"SELECT count(*) FROM read_simpatico('{out}')").fetchone()[0]
         print(
             f"   -> {hpln_bytes/1e9:.2f} GB ({parquet_bytes/hpln_bytes:.2f}x parquet), "
-            f"{rows} rows, {elapsed:.1f} s",
+            f"{rows} rows, {elapsed:.1f} s, "
+            f"{max(1, -(-rows // chunk_rows))} chunk(s) of {chunk_rows} rows"
+            + (f" (~{bytes_per_row * chunk_rows / 1e9:.2f} GB decoded)" if bytes_per_row else ""),
             flush=True,
         )
         report.append(
-            dict(table=table, rows=rows, seconds=round(elapsed, 2),
+            dict(table=table, rows=rows, chunk_rows=chunk_rows, seconds=round(elapsed, 2),
                  parquet_bytes=parquet_bytes, hpln_bytes=hpln_bytes,
                  sort_key=key if order else None, plan=has_plan)
         )
 
     with open(os.path.join(args.output, "mk-hpln.json"), "w") as fh:
-        json.dump(dict(input=args.input, chunk_rows=args.chunk_rows,
+        json.dump(dict(input=args.input, chunk_bytes=args.chunk_bytes,
                        group_rows=args.group_rows, sort=args.sort, tables=report), fh, indent=2)
     total_p = sum(r["parquet_bytes"] for r in report)
     total_h = sum(r["hpln_bytes"] for r in report)
