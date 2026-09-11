@@ -6,3 +6,4 @@ sirius:
       usage_limit_bytes: 256MiB
     host:
       capacity_bytes: 256MiB
+      initial_number_pools: 1

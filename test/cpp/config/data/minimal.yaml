@@ -6,8 +6,8 @@ sirius:
       usage_limit_fraction: 0.25
     host:
       capacity_bytes: 160000000
+      initial_number_pools: 1
     disk:
-      disk_id: 0
       capacity_bytes: 1000000000
       downgrade_root_dirs: "/tmp/sirius_disk_memory"
   executor:

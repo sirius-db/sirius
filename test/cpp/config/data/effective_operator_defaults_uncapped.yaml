@@ -6,3 +6,4 @@ sirius:
       reservation_limit_fraction: 1.0
     host:
       capacity_bytes: 256MiB
+      initial_number_pools: 1
