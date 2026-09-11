@@ -176,6 +176,47 @@ class hpln_metadata final : public sirius::io::sirius_io_object_metadata {
 [[nodiscard]] std::shared_ptr<hpln_bind_schema const> read_hpln_schema_shared(
   std::string const& path, hpln_open_options const& options = {});
 
+/// Write a .hpln one chunk at a time: compress, capture bounds, emit, forget.
+///
+/// @ref write_tables_to_hpln compresses every chunk before it writes anything, so a file costs its
+/// whole compressed size in GPU memory at once -- and the `COPY ... (FORMAT simpatico)` that feeds
+/// it holds the UNCOMPRESSED chunks until finalize, which at TPC-H SF1000 lineitem is ~780 GB of a
+/// 256 GB device. That is the reason SF1000 was unreachable as a .hpln at all.
+///
+/// Here the caller hands over one decoded chunk at a time and may free it as soon as @ref append
+/// returns: the chunk is compressed, its zone maps are captured from the decoded values, its
+/// payload is written, and only its header bytes and its bounds are retained. Peak device memory
+/// is one chunk rather than one table.
+///
+/// Construct, @ref append in chunk order, then @ref finish exactly once.
+class hpln_table_writer {
+ public:
+  hpln_table_writer(std::string path,
+                    duckdb::vector<duckdb::LogicalType> column_types,
+                    std::vector<std::string> column_names,
+                    std::string plan_dsl,
+                    std::size_t group_rows);
+  ~hpln_table_writer();
+
+  hpln_table_writer(hpln_table_writer const&)            = delete;
+  hpln_table_writer& operator=(hpln_table_writer const&) = delete;
+
+  /// Compress @p table, capture its per-group bounds and write its payload. Empty on success.
+  std::string append(cudf::table_view const& table,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr);
+
+  /// Emit the metadata regions: the headers, the directory, the engine's logical types, every
+  /// chunk's zone maps, the checksums and the trailer. Empty on success.
+  std::string finish();
+
+  [[nodiscard]] std::size_t chunks_written() const noexcept;
+
+ private:
+  struct impl;
+  std::unique_ptr<impl> _impl;
+};
+
 /// Pack @p types into the bytes a `logical_types` segment carries, and back.
 ///
 /// Positional with the header's columns. Only the types Sirius can pin are representable; an
