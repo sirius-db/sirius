@@ -300,7 +300,7 @@ void run_baseline(std::vector<file_info>& files,
     // `files` outlives every task — done.wait() below joins them all.
     disp.enqueue([&fi, &streams, &total_rows, &done] {
       auto stream = streams.acquire_stream(acquire_pol::GROW);
-      auto tbl    = parse_parquet(*fi.ds, stream);
+      auto tbl    = parse_parquet(*fi.ds, stream.get());
       total_rows.fetch_add(static_cast<std::size_t>(tbl->num_rows()), std::memory_order_relaxed);
       done.count_down();
     });
@@ -443,7 +443,7 @@ std::unique_ptr<cudf::table> columnar_parquet_parser(
         // opts selects exactly one column, so the table has exactly one.  Drain
         // the stream before releasing it: the column outlives this task (and
         // this task's buffers), and the caller assembles it on another thread.
-        cudaStreamSynchronize(stream.get().value());
+        stream.get().sync();
         auto released = result.tbl->release();
         cols[i]       = std::move(released.front());
         done.count_down();

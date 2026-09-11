@@ -19,7 +19,6 @@
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 
 #include <cuda/stream>
-
 #include <cuda_runtime.h>
 
 #include <cstddef>

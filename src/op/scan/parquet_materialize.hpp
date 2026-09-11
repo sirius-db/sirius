@@ -33,8 +33,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <cuda/stream>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <memory>
 #include <span>
