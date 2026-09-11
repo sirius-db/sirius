@@ -247,11 +247,18 @@ class hpln_table_writer {
 /// this many ranged reads and nothing else -- no chunk outside @p chunk_ids is touched. Throws
 /// std::runtime_error if the file is unreadable or an id is out of range; a scan that decoded a
 /// neighbouring chunk instead would return plausible rows from the wrong place.
+///
+/// @p columns, when non-empty, narrows every chunk to those FILE columns (strictly ascending):
+/// each chunk's header is rebuilt to describe exactly them and only their payload bytes are read,
+/// so the result is an ordinary chunk that HAS only those columns rather than a wide chunk behind
+/// a narrow description. Payload checksums are not verified for such a read -- the recorded CRC
+/// covers the whole chunk.
 [[nodiscard]] std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
   std::span<const std::size_t> chunk_ids,
-  hpln_open_options const& options = {});
+  hpln_open_options const& options       = {},
+  std::span<const std::size_t> columns   = {});
 
 /// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
 ///
