@@ -86,9 +86,10 @@ bool no_gpu()
 
 /// Turn the experimental gate on, and refuse to run if it did not take.
 ///
-/// The knob is read once per process and cached, so a test that merely sets it can be running
-/// against a value some earlier test already froze -- and would then pass through the OLD path,
-/// proving nothing. Asserting it is on is what makes every case below about the feature.
+/// The gate is read live (not cached), so setting it here is enough regardless of what any other
+/// test did first. Asserting it afterwards is what makes every case below actually about the
+/// feature: without the assertion a cached-off gate would route them through the OLD path and they
+/// would pass while proving nothing.
 void require_pushdown_gate()
 {
   ::setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/1);

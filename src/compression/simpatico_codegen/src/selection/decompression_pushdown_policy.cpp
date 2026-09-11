@@ -31,8 +31,15 @@ double env_fraction(char const* name, double fallback)
 
 bool decompression_pushdown_enabled()
 {
-  static bool const enabled = env_flag("SIRIUS_EXP_FUSED_SCAN_FILTER");
-  return enabled;
+  // Deliberately NOT cached, unlike the numeric knobs below. Caching froze the value at whichever
+  // call happened first in a process, so a test could only reach this path if it ran before every
+  // other test that touches it -- coverage that depends on declaration order, which is coverage
+  // that silently disappears. Every call site is per-batch or coarser and a batch is milliseconds,
+  // so re-reading the environment costs nothing measurable here.
+  //
+  // The tradeoff: readers no longer necessarily agree if the variable changes mid-query. Nothing
+  // changes it in production, and a test that flips it mid-query is asking for that.
+  return env_flag("SIRIUS_EXP_FUSED_SCAN_FILTER");
 }
 
 bool decompression_pushdown_diag_enabled()
