@@ -20,6 +20,7 @@
 #include "test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -406,6 +407,114 @@ void test_whole_column_is_emitted_whole()
 }
 
 // ---------------------------------------------------------------------------
+// A nullable column beside a subsettable one.
+//
+// The validity mask is a payload buffer that hangs off no leaf, so the per-leaf loops that
+// relocate everything else never see it. If it is not relocated and re-pointed explicitly, the
+// reader parses whatever leaf bytes landed at its stale offset AS a null mask: the values still
+// decode correctly and nothing faults, only the wrong rows come back null. So the assertion here
+// is on the null POSITIONS, not merely on the values or on a successful decode.
+//
+// The mask also indexes the column's original rows, so a nullable column must be emitted whole:
+// survivor chunk c does not name bit c's row in it.
+// ---------------------------------------------------------------------------
+void test_nullable_column_is_emitted_whole_with_its_mask()
+{
+  auto const stream = cudf::get_default_stream();
+  auto const host   = fixture_values();
+
+  // Nulls spread across every chunk, at positions that differ per chunk, so a mask read at the
+  // wrong offset cannot reproduce this pattern by luck.
+  std::vector<bool> want_valid(static_cast<std::size_t>(kNumRows), true);
+  auto nullable_tbl = make_table(host);
+  {
+    auto& col = nullable_tbl->get_column(0);
+    col.set_null_mask(
+      cudf::create_null_mask(
+        kNumRows, cudf::mask_state::ALL_VALID, stream, rmm::mr::get_current_device_resource_ref()),
+      0);
+    cudf::size_type nulls = 0;
+    for (std::int32_t i = 0; i < kNumRows; ++i) {
+      if ((i % kChunkRows) % (7 + i / kChunkRows) != 0) continue;
+      cudf::set_null_mask(col.mutable_view().null_mask(), i, i + 1, /*valid=*/false, stream);
+      want_valid[static_cast<std::size_t>(i)] = false;
+      ++nulls;
+    }
+    col.set_null_count(nulls);
+    expect(nulls > 0, "the nullable fixture has no nulls");
+  }
+
+  auto nullable = simpatico::compress_with_plan(
+    nullable_tbl->view(), kBitpackPlan, stream, rmm::mr::get_current_device_resource_ref());
+  auto plain = simpatico::compress_with_plan(
+    make_table(host)->view(), kBitpackPlan, stream, rmm::mr::get_current_device_resource_ref());
+
+  simpatico::compressed_table both;
+  both.columns.push_back(std::move(nullable.columns[0]));
+  both.columns.push_back(std::move(plain.columns[0]));
+  auto const src = serialize(both, stream);
+
+  auto const survivors = chunk_ids({1, 3});
+  std::vector<std::uint8_t> header;
+  std::vector<simpatico::gather_range> gather;
+  std::uint64_t payload_bytes = 0;
+  std::vector<std::uint8_t> column_subsetted;
+  auto const err = simpatico::build_chunk_subset_header(src.header,
+                                                        survivors,
+                                                        host_reader(src),
+                                                        header,
+                                                        gather,
+                                                        /*max_gap_bytes=*/0,
+                                                        &payload_bytes,
+                                                        &column_subsetted);
+  expect(err.empty(), err.empty() ? "subset header build failed" : err.c_str());
+  check_gather_well_formed(gather, "nullable");
+
+  // The nullable column is whole; the plain one beside it is still compacted, so carrying a mask
+  // costs that column its fetch skip and nothing more.
+  expect(column_subsetted == std::vector<std::uint8_t>{0, 1},
+         "a nullable column must be emitted whole and its plain neighbour still subsetted");
+
+  auto const compacted = apply_gather(src, gather, payload_bytes);
+
+  std::string sub_err;
+  auto fetch = [&](std::uint64_t offset, std::size_t size, void* dst, rmm::cuda_stream_view s) {
+    expect(offset + size <= compacted.size(), "reader fetched past the compacted payload");
+    if (cudaMemcpyAsync(dst, compacted.data() + offset, size, cudaMemcpyHostToDevice, s.value()) !=
+        cudaSuccess) {
+      throw std::runtime_error("payload HtoD copy failed");
+    }
+  };
+
+  std::vector<std::size_t> const first{0};
+  auto whole = simpatico::read_compressed_table_subset_from_memory(
+    header, fetch, first, stream, rmm::mr::get_current_device_resource_ref(), &sub_err);
+  expect(sub_err.empty(), sub_err.empty() ? "nullable column read failed" : sub_err.c_str());
+  expect(decode_values(whole, stream) == host,
+         "the nullable column did not decode to every row's value");
+
+  auto decoded = simpatico::decompress(whole, stream, rmm::mr::get_current_device_resource_ref());
+  expect(decoded != nullptr && decoded->num_columns() == 1,
+         "nullable decompress produced no column");
+  expect(host_validity_bits(decoded->view().column(0)) == want_valid,
+         "the relocated validity mask marks the wrong rows null");
+
+  std::vector<std::size_t> const second{1};
+  auto subsetted = simpatico::read_compressed_table_subset_from_memory(
+    header, fetch, second, stream, rmm::mr::get_current_device_resource_ref(), &sub_err);
+  expect(sub_err.empty(), sub_err.empty() ? "plain column read failed" : sub_err.c_str());
+  std::vector<std::int32_t> want;
+  for (auto const chunk : survivors) {
+    auto const begin = static_cast<std::int32_t>(chunk) * kChunkRows;
+    for (std::int32_t i = begin; i < std::min(begin + kChunkRows, kNumRows); ++i) {
+      want.push_back(host[i]);
+    }
+  }
+  expect(decode_values(subsetted, stream) == want,
+         "the plain column beside a nullable one did not decode to the surviving rows");
+}
+
+// ---------------------------------------------------------------------------
 // Dictionary-encoded strings: the shape that blocks the scan-bound TPC-H queries.
 //
 // A dictionary's keys are column-wide STATE -- they stay valid for whatever subset of the indices
@@ -552,6 +661,7 @@ int main()
     test_roundtrip_values(chunk_ids({2, 3, 4}), "adjacent subset including the short tail");
     test_roundtrip_values(all_chunk_ids(kNumRows), "all chunks");
     test_whole_column_is_emitted_whole();
+    test_nullable_column_is_emitted_whole_with_its_mask();
     test_dictionary_shape("input -> dictionary\n", "bare dictionary");
     test_dictionary_shape(
       "input -> dictionary -> keys_offsets, keys_chars, indices\n"

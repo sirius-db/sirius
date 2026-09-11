@@ -157,6 +157,7 @@ add_library(
   src/plan/chunk_subset.cpp
   src/plan/representation_factory.cpp
   src/plan/bitjoin_layout.cpp
+  src/plan/validity.cpp
   src/plan/compress.cpp
   src/plan/decompress.cpp
   src/util/stream_pool.cpp

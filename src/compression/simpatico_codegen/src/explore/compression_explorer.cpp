@@ -13,6 +13,7 @@
 #include "codegen/plan/operator_registry.hpp"  // is_terminal_compressor
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/plan/validity.hpp"
 
 #include <cudf/copying.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -462,6 +463,14 @@ exploration_result explore_column_compression(cudf::column_view input,
                                               rmm::cuda_stream_view stream,
                                               rmm::device_async_resource_ref mr)
 {
+  // Explore the column as compress_column will actually see it. The BFS calls
+  // compress_single_op directly, bypassing the plan walk's strip, so without
+  // this a nullable column would be scored on data the real compress pass never
+  // feeds its operators. The sidecar is discarded — exploration only ranks how
+  // the values compress.
+  validity_sidecar explored_validity;
+  input = strip_validity(input, explored_validity, stream, mr);
+
   size_t const full_size = column_size_bytes_ex(input, stream);
 
   // Head-prefix of `input` (rows). Strings are materialized — a zero-copy slice

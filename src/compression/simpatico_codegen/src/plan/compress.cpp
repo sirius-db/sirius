@@ -19,6 +19,7 @@
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/plan/validity.hpp"
 
 #include <cudf/column/column_factories.hpp>
 
@@ -106,14 +107,6 @@ bool is_keys_chars_path(std::string const& path)
 {
   return path.find("keys_chars") != std::string::npos;
 }
-
-// Ops that carry a nullable input's validity through to decode (via a null_mask
-// channel their representation marks required(), see representation.hpp). Every
-// other compressor operates on the packed data buffer only and would silently
-// drop the validity bitmask, surfacing garbage under the null slots on decode.
-// The walk fails closed for those (see emit_path) until numeric ops learn to
-// route validity themselves.
-bool op_handles_nulls(std::string const& op) { return op == "str_split" || op == "dictionary"; }
 
 std::unique_ptr<cudf::column> copy_identity_leaf(cudf::column_view const& view,
                                                  std::string const& path,
@@ -238,20 +231,18 @@ void CompressWalk::emit_path(ValueId v)
   }
   visited[n] = true;
 
-  // Fail closed on nullable input to an op that can't carry validity, rather
-  // than silently dropping the null mask. Intermediate channels are null-free by
-  // construction, so checking each op's input view is sufficient; only the root
-  // leaf column can legitimately carry nulls.
-  if (!op_handles_nulls(node.op)) {
-    for (auto const& src : node.input_sources) {
-      auto const src_it = columns.find(src);
-      if (src_it != columns.end() && src_it->second.null_count() > 0) {
-        set_error("compressor '" + node.op +
-                  "' does not support nullable input (validity would be dropped); "
-                  "route the column through a null-aware op (str_split/dictionary) "
-                  "or drop nulls upstream");
-        return;
-      }
+  // Backstop: no op can see a nullable input, because compress_column strips the
+  // column's validity into the tree's sidecar before the walk and intermediate
+  // channels are null-free by construction. No compressor carries a validity
+  // bitmask, so fail closed rather than silently drop one if that invariant is
+  // ever broken.
+  for (auto const& src : node.input_sources) {
+    auto const src_it = columns.find(src);
+    if (src_it != columns.end() && src_it->second.null_count() > 0) {
+      set_error("compressor '" + node.op +
+                "' received a nullable input (validity would be dropped); validity "
+                "should have been stripped into the plan tree's sidecar before the walk");
+      return;
     }
   }
 
@@ -522,25 +513,6 @@ void CompressWalk::emit_generic_node(NodeId n, cudf::column_view col)
   for (auto const& output : outputs)
     output_by_name.emplace(output.name, output.view);
 
-  // Guard: every channel the rep marks required must be routed by the plan, or
-  // data (e.g. a nullable column's validity via str_split's null_mask) would be
-  // silently dropped. Runs only when some outputs are declared (a bare terminal
-  // `input -> str_split` stored the whole rep above and is safe).
-  for (auto const& req : repr->required_channels()) {
-    bool declared = false;
-    for (auto const& out_name : node.output_names) {
-      if (req == out_name) {
-        declared = true;
-        break;
-      }
-    }
-    if (!declared) {
-      set_error("compressor '" + node.op + "' requires output '" + req +
-                "' to be routed by the plan (nullable input)");
-      return;
-    }
-  }
-
   size_t pending = 0;
   std::vector<ValueId> to_recurse;
   // The rep's owner key is this node's own representative output value {n,0} —
@@ -614,6 +586,12 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   }
   PlanTree& tree = *plan_tree;
 
+  // Detach validity before anything else looks at the column. Everything below
+  // this line -- the walk, every operator, the JIT-fused subtrees -- sees a
+  // null-free column, which is why no plan has to route a mask and no compressor
+  // has to know what one is. An all-valid input passes through untouched.
+  cudf::column_view values = strip_validity(input, tree.validity, stream, mr);
+
   // consumer_by_input[V] = the node that consumes the value produced at V,
   // derived structurally from each node's input_sources (the (node, port) each
   // input comes from). First-consumer-wins, matching parse_plan_dsl. Every value
@@ -634,7 +612,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
   // case (a raw-passthrough or boundary channel with a downstream consumer)
   // uniformly — so there is no separate fast path to maintain here.
   ValueColumnMap columns;
-  columns.emplace(ValueId{0, 0}, input);  // the column input is value (node 0, port 0)
+  columns.emplace(ValueId{0, 0}, values);  // the column input is value (node 0, port 0)
   std::unordered_map<ValueId, std::unique_ptr<compressed_representation>, ValueIdHash>
     reprs_by_input;
   std::vector<bool> visited(tree.nodes.size(), false);

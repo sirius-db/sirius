@@ -325,7 +325,74 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+// 12: each column carries a validity sidecar record after num_rows (see push_validity).
+//     Two independent lines both reached 11 with incompatible meanings, so the merged
+//     format takes the next number rather than aliasing either one — a v11 file written
+//     by either line parses as garbage here, and must be rejected, not guessed at.
+static constexpr std::uint8_t kVersion = 12;
+
+// Per-column validity record, written right after num_rows:
+//
+//   kind (uint8)                        [validity_kind]
+//   if kind != all_valid: null_count (int64 LE)
+//   if kind == mask:      size_bytes (uint64 LE) + payload_offset (uint64 LE)
+//
+// An all-valid column costs exactly one byte, and an all-null one costs nine
+// with no payload at all -- only a genuinely mixed column pays for a bitmask.
+// The mask is appended to the payload region like any leaf buffer, so callers
+// that stage the payload themselves need no special case for it.
+static void push_validity(std::vector<std::uint8_t>& hdr,
+                          validity_sidecar const& v,
+                          std::vector<payload_buffer_ref>& out_buffers,
+                          std::uint64_t& payload_offset)
+{
+  push_le(hdr, static_cast<std::uint8_t>(v.kind));
+  if (v.kind == validity_kind::all_valid) return;
+
+  push_le(hdr, v.null_count);
+  if (v.kind != validity_kind::mask) return;
+
+  auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
+  push_le(hdr, size_bytes);
+  push_le(hdr, payload_offset);
+  out_buffers.push_back(payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes});
+  payload_offset += size_bytes;
+}
+
+// Parsed form of the record above; the mask bytes are pulled from the payload
+// later (reconstruct_from_records), like every leaf buffer.
+struct ValidityRecord {
+  validity_kind kind           = validity_kind::all_valid;
+  std::int64_t null_count      = 0;
+  std::uint64_t size_bytes     = 0;
+  std::uint64_t payload_offset = 0;
+};
+
+// Inverse of push_validity. Returns false on a truncated or unknown record.
+//
+// When @p payload_offset_at is given it receives the position of the mask's
+// payload_offset field relative to @p header_base, so build_chunk_subset_header
+// can patch it: the mask is a payload buffer like any other and moves when the
+// payload is compacted, but it hangs off no leaf, so nothing else would record
+// where to re-point it.
+static bool read_validity(Reader& r,
+                          ValidityRecord& v,
+                          std::uint8_t const* header_base  = nullptr,
+                          std::uint64_t* payload_offset_at = nullptr)
+{
+  std::uint8_t k;
+  if (!r.read_le(k)) return false;
+  if (k > static_cast<std::uint8_t>(validity_kind::mask)) return false;
+  v.kind = static_cast<validity_kind>(k);
+  if (v.kind == validity_kind::all_valid) return true;
+
+  if (!r.read_le(v.null_count)) return false;
+  if (v.kind != validity_kind::mask) return true;
+
+  if (!r.read_le(v.size_bytes)) return false;
+  if (payload_offset_at) { *payload_offset_at = static_cast<std::uint64_t>(r.p - header_base); }
+  return r.read_le(v.payload_offset);
+}
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -415,6 +482,7 @@ struct ColRecord {
   std::uint8_t dtype_tag = 0;
   std::int32_t scale     = 0;  // fixed-point scale for the column dtype (0 otherwise)
   std::int64_t num_rows  = 0;
+  ValidityRecord validity;
   PlanTree tree;
   std::vector<leaf_desc> leaf_descs;
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
@@ -437,6 +505,9 @@ struct HeaderFieldOffsets {
   };
   struct Column {
     std::uint64_t num_rows_at = 0;  // int64
+    // Where the validity mask's payload_offset sits; only meaningful when the
+    // column's record is validity_kind::mask.
+    std::uint64_t validity_payload_offset_at = 0;  // uint64
     std::vector<Leaf> leaves;
   };
   std::vector<Column> columns;
@@ -486,6 +557,12 @@ static bool parse_hpln_header(Reader& r,
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (field_offsets) field_offsets->columns[ci].num_rows_at = field_at();
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
+    if (!read_validity(
+          r,
+          cr.validity,
+          header_base,
+          field_offsets ? &field_offsets->columns[ci].validity_payload_offset_at : nullptr))
+      return bad("truncated/unknown col validity");
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");
@@ -578,6 +655,17 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     auto plan_tree = std::make_unique<PlanTree>();
     *plan_tree     = std::move(cr.tree);
     auto& nodes    = plan_tree->nodes;
+
+    // Rebuild the validity sidecar. all_valid and all_null carry no payload, so
+    // only a mixed column costs a fetch here.
+    auto& validity      = plan_tree->validity;
+    validity.kind       = cr.validity.kind;
+    validity.null_count = cr.validity.null_count;
+    if (validity.kind == validity_kind::mask) {
+      auto const sz = static_cast<std::size_t>(cr.validity.size_bytes);
+      validity.mask = rmm::device_buffer(sz, stream, mr);
+      if (sz > 0) fetch(cr.validity.payload_offset, sz, validity.mask.data(), stream);
+    }
 
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
@@ -851,17 +939,22 @@ compressed_table read_compressed_table(std::string const& path,
 
   // Bounds-check every buffer up front so a truncated file is reported here
   // rather than faulting mid-copy, then copy each buffer straight to device.
+  auto in_payload = [&](std::uint64_t off, std::size_t sz) {
+    // Subtraction form: `off + sz` could overflow for a corrupt/hostile file's
+    // huge declared offset and wrap below payload_total, passing the check and
+    // then faulting in fetch(). Compare against the remaining space instead so
+    // it can never overflow.
+    return sz == 0 || (off <= payload_total && sz <= payload_total - off);
+  };
   for (auto const& cr : col_records) {
+    if (cr.validity.kind == validity_kind::mask &&
+        !in_payload(cr.validity.payload_offset, static_cast<std::size_t>(cr.validity.size_bytes)))
+      return fail("payload out of bounds");
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
         std::uint64_t const off = cr.buf_offsets[li][bi];
-        // Subtraction form: `off + sz` could overflow for a corrupt/hostile
-        // file's huge declared offset and wrap below payload_total, passing the
-        // check and then faulting in fetch(). Compare against the remaining space
-        // instead so it can never overflow.
-        if (sz > 0 && (off > payload_total || sz > payload_total - off))
-          return fail("payload out of bounds");
+        if (!in_payload(off, sz)) return fail("payload out of bounds");
       }
     }
   }
@@ -988,6 +1081,10 @@ std::string build_compressed_table_header(compressed_table const& table,
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
     PlanTree const& tree = col.plan_tree ? *col.plan_tree : kEmptyTree;
+
+    // Validity rides beside the tree, not inside it: it is not a leaf and has no
+    // node, so it is written here rather than through describe().
+    push_validity(hdr, tree.validity, out_buffers, payload_offset);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);
@@ -1273,7 +1370,12 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
     std::vector<std::vector<buffer_subset>> plans(cr.leaf_descs.size());
     std::vector<std::vector<bool>> buffer_whole(cr.leaf_descs.size());
     std::vector<bool> leaf_whole(cr.leaf_descs.size(), false);
-    bool subsettable = col_rows > 0;
+    // A nullable column is never row-subsetted: the validity mask is one bit per
+    // row of the WHOLE column, so survivor chunk c does not name bit c's row in
+    // it, and no re-chunking of a bitmask is modelled here. It is still emitted
+    // (whole) below, so the column reads back correctly -- it just does not
+    // contribute to the fetch skip.
+    bool subsettable = col_rows > 0 && cr.validity.kind == validity_kind::all_valid;
 
     for (std::size_t li = 0; subsettable && li < cr.leaf_descs.size(); ++li) {
       auto const& ld = cr.leaf_descs[li];
@@ -1371,6 +1473,19 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
         }
         plans[li][bi] = *plan;
       }
+    }
+
+    // The validity mask hangs off no leaf, so the loops below never see it. It is a
+    // payload buffer all the same and the compaction moves it, so copy it and re-point
+    // it here or the reader would parse whatever leaf bytes landed at its old offset as
+    // a null mask -- wrong rows marked null, with nothing to fault on.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const size = cr.validity.size_bytes;
+      if (!patch(col_offs.validity_payload_offset_at, dst_offset)) {
+        return "build_chunk_subset_header: header field offset out of range";
+      }
+      append_gather(cr.validity.payload_offset, size, dst_offset);
+      dst_offset += size;
     }
 
     if (!subsettable) {
