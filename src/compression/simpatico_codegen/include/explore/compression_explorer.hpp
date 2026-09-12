@@ -57,11 +57,36 @@ struct exploration_config {
   /// bigger than this is trimmed to a representative row-prefix so no codec
   /// allocates buffers larger than device memory. Default 2 GiB; 0 = unlimited.
   size_t max_explore_bytes = 2ull << 30;
+
+  /// Untimed warmup round-trips per finalist; warmup #1 absorbs the plan's
+  /// NVRTC cold compile so it never pollutes the reported rates. Min 2.
+  size_t rerank_warmup = 2;
+
+  /// Timed, event-bracketed round trips per finalist; the reported throughput
+  /// is the median of these.
+  size_t rerank_iters = 5;
+
+  /// Pareto pick: when > 0, max ratio among frontier points with measured
+  /// decompress throughput >= this floor (GB/s), else fastest-decompress
+  /// wins. 0 = legacy max-ratio pick.
+  double pareto_decomp_floor_gbps = 0.0;
 };
 
 // ---------------------------------------------------------------------------
 // Result
 // ---------------------------------------------------------------------------
+
+/// One measured point of the Pareto frontier. `old_wall_*` re-expresses the
+/// pre-fix one-shot metric, kept for comparison against older plan files.
+struct pareto_point {
+  std::string plan_dsl;
+  double compression_ratio        = 1.0;
+  size_t compressed_size_bytes    = 0;
+  double compress_gbps            = 0.0;
+  double decompress_gbps          = 0.0;
+  double old_wall_compress_gbps   = 0.0;
+  double old_wall_decompress_gbps = 0.0;
+};
 
 struct exploration_result {
   std::string plan_dsl;
@@ -71,7 +96,12 @@ struct exploration_result {
   size_t cascade_depth              = 0;
   double compress_throughput_gbps   = 0.0;
   double decompress_throughput_gbps = 0.0;
+  double old_wall_compress_gbps     = 0.0;  ///< pre-fix one-shot rate, for continuity
+  double old_wall_decompress_gbps   = 0.0;
   std::string pareto_alternates_summary;
+  /// Full measured frontier (Pareto mode only); lets a caller re-pick under a
+  /// different decompress floor without re-measuring.
+  std::vector<pareto_point> pareto_frontier;
 };
 
 // ---------------------------------------------------------------------------
