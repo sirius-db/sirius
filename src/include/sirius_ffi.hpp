@@ -85,8 +85,11 @@ class SIRIUS_FFI_EXPORT Context {
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
 /// streams fed by other fragments without copying.
 ///
-/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
-/// drain via relay_from or result_to_arrow.
+/// Usage order: declare inputs/outputs → build → fill inputs → run → drain.
+/// Fill inputs with relay_from (same process, native batches) or pull_arrow +
+/// push_arrow + close_input (Arrow C Data at a process edge). Drain with
+/// relay_from / pull_arrow on an intermediate fragment, or result_to_arrow on a
+/// result fragment.
 ///
 /// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
 /// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
@@ -141,8 +144,24 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Pull one parked sink batch on `stream_id` into the caller-owned ArrowArrayStream at
+  /// `out_array_addr` (Arrow C Data Interface; same address convention as result_to_arrow).
+  /// The stream carries that one batch: get_schema once, get_next once, then EOS.
+  /// @return false if no batch is parked now (not EOS — use drained()). The dest stream is
+  ///         left untouched on false; the caller must pass a zeroed ArrowArrayStream.
+  /// @throws before build()/run(), on a result fragment, or on an unknown output stream.
+  bool pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr);
+
+  /// Push one Arrow batch from the caller-owned ArrowArrayStream at `in_array_addr` onto
+  /// input stream `stream_id`. Consumes get_schema + one get_next; does not release the
+  /// stream and does not close the sender (same as a remote hop: the caller close_input()s).
+  /// Schema is validated against the declared input before the batch is queued.
+  /// @throws before build(), on an unknown input stream, on an empty/invalid stream, or on
+  ///         a schema mismatch.
+  void push_arrow(std::uint64_t stream_id, std::uintptr_t in_array_addr);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender). Idempotent per sender.
+  /// (relay_from closes its own sender; push_arrow does not). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
@@ -154,6 +173,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.
   /// @throws on an intermediate fragment or before run().
   void result_to_arrow(std::uintptr_t out_stream_addr);
+
+  /// True when output stream `stream_id` has ended (every sender closed, queue empty, no
+  /// error). False means "not done" — including "nothing parked right now".
+  /// @throws before build(), on a result fragment, or on an unknown output stream.
+  [[nodiscard]] bool drained(std::uint64_t stream_id);
 
   /// Batches currently parked on output stream `stream_id`. For diagnostics.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
