@@ -26,12 +26,51 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
 	s3-test s3-test-large s3-tpch \
 	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench \
-	slot-gate-test
+	slot-gate-test sccache-dist-status
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
 # Inputs that should trigger a CMake re-configure
 CMAKE_INPUTS := cmake/CMakePresets.json CMakeLists.txt extension_config.cmake $(wildcard cmake/*.cmake)
+
+# -----------------------------------------------------------------------------
+# RAPIDS sccache distributed build farm (opt-in; see docs/sccache-dist.md)
+# -----------------------------------------------------------------------------
+# `source scripts/sccache_dist_env.sh` sets SIRIUS_SCCACHE_DIST=1, which swaps
+# the CMake compiler launchers to the RAPIDS sccache fork via command-line -D
+# flags (these take precedence over the preset cache variables). When unset,
+# nothing changes and builds use the pixi-provided sccache as before.
+SIRIUS_SCCACHE_DIST ?= 0
+SIRIUS_SCCACHE_DIST_BIN ?= $(HOME)/.local/share/sirius/sccache-dist/bin/sccache
+
+ifeq ($(SIRIUS_SCCACHE_DIST),1)
+SCCACHE_DIST_CMAKE_FLAGS := \
+	-DCMAKE_C_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN) \
+	-DCMAKE_CXX_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN) \
+	-DCMAKE_CUDA_COMPILER_LAUNCHER=$(SIRIUS_SCCACHE_DIST_BIN)
+# Compile through the canonical pixi env's compilers (same absolute path on
+# every machine/checkout) so cache keys match across checkouts: conda's gcc
+# embeds its env path in the specs file, which sccache hashes into every key.
+ifneq ($(wildcard $(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/nvcc),)
+SCCACHE_DIST_ARCH_PREFIX := $(shell uname -m)-conda-linux-gnu
+SCCACHE_DIST_CMAKE_FLAGS += \
+	-DCMAKE_C_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-cc \
+	-DCMAKE_CXX_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-c++ \
+	-DCMAKE_CUDA_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/nvcc \
+	-DCMAKE_CUDA_HOST_COMPILER=$(SIRIUS_SCCACHE_DIST_CANON_ENV)/bin/$(SCCACHE_DIST_ARCH_PREFIX)-c++
+endif
+# Configure-time compiler checks should not go through the farm (rmm#2101).
+SCCACHE_DIST_CONFIGURE_ENV := SCCACHE_NO_DIST_COMPILE=1
+endif
+
+# Stamp the current dist mode (and canonical env, which changes the compiler
+# -D flags) so toggling either re-runs the CMake configure step.
+SCCACHE_DIST_STAMP := build/.sccache_dist_mode
+SCCACHE_DIST_MODE_ID := $(SIRIUS_SCCACHE_DIST)$(if $(SIRIUS_SCCACHE_DIST_CANON_ENV),-canon)
+$(shell mkdir -p build && \
+	{ [ -f $(SCCACHE_DIST_STAMP) ] && [ "$$(cat $(SCCACHE_DIST_STAMP))" = "$(SCCACHE_DIST_MODE_ID)" ]; } \
+	|| echo $(SCCACHE_DIST_MODE_ID) > $(SCCACHE_DIST_STAMP))
+CMAKE_INPUTS += $(SCCACHE_DIST_STAMP)
 
 all: release
 
@@ -41,7 +80,7 @@ $(PRESETS_LINK): cmake/CMakePresets.json
 
 # Configure step — only re-runs when cmake inputs change
 build/%/build.ninja: $(CMAKE_INPUTS) | $(PRESETS_LINK)
-	cd $(DUCKDB_DIR) && $(CMAKE) --preset $*
+	cd $(DUCKDB_DIR) && $(SCCACHE_DIST_CONFIGURE_ENV) $(CMAKE) --preset $* $(SCCACHE_DIST_CMAKE_FLAGS)
 
 release: build/release/build.ninja
 	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(BUILD_TARGETS)
@@ -110,6 +149,14 @@ clean:
 
 list-presets: $(PRESETS_LINK)
 	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets
+
+# Health check for the RAPIDS sccache distributed build farm (opt-in mode).
+sccache-dist-status:
+	@if [ "$(SIRIUS_SCCACHE_DIST)" != "1" ]; then \
+	  echo "sccache-dist-status: dist mode is off - run \`source scripts/sccache_dist_env.sh\` first" >&2; \
+	  exit 1; \
+	fi
+	@$(SIRIUS_SCCACHE_DIST_BIN) --dist-status; echo; $(SIRIUS_SCCACHE_DIST_BIN) --show-stats
 
 # -----------------------------------------------------------------------------
 # S3 integration test gates
