@@ -27,6 +27,15 @@ impl FragmentInstanceId {
     pub(crate) fn from_halves(hi: i64, lo: i64) -> Self {
         Self(Uuid::from_u64_pair(hi as u64, lo as u64))
     }
+
+    /// The proto `PUniqueId` form used by `fetch_data` and `transmit_chunk`.
+    pub(crate) fn to_proto(self) -> PUniqueId {
+        let (hi, lo) = self.0.as_u64_pair();
+        PUniqueId {
+            hi: hi as i64,
+            lo: lo as i64,
+        }
+    }
 }
 
 impl From<&TUniqueId> for FragmentInstanceId {

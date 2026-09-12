@@ -10,6 +10,22 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
 
+use crate::result_store::FragmentInstanceId;
+
+/// Where one sender fragment's output is parked until its receiver runs.
+///
+/// Keyed by the *receiver* it feeds: a sender is addressed by the exchange it produces into,
+/// not by its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SenderSlot {
+    /// Receiver fragment instance the output is destined for.
+    pub fragment_instance_id: FragmentInstanceId,
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Sender ordinal within that exchange's sender set.
+    pub sender_id: i32,
+}
+
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
 pub struct FragmentResult {
