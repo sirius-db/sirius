@@ -8,9 +8,9 @@ use sirius_starrocks_cn::SiriusEngine;
 #[cfg(not(feature = "sirius-engine"))]
 use sirius_starrocks_cn::StubExecutor;
 use sirius_starrocks_cn::{
-    BackendServer, BrpcServer, ComputeNodeConfig, FeConfig, FragmentExecutor, HeartbeatServer,
-    SharedHeartbeatState, register_node, report_to_frontend_once, start_backend_server,
-    start_heartbeat_server,
+    BackendServer, BrpcServer, ComputeNodeConfig, ExchangeIdentity, FeConfig, FragmentExecutor,
+    HeartbeatServer, LocalExchange, SharedHeartbeatState, SiriusComputeNodeService, register_node,
+    report_to_frontend_once, start_backend_server, start_heartbeat_server,
 };
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -78,6 +78,17 @@ impl Args {
             Arc::new(StubExecutor)
         };
 
+        let exchange = Arc::new(LocalExchange::default());
+        let identity = ExchangeIdentity {
+            host: self.compute_node.advertise_host.to_string(),
+            brpc_port: self.compute_node.brpc_port,
+        };
+        let service = SiriusComputeNodeService::with_executor_and_exchange(
+            executor.clone(),
+            exchange,
+            identity,
+        );
+
         let state = SharedHeartbeatState::new();
 
         // HeartbeatService tells FE this process is alive and captures FE identity. The configured
@@ -90,7 +101,7 @@ impl Args {
         // BackendService exposes the shallow CN RPC skeleton on the normal thrift port.
         let backend_server = start_backend_server(&self.compute_node)?;
         // BRPC PInternalService dispatches plan fragments on the brpc port.
-        let brpc_runtime = BrpcRuntime::start(&self.compute_node, executor.clone())?;
+        let brpc_runtime = BrpcRuntime::start(&self.compute_node, service)?;
         self.registration
             .register_node_with_retries(&self.fe, &self.compute_node)
             .await?;
@@ -261,12 +272,8 @@ struct BrpcRuntime {
 }
 
 impl BrpcRuntime {
-    /// Binds the BRPC listener and starts serving it on a dedicated runtime, dispatching fragments
-    /// to `executor`.
-    fn start(
-        compute_node: &ComputeNodeConfig,
-        executor: Arc<dyn FragmentExecutor>,
-    ) -> Result<Self> {
+    /// Binds the BRPC listener and starts serving it on a dedicated runtime.
+    fn start(compute_node: &ComputeNodeConfig, service: SiriusComputeNodeService) -> Result<Self> {
         let listener = BrpcServer::bind(compute_node.bind_host.as_str(), compute_node.brpc_port)?;
         let shutdown = CancellationToken::new();
         let server_shutdown = shutdown.clone();
@@ -276,7 +283,7 @@ impl BrpcRuntime {
                 .build()
                 .map_err(|err| anyhow!("failed to create BRPC service runtime: {err}"))?;
             runtime.block_on(
-                BrpcServer::with_executor(executor)
+                BrpcServer::with_service(service)
                     .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
             )
         });

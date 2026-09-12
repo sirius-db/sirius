@@ -3,15 +3,13 @@
 //! [`sirius::SiriusContext`] is `!Send`/`!Sync` and the engine serializes queries through a single
 //! process-global context, so the context is created, used, and dropped on one dedicated thread.
 //! [`SiriusEngine`] talks to that thread over channels — which are `Send`/`Sync` and carry only
-//! owned data (`Vec<u8>` in, `Vec<RecordBatch>` out) — so it satisfies `dyn FragmentExecutor:
-//! Send + Sync` without ever moving the context across threads.
+//! owned data — so it satisfies `dyn FragmentExecutor: Send + Sync` without ever moving the
+//! context across threads.
 //!
-//! The seam is synchronous (see [`FragmentExecutor`]): `execute()` blocks the caller until the
-//! engine thread returns the result. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so
-//! the BRPC current-thread runtime stays free to serve `fetch_data`, connection cleanup, and
-//! shutdown cancellation while a query runs. The single-fragment limitations are elsewhere: the
-//! whole result is materialized before dispatch returns, and the single process-global context
-//! serializes queries — both lifted by the streaming evolution.
+//! The seam is synchronous (see [`FragmentExecutor`]): `run_fragment` blocks the caller until the
+//! engine thread returns. `exec_plan_fragment` runs it on a `spawn_blocking` worker, so the BRPC
+//! current-thread runtime stays free to serve `fetch_data`. A sender parks native GPU batches;
+//! a receiver `relay_from`s them or a remote hop `pull_arrow`s them. No NIXL, no staging arena.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -20,17 +18,46 @@ use std::thread::JoinHandle;
 
 use arrow_array::RecordBatch;
 use sirius::SiriusContext;
-use starrocks_plan_translator::TranslatedPlan;
+use starrocks_plan_translator::{StreamInputSchema, TranslatedPlan};
 use tracing::info;
 
-use crate::fragment_executor::{FragmentExecutor, FragmentResult};
+use crate::fragment_executor::{FragmentExecutor, FragmentResult, FragmentRun, SenderSlot};
+use crate::parked_registry::ParkedRegistry;
 
-/// One execution request handed to the engine thread.
+/// One fragment execution handed to the engine thread.
 struct ExecuteRequest {
     /// Serialized Substrait plan bytes.
     plan: Vec<u8>,
+    /// Schema of every exchange this plan reads as a stream.
+    stream_inputs: Vec<StreamInputSchema>,
+    /// Parked sender outputs to relay in, keyed by receiver exchange node id.
+    inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender batches as `(node id, sender id, batches)`.
+    remote_inputs: Vec<(i32, i32, Vec<RecordBatch>)>,
+    /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
+    outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (broadcast sink).
+    broadcast: bool,
+    /// Hash-partition key columns for a hash fan-out (empty otherwise).
+    hash_keys: Vec<usize>,
     /// Channel the engine thread sends the result (or a flattened error) back on.
-    respond: Sender<Result<Vec<RecordBatch>, String>>,
+    respond: Sender<Result<Option<FragmentResult>, String>>,
+}
+
+/// One message to the engine thread — the only caller of `SiriusContext`, which is `!Send`.
+enum EngineRequest {
+    /// Run one fragment.
+    Run(ExecuteRequest),
+    /// Pull the next parked Arrow batches under `slot` (`None` when that stream is drained).
+    PullArrow {
+        slot: SenderSlot,
+        respond: Sender<Result<Option<Vec<RecordBatch>>, String>>,
+    },
+    /// Drop the parked fragment claim under `slot`.
+    DropParked {
+        slot: SenderSlot,
+        respond: Sender<Result<(), String>>,
+    },
 }
 
 /// GPU-backed [`FragmentExecutor`] running plans on an embedded Sirius engine.
@@ -42,7 +69,7 @@ struct ExecuteRequest {
 pub struct SiriusEngine {
     /// Sender to the engine thread. `Mutex<Option<..>>` makes the `!Sync` sender shareable and
     /// lets `Drop` close the channel before joining; sends are brief (the thread serializes work).
-    requests: Mutex<Option<Sender<ExecuteRequest>>>,
+    requests: Mutex<Option<Sender<EngineRequest>>>,
     /// Engine thread handle, taken and joined on drop.
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -54,7 +81,7 @@ impl SiriusEngine {
     /// failure surfaces here, before any RPC is served. `config` is the optional Sirius YAML path
     /// (built-in defaults when `None`).
     pub fn start(config: Option<PathBuf>) -> Result<Self, String> {
-        let (request_tx, request_rx) = channel::<ExecuteRequest>();
+        let (request_tx, request_rx) = channel::<EngineRequest>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let thread = std::thread::Builder::new()
             .name("sirius-engine".to_string())
@@ -69,18 +96,34 @@ impl SiriusEngine {
             Err(_) => Err("sirius-engine thread exited during bring-up".to_string()),
         }
     }
+
+    fn engine_call<T>(
+        &self,
+        build: impl FnOnce(Sender<Result<T, String>>) -> EngineRequest,
+    ) -> Result<T, String> {
+        let (respond_tx, respond_rx) = channel();
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
+            .send(build(respond_tx))
+            .map_err(|_| "sirius-engine thread is not running".to_string())?;
+        respond_rx
+            .recv()
+            .map_err(|_| "sirius-engine thread dropped the response".to_string())?
+    }
 }
 
 /// Engine-thread body: bring up the context, signal readiness, then serve requests until the
 /// request channel closes. The context is dropped here, on this thread, when the loop ends.
 fn engine_thread(
     config: Option<PathBuf>,
-    requests: Receiver<ExecuteRequest>,
+    requests: Receiver<EngineRequest>,
     ready: Sender<Result<(), String>>,
 ) {
     let context = match build_context(config) {
         Ok(context) => {
-            // A send error means the caller is already gone; nothing to serve.
             if ready.send(Ok(())).is_err() {
                 return;
             }
@@ -91,20 +134,191 @@ fn engine_thread(
             return;
         }
     };
+    // Sender fragments whose output is parked on the GPU, waiting for their receivers.
+    // Declared after `context` so the fragments drop first: a fragment borrows the engine.
+    let mut registry: ParkedRegistry<sirius::Fragment<'_>> = ParkedRegistry::new();
     info!("sirius-engine thread ready");
-    // One query at a time until the handle (and its sender) is dropped.
     while let Ok(request) = requests.recv() {
-        // `execute_substrait` drains the Arrow stream and drops the context-referencing wrapper
-        // here, on the engine thread, returning owned batches whose buffers are released via their
-        // own Arrow C release callbacks — independent of the context. So the batches are safe to
-        // send to, and drop on, the caller's thread.
-        let result = context
-            .execute_substrait(&request.plan)
-            .map_err(|err| err.to_string());
-        // Ignore a send error: the waiting fragment may have been dropped/cancelled.
-        let _ = request.respond.send(result);
+        match request {
+            EngineRequest::Run(request) => {
+                let result = run_fragment(&context, &mut registry, &request);
+                let _ = request.respond.send(result);
+            }
+            EngineRequest::PullArrow { slot, respond } => {
+                let _ = respond.send(pull_arrow(&mut registry, &slot));
+            }
+            EngineRequest::DropParked { slot, respond } => {
+                let _ = respond.send(registry.release(&slot).map(|_| ()));
+            }
+        }
     }
+    drop(registry);
     info!("sirius-engine thread shutting down");
+}
+
+fn pull_arrow(
+    registry: &mut ParkedRegistry<sirius::Fragment<'_>>,
+    slot: &SenderSlot,
+) -> Result<Option<Vec<RecordBatch>>, String> {
+    let (fragment, stream) = registry.claim(slot, "pull")?;
+    match fragment
+        .pull_arrow(stream)
+        .map_err(|err| format!("pull_arrow on stream {stream}: {err}"))?
+    {
+        Some(part) => Ok(Some(part.batches)),
+        None => {
+            if fragment
+                .drained(stream)
+                .map_err(|err| format!("drained on stream {stream}: {err}"))?
+            {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "output stream {stream} under {slot:?} has nothing parked and is not drained"
+                ))
+            }
+        }
+    }
+}
+
+/// Runs one fragment on the engine thread: declare streams, hop inputs, execute, then park or
+/// return Arrow rows.
+fn run_fragment<'ctx>(
+    context: &'ctx SiriusContext,
+    registry: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
+    request: &ExecuteRequest,
+) -> Result<Option<FragmentResult>, String> {
+    let mut fragment = context
+        .fragment()
+        .map_err(|err| format!("failed to create fragment: {err}"))?;
+
+    for schema in &request.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        for column in &schema.columns {
+            fragment
+                .declare_input_column(stream_id, &column.name, &column.ty)
+                .map_err(|err| {
+                    format!(
+                        "failed to declare column {} of stream {stream_id}: {err}",
+                        column.name
+                    )
+                })?;
+        }
+        let senders = request
+            .inputs
+            .iter()
+            .find(|(node_id, _)| *node_id == schema.node_id)
+            .map(|(_, senders)| senders.as_slice())
+            .unwrap_or_default();
+        let remote_senders = request
+            .remote_inputs
+            .iter()
+            .filter(|(node_id, _, _)| *node_id == schema.node_id)
+            .map(|(_, sender_id, _)| *sender_id)
+            .collect::<Vec<_>>();
+        if senders.is_empty() && remote_senders.is_empty() {
+            return Err(format!(
+                "exchange node {} is read as a stream but no sender output — parked or remote — \
+                 exists for it",
+                schema.node_id
+            ));
+        }
+        for sender_id in senders
+            .iter()
+            .map(|slot| slot.sender_id)
+            .chain(remote_senders)
+        {
+            let sender_id =
+                u32::try_from(sender_id).map_err(|_| format!("negative sender id {sender_id}"))?;
+            fragment
+                .declare_input_sender(stream_id, sender_id)
+                .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
+        }
+    }
+
+    for stream in 0..request.outputs.len() as u64 {
+        fragment
+            .declare_output(stream)
+            .map_err(|err| format!("failed to declare fragment output stream {stream}: {err}"))?;
+    }
+    if request.broadcast && request.outputs.len() > 1 {
+        fragment
+            .declare_output_broadcast()
+            .map_err(|err| format!("failed to declare the broadcast output mode: {err}"))?;
+    } else if !request.hash_keys.is_empty() && request.outputs.len() > 1 {
+        for &key in &request.hash_keys {
+            let key = u32::try_from(key).map_err(|_| format!("hash key column {key} overflows"))?;
+            fragment
+                .declare_output_hash_key(key)
+                .map_err(|err| format!("failed to declare hash key column {key}: {err}"))?;
+        }
+    }
+
+    fragment
+        .build(&request.plan)
+        .map_err(|err| format!("failed to plan fragment: {err}"))?;
+
+    for schema in &request.stream_inputs {
+        let stream_id = stream_id_of(schema.node_id)?;
+        let senders = request
+            .inputs
+            .iter()
+            .find(|(node_id, _)| *node_id == schema.node_id)
+            .map(|(_, senders)| senders.as_slice())
+            .unwrap_or_default();
+        for slot in senders {
+            let sender_id = u32::try_from(slot.sender_id)
+                .map_err(|_| format!("negative sender id {}", slot.sender_id))?;
+            let (sender, sender_stream) = registry.claim(slot, "relay")?;
+            let moved = fragment
+                .relay_from(sender, sender_stream, stream_id, sender_id)
+                .map_err(|err| format!("failed to relay sender {sender_id}: {err}"))?;
+            registry.release(slot)?;
+            info!(
+                stream_id,
+                sender_id,
+                batches = moved,
+                "relayed native batches across a fragment boundary"
+            );
+        }
+    }
+
+    for (node_id, sender_id, batches) in &request.remote_inputs {
+        let stream_id = stream_id_of(*node_id)?;
+        let sender = u32::try_from(*sender_id)
+            .map_err(|_| format!("negative remote sender id {sender_id}"))?;
+        for batch in batches {
+            fragment
+                .push_arrow(stream_id, batch)
+                .map_err(|err| format!("failed to push Arrow from sender {sender_id}: {err}"))?;
+        }
+        fragment.close_input(stream_id, sender).map_err(|err| {
+            format!("failed to close remote sender {sender_id} on stream {stream_id}: {err}")
+        })?;
+        info!(
+            stream_id,
+            sender_id,
+            batches = batches.len(),
+            "received remote Arrow batches"
+        );
+    }
+
+    fragment
+        .run()
+        .map_err(|err| format!("failed to execute fragment: {err}"))?;
+
+    if !request.outputs.is_empty() {
+        registry.park(&request.outputs, fragment)?;
+        return Ok(None);
+    }
+    fragment
+        .result_to_arrow()
+        .map(|result| Some(FragmentResult::new(result.batches)))
+        .map_err(|err| err.to_string())
+}
+
+fn stream_id_of(node_id: i32) -> Result<u64, String> {
+    u64::try_from(node_id).map_err(|_| format!("negative exchange node id {node_id}"))
 }
 
 /// Brings up a [`SiriusContext`] from an optional config path (built-in defaults when `None`).
@@ -120,22 +334,44 @@ fn build_context(config: Option<PathBuf>) -> Result<SiriusContext, String> {
 
 impl FragmentExecutor for SiriusEngine {
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String> {
-        let (respond_tx, respond_rx) = channel();
-        let request = ExecuteRequest {
-            plan: translated.to_substrait_bytes(),
-            respond: respond_tx,
-        };
-        self.requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .ok_or_else(|| "sirius-engine is shutting down".to_string())?
-            .send(request)
-            .map_err(|_| "sirius-engine thread is not running".to_string())?;
-        let batches = respond_rx
-            .recv()
-            .map_err(|_| "sirius-engine thread dropped the response".to_string())??;
-        Ok(FragmentResult::new(batches))
+        self.run_fragment(FragmentRun {
+            plan: translated,
+            inputs: Vec::new(),
+            remote_inputs: Vec::new(),
+            outputs: Vec::new(),
+            broadcast: false,
+            hash_keys: Vec::new(),
+        })?
+        .ok_or_else(|| "result fragment returned no rows".to_string())
+    }
+
+    fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        self.engine_call(|respond| {
+            EngineRequest::Run(ExecuteRequest {
+                plan: run.plan.to_substrait_bytes(),
+                stream_inputs: run.plan.stream_inputs.clone(),
+                inputs: run.inputs,
+                remote_inputs: run.remote_inputs,
+                outputs: run.outputs,
+                broadcast: run.broadcast,
+                hash_keys: run.hash_keys,
+                respond,
+            })
+        })
+    }
+
+    fn pull_arrow(&self, slot: &SenderSlot) -> Result<Option<Vec<RecordBatch>>, String> {
+        self.engine_call(|respond| EngineRequest::PullArrow {
+            slot: *slot,
+            respond,
+        })
+    }
+
+    fn drop_parked(&self, slot: &SenderSlot) -> Result<(), String> {
+        self.engine_call(|respond| EngineRequest::DropParked {
+            slot: *slot,
+            respond,
+        })
     }
 }
 
@@ -288,25 +524,24 @@ mod tests {
         let path = std::env::var("SIRIUS_SUBSTRAIT_PLAN").expect("SIRIUS_SUBSTRAIT_PLAN not set");
         let plan = std::fs::read(&path).expect("read dumped substrait plan");
         let engine = SiriusEngine::start(None).expect("bring up sirius engine");
-        let (respond_tx, respond_rx) = channel();
-        engine
-            .requests
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .send(ExecuteRequest {
-                plan,
-                respond: respond_tx,
+        let result = engine
+            .engine_call(|respond| {
+                EngineRequest::Run(ExecuteRequest {
+                    plan,
+                    stream_inputs: Vec::new(),
+                    inputs: Vec::new(),
+                    remote_inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    broadcast: false,
+                    hash_keys: Vec::new(),
+                    respond,
+                })
             })
-            .unwrap();
-        let batches = respond_rx
-            .recv()
             .expect("engine response")
             .expect("execute");
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let rows: usize = result.batches.iter().map(RecordBatch::num_rows).sum();
         eprintln!("plan {path} returned {rows} row(s)");
-        for batch in &batches {
+        for batch in &result.batches {
             eprintln!("{batch:?}");
         }
     }

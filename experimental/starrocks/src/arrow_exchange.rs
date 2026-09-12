@@ -194,13 +194,17 @@ fn decode_ipc(bytes: &[u8]) -> Result<(Vec<String>, Option<RecordBatch>), String
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
 
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use starrocks_thrift::internal_service::{InternalServiceVersion, TExecPlanFragmentParams};
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::local_exchange::{ExchangeKey, LocalExchange, SenderSource};
+    use crate::brpc::BrpcServer;
+    use crate::compute_node_service::SiriusComputeNodeService;
+    use crate::local_exchange::{LocalExchange, SenderSource};
 
     fn params() -> TExecPlanFragmentParams {
         TExecPlanFragmentParams {
@@ -239,6 +243,14 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![Some(value)]))]).unwrap()
     }
 
+    fn is_permission_denied(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+        })
+    }
+
     #[test]
     fn ipc_round_trip_preserves_batch_and_schema_only_eos_names() {
         let (names, batch) =
@@ -263,15 +275,36 @@ mod tests {
     }
 
     #[test]
-    fn transmit_chunk_frame_round_trip_delivers_arrow_into_the_rendezvous() {
+    fn transmit_chunk_hop_delivers_arrow_batch_and_eos_into_the_rendezvous() {
         let exchange = Arc::new(LocalExchange::default());
-        let instance = FragmentInstanceId::from_halves(11, 22);
-        let key = ExchangeKey {
-            fragment_instance_id: instance,
-            node_id: 7,
+        let service = SiriusComputeNodeService::with_executor_and_exchange(
+            Arc::new(crate::fragment_executor::StubExecutor),
+            exchange.clone(),
+            crate::compute_node_service::ExchangeIdentity::default(),
+        );
+        let listener = match BrpcServer::bind("127.0.0.1", 0) {
+            Ok(listener) => listener,
+            Err(err) if is_permission_denied(&err) => return,
+            Err(err) => panic!("{err:?}"),
         };
-        for frame in [
-            ArrowExchangeFrame {
+        let peer = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let join = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                BrpcServer::with_service(service)
+                    .serve_with_listener_shutdown(listener, server_shutdown.cancelled_owned()),
+            )
+        });
+        let instance = FragmentInstanceId::from_halves(11, 22);
+
+        transmit_chunk_blocking(
+            peer,
+            &ArrowExchangeFrame {
                 fragment_instance_id: instance,
                 dest_stream: 7,
                 sender_id: 0,
@@ -280,7 +313,11 @@ mod tests {
                 names: vec!["id".to_string()],
                 batch: Some(int_batch(42)),
             },
-            ArrowExchangeFrame {
+        )
+        .unwrap();
+        transmit_chunk_blocking(
+            peer,
+            &ArrowExchangeFrame {
                 fragment_instance_id: instance,
                 dest_stream: 7,
                 sender_id: 0,
@@ -289,20 +326,8 @@ mod tests {
                 names: vec!["id".to_string()],
                 batch: None,
             },
-        ] {
-            let (params, attachment) = frame.encode().unwrap();
-            let decoded = ArrowExchangeFrame::decode(&params, &attachment).unwrap();
-            exchange
-                .push_remote_frame(
-                    key,
-                    decoded.sender_id,
-                    decoded.seq,
-                    decoded.eos,
-                    decoded.names,
-                    decoded.batch,
-                )
-                .unwrap();
-        }
+        )
+        .unwrap();
 
         let ready = exchange
             .register_receiver(instance, vec![(7, 1)], params())
@@ -330,5 +355,8 @@ mod tests {
                 .value(0),
             42
         );
+
+        shutdown.cancel();
+        join.join().unwrap().unwrap();
     }
 }
