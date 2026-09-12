@@ -99,7 +99,7 @@ struct ExchangeState {
 
 /// Matches receiver-first StarRocks dispatch with later sender results.
 #[derive(Debug, Default)]
-pub(crate) struct LocalExchange {
+pub struct LocalExchange {
     inner: Mutex<ExchangeState>,
 }
 

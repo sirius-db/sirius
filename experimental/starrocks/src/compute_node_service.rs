@@ -1,38 +1,77 @@
 use std::collections::HashMap;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::fragment_executor::FragmentExecutor;
+use crate::arrow_exchange::{ArrowExchangeFrame, transmit_chunk_blocking};
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
+use crate::fragment_executor::{FragmentExecutor, FragmentRun, SenderSlot};
+use crate::local_exchange::{
+    ExchangeKey, LocalExchange, ReadyExchangeInput, ReadyFragment, SenderSource,
+};
 use crate::proto::starrocks::{
     PExecBatchPlanFragmentsRequest, PExecBatchPlanFragmentsResult, PExecPlanFragmentRequest,
     PExecPlanFragmentResult, PFetchDataRequest, PFetchDataResult, PGetFileSchemaRequest,
-    PGetFileSchemaResult, PSlotDescriptor, StatusPb, p_internal_service_brpc::PInternalService,
+    PGetFileSchemaResult, PSlotDescriptor, PTransmitChunkParams, PTransmitChunkResult, StatusPb,
+    p_internal_service_brpc::PInternalService,
 };
 use crate::result_encoder::{self, ThriftBinary};
-use crate::result_store::{FragmentInstanceId, ResultStore};
-use starrocks_plan_translator::{PlanTranslator, TranslatedPlan};
+use crate::result_store::{FetchOutcome, FragmentInstanceId, ResultStore};
+use starrocks_plan_translator::{ExchangeInput, PlanTranslator, TranslatedPlan};
 use starrocks_thrift::{
-    data_sinks::{TDataSinkType, TResultSinkType},
+    data_sinks::{TDataSinkType, TPlanFragmentDestination, TResultSinkType},
     descriptors::TDescriptorTable,
     internal_service::{
         TExecBatchPlanFragmentsParams, TExecPlanFragmentParams, TGetFileSchemaRequest,
     },
-    plan_nodes::TFileFormatType,
+    partitions::TPartitionType,
+    plan_nodes::{TFileFormatType, TPlanNodeType},
     status_code::TStatusCode,
+    types::TNetworkAddress,
 };
 use thrift::{
     protocol::{TBinaryInputProtocol, TSerializable},
     transport::TBufferChannel,
 };
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
+
+/// Hostname AND port equality against this CN's advertised brpc endpoint — two CNs on one host
+/// with different brpc ports see each other as remote.
+#[derive(Clone, Debug)]
+pub struct ExchangeIdentity {
+    pub host: String,
+    pub brpc_port: u16,
+}
+
+impl Default for ExchangeIdentity {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            brpc_port: 8060,
+        }
+    }
+}
+
+impl ExchangeIdentity {
+    fn matches(&self, addr: &TNetworkAddress) -> bool {
+        addr.hostname == self.host && addr.port == i32::from(self.brpc_port)
+    }
+}
+
+/// Where a data-stream sink destination lives relative to this CN.
+#[derive(Debug)]
+enum DestinationRoute {
+    Local,
+    Remote { host: String, brpc_port: u16 },
+}
 
 /// Sirius compute-node implementation of StarRocks PInternalService.
 ///
 /// Plan-fragment translation is the first implemented RPC path; future
 /// compute-node tasks should land here behind the generated service facade.
 #[derive(Clone, Debug)]
-pub(crate) struct SiriusComputeNodeService {
+pub struct SiriusComputeNodeService {
     /// Reusable StarRocks thrift-to-Substrait fragment translator.
     translator: PlanTranslator,
     /// Executes a translated fragment into Arrow result batches. Production injects the GPU-backed
@@ -43,6 +82,10 @@ pub(crate) struct SiriusComputeNodeService {
     results: Arc<ResultStore>,
     /// Descriptor tables retained for StarRocks's per-query cache protocol.
     descriptor_tables: Arc<Mutex<HashMap<FragmentInstanceId, TDescriptorTable>>>,
+    /// Sequential exchange rendezvous: receivers wait, senders park or hop Arrow over bRPC.
+    exchanges: Arc<LocalExchange>,
+    /// Advertised brpc identity used to classify destinations as local vs remote.
+    identity: ExchangeIdentity,
 }
 
 impl SiriusComputeNodeService {
@@ -55,13 +98,43 @@ impl SiriusComputeNodeService {
 
     /// Builds the service with a caller-provided fragment executor (e.g. the GPU-backed
     /// `SiriusEngine`), shared across BRPC connections via the `Arc`.
-    pub(crate) fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
+    pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
+        Self::with_executor_and_exchange(
+            executor,
+            Arc::new(LocalExchange::default()),
+            ExchangeIdentity::default(),
+        )
+    }
+
+    /// Builds the service with a shared exchange rendezvous and this CN's advertised identity.
+    pub fn with_executor_and_exchange(
+        executor: Arc<dyn FragmentExecutor>,
+        exchanges: Arc<LocalExchange>,
+        identity: ExchangeIdentity,
+    ) -> Self {
         Self {
             translator: PlanTranslator::new(),
             executor,
             results: Arc::new(ResultStore::default()),
             descriptor_tables: Arc::new(Mutex::new(HashMap::new())),
+            exchanges,
+            identity,
         }
+    }
+
+    /// Runs a receiver whose sender set just completed, on a helper thread so `transmit_chunk`
+    /// can reply before GPU work starts. Running the receiver inline would stall the BRPC
+    /// current-thread runtime (and deadlock if that receiver shipped back to a sender still
+    /// blocked on this RPC).
+    pub(crate) fn dispatch_ready_async(&self, ready: ReadyFragment) {
+        let service = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("arrow-exchange-ready".to_string())
+            .spawn(move || {
+                if let Err(err) = service.drain_ready(vec![ready]) {
+                    warn!(error = %err, "ready receiver from Arrow hop failed");
+                }
+            });
     }
 }
 
@@ -135,7 +208,24 @@ impl PInternalService for SiriusComputeNodeService {
         // An unknown id is an error, not EOS: it means this CN never buffered a result for the
         // fragment the FE is polling (wrong id, or a dispatch/result-sink path that did not run),
         // and StarRocks treats a missing result buffer as a failure rather than an empty result.
-        let Some(outcome) = self.results.take_next(id) else {
+        // Exchange receivers reserve a Waiting slot at dispatch; long-poll until rows or failure
+        // rather than replying not-ready (that would desync the FE packet counter).
+        let results = self.results.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || results.wait_ready(id, Duration::from_secs(600)))
+                .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                return Ok(Self::fetch_data_result(
+                    Self::internal_error(format!("fetch_data wait task panicked: {join_err}")),
+                    0,
+                    true,
+                )
+                .into());
+            }
+        };
+        let Some(outcome) = outcome else {
             return Ok(Self::fetch_data_result(
                 Self::internal_error(format!("no buffered result for fragment instance {id}")),
                 0,
@@ -143,22 +233,28 @@ impl PInternalService for SiriusComputeNodeService {
             )
             .into());
         };
-        match outcome.batch {
-            Some(batch) => match batch.to_binary() {
+        match outcome {
+            FetchOutcome::Failed(cause) => {
+                Ok(Self::fetch_data_result(Self::internal_error(cause), 0, true).into())
+            }
+            FetchOutcome::Rows {
+                batch: Some(batch),
+                packet_seq,
+                eos,
+            } => match batch.to_binary() {
                 Ok(bytes) => Ok(crate::prpc::Reply::with_attachment(
-                    Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos),
+                    Self::fetch_data_result(Self::ok_status(), packet_seq, eos),
                     bytes,
                 )),
-                Err(err) => Ok(Self::fetch_data_result(
-                    Self::internal_error(err),
-                    outcome.packet_seq,
-                    true,
-                )
-                .into()),
+                Err(err) => {
+                    Ok(Self::fetch_data_result(Self::internal_error(err), packet_seq, true).into())
+                }
             },
-            None => Ok(
-                Self::fetch_data_result(Self::ok_status(), outcome.packet_seq, outcome.eos).into(),
-            ),
+            FetchOutcome::Rows {
+                batch: None,
+                packet_seq,
+                eos,
+            } => Ok(Self::fetch_data_result(Self::ok_status(), packet_seq, eos).into()),
         }
     }
 
@@ -180,6 +276,35 @@ impl PInternalService for SiriusComputeNodeService {
             },
         };
         Ok(result.into())
+    }
+
+    /// Records one Arrow hop from a peer CN. The PRPC reply is method-level StarRocks status so
+    /// the sender unblocks before a completed receiver is dispatched onto a helper thread.
+    #[instrument(skip_all)]
+    async fn transmit_chunk(
+        &self,
+        request: PTransmitChunkParams,
+        attachment: Vec<u8>,
+    ) -> Result<crate::prpc::Reply<PTransmitChunkResult>, crate::prpc::Error> {
+        match self.ingest_transmit_chunk(&request, &attachment) {
+            Ok(ready) => {
+                if let Some(ready) = ready {
+                    self.dispatch_ready_async(ready);
+                }
+                Ok(PTransmitChunkResult {
+                    status: Some(Self::ok_status()),
+                    receive_timestamp: None,
+                    receiver_post_process_time: None,
+                }
+                .into())
+            }
+            Err(err) => Ok(PTransmitChunkResult {
+                status: Some(Self::internal_error(err)),
+                receive_timestamp: None,
+                receiver_post_process_time: None,
+            }
+            .into()),
+        }
     }
 }
 
@@ -213,8 +338,20 @@ impl SiriusComputeNodeService {
             }
             return Ok(());
         }
+        let expected_senders = Self::receiver_exchanges(&params)?;
+        if !expected_senders.is_empty() {
+            let fragment_instance_id = Self::fragment_instance_id(&params)
+                .ok_or_else(|| "exchange receiver is missing a fragment_instance_id".to_string())?;
+            if Self::is_mysql_result_sink(&params)? {
+                self.results.reserve(fragment_instance_id);
+            }
+            let ready =
+                self.exchanges
+                    .register_receiver(fragment_instance_id, expected_senders, params)?;
+            return self.drain_ready(ready.into_iter().collect());
+        }
         let translated = self.translate_fragment_logged(&params, dump_seq)?;
-        self.execute_and_buffer(&params, &translated)
+        self.execute_fragment(&params, translated, Vec::new(), Vec::new())
     }
 
     /// Restores descriptor tables omitted by StarRocks's per-query cache protocol.
@@ -270,24 +407,372 @@ impl SiriusComputeNodeService {
         Some(seq)
     }
 
-    /// Executes a RESULT_SINK fragment and buffers its rows. Non-result-sink fragments (e.g. a
-    /// DATA_STREAM_SINK feeding another fragment) are translate-only. An unsupported result-sink
-    /// format or a missing fragment instance id fails loudly so integration gaps surface as an
-    /// error rather than as a silent empty result at `fetch_data`.
-    fn execute_and_buffer(
+    /// Decodes a `transmit_chunk` attachment and records it on the exchange rendezvous.
+    fn ingest_transmit_chunk(
+        &self,
+        request: &PTransmitChunkParams,
+        attachment: &[u8],
+    ) -> std::result::Result<Option<ReadyFragment>, String> {
+        let frame = ArrowExchangeFrame::decode(request, attachment)?;
+        self.exchanges.push_remote_frame(
+            ExchangeKey {
+                fragment_instance_id: frame.fragment_instance_id,
+                node_id: frame.dest_stream,
+            },
+            frame.sender_id,
+            frame.seq,
+            frame.eos,
+            frame.names,
+            frame.batch,
+        )
+    }
+
+    /// Executes a RESULT_SINK fragment and buffers its rows, or runs a DATA_STREAM_SINK sender
+    /// and parks / hops its output. `inputs` are same-CN parked slots; `remote_inputs` are Arrow
+    /// batches already on this CN.
+    fn execute_fragment(
         &self,
         params: &TExecPlanFragmentParams,
-        translated: &TranslatedPlan,
+        translated: TranslatedPlan,
+        inputs: Vec<(i32, Vec<SenderSlot>)>,
+        remote_inputs: Vec<(i32, i32, Vec<arrow_array::RecordBatch>)>,
     ) -> std::result::Result<(), String> {
-        if !Self::is_mysql_result_sink(params)? {
+        if Self::is_mysql_result_sink(params)? {
+            let id = Self::fragment_instance_id(params).ok_or_else(|| {
+                "RESULT_SINK fragment is missing a fragment_instance_id".to_string()
+            })?;
+            let result = self
+                .executor
+                .run_fragment(FragmentRun {
+                    plan: &translated,
+                    inputs,
+                    remote_inputs,
+                    outputs: Vec::new(),
+                    broadcast: false,
+                    hash_keys: Vec::new(),
+                })?
+                .ok_or_else(|| "result fragment returned no rows".to_string())?;
+            let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
+            self.results.insert(id, batch);
             return Ok(());
         }
-        let id = Self::fragment_instance_id(params)
-            .ok_or_else(|| "RESULT_SINK fragment is missing a fragment_instance_id".to_string())?;
-        let result = self.executor.execute(translated)?;
-        let batch = result_encoder::MysqlResultEncoder::encode(&result.batches, 0)?;
-        self.results.insert(id, batch);
+
+        let Some(sink) = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.output_sink.as_ref())
+        else {
+            tracing::warn!("fragment carries no output sink; nothing consumes its output");
+            return Ok(());
+        };
+        let exec = params
+            .params
+            .as_ref()
+            .ok_or_else(|| "DATA_STREAM_SINK fragment is missing execution params".to_string())?;
+        let sender_id = exec.sender_id.unwrap_or(0);
+        if sink.type_ != TDataSinkType::DATA_STREAM_SINK {
+            return Err(format!("output sink {:?} is not supported", sink.type_));
+        }
+        let stream_sink = sink.stream_sink.as_ref().ok_or_else(|| {
+            "DATA_STREAM_SINK fragment carries no stream_sink payload".to_string()
+        })?;
+        if stream_sink.limit.is_some_and(|limit| limit >= 0) {
+            return Err("data stream sink limits are not supported".to_string());
+        }
+        let destinations = exec
+            .destinations
+            .as_ref()
+            .filter(|destinations| !destinations.is_empty())
+            .ok_or_else(|| "DATA_STREAM_SINK fragment has no destinations".to_string())?;
+
+        if destinations.len() > 1 {
+            match stream_sink.output_partition.type_ {
+                TPartitionType::UNPARTITIONED => {}
+                TPartitionType::HASH_PARTITIONED => {
+                    if translated.output_partition_columns.is_none() {
+                        return Err(
+                            "a hash-partitioned data stream sink translated without partition \
+                             key columns"
+                                .to_string(),
+                        );
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "a data stream sink with {} destinations carries partition type {:?}, \
+                         which this CN does not support",
+                        destinations.len(),
+                        other
+                    ));
+                }
+            }
+        }
+        let hash_keys = if destinations.len() > 1 {
+            translated
+                .output_partition_columns
+                .clone()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let broadcast = destinations.len() > 1 && hash_keys.is_empty();
+
+        let mut slots: Vec<SenderSlot> = Vec::with_capacity(destinations.len());
+        let mut routes = Vec::with_capacity(destinations.len());
+        for destination in destinations {
+            let slot = SenderSlot {
+                fragment_instance_id: FragmentInstanceId::from(&destination.fragment_instance_id),
+                node_id: stream_sink.dest_node_id,
+                sender_id,
+            };
+            if slots.contains(&slot) {
+                return Err(format!(
+                    "duplicate destination {slot:?} in one data stream sink; two claims would \
+                     race over one output stream"
+                ));
+            }
+            let route = self.route_destination(destination)?;
+            slots.push(slot);
+            routes.push(route);
+        }
+
+        self.executor.run_fragment(FragmentRun {
+            plan: &translated,
+            inputs,
+            remote_inputs,
+            outputs: slots.clone(),
+            broadcast,
+            hash_keys,
+        })?;
+
+        let mut ready_receivers = Vec::new();
+        for (slot, route) in slots.iter().zip(&routes) {
+            if matches!(route, DestinationRoute::Local) {
+                let ready = self.exchanges.push_sender(
+                    ExchangeKey {
+                        fragment_instance_id: slot.fragment_instance_id,
+                        node_id: slot.node_id,
+                    },
+                    sender_id,
+                    SenderSource::LocalParked {
+                        names: translated.output_names.clone(),
+                        slot: *slot,
+                    },
+                )?;
+                ready_receivers.extend(ready);
+            }
+        }
+        for (slot, route) in slots.iter().zip(&routes) {
+            if let DestinationRoute::Remote { host, brpc_port } = route {
+                self.ship_remote(*slot, &translated.output_names, host, *brpc_port)?;
+            }
+        }
+        self.drain_ready(ready_receivers)
+    }
+
+    fn route_destination(
+        &self,
+        destination: &TPlanFragmentDestination,
+    ) -> std::result::Result<DestinationRoute, String> {
+        let brpc_server = destination.brpc_server.as_ref().ok_or_else(|| {
+            format!(
+                "DATA_STREAM_SINK destination for fragment instance {} has no brpc_server address",
+                FragmentInstanceId::from(&destination.fragment_instance_id)
+            )
+        })?;
+        if self.identity.matches(brpc_server) {
+            Ok(DestinationRoute::Local)
+        } else {
+            Ok(DestinationRoute::Remote {
+                host: brpc_server.hostname.clone(),
+                brpc_port: u16::try_from(brpc_server.port).map_err(|_| {
+                    format!(
+                        "destination brpc port {} is not a valid TCP port",
+                        brpc_server.port
+                    )
+                })?,
+            })
+        }
+    }
+
+    fn ship_remote(
+        &self,
+        slot: SenderSlot,
+        names: &[String],
+        host: &str,
+        brpc_port: u16,
+    ) -> std::result::Result<(), String> {
+        let peer = lookup_peer(host, brpc_port)?;
+        let mut seq = 0i64;
+        let mut rows = 0usize;
+        loop {
+            match self.executor.pull_arrow(&slot)? {
+                Some(batches) => {
+                    for batch in batches {
+                        rows += batch.num_rows();
+                        transmit_chunk_blocking(
+                            peer,
+                            &ArrowExchangeFrame {
+                                fragment_instance_id: slot.fragment_instance_id,
+                                dest_stream: slot.node_id,
+                                sender_id: slot.sender_id,
+                                seq,
+                                eos: false,
+                                names: names.to_vec(),
+                                batch: Some(batch),
+                            },
+                        )?;
+                        seq += 1;
+                    }
+                }
+                None => {
+                    transmit_chunk_blocking(
+                        peer,
+                        &ArrowExchangeFrame {
+                            fragment_instance_id: slot.fragment_instance_id,
+                            dest_stream: slot.node_id,
+                            sender_id: slot.sender_id,
+                            seq,
+                            eos: true,
+                            names: names.to_vec(),
+                            batch: None,
+                        },
+                    )?;
+                    self.executor.drop_parked(&slot)?;
+                    info!(
+                        %peer,
+                        dest_stream = slot.node_id,
+                        sender_id = slot.sender_id,
+                        frames = seq,
+                        rows,
+                        "shipping Arrow exchange hop"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn drain_ready(&self, ready: Vec<ReadyFragment>) -> std::result::Result<(), String> {
+        let mut queue = ready;
+        while let Some(fragment) = queue.pop() {
+            let result_id = Self::fragment_instance_id(&fragment.params)
+                .filter(|_| matches!(Self::is_mysql_result_sink(&fragment.params), Ok(true)));
+            match self.execute_ready_fragment(fragment) {
+                Ok(next) => queue.extend(next),
+                Err(err) => {
+                    if let Some(id) = result_id {
+                        self.results.fail(id, err.clone());
+                    }
+                    return Err(err);
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn execute_ready_fragment(
+        &self,
+        ready: ReadyFragment,
+    ) -> std::result::Result<Vec<ReadyFragment>, String> {
+        let exchange_inputs = Self::exchange_inputs(&ready.inputs)?;
+        let mut inputs: Vec<(i32, Vec<SenderSlot>)> = Vec::new();
+        let mut remote_inputs: Vec<(i32, i32, Vec<arrow_array::RecordBatch>)> = Vec::new();
+        for input in ready.inputs {
+            let mut slots = Vec::new();
+            for source in input.sources {
+                match source {
+                    SenderSource::LocalParked { slot, .. } => slots.push(slot),
+                    SenderSource::Remote {
+                        sender_id,
+                        batches,
+                        closed,
+                        ..
+                    } => {
+                        if !closed {
+                            return Err(format!(
+                                "exchange node {} became ready with remote sender {sender_id} \
+                                 still open",
+                                input.node_id
+                            ));
+                        }
+                        remote_inputs.push((input.node_id, sender_id, batches));
+                    }
+                }
+            }
+            if !slots.is_empty() {
+                inputs.push((input.node_id, slots));
+            }
+        }
+        let dump_seq = Self::dump_fragment(&ready.params);
+        let translated =
+            self.translate_fragment_logged_with_inputs(&ready.params, &exchange_inputs, dump_seq)?;
+        // Sender sinks (merge → gather) drain any newly ready receivers inside execute_fragment.
+        self.execute_fragment(&ready.params, translated, inputs, remote_inputs)?;
+        Ok(Vec::new())
+    }
+
+    fn exchange_inputs(
+        inputs: &[ReadyExchangeInput],
+    ) -> std::result::Result<Vec<ExchangeInput>, String> {
+        inputs
+            .iter()
+            .map(|input| {
+                let names = input
+                    .sources
+                    .first()
+                    .map(|source| source.names().to_vec())
+                    .ok_or_else(|| {
+                        format!("exchange node {} has no sender source", input.node_id)
+                    })?;
+                if input
+                    .sources
+                    .iter()
+                    .any(|source| source.names() != names.as_slice())
+                {
+                    return Err("exchange senders produced different output names".to_string());
+                }
+                Ok(ExchangeInput {
+                    node_id: input.node_id,
+                    stream_view: format!("sirius_stream_{}", input.node_id),
+                    names,
+                })
+            })
+            .collect()
+    }
+
+    fn receiver_exchanges(
+        params: &TExecPlanFragmentParams,
+    ) -> std::result::Result<Vec<(i32, usize)>, String> {
+        let exchange_nodes = params
+            .fragment
+            .as_ref()
+            .and_then(|fragment| fragment.plan.as_ref())
+            .map(|plan| {
+                plan.nodes
+                    .iter()
+                    .filter(|node| node.node_type == TPlanNodeType::EXCHANGE_NODE)
+                    .map(|node| node.node_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        exchange_nodes
+            .into_iter()
+            .map(|node_id| {
+                let expected = params
+                    .params
+                    .as_ref()
+                    .and_then(|exec| exec.per_exch_num_senders.get(&node_id))
+                    .copied()
+                    .ok_or_else(|| {
+                        format!("EXCHANGE_NODE {node_id} is missing per_exch_num_senders")
+                    })?;
+                let expected = usize::try_from(expected).map_err(|_| {
+                    format!("EXCHANGE_NODE {node_id} has negative sender count {expected}")
+                })?;
+                Ok((node_id, expected))
+            })
+            .collect()
     }
 
     /// Deserializes a FE batch attachment and merges common params into each instance.
@@ -346,6 +831,25 @@ impl SiriusComputeNodeService {
         let translated = self
             .translator
             .translate_fragment(params)
+            .map_err(|err| err.to_string())?;
+        info!(
+            output_names = ?translated.output_names,
+            plan = %translated.explain(),
+            "translated StarRocks plan fragment"
+        );
+        Self::dump_substrait(&translated, dump_seq);
+        Ok(translated)
+    }
+
+    fn translate_fragment_logged_with_inputs(
+        &self,
+        params: &TExecPlanFragmentParams,
+        inputs: &[ExchangeInput],
+        dump_seq: Option<u64>,
+    ) -> std::result::Result<TranslatedPlan, String> {
+        let translated = self
+            .translator
+            .translate_fragment_with_exchange_inputs(params, inputs)
             .map_err(|err| err.to_string())?;
         info!(
             output_names = ?translated.output_names,
@@ -499,6 +1003,14 @@ impl SiriusComputeNodeService {
     }
 }
 
+fn lookup_peer(host: &str, port: u16) -> std::result::Result<SocketAddr, String> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("resolve {host}:{port}: {err}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -506,23 +1018,27 @@ mod tests {
     use prost::Message;
     use starrocks_thrift::{
         data::TResultBatch,
-        data_sinks::{TDataSink, TResultSink},
+        data_sinks::{
+            TDataSink, TDataSinkType, TDataStreamSink, TPlanFragmentDestination, TResultSink,
+        },
         descriptors::{TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor},
         internal_service::{InternalServiceVersion, TPlanFragmentExecParams},
         partitions::{TDataPartition, TPartitionType},
-        plan_nodes::{TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
+        plan_nodes::{TExchangeNode, TFileScanNode, TPlan, TPlanNode, TPlanNodeType},
         planner::TPlanFragment,
         types::{
-            TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode, TTypeNodeType, TUniqueId,
+            TNetworkAddress, TPrimitiveType, TScalarType, TTableType, TTypeDesc, TTypeNode,
+            TTypeNodeType, TUniqueId,
         },
     };
     use thrift::{protocol::TBinaryOutputProtocol, transport::TIoChannel};
     use tower::{Service, ServiceExt};
 
     use super::*;
+    use crate::arrow_exchange::ArrowExchangeFrame;
     use crate::{
         proto::starrocks::{
-            PFetchDataRequest, PUniqueId,
+            PFetchDataRequest, PTransmitChunkResult, PUniqueId,
             p_internal_service_brpc::{PInternalServiceRouter, SERVICE_NAME, methods},
         },
         prpc,
@@ -796,6 +1312,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn park_then_send_local_exchange_feeds_result_sink() {
+        // Receiver-first: the FE parks an EXCHANGE RESULT_SINK, then a leaf DATA_STREAM_SINK
+        // completes the sender set and the stub result is fetchable.
+        let service = SiriusComputeNodeService::new();
+        let query = TUniqueId::new(8, 1);
+        let receiver_id = TUniqueId::new(8, 10);
+        let sender_id = TUniqueId::new(8, 11);
+
+        let mut receiver = fragment_params(
+            Some(TPlan::new(vec![exchange_plan_node(2, 0)])),
+            Some(desc_table()),
+        );
+        receiver.fragment.as_mut().unwrap().output_sink = Some(result_sink());
+        let mut receiver_exec = exec_params(query.clone(), receiver_id.clone());
+        receiver_exec.per_exch_num_senders.insert(2, 1);
+        receiver.params = Some(receiver_exec);
+
+        let exec = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&receiver),
+        );
+        let exec = PExecPlanFragmentResult::decode(exec.body.as_slice()).unwrap();
+        assert_eq!(
+            exec.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            exec.status.error_msgs
+        );
+
+        let mut sender = fragment_params(Some(scan_plan(0, 0)), Some(desc_table()));
+        sender.fragment.as_mut().unwrap().output_sink = Some(stream_sink(2));
+        let mut sender_exec = exec_params(query, sender_id);
+        sender_exec.sender_id = Some(0);
+        sender_exec.destinations = Some(vec![TPlanFragmentDestination::new(
+            receiver_id.clone(),
+            None,
+            Some(TNetworkAddress::new("127.0.0.1".to_string(), 8060)),
+            None,
+        )]);
+        sender.params = Some(sender_exec);
+
+        let exec = route(
+            &service,
+            methods::EXEC_PLAN_FRAGMENT,
+            PExecPlanFragmentRequest {
+                attachment_protocol: Some("binary".to_string()),
+            }
+            .encode_to_vec(),
+            serialize_binary(&sender),
+        );
+        let exec = PExecPlanFragmentResult::decode(exec.body.as_slice()).unwrap();
+        assert_eq!(
+            exec.status.status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            exec.status.error_msgs
+        );
+
+        let fetched = route(
+            &service,
+            methods::FETCH_DATA,
+            fetch_request(8, 10),
+            Vec::new(),
+        );
+        let fetched_result = PFetchDataResult::decode(fetched.body.as_slice()).unwrap();
+        assert_eq!(fetched_result.status.status_code, TStatusCode::OK.0);
+        assert_eq!(fetched_result.eos, Some(false));
+        let batch =
+            SiriusComputeNodeService::deserialize_binary::<TResultBatch>(&fetched.attachment)
+                .unwrap();
+        assert_eq!(batch.rows.len(), 1);
+    }
+
+    #[test]
+    fn transmit_chunk_records_arrow_attachment_on_the_rendezvous() {
+        let service = SiriusComputeNodeService::new();
+        let instance = FragmentInstanceId::from_halves(11, 22);
+        let schema =
+            std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                true,
+            )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow_array::Int64Array::from(vec![Some(42)]))
+                    as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let data = ArrowExchangeFrame {
+            fragment_instance_id: instance,
+            dest_stream: 7,
+            sender_id: 0,
+            seq: 0,
+            eos: false,
+            names: vec!["id".to_string()],
+            batch: Some(batch),
+        };
+        let (params, attachment) = data.encode().unwrap();
+        let first = route(
+            &service,
+            methods::TRANSMIT_CHUNK,
+            params.encode_to_vec(),
+            attachment,
+        );
+        let first = PTransmitChunkResult::decode(first.body.as_slice()).unwrap();
+        assert_eq!(
+            first.status.as_ref().unwrap().status_code,
+            TStatusCode::OK.0,
+            "{:?}",
+            first.status
+        );
+
+        let eos = ArrowExchangeFrame {
+            fragment_instance_id: instance,
+            dest_stream: 7,
+            sender_id: 0,
+            seq: 1,
+            eos: true,
+            names: vec!["id".to_string()],
+            batch: None,
+        };
+        let (params, attachment) = eos.encode().unwrap();
+        let second = route(
+            &service,
+            methods::TRANSMIT_CHUNK,
+            params.encode_to_vec(),
+            attachment,
+        );
+        let second = PTransmitChunkResult::decode(second.body.as_slice()).unwrap();
+        assert_eq!(
+            second.status.as_ref().unwrap().status_code,
+            TStatusCode::OK.0
+        );
+
+        let ready = service
+            .exchanges
+            .register_receiver(instance, vec![(7, 1)], fragment_params(None, None))
+            .unwrap()
+            .expect("eos already arrived over transmit_chunk");
+        let SenderSource::Remote {
+            names,
+            sender_id,
+            batches,
+            closed,
+        } = &ready.inputs[0].sources[0]
+        else {
+            panic!("expected a remote source");
+        };
+        assert_eq!(names, &["id".to_string()]);
+        assert_eq!(*sender_id, 0);
+        assert!(*closed);
+        assert_eq!(batches.len(), 1);
+    }
+
     fn fetch_request(hi: i64, lo: i64) -> Vec<u8> {
         PFetchDataRequest {
             finst_id: PUniqueId { hi, lo },
@@ -867,6 +1547,51 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn stream_sink(dest_node_id: i32) -> TDataSink {
+        TDataSink::new(
+            TDataSinkType::DATA_STREAM_SINK,
+            Some(TDataStreamSink::new(
+                dest_node_id,
+                TDataPartition::new(TPartitionType::UNPARTITIONED, None, None, None),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn exchange_plan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
+        let mut node = scan_node(node_id, tuple_id);
+        node.node_type = TPlanNodeType::EXCHANGE_NODE;
+        node.num_children = 0;
+        node.file_scan_node = None;
+        node.exchange_node = Some(TExchangeNode::new(
+            vec![tuple_id],
+            None,
+            None,
+            Some(TPartitionType::UNPARTITIONED),
+            Some(true),
+            None,
+        ));
+        node
     }
 
     fn exec_params(
