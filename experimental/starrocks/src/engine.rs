@@ -204,6 +204,8 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 
@@ -272,6 +274,8 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 

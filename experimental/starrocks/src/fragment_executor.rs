@@ -86,6 +86,8 @@ mod tests {
         TranslatedPlan {
             plan: Default::default(),
             output_names: names.iter().map(|name| name.to_string()).collect(),
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 
