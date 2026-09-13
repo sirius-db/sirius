@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -65,6 +66,100 @@ def parse_bytes(text):
         if t.endswith(suffix):
             return int(float(t[: -len(suffix)]) * mult)
     return int(t)
+
+
+def drop_from_page_cache(paths):
+    """Ask the kernel to forget `paths`, whichever process cached them.
+
+    posix_fadvise is per-inode, so this works on a file another library is writing: it drops the
+    CLEAN pages and leaves dirty ones to writeback. That matters at this scale -- a table's COPY
+    reads ~223 GB of parquet and writes ~220 GB of .hpln, and every byte of both lands in page
+    cache. The cache is reclaimable, so nothing is actually short of memory, but `free` reads as
+    almost none and anything watching that number concludes the machine is about to die. It killed
+    this generation 30 minutes in, one chunk from the end.
+    """
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+class cache_trimmer:
+    """Background thread trimming the page cache while a long COPY runs, and logging memory.
+
+    The logging is not decoration: if a run is killed again, the trace says whether the process's
+    own RSS grew (DuckDB buffering ahead of a single-threaded sink) or only the cache did.
+    """
+
+    def __init__(self, paths, interval=20.0):
+        self._paths = list(paths)
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join(timeout=self._interval + 5)
+        drop_from_page_cache(self._paths)
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            drop_from_page_cache(self._paths)
+            try:
+                rss_kb = int(
+                    subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+                )
+                with open("/proc/meminfo") as fh:
+                    info = {
+                        k: int(v.split()[0])
+                        for k, v in (l.split(":", 1) for l in fh)
+                    }
+                print(
+                    f"   [mem] rss {rss_kb/1e6:.1f} GB  free {info['MemFree']/1e6:.0f} GB  "
+                    f"available {info['MemAvailable']/1e6:.0f} GB  "
+                    f"cached {info['Cached']/1e6:.0f} GB",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+
+def hpln_is_complete(path):
+    """True when `path` is a .hpln a reader can open — i.e. a COPY finished it.
+
+    An interrupted write leaves payload bytes and no trailer, which is exactly what makes this
+    checkable: the file is large and unreadable rather than short and plausible.
+    """
+    import struct
+
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size < 16:
+                return False
+            fh.seek(-16, os.SEEK_END)
+            trailer = fh.read(16)
+    except OSError:
+        return False
+    if trailer[12:] != b"HPLN":
+        return False
+    # The magic alone is not proof: check that the postscript it points at actually ends where the
+    # file does. A truncated write that happened to end in those four bytes would pass otherwise.
+    ps_offset, ps_len, _version = struct.unpack("<QHH", trailer[:12])
+    return ps_offset + ps_len + 16 == size
 
 
 def decoded_bytes_per_row(con, source):
@@ -143,6 +238,23 @@ def main():
         help="global: ORDER BY the table's sort key in the COPY query",
     )
     ap.add_argument("--config", default=os.environ.get("SIRIUS_CONFIG_FILE"))
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip a table whose .hpln already carries a trailer, so a long generation that was "
+        "interrupted does not restart from the first table",
+    )
+    ap.add_argument(
+        "--no-trim-cache",
+        action="store_true",
+        help="do not drop the inputs and output from the page cache as the COPY runs",
+    )
+    ap.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip the post-write row count, which re-reads the whole file — at SF1000 that is a "
+        "second 220 GB pass per table, and hpln-suite.py is the check that actually matters",
+    )
     args = ap.parse_args()
 
     if args.config:
@@ -186,6 +298,10 @@ def main():
         if not has_plan:
             opts = f"FORMAT simpatico, chunk_rows {chunk_rows}, group_rows {args.group_rows}"
 
+        if args.resume and hpln_is_complete(out):
+            print(f"== {table}: already complete at {out}, skipping (--resume)", flush=True)
+            continue
+
         print(
             f"== {table}: {len(files)} parquet file(s), {parquet_bytes/1e9:.2f} GB"
             f"{' ORDER BY ' + key if order else ''}"
@@ -193,10 +309,17 @@ def main():
             flush=True,
         )
         t0 = time.time()
-        con.execute(f"COPY ({select}) TO '{out}' ({opts});")
+        if args.no_trim_cache:
+            con.execute(f"COPY ({select}) TO '{out}' ({opts});")
+        else:
+            with cache_trimmer(files + [out]):
+                con.execute(f"COPY ({select}) TO '{out}' ({opts});")
         elapsed = time.time() - t0
         hpln_bytes = os.path.getsize(out)
-        rows = con.execute(f"SELECT count(*) FROM read_simpatico('{out}')").fetchone()[0]
+        rows = -1
+        if not args.no_verify:
+            rows = con.execute(f"SELECT count(*) FROM read_simpatico('{out}')").fetchone()[0]
+            drop_from_page_cache([out])
         print(
             f"   -> {hpln_bytes/1e9:.2f} GB ({parquet_bytes/hpln_bytes:.2f}x parquet), "
             f"{rows} rows, {elapsed:.1f} s, "
