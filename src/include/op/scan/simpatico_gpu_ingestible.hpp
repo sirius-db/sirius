@@ -287,6 +287,19 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
     std::size_t decode_chunks_pruned{0};
   };
   [[nodiscard]] prune_stats pruning() const noexcept { return _prune_stats; }
+  /// Chunks whose surviving rows were narrowed by the READ rather than after it -- the difference
+  /// between not FETCHING the pruned bytes and merely not decoding them. Counted at materialize
+  /// time, unlike @ref prune_stats, which is decided once when the scan is planned.
+  [[nodiscard]] std::size_t chunks_read_narrowed() const noexcept
+  {
+    return _chunks_read_narrowed.load(std::memory_order_relaxed);
+  }
+  /// Compressed bytes staged by those reads, for comparing against what a whole-chunk read costs.
+  [[nodiscard]] std::size_t bytes_staged_narrowed() const noexcept
+  {
+    return _bytes_staged.load(std::memory_order_relaxed);
+  }
+
   /// Splits whose subset header was refused and served whole (see @ref
   /// materialize_metadata_to_table).
   [[nodiscard]] std::size_t subset_refusals() const noexcept
@@ -334,6 +347,9 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   /// narrow the query is. At SF1000 that is what made an unpinned .hpln scan of partsupp read
   /// 105 GB to answer a two-column query.
   std::vector<std::size_t> _staged_columns;
+
+  std::atomic<std::size_t> _chunks_read_narrowed{0};
+  std::atomic<std::size_t> _bytes_staged{0};
 
   /// @ref simpatico_ingestible_table_info::column_ids expressed as positions into
   /// @ref _staged_columns -- which is what the decode selects by once the staged chunk holds only

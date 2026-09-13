@@ -83,6 +83,10 @@ struct hpln_open_options {
 struct ingested_hpln_chunk {
   std::shared_ptr<pinned_compressed_blob> blob;
   std::int64_t num_rows = 0;
+  /// Whether the READ was narrowed to the caller's surviving decode chunks. False either because
+  /// none were asked for or because the narrowing was refused, and the two are indistinguishable
+  /// to a consumer: both mean this blob holds the chunk's whole rows and still needs filtering.
+  bool rows_narrowed = false;
 };
 
 /// A .hpln file staged into pinned host memory, plus what its header says is in it.
@@ -251,14 +255,26 @@ class hpln_table_writer {
 /// @p columns, when non-empty, narrows every chunk to those FILE columns (strictly ascending):
 /// each chunk's header is rebuilt to describe exactly them and only their payload bytes are read,
 /// so the result is an ordinary chunk that HAS only those columns rather than a wide chunk behind
-/// a narrow description. Payload checksums are not verified for such a read -- the recorded CRC
+/// a narrow description.
+///
+/// @p decode_chunks, when non-empty, narrows the READ to the surviving 1024-row decode chunks of
+/// each requested chunk -- positional with @p chunk_ids, so entry i describes chunk_ids[i]. This is
+/// the difference between skipping a chunk's bytes and merely skipping its decode: without it a
+/// chunk that survives whole-chunk pruning is read in full even when its group bounds rule out
+/// almost all of it. Sizing the surviving ranges requires the small per-chunk metadata buffers,
+/// which live in the payload, so a narrowed read is two rounds rather than one. A chunk whose
+/// narrowing is refused is staged whole, and @ref ingested_hpln_chunk::rows_narrowed says which
+/// happened.
+///
+/// Payload checksums are not verified for a narrowed or column-subsetted read -- the recorded CRC
 /// covers the whole chunk.
 [[nodiscard]] std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
   std::span<const std::size_t> chunk_ids,
-  hpln_open_options const& options       = {},
-  std::span<const std::size_t> columns   = {});
+  hpln_open_options const& options     = {},
+  std::span<const std::size_t> columns = {},
+  std::span<const std::vector<std::uint32_t>> decode_chunks = {});
 
 /// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.
 ///
