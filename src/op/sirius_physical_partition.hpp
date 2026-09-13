@@ -80,8 +80,7 @@ class sirius_physical_partition : public sirius_physical_operator {
 
   bool is_build_partition() const;
 
-  /// operator_params::enable_runtime_size_estimation, threaded in at plan generation. Read by
-  /// input_barrier_for, which relaxes this partition's ingress only when it is set.
+  /// Whether this partition may use a projected input size.
   [[nodiscard]] bool is_size_estimation_enabled() const { return _enable_size_estimation; }
 
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
@@ -153,7 +152,6 @@ class sirius_physical_partition : public sirius_physical_operator {
     const op::input_stats& stats) const override;
 
  protected:
-  /// Emit the estimated-vs-actual size comparison for this partition (see @ref _actual_bytes).
   void on_finalize_operator() override;
 
  private:
@@ -163,12 +161,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// consumer's get_partition_strategy, which turns it into a partition count.
   uint64_t compute_total_bytes();
 
-  /// Bytes this partition should size itself for: the projected total for the input port, scaled
-  /// by the safety factor and floored at what has already arrived, so an undershooting
-  /// projection cannot ask for fewer partitions than the observed bytes justify. Latched in
-  /// @ref _size_estimate so the hint and the sizing decision cannot disagree. nullopt when
-  /// estimation is off or no projection is available yet; callers then wait for the whole input.
-  ///
+  /// Return a latched projected total, scaled and floored at bytes already received.
+  /// Returns nullopt when estimation is disabled or unavailable.
   /// @pre `lock` is held.
   std::optional<uint64_t> estimated_total_input_bytes();
 
@@ -200,36 +194,25 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
-  /// Non-owning sink for this operator's observability counters — the narrow-passthrough count
-  /// and the sizing basis below. The registered-state shared_ptr owns the context for at least
-  /// as long as the query plan; unit-test operators may leave it null.
+  /// Non-owning counter sink. Registered state owns the context for the plan's lifetime.
   duckdb::SiriusContext* _context_observer = nullptr;
-  /// operator_params::enable_runtime_size_estimation. Only the grouped-aggregation partition
-  /// sets it; join partitions keep sizing from the measured build side.
+  /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};
-  /// operator_params::size_estimate_safety_factor, applied to a projected total.
   double _size_estimate_safety_factor{1.0};
-  /// Projection from estimated_total_input_bytes(), latched on first success so the task hint
-  /// and the sizing decision cannot disagree. Guarded by `lock`. NOT the number that sized the
-  /// partition — the safety factor and the already-arrived floor are applied after it; report
-  /// @ref _sizing_bytes / @ref _sizing_basis, recorded at the decision itself.
+  /// Raw projection, latched so the task hint and sizing decision agree. Guarded by `lock`.
   std::optional<pipeline::data_size_estimate> _size_estimate;
 
-  /// How the partition count was *actually* chosen.
   enum class sizing_basis : uint8_t {
-    measured,           ///< no projection available; sized from the drained port
-    upstream_complete,  ///< an already-finished producer's exact total — too late to relax
-    projected,          ///< a real prediction, made while the producer was still running
+    measured,
+    upstream_complete,
+    projected,
   };
   static const char* sizing_basis_name(sizing_basis basis);
-  /// Publish @ref _sizing_basis to the context observer, once, at the decision. Only the
-  /// grouped-aggregation path calls this; counting join-side sizing would dilute the signal.
+  /// Publish the sizing basis when the partition count is fixed.
   void record_sizing_basis() const;
   sizing_basis _sizing_basis{sizing_basis::measured};
-  /// The byte total the count was derived from, whatever the basis.
   uint64_t _sizing_bytes{0};
-  /// Bytes actually partitioned, accumulated in execute() and compared against @ref _sizing_bytes
-  /// at finalize — how the projection's accuracy is checked from a query log.
+  /// Bytes processed, used to report projection error.
   std::atomic<uint64_t> _actual_bytes{0};
 };
 

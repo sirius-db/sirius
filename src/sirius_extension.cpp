@@ -3140,9 +3140,7 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
-/// Upper bound on size_estimate_safety_factor. The factor multiplies a projected byte total that
-/// is then narrowed to uint64_t; anything beyond this is a typo rather than a tuning choice, and
-/// large values only ever inflate the partition count.
+/// Reject implausible multipliers before converting the scaled total to uint64_t.
 static constexpr double kMaxSizeEstimateSafetyFactor = 1000.0;
 
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
@@ -3161,9 +3159,6 @@ static void SetSizeEstimateSafetyFactor(ClientContext& context, SetScope scope, 
   if (!params) { return; }
   auto slot           = lock_operator_params_slot(context);
   const double factor = parameter.GetValue<double>();
-  // Reject non-finite and absurd multipliers here rather than downstream: the value scales a
-  // projected byte total that is then cast to uint64_t, so a NaN/inf or a wildly large factor
-  // would turn into an undefined or nonsensical partition count.
   if (!std::isfinite(factor) || factor <= 0.0 || factor > kMaxSizeEstimateSafetyFactor) {
     throw InvalidInputException(
       "size_estimate_safety_factor must be finite and in (0.0, %g], got %f",

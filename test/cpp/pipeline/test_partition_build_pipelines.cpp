@@ -271,10 +271,7 @@ TEST_CASE_METHOD(
 {
   const std::string query = "SELECT n_regionkey, count(*) FROM nation GROUP BY n_regionkey";
 
-  // The ingress barrier of an aggregate-fanout PARTITION is the one thing
-  // enable_runtime_size_estimation changes at plan-conversion time, so assert it under both
-  // settings rather than only the one the feature ships in. Everything else about the shape —
-  // and the FULL egress into the merge — must be identical either way.
+  // Only the aggregate-fanout ingress barrier changes between settings.
   auto check_ingress = [&](bool estimation_on, sirius::op::MemoryBarrierType expected) {
     auto set = con->Query(std::string("SET enable_runtime_size_estimation = ") +
                           (estimation_on ? "true;" : "false;"));
@@ -296,9 +293,7 @@ TEST_CASE_METHOD(
       CHECK(inputs[0]->source_pipeline->get_sink()->type ==
             SiriusPhysicalOperatorType::HASH_GROUP_BY);
 
-      // Downstream, the merge consumes the partition output — a FULL barrier under either
-      // setting, because the merge needs every per-thread bucket before it can combine a
-      // partition.
+      // The merge always waits for every partition bucket.
       auto outputs = wirings_out_of(result, pipeline.get());
       REQUIRE(outputs.size() == 1);
       CHECK(outputs[0]->barrier_type == sirius::op::MemoryBarrierType::FULL);
@@ -308,16 +303,9 @@ TEST_CASE_METHOD(
     });
   };
 
-  // Off (the shipped default): the edge is never relaxed, so this is the pre-feature plan
-  // exactly — not an emulation of it maintained by the operator's task hint.
   check_ingress(/*estimation_on=*/false, sirius::op::MemoryBarrierType::FULL);
 
-  // On: the per-thread HASH_GROUP_BY output may stream into the partition, because a projected
-  // total lets it fix its count from the first batches instead of the whole input.
-  // sirius_physical_partition::get_next_task_hint still withholds tasks until a count is
-  // pinned, so this is safe even when the estimate never materializes.
   check_ingress(/*estimation_on=*/true, sirius::op::MemoryBarrierType::PARTIAL);
 
-  // Leave the setting as found; the connection's operator_params outlive this scope.
   con->Query("SET enable_runtime_size_estimation = false;");
 }
