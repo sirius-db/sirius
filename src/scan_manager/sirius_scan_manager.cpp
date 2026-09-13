@@ -2602,8 +2602,7 @@ pinned_entry const* sirius_scan_manager::find_pinned_entry_for_duckdb_table(
   pinned_entry const* identity_match    = nullptr;
   pinned_entry const* covering_mismatch = nullptr;
   for (auto const& [name, entry] : _pinned_entries) {
-    if (!entry.cache_info.matches_duckdb_table(
-          catalog_name, schema_name, table_name, table_oid)) {
+    if (!entry.cache_info.matches_duckdb_table(catalog_name, schema_name, table_name, table_oid)) {
       continue;
     }
     if (identity_match == nullptr) { identity_match = &entry; }

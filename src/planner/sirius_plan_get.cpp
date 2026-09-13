@@ -230,7 +230,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       auto& scan_manager = sirius_state->get_scan_manager();
       auto const catalog = table.ParentCatalog().GetName();
       auto const& schema = table.ParentSchema().name;
-      pinned = scan_manager.find_pinned_entry_for_duckdb_table(
+      pinned             = scan_manager.find_pinned_entry_for_duckdb_table(
         catalog, schema, table.name, table.oid, &column_ids, &op.returned_types);
       // A same-name pin for an older table cannot serve this scan. Until a
       // checkpoint rewrites the on-disk image, the disk-native path is also unsafe,
