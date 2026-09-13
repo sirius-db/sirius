@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-// String-codec decode tests: happy-path round-trips + malformed-segment
-// guards (kernels must emit zero-length rows, never read OOB).
+// String-codec round trips and malformed-segment checks.
 
 #include "scan/decode_test_utils.hpp"
 #include "scan/strings_synth.hpp"
@@ -26,9 +25,13 @@
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 
 #include <cuda/scan/gpu_decode_strings.cuh>
+#include <cuda/scan/strings/dict_fsst.cuh>
+#include <cuda/scan/strings/dictionary.cuh>
+#include <cuda/scan/strings/fsst.cuh>
 
 #include <catch.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
@@ -36,6 +39,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -53,6 +58,18 @@ using sirius::test::decode::strings::make_fsst_segment;
 using sirius::test::decode::strings::make_uncompressed_segment;
 
 namespace {
+
+// Prevent decoder kernels from reading beyond the small backing allocation.
+struct reject_decode_allocation_resource {
+  size_t allocations = 0;
+  rmm::mr::callback_memory_resource resource{
+    [](size_t, rmm::cuda_stream_view, void* arg) -> void* {
+      ++*static_cast<size_t*>(arg);
+      throw std::logic_error("invalid metadata reached decode scratch allocation");
+    },
+    [](void*, size_t, rmm::cuda_stream_view, void*) {},
+    &allocations};
+};
 
 /// Stage segment bytes on device; build a single-segment string column input
 /// and run it through `gpu_decode_strings_column`. Returns the decoded
@@ -144,9 +161,6 @@ std::vector<std::string> decode_one_segment(std::vector<uint8_t> const& bytes,
   return out;
 }
 
-/// Run a malformed segment through the orchestrator and return the decoded
-/// strings. Caller asserts every row is empty — the malformed-header path
-/// zero-fills lengths so no chars are emitted.
 std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& bytes,
                                                     duckdb::CompressionType codec,
                                                     uint32_t row_count)
@@ -185,6 +199,266 @@ std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& 
 }
 
 }  // namespace
+
+TEST_CASE("gpu_decode_strings DICT_FSST padded lengths round-trip in dictionary modes",
+          "[scan][decode][strings][dict_fsst]")
+{
+  auto mode = GENERATE(uint8_t{0}, uint8_t{1});
+  std::vector<std::string> dict{"",
+                                "",
+                                std::string(1000, 'a') + "red",
+                                std::string(1000, 'b') + "green",
+                                std::string(1000, 'c') + "blue"};
+  std::vector<uint32_t> selections;
+  for (uint32_t i = 0; i < 97; ++i) {
+    selections.push_back(i % dict.size());
+  }
+  auto bytes           = make_dict_fsst_segment(dict, selections, mode);
+  uint32_t const width = bytes[9];
+  auto align8          = [](uint32_t n) { return (n + 7u) & ~7u; };
+  REQUIRE(align8((dict.size() * width + 7u) / 8u) != align8(32u * width / 8u));
+  auto output =
+    decode_one_segment(bytes, CompressionType::COMPRESSION_DICT_FSST, selections.size(), 1005);
+  REQUIRE(output.size() == selections.size());
+  for (size_t i = 0; i < output.size(); ++i) {
+    REQUIRE(output[i] == dict[selections[i]]);
+  }
+}
+
+TEST_CASE("gpu_decode_strings DICT_FSST rejects invalid host metadata before preparation",
+          "[scan][decode][strings][dict_fsst][defensive]")
+{
+  auto malformed = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
+  CAPTURE(malformed);
+  // Large logical regions exercise arithmetic checks without allocating their payloads.
+  std::vector<uint8_t> backing(8192, 0);
+  uint32_t dict_size    = 0;
+  uint32_t dict_count   = 2;
+  uint32_t symtab_size  = 0;
+  backing[8]            = 0;
+  backing[9]            = 1;
+  backing[10]           = 1;
+  uint32_t logical_size = 64;
+  uint32_t row_count    = 1;
+  uint32_t row_start    = 0;
+  switch (malformed) {
+    case 0: backing[9] = 33; break;
+    case 1:
+      backing[8]  = 1;
+      symtab_size = 4096;
+      break;
+    case 2:
+      backing[8]  = 1;
+      dict_size   = 128;
+      symtab_size = 17;
+      break;
+    case 3:
+      backing[8]  = 2;
+      dict_size   = 128;
+      symtab_size = 17;
+      break;
+    case 4: dict_count = 0; break;
+    case 5: row_start = 512; break;
+    case 6:
+      backing[8]  = 2;
+      row_start   = 2;
+      symtab_size = 17;
+      break;
+    case 7: backing[10] = 33; break;
+    case 8:
+      row_start = UINT32_MAX;
+      row_count = 2;
+      break;
+    case 9:
+      dict_count  = UINT32_MAX;
+      backing[9]  = 0;
+      backing[10] = 0;
+      break;
+    case 10:
+      dict_count  = (1u << 30) + 2u;
+      backing[9]  = 0;
+      backing[10] = 0;
+      break;
+    case 11:
+      dict_count   = (1u << 26) + 1u;
+      backing[9]   = 32;
+      backing[10]  = 0;
+      logical_size = UINT32_MAX;
+      break;
+    case 12:
+      backing[9]   = 0;
+      backing[10]  = 32;
+      row_start    = 1u << 26;
+      logical_size = UINT32_MAX;
+      break;
+    case 13:
+      backing[9]  = 0;
+      backing[10] = 0;
+      row_start   = std::numeric_limits<int32_t>::max();
+      break;
+    case 14: backing[8] = 1; break;
+    case 15:
+      backing[8]   = 1;
+      backing[9]   = 0;
+      backing[10]  = 0;
+      logical_size = 16;
+      break;
+    case 16:
+      backing[8]  = 1;
+      symtab_size = 16;
+      break;
+    case 17:
+      backing[8]  = 2;
+      symtab_size = 16;
+      break;
+  }
+  std::memcpy(backing.data(), &dict_size, 4);
+  std::memcpy(backing.data() + 4, &dict_count, 4);
+  std::memcpy(backing.data() + 12, &symtab_size, 4);
+  rmm::cuda_stream stream;
+  reject_decode_allocation_resource mr;
+  rmm::device_buffer device(backing.data(), backing.size(), stream.view());
+  gpu_string_segment_desc segment{
+    static_cast<uint8_t const*>(device.data()), logical_size, 0, row_count, row_start, 16};
+  gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST, {segment}};
+  CHECK_THROWS_AS(sirius::cuda::scan::prepare_dict_fsst(run, stream.view(), mr.resource),
+                  std::runtime_error);
+  if (malformed >= 14) {
+    CHECK_THROWS_WITH(sirius::cuda::scan::prepare_dict_fsst(run, stream.view(), mr.resource),
+                      Catch::Contains("is shorter than the FSST symbol table header"));
+  }
+  CHECK(mr.allocations == 0);
+}
+
+TEST_CASE("gpu_decode_strings FSST rejects a symbol table shorter than its fixed header",
+          "[scan][decode][strings][fsst][defensive]")
+{
+  auto const table_bytes = GENERATE(uint32_t{1}, uint32_t{16});
+  CAPTURE(table_bytes);
+  uint32_t const header[] = {0, 16 + table_bytes, 0, 16};
+  std::vector<uint8_t> bytes(16 + table_bytes, 0);
+  std::memcpy(bytes.data(), header, sizeof(header));
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  gpu_string_codec_run run{CompressionType::COMPRESSION_FSST,
+                           {{static_cast<uint8_t const*>(device.data()),
+                             static_cast<uint32_t>(bytes.size()),
+                             0,
+                             1,
+                             0,
+                             0}}};
+  CHECK_THROWS_AS(sirius::cuda::scan::prepare_fsst(run, stream.view()), std::runtime_error);
+  CHECK_THROWS_WITH(sirius::cuda::scan::prepare_fsst(run, stream.view()),
+                    Catch::Contains("symbol table header"));
+}
+
+TEST_CASE("gpu_decode_strings FSST admits exactly the fixed symbol table header",
+          "[scan][decode][strings][fsst][defensive]")
+{
+  uint32_t const header[] = {0, 33, 0, 16};
+  std::vector<uint8_t> bytes(33, 0);
+  std::memcpy(bytes.data(), header, sizeof(header));
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  gpu_string_codec_run run{CompressionType::COMPRESSION_FSST,
+                           {{static_cast<uint8_t const*>(device.data()), 33, 0, 1, 0, 0}}};
+  REQUIRE_NOTHROW(sirius::cuda::scan::prepare_fsst(run, stream.view()));
+  auto prepared = sirius::cuda::scan::prepare_fsst(run, stream.view());
+  REQUIRE(prepared.total_fsst_row_count == 1);
+  REQUIRE(prepared.length_descs.size() == 1);
+}
+
+TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NULL slot exists",
+          "[scan][decode][strings][dict_fsst][defensive]")
+{
+  auto const mode      = GENERATE(uint8_t{1}, uint8_t{2});
+  auto bytes           = make_dict_fsst_segment({""}, {0}, mode);
+  uint32_t table_bytes = 0;
+  std::memcpy(&table_bytes, bytes.data() + 12, sizeof(table_bytes));
+  REQUIRE(table_bytes == 0);
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  auto const rows = mode == 1 ? 1u : 0u;
+  gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST,
+                           {{static_cast<uint8_t const*>(device.data()),
+                             static_cast<uint32_t>(bytes.size()),
+                             0,
+                             rows,
+                             0,
+                             0}}};
+  REQUIRE_NOTHROW(sirius::cuda::scan::prepare_dict_fsst(run, stream.view(), mr));
+  gpu_string_column_decode_input input;
+  input.total_rows = rows;
+  input.has_nulls  = false;
+  input.data.push_back(run);
+  auto column = gpu_decode_strings_column(input, stream.view(), mr);
+  REQUIRE(column->size() == rows);
+  REQUIRE(column->null_count() == rows);
+}
+
+TEST_CASE("gpu_decode_strings DICT_FSST rejects cumulative dictionary offset overflow",
+          "[scan][decode][strings][dict_fsst][defensive]")
+{
+  uint32_t const dict_count    = 1u << 30;
+  uint32_t const segment_count = 4;
+  REQUIRE(uint64_t{segment_count} * (uint64_t{dict_count} + 1) > UINT32_MAX);
+  std::vector<uint8_t> backing(16, 0);
+  std::memcpy(backing.data() + 4, &dict_count, sizeof(dict_count));
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(backing.data(), backing.size(), stream.view());
+  reject_decode_allocation_resource mr;
+  gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST, {}};
+  for (uint32_t row = 0; row < segment_count; ++row) {
+    run.segments.push_back({static_cast<uint8_t const*>(device.data()), 16, row, 1, 0, 0});
+  }
+  CHECK_THROWS_AS(sirius::cuda::scan::prepare_dict_fsst(run, stream.view(), mr.resource),
+                  std::runtime_error);
+  CHECK(mr.allocations == 0);
+}
+
+TEST_CASE("gpu_decode_strings FSST rejects a slice after the segment head",
+          "[scan][decode][strings][fsst][defensive]")
+{
+  auto bytes = make_fsst_segment({"first", "second string"});
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  gpu_string_segment_desc segment{
+    static_cast<uint8_t const*>(device.data()), static_cast<uint32_t>(bytes.size()), 0, 2, 0, 13};
+  gpu_string_codec_run run{CompressionType::COMPRESSION_FSST, {segment}};
+  REQUIRE_NOTHROW(sirius::cuda::scan::prepare_fsst(run, stream.view()));
+  run.segments[0].seg_row_start = 1;
+  run.segments[0].row_count     = 1;
+  REQUIRE_THROWS_AS(sirius::cuda::scan::prepare_fsst(run, stream.view()), std::runtime_error);
+}
+
+TEST_CASE("gpu_decode_strings DICTIONARY rejects a bit index beyond INT32_MAX",
+          "[scan][decode][strings][dictionary][defensive]")
+{
+  uint32_t const rows         = (1u << 26) + 1u;
+  uint32_t const index_offset = 20u + rows * 4u;
+  uint32_t const header[]     = {0, index_offset + 4u, index_offset, 1, 32};
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(header, sizeof(header), stream.view());
+  gpu_string_codec_run run{
+    CompressionType::COMPRESSION_DICTIONARY,
+    {{static_cast<uint8_t const*>(device.data()), UINT32_MAX, 0, rows, 0, 0}}};
+  REQUIRE_THROWS_AS(sirius::cuda::scan::prepare_dict(run, stream.view()), std::runtime_error);
+}
+
+TEST_CASE("gpu_decode_strings FSST rejects a bit index beyond INT32_MAX",
+          "[scan][decode][strings][fsst][defensive]")
+{
+  uint32_t const rows          = (1u << 26) + 1u;
+  uint32_t const symtab_offset = 16u + rows * 4u;
+  uint32_t const header[]      = {0, symtab_offset + 17u, 32, symtab_offset};
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(header, sizeof(header), stream.view());
+  gpu_string_codec_run run{
+    CompressionType::COMPRESSION_FSST,
+    {{static_cast<uint8_t const*>(device.data()), UINT32_MAX, 0, rows, 0, 0}}};
+  REQUIRE_THROWS_AS(sirius::cuda::scan::prepare_fsst(run, stream.view()), std::runtime_error);
+}
 
 // --- UNCOMPRESSED happy path ---
 
@@ -320,9 +594,7 @@ TEST_CASE("gpu_decode_strings DICTIONARY - empty dict, all NULL",
     REQUIRE(s.empty());
 }
 
-// --- Defensive: malformed segments must emit empty rows, not OOB reads. ---
-
-TEST_CASE("gpu_decode_strings DICTIONARY - corrupt index_buffer_offset zero-fills",
+TEST_CASE("gpu_decode_strings DICTIONARY - corrupt index_buffer_offset throws",
           "[scan][decode][strings][dictionary][defensive]")
 {
   std::vector<uint8_t> bytes(64, 0);
@@ -332,23 +604,21 @@ TEST_CASE("gpu_decode_strings DICTIONARY - corrupt index_buffer_offset zero-fill
                      /*idx_buf_count=*/2u,
                      /*width=*/1u};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICTIONARY, 8);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICTIONARY, 8),
+                    std::runtime_error);
 }
 
-TEST_CASE("gpu_decode_strings DICTIONARY - bitpacking_width > 32 zero-fills",
+TEST_CASE("gpu_decode_strings DICTIONARY - bitpacking_width > 32 throws",
           "[scan][decode][strings][dictionary][defensive]")
 {
   std::vector<uint8_t> bytes(128, 0);
   uint32_t hdr[5] = {0u, 64u, 28u, 1u, /*width=*/100u};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICTIONARY, 4);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICTIONARY, 4),
+                    std::runtime_error);
 }
 
-TEST_CASE("gpu_decode_strings FSST - corrupt dict_end > segment_size zero-fills",
+TEST_CASE("gpu_decode_strings FSST - corrupt dict_end > segment_size throws",
           "[scan][decode][strings][fsst][defensive]")
 {
   std::vector<uint8_t> bytes(64, 0);
@@ -357,23 +627,21 @@ TEST_CASE("gpu_decode_strings FSST - corrupt dict_end > segment_size zero-fills"
                      /*bitpacking_width=*/8u,
                      /*fsst_symbol_table_offset=*/16u};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_FSST, 8);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_FSST, 8),
+                    std::runtime_error);
 }
 
-TEST_CASE("gpu_decode_strings FSST - bitpacking_width > 32 zero-fills",
+TEST_CASE("gpu_decode_strings FSST - bitpacking_width > 32 throws",
           "[scan][decode][strings][fsst][defensive]")
 {
   std::vector<uint8_t> bytes(64, 0);
   uint32_t hdr[4] = {/*dict_size=*/8u, /*dict_end=*/40u, /*bitpacking_width=*/64u, /*sym_off=*/16u};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_FSST, 4);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_FSST, 4),
+                    std::runtime_error);
 }
 
-TEST_CASE("gpu_decode_strings DICT_FSST - mode > 2 zero-fills",
+TEST_CASE("gpu_decode_strings DICT_FSST - mode > 2 throws",
           "[scan][decode][strings][dict_fsst][defensive]")
 {
   std::vector<uint8_t> bytes(128, 0);
@@ -387,18 +655,16 @@ TEST_CASE("gpu_decode_strings DICT_FSST - mode > 2 zero-fills",
   bytes[10] = didx_w;
   bytes[11] = _pad;
   std::memcpy(bytes.data() + 12, &symtab_size, 4);
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICT_FSST, 4);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICT_FSST, 4),
+                    std::runtime_error);
 }
 
-TEST_CASE("gpu_decode_strings DICT_FSST - bytes_size below header throws nothing, zero-fills",
+TEST_CASE("gpu_decode_strings DICT_FSST - bytes_size below header throws",
           "[scan][decode][strings][dict_fsst][defensive]")
 {
   std::vector<uint8_t> bytes(8, 0xAB);
-  auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICT_FSST, 3);
-  for (auto& s : out)
-    REQUIRE(s.empty());
+  REQUIRE_THROWS_AS(decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICT_FSST, 3),
+                    std::runtime_error);
 }
 
 TEST_CASE("gpu_decode_strings - unsupported codec throws", "[scan][decode][strings][defensive]")

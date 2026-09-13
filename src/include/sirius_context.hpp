@@ -28,6 +28,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
+#include "transparent/connection_provenance.hpp"
 
 #include <rmm/resource_ref.hpp>
 
@@ -114,12 +115,51 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t next_query_ordinal() noexcept { return ++query_ordinal_; }
   [[nodiscard]] uint64_t current_query_ordinal() const noexcept { return query_ordinal_; }
 
-  /// \brief Start a new planning attempt: advance the generation and clear any
-  /// stale capture from a previous attempt.
+  /// \brief Start a planning generation, discarding the previous capture and decline.
   void begin_planning_attempt() noexcept
   {
     ++planning_generation_;
     captured_plan_.reset();
+    decline_reason_ = sirius::transparent::decline_reason::none;
+  }
+
+  /// \brief Current classification; provider_internal remains latched.
+  [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
+  {
+    return provenance_;
+  }
+  void latch_provider_internal() noexcept
+  {
+    provenance_ = sirius::transparent::connection_provenance::provider_internal;
+  }
+  void mark_user_provenance() noexcept
+  {
+    if (provenance_ != sirius::transparent::connection_provenance::provider_internal) {
+      provenance_ = sirius::transparent::connection_provenance::user;
+    }
+  }
+
+  /// \brief Whether this planning generation has already classified the connection.
+  [[nodiscard]] bool classified_this_attempt() const noexcept
+  {
+    return classified_generation_ == planning_generation_;
+  }
+  void mark_classified() noexcept { classified_generation_ = planning_generation_; }
+
+  /// \brief Decline all remaining stages of this planning generation.
+  void decline_attempt(sirius::transparent::decline_reason reason) noexcept
+  {
+    decline_reason_      = reason;
+    declined_generation_ = planning_generation_;
+  }
+  [[nodiscard]] bool attempt_declined() const noexcept
+  {
+    return decline_reason_ != sirius::transparent::decline_reason::none &&
+           declined_generation_ == planning_generation_;
+  }
+  [[nodiscard]] sirius::transparent::decline_reason attempt_decline_reason() const noexcept
+  {
+    return attempt_declined() ? decline_reason_ : sirius::transparent::decline_reason::none;
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
@@ -196,10 +236,15 @@ class SiriusConnectionState : public ClientContextState {
   [[nodiscard]] uint64_t connection_id() const noexcept { return connection_id_; }
 
  private:
-  uint64_t planning_generation_ = 0;
-  uint64_t captured_generation_ = 0;
+  uint64_t planning_generation_   = 0;
+  uint64_t captured_generation_   = 0;
+  uint64_t declined_generation_   = 0;
+  uint64_t classified_generation_ = ~uint64_t{0};  ///< sentinel: no attempt classified yet
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  sirius::transparent::connection_provenance provenance_ =
+    sirius::transparent::connection_provenance::unclassified;
+  sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
@@ -246,6 +291,10 @@ class SiriusContext : public ClientContextState {
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
+    // One count per declined planning attempt, including when gpu_execution is off.
+    uint64_t provider_internal_skips = 0;
+    uint64_t hidden_catalog_skips    = 0;
+    uint64_t classification_failures = 0;
   };
 
   /// Monotonic counters describing compressed-materialization activity.
@@ -593,6 +642,9 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record a planning attempt declined before the gpu_execution gate.
+  void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
+
   /// \brief Snapshot counters for compressed-materialization observability.
   [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
     const noexcept;
@@ -731,6 +783,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
+  std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
+  std::atomic<uint64_t> transparent_classification_failure_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};

@@ -52,8 +52,11 @@
 #include <cuda/std/algorithm>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
 
 namespace sirius::cuda::scan {
 
@@ -73,16 +76,53 @@ struct fsst_header_t {
   uint32_t fsst_symbol_table_offset;
 };
 
-//! @brief Copy FSST header @p hdr into @p base, bounded by the buffer size @p limit.
-//! @return true if the header was successfully copied (i.e. the header fits within the buffer), and
-//! if the header metadata is valid; false otherwise.
+constexpr char const* FSST_CODEC_NAME = "FSST";
+
+//! Validate header bounds and row/bit index ranges before decoding.
+//! The length pass starts at row zero, so partial-segment starts are unsupported.
+//! Payload offsets remain device-side checks.
+void validate_fsst_segment(size_t seg_idx,
+                           gpu_string_segment_desc const& seg,
+                           fsst_header_t const& hdr)
+{
+  auto fail = [&](std::string const& what) {
+    throw_malformed_segment(FSST_CODEC_NAME, seg_idx, seg, what);
+  };
+  uint64_t const bytes_size = seg.bytes_size;
+  if (seg.seg_row_start != 0) {
+    fail("seg_row_start " + std::to_string(seg.seg_row_start) +
+         ": the FSST length pass decodes whole segments only");
+  }
+  if (hdr.bitpacking_width > MAX_BITPACKING_WIDTH) {
+    fail("bitpacking_width " + std::to_string(hdr.bitpacking_width) + " > 32");
+  }
+  if (hdr.dict_end > bytes_size) { fail("dict_end past bytes_size"); }
+  if (uint64_t{hdr.fsst_symbol_table_offset} + FSST_SYMTAB_HEADER_BYTES > hdr.dict_end) {
+    fail("symbol table header at offset " + std::to_string(hdr.fsst_symbol_table_offset) +
+         " reaches past dict_end");
+  }
+  uint64_t const rows = seg.row_count;
+  // The kernels form row and bit indices in 32-bit signed arithmetic.
+  constexpr uint64_t kernel_index_limit = std::numeric_limits<int32_t>::max();
+  if (rows > kernel_index_limit || rows * hdr.bitpacking_width > kernel_index_limit) {
+    fail("row or bit index for rows " + std::to_string(rows) +
+         " does not fit the kernels' 32-bit index arithmetic");
+  }
+  if (sizeof(fsst_header_t) + packed_words_bytes(rows, hdr.bitpacking_width) >
+      hdr.fsst_symbol_table_offset) {
+    fail("packed lengths for rows " + std::to_string(rows) + " reach into the symbol table");
+  }
+}
+
+//! Read the header from base and check its region bounds.
 __device__ __forceinline__ bool parse_fsst_header(uint8_t const* base,
                                                   uint32_t limit,
                                                   fsst_header_t* hdr)
 {
   if (limit < sizeof(fsst_header_t)) return false;
   memcpy(hdr, base, sizeof(fsst_header_t));
-  return hdr->dict_end <= limit && hdr->fsst_symbol_table_offset < hdr->dict_end &&
+  return hdr->dict_end <= limit && hdr->dict_end >= FSST_SYMTAB_HEADER_BYTES &&
+         hdr->fsst_symbol_table_offset <= hdr->dict_end - FSST_SYMTAB_HEADER_BYTES &&
          hdr->bitpacking_width <= MAX_BITPACKING_WIDTH;
 }
 
@@ -355,16 +395,23 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_gather_fsst_chunked(
 
 }  // namespace
 
-prepared_fsst prepare_fsst(gpu_string_codec_run const& run)
+prepared_fsst prepare_fsst(gpu_string_codec_run const& run, rmm::cuda_stream_view stream)
 {
   prepared_fsst out;
   out.total_fsst_row_count = 0;
+  if (run.segments.empty()) return out;
   out.length_descs.reserve(run.segments.size());
   out.row_starts.reserve(run.segments.size());
 
+  static thread_local pinned_host_pool headers_pool;
+  auto const* headers =
+    fetch_segment_headers<fsst_header_t>(run, headers_pool, FSST_CODEC_NAME, stream);
+
   // Segment descriptors for pass-1 A+B.
-  for (auto const& seg : run.segments) {
+  for (size_t i = 0; i < run.segments.size(); ++i) {
+    auto const& seg = run.segments[i];
     if (seg.row_count == 0) continue;
+    validate_fsst_segment(i, seg, headers[i]);
     out.row_starts.push_back(out.total_fsst_row_count);
     out.total_fsst_row_count += seg.row_count;
     out.length_descs.push_back(
