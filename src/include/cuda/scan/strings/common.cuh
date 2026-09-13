@@ -145,6 +145,13 @@ struct prepared_dict_fsst {
 //! Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
+//! Mirror of BitpackingPrimitives::GetRequiredSize: DuckDB reserves whole groups of 32 values
+//! for each bitpacked region.
+constexpr uint64_t bitpacked_region_bytes(uint64_t count, uint64_t width)
+{
+  return ((count + 31u) / 32u) * 32u * width / 8u;
+}
+
 //! @brief Target CTA count for chunking segments: two full device waves at
 //! STRINGS_BLOCK_DIM threads. Cached per device.
 inline uint32_t get_target_ctas()
