@@ -3238,6 +3238,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     Value(""));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_provenance_failure",
+                    "make connection provenance classification fail on this connection",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_pinned_zone_map_pruning",
                     "disable automatic pinned-table zone-map capture and pruning",
                     LogicalType::BOOLEAN,

@@ -17,11 +17,14 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include "sirius_context.hpp"
+#include "transparent/connection_provenance.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
+#include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/planner/binder.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/planner/expression/bound_conjunction_expression.hpp>
 #include <duckdb/planner/expression_iterator.hpp>
@@ -216,15 +219,23 @@ void derive_join_dependent_filters_recursive(duckdb::LogicalOperator& op)
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!plan || !gpu_execution_enabled(input.context)) { return; }
-  // Mirror sirius_optimizer_hook's gate: when Sirius never initialized (or this
-  // is one of its internal queries), the query runs on CPU and its plan must
+  if (!plan) { return; }
+  auto& context = input.context;
+  auto ctx      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!ctx) { return; }
+  auto conn_state = duckdb::get_sirius_connection_state(context);
+  if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  // Screen before optimization can remove scans, including when GPU execution is off.
+  if (screen_planning_attempt(
+        context, *ctx, *conn_state, plan.get(), &input.optimizer.binder.GetStatementProperties()) !=
+      decline_reason::none) {
+    return;
+  }
+  // Mirror sirius_optimizer_hook's gate: when Sirius never initialized (or the
+  // GPU is off for this connection), the query runs on CPU and its plan must
   // stay byte-identical to a stock DuckDB plan — the derivation is
   // row-preserving but still perturbs EXPLAIN output and cost estimates.
-  auto ctx = input.context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!ctx || !ctx->is_initialized()) { return; }
-  auto conn_state = duckdb::get_sirius_connection_state(input.context);
-  if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
 
   // Optimizer hooks must not throw: a failed derivation only costs the pushdown, never the query.
   try {
@@ -244,14 +255,18 @@ duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOpe
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
 {
-  if (!gpu_execution_enabled(input.context)) { return; }
-
   auto& context = input.context;
 
   auto ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!ctx || !ctx->is_initialized()) { return; }
+  if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
+  if (screen_planning_attempt(context, *ctx, *conn_state, nullptr, nullptr) !=
+      decline_reason::none) {
+    return;
+  }
+  if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
 
   // Copy the optimized plan into THIS connection's per-connection state,
   // stamped with the current planning generation. OnFinalizePrepare will

@@ -37,6 +37,7 @@
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
+#include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
@@ -1167,7 +1168,29 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
     .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
     .runtime_fallbacks  = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .provider_internal_skips =
+      transparent_provider_internal_skip_count_.load(std::memory_order_relaxed),
+    .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
+    .classification_failures =
+      transparent_classification_failure_count_.load(std::memory_order_relaxed),
   };
+}
+
+void SiriusContext::record_transparent_decline(sirius::transparent::decline_reason reason) noexcept
+{
+  using sirius::transparent::decline_reason;
+  switch (reason) {
+    case decline_reason::provider_internal:
+      transparent_provider_internal_skip_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::hidden_catalog:
+      transparent_hidden_catalog_skip_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::classification_failed:
+      transparent_classification_failure_count_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case decline_reason::none: break;
+  }
 }
 
 void SiriusContext::record_transparent_rebind_success() noexcept
@@ -1358,27 +1381,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
-  // Mirror the optimizer hook's gpu_execution gate: when transparent execution
-  // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
-  // never rewrite the physical plan even if we could.
-  {
-    duckdb::Value setting;
-    auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
-    if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
-      if (conn_state) { conn_state->clear_captured_plan(); }
-      return RebindQueryInfo::DO_NOT_REBIND;
-    }
-  }
-  if (!is_initialized_) {
-    if (conn_state) { conn_state->clear_captured_plan(); }
-    return RebindQueryInfo::DO_NOT_REBIND;
-  }
-
-  // Only intercept SELECT statements.
-  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
-    if (conn_state) { conn_state->clear_captured_plan(); }
-    return RebindQueryInfo::DO_NOT_REBIND;
-  }
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
   // A generation mismatch (e.g. a leftover from Connection::ExtractPlan, which
@@ -1388,8 +1390,35 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // whose bind_data isn't serializable so plan->Copy() failed), re-plan from
   // the unbound SQL statement — this is what gpu_execution(...) does
   // internally and it works even when LogicalGet::Copy can't.
+  //
+  // Consume the capture before screening so a declined attempt leaves none behind.
+  // Binder properties retain hidden catalog references even when hooks are disabled
+  // or optimization removes scans. Screen before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
-  if (conn_state) { logical_plan = conn_state->take_captured_plan_if_current(); }
+  if (conn_state) {
+    logical_plan = conn_state->take_captured_plan_if_current();
+    if (sirius::transparent::screen_planning_attempt(
+          context, *this, *conn_state, nullptr, &prepared.properties) !=
+        sirius::transparent::decline_reason::none) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+  }
+  // Mirror the optimizer hook's gpu_execution gate: when transparent execution
+  // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
+  // never rewrite the physical plan even if we could.
+  {
+    duckdb::Value setting;
+    auto have_setting = context.TryGetCurrentSetting("gpu_execution", setting);
+    if (!have_setting || setting.IsNull() || !setting.GetValue<bool>()) {
+      return RebindQueryInfo::DO_NOT_REBIND;
+    }
+  }
+  if (!is_initialized_) { return RebindQueryInfo::DO_NOT_REBIND; }
+
+  // Only intercept SELECT statements.
+  if (prepared.statement_type != StatementType::SELECT_STATEMENT) {
+    return RebindQueryInfo::DO_NOT_REBIND;
+  }
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
