@@ -37,6 +37,7 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/exchange_staging_arena.hpp"                 // sirius::exec::exchange_staging_arena
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
@@ -241,6 +242,12 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   //! stream_bind_catalog: also in registered_state; held here past registered_state resets.
   duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
+  //! Cross-node exchange staging (opt-in via SIRIUS_EXCHANGE_STAGING_BYTES; null otherwise, and
+  //! every staging call errors loudly). Plain cudaMalloc by contract — see the arena's header.
+  //! `shared_ptr` so a `StagingArena` handle can serve leases from other threads (the arena's
+  //! internal mutex makes that safe) and outlive this context; there is still exactly ONE
+  //! allocator — the handle shares it, never mirrors it.
+  std::shared_ptr<sirius::exec::exchange_staging_arena> staging_arena;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -269,6 +276,10 @@ struct Context::Impl {
     stream_catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
     client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, stream_catalog);
     sirius::exec::register_stream_source_function(*db->instance);
+
+    // After engine bring-up so the arena's cudaMalloc comes out of the headroom the operator
+    // left beside the pool budget, not out of memory the pool then misses.
+    staging_arena                  = sirius::exec::exchange_staging_arena::from_env();
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
@@ -348,12 +359,63 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
 }
 
+std::uint64_t Context::staging_lease(std::uint64_t len)
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).lease(len);
+}
+
+void Context::staging_release(std::uint64_t offset)
+{
+  sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).release(offset);
+}
+
+std::uintptr_t Context::staging_base() const
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).base();
+}
+
+std::uint64_t Context::staging_capacity() const
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).capacity();
+}
+
+std::unique_ptr<StagingArena> Context::staging_arena_handle() const
+{
+  if (impl_->staging_arena == nullptr) { return nullptr; }
+  return std::make_unique<StagingArena>(impl_->staging_arena);
+}
+
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
 {
   return std::make_unique<Context>(config_path);
 }
+
+// ---------------------------------------------------------------------------
+// StagingArena
+// ---------------------------------------------------------------------------
+
+// Thread-safety contract (documented on the class): every method below only touches the arena,
+// whose lease/release serialize on its internal std::mutex and make no CUDA calls — so unlike
+// the Context methods above, these are callable from any thread.
+
+StagingArena::StagingArena(std::shared_ptr<sirius::exec::exchange_staging_arena> arena)
+  : arena_(std::move(arena))
+{
+}
+
+StagingArena::~StagingArena() = default;
+
+std::uint64_t StagingArena::lease(std::uint64_t len) const { return arena_->lease(len); }
+
+void StagingArena::release(std::uint64_t offset) const { arena_->release(offset); }
+
+std::uintptr_t StagingArena::base() const noexcept { return arena_->base(); }
+
+std::uint64_t StagingArena::capacity() const noexcept { return arena_->capacity(); }
+
+std::size_t StagingArena::outstanding() const { return arena_->outstanding(); }
 
 // ---------------------------------------------------------------------------
 // Fragment
