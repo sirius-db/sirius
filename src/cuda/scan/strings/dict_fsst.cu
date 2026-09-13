@@ -52,6 +52,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -89,10 +91,103 @@ struct dict_fsst_pre_desc {
   uint32_t dict_count;
   uint8_t mode;
   uint8_t string_lengths_width;
-  uint8_t valid;  ///< 0 = host-validated as a stub (kernel writes zeros and returns)
+  uint8_t valid;  ///< 0 for a zero-row segment
   uint8_t _pad;
 };
 static_assert(sizeof(dict_fsst_pre_desc) % 4 == 0);
+
+struct dict_fsst_layout {
+  uint32_t off_dict;
+  uint32_t off_symtab;
+  uint32_t off_slens;
+  uint32_t off_didx;  ///< 0 in FSST_ONLY (no indices region)
+};
+
+constexpr char const* DICT_FSST_CODEC_NAME = "DICT_FSST";
+
+//! A segment holds at most one row group of entries plus the NULL slot
+//! (DuckDB Storage::MAX_ROW_GROUP_SIZE = 2^30).
+constexpr uint64_t DICT_FSST_MAX_DICT_COUNT = (uint64_t{1} << 30) + 1u;
+
+//! Kernels form bit positions and row indices in 32-bit signed arithmetic.
+constexpr uint64_t KERNEL_INDEX_LIMIT = std::numeric_limits<int32_t>::max();
+
+constexpr uint64_t align_up8_u64(uint64_t n) { return (n + 7u) & ~uint64_t{7}; }
+
+//! Validate header bounds and row/bit index ranges before decoding. Zero widths are legal: no
+//! indices region in FSST_ONLY, every index 0 for a NULL-slot-only dictionary, every entry empty
+//! for zero-width lengths. Payloads are not checked here.
+dict_fsst_layout validate_dict_fsst_segment(size_t seg_idx,
+                                            gpu_string_segment_desc const& seg,
+                                            dict_fsst_header_t const& hdr)
+{
+  auto fail = [&](std::string const& what) {
+    throw_malformed_segment(DICT_FSST_CODEC_NAME, seg_idx, seg, what);
+  };
+  uint64_t const bytes_size = seg.bytes_size;
+  if (hdr.mode > DICT_FSST_MODE_FSST_ONLY) {
+    fail("mode " + std::to_string(hdr.mode) + " is not one of 0/1/2");
+  }
+  if (hdr.dict_count == 0) { fail("dict_count 0 (the NULL slot is always present)"); }
+  if (hdr.dict_count > DICT_FSST_MAX_DICT_COUNT) {
+    fail("dict_count " + std::to_string(hdr.dict_count) + " exceeds a row group");
+  }
+  if (hdr.string_lengths_width > MAX_BITPACKING_WIDTH) {
+    fail("string_lengths_width " + std::to_string(hdr.string_lengths_width) + " > 32");
+  }
+  if (hdr.dictionary_indices_width > MAX_BITPACKING_WIDTH) {
+    fail("dictionary_indices_width " + std::to_string(hdr.dictionary_indices_width) + " > 32");
+  }
+  bool const has_symtab = hdr.mode != DICT_FSST_MODE_DICTIONARY;
+  if (has_symtab && hdr.symbol_table_size > FSST_SYMTAB_MAX_BYTES) {
+    fail("symbol_table_size " + std::to_string(hdr.symbol_table_size) + " > " +
+         std::to_string(FSST_SYMTAB_MAX_BYTES));
+  }
+  // Keep this predicate aligned with has_fsst in kernel_build_dict_fsst_data.
+  bool const imports_symtab = has_symtab && hdr.dict_count > 1;
+  if (imports_symtab && hdr.symbol_table_size < FSST_SYMTAB_HEADER_BYTES) {
+    fail("symbol_table_size " + std::to_string(hdr.symbol_table_size) +
+         " is shorter than the FSST symbol table header");
+  }
+
+  uint64_t const off_dict = align_up8_u64(sizeof(dict_fsst_header_t));
+  uint64_t const dict_end = off_dict + hdr.dict_size;
+  if (dict_end > bytes_size) { fail("dictionary bytes end past bytes_size"); }
+  uint64_t const off_symtab  = align_up8_u64(dict_end);
+  uint64_t const symtab_size = has_symtab ? hdr.symbol_table_size : 0u;
+  if (has_symtab && off_symtab + symtab_size > bytes_size) {
+    fail("symbol table ends past bytes_size");
+  }
+  uint64_t const off_slens = align_up8_u64(off_symtab + symtab_size);
+  uint64_t const slens_end =
+    off_slens + bitpacked_region_bytes(hdr.dict_count, hdr.string_lengths_width);
+  if (slens_end > bytes_size) { fail("string_lengths region ends past bytes_size"); }
+
+  uint64_t const rows_end = uint64_t{seg.seg_row_start} + seg.row_count;
+  if (rows_end > KERNEL_INDEX_LIMIT ||
+      uint64_t{hdr.dict_count} * hdr.string_lengths_width > KERNEL_INDEX_LIMIT ||
+      rows_end * hdr.dictionary_indices_width > KERNEL_INDEX_LIMIT) {
+    fail("row or bit index for rows " + std::to_string(rows_end) +
+         " does not fit the kernels' 32-bit index arithmetic");
+  }
+  uint64_t off_didx = 0;
+  if (hdr.mode == DICT_FSST_MODE_FSST_ONLY) {
+    if (rows_end + 1u > hdr.dict_count) {
+      fail("FSST_ONLY rows " + std::to_string(rows_end) + " exceed dict_count " +
+           std::to_string(hdr.dict_count));
+    }
+  } else {
+    off_didx = align_up8_u64(slens_end);
+    if (off_didx + bitpacked_region_bytes(rows_end, hdr.dictionary_indices_width) > bytes_size) {
+      fail("dictionary_indices region for rows " + std::to_string(rows_end) +
+           " ends past bytes_size");
+    }
+  }
+  return {static_cast<uint32_t>(off_dict),
+          static_cast<uint32_t>(off_symtab),
+          static_cast<uint32_t>(off_slens),
+          static_cast<uint32_t>(off_didx)};
+}
 
 //! @brief One CTA per segment: parse the symbol table on device, unpack
 //! string_lengths into byte_offsets and inclusive-scan it, then for FSST modes
@@ -421,8 +516,7 @@ __global__ void kernel_gather_dict_fsst(dict_fsst_desc const* __restrict__ descs
   }
 }
 
-/// Fold inline NULLs (idx==0) into the column mask — DuckDB ships
-/// COMPRESSION_EMPTY validity for these, which the overlay path skips.
+/// Fold index-0 NULLs into the column mask.
 __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ descs,
                                             uint8_t* __restrict__ d_mask,
                                             int num_segments)
@@ -446,65 +540,10 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
   }
 }
 
-/// Stub descriptor for malformed segments — kernel zero-fills these rows.
-dict_fsst_desc make_stub_dict_fsst_desc(gpu_string_segment_desc const& seg)
-{
-  return {seg.d_bytes,
-          seg.bytes_size,
-          seg.row_count,
-          seg.row_offset,
-          seg.seg_row_start,
-          0u,
-          0u,
-          0u,
-          0u,
-          0u,
-          0u,
-          0u,
-          0u,
-          {0, 0, 0, 0, 0, 0}};
-}
-
-//! @brief Resizable pinned-host scratch buffer, grown on demand and reused
-//! across calls (one instance per usage site).
-class pinned_host_pool {
-  void* ptr_  = nullptr;
-  size_t cap_ = 0;
-
- public:
-  void* get(size_t bytes)
-  {
-    if (bytes > cap_) {
-      if (ptr_) cudaFreeHost(ptr_);
-      ptr_ = nullptr;
-      cap_ = 0;
-      if (bytes > 0) {
-        RMM_CUDA_TRY(cudaMallocHost(&ptr_, bytes));
-        cap_ = bytes;
-      }
-    }
-    return ptr_;
-  }
-  ~pinned_host_pool()
-  {
-    if (ptr_) cudaFreeHost(ptr_);
-  }
-};
-
 }  // namespace
 
-//! @brief Build per-segment DICT_FSST predecode state on device.
-//!
-//! Pipeline:
-//!   1. Batched async D2H of all headers (one stream-sync, pinned host pool).
-//!   2. Validate headers + compute per-segment region offsets and a cumulative
-//!      `base_off` into the flat byte_offsets / decoded_offsets arrays.
-//!   3. Launch `kernel_build_dict_fsst_data` — one CTA per segment does symbol
-//!      table import, string_lengths unpack + scan, FSST per-entry decoded
-//!      length walks, and per-segment scalar outputs.
-//!   4. Batched async D2H of the small result buffers (one stream-sync).
-//!   5. Host-side build of `dict_fsst_desc[]` with the cross-segment
-//!      `predecode_seg_offset` prefix sum.
+//! Prepare DICT_FSST state after host validation. Synchronizes for headers and, when rows
+//! are present, for device-built offsets, decoders and decoded totals needed by the host.
 prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
                                      rmm::cuda_stream_view stream,
                                      rmm::device_async_resource_ref mr)
@@ -520,60 +559,43 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
 
   // Phase 1: batched async D2H of all headers into pinned host memory, one sync.
   static thread_local pinned_host_pool headers_pool;
-  auto* headers =
-    static_cast<dict_fsst_header_t*>(headers_pool.get(sizeof(dict_fsst_header_t) * num_segs));
-  for (uint32_t i = 0; i < num_segs; ++i) {
-    auto const& seg = run.segments[i];
-    if (seg.row_count == 0 || seg.bytes_size < sizeof(dict_fsst_header_t)) {
-      headers[i].mode = 0xFFu;  // out-of-range marker, host-validated below
-      continue;
-    }
-    RMM_CUDA_TRY(cudaMemcpyAsync(&headers[i],
-                                 seg.d_bytes,
-                                 sizeof(dict_fsst_header_t),
-                                 cudaMemcpyDeviceToHost,
-                                 stream.value()));
-  }
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  auto const* headers =
+    fetch_segment_headers<dict_fsst_header_t>(run, headers_pool, DICT_FSST_CODEC_NAME, stream);
 
   // Phase 2: validate, compute per-segment region offsets + cumulative
   // base_off into the global byte/decoded_offsets arrays.
   std::vector<dict_fsst_pre_desc> pre(num_segs);
-  uint32_t total_dict_entries = 0;  // sum of (dict_count + 1) for valid segs
+  std::vector<uint32_t> indices_offsets(num_segs, 0u);
+  // Sum of (dict_count + 1) over non-empty segments: the index base into the
+  // flat byte/decoded offset arrays, which the kernels address with uint32.
+  uint64_t total_dict_entries = 0;
   for (uint32_t i = 0; i < num_segs; ++i) {
     auto const& seg = run.segments[i];
     auto& p         = pre[i];
     p.valid         = 0;
     p.d_bytes       = seg.d_bytes;
     p.bytes_size    = seg.bytes_size;
-    if (seg.row_count == 0 || seg.bytes_size < sizeof(dict_fsst_header_t)) continue;
-    auto const& hdr = headers[i];
-    if (hdr.mode > DICT_FSST_MODE_FSST_ONLY) continue;
+    if (seg.row_count == 0) continue;
+    auto const& hdr   = headers[i];
+    auto const layout = validate_dict_fsst_segment(i, seg, hdr);
+    if (total_dict_entries + hdr.dict_count + 1u > std::numeric_limits<uint32_t>::max()) {
+      throw_malformed_segment(
+        DICT_FSST_CODEC_NAME, i, seg, "cumulative dictionary entries exceed the 32-bit index");
+    }
 
-    uint32_t off_dict   = align_up8(static_cast<uint32_t>(sizeof(hdr)));
-    uint32_t off_symtab = align_up8(off_dict + hdr.dict_size);
-    uint32_t off_slens  = align_up8(off_symtab + hdr.symbol_table_size);
-    uint32_t off_didx   = align_up8(off_slens + static_cast<uint32_t>(bitpacked_region_bytes(
-                                                  hdr.dict_count, hdr.string_lengths_width)));
-    if (off_didx > seg.bytes_size && hdr.mode != DICT_FSST_MODE_FSST_ONLY) continue;
-
-    p.off_dict             = off_dict;
-    p.off_symtab           = off_symtab;
-    p.off_slens            = off_slens;
+    p.off_dict             = layout.off_dict;
+    p.off_symtab           = layout.off_symtab;
+    p.off_slens            = layout.off_slens;
     p.dict_count           = hdr.dict_count;
     p.mode                 = hdr.mode;
     p.string_lengths_width = hdr.string_lengths_width;
-    p.base_off             = total_dict_entries;
+    p.base_off             = static_cast<uint32_t>(total_dict_entries);
     p.valid                = 1;
+    indices_offsets[i]     = layout.off_didx;
     total_dict_entries += hdr.dict_count + 1u;
   }
 
-  if (total_dict_entries == 0) {
-    for (auto const& seg : run.segments) {
-      if (seg.row_count > 0) out.descs.push_back(make_stub_dict_fsst_desc(seg));
-    }
-    return out;
-  }
+  if (total_dict_entries == 0) return out;  // every segment is empty
 
   // Phase 3: launch the on-device prep kernel.
   rmm::device_buffer d_pre_buf(pre.size() * sizeof(dict_fsst_pre_desc), stream, mr);
@@ -659,35 +681,27 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
   for (uint32_t i = 0; i < num_segs; ++i) {
     auto const& seg = run.segments[i];
     if (seg.row_count == 0) continue;
-    auto const& p = pre[i];
-    if (!p.valid) {
-      out.descs.push_back(make_stub_dict_fsst_desc(seg));
-      continue;
-    }
+    auto const& p          = pre[i];
     auto const& hdr        = headers[i];
     uint32_t predecode_off = 0;
     if (p.mode == DICT_FSST_MODE_DICT_FSST) {
       predecode_off = predecode_cursor;
       predecode_cursor += per_seg_total[i];
     }
-    out.descs.push_back(
-      {seg.d_bytes,
-       seg.bytes_size,
-       seg.row_count,
-       seg.row_offset,
-       seg.seg_row_start,
-       p.off_dict,
-       (p.mode == DICT_FSST_MODE_FSST_ONLY)
-         ? 0u
-         : align_up8(p.off_slens + static_cast<uint32_t>(bitpacked_region_bytes(
-                                     p.dict_count, p.string_lengths_width))),
-       p.base_off,
-       i,  // seg_decoder_idx — 1:1 with seg_idx in the new layout
-       p.dict_count,
-       predecode_off,
-       hdr.dictionary_indices_width,
-       p.mode,
-       {0, 0, 0, 0, 0, 0}});
+    out.descs.push_back({seg.d_bytes,
+                         seg.bytes_size,
+                         seg.row_count,
+                         seg.row_offset,
+                         seg.seg_row_start,
+                         p.off_dict,
+                         indices_offsets[i],
+                         p.base_off,
+                         i,  // seg_decoder_idx — 1:1 with seg_idx in the new layout
+                         p.dict_count,
+                         predecode_off,
+                         hdr.dictionary_indices_width,
+                         p.mode,
+                         {0, 0, 0, 0, 0, 0}});
     if (per_seg_inline_null[i]) out.any_inline_nulls = true;
   }
   out.total_predecode_bytes = predecode_cursor;

@@ -30,9 +30,10 @@
 
 namespace sirius::cuda::scan {
 
-//! @brief Build the per-segment length descriptors, per-chunk gather descriptors, decoder slots,
-//! and FSST row-start prefix for an FSST codec run.
-prepared_fsst prepare_fsst(gpu_string_codec_run const& run);
+//! @brief Prepare FSST length/gather descriptors, decoder slots and row-start prefixes.
+//! For a non-empty run, read non-zero-row headers with one stream sync. Invalid header
+//! bounds throw std::runtime_error before decoding; payload contents are not validated here.
+prepared_fsst prepare_fsst(gpu_string_codec_run const& run, rmm::cuda_stream_view stream);
 
 //! @brief Pass 1: build the per-segment decoders, prefix-sum the compressed lengths into
 //! @p d_comp_offsets, and write each row's decoded length into @p d_lengths. No-op when

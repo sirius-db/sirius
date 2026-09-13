@@ -119,7 +119,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   for (auto const& run : col.data) {
     switch (run.codec) {
       case duckdb::CompressionType::COMPRESSION_DICTIONARY: {
-        auto p = prepare_dict(run);
+        auto p = prepare_dict(run, stream);
         prep_dict.descs_short.insert(
           prep_dict.descs_short.end(), p.descs_short.begin(), p.descs_short.end());
         prep_dict.descs_long.insert(
@@ -127,7 +127,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         break;
       }
       case duckdb::CompressionType::COMPRESSION_FSST: {
-        auto p = prepare_fsst(run);
+        auto p = prepare_fsst(run, stream);
         // Rebase row_starts + decoder indices into the merged FSST set.
         auto const row_count_base     = prep_fsst.total_fsst_row_count;
         auto const decoder_count_base = static_cast<uint32_t>(prep_fsst.decoders.size());
