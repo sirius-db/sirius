@@ -17,13 +17,11 @@
 //===----------------------------------------------------------------------===//
 // DICT_FSST string codec. On-disk segment layout (DuckDB):
 //
-//   +-----+------------+--------+----------------+--------------------+
-//   | hdr | dict bytes | symtab | string_lengths |    dict_indices    |
-//   | 16B |            |        |                |  (absent: mode 2)  |
-//   +-----+------------+--------+----------------+--------------------+
-//   0     off_dict     off_symtab               off_slens         off_didx
+//   header | dictionary bytes | symbol table | packed lengths | packed indices
 //
-// All regions 8-byte aligned (DuckDB AlignValue).
+// Regions are 8-byte aligned. Bitpacked lengths and indices occupy whole
+// groups of 32 values. Mode 0 has no symbol table. Offsets follow
+// duckdb/src/storage/compression/dict_fsst/decompression.cpp.
 //
 // Modes (hdr.mode):
 //   0 DICTIONARY  — dict bytes raw; gather is memcpy.
@@ -33,8 +31,8 @@
 //   2 FSST_ONLY   — all rows unique; row i → dict entry i+1; no dict_indices
 //                   region; gather inline-decompresses each row.
 //
-// dict_idx == 0 = NULL. DuckDB ships COMPRESSION_EMPTY validity for these,
-// which the overlay path skips — mark_nulls folds them in.
+// Dictionary index 0 encodes NULL. mark_nulls updates the mask even when
+// DuckDB omits a separate validity payload.
 // The on-device FSST decode core (detail/fsst.cuh) is shared with the FSST codec.
 //===----------------------------------------------------------------------===//
 
@@ -554,11 +552,9 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
 
     uint32_t off_dict   = align_up8(static_cast<uint32_t>(sizeof(hdr)));
     uint32_t off_symtab = align_up8(off_dict + hdr.dict_size);
-    uint32_t off_slens  = (hdr.mode == DICT_FSST_MODE_DICTIONARY)
-                            ? off_dict + align_up8(hdr.dict_size)
-                            : align_up8(off_symtab + hdr.symbol_table_size);
-    uint32_t slens_bits = hdr.dict_count * hdr.string_lengths_width;
-    uint32_t off_didx   = align_up8(off_slens + (slens_bits + 7u) / 8u);
+    uint32_t off_slens  = align_up8(off_symtab + hdr.symbol_table_size);
+    uint32_t off_didx   = align_up8(off_slens + static_cast<uint32_t>(bitpacked_region_bytes(
+                                                  hdr.dict_count, hdr.string_lengths_width)));
     if (off_didx > seg.bytes_size && hdr.mode != DICT_FSST_MODE_FSST_ONLY) continue;
 
     p.off_dict             = off_dict;
@@ -683,7 +679,8 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
        p.off_dict,
        (p.mode == DICT_FSST_MODE_FSST_ONLY)
          ? 0u
-         : align_up8(p.off_slens + (p.dict_count * p.string_lengths_width + 7u) / 8u),
+         : align_up8(p.off_slens + static_cast<uint32_t>(bitpacked_region_bytes(
+                                     p.dict_count, p.string_lengths_width))),
        p.base_off,
        i,  // seg_decoder_idx — 1:1 with seg_idx in the new layout
        p.dict_count,
