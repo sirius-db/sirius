@@ -37,8 +37,11 @@
 #include "cuda/scan/strings/dictionary.cuh"
 #include "cuda/scan/unpack_value.cuh"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
 
 namespace sirius::cuda::scan {
 
@@ -52,6 +55,40 @@ struct dict_header_t {
   uint32_t index_buffer_count;
   uint32_t bitpacking_width;  ///< selection buffer
 };
+
+constexpr char const* DICTIONARY_CODEC_NAME = "DICTIONARY";
+
+//! Validate header bounds and row/bit index ranges before decoding.
+//! Payload index values remain device-side checks.
+void validate_dict_segment(size_t seg_idx,
+                           gpu_string_segment_desc const& seg,
+                           dict_header_t const& hdr)
+{
+  auto fail = [&](std::string const& what) {
+    throw_malformed_segment(DICTIONARY_CODEC_NAME, seg_idx, seg, what);
+  };
+  uint64_t const bytes_size = seg.bytes_size;
+  if (hdr.bitpacking_width > MAX_BITPACKING_WIDTH) {
+    fail("bitpacking_width " + std::to_string(hdr.bitpacking_width) + " > 32");
+  }
+  uint64_t const rows_end = uint64_t{seg.seg_row_start} + seg.row_count;
+  // The kernels form row and bit indices in 32-bit signed arithmetic.
+  constexpr uint64_t kernel_index_limit = std::numeric_limits<int32_t>::max();
+  if (rows_end > kernel_index_limit || rows_end * hdr.bitpacking_width > kernel_index_limit) {
+    fail("row or bit index for rows " + std::to_string(rows_end) +
+         " does not fit the kernels' 32-bit index arithmetic");
+  }
+  if (sizeof(dict_header_t) + packed_words_bytes(rows_end, hdr.bitpacking_width) >
+      hdr.index_buffer_offset) {
+    fail("selection buffer for rows " + std::to_string(rows_end) +
+         " reaches into the index buffer");
+  }
+  if (uint64_t{hdr.index_buffer_offset} + uint64_t{hdr.index_buffer_count} * sizeof(uint32_t) >
+      bytes_size) {
+    fail("index buffer ends past bytes_size");
+  }
+  if (hdr.dict_end > bytes_size) { fail("dict_end past bytes_size"); }
+}
 
 //! @brief Parse DICTIONARY header @p hdr from @p base, bounded by the buffer size @p limit.
 //! @return true if the header was successfully parsed (i.e. the header fits within the buffer), and
@@ -192,11 +229,17 @@ __global__ void kernel_gather_dict_warp(string_chunk_desc const* __restrict__ de
 
 }  // namespace
 
-prepared_dict prepare_dict(gpu_string_codec_run const& run)
+prepared_dict prepare_dict(gpu_string_codec_run const& run, rmm::cuda_stream_view stream)
 {
   prepared_dict out;
-  for (auto const& seg : run.segments) {
+  if (run.segments.empty()) return out;
+  static thread_local pinned_host_pool headers_pool;
+  auto const* headers =
+    fetch_segment_headers<dict_header_t>(run, headers_pool, DICTIONARY_CODEC_NAME, stream);
+  for (size_t i = 0; i < run.segments.size(); ++i) {
+    auto const& seg = run.segments[i];
     if (seg.row_count == 0) continue;
+    validate_dict_segment(i, seg, headers[i]);
     string_chunk_desc d{
       seg.d_bytes, seg.bytes_size, seg.row_count, seg.row_offset, seg.seg_row_start};
     auto& bucket =
