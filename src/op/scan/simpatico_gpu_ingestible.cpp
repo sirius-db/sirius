@@ -557,6 +557,25 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
 //===----------------------------------------------------------------------===//
 // materialize
 //===----------------------------------------------------------------------===//
+namespace {
+
+/// SIRIUS_EXP_HPLN_RANGE_READ -- narrow a .hpln chunk's READ to its surviving decode chunks,
+/// rather than reading the chunk whole and narrowing afterwards.
+///
+/// On by default; "0" is both the kill switch and the A/B arm that says what addressing the bytes
+/// is worth. Off, the surviving rows are still the only ones transferred and decoded -- the
+/// difference is purely what comes off the storage, which is the arm that matters over a network.
+bool hpln_range_read_enabled()
+{
+  static bool const enabled = [] {
+    auto const* value = std::getenv("SIRIUS_EXP_HPLN_RANGE_READ");
+    return value == nullptr || std::string_view{value} != "0";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
 filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   cucascade::memory::memory_space const& mem_space,
@@ -575,8 +594,18 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   // file read plus one decode rather than a decode and a re-compress.
   sirius::hpln_open_options options;
   options.io_ctx = split.io_ctx;
+  // The surviving decode chunks go INTO the read, so a chunk that whole-chunk pruning kept but its
+  // group bounds mostly rule out costs only its surviving bytes. Narrowing after the read -- which
+  // is what this did, and what a host pin still does because its bytes are already resident --
+  // saves the PCIe copy and the decode but not the I/O, and the I/O is what a network charges for.
   auto ingested = sirius::read_hpln_chunks_into_pinned(
-    split.path, *_info->host_space, split.chunk_ids, options, _staged_columns);
+    split.path,
+    *_info->host_space,
+    split.chunk_ids,
+    options,
+    _staged_columns,
+    hpln_range_read_enabled() ? std::span<const std::vector<std::uint32_t>>{split.decode_chunks}
+                              : std::span<const std::vector<std::uint32_t>>{});
 
   rmm::device_async_resource_ref mr(mem_space.get_default_allocator());
   std::vector<std::unique_ptr<cudf::table>> decoded;
@@ -598,7 +627,12 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     std::vector<std::uint8_t> subset_header;
     std::vector<simpatico::gather_range> gather;
     bool use_subset = false;
-    if (i < split.decode_chunks.size() && !split.decode_chunks[i].empty()) {
+    // Already narrowed at read time: the blob IS the surviving rows, so there is nothing left to
+    // subset and the whole-payload fetch below addresses exactly them.
+    if (ingested[i].rows_narrowed) {
+      _chunks_read_narrowed.fetch_add(1, std::memory_order_relaxed);
+      _bytes_staged.fetch_add(ingested[i].blob->payload_bytes, std::memory_order_relaxed);
+    } else if (i < split.decode_chunks.size() && !split.decode_chunks[i].empty()) {
       simpatico::payload_host_read_fn read_metadata =
         [&blob](std::uint64_t off, std::uint64_t size, void* dst) {
           copy_pinned_blocks_to_host(*blob.payload, off, dst, size);

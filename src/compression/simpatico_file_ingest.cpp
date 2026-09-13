@@ -404,6 +404,110 @@ std::shared_ptr<pinned_compressed_blob> allocate_chunk_columns(
   return blob;
 }
 
+/// Stage @p chunk narrowed to @p columns and/or @p decode_chunks, reading only the bytes that
+/// survive BOTH.
+///
+/// The difference from doing this after the read -- which is what the scan used to do, and what a
+/// host pin still does because its bytes are already in memory -- is the whole point: a chunk that
+/// survives whole-chunk pruning but is 92% ruled out by its group bounds was still being read in
+/// full. Over a network that is the request that costs.
+///
+/// Sizing a bitpack `packed` buffer's surviving chunks needs its chunk_count/chunk_bits, which
+/// live in the PAYLOAD, so this reads those small buffers first and the narrowed payload second.
+/// That is one extra round of small reads to avoid a large one.
+///
+/// Returns false (leaving @p out_blob null) when the narrowing is refused -- a column that is not
+/// chunk-addressable -- so the caller can fall back to staging the chunk whole. Refusing is always
+/// correct, just less selective.
+bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
+                             simpatico::hpln_chunk_ref const& chunk,
+                             std::span<const std::size_t> columns,
+                             std::span<const std::uint32_t> decode_chunks,
+                             hpln_source& src,
+                             hpln_io_policy const& policy,
+                             cucascade::memory::memory_space& host_space,
+                             std::vector<hpln_extent>& out_extents,
+                             std::shared_ptr<pinned_compressed_blob>& out_blob)
+{
+  out_blob.reset();
+
+  // Step one: the columns. Produces a header describing only them and the ranges, in FILE space,
+  // that back it.
+  std::vector<std::uint8_t> header_after_columns;
+  std::vector<simpatico::gather_range> gather_columns;
+  std::span<const std::uint8_t> working_header = header;
+  if (!columns.empty()) {
+    if (auto const err = simpatico::build_column_subset_header(
+          header, columns, header_after_columns, gather_columns, nullptr);
+        !err.empty()) {
+      return false;
+    }
+    working_header = header_after_columns;
+  }
+
+  // Step two: the rows, against whatever the first step left. Its ranges are in the FIRST step's
+  // destination space, which is why they are composed rather than used directly.
+  std::vector<std::uint8_t> narrowed_header;
+  std::vector<simpatico::gather_range> gather_rows;
+  std::uint64_t payload_bytes = 0;
+  std::vector<std::uint8_t> subsetted;
+  // Reads the small sizing buffers out of the file, translating from the first step's space when
+  // there is one.
+  simpatico::payload_host_read_fn read_payload =
+    [&](std::uint64_t off, std::uint64_t size, void* dst) {
+      if (size == 0) { return true; }
+      std::vector<simpatico::gather_range> want{{off, size, 0}};
+      auto const ranges = gather_columns.empty()
+                            ? want
+                            : simpatico::compose_gathers(gather_columns, want);
+      if (ranges.empty()) { return false; }
+      for (auto const& r : ranges) {
+        auto const bytes = src.read_range(chunk.payload_offset + r.src_offset, r.size, "sizing");
+        if (bytes.size() != r.size) { return false; }
+        std::memcpy(static_cast<std::uint8_t*>(dst) + r.dst_offset, bytes.data(), r.size);
+      }
+      return true;
+    };
+  if (auto const err = simpatico::build_chunk_subset_header(working_header,
+                                                            decode_chunks,
+                                                            read_payload,
+                                                            narrowed_header,
+                                                            gather_rows,
+                                                            /*max_gap_bytes=*/0,
+                                                            &payload_bytes,
+                                                            &subsetted);
+      !err.empty()) {
+    return false;
+  }
+  // A column emitted WHOLE beside compacted ones has a different row count, and the two cannot be
+  // one cudf::table. Every column here is one this scan reads, so any refusal refuses the chunk.
+  for (auto const flag : subsetted) {
+    if (flag == 0) { return false; }
+  }
+
+  auto const file_ranges = simpatico::compose_gathers(gather_columns, gather_rows);
+  if (file_ranges.empty() && payload_bytes > 0) { return false; }
+
+  auto* host_mr = host_space.get_memory_resource_of<cucascade::memory::Tier::HOST>();
+  if (host_mr == nullptr) {
+    throw std::runtime_error("[hpln ingest] target host space has no host memory resource");
+  }
+  auto blob           = std::make_shared<pinned_compressed_blob>();
+  blob->header        = std::move(narrowed_header);
+  auto payload_res    = host_space.make_reservation_or_null(payload_bytes);
+  blob->payload       = host_mr->allocate_multiple_blocks(payload_bytes, payload_res.get());
+  blob->payload_bytes = payload_bytes;
+  for (auto const& g : file_ranges) {
+    hpln_extent e;
+    e.offset = chunk.payload_offset + g.src_offset;
+    append_block_segments(*blob->payload, g.dst_offset, g.size, e);
+    out_extents.push_back(std::move(e));
+  }
+  static_cast<void>(policy);
+  out_blob = std::move(blob);
+  return true;
+}
+
 /// Open @p path for reading, through @p options's io_context when it has one.
 std::unique_ptr<hpln_source> open_hpln(std::string const& path,
                                        char const* who,
@@ -460,7 +564,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   cucascade::memory::memory_space& host_space,
   std::span<const std::size_t> chunk_ids,
   hpln_open_options const& options,
-  std::span<const std::size_t> columns)
+  std::span<const std::size_t> columns,
+  std::span<const std::vector<std::uint32_t>> decode_chunks)
 {
   auto src    = open_hpln(path, "hpln ingest", options);
   auto layout = locate_hpln(*src, path);
@@ -485,6 +590,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   // mean two overlapping requests, which the read planner refuses precisely because overlapping
   // destinations are how a range silently lands in the wrong place.
   std::unordered_map<std::size_t, std::shared_ptr<pinned_compressed_blob>> staged;
+  std::unordered_map<std::size_t, bool> narrowed_ids;
+  std::size_t at = 0;
   for (auto const id : chunk_ids) {
     if (id >= layout.chunks.size()) {
       throw std::runtime_error("[hpln ingest] '" + path + "': chunk " + std::to_string(id) +
@@ -493,18 +600,54 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
     }
     auto it = staged.find(id);
     if (it == staged.end()) {
-      auto blob = columns.empty()
-                    ? allocate_chunk(headers[id], layout.chunks[id], host_space, extents)
-                    : allocate_chunk_columns(
-                        headers[id], layout.chunks[id], columns, host_space, extents, path);
+      std::shared_ptr<pinned_compressed_blob> blob;
+      bool narrowed = false;
+      // Row narrowing is positional with chunk_ids, not with the file's chunks: it says what the
+      // CALLER wants of this split's i-th chunk.
+      auto const rows = at < decode_chunks.size() ? std::span<const std::uint32_t>{decode_chunks[at]}
+                                                  : std::span<const std::uint32_t>{};
+      if (!rows.empty()) {
+        narrowed = allocate_chunk_narrowed(headers[id],
+                                           layout.chunks[id],
+                                           columns,
+                                           rows,
+                                           *src,
+                                           options.policy,
+                                           host_space,
+                                           extents,
+                                           blob);
+      }
+      if (!blob) {
+        blob = columns.empty()
+                 ? allocate_chunk(headers[id], layout.chunks[id], host_space, extents)
+                 : allocate_chunk_columns(
+                     headers[id], layout.chunks[id], columns, host_space, extents, path);
+      }
       it = staged.emplace(id, std::move(blob)).first;
+      narrowed_ids[id] = narrowed;
     }
-    out.push_back({it->second, layout.chunks[id].num_rows});
+    // A narrowed blob holds only the surviving decode chunks' rows, so the row count has to
+    // follow the bytes -- a consumer sizing anything by the chunk's own count would be wrong.
+    std::int64_t rows_in_blob = layout.chunks[id].num_rows;
+    if (narrowed_ids[id]) {
+      constexpr std::size_t decode_chunk_rows = static_cast<std::size_t>(::codegen::kChunkSize);
+      auto const chunk_rows = static_cast<std::size_t>(layout.chunks[id].num_rows);
+      std::size_t kept      = 0;
+      for (auto const d : decode_chunks[at]) {
+        auto const begin = static_cast<std::size_t>(d) * decode_chunk_rows;
+        if (begin >= chunk_rows) { continue; }
+        kept += std::min(decode_chunk_rows, chunk_rows - begin);
+      }
+      rows_in_blob = static_cast<std::int64_t>(kept);
+    }
+    out.push_back({it->second, rows_in_blob, narrowed_ids[id]});
+    ++at;
   }
   src->read_extents(std::move(extents), options.policy, "chunk payload");
-  // A column subset cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
-  // and this read deliberately did not fetch all of it. Same limitation the row subset has.
-  if (options.verify_payload && columns.empty() && !layout.checksums.empty()) {
+  // A narrowed read cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
+  // and this read deliberately did not fetch all of it.
+  auto const any_narrowed = std::ranges::any_of(narrowed_ids, [](auto const& kv) { return kv.second; });
+  if (options.verify_payload && columns.empty() && !any_narrowed && !layout.checksums.empty()) {
     // After the read, before the blob is handed to anyone: a caller that got a chunk back has
     // already been told it is intact.
     for (auto const& [id, blob] : staged) {

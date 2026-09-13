@@ -1430,6 +1430,55 @@ std::string describe_compressed_table_header(std::span<const std::uint8_t> heade
   return {};
 }
 
+std::vector<gather_range> compose_gathers(std::span<const gather_range> outer,
+                                          std::span<const gather_range> inner)
+{
+  std::vector<gather_range> out;
+  if (outer.empty()) { return {inner.begin(), inner.end()}; }
+  out.reserve(inner.size());
+
+  // `outer` tiles its destination space contiguously from zero, so a binary search over the
+  // destination offsets finds the range holding any byte of it.
+  auto find = [&](std::uint64_t dst) -> std::size_t {
+    std::size_t lo = 0;
+    std::size_t hi = outer.size();
+    while (lo + 1 < hi) {
+      auto const mid = lo + (hi - lo) / 2;
+      if (outer[mid].dst_offset <= dst) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  };
+
+  for (auto const& in : inner) {
+    std::uint64_t remaining = in.size;
+    std::uint64_t src       = in.src_offset;
+    std::uint64_t dst       = in.dst_offset;
+    while (remaining > 0) {
+      auto const i = find(src);
+      auto const& o = outer[i];
+      if (src < o.dst_offset || src >= o.dst_offset + o.size) {
+        return {};  // a byte no outer range produced: refuse rather than read something else
+      }
+      auto const within = src - o.dst_offset;
+      auto const take   = std::min<std::uint64_t>(o.size - within, remaining);
+      if (!out.empty() && out.back().src_offset + out.back().size == o.src_offset + within &&
+          out.back().dst_offset + out.back().size == dst) {
+        out.back().size += take;
+      } else {
+        out.push_back(gather_range{o.src_offset + within, take, dst});
+      }
+      src += take;
+      dst += take;
+      remaining -= take;
+    }
+  }
+  return out;
+}
+
 std::string build_column_subset_header(std::span<const std::uint8_t> header,
                                        std::span<const std::size_t> selected_columns,
                                        std::vector<std::uint8_t>& out_header,

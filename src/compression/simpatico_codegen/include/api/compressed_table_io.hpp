@@ -392,6 +392,18 @@ struct gather_range {
   std::uint64_t dst_offset = 0;  ///< offset in the COMPACTED payload the new header describes
 };
 
+/// Rewrite @p inner so its sources name the payload @p outer reads FROM, not the one it produces.
+///
+/// Two narrowings compose: a column subset turns the file's payload into a compacted one, and a
+/// row subset then narrows THAT. The second's ranges are expressed in the first's destination
+/// space, so following them against the file would read the wrong bytes -- silently, since any
+/// offset in a large payload reads something. This is the only place that mapping lives.
+///
+/// @p outer must tile its destination space contiguously from zero, which is what both builders
+/// emit. Returns an empty vector if @p inner names a destination byte @p outer never produced.
+[[nodiscard]] std::vector<gather_range> compose_gathers(std::span<const gather_range> outer,
+                                                        std::span<const gather_range> inner);
+
 /// Reads @p size bytes of the original payload at @p offset into host memory at @p dst.
 /// Returns false if the range cannot be served. Used only to read the small per-chunk metadata
 /// buffers that size a bitpack `packed` buffer; on a host pin this is a memcpy.
