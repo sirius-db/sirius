@@ -338,9 +338,8 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_build_dict_fsst_data
   // Phase 4: per-segment scalars.
   if (threadIdx.x == 0) {
     d_per_seg_decoded_total[seg_idx] = my_dec_off[d.dict_count];
-    // entry_lens[0] = byte_offsets[1] - byte_offsets[0] = byte_offsets[1].
-    bool const any_null =
-      (d.mode != DICT_FSST_MODE_FSST_ONLY) && (d.dict_count > 1) && (my_byte_off[1] == 0);
+    // Entry 0 is the NULL slot, including when it is the only dictionary entry.
+    bool const any_null            = (d.mode != DICT_FSST_MODE_FSST_ONLY) && (my_byte_off[1] == 0);
     d_per_seg_inline_null[seg_idx] = any_null ? 1 : 0;
   }
 }

@@ -368,6 +368,35 @@ TEST_CASE("gpu_decode_strings FSST admits exactly the fixed symbol table header"
   REQUIRE(prepared.length_descs.size() == 1);
 }
 
+TEST_CASE("gpu_decode_strings DICT_FSST admits no symbol table when only the NULL slot exists",
+          "[scan][decode][strings][dict_fsst][defensive]")
+{
+  auto const mode      = GENERATE(uint8_t{1}, uint8_t{2});
+  auto bytes           = make_dict_fsst_segment({""}, {0}, mode);
+  uint32_t table_bytes = 0;
+  std::memcpy(&table_bytes, bytes.data() + 12, sizeof(table_bytes));
+  REQUIRE(table_bytes == 0);
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  auto const rows = mode == 1 ? 1u : 0u;
+  gpu_string_codec_run run{CompressionType::COMPRESSION_DICT_FSST,
+                           {{static_cast<uint8_t const*>(device.data()),
+                             static_cast<uint32_t>(bytes.size()),
+                             0,
+                             rows,
+                             0,
+                             0}}};
+  REQUIRE_NOTHROW(sirius::cuda::scan::prepare_dict_fsst(run, stream.view(), mr));
+  gpu_string_column_decode_input input;
+  input.total_rows = rows;
+  input.has_nulls  = false;
+  input.data.push_back(run);
+  auto column = gpu_decode_strings_column(input, stream.view(), mr);
+  REQUIRE(column->size() == rows);
+  REQUIRE(column->null_count() == rows);
+}
+
 TEST_CASE("gpu_decode_strings DICT_FSST rejects cumulative dictionary offset overflow",
           "[scan][decode][strings][dict_fsst][defensive]")
 {
