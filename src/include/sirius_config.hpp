@@ -174,14 +174,10 @@ struct operator_params {
   /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
-  /// Let a grouped aggregation's PARTITION size itself from a projected input total instead of
-  /// waiting for its whole input, so that edge runs as a PARTIAL rather than a FULL barrier. Off
-  /// reproduces the previous behaviour exactly. Off by default; see
-  /// docs/super-sirius/data-size-estimation.md for why, and for the measurements behind it.
+  /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Multiplier applied to a *projected* total before it sizes partitions; raise above 1.0 to bias
-  /// toward more (smaller) partitions when projections undershoot. Measured totals are not scaled.
+  /// Multiplier applied to projected totals before partition sizing.
   double size_estimate_safety_factor = 1.0;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time

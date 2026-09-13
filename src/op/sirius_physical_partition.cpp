@@ -70,8 +70,6 @@ constexpr bool producer_requires_full_partition_input(SiriusPhysicalOperatorType
 
 }  // namespace
 
-/// Display name for the basis a partition count was chosen on. Shared by the DEBUG line emitted
-/// at the decision and the INFO line emitted at finalize, so the two can never disagree.
 const char* sirius_physical_partition::sizing_basis_name(sizing_basis basis)
 {
   switch (basis) {
@@ -228,13 +226,8 @@ MemoryBarrierType sirius_physical_partition::input_barrier_for(
   if (producer_requires_full_partition_input(producer.type)) { return MemoryBarrierType::FULL; }
 
   auto* partition_parent = get_parent_op();
-  // An aggregate-fanout PARTITION (parent MERGE_GROUP_BY) is PARTIAL only when estimation is
-  // enabled on it, so feature-off keeps the original FULL barrier rather than an emulation of
-  // it — and so does the delim-join DISTINCT partition, which sits under a
-  // grouped_aggregate_merge (likewise typed MERGE_GROUP_BY) but is never constructed with
-  // estimation enabled, and which the type test alone cannot tell apart. Only the
-  // producer→PARTITION edge is relaxed; the PARTITION→MERGE_GROUP_BY edge stays FULL, since
-  // the merge still needs every bucket.
+  // Only estimation-enabled aggregate fanout relaxes its input barrier. Delim-join partitions
+  // also sit below MERGE_GROUP_BY but never enable estimation.
   bool const aggregate_fanout =
     partition_parent != nullptr &&
     partition_parent->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY;
@@ -271,8 +264,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
-  // Running tally of everything this partition actually processed; on_finalize_operator
-  // compares it against the projection that sized the partition count.
+  // Track actual input for the final projection-error report.
   if (input_batch_ro.get_data()) {
     _actual_bytes.fetch_add(input_batch_ro.get_data()->get_size_in_bytes(),
                             std::memory_order_relaxed);
@@ -427,12 +419,10 @@ std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
       _size_estimate->ratio_samples);
   }
 
-  // A measured total needs no padding; only a projection does.
   auto const scaled = _size_estimate->exact
                         ? static_cast<double>(_size_estimate->bytes)
                         : static_cast<double>(_size_estimate->bytes) * _size_estimate_safety_factor;
-  // Never size for less than what has already landed: an undershooting projection would
-  // otherwise produce fewer partitions than the bytes on hand already justify.
+  // An estimate cannot invalidate bytes already received.
   return std::max(static_cast<uint64_t>(scaled), compute_total_bytes());
 }
 
@@ -444,18 +434,11 @@ void sirius_physical_partition::set_num_partitions(int num_partitions)
 
 void sirius_physical_partition::on_finalize_operator()
 {
-  // Post-query accuracy report, keyed off _sizing_basis / _sizing_bytes as recorded at the
-  // decision — not off _size_estimate, whose raw value differs once the safety factor and the
-  // already-arrived floor apply.
   if (!_enable_size_estimation) { return; }
   std::lock_guard<std::mutex> guard(lock);
   auto const actual = _actual_bytes.load(std::memory_order_relaxed);
 
   if (_sizing_basis == sizing_basis::measured) {
-    // No projection when the count was fixed, so an estimated-vs-actual error is meaningless.
-    // Nor can one have arrived since: get_next_task_hint() tests
-    // `!_num_partitions.has_value()` before calling the estimator, so once the count is set
-    // nothing consults it again and _size_estimate stays empty.
     SIRIUS_LOG_INFO(
       "sirius_physical_partition id {} size estimate: sized from measured input ({} bytes); "
       "no projection was available; partitions {}",
@@ -465,8 +448,6 @@ void sirius_physical_partition::on_finalize_operator()
     return;
   }
 
-  // A projection (or an already-complete upstream total) chose the count, so comparing it
-  // against the bytes that actually arrived is meaningful.
   double const error_pct = actual == 0
                              ? 0.0
                              : (static_cast<double>(_sizing_bytes) - static_cast<double>(actual)) /
@@ -547,13 +528,7 @@ std::optional<task_creation_hint> sirius_physical_partition::get_next_task_hint(
     }
   }
 
-  // Aggregate-fanout partition with estimation enabled — the one case input_barrier_for wires
-  // PARTIAL. Tasks may start before the producer drains, but only once the count is pinned:
-  // it is fixed for the operator's life, since re-sizing would route later batches to slots
-  // computed under a different modulus. Until a projection exists, reproduce the FULL wait.
-  //
-  // Guarded on _enable_size_estimation because that is when this operator is the authority;
-  // with the feature off the port is still FULL and the base hint below enforces the wait.
+  // A PARTIAL aggregate-fanout ingress must wait until an estimate fixes the partition count.
   if (_enable_size_estimation && _sibling_partition_op == nullptr && !_num_partitions.has_value() &&
       !ports.empty() && !estimated_total_input_bytes().has_value()) {
     auto* port_ptr = ports.begin()->second;
@@ -672,9 +647,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
   } else {
     std::lock_guard<std::mutex> guard(lock);
     if (!_num_partitions.has_value()) {
-      // Size from the projected total when one is available (the port may hold only the first
-      // few batches), otherwise from what has arrived — which, without a projection, is the
-      // complete input because get_next_task_hint held the task back until then.
+      // Without an estimate, the task hint waits until the received input is complete.
       auto const estimated   = estimated_total_input_bytes();
       auto const total_bytes = estimated.value_or(compute_total_bytes());
       partition_sizing_input const in{total_bytes,
@@ -683,9 +656,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
                                       /*combined_total_bytes=*/total_bytes};
       auto const strategy = consumer->get_partition_strategy(in);
       _num_partitions     = strategy.num_partitions;
-      // Record what actually drove the decision. This is the authoritative answer to "did the
-      // feature do anything" — _size_estimate is not, because it can latch afterwards.
-      _sizing_bytes = in.total_bytes;
+      _sizing_bytes       = in.total_bytes;
       if (estimated.has_value()) {
         _sizing_basis = (_size_estimate && _size_estimate->exact) ? sizing_basis::upstream_complete
                                                                   : sizing_basis::projected;

@@ -270,19 +270,10 @@ class SiriusContext : public ClientContextState {
     uint64_t scan_narrow_targets_retracted = 0;
   };
 
-  /// Monotonic counts of hash PARTITION operators by what drove their partition count.
-  ///
-  /// One increment per operator that fixed its count, recorded at the moment of the decision.
-  /// This is the authoritative answer to "did runtime size estimation do anything on this
-  /// query?": `partitions_sized_from_projection` advancing is the only proof the estimator
-  /// produced a usable number, since a partition that sizes from `measured` bytes has waited
-  /// for its whole input exactly as it would with the feature off.
+  /// Counts grouped-aggregation partitions by sizing basis.
   struct size_estimation_stats {
-    /// Sized from bytes already in the port — no projection was available.
-    uint64_t partitions_sized_from_measured = 0;
-    /// Sized from a projection built by chaining measured pipeline ratios.
-    uint64_t partitions_sized_from_projection = 0;
-    /// Sized from an upstream pipeline that had already finished, so the total was exact.
+    uint64_t partitions_sized_from_measured          = 0;
+    uint64_t partitions_sized_from_projection        = 0;
     uint64_t partitions_sized_from_upstream_complete = 0;
   };
 
@@ -631,16 +622,16 @@ class SiriusContext : public ClientContextState {
   /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
   void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
 
-  /// \brief Snapshot counters for runtime size-estimation observability.
+  /// \brief Snapshot runtime size-estimation counters.
   [[nodiscard]] size_estimation_stats get_size_estimation_stats() const noexcept;
 
-  /// \brief Record a hash PARTITION that fixed its count from bytes already received.
+  /// \brief Record a partition sized from bytes already received.
   void record_partition_sized_from_measured() noexcept;
 
-  /// \brief Record a hash PARTITION that fixed its count from a projected total.
+  /// \brief Record a partition sized from a projected total.
   void record_partition_sized_from_projection() noexcept;
 
-  /// \brief Record a hash PARTITION that fixed its count from a finished upstream's exact total.
+  /// \brief Record a partition sized from a finished upstream.
   void record_partition_sized_from_upstream_complete() noexcept;
 
  private:
