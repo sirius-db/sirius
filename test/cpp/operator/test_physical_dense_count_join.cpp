@@ -782,11 +782,9 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
                                           /*counted_value_idx=*/std::nullopt,
                                           /*max_bins_bytes=*/8);
   CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor);
-  // The sparse term is sized by the group count, not by 16x the input bytes, so an absurd byte
-  // count no longer drags the whole estimate to SIZE_MAX -- that it used to is precisely the
-  // behaviour that asked 833 GiB of a 77.6 GiB space on q13/SF3000. What must still hold is
-  // that the saturating arithmetic does not wrap: the answer stays enormous, and stays
-  // monotonic in the input.
+  // The sparse term is sized by the group count, so an absurd byte count no longer drags the
+  // estimate to SIZE_MAX. What must hold is that the saturating arithmetic does not wrap and
+  // that the estimate stays monotonic in the input.
   auto const absurd =
     sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()});
   CHECK(absurd > std::numeric_limits<std::size_t>::max() / 4);

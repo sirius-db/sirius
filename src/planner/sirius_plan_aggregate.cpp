@@ -334,12 +334,8 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
     preserved_child, counted_child, preserved_ref.index, counted_ref.index, counted_value_idx};
 }
 
-/** @brief The histogram budget in bytes, resolving the auto (0) setting.
- *
- * Auto takes a share of GPU tier capacity, because the histogram scales with the key
- * domain and a constant cannot track that across scale factors. An explicit non-zero
- * setting wins, and an unreadable space falls back to the pre-auto constant.
- */
+/// Histogram budget in bytes, resolving the auto (0) setting to a share of GPU tier
+/// capacity. An explicit non-zero setting wins; an unreadable space falls back to a constant.
 [[nodiscard]] std::uint64_t resolve_dense_count_budget(duckdb::SiriusContext& sirius_ctx,
                                                        sirius::operator_params const& op_params)
 {
@@ -354,14 +350,10 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
                                     op_params.dense_count_join_memory_fraction);
 }
 
-/** @brief Bytes the direct-address histogram would need for these cardinalities.
- *
- * Mirrors dense_count_layout::plan and total_bytes: presence plus counts over the key
- * range, at a slot width that doubles once either side clears UINT32_MAX rows. The key
- * range is unknown before execution, so the preserved cardinality stands in for it --
- * sound for the dense keys this operator exists to serve, and an underestimate for
- * sparse ones, which the runtime gate still catches.
- */
+/// Bytes the histogram would need, mirroring dense_count_layout::plan: presence plus counts
+/// over the key range, at a slot width that doubles once either side clears UINT32_MAX rows.
+/// The key range is unknown before execution, so the preserved cardinality stands in for it --
+/// sound for dense keys, and an underestimate for sparse ones that the runtime gate catches.
 [[nodiscard]] std::uint64_t estimated_histogram_bytes(std::size_t preserved_rows,
                                                       std::size_t counted_rows)
 {
@@ -393,23 +385,13 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
   auto const counted_cardinality =
     join.children[detection->counted_child]->EstimateCardinality(context);
 
-  // Decline the fusion when the histogram cannot be admitted, rather than letting the
-  // operator fall through to its sparse path.
+  // Decline the fusion when the histogram cannot be admitted, rather than planning an
+  // operator that can then only fall through to its sparse path. On a large counted side
+  // that path costs far more than the ordinary join + aggregate this returns to, and a
+  // decision made on an estimate is better wrong in this direction than the other.
   //
-  // The operator has only two strategies once planned, and the sparse one is what turned
-  // TPC-H q13/SF3000 from a 46.7 s query into a failure: its peak-memory estimate is 16x
-  // the input, which asked for 833 GiB against a 77.6 GiB space, took a partial
-  // reservation, and then died retrying a 228 MB allocation with nothing evictable. The
-  // unfused join + aggregate is the known-working plan for exactly this shape, so prefer
-  // it. It costs about 18% here (46.7 s against 38.0 s for an admitted dense path), which
-  // is the right trade against not finishing.
-  //
-  // This leans on an estimate, so it can decline a fusion that would have been admitted.
-  // That direction is cheap and the other is not.
-  //
-  // MUST run before create_plan: that call drains the logical children, and a nullptr
-  // returned afterwards leaves the caller re-planning emptied nodes -- which surfaces as
-  // "Attempting to dereference an optional pointer that is not set", not as a fallback.
+  // MUST run before create_plan, which drains the logical children: a nullptr returned
+  // after it leaves the caller re-planning emptied nodes rather than falling back.
   auto const budget = resolve_dense_count_budget(*sirius_ctx, op_params);
   auto const histogram_bytes =
     estimated_histogram_bytes(preserved_cardinality, counted_cardinality);

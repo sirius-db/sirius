@@ -418,12 +418,9 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
 
   constexpr std::size_t allocation_floor = 1024 * 1024;
 
-  // The admission ceiling is a gate, not a size: min(budget, 4 * input) reports the budget
-  // whenever the input is large, and the budget now scales with the card, so using it here
-  // makes the estimate grow on a bigger GPU. Prefer the planner's sizing of the actual
-  // histogram (2 * key_range * slot_bytes from the child cardinalities), capped by the
-  // ceiling since anything above it would not have been admitted. Falls back to the ceiling
-  // when the planner did not supply one.
+  // max_admitted_histogram_bytes is a gate, not a size: it reports the whole budget whenever
+  // the input is large, so an estimate built on it grows with the card. Prefer the planner's
+  // sizing, capped by the ceiling since nothing above it would have been admitted.
   auto const admission_ceiling = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
   auto const histogram_bytes =
     _planned_histogram_bytes > 0
@@ -434,15 +431,10 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
   auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-  // Output rows are distinct PRESERVED keys, not input elements. stats.bytes covers both
-  // sides and every column, so stats.bytes / key_width counts each input byte as a key: on
-  // q13/SF3000 that is 6.99e9 (clamped to the cudf limit, 2.15e9) against 450M real groups,
-  // and the error multiplies through the three per-row terms below.
-  //
-  // The preserved child's cardinality is the right bound -- one row per distinct preserved
-  // key -- and the base estimated_cardinality is NOT it: duckdb estimates this fused
-  // aggregate at the join's output size, 4.5e9 on the same query. The byte-derived bound
-  // stays as a ceiling for when the planner supplied nothing.
+  // Output rows are distinct preserved keys, so the preserved cardinality bounds them.
+  // stats.bytes spans both sides and every column, making stats.bytes / key_width count each
+  // input byte as a key -- an error that multiplies through the three per-row terms below. It
+  // stays only as a ceiling for when the planner supplied nothing.
   auto const planned_rows =
     _planned_output_rows > 0 ? static_cast<std::size_t>(_planned_output_rows) : cudf_row_limit;
   auto const output_rows = std::min({planned_rows, stats.bytes / key_width, cudf_row_limit});
@@ -465,23 +457,13 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   auto const minmax_peak =
     saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
 
-  // Sparse execution: a groupby streams its input through a hash table sized by DISTINCT
-  // KEYS, so the residency scales with the group count, not with how many rows were read.
-  // The previous form was 16 * input bytes, which on q13/SF3000 asked for 833 GiB against a
-  // 77.6 GiB space -- an estimate above the tier is not conservative, it just guarantees a
-  // clamp and a partial reservation, which is how that query came to run unreserved and die
-  // retrying a 228 MB allocation.
+  // Sparse execution: a groupby streams its input through a hash table sized by distinct
+  // keys, so residency tracks the group count rather than how many rows were read. Measured
+  // at ~107 bytes per group; the factor below carries headroom over that. One mean batch is
+  // added for the input the current groupby holds, input_stats carrying no per-batch maximum.
   //
-  // Measured by forcing the sparse path on q13/SF1000: 14.93 GiB actual against 150M groups,
-  // or 107 bytes per group, where the old form predicted 280 GiB. The multiplier below is 8
-  // rather than the ~6.7 that fits exactly, for headroom. One batch's worth of input is added
-  // for the working set the current groupby reads; the largest batch is not in input_stats, so
-  // the mean stands in for it.
-  //
-  // Both terms scale with the scale factor on q13, so that query cannot by itself separate a
-  // per-group model from a per-input-byte one -- the group form is chosen because it is what
-  // a hash aggregate's residency actually tracks. A count-join whose preserved side is small
-  // against a large counted side would tell the two apart; TPC-H has no such shape.
+  // An estimate above the tier is not the safe direction: it cannot be granted, so it yields
+  // a clamp and a partial reservation instead of a refusal.
   constexpr std::size_t kSparseGroupFactor = 8;
   auto const avg_batch_bytes =
     stats.num_batches > 0 ? stats.bytes / stats.num_batches : stats.bytes;
