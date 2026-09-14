@@ -40,10 +40,14 @@ impl BrpcServer {
     /// Builds a BRPC server that dispatches fragments to `executor` (the GPU-backed
     /// `SiriusEngine`, or a stub).
     pub fn with_executor(executor: Arc<dyn FragmentExecutor>) -> Self {
-        let service =
-            PInternalServiceRouter::new(SiriusComputeNodeService::with_executor(executor));
+        Self::with_service(SiriusComputeNodeService::with_executor(executor))
+    }
+
+    /// Builds a BRPC server around an already-constructed compute-node service (exchange
+    /// rendezvous, identity, optional NIXL transport).
+    pub fn with_service(service: SiriusComputeNodeService) -> Self {
         Self {
-            inner: BrpcServiceServer::with_service(service),
+            inner: BrpcServiceServer::with_service(PInternalServiceRouter::new(service)),
         }
     }
 
