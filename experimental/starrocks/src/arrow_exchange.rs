@@ -136,27 +136,34 @@ pub(crate) fn transmit_chunk_blocking(
 }
 
 fn encode_ipc(names: &[String], batch: Option<&RecordBatch>) -> Result<Vec<u8>, String> {
-    let schema = match batch {
-        Some(batch) => batch.schema(),
+    // Parked engine batches often have empty field names. The translator's output
+    // names are the hop schema; stamp them on every frame so data and eos match.
+    let (schema, owned_batch) = match batch {
+        Some(batch) => {
+            let schema = stamp_names(batch.schema(), names)?;
+            require_column_names(schema.fields().iter().map(|field| field.name().as_str()))?;
+            let renamed = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+                .map_err(|err| format!("arrow ipc rename: {err}"))?;
+            (schema, Some(renamed))
+        }
         None => {
-            if names.is_empty() {
-                return Err(
-                    "eos transmit_chunk has no column names to put in the Arrow schema".to_string(),
-                );
-            }
-            Arc::new(Schema::new(
-                names
-                    .iter()
-                    .map(|name| Field::new(name.as_str(), DataType::Null, true))
-                    .collect::<Vec<_>>(),
-            ))
+            require_column_names(names.iter().map(String::as_str))?;
+            (
+                Arc::new(Schema::new(
+                    names
+                        .iter()
+                        .map(|name| Field::new(name.as_str(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                )),
+                None,
+            )
         }
     };
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
             .map_err(|err| format!("arrow ipc write: {err}"))?;
-        if let Some(batch) = batch {
+        if let Some(batch) = owned_batch.as_ref() {
             writer
                 .write(batch)
                 .map_err(|err| format!("arrow ipc write batch: {err}"))?;
@@ -166,6 +173,38 @@ fn encode_ipc(names: &[String], batch: Option<&RecordBatch>) -> Result<Vec<u8>, 
             .map_err(|err| format!("arrow ipc finish: {err}"))?;
     }
     Ok(buf)
+}
+
+fn stamp_names(
+    schema: arrow_schema::SchemaRef,
+    names: &[String],
+) -> Result<arrow_schema::SchemaRef, String> {
+    if names.is_empty() {
+        return Ok(schema);
+    }
+    if names.len() != schema.fields().len() {
+        return Err(format!(
+            "output names ({}) do not match batch columns ({})",
+            names.len(),
+            schema.fields().len()
+        ));
+    }
+    Ok(Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .zip(names)
+            .map(|(field, name)| field.as_ref().clone().with_name(name))
+            .collect::<Vec<_>>(),
+    )))
+}
+
+fn require_column_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+    let names: Vec<&str> = names.into_iter().collect();
+    if names.is_empty() || names.iter().any(|name| name.is_empty()) {
+        return Err("Arrow exchange frames need a non-empty name for every column".to_string());
+    }
+    Ok(())
 }
 
 fn decode_ipc(bytes: &[u8]) -> Result<(Vec<String>, Option<RecordBatch>), String> {
@@ -272,6 +311,41 @@ mod tests {
                 .unwrap();
         assert_eq!(eos_names, ["id", "amount"]);
         assert!(eos_batch.is_none());
+    }
+
+    #[test]
+    fn ipc_stamps_translator_names_onto_unnamed_engine_batches() {
+        use arrow_array::StringArray;
+
+        let unnamed = Arc::new(Schema::new(vec![
+            Field::new("", DataType::Utf8, true),
+            Field::new("", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            unnamed,
+            vec![
+                Arc::new(StringArray::from(vec![Some("east")])),
+                Arc::new(Int64Array::from(vec![Some(10)])),
+            ],
+        )
+        .unwrap();
+        let names = vec!["col_1".to_string(), "col_3".to_string()];
+        let (data_names, data_batch) =
+            decode_ipc(&encode_ipc(&names, Some(&batch)).unwrap()).unwrap();
+        let (eos_names, eos_batch) = decode_ipc(&encode_ipc(&names, None).unwrap()).unwrap();
+        assert_eq!(data_names, names);
+        assert_eq!(eos_names, names);
+        assert!(eos_batch.is_none());
+        assert_eq!(
+            data_batch
+                .unwrap()
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            names
+        );
     }
 
     #[test]
