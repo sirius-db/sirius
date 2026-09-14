@@ -323,12 +323,13 @@ over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the 
   repository and finish the pipeline while that arm still had rows.
 - **`PASSTHROUGH_SINK -> UNION` is `PARTIAL`**, not the base's `FULL` default, which
   would hold every arm's output in repositories until all arms finished.
-- **Overrides both task-driver methods.** Ready when every *live* arm has a batch, popping one batch
-  from one arm; the base is lockstep and strands the long arm once a short one drains, so a finished
-  arm is excused while arms still producing rendezvous. A starved arm — live producer, empty port —
-  outranks a ready one, since `task_scheduler::start_query` starts one scan for the whole query and
-  an arm is named in this hint or never runs. One arm per task also keeps each batch on the GPU that
-  produced it.
+- **Overrides both task-driver methods.** UNION nominates and drains arms sequentially in child
+  order. Only the active arm can be nominated by UNION or popped; a finished empty arm is skipped,
+  and UNION issues one normal draining nomination per live arm. If an arm already has data from
+  startup or one-task lookahead, UNION enqueues that normal nomination while returning ready for its
+  own batch. Popping the final queued batch from a finished non-final arm advances the cursor and
+  schedules UNION once so the next arm is activated even when no producer completion can provide
+  another wakeup. One arm per task also keeps each batch on the GPU that produced it.
 - **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
   operator, so this answer decides the whole plan's.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches

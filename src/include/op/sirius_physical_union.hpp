@@ -75,7 +75,7 @@ class sirius_physical_union : public sirius_physical_operator {
   [[nodiscard]] MemoryBarrierType input_barrier_for(
     sirius_physical_operator const& producer) const override;
 
-  //! Relaxes the lockstep base: a finished arm is excused, and a starved arm outranks a ready one.
+  //! Drains one arm at a time, nominating each arm's producer at most once.
   std::optional<task_creation_hint> get_next_task_hint() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
@@ -90,13 +90,13 @@ class sirius_physical_union : public sirius_physical_operator {
   //! Arm ports in arm order, resolved once on first use. Callers must hold `lock`.
   const std::vector<port*>& arm_ports();
 
-  //! Arm to start the next pop at, so draining rotates across arms rather than emptying arm 0
-  //! first. Guarded by `lock`.
-  std::size_t _arm_cursor = 0;
+  //! The only arm eligible to produce or drain. `children.size()` means every arm is exhausted.
+  //! Guarded by `lock`.
+  std::size_t _active_arm = 0;
 
-  //! Arm to start the next producer nomination at, so successive `WAITING_FOR_INPUT_DATA` hints
-  //! do not keep naming the same arm. Separate from `_arm_cursor`. Guarded by `lock`.
-  std::size_t _wait_cursor = 0;
+  //! Whether UNION has issued a normal, draining nomination for the active arm's producer.
+  //! Guarded by `lock`.
+  bool _active_arm_nominated = false;
 
   std::vector<port*> _arm_ports;
 };

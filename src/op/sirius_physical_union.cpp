@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_union.hpp"
 
+#include "creator/task_creator.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -138,79 +139,85 @@ MemoryBarrierType sirius_physical_union::input_barrier_for(
 
 std::optional<task_creation_hint> sirius_physical_union::get_next_task_hint()
 {
-  std::lock_guard<std::mutex> lg(lock);
+  std::unique_lock<std::mutex> lg(lock);
 
-  // `port::type` is deliberately not consulted: a UNION arm carries no cross-batch state, so its
-  // inbound edge is declared PARTIAL by this operator's `input_barrier_for`.
   const auto& ports_by_arm = arm_ports();
-  const auto num_arms      = ports_by_arm.size();
-  if (num_arms == 0) { return std::nullopt; }
+  while (_active_arm < ports_by_arm.size()) {
+    auto* p                = ports_by_arm[_active_arm];
+    const bool has_data    = p->repo && p->repo->total_size() > 0;
+    const bool is_finished = p->src_pipeline && p->src_pipeline->is_pipeline_finished();
+    if (has_data) {
+      // A queued batch can come from scans.front() or a one-task lookahead request. Promote that
+      // activation to a normal draining request before relying on the nomination latch.
+      sirius_physical_operator* producer_to_schedule = nullptr;
+      creator::task_creator* creator_to_schedule     = nullptr;
+      if (!_active_arm_nominated && !is_finished && p->src_pipeline) {
+        auto producers = p->src_pipeline->get_operators();
+        auto* creator  = p->src_pipeline->get_task_creator();
+        if (!producers.empty() && creator) {
+          _active_arm_nominated = true;
+          producer_to_schedule  = &producers.front().get();
+          creator_to_schedule   = creator;
+        }
+      }
 
-  bool any_ready                             = false;
-  sirius_physical_operator* starved_producer = nullptr;
-  std::size_t starved_arm                    = 0;
-  for (std::size_t offset = 0; offset < num_arms; offset++) {
-    const auto arm      = (_wait_cursor + offset) % num_arms;
-    auto* p             = ports_by_arm[arm];
-    const bool has_data = p->repo && p->repo->total_size() > 0;
-    const bool live     = p->src_pipeline && !p->src_pipeline->is_pipeline_finished();
-    any_ready           = any_ready || has_data;
-    if (!has_data && live && starved_producer == nullptr) {
-      starved_producer = &(p->src_pipeline->get_operators()[0].get());
-      starved_arm      = arm;
+      lg.unlock();
+      if (creator_to_schedule && producer_to_schedule) {
+        creator_to_schedule->schedule(producer_to_schedule);
+      }
+      return task_creation_hint{TaskCreationHint::READY, this};
     }
-  }
 
-  // A starved arm outranks a ready one, because nothing else will start it.
-  // `task_creator::get_operator_for_next_task` reaches an operator *only* by walking
-  // `hint.producer`, and `task_scheduler::start_query` schedules `scans.front()` alone. Nothing
-  // schedules a scan again after that: both recurring paths schedule a pipeline's output consumers,
-  // never its own source. So this branch is not only how an arm starts, it is how every arm's scan
-  // resumes each time its splits run dry — answering READY first spends that request on draining.
-  // The producer is likewise never null, or the still-producing arm has nothing to run it. The walk
-  // is all-or-nothing too: when it yields no operator `task_creator` abandons the whole request,
-  // and an arm whose connector closed while its last tasks run is starved but yields nothing — so a
-  // fixed start would burn every request for that arm's tail, which is what `_wait_cursor` advances
-  // past.
-  if (starved_producer != nullptr) {
-    _wait_cursor = (starved_arm + 1) % num_arms;
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, starved_producer};
-  }
+    if (is_finished) {
+      ++_active_arm;
+      _active_arm_nominated = false;
+      continue;
+    }
 
-  // Reached only when nothing is starved, so the aggregate rule is: READY iff every *live* arm has
-  // a queued batch and at least one port is poppable. That is the base's ALL weakened by exactly
-  // one clause -- a finished arm is excused instead of blocking forever -- which is what lets an
-  // empty arm through and what stops a drained short arm from stranding a long one. Arms still
-  // producing rendezvous; `any_ready` alone decides only once every arm has finished.
-  if (any_ready) { return task_creation_hint{TaskCreationHint::READY, this}; }
+    if (!_active_arm_nominated && p->src_pipeline) {
+      _active_arm_nominated = true;
+      auto* producer        = &p->src_pipeline->get_operators().front().get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
+
+    return std::nullopt;
+  }
 
   return std::nullopt;
 }
 
 std::unique_ptr<operator_data> sirius_physical_union::get_next_task_input_data()
 {
-  std::lock_guard<std::mutex> lg(lock);
+  std::unique_lock<std::mutex> lg(lock);
 
-  // One batch from one arm, not the base's one-from-every-port bundle, which would mix batches
-  // produced on different GPUs into a task that runs on one device. task_creator loops
-  // `while (!node->all_ports_empty())` around this call, so every arm still drains in a round.
   const auto& ports_by_arm = arm_ports();
-  const auto num_arms      = ports_by_arm.size();
-  if (num_arms == 0) { return nullptr; }
-  for (std::size_t offset = 0; offset < num_arms; offset++) {
-    const auto arm = (_arm_cursor + offset) % num_arms;
-    auto* p        = ports_by_arm[arm];
-    if (p->repo == nullptr) { continue; }
-    auto batch = p->repo->pop_next_data_batch();
-    if (!batch) { continue; }
-    _arm_cursor = (arm + 1) % num_arms;
-    std::vector<std::shared_ptr<::cucascade::data_batch>> popped;
-    popped.push_back(std::move(batch));
-    // pipelineable, not partitioned: with no partition_idx the task creator routes by data
-    // locality, so the batch is processed on the GPU that produced it.
-    return std::make_unique<pipelineable_operator_data>(std::move(popped));
+  if (_active_arm >= ports_by_arm.size()) { return nullptr; }
+
+  auto* p = ports_by_arm[_active_arm];
+  if (p->repo == nullptr) { return nullptr; }
+
+  auto batch = p->repo->pop_next_data_batch();
+  if (!batch) { return nullptr; }
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> popped;
+  popped.push_back(std::move(batch));
+  auto input = std::make_unique<pipelineable_operator_data>(std::move(popped));
+
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline_to_schedule;
+  if (p->repo->total_size() == 0 && p->src_pipeline && p->src_pipeline->is_pipeline_finished()) {
+    ++_active_arm;
+    _active_arm_nominated = false;
+    if (_active_arm < ports_by_arm.size()) { pipeline_to_schedule = get_pipeline(); }
   }
-  return nullptr;
+
+  lg.unlock();
+  if (pipeline_to_schedule) {
+    if (auto* creator = pipeline_to_schedule->get_task_creator()) { creator->schedule(this); }
+  }
+
+  // pipelineable, not partitioned: with no partition_idx the task creator routes by data
+  // locality, so the batch is processed on the GPU that produced it.
+  return input;
 }
 
 }  // namespace op
