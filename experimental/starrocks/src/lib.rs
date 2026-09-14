@@ -50,6 +50,7 @@ mod compute_node_service;
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod nixl_transport;
 mod proto;
 mod prpc;
 mod result_encoder;
@@ -59,6 +60,12 @@ pub use brpc::BrpcServer;
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use nixl_transport::NixlTransport;
+
+/// Serializes GPU-using tests inside this process. Cross-process GPU exclusion is the
+/// `gpu-lock.sh` wrapper used by the study scripts, not this mutex.
+#[cfg(all(test, feature = "nixl-transport"))]
+pub(crate) static GPU_ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

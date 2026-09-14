@@ -42,12 +42,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = "1"
 
 [features]
-# On by default so a normal build links the GPU engine. CI disables it
-# (`--no-default-features`) to keep the pure-Rust thrift/translator build and
-# tests buildable without a Sirius build tree or a GPU.
-default = ["sirius-engine"]
+# On by default so a normal build links the GPU engine and the nixl exchange
+# transport. CI disables it (`--no-default-features`) to keep the pure-Rust
+# thrift/translator build and tests buildable without a Sirius build tree, a
+# GPU, or a libnixl install.
+default = ["sirius-engine", "nixl-transport"]
 # Bring up an embedded Sirius engine context for the compute node.
 sirius-engine = ["dep:sirius"]
+# Cross-node exchange over nixl. Needs a libnixl install at build time
+# (NIXL_PREFIX; set NIXL_NO_STUBS_FALLBACK=1 or nixl-sys silently builds a
+# stub). HTTP control-plane routes land in a later commit.
+nixl-transport = ["sirius-engine", "dep:nixl-sys"]
 
 [dependencies]
 anyhow.workspace = true
@@ -61,6 +66,9 @@ prost.workspace = true
 # Optional: links the local Sirius engine build tree (gated by the
 # `sirius-engine` feature). Path dependency on the sibling `rust/` workspace.
 sirius = { path = "../../rust/crates/sirius", optional = true }
+# Optional: nixl agent bindings for the cross-node exchange tier (gated by the
+# `nixl-transport` feature). Links libnixl from NIXL_PREFIX at build time.
+nixl-sys = { version = "1.3", optional = true }
 starrocks-plan-translator = { path = "crates/starrocks-plan-translator" }
 starrocks-thrift = { path = "crates/starrocks-thrift" }
 thiserror.workspace = true
