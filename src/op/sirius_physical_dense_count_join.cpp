@@ -465,8 +465,30 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   auto const minmax_peak =
     saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
 
-  // Sparse execution: 16 is a heuristic expansion factor
-  auto const sparse_peak = saturating_add(allocation_floor, saturating_mul(16, stats.bytes));
+  // Sparse execution: a groupby streams its input through a hash table sized by DISTINCT
+  // KEYS, so the residency scales with the group count, not with how many rows were read.
+  // The previous form was 16 * input bytes, which on q13/SF3000 asked for 833 GiB against a
+  // 77.6 GiB space -- an estimate above the tier is not conservative, it just guarantees a
+  // clamp and a partial reservation, which is how that query came to run unreserved and die
+  // retrying a 228 MB allocation.
+  //
+  // Measured by forcing the sparse path on q13/SF1000: 14.93 GiB actual against 150M groups,
+  // or 107 bytes per group, where the old form predicted 280 GiB. The multiplier below is 8
+  // rather than the ~6.7 that fits exactly, for headroom. One batch's worth of input is added
+  // for the working set the current groupby reads; the largest batch is not in input_stats, so
+  // the mean stands in for it.
+  //
+  // Both terms scale with the scale factor on q13, so that query cannot by itself separate a
+  // per-group model from a per-input-byte one -- the group form is chosen because it is what
+  // a hash aggregate's residency actually tracks. A count-join whose preserved side is small
+  // against a large counted side would tell the two apart; TPC-H has no such shape.
+  constexpr std::size_t kSparseGroupFactor = 8;
+  auto const avg_batch_bytes =
+    stats.num_batches > 0 ? stats.bytes / stats.num_batches : stats.bytes;
+  auto sparse_peak = saturating_add(allocation_floor, avg_batch_bytes);
+  sparse_peak      = saturating_add(
+    sparse_peak,
+    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), output_rows));
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 
