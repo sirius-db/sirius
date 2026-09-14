@@ -121,6 +121,9 @@ class simpatico_batch_coalescer : public batch_coalescer {
     }
     _current->num_rows += split->num_rows;
     _current->decoded_bytes += split->decoded_bytes;
+    _current->payload_ranges.insert(_current->payload_ranges.end(),
+                                    split->payload_ranges.begin(),
+                                    split->payload_ranges.end());
     return out;
   }
 
@@ -187,6 +190,8 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->group_bounds = std::shared_ptr<sirius::scan_manager::group_bounds_arena const>(
     schema, &schema->group_bounds);
   info->column_has_nulls = schema->column_has_nulls;
+  info->column_extents          = schema->column_extents;
+  info->chunk_payload_offsets   = schema->chunk_payload_offsets;
   info->host_space          = &host_space;
   info->io_ctx              = std::move(io_ctx);
   // Whole file by default; a caller with a narrower projection overwrites this.
@@ -550,6 +555,34 @@ simpatico_gpu_ingestible::metadata_scan_task_t simpatico_gpu_ingestible::next_sp
     // decode will actually return rather than by the chunk it came from.
     split->num_rows      = live.num_rows;
     split->decoded_bytes = estimate_decoded_bytes(*_info, split->num_rows);
+    // The bytes this split will pull, so the prefetcher can warm them while the pipeline is still
+    // busy with the split ahead. Narrowed to the staged columns -- advising the whole chunk would
+    // warm columns the scan never reads, which for a heavily projected query is most of them.
+    // Row narrowing is deliberately NOT applied: sizing those ranges needs buffers that live in
+    // the payload, so it would cost a read to avoid a read. Advising a superset is harmless.
+    if (live.id < _info->column_extents.size() && live.id < _info->chunk_payload_offsets.size()) {
+      auto const base     = _info->chunk_payload_offsets[live.id];
+      auto const& extents = _info->column_extents[live.id];
+      // An empty _staged_columns means "the whole chunk", so advise every column.
+      std::vector<std::size_t> columns;
+      if (_staged_columns.empty()) {
+        columns.resize(extents.size());
+        std::iota(columns.begin(), columns.end(), std::size_t{0});
+      } else {
+        columns = _staged_columns;
+      }
+      for (auto const column : columns) {
+        if (column >= extents.size() || extents[column].second == 0) { continue; }
+        auto const begin = base + extents[column].first;
+        auto const size  = extents[column].second;
+        if (!split->payload_ranges.empty() &&
+            split->payload_ranges.back().first + split->payload_ranges.back().second == begin) {
+          split->payload_ranges.back().second += size;
+        } else {
+          split->payload_ranges.emplace_back(begin, size);
+        }
+      }
+    }
     return split;
   };
 }
@@ -575,6 +608,26 @@ bool hpln_range_read_enabled()
 }
 
 }  // namespace
+
+std::vector<scan_info::fadvise_entry> simpatico_scan_info::fadvise_entries() const
+{
+  if (payload_ranges.empty() || !io_ctx) { return {}; }
+  std::shared_ptr<sirius::io::sirius_datasource> ds;
+  try {
+    ds = io_ctx->open_datasource(path);
+  } catch (std::exception const&) {
+    return {};  // advisory only: a backend that cannot open here will report it at read time
+  }
+  if (!ds) { return {}; }
+  std::vector<fadvise_entry> entries;
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.reserve(payload_ranges.size());
+  for (auto const& [offset, size] : payload_ranges) {
+    ranges.emplace_back(static_cast<std::int64_t>(offset), static_cast<std::int64_t>(size));
+  }
+  entries.push_back(fadvise_entry{std::move(ds), std::move(ranges)});
+  return entries;
+}
 
 filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,

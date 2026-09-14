@@ -123,6 +123,15 @@ struct hpln_bind_schema {
   /// carries none or the segment did not decode -- both mean "serve unpruned", never "prune
   /// wrongly". Positional with the FILE's columns, not with any projection.
   scan_manager::group_bounds_arena group_bounds;
+  /// Per chunk, per FILE column: the column's byte extent within that chunk's payload, as
+  /// (offset, bytes). Exact because the writer lays a column's buffers out contiguously and walks
+  /// columns in order, so a prefix sum over the header's per-column `compressed_bytes` is the
+  /// layout. Kept so a scan can say which bytes it will read BEFORE reading them -- which is what
+  /// a prefetch hint needs and what `.hpln` scans could not previously supply.
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> column_extents;
+  /// Per chunk: where the chunk's payload starts in the FILE, so the extents above can be made
+  /// absolute.
+  std::vector<std::uint64_t> chunk_payload_offsets;
   /// Whether each FILE column can contain NULL, ORed over the file's chunks. Positional with
   /// @ref names. A .hpln records validity per chunk, so a column with nulls in only one chunk is
   /// still a nullable column to a reader binding the whole file.

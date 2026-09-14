@@ -145,6 +145,12 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// first, then the columns read only so a filter can be evaluated.
   std::vector<std::size_t> column_ids;
 
+  /// Per chunk, per FILE column: byte extent within that chunk's payload, and where the chunk's
+  /// payload starts in the file. Carried from the bind so a split can name the bytes it will read
+  /// before it reads them. See @ref simpatico_scan_info::fadvise_entries.
+  std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> column_extents;
+  std::vector<std::uint64_t> chunk_payload_offsets;
+
   /// Positions into @ref duckdb_column_ids the planner projects: the first @ref scan_output_arity
   /// entries are the scan's output columns in output order, and the rest are columns read ONLY to
   /// evaluate the filter. Empty means "every read column is an output column", which is what a
@@ -219,8 +225,21 @@ class simpatico_scan_info : public scan_info {
   std::int64_t num_rows = 0;
   /// Decoded size of the columns this split produces; drives the memory reservation.
   std::size_t decoded_bytes = 0;
+  /// Absolute file ranges this split will read, already narrowed to the staged columns. Ascending
+  /// and merged where adjacent.
+  std::vector<std::pair<std::uint64_t, std::uint64_t>> payload_ranges;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override { return decoded_bytes; }
+
+  /// The bytes this split will pull, handed to the prefetcher so the read overlaps the compute
+  /// ahead of it instead of blocking on it.
+  ///
+  /// Parquet has always done this (@c parquet_split_info::fadvise_entries); a .hpln split returned
+  /// nothing, on the reasoning that a reader "locates every chunk from the trailer... in one
+  /// pass". True of the METADATA, and false of the payload, which is almost all of the bytes and
+  /// whose ranges are known exactly here. Measured cost of the omission at SF1000: a cold scan
+  /// paid +45.2 s over its warm self for 824 GB, where parquet paid +3.3 s for 1519.9 GB.
+  [[nodiscard]] std::vector<fadvise_entry> fadvise_entries() const override;
 };
 
 //===----------------------------------------------------------------------===//
