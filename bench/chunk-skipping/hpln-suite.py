@@ -45,15 +45,51 @@ def hpln_views(d):
     return out
 
 
+def all_files(d, hpln):
+    """Every file of a dataset, for cache eviction."""
+    out = []
+    for t in TABLES:
+        if hpln:
+            out.append(os.path.join(d, f"{t}.hpln"))
+        else:
+            for pattern in (f"{t}.parquet", f"{t}_*.parquet", os.path.join(t, "*.parquet")):
+                out.extend(glob.glob(os.path.join(d, pattern)))
+    return sorted(set(p for p in out if os.path.exists(p)))
+
+
+def drop_cache(paths):
+    """Evict `paths`, so the next query reads from storage rather than from the last query."""
+    os.sync()
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
+def io_read_bytes():
+    """Bytes this process has pulled from block devices, as the kernel counts them."""
+    with open("/proc/self/io") as fh:
+        for line in fh:
+            if line.startswith("read_bytes:"):
+                return int(line.split(":")[1])
+    return 0
+
+
 def register(con, views):
     for table, source in views.items():
         con.execute(f"CREATE OR REPLACE VIEW {table} AS SELECT * FROM {source};")
 
 
 def run(con, sql):
+    b0 = io_read_bytes()
     t0 = time.time()
     rows = con.execute(sql).fetchall()
-    return time.time() - t0, rows
+    return time.time() - t0, io_read_bytes() - b0, rows
 
 
 def normalize(rows):
@@ -69,6 +105,12 @@ def main():
     ap.add_argument("--parquet", required=True)
     ap.add_argument("--queries", default=",".join(str(i) for i in range(1, 23)))
     ap.add_argument("--config", default=os.environ.get("SIRIUS_CONFIG_FILE"))
+    ap.add_argument(
+        "--drop-cache",
+        action="store_true",
+        help="evict each arm's files before EVERY query, so a cold run measures storage rather "
+        "than the previous query's reads",
+    )
     args = ap.parse_args()
     if args.config:
         os.environ["SIRIUS_CONFIG_FILE"] = args.config
@@ -77,6 +119,7 @@ def main():
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{EXTENSION_PATH}'")
     con.execute("SET gpu_execution = true")
+    con.execute("SET enable_duckdb_fallback = false")
 
     qs = [int(q) for q in args.queries.split(",")]
     hv, pv = hpln_views(args.hpln), parquet_views(args.parquet)
@@ -86,17 +129,21 @@ def main():
         line = f"q{q:<3}"
         try:
             register(con, pv)
-            pt, prows = run(con, sql)
-            line += f" parquet {pt:7.3f}s"
+            if args.drop_cache:
+                drop_cache(all_files(args.parquet, hpln=False))
+            pt, pbytes, prows = run(con, sql)
+            line += f" parquet {pt:7.3f}s {pbytes/1e9:6.2f}GB"
         except Exception as e:
-            prows, pt = None, float("nan")
+            prows, pt, pbytes = None, float("nan"), 0
             line += f" parquet FAILED: {str(e).splitlines()[0][:90]}"
         try:
             register(con, hv)
-            ht, hrows = run(con, sql)
-            line += f" | hpln {ht:7.3f}s"
+            if args.drop_cache:
+                drop_cache(all_files(args.hpln, hpln=True))
+            ht, hbytes, hrows = run(con, sql)
+            line += f" | hpln {ht:7.3f}s {hbytes/1e9:6.2f}GB"
         except Exception as e:
-            hrows, ht = None, float("nan")
+            hrows, ht, hbytes = None, float("nan"), 0
             line += f" | hpln FAILED: {str(e).splitlines()[0][:110]}"
             fails.append(q)
         if prows is not None and hrows is not None:
@@ -112,14 +159,18 @@ def main():
                 line += "  MATCH" if same else f"  *** MISMATCH ({len(prows)} vs {len(hrows)} rows)"
             if not same:
                 fails.append(q)
-            results.append((q, pt, ht))
+            results.append((q, pt, ht, pbytes, hbytes))
         print(line, flush=True)
 
     if results:
         tp = sum(r[1] for r in results)
         th = sum(r[2] for r in results)
+        bp = sum(r[3] for r in results)
+        bh = sum(r[4] for r in results)
         print(f"\nTOTAL over {len(results)} comparable queries: "
               f"parquet {tp:.3f}s, hpln {th:.3f}s ({(th/tp - 1) * 100:+.1f}%)")
+        print(f"  bytes read: parquet {bp/1e9:.1f} GB, hpln {bh/1e9:.1f} GB "
+              f"({(bh/bp - 1) * 100:+.1f}%)" if bp else "")
     print(f"FAILED/MISMATCHED: {sorted(set(fails)) if fails else 'none'}")
 
 
