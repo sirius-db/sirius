@@ -58,6 +58,10 @@ using ::codegen::jit::make_entry_symbol;
 using ::codegen::jit::replace_all;
 using ::codegen::jit::unsigned_counterpart;
 
+static_assert(
+  codegen::kChunkSize > 0 && codegen::kChunkSize <= UINT32_MAX / 64,
+  "Chunk-local bit positions must fit in uint32_t for all supported widths (up to 64 bits)");
+
 // ---------------------------------------------------------------------
 // Dtype table — element size per supported scalar type.
 // ---------------------------------------------------------------------
@@ -465,8 +469,8 @@ namespace {
 // (bit_in==0 → shift_l==32; uint64<<32 is well-defined in C++20.)
 __device__ __forceinline__ uint64_t simpatico_bitunpack_one(
     const uint32_t* __restrict__ packed, int bits, int32_t idx) {
-    const uint64_t bp      = static_cast<uint64_t>(static_cast<uint32_t>(idx))
-                           * static_cast<uint32_t>(bits);
+    // Chunk-local idx and bits <= 64 satisfy the renderer's checked uint32_t bound.
+    const uint32_t bp      = static_cast<uint32_t>(idx) * static_cast<uint32_t>(bits);
     const int32_t  word_in = static_cast<int32_t>(bp >> 5);
     const int32_t  bit_in  = static_cast<int32_t>(bp & 31);
     const int32_t  shift_l = 32 - bit_in;
