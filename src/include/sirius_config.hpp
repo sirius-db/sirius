@@ -100,7 +100,28 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+/// 0 = auto: derive the budget from GPU tier capacity via
+/// DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION, mirroring MAX_SORT_PARTITION_BYTES.
+///
+/// A fixed budget does not survive a change of scale factor. The histogram is
+/// 2 * key_range * slot_bytes and the slot width doubles once either side exceeds
+/// UINT32_MAX rows, so TPC-H q13 needs 1.12 GiB at SF1000 (150M keys, 32-bit
+/// slots) and 6.71 GiB at SF3000 (450M keys, 64-bit slots -- 4.45e9 counted rows
+/// clears 2^32 by 3.6%). The old 2 GiB constant sat between those two, which is
+/// what pushed SF3000 onto the sparse path.
+constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
+
+/// Share of GPU tier capacity a direct-address histogram may occupy when the
+/// budget is auto. Each task plans a full-width histogram over its own partition
+/// rather than a slice of a shared one, so a concurrent pipeline can hold one of
+/// these per thread; the admission gate's row terms (slots <= 8 * preserved rows,
+/// slots <= 2 * total rows) are what bound the replication.
+constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
+
+/// Budget used when the GPU tier capacity cannot be read at planning time.
+/// The pre-auto constant, kept so an unreachable space degrades to the old
+/// behaviour rather than to no budget at all.
+constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
 }  // namespace config
 
@@ -189,8 +210,13 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
+  /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A range that
+  /// does not fit declines the fusion at planning time, so the query runs the
+  /// ordinary join + aggregate rather than this operator's sparse path.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
+
+  /// Share of GPU tier capacity for the histogram when the budget above is 0.
+  double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's
