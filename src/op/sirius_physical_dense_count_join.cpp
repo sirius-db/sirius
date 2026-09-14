@@ -216,13 +216,17 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   std::size_t counted_key_idx,
   std::optional<std::size_t> counted_value_idx,
   uint64_t max_bins_bytes,
+  uint64_t planned_histogram_bytes,
+  uint64_t planned_output_rows,
   uint64_t hash_partition_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
     _preserved_key_idx(preserved_key_idx),
     _counted_key_idx(counted_key_idx),
     _counted_value_idx(counted_value_idx),
-    _max_bins_bytes(max_bins_bytes)
+    _max_bins_bytes(max_bins_bytes),
+    _planned_histogram_bytes(planned_histogram_bytes),
+    _planned_output_rows(planned_output_rows)
 {
   _hash_partition_bytes = hash_partition_bytes;
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
@@ -414,13 +418,34 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
 
   constexpr std::size_t allocation_floor = 1024 * 1024;
 
-  auto const histogram_bytes = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
+  // The admission ceiling is a gate, not a size: min(budget, 4 * input) reports the budget
+  // whenever the input is large, and the budget now scales with the card, so using it here
+  // makes the estimate grow on a bigger GPU. Prefer the planner's sizing of the actual
+  // histogram (2 * key_range * slot_bytes from the child cardinalities), capped by the
+  // ceiling since anything above it would not have been admitted. Falls back to the ceiling
+  // when the planner did not supply one.
+  auto const admission_ceiling = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
+  auto const histogram_bytes =
+    _planned_histogram_bytes > 0
+      ? std::min(static_cast<std::size_t>(_planned_histogram_bytes), admission_ceiling)
+      : admission_ceiling;
 
   auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
   auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-  auto const output_rows    = std::min(stats.bytes / key_width, cudf_row_limit);
+  // Output rows are distinct PRESERVED keys, not input elements. stats.bytes covers both
+  // sides and every column, so stats.bytes / key_width counts each input byte as a key: on
+  // q13/SF3000 that is 6.99e9 (clamped to the cudf limit, 2.15e9) against 450M real groups,
+  // and the error multiplies through the three per-row terms below.
+  //
+  // The preserved child's cardinality is the right bound -- one row per distinct preserved
+  // key -- and the base estimated_cardinality is NOT it: duckdb estimates this fused
+  // aggregate at the join's output size, 4.5e9 on the same query. The byte-derived bound
+  // stays as a ceiling for when the planner supplied nothing.
+  auto const planned_rows =
+    _planned_output_rows > 0 ? static_cast<std::size_t>(_planned_output_rows) : cudf_row_limit;
+  auto const output_rows = std::min({planned_rows, stats.bytes / key_width, cudf_row_limit});
   auto const selected_bytes =
     saturating_mul(sizeof(int64_t), output_rows);  // histogram bin index per key
   auto const output_bytes =

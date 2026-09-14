@@ -107,6 +107,13 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    *        `std::nullopt` for COUNT(*)
    * @param max_bins_bytes Budget for one partition task's direct-address histograms; the runtime
    *        density and input-size gates may still select sparse aggregation below it
+   * @param planned_histogram_bytes What the planner computed the histogram would need, from the
+   *        child cardinalities. Used only by the memory estimate, which otherwise has to fall back
+   *        to the admission ceiling -- a gate, not a size, and one that now grows with the card
+   * @param planned_output_rows Estimated rows this operator emits, i.e. the preserved child's
+   *        cardinality: a count-join emits exactly one row per distinct preserved key. The base
+   *        `estimated_cardinality` is NOT this number -- duckdb estimates the fused aggregate at
+   *        the join's output size (4.5e9 against 450M real groups on q13/SF3000)
    * @param hash_partition_bytes Configured per-partition byte target; get_partition_strategy
    *        scales it up, because one task of this operator holds a partition of both inputs and
    *        this operator only ever sees narrow tables
@@ -118,7 +125,9 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
     std::size_t counted_key_idx,
     std::optional<std::size_t> counted_value_idx,
     uint64_t max_bins_bytes,
-    uint64_t hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES);
+    uint64_t planned_histogram_bytes = 0,
+    uint64_t planned_output_rows     = 0,
+    uint64_t hash_partition_bytes    = config::DEFAULT_HASH_PARTITION_BYTES);
 
   std::string params_to_string() const override;
 
@@ -259,6 +268,10 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   std::size_t _counted_key_idx;
   std::optional<std::size_t> _counted_value_idx;
   uint64_t _max_bins_bytes;
+  /// Planner's sizing of the histogram; 0 when unknown, which keeps the old ceiling behaviour.
+  uint64_t _planned_histogram_bytes{0};
+  /// Planner's estimate of emitted rows (preserved cardinality); 0 when unknown.
+  uint64_t _planned_output_rows{0};
   /// Written by every task, read by nothing the operator decides on; see last_strategy().
   std::atomic<strategy> _last_strategy{strategy::NOT_RUN};
   /// Next partition to hand to a task; guarded by the base `lock`.
