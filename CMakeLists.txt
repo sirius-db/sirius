@@ -21,6 +21,8 @@ project(
   VERSION 0.0.0
   LANGUAGES CXX CUDA)
 
+include(GNUInstallDirs)
+
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -664,7 +666,7 @@ set_target_properties(
 target_include_directories(
   sirius_shared
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-         $<INSTALL_INTERFACE:include/sirius>)
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/sirius>)
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
@@ -725,7 +727,7 @@ install(
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
-  INSTALL_DESTINATION "lib/cmake/sirius")
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
   VERSION "${PROJECT_VERSION}"
@@ -734,21 +736,23 @@ write_basic_package_version_file(
 install(
   TARGETS sirius_shared
   EXPORT sirius-targets
-  LIBRARY DESTINATION lib COMPONENT sirius_library)
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT sirius_library)
 install(
   FILES src/include/sirius_ffi.hpp
-  DESTINATION include/sirius
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius"
   COMPONENT sirius_library)
 install(
   EXPORT sirius-targets
   FILE sirius-targets.cmake
   NAMESPACE sirius::
-  DESTINATION "lib/cmake/sirius"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
   COMPONENT sirius_library)
 install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
-  DESTINATION "lib/cmake/sirius"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
   COMPONENT sirius_library)
 
 if(ENABLE_STREAM_CHECK)
