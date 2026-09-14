@@ -1,6 +1,14 @@
 version: 7
 platforms:
-- name: p1
+- name: linux-64-cuda12
+  subdir: linux-64
+  virtual-packages:
+  - __cuda=12
+  - __unix=0=0
+  - __linux=4.18
+  - __glibc=2.28
+  - __archspec=0=x86_64
+- name: linux-64-cuda13
   subdir: linux-64
   virtual-packages:
   - __cuda=13
@@ -8,26 +16,18 @@ platforms:
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=x86_64
-- name: p2
+- name: linux-aarch64-cuda12
   subdir: linux-aarch64
   virtual-packages:
-  - __cuda=13
+  - __cuda=12
   - __unix=0=0
   - __linux=4.18
   - __glibc=2.28
   - __archspec=0=aarch64
-- name: p3
-  subdir: linux-64
-  virtual-packages:
-  - __cuda=12
-  - __unix=0=0
-  - __linux=4.18
-  - __glibc=2.28
-  - __archspec=0=x86_64
-- name: p4
+- name: linux-aarch64-cuda13
   subdir: linux-aarch64
   virtual-packages:
-  - __cuda=12
+  - __cuda=13
   - __unix=0=0
   - __linux=4.18
   - __glibc=2.28
@@ -40,7 +40,7 @@ environments:
     indexes:
     - https://pypi.org/simple
     packages:
-      p3:
+      linux-64-cuda12:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-auth-0.10.4-hb7a77c6_1.conda
@@ -288,7 +288,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rmm-26.06.00-cuda12_cp311_abi3_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/ucxx-0.50.01-cuda12_cp311_abi3_260608_b12cd9f0.conda
       - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
-      p4:
+      linux-aarch64-cuda12:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.4-h03961ac_1.conda
@@ -545,7 +545,7 @@ environments:
     indexes:
     - https://pypi.org/simple
     packages:
-      p1:
+      linux-64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-auth-0.10.4-hb7a77c6_1.conda
@@ -794,7 +794,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rmm-26.06.00-cuda13_cp311_abi3_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/ucxx-0.50.01-cuda13_cp311_abi3_260608_b12cd9f0.conda
       - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
-      p2:
+      linux-aarch64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_go_select-2.3.0-cgo.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.4-h03961ac_1.conda
@@ -1053,7 +1053,7 @@ environments:
     indexes:
     - https://pypi.org/simple
     packages:
-      p1:
+      linux-64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bc-1.07.1-h7f98852_0.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-64/binutils-2.45.1-default_h4852527_102.conda
@@ -1201,7 +1201,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.5.1-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
       - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
-      p2:
+      linux-aarch64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/bc-1.07.1-hf897c2e_0.tar.bz2
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/binutils-2.45.1-default_hf1166c9_102.conda
@@ -1358,7 +1358,7 @@ environments:
     - url: https://conda.anaconda.org/rapidsai/
     - url: https://conda.anaconda.org/conda-forge/
     packages:
-      p1:
+      linux-64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libgcc-15.2.0-he0feb66_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libgomp-15.2.0-he0feb66_19.conda
@@ -1366,7 +1366,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pixi-0.71.1-ha759004_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.6.17-hbd8a1cb_0.conda
-      p2:
+      linux-aarch64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-15.2.0-h8acb6b2_19.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-15.2.0-h8acb6b2_19.conda
@@ -1381,7 +1381,7 @@ environments:
     indexes:
     - https://pypi.org/simple
     packages:
-      p1:
+      linux-64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-auth-0.10.1-ha62d5e7_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-cal-0.9.13-h2c9d079_1.conda
@@ -1606,7 +1606,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rmm-26.06.00-cuda13_cp311_abi3_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/ucxx-0.50.01-cuda13_cp311_abi3_260608_b12cd9f0.conda
       - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
-      p2:
+      linux-aarch64-cuda13:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.1-h32143b3_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-cal-0.9.13-hc50a40c_1.conda
@@ -1840,7 +1840,7 @@ environments:
     indexes:
     - https://pypi.org/simple
     packages:
-      p3:
+      linux-64-cuda12:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-auth-0.10.1-ha62d5e7_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/aws-c-cal-0.9.13-h2c9d079_1.conda
@@ -2064,7 +2064,7 @@ environments:
       - conda: https://conda.anaconda.org/rapidsai/linux-64/rmm-26.06.00-cuda12_cp311_abi3_260603_87184183.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/ucxx-0.50.01-cuda12_cp311_abi3_260608_b12cd9f0.conda
       - pypi: https://files.pythonhosted.org/packages/e5/61/7f9958174c5b969a6a5e94e676364fffcd6fee53e5eef2e98c36d91dfc7a/rumdl-0.2.44-py3-none-manylinux_2_28_x86_64.whl
-      p4:
+      linux-aarch64-cuda12:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-0.10.1-h32143b3_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-cal-0.9.13-hc50a40c_1.conda
