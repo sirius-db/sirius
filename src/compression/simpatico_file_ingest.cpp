@@ -982,9 +982,8 @@ hpln_bind_schema parse_hpln_schema(std::string const& path,
   std::vector<std::int64_t> chunk_rows;
   scan_manager::group_bounds_arena bounds;
 
-  std::vector<std::vector<std::uint8_t>> headers_kept;
   if (layout.located) {
-    std::vector<std::vector<std::uint8_t>>& headers = headers_kept;
+    std::vector<std::vector<std::uint8_t>> headers;
     describe_chunks(src, path, layout, options.policy, headers, header_schema);
     for (auto const& c : layout.chunks) {
       chunk_rows.push_back(c.num_rows);
@@ -1034,27 +1033,6 @@ hpln_bind_schema parse_hpln_schema(std::string const& path,
       path,
       bounds.chunk_count(),
       out.chunk_rows.size());
-  }
-  // Per-chunk column extents, for a prefetch hint. Each chunk's header is already in hand, and a
-  // column's bytes are contiguous within the payload, so this is a prefix sum rather than a parse.
-  if (layout.located) {
-    out.column_extents.reserve(layout.chunks.size());
-    out.chunk_payload_offsets.reserve(layout.chunks.size());
-    for (std::size_t c = 0; c < layout.chunks.size(); ++c) {
-      out.chunk_payload_offsets.push_back(layout.chunks[c].payload_offset);
-      std::vector<std::pair<std::uint64_t, std::uint64_t>> extents;
-      simpatico::hpln_schema chunk_schema;
-      if (c < headers_kept.size() &&
-          simpatico::describe_compressed_table_header(headers_kept[c], chunk_schema).empty()) {
-        std::uint64_t at = 0;
-        extents.reserve(chunk_schema.columns.size());
-        for (auto const& col : chunk_schema.columns) {
-          extents.emplace_back(at, col.compressed_bytes);
-          at += col.compressed_bytes;
-        }
-      }
-      out.column_extents.push_back(std::move(extents));
-    }
   }
   out.num_rows = std::accumulate(out.chunk_rows.begin(), out.chunk_rows.end(), std::int64_t{0});
   out.names.reserve(header_schema.columns.size());
