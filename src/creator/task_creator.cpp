@@ -172,9 +172,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query,
   // queries own their own entries, and this one is brand new.
   for (const auto& pipeline : pipelines) {
     pipeline->set_task_creator(this);
-    if (pipeline->is_query_terminal()) {
-      pipeline->set_completion_handler(handler);
-    }
+    if (pipeline->is_query_terminal()) { pipeline->set_completion_handler(handler); }
     auto source_operator = pipeline->get_source();
     if (source_operator == nullptr) {
       SIRIUS_LOG_WARN("Pipeline has no source operator; skipping task creation for this pipeline.");
