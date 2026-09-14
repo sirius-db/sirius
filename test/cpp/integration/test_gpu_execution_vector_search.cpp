@@ -28,6 +28,8 @@
 #include <catch.hpp>
 #include <cuvs/distance/distance.hpp>
 #include <duckdb.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <sirius_context.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -925,8 +927,22 @@ TEST_CASE_METHOD(VectorSearchFixture,
   {
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
-    auto const& mgr   = sirius_ctx->get_scan_manager();
-    const auto* entry = mgr.find_pinned_entry_for_duckdb_table(attach_alias, "main", "vs_mc");
+    duckdb::idx_t table_oid;
+    con->BeginTransaction();
+    try {
+      auto& table_entry =
+        duckdb::Catalog::GetEntry(
+          *con->context, duckdb::CatalogType::TABLE_ENTRY, attach_alias, "main", "vs_mc")
+          .Cast<duckdb::DuckTableEntry>();
+      table_oid = table_entry.oid;
+      con->Rollback();
+    } catch (...) {
+      con->Rollback();
+      throw;
+    }
+    auto const& mgr = sirius_ctx->get_scan_manager();
+    const auto* entry =
+      mgr.find_pinned_entry_for_duckdb_table(attach_alias, "main", "vs_mc", table_oid);
     REQUIRE(entry != nullptr);
     auto it = entry->data_batches_by_column.find("vec");
     REQUIRE(it != entry->data_batches_by_column.end());

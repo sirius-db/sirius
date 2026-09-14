@@ -83,6 +83,9 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::string catalog_name;
   std::string schema_name;
   std::string table_name;
+  /// Catalog object id of the resolved DuckTableEntry. A zero id cannot match a
+  /// real table, so incomplete hand-built descriptors safely miss the cache.
+  duckdb::idx_t table_oid = 0;
 
   duckdb_native_ingestible_table_info() = default;
 
