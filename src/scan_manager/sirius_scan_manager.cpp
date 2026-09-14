@@ -3186,6 +3186,14 @@ cached_scan_plan build_cached_scan_plan(pinned_entry const& entry,
     plan.survivor_row_ranges.clear();
     plan.rows_pruned_within_chunks = 0;
   }
+  // What the pruning actually achieved. Nothing reported this, which made every question about a
+  // pinned scan's zone maps unanswerable: a pin that prunes nothing and one that prunes everything
+  // both just return rows.
+  SIRIUS_LOG_INFO("[sirius_scan_manager] cached scan of '{}': {}/{} chunks survive, {} row ranges",
+                  entry.cache_info.table_name,
+                  plan.survivor_chunk_indices.size(),
+                  n_chunks,
+                  plan.survivor_row_ranges.size());
   return plan;
 }
 

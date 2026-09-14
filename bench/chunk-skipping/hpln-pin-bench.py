@@ -67,11 +67,21 @@ def arm_config(arm, args):
     if arm.startswith("hpln"):
         d = args.hpln_sorted if arm == "hpln-sorted" else args.hpln_unsorted
         views = {t: hpln_source(d, t) for t in TABLES}
-        pins = [
-            (t, f"CALL pin_table('{os.path.join(d, f'{t}.hpln')}', format => 'simpatico', "
-                f"tier => 'host', name => '{t}');")
-            for t in TABLES
-        ]
+        # The same column union the parquet arm pins. Without it the .hpln arm stages every column
+        # of every file and the two arms are not comparable: at SF1000 that is 442 GB against a
+        # 471 GB pinned budget, most of it columns no query reads.
+        cols_by_table = union_columns_by_table()
+        pins = []
+        for t in TABLES:
+            cols = "" if args.pin_all_columns else ", cols => [%s]" % ",".join(
+                f"'{c}'" for c in cols_by_table.get(t, [])
+            )
+            if not cols_by_table.get(t):
+                cols = ""
+            pins.append(
+                (t, f"CALL pin_table('{os.path.join(d, f'{t}.hpln')}', format => 'simpatico', "
+                    f"tier => 'host', name => '{t}'{cols});")
+            )
         return views, pins
 
     views = {t: parquet_source(args.parquet, t) for t in TABLES}
@@ -85,7 +95,7 @@ def arm_config(arm, args):
             if key and key in cols:
                 cluster = f", cluster_by=['{key}']"
         path = detect_pin_glob(args.parquet, table)
-        pins.append((table, f"CALL pin_table('{path}', tier => 'host', name => '{table}', "
+        pins.append((table, f"CALL pin_table('{path}', tier => '{args.tier}', name => '{table}', "
                             f"cols=[{col_literals}]{cluster});"))
     return views, pins
 
@@ -131,6 +141,15 @@ def run_arm(arm, args, reference):
     con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{EXTENSION_PATH}'")
     con.execute("SET gpu_execution = true")
+    # A GPU failure that falls back to DuckDB looks exactly like a correct slow run, which is how
+    # this project has been misled before. Fail loudly instead.
+    con.execute("SET enable_duckdb_fallback = false")
+    # The settings the SF1000 sweep runs under (run-sweep-sf1000.sh). Without them this harness
+    # measures a configuration the project does not use: no late materialization, no fused scan
+    # filter, no ast_jit -- which at SF1000 both OOMs at 2GB batches and makes pin-time clustering
+    # look worthless. Passed the same way the sweep passes them, so the two cannot drift.
+    for stmt in filter(None, (x.strip() for x in os.environ.get("SIRIUS_PRE_SQL", "").split(";"))):
+        con.execute(stmt)
     if not arm.startswith("hpln"):
         # The parquet arm has to compress at pin time to be the same representation the .hpln
         # already is; without this it pins raw and the comparison is about compression, not I/O.
@@ -188,6 +207,20 @@ def main():
     ap.add_argument("--iterations", type=int, default=3)
     ap.add_argument("--queries", default=",".join(str(i) for i in range(1, 23)))
     ap.add_argument("--plan-dir", default=os.path.join(REPO, "bench/chunk-skipping/plans-hpln"))
+    ap.add_argument(
+        "--pin-all-columns",
+        action="store_true",
+        help="pin every column of a .hpln rather than the union the queries read — the old "
+        "behaviour, kept as the arm that says what the column subset is worth",
+    )
+    ap.add_argument(
+        "--tier",
+        default="host",
+        choices=["host", "gpu"],
+        help="tier for the PARQUET arms. A .hpln pin is host-only by construction -- the file is "
+        "the host representation -- so 'gpu' is what the project's tuned SF1000 config uses and "
+        "what the format cannot match",
+    )
     ap.add_argument("--drop-cache", action="store_true",
                     help="evict the arm's input files from the page cache before pinning")
     ap.add_argument("--out", default=os.path.join(REPO, "bench/chunk-skipping/results-hpln-pin"))
