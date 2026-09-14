@@ -49,33 +49,22 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
-#include <cudf/interop.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/span.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
-
-// Completes cudf's forward-declared ArrowDeviceArray to the Arrow C Device Data
-// Interface. DuckDB's arrow.hpp already filled ArrowSchema/ArrowArray (and set
-// ARROW_C_DATA_INTERFACE), so apache arrow/c/abi.h would skip those structs.
-#ifndef ARROW_C_DEVICE_DATA_INTERFACE
-#define ARROW_C_DEVICE_DATA_INTERFACE
-struct ArrowDeviceArray {
-  ArrowArray array;
-  int64_t device_id;
-  ArrowDeviceType device_type;
-  void* sync_event;
-  int64_t reserved[3];
-};
-#endif
 
 namespace sirius::ffi {
 
@@ -84,94 +73,12 @@ namespace {
 constexpr const char* kSiriusStateKey   = "sirius_state";
 constexpr const char* kQueryLabel       = "sirius_ffi";
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
+/// chunked_pack gather granularity. Every next() span must be exactly this long, so a lease is
+/// the payload plus one chunk of slack for the final span. 1 MiB is cudf's minimum.
+constexpr std::size_t kPackChunkBytes = 8u << 20;
 
 // DuckDB view name a plan uses to read input stream `id`.
 std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
-
-ArrowSchema steal_schema(cudf::unique_schema_t schema)
-{
-  ArrowSchema out = *schema;
-  schema->release = nullptr;
-  return out;
-}
-
-ArrowArray steal_host_array(cudf::unique_device_array_t host)
-{
-  ArrowArray array    = host->array;
-  host->array.release = nullptr;
-  return array;
-}
-
-// One-batch ArrowArrayStream: get_schema once, get_next once, then EOS. Matches
-// result_to_arrow's address convention (caller-owned ArrowArrayStream).
-struct exported_batch_stream {
-  ArrowSchema schema{};
-  ArrowArray array{};
-  bool schema_consumed{false};
-  bool array_consumed{false};
-  std::string last_error;
-};
-
-int exported_get_schema(ArrowArrayStream* stream, ArrowSchema* out)
-{
-  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
-  if (state->schema_consumed) {
-    state->last_error = "schema already consumed";
-    return EINVAL;
-  }
-  *out                   = state->schema;
-  state->schema.release  = nullptr;
-  state->schema_consumed = true;
-  return 0;
-}
-
-int exported_get_next(ArrowArrayStream* stream, ArrowArray* out)
-{
-  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
-  if (!state->array_consumed) {
-    *out                  = state->array;
-    state->array.release  = nullptr;
-    state->array_consumed = true;
-    return 0;
-  }
-  *out = ArrowArray{};
-  return 0;
-}
-
-const char* exported_get_last_error(ArrowArrayStream* stream)
-{
-  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
-  return state->last_error.empty() ? nullptr : state->last_error.c_str();
-}
-
-void exported_release(ArrowArrayStream* stream)
-{
-  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
-  if (state->schema.release) { state->schema.release(&state->schema); }
-  if (state->array.release) { state->array.release(&state->array); }
-  delete state;
-  stream->release      = nullptr;
-  stream->private_data = nullptr;
-}
-
-void export_one_batch(ArrowArrayStream* dest, ArrowSchema schema, ArrowArray array)
-{
-  auto* state          = new exported_batch_stream;
-  state->schema        = schema;
-  state->array         = array;
-  dest->get_schema     = &exported_get_schema;
-  dest->get_next       = &exported_get_next;
-  dest->get_last_error = &exported_get_last_error;
-  dest->release        = &exported_release;
-  dest->private_data   = state;
-}
-
-std::string arrow_stream_error(ArrowArrayStream* stream, int err)
-{
-  const char* msg = (stream->get_last_error != nullptr) ? stream->get_last_error(stream) : nullptr;
-  if (msg != nullptr && msg[0] != '\0') { return msg; }
-  return "ArrowArrayStream error " + std::to_string(err);
-}
 
 void check_declared_schema(const sirius::exec::stream_input_spec& declared,
                            const cudf::table_view& view,
@@ -767,31 +674,36 @@ std::size_t Fragment::relay_from(Fragment& source,
   return moved;
 }
 
-bool Fragment::pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr)
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t stream_id,
+                                                                   std::uint64_t& offset,
+                                                                   std::uint64_t& length,
+                                                                   std::uint64_t& rows)
 {
   if (!impl_->built) {
-    throw sirius::invalid_input_exception("Fragment: build() must run before pull_arrow()");
+    throw sirius::invalid_input_exception("Fragment: build() must run before export_packed()");
   }
   // Same "empty vs finished" trap as relay_from: before run(), pull() returning nullopt
   // cannot be told apart from a drained stream.
   if (!impl_->ran) {
     throw sirius::invalid_input_exception(
-      "Fragment: pull_arrow() requires the fragment to have run — call run() first, otherwise "
+      "Fragment: export_packed() requires the fragment to have run — call run() first, otherwise "
       "an empty stream is indistinguishable from a finished one");
   }
   if (impl_->fragment == nullptr) {
     throw sirius::invalid_input_exception(
-      "Fragment: pull_arrow() requires an intermediate fragment with output streams — a result "
+      "Fragment: export_packed() requires an intermediate fragment with output streams — a result "
       "fragment produces Arrow via result_to_arrow()");
   }
-  if (out_array_addr == 0) {
-    throw sirius::invalid_input_exception(
-      "Fragment: pull_arrow() needs a non-null ArrowArrayStream");
-  }
+  auto& arena = sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get());
 
+  offset     = 0;
+  length     = 0;
+  rows       = 0;
   auto batch = impl_->session().pull(stream_id);
-  if (!batch) { return false; }
+  if (!batch) { return nullptr; }
 
+  // The shared lock holds residency and immutability for the whole pack; it releases when this
+  // scope ends, after the packing stream has been synchronized and the data lives in the lease.
   auto read_only = (*batch)->to_read_only();
   if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
     throw sirius::invalid_input_exception(
@@ -804,6 +716,7 @@ bool Fragment::pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr
     throw sirius::invalid_input_exception("Fragment: batch on output stream " +
                                           std::to_string(stream_id) + " has no memory space");
   }
+  rows = static_cast<std::uint64_t>(view.num_rows());
 
   auto stream = cudf::get_default_stream();
   if (cudaEvent_t writer = read_only.get_writer_event()) {
@@ -813,24 +726,59 @@ bool Fragment::pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr
     }
   }
 
-  auto metadata   = cudf::interop::get_table_metadata(view);
-  auto schema_ptr = cudf::to_arrow_schema(view, metadata);
-  auto host       = cudf::to_arrow_host(view, stream);
-  stream.synchronize();
+  auto packer =
+    cudf::chunked_pack::create(view, kPackChunkBytes, stream, space->get_default_allocator());
+  const std::uint64_t total = packer->get_total_contiguous_size();
 
-  auto* dest = reinterpret_cast<ArrowArrayStream*>(out_array_addr);
-  export_one_batch(dest, steal_schema(std::move(schema_ptr)), steal_host_array(std::move(host)));
-  return true;
+  // A zero-row batch packs to a metadata-only frame: no payload, no lease. offset==0 with
+  // length==0 means "no lease exists for this batch".
+  if (total == 0) { return packer->build_metadata(); }
+
+  const auto lease_offset = arena.lease(total + kPackChunkBytes);
+  std::unique_ptr<std::vector<std::uint8_t>> metadata;
+  try {
+    auto* lease         = reinterpret_cast<std::uint8_t*>(arena.base()) + lease_offset;
+    std::size_t written = 0;
+    while (packer->has_next()) {
+      written += packer->next(cudf::device_span<std::uint8_t>(lease + written, kPackChunkBytes));
+    }
+    if (written != total) {
+      throw sirius::internal_exception(
+        "Fragment: chunked_pack wrote {} of {} bytes for output stream {}",
+        written,
+        total,
+        stream_id);
+    }
+    metadata = packer->build_metadata();
+    stream.synchronize();
+  } catch (...) {
+    arena.release(lease_offset);
+    throw;
+  }
+  offset = lease_offset;
+  length = total;
+  return metadata;
 }
 
-void Fragment::push_arrow(std::uint64_t stream_id, std::uintptr_t in_array_addr)
+void Fragment::push_packed(std::uint64_t stream_id,
+                           std::uintptr_t metadata_addr,
+                           std::size_t metadata_len,
+                           std::uint64_t offset,
+                           std::uint64_t length)
 {
   if (!impl_->built) {
-    throw sirius::invalid_input_exception("Fragment: build() must run before push_arrow()");
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_packed()");
   }
-  if (in_array_addr == 0) {
+  auto& arena = sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get());
+  if (metadata_addr == 0 || metadata_len == 0) {
+    throw sirius::invalid_input_exception("Fragment: push_packed() requires pack metadata");
+  }
+  if (offset > arena.capacity() || length > arena.capacity() - offset) {
     throw sirius::invalid_input_exception(
-      "Fragment: push_arrow() needs a non-null ArrowArrayStream");
+      "Fragment: push_packed() range [{}, +{}) exceeds the staging arena capacity {}",
+      offset,
+      length,
+      arena.capacity());
   }
 
   auto declared_it = impl_->resolved_inputs.find(stream_id);
@@ -840,57 +788,30 @@ void Fragment::push_arrow(std::uint64_t stream_id, std::uintptr_t in_array_addr)
                                           " was never declared on this fragment");
   }
 
-  auto* in = reinterpret_cast<ArrowArrayStream*>(in_array_addr);
-  if (in->get_schema == nullptr || in->get_next == nullptr) {
-    throw sirius::invalid_input_exception(
-      "Fragment: push_arrow() ArrowArrayStream is missing get_schema/get_next");
-  }
-
-  ArrowSchema schema{};
-  if (int err = in->get_schema(in, &schema); err != 0) {
-    throw sirius::invalid_input_exception("Fragment: push_arrow() get_schema failed: " +
-                                          arrow_stream_error(in, err));
-  }
-
-  ArrowArray array{};
-  if (int err = in->get_next(in, &array); err != 0) {
-    if (schema.release) { schema.release(&schema); }
-    throw sirius::invalid_input_exception("Fragment: push_arrow() get_next failed: " +
-                                          arrow_stream_error(in, err));
-  }
-  if (array.release == nullptr) {
-    if (schema.release) { schema.release(&schema); }
-    throw sirius::invalid_input_exception(
-      "Fragment: push_arrow() stream has no batch (empty get_next is EOS, not a hop)");
-  }
+  const auto* metadata = reinterpret_cast<const std::uint8_t*>(metadata_addr);
+  const auto* payload  = reinterpret_cast<const std::uint8_t*>(arena.base()) + offset;
+  auto unpacked        = cudf::unpack(metadata, payload);
+  check_declared_schema(declared_it->second, unpacked, stream_id, "packed batch");
 
   auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
     cucascade::memory::Tier::GPU, /*device_id=*/0);
   if (gpu_space == nullptr) {
-    if (array.release) { array.release(&array); }
-    if (schema.release) { schema.release(&schema); }
-    throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
+    throw sirius::internal_exception("Fragment: push_packed() found no GPU memory space");
   }
 
-  auto cuda_stream = cudf::get_default_stream();
-  std::unique_ptr<cudf::table> table;
-  try {
-    table = cudf::from_arrow(&schema, &array, cuda_stream, gpu_space->get_default_allocator());
-    check_declared_schema(declared_it->second, table->view(), stream_id, "Arrow batch");
-    cuda_stream.synchronize();
-  } catch (...) {
-    if (array.release) { array.release(&array); }
-    if (schema.release) { schema.release(&schema); }
-    throw;
-  }
-  if (array.release) { array.release(&array); }
-  if (schema.release) { schema.release(&schema); }
+  auto stream = cudf::get_default_stream();
+  auto table  = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+  stream.synchronize();
 
   auto data_batch = sirius::make_data_batch(
-    std::move(table), *gpu_space, cuda_stream, telemetry::batch_telemetry_info{});
-  if (!impl_->session().push(stream_id, std::move(data_batch))) {
+    std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+  bool const pushed = impl_->session().push(stream_id, std::move(data_batch));
+  // Study path has no InboundStore: the receiver lease is consumed here. length==0 means the
+  // sender never leased, so offset 0 must not be released.
+  if (length != 0) { arena.release(offset); }
+  if (!pushed) {
     throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
-                                          " refused an Arrow batch; it had already ended");
+                                          " refused a packed batch; it had already ended");
   }
 }
 

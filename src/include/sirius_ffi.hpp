@@ -164,9 +164,9 @@ class SIRIUS_FFI_EXPORT StagingArena {
 /// streams fed by other fragments without copying.
 ///
 /// Usage order: declare inputs/outputs → build → fill inputs → run → drain.
-/// Fill inputs with relay_from (same process, native batches) or pull_arrow +
-/// push_arrow + close_input (Arrow C Data at a process edge). Drain with
-/// relay_from / pull_arrow on an intermediate fragment, or result_to_arrow on a
+/// Fill inputs with relay_from (same process, native batches) or export_packed +
+/// push_packed + close_input (packed GPU bytes at a process edge). Drain with
+/// relay_from / export_packed on an intermediate fragment, or result_to_arrow on a
 /// result fragment.
 ///
 /// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
@@ -222,24 +222,42 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
-  /// Pull one parked sink batch on `stream_id` into the caller-owned ArrowArrayStream at
-  /// `out_array_addr` (Arrow C Data Interface; same address convention as result_to_arrow).
-  /// The stream carries that one batch: get_schema once, get_next once, then EOS.
-  /// @return false if no batch is parked now (not EOS — use drained()). The dest stream is
-  ///         left untouched on false; the caller must pass a zeroed ArrowArrayStream.
-  /// @throws before build()/run(), on a result fragment, or on an unknown output stream.
-  bool pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr);
+  /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease
+  /// (`cudf::chunked_pack` gathers directly into the lease). Returns the cudf pack metadata the
+  /// receiver's `push_packed` needs, or nullptr when nothing is parked right now; on success
+  /// writes the lease offset, packed payload length, and row count.
+  ///
+  /// The packing stream is synchronized before returning, so the caller may transmit from
+  /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
+  /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
+  /// the caller's responsibility.
+  ///
+  /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
+  /// `length == 0` and holds NO lease — the caller must not release anything for it.
+  /// @throws before `build()`/`run()`, on an unknown output stream, when no arena is configured,
+  /// on lease exhaustion, or on a parked batch that is not GPU-resident.
+  std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
+                                                           std::uint64_t& offset,
+                                                           std::uint64_t& length,
+                                                           std::uint64_t& rows);
 
-  /// Push one Arrow batch from the caller-owned ArrowArrayStream at `in_array_addr` onto
-  /// input stream `stream_id`. Consumes get_schema + one get_next; does not release the
-  /// stream and does not close the sender (same as a remote hop: the caller close_input()s).
-  /// Schema is validated against the declared input before the batch is queued.
-  /// @throws before build(), on an unknown input stream, on an empty/invalid stream, or on
-  ///         a schema mismatch.
-  void push_arrow(std::uint64_t stream_id, std::uintptr_t in_array_addr);
+  /// Unpack the `length` packed bytes at staging offset `offset` using the pack metadata at
+  /// `metadata_addr` (`metadata_len` bytes, host memory), deep-copy the table out of the lease
+  /// into ordinary pool memory, push it into input stream `stream_id`, and release the receiver
+  /// lease when `length != 0`. The copy is synchronized before returning.
+  ///
+  /// Legal between `build()` and `run()`, exactly where `relay_from` sits. Does not close the
+  /// sender (the caller `close_input()`s).
+  /// @throws before `build()`, on an unknown input stream, when no arena is configured, on an
+  /// out-of-bounds lease range or empty metadata, or when the stream already ended.
+  void push_packed(std::uint64_t stream_id,
+                   std::uintptr_t metadata_addr,
+                   std::size_t metadata_len,
+                   std::uint64_t offset,
+                   std::uint64_t length);
 
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender; push_arrow does not). Idempotent per sender.
+  /// (relay_from closes its own sender; push_packed does not). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 

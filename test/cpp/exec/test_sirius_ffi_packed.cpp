@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// FRAG-2 through the FFI Arrow hop: pull_arrow / push_arrow / close_input must
+// FRAG-2 through the FFI packed hop: export_packed / push_packed / close_input must
 // deliver the same rows as native relay_from. Substrait is built here because
 // the public FFI surface has no SQL→Substrait helper.
 
@@ -27,6 +27,7 @@
 #include <substrait/plan.pb.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <source_location>
@@ -36,6 +37,29 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+constexpr char const* kStagingEnv = "SIRIUS_EXCHANGE_STAGING_BYTES";
+
+struct restore_staging_env {
+  std::string old;
+  bool had{false};
+  restore_staging_env()
+  {
+    if (char const* v = std::getenv(kStagingEnv)) {
+      had = true;
+      old = v;
+    }
+    setenv(kStagingEnv, "64MiB", 1);
+  }
+  ~restore_staging_env()
+  {
+    if (had) {
+      setenv(kStagingEnv, old.c_str(), 1);
+    } else {
+      unsetenv(kStagingEnv);
+    }
+  }
+};
 
 fs::path isolated_memory_config_path()
 {
@@ -50,7 +74,6 @@ std::string serialize_plan(substrait::Plan const& plan)
   return bytes;
 }
 
-// local_files parquet read — the shape DuckDB's Substrait reader resolves to parquet_scan.
 std::string local_files_plan(std::string const& path)
 {
   substrait::Plan plan;
@@ -62,7 +85,21 @@ std::string local_files_plan(std::string const& path)
   return serialize_plan(plan);
 }
 
-// Named-table read of sirius_stream_<id> with schema (a BIGINT).
+// Same scan, with a literal-false filter so the sink parks a 0-row GPU batch (empty parquet
+// files are rejected by the GPU ingest path before any batch exists).
+std::string local_files_false_filter_plan(std::string const& path)
+{
+  substrait::Plan plan;
+  auto* root = plan.add_relations()->mutable_root();
+  root->add_names("a");
+  auto* filter = root->mutable_input()->mutable_filter();
+  filter->mutable_condition()->mutable_literal()->set_boolean(false);
+  auto* item = filter->mutable_input()->mutable_read()->mutable_local_files()->add_items();
+  item->set_uri_file(path);
+  item->mutable_parquet();
+  return serialize_plan(plan);
+}
+
 std::string stream_read_plan(std::uint64_t stream_id)
 {
   substrait::Plan plan;
@@ -158,10 +195,11 @@ std::unique_ptr<sirius::ffi::Fragment> make_gather_receiver(sirius::ffi::Context
 
 }  // namespace
 
-TEST_CASE("FFI Arrow hop matches native relay_from for a parquet scan",
+TEST_CASE("FFI packed hop matches native relay_from for a parquet scan",
           "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_arrow_hop");
+  restore_staging_env staging;
+  sirius::test::scratch_dir scratch("ffi_packed_hop");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -181,36 +219,48 @@ TEST_CASE("FFI Arrow hop matches native relay_from for a parquet scan",
   }
   REQUIRE(native == expected);
 
-  std::vector<std::int64_t> via_arrow;
+  std::vector<std::int64_t> via_packed;
   {
     auto sender   = run_parquet_sender(*ctx, sender_plan);
     auto receiver = make_gather_receiver(*ctx, receiver_plan);
 
     std::size_t moved = 0;
     for (;;) {
-      ArrowArrayStream hop{};
-      if (!sender->pull_arrow(0, reinterpret_cast<std::uintptr_t>(&hop))) { break; }
-      receiver->push_arrow(0, reinterpret_cast<std::uintptr_t>(&hop));
-      release_if(hop);
+      std::uint64_t offset = 0;
+      std::uint64_t length = 0;
+      std::uint64_t rows   = 0;
+      auto metadata        = sender->export_packed(0, offset, length, rows);
+      if (!metadata) { break; }
+      REQUIRE(rows > 0);
+      REQUIRE(length > 0);
+      receiver->push_packed(
+        0, reinterpret_cast<std::uintptr_t>(metadata->data()), metadata->size(), offset, length);
       ++moved;
     }
     REQUIRE(moved > 0);
     REQUIRE(sender->drained(0));
     {
-      ArrowArrayStream extra{};
-      REQUIRE_FALSE(sender->pull_arrow(0, reinterpret_cast<std::uintptr_t>(&extra)));
+      std::uint64_t offset = 0;
+      std::uint64_t length = 0;
+      std::uint64_t rows   = 0;
+      REQUIRE(sender->export_packed(0, offset, length, rows) == nullptr);
     }
+    auto handle = ctx->staging_arena_handle();
+    REQUIRE(handle != nullptr);
+    REQUIRE(handle->outstanding() == 0);
     receiver->close_input(0, 0);
     receiver->run();
-    via_arrow = result_i64s(*receiver);
+    via_packed = result_i64s(*receiver);
   }
 
-  REQUIRE(via_arrow == native);
+  REQUIRE(via_packed == native);
 }
 
-TEST_CASE("Fragment::pull_arrow requires run() like relay_from", "[isolated_context][sirius_ffi]")
+TEST_CASE("Fragment::export_packed requires run() like relay_from",
+          "[isolated_context][sirius_ffi]")
 {
-  sirius::test::scratch_dir scratch("ffi_arrow_before_run");
+  restore_staging_env staging;
+  sirius::test::scratch_dir scratch("ffi_packed_before_run");
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
@@ -219,7 +269,40 @@ TEST_CASE("Fragment::pull_arrow requires run() like relay_from", "[isolated_cont
   sender->declare_output(0);
   sender->build(local_files_plan(path));
 
-  ArrowArrayStream hop{};
-  REQUIRE_THROWS(sender->pull_arrow(0, reinterpret_cast<std::uintptr_t>(&hop)));
+  std::uint64_t offset = 0;
+  std::uint64_t length = 0;
+  std::uint64_t rows   = 0;
+  REQUIRE_THROWS(sender->export_packed(0, offset, length, rows));
   REQUIRE_FALSE(sender->drained(0));
+}
+
+TEST_CASE("FFI packed hop of a zero-row batch holds no lease", "[isolated_context][sirius_ffi]")
+{
+  restore_staging_env staging;
+  sirius::test::scratch_dir scratch("ffi_packed_zero_row");
+  auto const path = scratch.file("ids.parquet");
+  write_ids_parquet(path);
+
+  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto const sender_plan   = local_files_false_filter_plan(path);
+  auto const receiver_plan = stream_read_plan(0);
+
+  auto sender   = run_parquet_sender(*ctx, sender_plan);
+  auto receiver = make_gather_receiver(*ctx, receiver_plan);
+
+  std::uint64_t offset = 0;
+  std::uint64_t length = 0;
+  std::uint64_t rows   = 0;
+  auto metadata        = sender->export_packed(0, offset, length, rows);
+  REQUIRE(metadata != nullptr);
+  REQUIRE(rows == 0);
+  REQUIRE(offset == 0);
+  REQUIRE(length == 0);
+  REQUIRE(ctx->staging_arena_handle()->outstanding() == 0);
+
+  receiver->push_packed(
+    0, reinterpret_cast<std::uintptr_t>(metadata->data()), metadata->size(), offset, length);
+  receiver->close_input(0, 0);
+  receiver->run();
+  REQUIRE(result_i64s(*receiver).empty());
 }
