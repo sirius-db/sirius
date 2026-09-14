@@ -32,6 +32,7 @@
 #include "expression/ast/reference.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_projection.hpp"
@@ -43,6 +44,8 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -331,6 +334,43 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
     preserved_child, counted_child, preserved_ref.index, counted_ref.index, counted_value_idx};
 }
 
+/** @brief The histogram budget in bytes, resolving the auto (0) setting.
+ *
+ * Auto takes a share of GPU tier capacity, because the histogram scales with the key
+ * domain and a constant cannot track that across scale factors. An explicit non-zero
+ * setting wins, and an unreadable space falls back to the pre-auto constant.
+ */
+[[nodiscard]] std::uint64_t resolve_dense_count_budget(duckdb::SiriusContext& sirius_ctx,
+                                                       sirius::operator_params const& op_params)
+{
+  if (op_params.dense_count_join_max_bytes > 0) { return op_params.dense_count_join_max_bytes; }
+  auto const& manager    = sirius_ctx.get_memory_manager();
+  std::uint64_t capacity = 0;
+  for (auto const* space : manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+    if (space != nullptr) { capacity = std::max<std::uint64_t>(capacity, space->get_max_memory()); }
+  }
+  if (capacity == 0) { return sirius::config::DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES; }
+  return static_cast<std::uint64_t>(static_cast<double>(capacity) *
+                                    op_params.dense_count_join_memory_fraction);
+}
+
+/** @brief Bytes the direct-address histogram would need for these cardinalities.
+ *
+ * Mirrors dense_count_layout::plan and total_bytes: presence plus counts over the key
+ * range, at a slot width that doubles once either side clears UINT32_MAX rows. The key
+ * range is unknown before execution, so the preserved cardinality stands in for it --
+ * sound for the dense keys this operator exists to serve, and an underestimate for
+ * sparse ones, which the runtime gate still catches.
+ */
+[[nodiscard]] std::uint64_t estimated_histogram_bytes(std::size_t preserved_rows,
+                                                      std::size_t counted_rows)
+{
+  auto const wide = preserved_rows >= std::numeric_limits<std::uint32_t>::max() ||
+                    counted_rows >= std::numeric_limits<std::uint32_t>::max();
+  auto const slot_bytes = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
+  return sirius::memory::saturating_mul(2 * slot_bytes, preserved_rows);
+}
+
 }  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -352,6 +392,38 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
     join.children[detection->preserved_child]->EstimateCardinality(context);
   auto const counted_cardinality =
     join.children[detection->counted_child]->EstimateCardinality(context);
+
+  // Decline the fusion when the histogram cannot be admitted, rather than letting the
+  // operator fall through to its sparse path.
+  //
+  // The operator has only two strategies once planned, and the sparse one is what turned
+  // TPC-H q13/SF3000 from a 46.7 s query into a failure: its peak-memory estimate is 16x
+  // the input, which asked for 833 GiB against a 77.6 GiB space, took a partial
+  // reservation, and then died retrying a 228 MB allocation with nothing evictable. The
+  // unfused join + aggregate is the known-working plan for exactly this shape, so prefer
+  // it. It costs about 18% here (46.7 s against 38.0 s for an admitted dense path), which
+  // is the right trade against not finishing.
+  //
+  // This leans on an estimate, so it can decline a fusion that would have been admitted.
+  // That direction is cheap and the other is not.
+  //
+  // MUST run before create_plan: that call drains the logical children, and a nullptr
+  // returned afterwards leaves the caller re-planning emptied nodes -- which surfaces as
+  // "Attempting to dereference an optional pointer that is not set", not as a fallback.
+  auto const budget = resolve_dense_count_budget(*sirius_ctx, op_params);
+  auto const histogram_bytes =
+    estimated_histogram_bytes(preserved_cardinality, counted_cardinality);
+  if (histogram_bytes > budget) {
+    SIRIUS_LOG_INFO(
+      "[sirius_plan_aggregate] NOT fusing COUNT-join: estimated histogram {} bytes over the {} "
+      "byte budget (preserved est {} rows, counted est {} rows); planning the ordinary join + "
+      "aggregate instead",
+      histogram_bytes,
+      budget,
+      preserved_cardinality,
+      counted_cardinality);
+    return nullptr;
+  }
 
   auto preserved                   = create_plan(*join.children[detection->preserved_child]);
   auto counted                     = create_plan(*join.children[detection->counted_child]);
@@ -378,7 +450,7 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
     detection->preserved_key_idx,
     detection->counted_key_idx,
     detection->counted_value_idx,
-    op_params.dense_count_join_max_bytes,
+    budget,
     op_params.hash_partition_bytes);
   fused->children.push_back(std::move(preserved));
   fused->children.push_back(std::move(counted));
