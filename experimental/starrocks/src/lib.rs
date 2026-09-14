@@ -53,6 +53,7 @@ mod fragment_executor;
 mod local_exchange;
 mod nixl_chunk;
 mod nixl_transport;
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
