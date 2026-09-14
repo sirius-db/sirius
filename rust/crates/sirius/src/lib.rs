@@ -10,17 +10,17 @@
 //!   YAML config file, able to execute a whole Substrait plan in one call.
 //! * [`Fragment`] — one plan fragment of a multi-fragment query, for driving a
 //!   distributed plan a piece at a time. Same-process hops use native GPU
-//!   batches ([`Fragment::relay_from`]); a process edge hops Arrow C Data
-//!   ([`Fragment::pull_arrow`] / [`Fragment::push_arrow`]).
+//!   batches ([`Fragment::relay_from`]); a process edge hops packed GPU bytes
+//!   ([`Fragment::export_packed`] / [`Fragment::push_packed`]).
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::path::Path;
 
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
-use cxx::{Exception, UniquePtr, let_cxx_string};
+use cxx::{let_cxx_string, Exception, UniquePtr};
 
 /// An initialized Sirius engine context.
 ///
@@ -122,6 +122,47 @@ impl SiriusContext {
         // Drain fully while `self` is alive (conversion dereferences the context).
         collect_arrow_stream(stream)
     }
+
+    /// Lease `len` bytes of the exchange staging arena, returning the lease's byte offset from
+    /// [`staging_base`](Self::staging_base).
+    ///
+    /// The arena exists only when `SIRIUS_EXCHANGE_STAGING_BYTES` was set at context bring-up;
+    /// without one, every staging call is an error rather than a silent host-copy path.
+    /// Exhaustion is an error naming the requested/free/capacity byte counts.
+    pub fn staging_lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.borrow_mut().pin_mut().staging_lease(len)
+    }
+
+    /// Return the staging lease at `offset`. The released block goes back to the arena's
+    /// address-ordered free list and coalesces with its free neighbours, so the space is
+    /// reusable regardless of release order.
+    pub fn staging_release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.borrow_mut().pin_mut().staging_release(offset)
+    }
+
+    /// Device base address of the staging arena, for transport memory registration.
+    pub fn staging_base(&self) -> Result<usize, Exception> {
+        self.inner.borrow().staging_base()
+    }
+
+    /// Capacity of the staging arena in bytes.
+    pub fn staging_capacity(&self) -> Result<u64, Exception> {
+        self.inner.borrow().staging_capacity()
+    }
+
+    /// Thread-safe handle to the exchange staging arena, or `None` when no arena is configured
+    /// (`SIRIUS_EXCHANGE_STAGING_BYTES` unset at bring-up).
+    ///
+    /// Unlike the `staging_*` methods above — which go through this `!Sync` context and
+    /// therefore its owning thread — the handle is `Send + Sync` and serves leases from any
+    /// thread, concurrently with the context thread's own staging traffic. It shares ownership
+    /// of the ONE C++ allocator ([`Fragment::export_packed`] leases from the same arena), so
+    /// the two sides can never double-book a region, and the handle stays valid even if this
+    /// context is dropped first.
+    pub fn staging_arena(&self) -> Option<StagingArena> {
+        let handle = self.inner.borrow().staging_arena_handle();
+        (!handle.is_null()).then(|| StagingArena { inner: handle })
+    }
 }
 
 /// Drains a filled Arrow C Data Interface stream into owned batches, retaining the schema.
@@ -149,7 +190,7 @@ pub fn stream_view_name(stream_id: u64) -> String {
 ///
 /// A fragment declaring one or more **output streams** is rooted in a streaming sink: its results
 /// stay on the GPU as native batches that outlive its own query, ready for a downstream fragment
-/// to take with [`Fragment::relay_from`] or [`Fragment::pull_arrow`]. A fragment declaring
+/// to take with [`Fragment::relay_from`] or [`Fragment::export_packed`]. A fragment declaring
 /// **none** is a result fragment and produces Arrow via [`Fragment::result_to_arrow`].
 ///
 /// Calls are ordered: declare, [`build`](Fragment::build), fill every sender,
@@ -245,45 +286,64 @@ impl Fragment<'_> {
         )
     }
 
-    /// Pull one parked sink batch on `stream_id` as Arrow C Data. `Ok(None)` means nothing is
-    /// parked right now — not EOS; use [`drained`](Fragment::drained) after a false pull to know
-    /// the stream has ended.
-    pub fn pull_arrow(&mut self, stream_id: u64) -> Result<Option<SubstraitResult>, SiriusError> {
-        let mut stream = FFI_ArrowArrayStream::empty();
-        let out_array_addr = std::ptr::addr_of_mut!(stream) as usize;
-        // SAFETY: `out_array_addr` is the address of `stream`, a live, writable, empty
-        // `FFI_ArrowArrayStream` owned by this stack frame for the call's duration.
-        let pulled = unsafe {
+    /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease,
+    /// as cudf packed bytes.
+    ///
+    /// `Ok(None)` means nothing is parked right now — for a fragment that finished
+    /// [`run`](Fragment::run), the stream is drained. The packed device bytes are complete when
+    /// this returns, so a transport may transmit from
+    /// `[staging_base() + offset, + len)` immediately; the exporter's lease stays live until the
+    /// caller hands it back with [`SiriusContext::staging_release`] after the transmit completes.
+    ///
+    /// A zero-row batch comes back metadata-only: `offset == 0` with `len == 0` means NO lease
+    /// exists for it, and the caller must not release anything.
+    ///
+    /// In a same-process loopback the receiver's [`push_packed`](Fragment::push_packed) consumes
+    /// that lease (this study path has no inbound ticket store). A remote hop still releases the
+    /// exporter's lease after the write, on this process.
+    pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
+        let mut offset = 0u64;
+        let mut len = 0u64;
+        let mut rows = 0u64;
+        let metadata =
             self.inner
                 .pin_mut()
-                .pull_arrow(stream_id, out_array_addr)
-                .map_err(SiriusError::Engine)?
-        };
-        if !pulled {
+                .export_packed(stream_id, &mut offset, &mut len, &mut rows)?;
+        if metadata.is_null() {
             return Ok(None);
         }
-        Ok(Some(collect_arrow_stream(stream)?))
+        Ok(Some(PackedBatch {
+            metadata: metadata.as_slice().to_vec(),
+            offset,
+            len,
+            rows,
+        }))
     }
 
-    /// Push one Arrow record batch onto input stream `stream_id`. Does not close the sender —
-    /// call [`close_input`](Fragment::close_input) after the last batch, the same as a remote hop.
-    pub fn push_arrow(&mut self, stream_id: u64, batch: &RecordBatch) -> Result<(), SiriusError> {
-        let reader = RecordBatchIterator::new(std::iter::once(Ok(batch.clone())), batch.schema());
-        let mut stream = FFI_ArrowArrayStream::new(Box::new(reader));
-        let in_array_addr = std::ptr::addr_of_mut!(stream) as usize;
-        // SAFETY: `in_array_addr` is the address of `stream`, a live `FFI_ArrowArrayStream`
-        // owned by this stack frame. C++ consumes get_schema + one get_next and does not
-        // release it; dropping `stream` does.
+    /// Push a packed batch sitting in the staging arena into input stream `stream_id`: the
+    /// receive-side mirror of [`export_packed`](Fragment::export_packed).
+    ///
+    /// The table is deep-copied out of the lease into ordinary pool memory before this returns.
+    /// When `batch.len != 0`, this call also releases that receiver lease. Legal between
+    /// [`build`](Fragment::build) and [`run`](Fragment::run), like
+    /// [`relay_from`](Fragment::relay_from); pushing after the stream ended is an error, never a
+    /// silent drop.
+    pub fn push_packed(&mut self, stream_id: u64, batch: &PackedBatch) -> Result<(), Exception> {
+        // SAFETY: the metadata pointer/length name `batch.metadata`'s buffer, which this borrow
+        // keeps alive and readable for the duration of the call.
         unsafe {
-            self.inner
-                .pin_mut()
-                .push_arrow(stream_id, in_array_addr)
-                .map_err(SiriusError::Engine)
+            self.inner.pin_mut().push_packed(
+                stream_id,
+                batch.metadata.as_ptr() as usize,
+                batch.metadata.len(),
+                batch.offset,
+                batch.len,
+            )
         }
     }
 
     /// Record that `sender_id` finished producing into input stream `stream_id` — the EOS mirror
-    /// of [`push_arrow`](Fragment::push_arrow) for remote senders
+    /// of [`push_packed`](Fragment::push_packed) for remote senders
     /// ([`relay_from`](Fragment::relay_from) closes its own sender). Idempotent per sender; the
     /// stream ends once every expected sender has closed.
     pub fn close_input(&mut self, stream_id: u64, sender_id: u32) -> Result<(), Exception> {
@@ -342,9 +402,88 @@ impl Fragment<'_> {
     }
 }
 
+/// One batch exported into the exchange staging arena as cudf packed bytes.
+///
+/// `metadata` is the host-side cudf pack metadata (it travels with the payload on the wire);
+/// `offset`/`len` locate the packed device payload inside the staging arena. The exporter's
+/// lease at `offset` stays outstanding until [`SiriusContext::staging_release`] — except for a
+/// metadata-only zero-row batch (`offset == 0`, `len == 0`), which holds no lease and must not
+/// be released. On this study path, [`Fragment::push_packed`] also releases a nonzero receiver
+/// lease, so a same-process loopback must not release again after a successful push.
+pub struct PackedBatch {
+    /// cudf pack metadata bytes (host memory).
+    pub metadata: Vec<u8>,
+    /// Byte offset of the packed payload from the arena base.
+    pub offset: u64,
+    /// Length of the packed payload in bytes.
+    pub len: u64,
+    /// Exact row count of the packed table, filled by
+    /// [`export_packed`](Fragment::export_packed). Ignored by
+    /// [`push_packed`](Fragment::push_packed).
+    pub rows: u64,
+}
+
+/// Thread-safe handle to a context's exchange staging arena, from
+/// [`SiriusContext::staging_arena`].
+///
+/// This is what lets a transport thread serve `lease`/`release` while the context's owning
+/// thread is busy running a fragment: the two contend on nothing but the arena's own mutex, so
+/// an engine stall can never starve a peer's staging lease.
+pub struct StagingArena {
+    inner: UniquePtr<sirius_sys::StagingArena>,
+}
+
+// SAFETY: the C++ `StagingArena` is a `shared_ptr` to the one `exchange_staging_arena`. Every
+// method (`lease`, `release`, and the immutable `base`/`capacity` reads) serializes on the
+// arena's internal `std::mutex` and makes NO CUDA calls — the region is a single `cudaMalloc`
+// made at arena construction — so there is no thread-affine state behind any operation. The
+// `shared_ptr` keeps the device region alive independently of the `SiriusContext`, so the
+// handle cannot dangle if the context is torn down first.
+unsafe impl Send for StagingArena {}
+unsafe impl Sync for StagingArena {}
+
+impl StagingArena {
+    /// Lease `len` bytes, returning the lease's byte offset from [`base`](Self::base). Errors
+    /// on exhaustion or a zero-length request — the arena never blocks.
+    pub fn lease(&self, len: u64) -> Result<u64, Exception> {
+        self.inner.lease(len)
+    }
+
+    /// Return the lease at `offset`; the block goes back to the arena's free list and
+    /// coalesces with its free neighbours, so the space is reusable regardless of release
+    /// order.
+    pub fn release(&self, offset: u64) -> Result<(), Exception> {
+        self.inner.release(offset)
+    }
+
+    /// Device base address of the arena, for transport memory registration.
+    pub fn base(&self) -> usize {
+        self.inner.base()
+    }
+
+    /// Capacity of the arena in bytes.
+    pub fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+
+    /// Leases currently held. Nonzero once a query has quiesced means a leaked lease — this is
+    /// the only way a compute node can observe one.
+    pub fn outstanding(&self) -> Result<usize, Exception> {
+        self.inner.outstanding()
+    }
+}
+
+impl std::fmt::Debug for StagingArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagingArena")
+            .field("base", &self.base())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
 /// Error returned by the Arrow-producing entry points: [`SiriusContext::execute_substrait`],
-/// [`SiriusContext::execute_substrait_result`], [`Fragment::result_to_arrow`],
-/// [`Fragment::pull_arrow`], and [`Fragment::push_arrow`].
+/// [`SiriusContext::execute_substrait_result`], and [`Fragment::result_to_arrow`].
 #[derive(Debug)]
 pub enum SiriusError {
     /// The engine failed to translate or execute the plan (a C++ exception).
@@ -385,16 +524,43 @@ mod tests {
     use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
     use substrait::proto::read_rel::{NamedTable, ReadType};
     use substrait::proto::{
+        aggregate_function, aggregate_rel, expression, function_argument, plan_rel, r#type, rel,
         AggregateFunction, AggregateRel, Expression, FunctionArgument, NamedStruct, Plan, PlanRel,
-        ReadRel, Rel, RelRoot, Type, aggregate_function, aggregate_rel, expression,
-        function_argument, plan_rel, rel, r#type,
+        ReadRel, Rel, RelRoot, Type,
     };
 
-    use super::{Fragment, SiriusContext, SiriusError, SubstraitResult, stream_view_name};
+    use super::{stream_view_name, Fragment, SiriusContext, SubstraitResult};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
     static GPU_CONTEXT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Arena size is read at context bring-up. Packed-hop tests set it while they
+    /// hold [`GPU_CONTEXT_LOCK`] and restore the previous value on drop.
+    struct StagingEnv {
+        previous: Option<String>,
+    }
+
+    impl StagingEnv {
+        fn install() -> Self {
+            let previous = std::env::var("SIRIUS_EXCHANGE_STAGING_BYTES").ok();
+            // SAFETY: the GPU context lock is held, so no other test mutates this env here.
+            unsafe { std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", "64MiB") };
+            Self { previous }
+        }
+    }
+
+    impl Drop for StagingEnv {
+        fn drop(&mut self) {
+            // SAFETY: same as [`StagingEnv::install`].
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("SIRIUS_EXCHANGE_STAGING_BYTES", value),
+                    None => std::env::remove_var("SIRIUS_EXCHANGE_STAGING_BYTES"),
+                }
+            }
+        }
+    }
 
     /// Proof-of-life: bring up a real Sirius engine context and drop it. This
     /// links the real Sirius library and exercises the full cxx round-trip +
@@ -424,11 +590,11 @@ mod tests {
     }
 
     fn local_files_read(path: &str) -> Rel {
-        use substrait::proto::read_rel::LocalFiles;
-        use substrait::proto::read_rel::local_files::FileOrFiles;
         use substrait::proto::read_rel::local_files::file_or_files::{
             FileFormat, ParquetReadOptions, PathType,
         };
+        use substrait::proto::read_rel::local_files::FileOrFiles;
+        use substrait::proto::read_rel::LocalFiles;
 
         Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
@@ -751,7 +917,7 @@ mod tests {
         rows
     }
 
-    fn hop_arrow(
+    fn hop_packed(
         sender: &mut Fragment<'_>,
         receiver: &mut Fragment<'_>,
         source_stream: u64,
@@ -759,15 +925,13 @@ mod tests {
         sender_id: u32,
     ) -> usize {
         let mut moved = 0usize;
-        while let Some(part) = sender.pull_arrow(source_stream).unwrap() {
-            for batch in part.batches {
-                receiver.push_arrow(input_stream, &batch).unwrap();
-                moved += 1;
-            }
+        while let Some(batch) = sender.export_packed(source_stream).unwrap() {
+            receiver.push_packed(input_stream, &batch).unwrap();
+            moved += 1;
         }
         assert!(
             sender.drained(source_stream).unwrap(),
-            "pull_arrow must exhaust a finished sender"
+            "export_packed must exhaust a finished sender"
         );
         receiver.close_input(input_stream, sender_id).unwrap();
         moved
@@ -928,13 +1092,14 @@ mod tests {
         );
     }
 
-    /// The Arrow process-edge hop (`pull_arrow` → `push_arrow` → `close_input`) must deliver
+    /// The packed process-edge hop (`export_packed` → `push_packed` → `close_input`) must deliver
     /// the same rows as native `relay_from` for the identical plan pair. Requires a GPU.
     #[test]
-    fn arrow_hop_matches_relay_hop() {
+    fn packed_hop_matches_relay_hop() {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _staging = StagingEnv::install();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.parquet");
         write_users_parquet(&path);
@@ -945,6 +1110,9 @@ mod tests {
         let receiver_plan = stream_read_plan(0);
 
         let ctx = SiriusContext::new().expect("bring up sirius context");
+        let arena = ctx.staging_arena().expect("arena configured");
+        assert_eq!(ctx.staging_capacity().unwrap(), 64 << 20);
+        assert_ne!(ctx.staging_base().unwrap(), 0);
 
         let relay_result = {
             let mut sender = ctx.fragment().unwrap();
@@ -962,7 +1130,7 @@ mod tests {
             receiver.result_to_arrow().unwrap()
         };
 
-        let arrow_result = {
+        let packed_result = {
             let mut sender = ctx.fragment().unwrap();
             sender.declare_output(0).unwrap();
             sender.build(&sender_plan).unwrap();
@@ -972,19 +1140,24 @@ mod tests {
             receiver.declare_input_column(0, "id", "BIGINT").unwrap();
             receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
             receiver.build(&receiver_plan).unwrap();
-            let moved = hop_arrow(&mut sender, &mut receiver, 0, 0, 0);
-            assert!(moved > 0, "the Arrow hop must carry batches");
+            let moved = hop_packed(&mut sender, &mut receiver, 0, 0, 0);
+            assert!(moved > 0, "the packed hop must carry batches");
             assert!(
-                sender.pull_arrow(0).unwrap().is_none(),
+                sender.export_packed(0).unwrap().is_none(),
                 "a drained stream yields no extra batch"
+            );
+            assert_eq!(
+                arena.outstanding().unwrap(),
+                0,
+                "push_packed consumes the same-process lease"
             );
             receiver.run().unwrap();
             receiver.result_to_arrow().unwrap()
         };
 
-        assert_eq!(rows(&relay_result), rows(&arrow_result));
+        assert_eq!(rows(&relay_result), rows(&packed_result));
         assert_eq!(
-            rows(&arrow_result),
+            rows(&packed_result),
             vec![
                 (1, "a".to_string()),
                 (2, "b".to_string()),
@@ -1080,13 +1253,14 @@ mod tests {
     }
 
     /// Two-shard GROUP BY: partial SUM on each parquet leaf, hash N=2 on the key, merge SUM
-    /// on each destination through the Arrow hop. Same numbers as the C++ FRAG-6 fixture.
+    /// on each destination through the packed hop. Same numbers as the C++ FRAG-6 fixture.
     /// Requires a GPU.
     #[test]
-    fn two_shard_group_by_over_arrow_hop() {
+    fn two_shard_group_by_over_packed_hop() {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _staging = StagingEnv::install();
         let dir = tempfile::tempdir().unwrap();
         let sales_0 = dir.path().join("sales_0.parquet");
         let sales_1 = dir.path().join("sales_1.parquet");
@@ -1141,8 +1315,8 @@ mod tests {
             let mut root = ctx.fragment().unwrap();
             declare_sales_input(&mut root, 0, &[0, 1]);
             root.build(&stream_groupby_plan(0)).unwrap();
-            hop_arrow(&mut leaf0, &mut root, dest, 0, 0);
-            hop_arrow(&mut leaf1, &mut root, dest, 0, 1);
+            hop_packed(&mut leaf0, &mut root, dest, 0, 0);
+            hop_packed(&mut leaf1, &mut root, dest, 0, 1);
             root.run().unwrap();
             got.extend(group_rows(&root.result_to_arrow().unwrap()));
         }
@@ -1186,13 +1360,14 @@ mod tests {
         );
     }
 
-    /// `push_arrow` refuses a batch whose Arrow types disagree with the declared stream.
+    /// `push_packed` refuses a batch whose unpacked types disagree with the declared stream.
     /// Requires a GPU.
     #[test]
-    fn push_arrow_rejects_a_mismatched_schema() {
+    fn push_packed_rejects_a_mismatched_schema() {
         let _guard = GPU_CONTEXT_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let _staging = StagingEnv::install();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.parquet");
         write_users_parquet(&path);
@@ -1206,8 +1381,8 @@ mod tests {
         sender.declare_output(0).unwrap();
         sender.build(&sender_plan).unwrap();
         sender.run().unwrap();
-        let part = sender
-            .pull_arrow(0)
+        let batch = sender
+            .export_packed(0)
             .unwrap()
             .expect("sender parked a batch");
 
@@ -1216,15 +1391,15 @@ mod tests {
         receiver.declare_input_column(0, "name", "VARCHAR").unwrap();
         receiver.build(&stream_read_plan_f64(0)).unwrap();
 
-        let err = receiver.push_arrow(0, &part.batches[0]).unwrap_err();
-        let SiriusError::Engine(err) = err else {
-            panic!("expected an engine schema error, got {err:?}");
-        };
+        let err = receiver.push_packed(0, &batch).unwrap_err();
         let what = err.what().to_string();
         assert!(
             what.contains("DOUBLE") && (what.contains("BIGINT") || what.contains("int64")),
             "the error must name the declared and the produced type: {what}"
         );
+        if batch.len != 0 {
+            ctx.staging_release(batch.offset).unwrap();
+        }
     }
 
     /// A missing config file is rejected before any GPU work (`load_from_file`

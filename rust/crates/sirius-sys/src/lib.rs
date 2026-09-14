@@ -57,13 +57,63 @@ mod ffi {
             out_stream_addr: usize,
         ) -> Result<()>;
 
+        /// Lease `len` bytes of the exchange staging arena, returning the
+        /// lease's byte offset from `staging_base()`. Fallible: no configured
+        /// arena (`SIRIUS_EXCHANGE_STAGING_BYTES` unset) and exhaustion both
+        /// surface as `Err`.
+        fn staging_lease(self: Pin<&mut Context>, len: u64) -> Result<u64>;
+
+        /// Return the staging lease at `offset`; the block goes back to the
+        /// arena's free list and coalesces with its free neighbours, so the
+        /// space is reusable regardless of release order.
+        fn staging_release(self: Pin<&mut Context>, offset: u64) -> Result<()>;
+
+        /// Device base address of the staging arena, for transport memory
+        /// registration.
+        fn staging_base(self: &Context) -> Result<usize>;
+
+        /// Capacity of the staging arena in bytes.
+        fn staging_capacity(self: &Context) -> Result<u64>;
+
+        /// Thread-safe handle to the context's exchange staging arena, sharing
+        /// ownership of the ONE allocator with the context (whose
+        /// `export_packed` leases from the same arena). Unlike the `staging_*`
+        /// methods on [`Context`] — reachable only through the context's owning
+        /// thread — every method here may be called from any thread: the C++
+        /// side serializes on the arena's internal mutex and makes no CUDA
+        /// calls.
+        type StagingArena;
+
+        /// The context's staging arena handle, or a null `UniquePtr` when no
+        /// arena is configured (`SIRIUS_EXCHANGE_STAGING_BYTES` unset).
+        fn staging_arena_handle(self: &Context) -> UniquePtr<StagingArena>;
+
+        /// Lease `len` bytes of the arena, returning the lease's byte offset
+        /// from `base()`. Fallible on exhaustion (the arena never blocks).
+        fn lease(self: &StagingArena, len: u64) -> Result<u64>;
+
+        /// Return the lease at `offset`; the block goes back to the arena's
+        /// free list and coalesces with its free neighbours.
+        fn release(self: &StagingArena, offset: u64) -> Result<()>;
+
+        /// Device base address of the arena, for transport memory registration.
+        fn base(self: &StagingArena) -> usize;
+
+        /// Capacity of the arena in bytes.
+        fn capacity(self: &StagingArena) -> u64;
+
+        /// Leases currently held. Nonzero at quiesce means a leaked lease.
+        /// `Result` rather than a bare `usize` because, unlike `base`/`capacity`,
+        /// the C++ side takes the arena mutex and is therefore not `noexcept`.
+        fn outstanding(self: &StagingArena) -> Result<usize>;
+
         /// One plan fragment of a multi-fragment query. Either declares output
         /// streams (an intermediate fragment, whose results park as native GPU
         /// batches that outlive its own query) or none (a result fragment, which
         /// produces Arrow).
         ///
         /// Usage order: `declare_*` → `build` → fill inputs → `run` → drain via
-        /// `relay_from` / `pull_arrow` or `result_to_arrow`. Exactly one fragment
+        /// `relay_from` / `export_packed` or `result_to_arrow`. Exactly one fragment
         /// may sit between its own `build` and `run`; the engine serializes queries.
         type Fragment;
 
@@ -124,38 +174,46 @@ mod ffi {
             sender_id: u32,
         ) -> Result<usize>;
 
-        /// Pull one parked sink batch on `stream_id` into the caller-owned
-        /// `ArrowArrayStream` at `out_array_addr`. Returns false if nothing is
-        /// parked right now (not EOS — use `drained`); the dest stream is left
-        /// untouched on false.
-        ///
-        /// # Safety
-        /// `out_array_addr` must be the address of a valid, writable, zeroed
-        /// `ArrowArrayStream` that outlives this call. The safe wrapper upholds
-        /// this.
-        unsafe fn pull_arrow(
+        /// Pack the next batch parked on an output stream into a fresh
+        /// staging-arena lease. Returns the cudf pack metadata (a null
+        /// `UniquePtr` when nothing is parked right now) and writes the lease
+        /// offset, packed payload length, and the batch's row count; the device
+        /// bytes are complete on return (the packing stream is synchronized).
+        /// Releasing the exporter's lease — via `staging_release(offset)`, after
+        /// the transmit completes — is the caller's job. A zero-row batch
+        /// returns metadata with `offset == 0` and `length == 0` and holds no
+        /// lease.
+        fn export_packed(
             self: Pin<&mut Fragment>,
             stream_id: u64,
-            out_array_addr: usize,
-        ) -> Result<bool>;
+            offset: &mut u64,
+            length: &mut u64,
+            rows: &mut u64,
+        ) -> Result<UniquePtr<CxxVector<u8>>>;
 
-        /// Push one Arrow batch from the caller-owned `ArrowArrayStream` at
-        /// `in_array_addr` onto input stream `stream_id`. Consumes `get_schema`
-        /// plus one `get_next`; does not release the stream and does not close
-        /// the sender.
+        /// Unpack `length` packed bytes at staging offset `offset` with the
+        /// cudf pack metadata at `metadata_addr` (`metadata_len` bytes of host
+        /// memory), deep-copy the table out of the lease into pool memory, push
+        /// it into an input stream, and release the receiver lease when
+        /// `length != 0`. Legal between `build()` and `run()`. A push after the
+        /// stream ended is an `Err`, never a silent drop.
         ///
         /// # Safety
-        /// `in_array_addr` must be the address of a valid `ArrowArrayStream`
-        /// that outlives this call. The safe wrapper upholds this.
-        unsafe fn push_arrow(
+        /// `metadata_addr` must point at `metadata_len` readable bytes of pack
+        /// metadata that outlive this call. The safe
+        /// [`sirius`](https://docs.rs/sirius) wrapper upholds this.
+        unsafe fn push_packed(
             self: Pin<&mut Fragment>,
             stream_id: u64,
-            in_array_addr: usize,
+            metadata_addr: usize,
+            metadata_len: usize,
+            offset: u64,
+            length: u64,
         ) -> Result<()>;
 
         /// Close `sender_id` on input stream `stream_id`. The end-of-stream mirror
         /// for senders that are not local fragments — `relay_from` closes its own
-        /// sender; `push_arrow` does not. Idempotent per sender; the stream ends
+        /// sender; `push_packed` does not. Idempotent per sender; the stream ends
         /// once every expected sender has closed.
         fn close_input(self: Pin<&mut Fragment>, stream_id: u64, sender_id: u32) -> Result<()>;
 
@@ -191,5 +249,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    Context, Fragment, make_context, make_context_from_config, make_fragment, stream_view_name,
+    make_context, make_context_from_config, make_fragment, stream_view_name, Context, Fragment,
+    StagingArena,
 };
