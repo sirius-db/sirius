@@ -167,25 +167,7 @@ class task_scheduler {
   std::future<void> start_query();
 
   /**
-   * @brief Drop every queued task belonging to @p query_id.
-   *
-   * Clears the scheduler's queue and each GPU executor's queue of that query's pending work,
-   * leaving every other query's tasks in place. In-flight tasks are unaffected.
-   *
-   * Called from the per-query cleanup so a finished or failed query leaves nothing queued that
-   * points into the plan about to be destroyed.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
-
-  /**
-   * @brief Report a fatal query error via the completion future.
-   *
-   * Deliberately does NOT stop or drain any executor itself: callers can run on a GPU executor's
-   * or the task_creator's own worker thread (e.g. notify_downstream_pipelines() from
-   * ~gpu_pipeline_task), and synchronously stopping a pool from its own worker thread self-
-   * deadlocks in bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the
-   * query thread's future.get() throw; its catch block then calls drain_after_error() to perform
-   * the actual cancellation from a thread that is never a pool worker.
+   * @brief Terminate the query execution and report the error to duckdb.
    *
    * @param error The error to report.
    */
@@ -214,11 +196,7 @@ class task_scheduler {
  private:
   void management_eventloop();
 
-  /// The query currently installed by prepare_for_query, or nullopt between queries.
-  /// Per-query task_creator cleanup is keyed on it.
-  [[nodiscard]] std::optional<sirius::query_id_t> current_query_id() const;
-
-  mutable std::mutex _query_mutex;
+  std::mutex _query_mutex;
   duckdb::shared_ptr<planner::query> _query;
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
@@ -241,8 +219,7 @@ class task_scheduler {
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  /// Strong owner for the weak completion references held by terminal pipelines.
-  std::shared_ptr<completion_handler> _completion_handler;
+  std::unique_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

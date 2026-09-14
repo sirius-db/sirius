@@ -149,8 +149,7 @@ enum class SiriusPhysicalOperatorType : uint8_t {
   GPU_SCAN,
   DYNAMIC_FILTER,
   STREAMING_SOURCE,
-  STREAMING_SINK,
-  DENSE_COUNT_JOIN
+  STREAMING_SINK
 };
 
 std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type);

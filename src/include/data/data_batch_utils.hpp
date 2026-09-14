@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "compression/simpatico_compressed_representation.hpp"
-#include "memory/size_arithmetic.hpp"
 #include "telemetry/data_batch_probe.hpp"
 
 #include <cudf/table/table_view.hpp>
@@ -70,15 +68,20 @@ inline cudf::table_view get_cudf_table_view(const cucascade::read_only_data_batc
 /**
  * @brief Peak device bytes needed to materialize @p data on the GPU.
  *
- * nullptr returns zero. Simpatico keeps its physical payload live with the logical output; other
- * representations charge only logical bytes. Addition saturates.
+ * For uncompressed data the source lives in host memory; only the destination
+ * lands on device, so the peak equals the uncompressed size. For compressed
+ * data the encoded payload must first be staged on device before decompression
+ * produces the output, so both are alive simultaneously:
+ * peak = compressed_bytes + uncompressed_bytes. When a column projection is
+ * applied (compressed_host/device_representation::select_columns), both byte
+ * fields are scaled pro-rata, so the estimate naturally covers only the
+ * projected columns.
  */
 inline std::size_t peak_materialization_bytes(const cucascade::idata_representation* data)
 {
-  if (data == nullptr) { return 0; }
-  auto const logical_bytes = data->get_uncompressed_data_size_in_bytes();
-  if (!is_simpatico_compressed_representation(data)) { return logical_bytes; }
-  return memory::saturating_add(data->get_size_in_bytes(), logical_bytes);
+  auto const compressed   = data->get_size_in_bytes();
+  auto const uncompressed = data->get_uncompressed_data_size_in_bytes();
+  return compressed < uncompressed ? compressed + uncompressed : uncompressed;
 }
 
 /**

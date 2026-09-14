@@ -18,11 +18,9 @@
 
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
-#include "exec/multi_index_priority_queue.hpp"
+#include "exec/inspectable_mpsc.hpp"
+#include "exec/invocable.hpp"
 #include "parallel/task.hpp"
-#include "query_id.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <atomic>
 #include <memory>
@@ -98,18 +96,9 @@ class itask_executor {
   void wait_all();
 
   /**
-   * @brief Drain any leftover tasks remaining in the queue, for every query.
+   * @brief Drain any leftover tasks remaining in the queue.
    */
   void drain_leftover_tasks();
-
-  /**
-   * @brief Drop the queued tasks belonging to one query.
-   *
-   * Tasks of other queries are left in place and the queue stays open, so unlike interrupt()
-   * this does not stall any other query's producers or consumers. Only queued work is affected;
-   * a task already dispatched to the thread pool runs to completion.
-   */
-  void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
    * @brief Drain in-flight tasks and restart the manager, ready for the next query.
@@ -150,7 +139,7 @@ class itask_executor {
    * returns nullptr (no per-thread init). Override to set the CUDA device or
    * perform other per-thread setup.
    */
-  virtual absl::AnyInvocable<void() noexcept> get_per_thread_init() { return nullptr; }
+  virtual sirius::exec::invocable<void() noexcept> get_per_thread_init() { return nullptr; }
 
   /**
    * @brief Called from start() after the manager thread is launched.
@@ -181,10 +170,7 @@ class itask_executor {
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;
   std::unique_ptr<exec::bounded_thread_pool> _bounded_pool;
-  /// Ordered by task priority and indexed by query, so one query's queued work can be
-  /// dropped without touching another's. Keys come from pipeline::index_keys_for, the
-  /// same extractor the task_scheduler's queue uses.
-  exec::multi_index_priority_queue<itask> _task_queue;
+  exec::inspectable_mpsc<itask> _task_queue;
   std::thread _manager_thread;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;

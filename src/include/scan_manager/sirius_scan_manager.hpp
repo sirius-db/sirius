@@ -20,9 +20,8 @@
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
 #include "io/datasource_factory.hpp"
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
-#include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/config.hpp"
@@ -77,7 +76,7 @@ class topology_index;
 }  // namespace sirius::memory
 
 namespace sirius::io {
-class sirius_ioctx;
+class ioctx;
 namespace cache {
 class buffer_pool;
 }  // namespace cache
@@ -131,14 +130,14 @@ class cache_entry_info {
     const op::scan::ingestible_table_info& other) const;
 
   /// Duckdb-identity check shared by can_serve_with_columns and the plan-time
-  /// MVCC guards — one matcher, so the probe and prepare can never disagree.
+  /// MVCC guards — one matcher, so the probe and prepare can never drift.
   /// False for parquet entries (empty table_name).
   [[nodiscard]] bool matches_duckdb_table(std::string_view catalog,
                                           std::string_view schema,
                                           std::string_view table) const;
 
   /// Parquet-identity check shared by can_serve_with_columns and the plan-time
-  /// residency gate — one matcher, so the probe and prepare can never disagree.
+  /// residency gate — one matcher, so the probe and prepare can never drift.
   /// Same file set irrespective of order (both sides sorted, byte-exact compare).
   /// False for duckdb entries (empty resolved_file_paths) and for an empty @p files.
   [[nodiscard]] bool matches_parquet_files(std::span<std::string const> files) const;
@@ -221,20 +220,6 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
-  /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
-  /// the column's values were proven distinct across the whole pinned table at
-  /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
-  /// means UNKNOWN, never "known duplicated": the fact only ever unlocks an
-  /// optimization, so absence must cost speed, not correctness. Attached by
-  /// @ref attach_proven_unique_columns after insert, BY NAME, because the merge
-  /// path appends columns and a positional attach would then describe the wrong
-  /// ones.
-  std::vector<bool> proven_unique_columns;
-  /// Generation-checked handle for late materialization: what a deferred
-  /// column holds instead of a pointer to this entry, so an unpin or a
-  /// replacing re-pin makes every outstanding origin fail closed rather than
-  /// dangle. Null unless the late-mat gate is on.
-  std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).
@@ -335,16 +320,6 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 [[nodiscard]] std::optional<cudf::data_type> pinned_column_narrow_carrier(
   pinned_entry const& entry, std::size_t entry_position, cudf::data_type native_type);
 
-/// True when every column of @p column_ids that @p entry carries still maps, in
-/// every chunk, to the pin-time native cuDF type @p returned_types declares. A
-/// column the entry lacks is skipped (coverage is checked separately) and an
-/// empty column-storage matrix passes. Shared by the plan-time MVCC guard and
-/// the lookup below.
-[[nodiscard]] bool pinned_native_types_match_columns(
-  pinned_entry const& entry,
-  duckdb::vector<duckdb::ColumnIndex> const& column_ids,
-  duckdb::vector<duckdb::LogicalType> const& returned_types);
-
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
@@ -378,8 +353,6 @@ struct cached_scan_plan {
 /// publish into it mid-scan); the provider snapshots it PER BATCH onto the
 /// attached scan, so later batches legitimately see more filters. Null (the
 /// default) disables it.
-/// Both are gated per chunk on @p mvcc_masks: a masked chunk gives up row
-/// dropping, while its default-slot siblings keep the decode-side pushdown.
 std::unique_ptr<databatch_provider> make_provider_for_pinned_entry(
   pinned_entry const& entry,
   std::span<std::size_t const> selected_columns,
@@ -526,13 +499,7 @@ class sirius_scan_manager {
   /// \param column_storage        Chunk-major stored-column metadata as the pin driver
   ///                              recorded it; must cover every chunk and cached column. A
   ///                              recorded carrier that contradicts a stored column type throws.
-  /// \return The names of the columns whose data this call actually STORED. On the replace
-  ///         path that is every column; on the merge path it is only the newly added ones —
-  ///         a column already cached keeps its previous chunks and the incoming ones are
-  ///         dropped, so anything derived from this materialization (uniqueness verdicts,
-  ///         say) describes data that never entered the cache. See
-  ///         @ref attach_proven_unique_columns.
-  [[nodiscard]] std::vector<std::string> insert_pinned_entry(
+  void insert_pinned_entry(
     const std::string& name,
     cache_entry_info cache_info,
     std::vector<std::unique_ptr<cudf::table>> data_tables,
@@ -616,31 +583,6 @@ class sirius_scan_manager {
   /// chunks'. Throws std::invalid_argument when no entry exists for @p name.
   void attach_mvcc_metadata(const std::string& name, duckdb_mvcc_metadata metadata);
 
-  /// \brief Record which of @p name 's pinned columns were proven distinct at pin time.
-  ///
-  /// Called by every pin path right after its insert. Takes NAMES, not
-  /// positions: a re-pin that merges into an existing entry appends its new
-  /// columns to the entry's own order, which is not the incoming pin's order,
-  /// so a positional attach could mark the wrong column unique — and a false
-  /// positive here is wrong query results, not a slow query.
-  ///
-  /// Facts are OR-ed in and never cleared: a merge leaves the already-pinned
-  /// columns' data untouched, so a proof taken against THAT data still holds,
-  /// while a replacing re-pin builds a fresh entry with no facts at all. Names
-  /// absent from @p unique_column_names are left as they were — absence is
-  /// "unknown", so nothing is asserted by omission. A name that matches no
-  /// pinned column is ignored. Throws std::invalid_argument when no entry
-  /// exists for @p name.
-  ///
-  /// The caller must pass only columns whose data the accompanying insert
-  /// actually STORED (@ref insert_pinned_entry returns exactly that set). A
-  /// verdict describes the values the pin driver read; the merge path keeps an
-  /// already-cached column's earlier chunks and drops the incoming ones, so
-  /// attaching that verdict to the retained column would assert distinctness
-  /// about bytes nothing ever examined — and this flag admits a group key.
-  void attach_proven_unique_columns(const std::string& name,
-                                    std::span<std::string const> unique_column_names);
-
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
@@ -649,18 +591,10 @@ class sirius_scan_manager {
 
   /// The pinned entry whose duckdb identity matches catalog.schema.table, or
   /// nullptr. Non-owning; obtain and read it inside one slot-scoped window, and
-  /// never hold it across a pin or unpin. When one table is pinned under two
-  /// names with different column sets, @p requested_ids and @p returned_types
-  /// apply the plan-time guard's own two gates: prefer an entry that covers the
-  /// scan and whose pin-time native types still match, then one that only
-  /// covers, then the first identity match. Never null where one identity match
-  /// exists — that would read as an unpinned table.
+  /// never hold it across a pin or unpin. First match wins if one table was
+  /// pinned under two names. Read by the plan-time MVCC guards.
   [[nodiscard]] pinned_entry const* find_pinned_entry_for_duckdb_table(
-    std::string_view catalog_name,
-    std::string_view schema_name,
-    std::string_view table_name,
-    duckdb::vector<duckdb::ColumnIndex> const* requested_ids  = nullptr,
-    duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
+    std::string_view catalog_name, std::string_view schema_name, std::string_view table_name) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain
@@ -675,7 +609,7 @@ class sirius_scan_manager {
   /// \brief Process-wide ioctx used to mint @c sirius_datasource instances.
   ///        Holds a @c uring_ioctx, or a @c kvikio_context when the manager
   ///        was configured with @c use_sirius_datasource=false.
-  [[nodiscard]] sirius::io::sirius_ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
+  [[nodiscard]] sirius::io::ioctx* io_ctx() const noexcept { return _io_ctx.get(); }
 
   [[nodiscard]] std::shared_ptr<sirius::io::sirius_datasource> create_datasource(
     std::string_view path, sirius::io::open_hint hint = sirius::io::open_hint::generic);
@@ -734,7 +668,7 @@ class sirius_scan_manager {
   /// building it once per backend on first use.  Routes by path through the registry
   /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
   /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+  std::shared_ptr<sirius::io::ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -743,7 +677,7 @@ class sirius_scan_manager {
   std::shared_ptr<const sirius::memory::topology_index> _topology_index;
   exec::static_thread_pool _thread_pool;
   std::unique_ptr<exec::scoped_dispatcher> _dispatcher;
-  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<sirius::io::ioctx> _io_ctx;
   /// Lazily-built per-backend ioctxs for path-routed datasources (e.g. an s3://
   /// rest_ioctx alongside the local uring/kvikio `_io_ctx`).  Built exactly once
   /// per type: `_routed_io_ctxs_build_mtx` serializes construction (reactor
@@ -752,24 +686,13 @@ class sirius_scan_manager {
   /// in the dtor.
   std::mutex _routed_io_ctxs_build_mtx;
   std::mutex _routed_io_ctxs_mtx;
-  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::sirius_ioctx>>
+  std::unordered_map<sirius::io::io_context_type, std::shared_ptr<sirius::io::ioctx>>
     _routed_io_ctxs;
   std::unordered_map<op::scan::sirius_gpu_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
   bool _pruning_enabled{true};
-  /// Source of pin generations. Never 0 — that value means "invalidated", so
-  /// an origin holding it can never resolve.
-  std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
-
-  /// Give the entry now living at @p name a fresh late-mat handle, and
-  /// invalidate whatever handle it is replacing. Called after every insert;
-  /// a no-op when the late-mat gate is off.
-  void publish_late_mat_handle(const std::string& name);
-  /// Invalidate the handle of the entry at @p name, if any — every outstanding
-  /// origin against it then fails closed. Called before it is erased.
-  void retire_late_mat_handle(const std::string& name);
 
   /// One mask computation per distinct pinned entry matched this query
   /// (recorded by try_match_cached_entry, deduped by entry name); executed

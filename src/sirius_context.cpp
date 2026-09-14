@@ -40,7 +40,6 @@
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
-#include "vss/cuvs_index_cache.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -391,9 +390,8 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   }
   // Register this query's repository manager up front
   data_repository_registry_.create_for_query(query_id);
-  // Registers this query's task_creator state. No reset of a previous query here: each query
-  // owns its own entry now, and run_mandatory_cleanup drops it by id.
-  task_creator_->set_client_context(query_id, context);
+  task_creator_->reset();
+  task_creator_->set_client_context(context);
   // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
@@ -406,18 +404,6 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     SIRIUS_LOG_INFO("QueryEnd");
   } catch (...) {
   }
-
-  // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
-  // pointers into the plan that query_.reset() below destroys, and in-flight creation lambdas
-  // dereference them. reset() drains those requests and joins that work before returning.
-  // Only this query's is touched; other in-flight queries keep creating tasks.
-  if (task_creator_) { task_creator_->reset(query_id); }
-
-  // With the producer stopped, drop whatever it already queued for this query. Ordering is
-  // deliberate: task_creator first so nothing new arrives, then the queues, then query_.reset()
-  // below — queued tasks reach operators through their pipeline, so they must be gone before the
-  // plan is destroyed. Other in-flight queries keep their queued work.
-  if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
 
   query_.reset();
 
@@ -466,12 +452,14 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // host_data_representation are gone before the providers go away.
   if (scan_manager_) { scan_manager_->reset(); }
 
-  // NOTE: task_creator_->reset(query_id) already ran at the top of this function — it has to
-  // precede query_.reset(), since queued creation requests point into the plan that destroys.
-  // That reset is also what drops duckdb_scan_task_global_state, which transitively owns a
-  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles; leaving it alive
-  // past the window would release those handles during ~task_creator at DB teardown (~DBConfig
-  // fires ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
+  // Drop per-query global states held by task_creator. These include
+  // duckdb_scan_task_global_state, which transitively owns a
+  // duckdb::DuckTableScanState referencing BufferManager-owned BlockHandles.
+  // If we leave this state alive past the window, ~task_creator at
+  // SiriusContext teardown ends up releasing those BlockHandles after parts of
+  // DuckDB's DatabaseInstance have already been torn down (~DBConfig fires
+  // ~SiriusContext mid-DB destruction), which SIGSEGVs in ~BlockMemory.
+  if (task_creator_) { task_creator_->reset(); }
 
   try {
     log_pool_stats(end_tag);
@@ -486,7 +474,7 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
     run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
     mark_runtime_unavailable();
-    drop_query_runtime_state_best_effort(query_id);
+    drop_task_creator_state_best_effort();
     try {
       SIRIUS_LOG_ERROR(
         "Mandatory per-query cleanup failed during unwind; marking the Sirius runtime "
@@ -496,7 +484,7 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
     }
   } catch (...) {
     mark_runtime_unavailable();
-    drop_query_runtime_state_best_effort(query_id);
+    drop_task_creator_state_best_effort();
     try {
       SIRIUS_LOG_ERROR(
         "Mandatory per-query cleanup failed during unwind (unknown exception); marking the "
@@ -506,22 +494,14 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
   }
 }
 
-void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept
+void SiriusContext::drop_task_creator_state_best_effort() noexcept
 {
-  // Reached only when run_mandatory_cleanup threw, which means it may have aborted BEFORE its
-  // own reset/drain pair ran. Once the runtime is latched unavailable no later window will run
-  // them either, so the failed query's per-query state (and the buffer handles it retains)
-  // would survive until ~task_creator during DB teardown — the exact shutdown-order crash the
-  // in-window reset prevents.
-  //
-  // Same order as the main path: stop the producer, then drop what it queued. Each step is
-  // independently guarded so a throw in one still lets the other run.
+  // Once the runtime is latched unavailable no later window will run the
+  // task_creator reset, so the failed query's per-query global state (and the
+  // buffer handles it retains) would survive until ~task_creator during DB
+  // teardown — the exact shutdown-order crash the in-window reset prevents.
   try {
-    if (task_creator_) { task_creator_->reset(query_id); }
-  } catch (...) {
-  }
-  try {
-    if (task_scheduler_) { task_scheduler_->drain_query_tasks(query_id); }
+    if (task_creator_) { task_creator_->reset(); }
   } catch (...) {
   }
 }
@@ -630,7 +610,7 @@ void SiriusContext::StandaloneQueryScope::finish()
     // error.
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
-    ctx_.drop_query_runtime_state_best_effort(window_id_);
+    ctx_.drop_task_creator_state_best_effort();
     log_window_event("end", "cleanup_failed");
     throw;
   }
@@ -678,10 +658,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   memory_manager_ = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
     config_.get_memory_space_configs());
-
-  // Session cache for pinned GPU-resident cuVS ANN indexes. Takes the memory
-  // manager so an index build can reserve its GPU footprint through Sirius.
-  cuvs_index_cache_ = std::make_unique<sirius::vss::cuvs_index_cache>(*memory_manager_);
 
   // Declare one telemetry device group per GPU so thread/queue telemetry can
   // nest under its device instead of piling up flat under the engine. The GPU
@@ -921,11 +897,6 @@ void SiriusContext::terminate()
   task_scheduler_->stop();
   if (scan_manager_) { scan_manager_->stop(); }
   task_creator_->stop_thread_pool();
-  // Drop any per-query state a window failed to clean up (e.g. a latched-unavailable path whose
-  // best-effort reset threw). Doing it here, rather than letting ~task_creator do it, keeps the
-  // DuckTableScanState/BlockHandle releases inside the window where DuckDB is still intact.
-  task_creator_->reset_all();
-  task_creator_.reset();
   for (auto& executor : downgrade_executors_) {
     executor->stop();
   }
@@ -948,11 +919,6 @@ void SiriusContext::terminate()
   cudaDeviceSynchronize();
 
   scan_manager_.reset();
-
-  // Free pinned cuVS indexes and release their GPU reservations while the
-  // memory manager is still alive. The device was synchronized just above, so
-  // no kernels are still reading the index buffers being freed here.
-  cuvs_index_cache_.reset();
 
   // Drop any remaining per-query repositories while the memory manager is still alive. The
   // downgrade executors (the only other holders of a manager reference) were stopped above, so
@@ -1075,18 +1041,6 @@ const sirius::scan_manager::sirius_scan_manager& SiriusContext::get_scan_manager
 {
   throw_if_not_initialized();
   return *scan_manager_;
-}
-
-sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache()
-{
-  throw_if_not_initialized();
-  return *cuvs_index_cache_;
-}
-
-const sirius::vss::cuvs_index_cache& SiriusContext::get_cuvs_index_cache() const
-{
-  throw_if_not_initialized();
-  return *cuvs_index_cache_;
 }
 
 std::shared_lock<std::shared_mutex> SiriusContext::lock_pinned_table_updates()
@@ -1655,38 +1609,13 @@ void install_configured_log_sink(DatabaseInstance* db)
 
 SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 {
-  auto const previous_log_backend = Config::LOG_BACKEND;
-  auto const previous_log_dir     = Config::LOG_DIR;
-  auto const previous_log_level   = Config::LOG_LEVEL;
-  auto const* backend_env         = std::getenv("SIRIUS_LOG_BACKEND");
-  auto const* log_dir_env         = std::getenv("SIRIUS_LOG_DIR");
-  auto const* level_env           = std::getenv("SIRIUS_LOG_LEVEL");
-  if (backend_env) {
-    std::string_view const backend{backend_env};
-    if (backend != "duckdb" && backend != "spdlog" && backend != "noop") {
-      throw InvalidInputException(
-        "SIRIUS_LOG_BACKEND must be one of: duckdb, spdlog, noop; got '%s'", backend_env);
-    }
-  }
-  if (level_env && !sirius::log::string_to_enum(level_env)) {
-    throw InvalidInputException(
-      "SIRIUS_LOG_LEVEL must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
-      level_env);
-  }
-  if (backend_env) { Config::LOG_BACKEND = backend_env; }
-  if (log_dir_env) { Config::LOG_DIR = log_dir_env; }
-  if (level_env) { Config::LOG_LEVEL = level_env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_BACKEND")) { Config::LOG_BACKEND = env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_DIR")) { Config::LOG_DIR = env; }
+  if (auto* env = std::getenv("SIRIUS_LOG_LEVEL")) { Config::LOG_LEVEL = env; }
   // Install now (no db yet) so spdlog/noop capture the logs emitted by
   // read_config_file_if_exists() below; the duckdb backend needs a db (installed
   // later).
-  try {
-    install_configured_log_sink(nullptr);
-  } catch (...) {
-    Config::LOG_BACKEND = previous_log_backend;
-    Config::LOG_DIR     = previous_log_dir;
-    Config::LOG_LEVEL   = previous_log_level;
-    throw;
-  }
+  install_configured_log_sink(nullptr);
   read_config_file_if_exists();
 }
 

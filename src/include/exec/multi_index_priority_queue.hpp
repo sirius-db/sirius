@@ -175,18 +175,14 @@ class multi_index_priority_queue {
   /// teardown contract callers rely on (e.g. returning a task to a closed queue).
   /// Strongly exception-safe: if any allocation throws, the queue is left as it
   /// was (the task is destroyed) and nothing is enqueued.
-  ///
-  /// \return true if the task was enqueued, false if it was dropped because the queue is
-  ///         interrupted. Callers that only enqueue may ignore it; those that report dropped
-  ///         work (itask_executor::schedule) rely on it.
-  bool push(task_ptr task)
+  void push(task_ptr task)
   {
     assert(task && "cannot push a null task");
     const index_keys keys = _extract(*task);
     {
       std::lock_guard<std::mutex> lock(_mutex);
       // Interrupted (shutdown): drop the task instead of enqueuing it.
-      if (!_active) { return false; }
+      if (!_active) { return; }
 
       auto lit             = _levels.find(keys.priority);
       const bool new_level = (lit == _levels.end());
@@ -234,7 +230,6 @@ class multi_index_priority_queue {
       }
     }
     _cv.notify_all();
-    return true;
   }
 
   /// Blocks until the globally-first (lowest-priority-value) task is available and

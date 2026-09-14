@@ -1,9 +1,6 @@
-use std::collections::BTreeMap;
-
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::plan_nodes::{TJoinOp, TPlan, TPlanNode, TPlanNodeType, TSortInfo};
-use starrocks_thrift::types::TSlotId;
 use substrait::proto::read_rel::local_files::FileOrFiles;
 use substrait::proto::read_rel::local_files::file_or_files::{
     FileFormat, ParquetReadOptions, PathType,
@@ -11,8 +8,8 @@ use substrait::proto::read_rel::local_files::file_or_files::{
 use substrait::proto::read_rel::{LocalFiles, NamedTable, ReadType};
 use substrait::proto::{
     AggregateFunction, AggregateRel, Expression, FetchRel, FilterRel, JoinRel, ProjectRel, ReadRel,
-    Rel, RelCommon, SortField, SortRel, aggregate_rel, expression, fetch_rel, function_argument,
-    join_rel, rel, rel_common, sort_field,
+    Rel, RelCommon, SortField, SortRel, aggregate_rel, fetch_rel, function_argument, join_rel, rel,
+    rel_common, sort_field,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -72,15 +69,6 @@ impl<'a> PlanContext<'a> {
     /// Creates an expression context for an expression over `row_tuples`.
     fn expr_context<'b>(&'b mut self, row_tuples: &'b [i32]) -> ExprContext<'b> {
         ExprContext::new(self.desc, self.registry, row_tuples)
-    }
-
-    /// Creates an expression context with synthetic slot-to-column mappings.
-    fn expr_context_with_slots<'b>(
-        &'b mut self,
-        row_tuples: &'b [i32],
-        slot_overrides: &'b std::collections::HashMap<(i32, i32), usize>,
-    ) -> ExprContext<'b> {
-        ExprContext::with_slot_overrides(self.desc, self.registry, row_tuples, slot_overrides)
     }
 }
 
@@ -274,26 +262,6 @@ fn translate_scan(
     apply_conjuncts(input, node, ctx)
 }
 
-/// Refuses a node whose `common_slot_map` this translator does not materialize.
-///
-/// Only `PROJECT_NODE` appends its common slots. On every other node carrying the field the
-/// shared sub-expressions would be read past: a conjunct or key that references one of them then
-/// fails later with an opaque descriptor error (`slot N (tuple T) is not part of row_tuples`),
-/// and a map nothing references is silently ignored. Report the unsupported shape up front.
-fn reject_common_slots(
-    node: &TPlanNode,
-    common_slot_map: Option<&BTreeMap<TSlotId, TExpr>>,
-) -> Result<()> {
-    if common_slot_map.is_some_and(|map| !map.is_empty()) {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "common slots are only materialized on PROJECT_NODE",
-        });
-    }
-    Ok(())
-}
-
 /// Wraps the child relation of a `SELECT_NODE` with its filter conjuncts.
 fn translate_select(
     node: &TPlanNode,
@@ -301,12 +269,6 @@ fn translate_select(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 1)?;
-    reject_common_slots(
-        node,
-        node.select_node
-            .as_ref()
-            .and_then(|select| select.common_slot_map.as_ref()),
-    )?;
     apply_conjuncts(children.into_iter().next().unwrap(), node, ctx)
 }
 
@@ -669,12 +631,6 @@ fn translate_hash_join(
     ctx: &mut PlanContext<'_>,
 ) -> Result<TranslatedRel> {
     expect_children(node, &children, 2)?;
-    reject_common_slots(
-        node,
-        node.hash_join_node
-            .as_ref()
-            .and_then(|join| join.common_slot_map.as_ref()),
-    )?;
     let join = node
         .hash_join_node
         .as_ref()
@@ -682,19 +638,17 @@ fn translate_hash_join(
             context: "HASH_JOIN_NODE",
             field: "hash_join_node",
         })?;
-    // Validated before the conjuncts so an unsupported op is reported as such, rather than as
-    // missing conjuncts, which some join shapes arrive with once the FE has folded predicates away.
-    let (join_type, output) = match join.join_op {
-        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, JoinOutput::Both),
-        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, JoinOutput::Both),
-        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, JoinOutput::Both),
-        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, JoinOutput::Both),
-        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, JoinOutput::Left),
-        TJoinOp::LEFT_ANTI_JOIN => (join_rel::JoinType::Left, JoinOutput::LeftAnti),
-        TJoinOp::RIGHT_ANTI_JOIN => (join_rel::JoinType::Right, JoinOutput::RightAnti),
-        TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
-            (join_rel::JoinType::LeftMark, JoinOutput::NullAwareLeftAnti)
-        }
+    // Validated before the conjuncts so an unsupported op is reported as such, rather than as the
+    // missing conjuncts an anti join arrives with once the FE has folded its predicate away.
+    //
+    // Anti joins (from NOT IN / NOT EXISTS rewrites) are not translated: DuckDB's Substrait
+    // consumer has no left-anti conversion, so an emitted plan would fail downstream anyway.
+    let (join_type, semi) = match join.join_op {
+        TJoinOp::INNER_JOIN => (join_rel::JoinType::Inner, false),
+        TJoinOp::LEFT_OUTER_JOIN => (join_rel::JoinType::Left, false),
+        TJoinOp::RIGHT_OUTER_JOIN => (join_rel::JoinType::Right, false),
+        TJoinOp::FULL_OUTER_JOIN => (join_rel::JoinType::Outer, false),
+        TJoinOp::LEFT_SEMI_JOIN => (join_rel::JoinType::LeftSemi, true),
         _ => {
             return Err(TranslateError::UnsupportedPlanNode {
                 node_id: node.node_id,
@@ -704,45 +658,12 @@ fn translate_hash_join(
         }
     };
 
-    // A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when the marker's
-    // NULL-ness is decided per probe row. Neither executor does that: DuckDB sets one global
-    // `has_null` if any build row has a NULL in any equality key and then rewrites every FALSE
-    // marker to NULL (`duckdb/src/execution/join_hashtable.cpp:431` and `:1211-1217`), and the
-    // GPU path does the same with `set_build_has_null(_build_has_null,
-    // table_has_any_null(right_keys))` in `src/op/sirius_physical_hash_join.cpp`. The per-group
-    // path that would be correct is only reachable from DuckDB's own delim-join planner, never
-    // from a Substrait `JoinRel`.
-    //
-    // That is exact for a single equality key and nothing else, because then "unmatched with a
-    // NULL somewhere on the build side" really is UNKNOWN. It is wrong as soon as another
-    // predicate can make a row definitely non-matching: a correlated `NOT IN` puts its
-    // correlation predicate in `other_join_conjuncts` (FE `QuantifiedApply2JoinRule` builds
-    // `eq AND correlatedConjuncts AND predicate`, and `JoinHelper` filters correlated equalities
-    // out of the eq conjuncts), and a tuple `NOT IN` arrives as several eq conjuncts. In both
-    // cases a row that is definitely FALSE is reported UNKNOWN and silently dropped, so
-    // `NOT IN` returns too few rows -- often none. StarRocks itself does not have this problem;
-    // its BE only short-circuits when `_other_join_conjunct_ctxs` is empty.
-    if matches!(join.join_op, TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN)
-        && (join.eq_join_conjuncts.len() != 1
-            || join
-                .other_join_conjuncts
-                .as_ref()
-                .is_some_and(|conjuncts| !conjuncts.is_empty()))
-    {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "null-aware left anti join with correlated or multi-column keys",
-        });
-    }
-
     let mut children = children.into_iter();
     let left = children.next().unwrap();
     let right = children.next().unwrap();
 
     let combined_tuples = [left.row_tuples.as_slice(), right.row_tuples.as_slice()].concat();
     let mut conditions = Vec::new();
-    let mut first_equality = None;
     for eq in &join.eq_join_conjuncts {
         if let Some(opcode) = eq.opcode
             && opcode != TExprOpcode::EQ
@@ -757,9 +678,6 @@ fn translate_hash_join(
         let left_expr = eq.left.translate(&mut expr_ctx)?;
         let mut expr_ctx = ctx.expr_context(&combined_tuples);
         let right_expr = eq.right.translate(&mut expr_ctx)?;
-        if first_equality.is_none() {
-            first_equality = Some((left_expr.clone(), right_expr.clone()));
-        }
         let anchor = ctx.registry.register_function(URN_COMPARISON, "equal");
         conditions.push(expr_translator::scalar_function(
             anchor,
@@ -777,13 +695,11 @@ fn translate_hash_join(
         reason: "hash join without join conjuncts",
     })?;
 
-    let (row_tuples, output_width) = match output {
-        JoinOutput::Left => (left.row_tuples.clone(), left.output_width),
-        JoinOutput::NullAwareLeftAnti => (left.row_tuples.clone(), left.output_width + 1),
-        _ => (
-            combined_tuples.clone(),
-            left.output_width + right.output_width,
-        ),
+    // Semi joins emit only the probe-side row; other joins emit probe then build columns.
+    let (row_tuples, output_width) = if semi {
+        (left.row_tuples.clone(), left.output_width)
+    } else {
+        (combined_tuples, left.output_width + right.output_width)
     };
 
     let joined = TranslatedRel {
@@ -799,55 +715,8 @@ fn translate_hash_join(
         row_tuples,
         output_width,
     };
-    let joined = match output {
-        JoinOutput::LeftAnti => {
-            let (_, right_key) = first_equality
-                .ok_or_else(|| TranslateError::malformed("left anti join has no equality key"))?;
-            require_column_key(node, &right_key)?;
-            let filtered = filter_is_null(joined, right_key, ctx);
-            emit_columns(
-                filtered.rel,
-                (0..left.output_width as i32).collect(),
-                left.row_tuples,
-            )
-        }
-        JoinOutput::RightAnti => {
-            let (left_key, _) = first_equality
-                .ok_or_else(|| TranslateError::malformed("right anti join has no equality key"))?;
-            require_column_key(node, &left_key)?;
-            let filtered = filter_is_null(joined, left_key, ctx);
-            let start = left.output_width as i32;
-            let end = start + right.output_width as i32;
-            emit_columns(filtered.rel, (start..end).collect(), right.row_tuples)
-        }
-        JoinOutput::NullAwareLeftAnti => {
-            let marker = field_selection(left.output_width as i32);
-            let not_anchor = ctx.registry.register_function(URN_BOOLEAN, "not");
-            let condition = expr_translator::scalar_function(
-                not_anchor,
-                vec![marker],
-                crate::type_mapper::bool_type(),
-            );
-            let filtered = filter_rel(joined, condition);
-            emit_columns(
-                filtered.rel,
-                (0..left.output_width as i32).collect(),
-                left.row_tuples,
-            )
-        }
-        _ => joined,
-    };
     // Node conjuncts are post-join predicates over the join's output row.
     apply_conjuncts(joined, node, ctx)
-}
-
-#[derive(Clone, Copy)]
-enum JoinOutput {
-    Both,
-    Left,
-    LeftAnti,
-    RightAnti,
-    NullAwareLeftAnti,
 }
 
 /// Translates an inner/cross `NESTLOOP_JOIN_NODE` into an equality join on synthetic constants.
@@ -865,7 +734,6 @@ fn translate_nestloop_join(
             context: "NESTLOOP_JOIN_NODE",
             field: "nestloop_join_node",
         })?;
-    reject_common_slots(node, join.common_slot_map.as_ref())?;
     match join.join_op {
         None | Some(TJoinOp::CROSS_JOIN) | Some(TJoinOp::INNER_JOIN) => {}
         Some(_) => {
@@ -1042,19 +910,6 @@ fn translate_project_node(
         node.row_tuples.clone()
     };
 
-    let output_tuple = output_tuples[0];
-    let mut input = child;
-    let mut common_slots = std::collections::HashMap::new();
-    for (&slot_id, expr) in project_node.common_slot_map.as_ref().into_iter().flatten() {
-        let expression = {
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
-            expr.translate(&mut expr_ctx)?
-        };
-        let field = input.output_width;
-        input = append_project(input, expression);
-        common_slots.insert((output_tuple, slot_id), field);
-    }
-
     let mut expressions = Vec::new();
     for &tuple_id in &output_tuples {
         for slot_id in ctx.desc.materialized_slot_ids(tuple_id)? {
@@ -1064,12 +919,12 @@ fn translate_project_node(
                     node.node_id, slot_id
                 ))
             })?;
-            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
     }
 
-    Ok(project_rel(input, expressions, output_tuples))
+    Ok(project_rel(child, expressions, output_tuples))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -1214,61 +1069,6 @@ fn i32_literal(value: i32) -> Expression {
             },
         )),
     }
-}
-
-/// Wraps a relation in a filter without changing its row layout.
-fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
-    let output_width = input.output_width;
-    TranslatedRel {
-        rel: Rel {
-            rel_type: Some(rel::RelType::Filter(Box::new(FilterRel {
-                input: Some(Box::new(input.rel)),
-                condition: Some(Box::new(condition)),
-                ..Default::default()
-            }))),
-        },
-        row_tuples: input.row_tuples,
-        output_width,
-    }
-}
-
-/// Refuses an anti join whose null-tested key is not a column reference (casts allowed).
-///
-/// The outer-join + `is_null(key)` lowering identifies an unmatched row by the NULL padding the
-/// join puts on the other side. That is only exact when the key expression propagates NULL: a
-/// column reference does, and so does a cast of one, but `if`/`case`/`coalesce` over a column can
-/// yield a non-NULL value for the padded row, and the filter would then drop an unmatched row as
-/// if it had matched. Refuse those shapes rather than return too few rows.
-fn require_column_key(node: &TPlanNode, key: &Expression) -> Result<()> {
-    fn is_column_reference(expr: &Expression) -> bool {
-        match expr.rex_type.as_ref() {
-            Some(expression::RexType::Selection(_)) => true,
-            Some(expression::RexType::Cast(cast)) => {
-                cast.input.as_deref().is_some_and(is_column_reference)
-            }
-            _ => false,
-        }
-    }
-    if is_column_reference(key) {
-        return Ok(());
-    }
-    Err(TranslateError::UnsupportedPlanNode {
-        node_id: node.node_id,
-        node_type: node.node_type,
-        reason: "anti join key is not a plain column reference",
-    })
-}
-
-/// Filters to rows where an equality-key expression is null.
-fn filter_is_null(
-    input: TranslatedRel,
-    key: Expression,
-    ctx: &mut PlanContext<'_>,
-) -> TranslatedRel {
-    let anchor = ctx.registry.register_function(URN_COMPARISON, "is_null");
-    let condition =
-        expr_translator::scalar_function(anchor, vec![key], crate::type_mapper::bool_type());
-    filter_rel(input, condition)
 }
 
 /// Wraps a relation in a Substrait filter when the StarRocks node has conjuncts.

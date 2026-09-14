@@ -303,9 +303,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
-    std::unique_ptr<cudf::column>* survivors,
-    std::span<std::size_t const> elided) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
@@ -318,11 +316,6 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     return _duckdb_filter_expression != nullptr;
   }
 
-  /// post_filter_and_project routes its filter through
-  /// expression_evaluator::select_with_survivors, which writes the surviving
-  /// positions into the out-parameter.
-  [[nodiscard]] bool can_report_survivors() const noexcept override { return true; }
-
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
   {
     return _filter_analysis;
@@ -334,7 +327,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
-                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
+                                                  std::shared_ptr<io::ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 

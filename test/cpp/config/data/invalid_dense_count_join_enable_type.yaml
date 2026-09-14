@@ -1,5 +1,0 @@
-sirius:
-  topology:
-    num_gpus: 1
-  operator_params:
-    enable_dense_count_join: [true]

@@ -25,7 +25,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <cuda/stream>
+#include <cuda/stream_ref>
 
 #include <span>
 
@@ -46,19 +46,18 @@ using cudf_datasource_stream_t = rmm::cuda_stream_view;
 /**
  * @brief Concrete @c io_datasource backed by io_uring.
  *
- * Thin delegate: every read method forwards to @c sirius_ioctx, passing the
- * owned @c sirius_io_object by reference.
+ * Thin delegate: every read method forwards to @c ioctx, passing the
+ * owned @c io_object by reference.
  *
  * Ownership model: one scan owns one @c sirius_datasource.  The underlying
- * @c sirius_io_object can be shared across multiple datasources (e.g. when
+ * @c io_object can be shared across multiple datasources (e.g. when
  * the same file is scanned in different pipelines), but the datasource
- * itself stores per-scan state (notably the @c prefetching_handle returned
+ * itself stores per-scan state (notably the @c cache_handle returned
  * by an @c fadvise call) and is therefore not safe to share.
  */
 class sirius_datasource : public cudf::io::datasource {
  public:
-  explicit sirius_datasource(std::shared_ptr<sirius_ioctx> io_ctx,
-                             std::shared_ptr<sirius_io_object> io_object);
+  explicit sirius_datasource(std::shared_ptr<ioctx> io_ctx, std::shared_ptr<io_object> io_object);
 
   ~sirius_datasource() override;
 
@@ -67,19 +66,19 @@ class sirius_datasource : public cudf::io::datasource {
 
   // ---- Context accessors ---------------------------------------------------
 
-  [[nodiscard]] std::shared_ptr<sirius_ioctx> io_ctx() const { return _io_ctx; }
+  [[nodiscard]] std::shared_ptr<ioctx> io_ctx() const { return _io_ctx; }
 
   /// The underlying io_object this datasource reads through.  Exposed so
-  /// callers that received the datasource from @c sirius_ioctx::open_datasource
+  /// callers that received the datasource from @c ioctx::open_datasource
   /// can still reach the io_object (e.g. as the metadata-store cache key).
-  [[nodiscard]] const sirius_io_object& io_object() const noexcept { return *_io_object; }
+  [[nodiscard]] const io_object& get_io_object() const noexcept { return *_io_object; }
 
   /// Backend-parsed metadata for this datasource's io_object, looked up in the
   /// ioctx's metadata store (null when no cache or no entry). Independent of
   /// the prefetching machinery.
-  [[nodiscard]] std::shared_ptr<sirius_io_object_metadata> metadata() const;
+  [[nodiscard]] std::shared_ptr<io_object_metadata> metadata() const;
 
-  [[nodiscard]] bool store_metadata(std::shared_ptr<sirius_io_object_metadata> metadata);
+  [[nodiscard]] bool store_metadata(std::shared_ptr<io_object_metadata> metadata);
 
   // ---- cudf::io::datasource overrides ---------------------------------------
 
@@ -115,9 +114,9 @@ class sirius_datasource : public cudf::io::datasource {
 
   // ---- Advisory IO ---------------------------------------------------------
 
-  /// \brief Return a fresh datasource that shares this one's @c sirius_ioctx and
-  /// @c sirius_io_object (so it points at the same file) but carries an
-  /// empty @c prefetching_handle.
+  /// \brief Return a fresh datasource that shares this one's @c ioctx and
+  /// @c io_object (so it points at the same file) but carries an
+  /// empty @c cache_handle.
   ///
   /// \note Used when a single file is split across multiple scans (e.g. several
   /// row_group_slices from the same parquet file).  Each split owns its
@@ -133,7 +132,7 @@ class sirius_datasource : public cudf::io::datasource {
   /// @c preferred_prefetching_stage:
   ///   - @c speculative / @c immediate: only honored when @p site matches
   ///     the ioctx's preferred mode.  Hands @p ranges to the prefetching
-  ///     cache and stashes the returned @c prefetching_handle on this
+  ///     cache and stashes the returned @c cache_handle on this
   ///     datasource so a later @c fadvise(disposable) can cancel.
   ///   - @c disposable: always honored.  If a handle is stored (i.e. a
   ///     prior speculative/immediate call enqueued work), cancel it so the
@@ -152,12 +151,12 @@ class sirius_datasource : public cudf::io::datasource {
   [[nodiscard]] bool uses_prefetching_cache() const noexcept;
 
  private:
-  std::shared_ptr<sirius_ioctx> _io_ctx;
-  std::shared_ptr<sirius_io_object> _io_object;
+  std::shared_ptr<ioctx> _io_ctx;
+  std::shared_ptr<io_object> _io_object;
   /// Handle of the most recent speculative/immediate insert into the
   /// prefetching cache, or empty if none was made.  fadvise(disposable)
   /// uses this to cancel still-pending work.
-  cache::prefetching_handle _prefetch_handle;
+  cache::cache_handle _cache_handle;
 };
 
 }  // namespace sirius::io

@@ -18,8 +18,6 @@
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
 
-#include <cuda/stream>
-
 #include <catch.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
@@ -254,8 +252,7 @@ TEST_CASE("sirius_physical_projection mixes evaluated and passthrough columns (p
   // alive even after the input variable disappears.
   inputs.clear();
   input_batch.reset();
-  ::cuda::stream_ref const stream = cudf::get_default_stream();
-  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
 
   auto out_view = sirius::get_cudf_table_view(*out_batch);
   REQUIRE(out_view.num_columns() == 3);
@@ -303,8 +300,7 @@ TEST_CASE("sirius_physical_projection passthrough output outlives input batch ha
   // output owner's read-only lock keeps the data alive.
   inputs.clear();
   input_batch.reset();
-  ::cuda::stream_ref const stream = cudf::get_default_stream();
-  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(cudf::get_default_stream().value()) == cudaSuccess);
 
   auto out_view = sirius::get_cudf_table_view(*out_batch);
   REQUIRE(out_view.num_columns() == 2);

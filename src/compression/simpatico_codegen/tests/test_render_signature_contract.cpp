@@ -140,9 +140,6 @@ int main()
     cdj::kShapeDictGather,
     cdj::kShapeIndexConsume,
     cdj::kShapeStrSplitMeta,
-    cdj::kShapeSparseConsume,
-    cdj::kShapeSparseDictGather,
-    cdj::kShapeSparseStrSplitMeta,
   };
 
   const std::vector<Shape> shapes = {

@@ -15,7 +15,6 @@
  */
 
 #include <cudf/binaryop.hpp>
-#include <cudf/cudf_utils.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -82,7 +81,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
     if (!mask || current.num_rows() == 0) { return 1.0; }
     auto const rows_before = current.num_rows();
-    owned                  = sirius::ApplyRetentionMask(current, mask->view(), stream, mr);
+    owned                  = cudf::apply_boolean_mask(current, mask->view(), stream, mr);
     current                = owned->view();
     return static_cast<double>(current.num_rows()) / static_cast<double>(rows_before);
   };

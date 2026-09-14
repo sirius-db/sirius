@@ -386,7 +386,6 @@ void gpu_pipeline_executor::manager_loop()
             std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
-          if (cur_local) { new_local_state->inherit_retry_reservation_floor(*cur_local); }
 
           // Preserve the per-task device pin across reschedule. Dropping it lets
           // an OOM'd partition task scatter to the wrong GPU and touch a cuco
@@ -456,25 +455,13 @@ void gpu_pipeline_executor::manager_loop()
           // the task destructor only fires once the pipeline drains —
           // mid-pipeline batches need to start rotating before that point so
           // they reach all GPUs.
-          try {
-            for (auto* consumer : consumers) {
-              if (consumer) { _task_creator->schedule(consumer); }
-            }
-          } catch (const std::exception& e) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: failed to schedule downstream consumers: {}",
-                             e.what());
-            if (_completion_handler) {
-              _completion_handler->report_error(std::current_exception());
-            }
-            return;
+          for (auto* consumer : consumers) {
+            if (consumer) { _task_creator->schedule(consumer); }
           }
         }
 
         if (query_complete && _completion_handler) {
-          // Scoped to the finishing query: its pending creation requests point at operators
-          // that mark_completed() may let the engine destroy. Any other query's requests are
-          // left alone.
-          _task_creator->drain_pending_tasks(pipeline->get_query_id());
+          _task_creator->drain_pending_tasks();
           _completion_handler->mark_completed();
         }
       });
@@ -492,7 +479,7 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
   _task_creator = task_creator;
 }
 
-bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.empty(); }
+bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
 
 executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
 {

@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+// test
 #include <catch.hpp>
+
+// sirius
 #include <vss/distance_metric.hpp>
 
 #include <stdexcept>
@@ -27,12 +30,4 @@ TEST_CASE("enn_distance_type_from_metric maps l2 to the unexpanded form", "[vss]
   REQUIRE(sirius::vss::enn_distance_type_from_metric("cosine") == Metric::CosineExpanded);
   REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric("dot"), std::invalid_argument);
   REQUIRE_THROWS_AS(sirius::vss::enn_distance_type_from_metric(""), std::invalid_argument);
-}
-
-TEST_CASE("ann_distance_type_from_metric maps the supported metrics", "[vss]")
-{
-  REQUIRE(sirius::vss::ann_distance_type_from_metric("l2") == Metric::L2SqrtExpanded);
-  REQUIRE(sirius::vss::ann_distance_type_from_metric("cosine") == Metric::CosineExpanded);
-  REQUIRE_THROWS_AS(sirius::vss::ann_distance_type_from_metric("dot"), std::invalid_argument);
-  REQUIRE_THROWS_AS(sirius::vss::ann_distance_type_from_metric(""), std::invalid_argument);
 }

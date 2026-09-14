@@ -17,7 +17,6 @@
 #include "parallel/task_executor.hpp"
 
 #include "log/logging.hpp"
-#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
 #include "telemetry/telemetry_context.hpp"
 
@@ -34,9 +33,6 @@ itask_executor::itask_executor(
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context,
   std::optional<int> device_id)
   : _config(std::move(config)),
-    // Shared with the task_scheduler's queue so both derive a task's query the same way; see
-    // pipeline::index_keys_for.
-    _task_queue(&pipeline::index_keys_for),
     _telemetry_context(std::move(telemetry_context)),
     _task_queue_telemetry(std::make_unique<telemetry::TaskQueueHandleWrapper>(
       *_telemetry_context,
@@ -96,11 +92,6 @@ void itask_executor::wait_all()
 }
 
 void itask_executor::drain_leftover_tasks() { _task_queue.drain(); }
-
-void itask_executor::drain_query_tasks(sirius::query_id_t query_id)
-{
-  _task_queue.drain(exec::query_index{static_cast<exec::query_key>(sirius::value_of(query_id))});
-}
 
 void itask_executor::drain_and_wait()
 {

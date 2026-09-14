@@ -17,7 +17,6 @@
 #pragma once
 
 #include "compressed_scan.hpp"
-#include "compression/simpatico_compressed_representation.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
@@ -104,7 +103,7 @@ void copy_pinned_blocks_to_device(
  * Multiple compressed_host_representation objects may share the same underlying
  * blob (e.g. after select_columns() or clone()).
  */
-class compressed_host_representation : public simpatico_compressed_representation {
+class compressed_host_representation : public cucascade::idata_representation {
  public:
   /**
    * @brief Construct a compressed_host_representation owning a share of @p blob.
@@ -248,7 +247,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
  * simpatico::decompress() directly on the cached table, decompressing only the selected
  * columns when a projection is set.
  */
-class compressed_device_representation : public simpatico_compressed_representation {
+class compressed_device_representation : public cucascade::idata_representation {
  public:
   compressed_device_representation(
     cucascade::memory::memory_space& memory_space,
@@ -281,10 +280,6 @@ class compressed_device_representation : public simpatico_compressed_representat
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
-  /// Whether @ref table is readable. A chunk may legitimately carry no blob —
-  /// serving paths that need only the row count or a column projection never
-  /// touch one — so anything that DOES read the table must ask first.
-  [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
 

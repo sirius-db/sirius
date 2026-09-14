@@ -49,7 +49,6 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -64,33 +63,13 @@
 #include <duckdb/common/types/value.hpp>
 
 #include <algorithm>
-#include <concepts>
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace sirius {
-
-/**
- * @brief Apply a boolean retention mask across supported cuDF releases.
- *
- * cuDF 26.10 renamed apply_boolean_mask() to apply_retention_mask(). Keep the
- * compatibility decision here so call sites use the non-deprecated name.
- */
-inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
-                                                       cudf::column_view const& retention_mask,
-                                                       rmm::cuda_stream_view stream,
-                                                       rmm::device_async_resource_ref mr)
-{
-#if CUDF_VERSION_NUM >= 2610
-  return cudf::apply_retention_mask(input, retention_mask, stream, mr);
-#else
-  return cudf::apply_boolean_mask(input, retention_mask, stream, mr);
-#endif
-}
 
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
 {
@@ -325,19 +304,6 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
     // Better than crashing — the column will be STRING instead of native type.
     default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
   }
-}
-
-/** @brief Assemble an owned table from column pointers; `cudf::table` has no variadic constructor.
- */
-template <typename... Columns>
-  requires(sizeof...(Columns) > 0 &&
-           (std::convertible_to<Columns &&, std::unique_ptr<cudf::column>> && ...))
-[[nodiscard]] inline std::unique_ptr<cudf::table> make_table(Columns&&... columns)
-{
-  std::vector<std::unique_ptr<cudf::column>> owned;
-  owned.reserve(sizeof...(Columns));
-  (owned.push_back(std::forward<Columns>(columns)), ...);
-  return std::make_unique<cudf::table>(std::move(owned));
 }
 
 /**

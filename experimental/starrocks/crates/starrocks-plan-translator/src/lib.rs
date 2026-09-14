@@ -30,10 +30,10 @@
 //! | `FILE_SCAN_NODE`     | `ReadRel` (local files) |
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
-//! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
+//! | `PROJECT_NODE`       | `ProjectRel`       |
 //! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
-//! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
+//! | `HASH_JOIN_NODE`     | `JoinRel` (inner/outer/left-semi; anti joins are rejected) |
 //! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
 //!
 //! Node-level `conjuncts` (scan/filter predicates, HAVING, post-join filters) become a
@@ -50,7 +50,7 @@
 //! | `COMPOUND_PRED`   | boolean function (`and`, `or`, `not`) |
 //! | `CAST_EXPR`       | cast (throwing failure behavior) |
 //! | `IS_NULL_PRED`    | `is_null` / `is_not_null` |
-//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` (decimal operands in FP64) |
+//! | `ARITHMETIC_EXPR` | `add`/`subtract`/`multiply`/`divide`/`modulus` |
 //! | `IN_PRED`         | singular-or-list (wrapped in `not` for `NOT IN`) |
 //! | `CASE_EXPR`       | if-then chain (no leading case operand) |
 //! | `FUNCTION_CALL`   | allowlisted scalar functions (`like`, `if`, `substring`, `year`, ...) |
@@ -64,12 +64,6 @@
 //! decimal precision &gt; 38 (both exceed the i128 decimal encoding), and
 //! non-scalar type nodes. `JSON`/`VARIANT` are surfaced as strings until richer
 //! support lands.
-//!
-//! Decimal arithmetic is **not exact**. `ARITHMETIC_EXPR` over decimal operands, and decimal
-//! `sum`/`avg`, are evaluated in FP64 because the GPU expression and aggregate paths cannot
-//! consume decimal arithmetic; decimal slots of precision &gt; 18 likewise map to FP64. Results
-//! are not cast back, so a column the frontend declared DECIMAL can arrive as a double and
-//! differ from StarRocks in its final digits.
 //!
 //! # Adding a node
 //!

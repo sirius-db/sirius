@@ -17,6 +17,7 @@
 #include "io/uring/uring_reactor.hpp"
 
 #include "cucascade/cuda/event.hpp"
+#include "exec/thread_util.hpp"
 #include "driver_types.h"
 #include "io/details/slot_pool.hpp"
 #include "io/types.hpp"
@@ -44,6 +45,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace sirius::io::uring {
@@ -509,7 +511,7 @@ void uring_reactor::start()
                          _stop_source.get_token());
   if (!_tname.empty()) {
     std::string full_name = _tname + "_worker";
-    pthread_setname_np(_worker.native_handle(), full_name.c_str());
+    std::ignore = sirius::exec::thread_util::set_thread_name(_worker, full_name);
   }
 }
 
