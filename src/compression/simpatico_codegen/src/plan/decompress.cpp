@@ -79,6 +79,7 @@ std::string codegen_kind_for_compressor(std::string const& c)
   if (c == "delta") return "delta";
   if (c == "rle") return "rle";
   if (c == "for") return "for";
+  if (c == "factor") return "factor";
   if (c == "zigzag") return "zigzag";
   return {};
 }
@@ -95,6 +96,7 @@ std::vector<std::string> consumed_slots(std::string const& kind)
   if (kind == "delta") return {"delta_first"};
   if (kind == "rle") return {"rle_runs_offsets"};
   if (kind == "for") return {"references"};
+  if (kind == "factor") return {"divisors"};
   if (kind == "zigzag") return {"zigzag"};
   if (kind == "RawFused") return {"data", "offsets"};
   return {};

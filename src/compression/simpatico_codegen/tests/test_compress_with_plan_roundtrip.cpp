@@ -373,6 +373,36 @@ int main()
     }
 
     {
+      // ALP on DECIMAL64 — the fixed-point path. Three shapes: a clean common
+      // power of ten, a fraction of values that do not divide (exceptions on
+      // the decimal path), and none available at all (scale 10^0, an identity).
+      auto clean = make_decimal64_table(2, 4096, 21, 100, 0);
+      std::string dsl =
+        "input -> alp\n"
+        "---\n"
+        "input -> alp\n";
+      roundtrip_once(clean->view(), dsl, 1, "alp_decimal64");
+      roundtrip_once(clean->view(), dsl, 2, "alp_decimal64_mt");
+
+      auto with_exc = make_decimal64_table(2, 4096, 23, 100, 37);
+      roundtrip_once(with_exc->view(), dsl, 1, "alp_decimal64_exceptions");
+
+      auto no_factor = make_decimal64_table(2, 4096, 29, 1, 0);
+      roundtrip_once(no_factor->view(), dsl, 1, "alp_decimal64_no_scale");
+
+      // Composed with bitpack on the integers channel — the shape that makes
+      // the decimal path worth having.
+      std::string dsl_bp =
+        "input -> alp -> integers, exceptions, exception_positions, metadata\n"
+        "alp.integers -> bitpack\n"
+        "---\n"
+        "input -> alp -> integers, exceptions, exception_positions, metadata\n"
+        "alp.integers -> bitpack\n";
+      roundtrip_once(clean->view(), dsl_bp, 1, "alp_decimal64_bitpack");
+      roundtrip_once(with_exc->view(), dsl_bp, 1, "alp_decimal64_bitpack_exceptions");
+    }
+
+    {
       // ALP-RD (Right-Dictionary), FLOAT32 — the non-decimal float path.
       auto t = make_f32_table(2, 4096, 33);
       std::string dsl =
@@ -484,6 +514,78 @@ int main()
         "for.references -> identity\n";
       roundtrip_once(t->view(), dsl, 1, "jit_for_ref_identity_int32");
       roundtrip_once(t->view(), dsl, 2, "jit_for_ref_identity_int32_mt");
+    }
+
+    {
+      // FACTOR at the region root with no fused child: `quotients` drains to a
+      // synthesized Raw passthrough (fixed stride) and `divisors` is the
+      // boundary channel on the op's own rep.
+      auto t = make_scaled_int64_table(2, 2048, 11, 100);
+      std::string dsl =
+        "input -> factor -> quotients, divisors\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n";
+      roundtrip_once(t->view(), dsl, 1, "factor_only");
+      roundtrip_once(t->view(), dsl, 2, "factor_only_mt");
+    }
+
+    {
+      // FACTOR -> Bitpack (FUSED): int64 (decimal storage width) and int32.
+      auto t64 = make_scaled_int64_table(2, 4096, 13, 1000);
+      std::string dsl64 =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n";
+      roundtrip_once(t64->view(), dsl64, 1, "jit_factor_bp_int64");
+      roundtrip_once(t64->view(), dsl64, 2, "jit_factor_bp_int64_mt");
+
+      // Non-factorable input (consecutive residues => per-chunk GCD collapses
+      // to 1): exercises the divisor == 1 identity path end to end.
+      auto t32 = make_int32_table(2, 4096, 17);
+      std::string dsl32 =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n";
+      roundtrip_once(t32->view(), dsl32, 1, "jit_factor_bp_int32_gcd1");
+      roundtrip_once(t32->view(), dsl32, 2, "jit_factor_bp_int32_gcd1_mt");
+    }
+
+    {
+      // FACTOR with `divisors` routed to a non-fused op, mirroring the
+      // for.references -> identity case: the boundary channel must survive
+      // being stored by a separate leaf.
+      auto t = make_scaled_int64_table(2, 4096, 19, 250);
+      std::string dsl =
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "factor.divisors -> identity\n"
+        "---\n"
+        "input -> factor -> quotients, divisors\n"
+        "factor.quotients -> bitpack\n"
+        "factor.divisors -> identity\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_factor_div_identity_int64");
+      roundtrip_once(t->view(), dsl, 2, "jit_factor_div_identity_int64_mt");
+    }
+
+    {
+      // Delta -> FACTOR -> Bitpack (FUSED): FACTOR nested BELOW another
+      // transformer, so decode must materialise its child through the generic
+      // slab path rather than the closed-form leaf path.
+      auto t = make_scaled_int64_table(2, 4096, 23, 100);
+      std::string dsl =
+        "input -> delta -> differences\n"
+        "delta.differences -> factor -> quotients, divisors\n"
+        "delta.differences.quotients -> bitpack\n"
+        "---\n"
+        "input -> delta -> differences\n"
+        "delta.differences -> factor -> quotients, divisors\n"
+        "delta.differences.quotients -> bitpack\n";
+      roundtrip_once(t->view(), dsl, 1, "jit_delta_factor_bp_int64");
+      roundtrip_once(t->view(), dsl, 2, "jit_delta_factor_bp_int64_mt");
     }
 
     {

@@ -20,10 +20,11 @@ input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_quantity  dtype: t26  ratio: 4.885x  depth: 1
-# comp: 111.87 GB/s  decomp: 251.82 GB/s
-# GB300 (PR #1354, same plan): comp 836.89 GB/s  decomp 1692.77 GB/s
-input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: l_quantity  dtype: t26  ratio: 10.383x  depth: 2
+# comp: 696.68 GB/s  decomp: 2938.41 GB/s
+# hand-picked knee: -0.001x ratio vs the depth-4 rule pick for +13% decode
+input -> factor -> quotients, divisors
+factor.quotients -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 ---
 # column: l_extendedprice  dtype: t26  ratio: 2.655x  depth: 1
 # comp: 89.73 GB/s  decomp: 218.48 GB/s
