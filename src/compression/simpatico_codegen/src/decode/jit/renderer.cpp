@@ -58,9 +58,11 @@ using ::codegen::jit::make_entry_symbol;
 using ::codegen::jit::replace_all;
 using ::codegen::jit::unsigned_counterpart;
 
+// The encoder uses int32_t for bit positions and (count * bits + 31) / 32.
+// INT32_MAX % 64 == 63 also leaves room for the packed-word rounding term.
 static_assert(
-  codegen::kChunkSize > 0 && codegen::kChunkSize <= UINT32_MAX / 64,
-  "Chunk-local bit positions must fit in uint32_t for all supported widths (up to 64 bits)");
+  codegen::kChunkSize > 0 && codegen::kChunkSize <= INT32_MAX / 64,
+  "Chunk-local bit arithmetic must fit in int32_t for encoding and decoding (up to 64 bits)");
 
 // ---------------------------------------------------------------------
 // Dtype table — element size per supported scalar type.
