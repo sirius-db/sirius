@@ -784,9 +784,14 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
                                           /*counted_key_idx=*/0,
                                           /*counted_value_idx=*/std::nullopt,
                                           /*max_bins_bytes=*/8);
-  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor + 16 * 100);
-  CHECK(sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()}) ==
-        std::numeric_limits<std::size_t>::max());
+  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor);
+  // The sparse term is sized by the group count, so an absurd byte count no longer drags the
+  // estimate to SIZE_MAX. What must hold is that the saturating arithmetic does not wrap and
+  // that the estimate stays monotonic in the input.
+  auto const absurd =
+    sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()});
+  CHECK(absurd > std::numeric_limits<std::size_t>::max() / 4);
+  CHECK(absurd >= sparse.no_history_peak_memory_estimate({2, 100}));
 }
 
 TEST_CASE("dense_count_join rejects an unrepresentable histogram layout",
