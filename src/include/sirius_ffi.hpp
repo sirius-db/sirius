@@ -15,8 +15,11 @@
  */
 
 /*
- * Public C++ surface for embedding Sirius (FFI use cases, e.g. the Rust
- * `sirius-sys` crate). Intentionally lightweight — a small RAII wrapper that
+ * Public C++ surface for embedding Sirius: the host process
+ * (`sirius::ffi::Context` plus `Fragment`). That is the embedding process
+ * (Rust `sirius-sys`, C++ tests), not GPU host memory.
+ *
+ * Intentionally lightweight — a small RAII wrapper that
  * forward-declares the heavy internal type — so consumers bind it without
  * pulling in sirius_context.hpp (and its cudf/rmm/duckdb includes).
  *
@@ -44,11 +47,14 @@ class Fragment;
 
 /// RAII handle to a Sirius engine context.
 ///
+/// Together with [`Fragment`], this is the host process: the embedding process
+/// (Rust compute node, C++ tests). That name is not GPU host memory.
+///
 /// Constructing a `Context` brings up an initialized engine (a
 /// `duckdb::SiriusContext`) and an embedded in-process DuckDB whose connection
 /// has that engine registered as the `sirius_state` so the GPU executor can find
 /// it. DuckDB is used only to lower a Substrait plan to a DuckDB
-/// `LogicalOperator` (the translation step) and to host the catalog — execution
+/// `LogicalOperator` (the translation step) and to own the catalog. Execution
 /// runs directly on the Sirius engine, not through DuckDB's query pipeline.
 ///
 /// Held from Rust via `cxx::UniquePtr`; created by `make_context()` /
@@ -80,6 +86,7 @@ class SIRIUS_FFI_EXPORT Context {
 };
 
 /// One plan fragment of a multi-fragment query, executed on this process's [`Context`].
+/// Together they are the host process (the embedding process, not GPU host memory).
 ///
 /// A fragment is either **intermediate** (declares output streams, rooted in a streaming sink)
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
@@ -88,9 +95,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
-/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
-/// build() but before run() closes the lifecycle itself.
+/// build() opens a query lifecycle inside streaming_fragment; run() closes it. Exactly one
+/// fragment may sit between its own build() and run() at a time (the engine serializes
+/// queries). A Fragment destroyed after build() but before run() closes the lifecycle
+/// itself.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
