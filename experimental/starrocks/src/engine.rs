@@ -78,7 +78,7 @@ fn engine_thread(
     requests: Receiver<ExecuteRequest>,
     ready: Sender<Result<(), String>>,
 ) {
-    let mut context = match build_context(config) {
+    let context = match build_context(config) {
         Ok(context) => {
             // A send error means the caller is already gone; nothing to serve.
             if ready.send(Ok(())).is_err() {
@@ -204,6 +204,8 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 
@@ -272,6 +274,8 @@ mod tests {
         TranslatedPlan {
             plan,
             output_names: names,
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 
