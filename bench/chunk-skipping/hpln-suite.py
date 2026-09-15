@@ -149,6 +149,10 @@ def main():
     con.execute(f"LOAD '{EXTENSION_PATH}'")
     con.execute("SET gpu_execution = true")
     con.execute("SET enable_duckdb_fallback = false")
+    # ast_jit is NOT set here, deliberately. It is worth -4.17% on the GPU-pinned suite
+    # (bench/sf1000-repro/run.sh), and MEASURED THE OTHER WAY on a cold unpinned scan at SF1000:
+    # .hpln 52.521 -> 59.833 s (+13.9%) and parquet 56.952 -> 59.449 (+4.4%). Pass it through
+    # SIRIUS_PRE_SQL if you want it; do not make it the default for this harness.
     for stmt in filter(
         None, (x.strip() for x in os.environ.get("SIRIUS_PRE_SQL", "").split(";"))
     ):
