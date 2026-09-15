@@ -19,7 +19,7 @@ use crate::result_store::FragmentInstanceId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SenderSlot {
     /// Receiver fragment instance the output is destined for.
-    pub fragment_instance_id: FragmentInstanceId,
+    pub(crate) fragment_instance_id: FragmentInstanceId,
     /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
     pub node_id: i32,
     /// Sender ordinal within that exchange's sender set.
