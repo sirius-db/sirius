@@ -221,22 +221,26 @@ fn check_single_visible_device(exported: Option<&str>) -> Result<(), String> {
 /// Bytes of the log-only first-contact bandwidth canary. Tunable via
 /// `SIRIUS_CN_NIXL_CANARY_BYTES`. The GROUP BY shuffle path never gates on the measured GiB/s
 /// (MIG 0→1 host-bounces on this box).
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 fn canary_bytes() -> u64 {
     parse_u64_env("SIRIUS_CN_NIXL_CANARY_BYTES").unwrap_or(16 << 20)
 }
 
 /// A small first WRITE settles UCX connection wireup so a later timed WRITE measures the
 /// steady link, not the handshake. Not tunable: it is a wireup settle, not a measurement.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 const WARMUP_BYTES: u64 = 1 << 20;
 
 /// Bound on waiting for one posted WRITE to reach DONE. Tunable via
 /// `SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS`.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 fn xfer_timeout() -> Duration {
     parse_u64_env("SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS")
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(30))
 }
 
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 fn parse_u64_env(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()

@@ -66,6 +66,7 @@ impl SenderSource {
     /// Receiver-side arena offsets that still hold a lease (`len != 0`). The caller of
     /// [`LocalExchange::retire_receiver`] releases these so a cancelled query cannot pin the
     /// arena.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn outstanding_lease_offsets(&self) -> Vec<u64> {
         match self {
             Self::LocalParked { .. } => Vec::new(),
@@ -99,6 +100,7 @@ struct PendingReceiver {
 }
 
 /// How many cancelled receivers are remembered; the oldest is forgotten first.
+#[cfg_attr(not(test), allow(dead_code))]
 const RETIRED_CAPACITY: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -109,6 +111,7 @@ struct ExchangeState {
     /// idempotently; a gap (above) is a lost frame and fails the sender.
     remote_seq: HashMap<(ExchangeKey, i32), i64>,
     retired: HashSet<FragmentInstanceId>,
+    #[cfg_attr(not(test), allow(dead_code))]
     retired_order: VecDeque<FragmentInstanceId>,
 }
 
@@ -260,6 +263,7 @@ impl LocalExchange {
 
     /// Forgets a receiver the FE cancelled. Returns recorded sources so the caller can drop
     /// parked GPU output and release remote staging leases. Idempotent.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn retire_receiver(
         &self,
         fragment_instance_id: FragmentInstanceId,
