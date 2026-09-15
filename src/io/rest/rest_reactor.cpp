@@ -609,6 +609,7 @@ void rest_reactor::shutdown() noexcept
 void rest_reactor::enqueue(std::unique_ptr<grouped_io_request> req) noexcept
 {
   if (req == nullptr) return;
+  note_group(req->slice_count());
   auto const bytes = req->remaining_bytes();
   auto const error = std::make_error_code(std::errc::operation_canceled);
 
@@ -956,6 +957,8 @@ struct io_slot {
   curl_slist_ptr headers;
   buf_sink sink;
   header_capture hc;
+  /// When this slot's GET was armed, for the per-request duration counter.
+  std::chrono::steady_clock::time_point started{};
 
   void reset() noexcept
   {
@@ -964,7 +967,8 @@ struct io_slot {
     headers.reset();
     sink = buf_sink{};
     hc.reset();
-    token = {};
+    token   = {};
+    started = {};
   }
 };
 
@@ -1260,8 +1264,77 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       request.op->staging_owner = std::shared_ptr<allocation_type>(std::move(allocation));
     };
 
+    // Build one physical read covering `run` leading contiguous slices of @p group.
+    // Returns false if the run is not fusable, leaving the caller's per-slice path
+    // to handle it unchanged.
+    auto make_fused_operation =
+      [&](grouped_io_request& group, std::size_t run, std::size_t /*free_connections*/) -> bool {
+      auto const head = group.front().rng;
+      std::size_t lo = head.offset, hi = head.offset + head.size;
+      for (std::size_t i = 0; i < run; ++i) {
+        auto const& sl = group.slice_at(i);
+        // Only staged device reads are fused: their host side is reactor-owned, so
+        // one staging allocation can back every constituent. A caller-owned host
+        // destination would have to be scattered into, which this does not do.
+        if (!sl.is_staged() || !sl.has_device_request()) return false;
+        lo = std::min(lo, sl.rng.offset);
+        hi = std::max(hi, sl.rng.offset + sl.rng.size);
+      }
+      auto const* file = dynamic_cast<io_object_type const*>(group.obj.get());
+      if (file == nullptr) return false;
+      if (hi > file->size()) hi = file->size();
+      if (hi <= lo) return false;
+
+      auto op         = std::make_unique<io_op_request>();
+      op->obj         = group.obj;
+      op->io_rng      = range{lo, hi - lo};
+      op->coordinator = group.coordinator;
+
+      std::size_t logical = 0;
+      for (std::size_t i = 0; i < run; ++i) {
+        auto slice = group.take_front();
+        logical += slice.size();
+        auto copy = std::make_unique<device_cpy_request>(
+          device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
+        if (i == 0) {
+          op->device_copy = std::move(copy);
+          op->on_complete = std::move(slice.on_complete);
+        } else {
+          op->fused_extra.push_back(
+            fused_constituent{std::move(copy), std::move(slice.on_complete), {}});
+        }
+      }
+
+      auto request           = std::make_unique<rest_io_op_request>();
+      request->object        = file->get_object_ref();
+      request->needs_staging = true;
+      request->logical_bytes = logical;
+      request->op            = std::move(op);
+      _queued_bytes.fetch_sub(logical, std::memory_order_relaxed);
+      ready.push_back(std::move(request));
+      return true;
+    };
+
     auto expand_active = [&](std::size_t free_connections) {
       if (active_group == nullptr || active_group->empty()) return;
+      // Fuse a contiguous run into one GET.
+      //
+      // Adjacent logical slices otherwise become adjacent HTTP requests, which is
+      // the dominant cost on an object store: a gets wall time is essentially its
+      // round trip until it is several MB, so N small reads of a contiguous region
+      // cost ~N times one large read of the whole thing. device_cpy_request already
+      // copies only its own window out of a wider physical read, so the constituents
+      // need nothing but their own destinations.
+      //
+      // Bounded by the segment maximum so the fused range is still one physical
+      // read; a longer run simply fuses its prefix and the rest follows next pass.
+      if (auto const run = active_group->leading_run(rest_max_segment_bytes); run > 1) {
+        if (make_fused_operation(*active_group, run, free_connections)) {
+          if (active_group->empty()) { active_group.reset(); }
+          return;
+        }
+      }
+
       auto slice            = active_group->take_front();
       auto const slice_size = slice.size();
       try {
@@ -1410,6 +1483,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_WRITEDATA, &slot.sink));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, &capture_header));
       SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_HEADERDATA, &slot.hc));
+      slot.started = std::chrono::steady_clock::now();
     };
 
     int running  = 0;
@@ -1453,10 +1527,21 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           slot.reset();
         }
       }
+      // One sample per submit pass: the depth the reactor managed to reach with
+      // whatever the callers had queued. A ceiling that is never approached means
+      // the reactor is starved, not saturated.
+      note_inflight(static_cast<std::uint64_t>(inflight));
     };
 
     auto finish = [&](std::size_t index, CURLcode curl_status, long http_status) {
-      auto& slot        = slots[index];
+      auto& slot = slots[index];
+      if (slot.started != std::chrono::steady_clock::time_point{}) {
+        note_request(
+          static_cast<std::uint64_t>(slot.sink.total_received),
+          static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - slot.started)
+                                       .count()));
+      }
       auto& request     = *slot.req;
       auto& op          = *request.op;
       auto const io_rng = op.io_rng;
