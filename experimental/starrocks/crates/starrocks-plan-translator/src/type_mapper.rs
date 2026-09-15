@@ -222,6 +222,39 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
     Ok(Type { kind: Some(kind) })
 }
 
+/// Renders a Substrait type as the DuckDB type name the engine parses when a fragment declares
+/// an input stream's schema.
+pub fn duckdb_type_name(ty: &Type) -> Result<String> {
+    let kind = ty
+        .kind
+        .as_ref()
+        .ok_or_else(|| TranslateError::malformed("stream input column has no type"))?;
+    let name = match kind {
+        r#type::Kind::Bool(_) => "BOOLEAN".to_string(),
+        r#type::Kind::I8(_) => "TINYINT".to_string(),
+        r#type::Kind::I16(_) => "SMALLINT".to_string(),
+        r#type::Kind::I32(_) => "INTEGER".to_string(),
+        r#type::Kind::I64(_) => "BIGINT".to_string(),
+        r#type::Kind::Fp32(_) => "FLOAT".to_string(),
+        r#type::Kind::Fp64(_) => "DOUBLE".to_string(),
+        r#type::Kind::FixedChar(_) | r#type::Kind::Varchar(_) | r#type::Kind::String(_) => {
+            "VARCHAR".to_string()
+        }
+        r#type::Kind::Binary(_) | r#type::Kind::FixedBinary(_) => "BLOB".to_string(),
+        r#type::Kind::Date(_) => "DATE".to_string(),
+        r#type::Kind::PrecisionTimestamp(_) => "TIMESTAMP".to_string(),
+        r#type::Kind::Decimal(decimal) => {
+            format!("DECIMAL({},{})", decimal.precision, decimal.scale)
+        }
+        _ => {
+            return Err(TranslateError::malformed(
+                "stream input column type has no DuckDB name",
+            ));
+        }
+    };
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
