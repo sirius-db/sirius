@@ -417,26 +417,23 @@ impl SiriusComputeNodeService {
         let broker = request.scan_range.broker_scan_range.ok_or_else(|| {
             "TGetFileSchemaRequest scan_range carries no broker_scan_range".to_string()
         })?;
-        // Cross-file sampling and type promotion (what the native scanner does for multi-file
-        // FILES()) is a follow-up; reject multiple ranges rather than resolve a partial schema.
-        let ranges = broker.ranges;
-        if ranges.len() > 1 {
-            return Err(format!(
-                "multi-file FILES() schema inference is not supported yet ({} files); use a single file path",
-                ranges.len()
-            ));
+        if broker.ranges.is_empty() {
+            return Err("broker_scan_range carries no file ranges".to_string());
         }
-        let range = ranges
+        let paths = broker
+            .ranges
             .into_iter()
-            .next()
-            .ok_or_else(|| "broker_scan_range carries no file ranges".to_string())?;
-        if range.format_type != TFileFormatType::FORMAT_PARQUET {
-            return Err(format!(
-                "unsupported file format {:?}; only parquet schema inference is implemented",
-                range.format_type
-            ));
-        }
-        crate::file_schema::parquet_file_schema(&range.path).await
+            .map(|range| {
+                if range.format_type != TFileFormatType::FORMAT_PARQUET {
+                    return Err(format!(
+                        "unsupported file format {:?} for '{}'; only parquet schema inference is implemented",
+                        range.format_type, range.path
+                    ));
+                }
+                Ok(range.path)
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        crate::file_schema::parquet_files_schema(&paths).await
     }
 
     /// Deserializes a thrift struct using the StarRocks binary attachment protocol.
