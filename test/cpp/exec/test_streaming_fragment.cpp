@@ -99,7 +99,8 @@ struct fragment_fixture {
 //! The execution window a FRAG-CONTROL engine must sit inside. RAII matters here: a `REQUIRE`
 //! that fails inside a hand-bracketed window would leave the slot held and self-deadlock in the
 //! test's `Rollback`, so the scope's destructor backstop is what lets a failing assertion fail.
-//! Assembler tests must not open one of these — streaming_fragment::build() owns the window.
+//! streaming_fragment tests must not open one of these. streaming_fragment::build() owns the
+//! window.
 using query_window = duckdb::SiriusContext::StandaloneQueryScope;
 
 //! Every INTEGER value sitting in an output stream, draining it. Row counts alone would not
@@ -417,7 +418,7 @@ TEST_CASE_METHOD(fragment_fixture,
 }
 
 // ============================================================================
-// FRAG-6: empty outputs are a RESULT_COLLECTOR terminal on the same Assembler.
+// FRAG-6: empty outputs are a RESULT_COLLECTOR terminal on the same streaming_fragment.
 // ============================================================================
 
 TEST_CASE_METHOD(fragment_fixture,

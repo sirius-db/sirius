@@ -365,8 +365,8 @@ additive — nothing in this design forecloses it.
 ## Fragments: `exec::streaming_fragment` and the FFI
 
 The layer above these primitives — building a plan around them, bridging DuckDB bind time to
-physical-plan time via `stream_bind_catalog`, and the cross-language `sirius::ffi::Fragment`
-lifecycle — has its own document: [Streaming Fragments](streaming-fragments.md).
+physical-plan time via `stream_bind_catalog`, and the host process (`sirius::ffi::Context` plus
+`Fragment`; not GPU host memory) — has its own document: [Streaming Fragments](streaming-fragments.md).
 
 ## Tests
 
