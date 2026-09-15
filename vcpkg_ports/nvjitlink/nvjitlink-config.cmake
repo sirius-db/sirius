@@ -1,4 +1,5 @@
 include(CMakeFindDependencyMacro)
+find_dependency(CUDAToolkit)
 find_dependency(Threads)
 
 if(NOT TARGET nvjitlink::nvjitlink_static)
@@ -9,5 +10,6 @@ if(NOT TARGET nvjitlink::nvjitlink_static)
                "${CMAKE_CURRENT_LIST_DIR}/../../lib/libnvJitLink_static.a"
                INTERFACE_INCLUDE_DIRECTORIES
                "${CMAKE_CURRENT_LIST_DIR}/../../include"
-               INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS};Threads::Threads")
+               INTERFACE_LINK_LIBRARIES
+               "CUDA::nvptxcompiler_static;${CMAKE_DL_LIBS};Threads::Threads")
 endif()
