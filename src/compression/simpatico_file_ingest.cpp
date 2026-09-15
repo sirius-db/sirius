@@ -339,19 +339,18 @@ std::shared_ptr<pinned_compressed_blob> allocate_chunk(std::vector<std::uint8_t>
 /// The pinned allocation is a list of fixed-size blocks, so a byte range that is contiguous in the
 /// FILE is not contiguous in memory; the reader takes a scatter list per extent, which is exactly
 /// this.
-void append_block_segments(cucascade::memory::fixed_size_host_memory_resource::
-                             multiple_blocks_allocation& blocks,
-                           std::uint64_t offset,
-                           std::uint64_t size,
-                           hpln_extent& out)
+void append_block_segments(
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& blocks,
+  std::uint64_t offset,
+  std::uint64_t size,
+  hpln_extent& out)
 {
   auto const block = blocks.block_size();
   while (size > 0) {
     auto const idx    = static_cast<std::size_t>(offset / block);
     auto const within = offset % block;
     auto const n      = std::min<std::uint64_t>(block - within, size);
-    out.dst.push_back(
-      {reinterpret_cast<std::uint8_t*>(blocks.at(idx).data()) + within, n});
+    out.dst.push_back({reinterpret_cast<std::uint8_t*>(blocks.at(idx).data()) + within, n});
     offset += n;
     size -= n;
   }
@@ -457,9 +456,8 @@ bool allocate_chunk_narrowed(std::vector<std::uint8_t> const& header,
     [&](std::uint64_t off, std::uint64_t size, void* dst) {
       if (size == 0) { return true; }
       std::vector<simpatico::gather_range> want{{off, size, 0}};
-      auto const ranges = gather_columns.empty()
-                            ? want
-                            : simpatico::compose_gathers(gather_columns, want);
+      auto const ranges =
+        gather_columns.empty() ? want : simpatico::compose_gathers(gather_columns, want);
       if (ranges.empty()) { return false; }
       for (auto const& r : ranges) {
         auto const bytes = src.read_range(chunk.payload_offset + r.src_offset, r.size, "sizing");
@@ -604,8 +602,9 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
       bool narrowed = false;
       // Row narrowing is positional with chunk_ids, not with the file's chunks: it says what the
       // CALLER wants of this split's i-th chunk.
-      auto const rows = at < decode_chunks.size() ? std::span<const std::uint32_t>{decode_chunks[at]}
-                                                  : std::span<const std::uint32_t>{};
+      auto const rows = at < decode_chunks.size()
+                          ? std::span<const std::uint32_t>{decode_chunks[at]}
+                          : std::span<const std::uint32_t>{};
       if (!rows.empty()) {
         narrowed = allocate_chunk_narrowed(headers[id],
                                            layout.chunks[id],
@@ -623,7 +622,7 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
                  : allocate_chunk_columns(
                      headers[id], layout.chunks[id], columns, host_space, extents, path);
       }
-      it = staged.emplace(id, std::move(blob)).first;
+      it               = staged.emplace(id, std::move(blob)).first;
       narrowed_ids[id] = narrowed;
     }
     // A narrowed blob holds only the surviving decode chunks' rows, so the row count has to
@@ -646,7 +645,8 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
   src->read_extents(std::move(extents), options.policy, "chunk payload");
   // A narrowed read cannot be checksum-verified: the recorded CRC covers a chunk's WHOLE payload,
   // and this read deliberately did not fetch all of it.
-  auto const any_narrowed = std::ranges::any_of(narrowed_ids, [](auto const& kv) { return kv.second; });
+  auto const any_narrowed =
+    std::ranges::any_of(narrowed_ids, [](auto const& kv) { return kv.second; });
   if (options.verify_payload && columns.empty() && !any_narrowed && !layout.checksums.empty()) {
     // After the read, before the blob is handed to anyone: a caller that got a chunk back has
     // already been told it is intact.
@@ -659,6 +659,22 @@ std::vector<ingested_hpln_chunk> read_hpln_chunks_into_pinned(
                  crc_of_staged_payload(*blob));
     }
   }
+  // What one split's staging actually cost the storage, split from what it asked for. A .hpln
+  // read is planned (coalesced, split, bridged) and re-locates the file every call, so "bytes the
+  // payload needed" and "bytes the device served" are different numbers and only the second is
+  // paid for.
+  auto const st = src->stats();
+  SIRIUS_LOG_DEBUG(
+    "[hpln ingest] '{}' via {}: {} chunks of {}, {} requests, {} extents, {} B read for "
+    "{} B wanted",
+    path,
+    st.transport,
+    chunk_ids.size(),
+    layout.chunks.size(),
+    st.requests,
+    st.extents,
+    st.bytes_read,
+    st.bytes_wanted);
   report(*src, options);
   return out;
 }

@@ -1014,6 +1014,64 @@ Still open: **choosing the key automatically.** Today it is an explicit argument
 (`SIRIUS_PIN_CLUSTER_<TABLE>` in the benchmark harness), which is honest but leaves the win to
 whoever knows the workload.
 
+### 5.6 The pruning win is a property of the PIN'S WIDTH, not of the scale (2026-09-14)
+
+`.hpln` measured no better than parquet at SF1000 while winning 19% at SF100. Two causes, both
+measured, and neither is the format.
+
+**Cause 1 — the SF1000 `.hpln` is in natural order, so its zone maps prune nothing.**
+`/datasets/tpch_sf1000_hpln_unsorted_4gb` was generated with `sort: none`. Host-pinned, the
+`cached scan` report says every chunk survives every query — `194/194`, `44/44`, `7/7` — and the
+whole 22-query suite drops **212,992 rows sub-chunk out of 6 billion** (three queries, 106,496 +
+65,536 + 40,960). The zone maps are present and correct; a natural-order lineitem simply has every
+`l_shipdate` in every 8192-row group. At SF100 the arm that wins is the globally SORTED file
+(sorted 1.222 s vs unsorted 1.354 s vs parquet 1.515 s), and a `.hpln` pin cannot cluster at pin
+time by construction — the sort has to happen in the writer, and this generation did not do it.
+
+**Caveat, stated rather than buried:** a globally sorted SF1000 `.hpln` WAS host-pinned once, before
+it was deleted for disk, and measured **10.500 s against parquet/natural 10.429 s** — no win. That
+run predates the whole-chunk prune report (`de3e55f1`), so nobody knows whether it pruned, and it
+used 4 GB batches through the union pin below. It is the one measurement that cause 1 does not
+explain, and it cannot be rechecked without regenerating 442 GB.
+
+**Cause 2 — chunk-subset fetch INVERTS sign when the pin holds columns the query does not read.**
+SF1000, host tier, 2 GB batches, `cluster_by=['l_shipdate']`, q6, `SIRIUS_EXP_CHUNK_SUBSET_FETCH`
+on vs off:
+
+| pin | fetch ON | fetch OFF | |
+|---|---|---|---|
+| narrow — only q6's 4 columns pinned (`performance_test.py --mode grouped`) | **0.111 s** | 0.200 s | **−45%** |
+| wide — the 22-query column union pinned (`hpln-pin-bench.py`) | 0.337 / 0.320 s | 0.273 / 0.268 s | **+19%** |
+
+Both A/B pairs repeated; the wide one twice. In both pins the zone maps prune the same thing —
+5,088,501,760 of 6,000,000,000 rows, and the subset path engages on all 297 chunks. The narrowing
+work is done against the chunk's FULL header (`compression_converters.cpp:154-201` synthesizes the
+subset over every column and only then checks that the READ columns compacted), so its cost scales
+with the pin's width while its benefit scales with the query's. When the pin is 16 columns and the
+query reads 4, the synthesis outweighs the saved transfer.
+
+**This is why §5.4 does not reproduce in `hpln-pin-bench.py`.** Same scale, same data, same config,
+same batch size: `performance_test.py --mode grouped` (per-query pins) measures 9.5407 → 8.6855 s,
+**−8.96%** — §5.4's −8.57%, reproduced, with every per-query mover intact (q6 −48%, q15 −45%,
+q14 −41%, q20 −37%, and q12 regressing +6.7% exactly as documented). The same clustering measured
+through the union pin is **+2.89%** (10.436 → 10.738 s). At SF100 the union pin says +3.84% too.
+
+So every `.hpln` arm ever measured was taken in the one pin shape where sub-chunk pruning cannot
+pay. Whole-chunk pruning still pays there — which is exactly why the SORTED SF100 `.hpln` wins 19%
+in the same harness while `cluster_by` parquet wins nothing.
+
+**What follows from this:**
+
+- Narrow the subset synthesis to the selected columns before building it (the `.hpln` file path
+  already does this: `allocate_chunk_narrowed` runs `build_column_subset_header` FIRST, then
+  `build_chunk_subset_header` on the narrowed header, and composes the two gathers). Until then,
+  a shared wide pin is a configuration where the feature costs rather than pays.
+- A sorted SF1000 `.hpln` has never been measured host-pinned; the sorted one was deleted for disk
+  and the replacement was written unsorted. Nothing at SF1000 has tested the mechanism that
+  actually wins at SF100.
+- Any future A/B must state the pin width. A suite number from a union pin and one from a
+  per-query pin are not comparable, and the difference is larger than every effect in this document.
+
 ## 6. Skipping the *fetch*, not just the decode
 
 Chunk skipping saves different things at different tiers. On a GPU-tier pin the payload is already
@@ -1340,6 +1398,137 @@ Mostly, with one correction and one thing now done.
 The one genuinely new requirement is step 2: an operator-level notion of "metadata channel vs bulk
 channel". Nothing in the plan anticipated it, and it is what makes compaction expressible without
 special-casing bitpack everywhere.
+
+### 6.7 Why the pin and the cold scan are not faster: buffered reads and bigger bytes (2026-09-14)
+
+Measured per table, SF1000 lineitem, the 14 columns the 22 queries read, page cache dropped.
+
+**The pin.** A `.hpln` pin is an I/O copy and a parquet pin decodes and re-compresses, so the copy
+should win by the decode. It wins by 13%:
+
+| | time | bytes | rate |
+|---|---|---|---|
+| `.hpln` pin (I/O copy) | **12.60 s** | 143.85 GB | 11.42 GB/s |
+| parquet pin (decode + re-compress) | 14.51 s | 105.46 GB | 7.27 GB/s |
+
+The copy does buy **1.57x on the rate** — that is the re-compression, and it is real. It is then
+spent on **1.36x more bytes**, because `.hpln` is bigger than parquet for exactly these columns.
+Net 13%, not the 4.4x the format's headline claimed.
+
+Neither half is a reading bug: the instrumented ingest reports **143.62 GB read for 143.62 GB
+wanted** over 584 extents and 8888 requests — no bridged waste, no over-read. The bytes are simply
+there. Per column, against parquet's snappy + dictionary + RLE, three columns carry all of it:
+
+| column | parquet | `.hpln` | |
+|---|---|---|---|
+| `l_shipmode` (`input -> str_split`) | 2.27 GB | ~14.1 GB | **6.2x** |
+| `l_quantity` | 4.52 GB | ~9.8 GB | 2.2x |
+| `l_orderkey` | 1.87 GB | ~3.9 GB | 2.1x |
+| everything else | — | — | 0.26–1.02x |
+
+`l_shipmode` is a seven-value string column; parquet dictionary-encodes it and the committed
+simpatico plan splits it. It is the same column that blocks the fetch skip (§0), so it is now two
+problems with one cause.
+
+**The cold scan — and the recorded explanation was wrong.** `SELECT sum(l_extendedprice),
+sum(l_quantity)`, cold then warm:
+
+| | cold | warm |
+|---|---|---|
+| `.hpln` | 1.913 s / 28.06 GB | 0.607 s / **0.00 GB** |
+| parquet | 1.320 s / 22.89 GB | 1.251 s / **22.87 GB** |
+
+Parquet's warm run still pulls every byte off the device: **it reads O_DIRECT, so it has no warm
+case at all.** That is the whole of the "+45.2 s cold−warm for `.hpln` against +3.3 s for parquet"
+that the prefetch work was built on — the two numbers measure different things and were never
+comparable. What is true is narrower and still worth fixing: `.hpln` time is exactly additive
+(1.913 ≈ 0.607 + 1.306), because a split stages its whole chunk into pinned host memory before
+anything decodes and then copies it H2D, where parquet goes disk → device in one hop.
+
+**Why buffered:** `uring_reactor::prep_host_rxv_request` picks the O_DIRECT fd only when a
+segment's offset, length and every iovec base are 4 KiB-aligned, and falls back to the buffered fd
+otherwise. A `.hpln` payload offset is wherever the writer put it, so every read takes the
+buffered path — a page-cache copy per byte, and 143 GB of cache churn on a pin.
+
+**The rate is not a queue-depth or reactor problem**; both were swept and are flat:
+
+| | 1 GB | 2 GB | 4 GB | 8 GB |
+|---|---|---|---|---|
+| pin, `max_bytes_in_flight` | 11.28 | 11.36 | 11.26 | 11.17 GB/s |
+
+| | 4 | 8 | 16 |
+|---|---|---|---|
+| pin, `uring_n_reactors` | 11.40 | 10.99 | 10.99 GB/s |
+
+Raw device, buffered `preadv`, same file: 5.16 GB/s at one thread, 12.96 at four, **21.71 at
+sixteen**. So the ceiling is there and the `.hpln` path reaches about half of it.
+
+**What follows, in order of size:**
+
+1. **Pad the writer's payload offsets to 4 KiB** so reads qualify for O_DIRECT. It costs a few
+   bytes per column per chunk and is the only thing standing between this path and the fd parquet
+   already uses.
+2. **Fix `l_shipmode`** (and re-examine `l_quantity`/`l_orderkey`): the plans are Pareto-picked for
+   decode throughput with no size term, and on a cold or networked read the bytes are the cost.
+3. **Overlap staging with decode** per chunk, so a cold scan stops being read-then-decode.
+
+### 6.8 Fixed (2026-09-15): the scan never used the io_context at all
+
+§6.7 blamed buffered reads, and that was the symptom. The cause was one line.
+
+**`simpatico_batch_coalescer::push` rebuilt the merged split and copied `path` but not `io_ctx`.**
+Every coalesced split — which is every split — therefore reached `read_hpln_chunks_into_pinned`
+with a null transport, and `open_hpln_source` silently fell back to its `std::ifstream` path: no
+io_uring, no O_DIRECT, no reads in flight, no coalescing. It does not fail, it just gets slower,
+and the bytes are identical, which is why a day of sweeping `uring_n_reactors` and
+`max_bytes_in_flight` found both of them flat — **none of that machinery was in the path.**
+
+The three changes, in the order they matter:
+
+1. **Carry the transport through the coalescer.** One line. On the UNCHANGED SF1000 dataset, cold
+   `sum(l_extendedprice), sum(l_quantity)`: **1.913 s → 1.546 s**, 14.67 → **18.11 GB/s** — now
+   ahead of parquet's 17.09 GB/s on the same query, with the remaining gap purely the extra bytes.
+2. **4 KiB payload alignment, writer-side and opt-in** (`kPayloadAlign`). Each buffer starts on a
+   block boundary and a chunk's payload rounds up to one, so a read satisfies
+   `io_object_segment::is_odirect_compatible` and takes the unbuffered fd. Declared sizes are
+   unchanged — the slack is written (the staging vector is zero-filled, so checksums stay
+   deterministic) and never read, which keeps old files readable and new files readable by old
+   readers. `build_column_subset_header` gathers the padded extent so a projection stays aligned on
+   both sides, and it *detects* the layout rather than assuming it: against a tight file it pads
+   nothing, so the 442 GB dataset still reads exactly as before.
+   **Alignment is a FILE concern only.** A pin's payload is never read through a block device, and
+   padding it inflated the `header + payload` size that `pin_table` compares against the
+   uncompressed form — small chunks stopped compressing at all. Hence the opt-in parameter, taken
+   only by `hpln_stream_writer::append`.
+3. **`l_shipmode`: `str_split` → `dictionary -> bitpack`**, 1.700x → **21.589x**. SF100 lineitem
+   **21.37 GB → 18.05 GB (−15.5%)**. It sits below the plans' 250 GB/s decode floor on purpose: a
+   file pays for bytes on every cold read, and that floor has no size term. It also makes the
+   column chunk-addressable, so q12 stops forcing a whole-chunk serve (§0's last format gap).
+
+**Cold suite, SF100, against parquet's BEST arm (natural order), 22/22 correct:**
+
+| | time | bytes |
+|---|---|---|
+| parquet | 6.768 s | 90.3 GB |
+| `.hpln`, old dataset + new binary | 6.082 s | 78.0 GB |
+| `.hpln`, aligned + new plan | **4.545 s (−32.8%)** | 88.8 GB |
+
+The aligned file *counts* more bytes because O_DIRECT bypasses the page cache — every byte reaches
+the device, where buffered reads hid some behind it. It is still 25% faster than the same data
+read tight.
+
+**What this retires:** the "`.hpln` overlaps none of its I/O" reasoning (§6.7) and the prefetch
+work built on it were both chasing a transport that was never attached. `cold − warm` is still not
+an overlap metric — parquet has no warm case — and the honest remaining headroom is small: 28.0 GB
+at the measured 18.11 GB/s is 1.546 s, which IS the cold time, against a 21.7 GB/s device ceiling.
+So a staging/decode pipeline is worth at most ~16%, not the ~50% the old number implied. Left
+undone deliberately.
+
+**Still open:** `l_quantity` (2.2x parquet) has no better plan in the codec set — explored, nothing
+found. `ps_comment` and `o_comment` are stored raw and dominate the dataset's size on disk; the
+plans that beat them all route through deflate, which is out of bounds here, so the size gap on
+high-cardinality text is structural until a non-LZ option exists. `l_orderkey` has a `delta -> ans`
+plan at 20.711x against the committed 12.393x, not taken: it costs decode 2072 → 639 GB/s.
 
 ## 6.6 Skipping decode inside a GPU-resident compressed chunk
 

@@ -60,7 +60,8 @@ struct hpln_io_policy {
   /// 0.96 GB/s at equal volume), and 16 MB is where it flattens.
   std::uint64_t target_request_bytes = 16ull << 20;
   /// Bytes allowed outstanding across concurrent requests. 64 x 16 MB is what kept the measured
-  /// pipe full; less starves it regardless of how well the ranges were merged.
+  /// pipe full; less starves it regardless of how well the ranges were merged. A batch is awaited
+  /// before the next is built, so this also bounds what one reading thread keeps queued.
   std::uint64_t max_bytes_in_flight = 1ull << 30;
 
   /// A policy that coalesces nothing and splits nothing -- one request per extent, as the

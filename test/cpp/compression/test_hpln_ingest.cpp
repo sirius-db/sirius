@@ -146,8 +146,11 @@ TEST_CASE("hpln ingest - a written file stages into pinned memory and decodes to
       REQUIRE(c.num_rows == kRows);
       REQUIRE(c.compressed_bytes > 0);
     }
-    // Ingest stages, it does not re-encode: the pinned payload is the file's payload.
-    REQUIRE(ingested.blob->payload_bytes == ingested.schema.payload_bytes);
+    // Ingest stages, it does not re-encode: the pinned payload is the file's payload region --
+    // which a writer rounds up to kPayloadAlign so its reads can go O_DIRECT. Asserting the
+    // rounded size rather than `>=` still fails on a re-encode, which is what this guards.
+    REQUIRE(ingested.blob->payload_bytes ==
+            simpatico::align_payload(ingested.schema.payload_bytes));
     REQUIRE(ingested.blob->header.size() == ingested.schema.header_bytes);
     // The file is header + payload + postscript + trailer, so it is strictly larger than the
     // data it carries; what must hold is that the data region fits inside it.

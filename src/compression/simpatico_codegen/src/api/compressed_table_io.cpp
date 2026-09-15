@@ -354,7 +354,8 @@ static constexpr std::uint8_t kVersion = 12;
 static void push_validity(std::vector<std::uint8_t>& hdr,
                           validity_sidecar const& v,
                           std::vector<payload_buffer_ref>& out_buffers,
-                          std::uint64_t& payload_offset)
+                          std::uint64_t& payload_offset,
+                          std::uint64_t payload_align)
 {
   push_le(hdr, static_cast<std::uint8_t>(v.kind));
   if (v.kind == validity_kind::all_valid) return;
@@ -364,6 +365,7 @@ static void push_validity(std::vector<std::uint8_t>& hdr,
 
   auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
   push_le(hdr, size_bytes);
+  payload_offset = align_up_to(payload_offset, payload_align);
   push_le(hdr, payload_offset);
   out_buffers.push_back(payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes});
   payload_offset += size_bytes;
@@ -906,7 +908,8 @@ std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_
   std::vector<std::uint8_t> header;
   std::vector<payload_buffer_ref> buffers;
   std::uint64_t payload_bytes = 0;
-  if (auto err = build_compressed_table_header(table, header, buffers, payload_bytes, stream);
+  if (auto err =
+        build_compressed_table_header(table, header, buffers, payload_bytes, stream, kPayloadAlign);
       !err.empty()) {
     return err;
   }
@@ -924,6 +927,15 @@ std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_
     }
   }
   stream.synchronize();  // D→H copies must complete before the file write
+
+  // A chunk starts on a kPayloadAlign boundary, so its buffers' aligned offsets are aligned in
+  // the FILE too -- which is what the O_DIRECT test actually looks at. The gap is written rather
+  // than seeked over, so the file has no holes and every offset still means what it says.
+  if (auto const pad = align_payload(st.at) - st.at; pad > 0) {
+    static const std::vector<char> zeros(kPayloadAlign, 0);
+    st.f.write(zeros.data(), static_cast<std::streamsize>(pad));
+    st.at += pad;
+  }
 
   auto const index = static_cast<std::uint32_t>(st.dir.size());
   hpln_chunk_ref ref{};
@@ -1235,7 +1247,8 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::vector<std::uint8_t>& out_header,
                                           std::vector<payload_buffer_ref>& out_buffers,
                                           std::uint64_t& out_payload_bytes,
-                                          rmm::cuda_stream_view stream)
+                                          rmm::cuda_stream_view stream,
+                                          std::uint64_t payload_align)
 {
   nvtx3::scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
@@ -1274,7 +1287,7 @@ std::string build_compressed_table_header(compressed_table const& table,
 
     // Validity rides beside the tree, not inside it: it is not a leaf and has no
     // node, so it is written here rather than through describe().
-    push_validity(hdr, tree.validity, out_buffers, payload_offset);
+    push_validity(hdr, tree.validity, out_buffers, payload_offset, payload_align);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);
@@ -1301,6 +1314,10 @@ std::string build_compressed_table_header(compressed_table const& table,
         push_str16(hdr, bd.name);
         push_le(hdr, bd.type_tag);
         push_le(hdr, bd.size_bytes);
+        // Aligned start, exact size: see kPayloadAlign. The slack before the next buffer is
+        // written (the staging vector is zero-filled, so it checksums deterministically) and
+        // never read.
+        payload_offset = align_up_to(payload_offset, payload_align);
         push_le(hdr, payload_offset);
 
         // Record the buffer for the caller to stage out of device memory; no
@@ -1315,7 +1332,7 @@ std::string build_compressed_table_header(compressed_table const& table,
     }
   }
 
-  out_payload_bytes = payload_offset;
+  out_payload_bytes = align_up_to(payload_offset, payload_align);
   return {};
 }
 
@@ -1481,7 +1498,7 @@ std::vector<gather_range> compose_gathers(std::span<const gather_range> outer,
     std::uint64_t src       = in.src_offset;
     std::uint64_t dst       = in.dst_offset;
     while (remaining > 0) {
-      auto const i = find(src);
+      auto const i  = find(src);
       auto const& o = outer[i];
       if (src < o.dst_offset || src >= o.dst_offset + o.size) {
         return {};  // a byte no outer range produced: refuse rather than read something else
@@ -1513,9 +1530,7 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
   out_gather.clear();
   if (out_payload_bytes) *out_payload_bytes = 0;
 
-  if (selected_columns.empty()) {
-    return "build_column_subset_header: no columns selected";
-  }
+  if (selected_columns.empty()) { return "build_column_subset_header: no columns selected"; }
   for (std::size_t i = 1; i < selected_columns.size(); ++i) {
     if (selected_columns[i] <= selected_columns[i - 1]) {
       return "build_column_subset_header: selected_columns must be strictly ascending";
@@ -1539,9 +1554,9 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
   // header is assembled by copying each kept column's record and patching the payload offsets
   // inside it; nothing is re-serialized, which is what keeps this from drifting away from
   // build_compressed_table_header.
-  auto const prefix_bytes = offsets.columns.empty() ? std::size_t{0}
-                                                    : static_cast<std::size_t>(
-                                                        offsets.columns.front().begin_at);
+  auto const prefix_bytes = offsets.columns.empty()
+                              ? std::size_t{0}
+                              : static_cast<std::size_t>(offsets.columns.front().begin_at);
   if (prefix_bytes == 0 || prefix_bytes > header.size()) {
     return "build_column_subset_header: header has no column records";
   }
@@ -1574,6 +1589,31 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
     out_gather.push_back(gather_range{src, size, dst});
   };
 
+  // Can a buffer be gathered with its alignment padding, or was this file written tight?
+  //
+  // A file from before kPayloadAlign packs buffers end to end, so reading a padded extent out of
+  // one would overlap the next -- which the read planner rejects outright, and which past the last
+  // buffer would run off the chunk. So the layout is read from the file rather than assumed: pad
+  // only where every buffer starts aligned AND the next one starts far enough away to leave the
+  // slack. An old file fails the test on the first buffer and behaves exactly as it always did.
+  std::vector<std::uint64_t> starts;
+  for (auto const& cr : recs) {
+    if (cr.validity.kind == validity_kind::mask) { starts.push_back(cr.validity.payload_offset); }
+    for (auto const& leaf : cr.buf_offsets) {
+      starts.insert(starts.end(), leaf.begin(), leaf.end());
+    }
+  }
+  std::sort(starts.begin(), starts.end());
+  auto const padded_span = [&](std::uint64_t offset, std::uint64_t size) -> std::uint64_t {
+    if (offset % kPayloadAlign != 0) { return size; }
+    auto const want = align_payload(size);
+    auto const next = std::upper_bound(starts.begin(), starts.end(), offset);
+    // Past the last buffer the chunk's own padding is the slack, and the writer rounded the
+    // payload up to it (build_compressed_table_header), so the padded extent always fits.
+    if (next == starts.end()) { return want; }
+    return offset + want <= *next ? want : size;
+  };
+
   std::uint64_t dst_offset = 0;
   for (auto const ci : selected_columns) {
     auto const& cr       = recs[ci];
@@ -1592,22 +1632,28 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
     // Every buffer is kept WHOLE -- this narrows columns, not rows -- so each one is a single
     // range and the compacted payload is their concatenation. No decode guard words are involved:
     // those exist only where a row subset slices within a buffer.
+    //
+    // Ranges carry the buffer's PADDED extent (kPayloadAlign) while the header keeps declaring the
+    // exact size. That is what lets a subset stay O_DIRECT-eligible: the source offsets are
+    // aligned by the writer, so gathering the padding too keeps each destination aligned and each
+    // range contiguous with the next -- a whole-column selection still collapses to one range.
     if (cr.validity.kind == validity_kind::mask) {
-      auto const size = cr.validity.size_bytes;
+      auto const span = padded_span(cr.validity.payload_offset, cr.validity.size_bytes);
       if (!patch(col_offs.validity_payload_offset_at + shift, dst_offset)) {
         return "build_column_subset_header: header field offset out of range";
       }
-      append_gather(cr.validity.payload_offset, size, dst_offset);
-      dst_offset += size;
+      append_gather(cr.validity.payload_offset, span, dst_offset);
+      dst_offset += span;
     }
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
-        auto const size = cr.leaf_descs[li].buffers[bi].size_bytes;
+        auto const span =
+          padded_span(cr.buf_offsets[li][bi], cr.leaf_descs[li].buffers[bi].size_bytes);
         if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at + shift, dst_offset)) {
           return "build_column_subset_header: header field offset out of range";
         }
-        append_gather(cr.buf_offsets[li][bi], size, dst_offset);
-        dst_offset += size;
+        append_gather(cr.buf_offsets[li][bi], span, dst_offset);
+        dst_offset += span;
       }
     }
   }
