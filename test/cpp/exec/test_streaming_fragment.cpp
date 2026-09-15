@@ -139,7 +139,7 @@ std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
 std::map<std::string, std::int64_t> drain_groups(streaming_fragment& fragment, stream_id_t id)
 {
   std::map<std::string, std::int64_t> groups;
-  while (auto batch = fragment.session().pull(id)) {
+  while (auto batch = fragment.pull(id)) {
     auto view = sirius::get_cudf_table_view(**batch);
     REQUIRE(view.num_columns() == 2);
     auto regions = sirius::test::operator_utils::copy_column_to_host<std::string>(view.column(0));
@@ -1246,10 +1246,10 @@ TEST_CASE_METHOD(fragment_fixture,
 
       sender_id_t sender = 0;
       for (auto* leaf : {leaf0.get(), leaf1.get()}) {
-        while (auto batch = leaf->session().pull(dest)) {
-          REQUIRE(root.session().push(0, *batch));
+        while (auto batch = leaf->pull(dest)) {
+          REQUIRE(root.push(0, *batch));
         }
-        root.session().close_input(0, sender);
+        root.close_input(0, sender);
         ++sender;
       }
 
