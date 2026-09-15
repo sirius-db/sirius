@@ -17,9 +17,20 @@ import os
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-EXTENSION_PATH = os.path.join(REPO, "build/release/extension/sirius/sirius.duckdb_extension")
+EXTENSION_PATH = os.path.join(
+    REPO, "build/release/extension/sirius/sirius.duckdb_extension"
+)
 QUERY_DIR = os.path.join(REPO, "test/tpch_performance/tpch_queries/orig")
-TABLES = ["lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"]
+TABLES = [
+    "lineitem",
+    "orders",
+    "customer",
+    "part",
+    "partsupp",
+    "supplier",
+    "nation",
+    "region",
+]
 
 
 def parquet_views(d):
@@ -52,7 +63,11 @@ def all_files(d, hpln):
         if hpln:
             out.append(os.path.join(d, f"{t}.hpln"))
         else:
-            for pattern in (f"{t}.parquet", f"{t}_*.parquet", os.path.join(t, "*.parquet")):
+            for pattern in (
+                f"{t}.parquet",
+                f"{t}_*.parquet",
+                os.path.join(t, "*.parquet"),
+            ):
                 out.extend(glob.glob(os.path.join(d, pattern)))
     return sorted(set(p for p in out if os.path.exists(p)))
 
@@ -94,8 +109,10 @@ def run(con, sql):
 
 def normalize(rows):
     """Stringify with a fixed float precision, so a 1-ulp difference is not a mismatch."""
+
     def cell(v):
         return f"{v:.4f}" if isinstance(v, float) else str(v)
+
     return [tuple(cell(v) for v in r) for r in rows]
 
 
@@ -112,6 +129,18 @@ def main():
         "than the previous query's reads",
     )
     args = ap.parse_args()
+
+    # The gates the project actually runs under (run-sweep-sf1000.sh), set BEFORE the extension
+    # loads: the engine reads them from the environment once, on first use. Without them this
+    # harness measures a configuration nobody ships -- and asymmetrically, because
+    # SIRIUS_EXP_FUSED_SCAN_FILTER gates .hpln's decode-time filtering entirely while parquet's
+    # reader-level filter is unaffected, so a run without it understates .hpln on every
+    # join-heavy query.
+    os.environ.setdefault("SIRIUS_EXP_FUSED_SCAN_FILTER", "1")
+    os.environ.setdefault("SIRIUS_EXP_LATE_MAT", "1")
+    os.environ.setdefault(
+        "SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS", "c_custkey,n_name,n_nationkey"
+    )
     if args.config:
         os.environ["SIRIUS_CONFIG_FILE"] = args.config
     import duckdb
@@ -120,6 +149,10 @@ def main():
     con.execute(f"LOAD '{EXTENSION_PATH}'")
     con.execute("SET gpu_execution = true")
     con.execute("SET enable_duckdb_fallback = false")
+    for stmt in filter(
+        None, (x.strip() for x in os.environ.get("SIRIUS_PRE_SQL", "").split(";"))
+    ):
+        con.execute(stmt)
 
     qs = [int(q) for q in args.queries.split(",")]
     hv, pv = hpln_views(args.hpln), parquet_views(args.parquet)
@@ -156,7 +189,11 @@ def main():
                 same = True
                 line += "  MATCH(unordered)"
             else:
-                line += "  MATCH" if same else f"  *** MISMATCH ({len(prows)} vs {len(hrows)} rows)"
+                line += (
+                    "  MATCH"
+                    if same
+                    else f"  *** MISMATCH ({len(prows)} vs {len(hrows)} rows)"
+                )
             if not same:
                 fails.append(q)
             results.append((q, pt, ht, pbytes, hbytes))
@@ -167,10 +204,16 @@ def main():
         th = sum(r[2] for r in results)
         bp = sum(r[3] for r in results)
         bh = sum(r[4] for r in results)
-        print(f"\nTOTAL over {len(results)} comparable queries: "
-              f"parquet {tp:.3f}s, hpln {th:.3f}s ({(th/tp - 1) * 100:+.1f}%)")
-        print(f"  bytes read: parquet {bp/1e9:.1f} GB, hpln {bh/1e9:.1f} GB "
-              f"({(bh/bp - 1) * 100:+.1f}%)" if bp else "")
+        print(
+            f"\nTOTAL over {len(results)} comparable queries: "
+            f"parquet {tp:.3f}s, hpln {th:.3f}s ({(th/tp - 1) * 100:+.1f}%)"
+        )
+        print(
+            f"  bytes read: parquet {bp/1e9:.1f} GB, hpln {bh/1e9:.1f} GB "
+            f"({(bh/bp - 1) * 100:+.1f}%)"
+            if bp
+            else ""
+        )
     print(f"FAILED/MISMATCHED: {sorted(set(fails)) if fails else 'none'}")
 
 

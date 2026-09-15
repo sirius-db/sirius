@@ -1636,6 +1636,61 @@ filtering. And the `0 of 22,560 row groups` figure recorded above covers only th
 `build_file_scan_info`, which is the one that logs; cuDF may prune again inside `read_parquet` with
 the merged AST, uninstrumented.
 
+### 6.9 Dynamic filters: a negative result, and the harness trap that manufactured the question
+
+**`.hpln` already gets as much from join filters as parquet does — §6.8's "3.5% vs 13.5%" was a
+measurement artifact.** `hpln-suite.py` set none of the gates the project runs under, and
+`SIRIUS_EXP_FUSED_SCAN_FILTER` is not symmetric: it gates `.hpln`'s decode-time filtering
+ENTIRELY (`decompression_pushdown_enabled()` reads it) while parquet's reader-level filter is
+untouched. So every join-heavy comparison run through that harness understated `.hpln`.
+
+SF1000, 8 join-heavy queries (3,5,7,8,9,10,17,19), gates ON, `enable_dynamic_filter` on vs off:
+
+| | off | on | gain |
+|---|---|---|---|
+| parquet | 31.467 s | 27.408 s | −12.9% |
+| `.hpln` | 32.517 s | **27.480 s** | **−15.5%** |
+
+`.hpln` extracts MORE than parquet, via the downstream `sirius_physical_dynamic_filter` operator.
+
+**Attaching the filters to the decode instead measured WORSE and was reverted.** Wiring
+`snapshot_membership_probes` into the `.hpln` decode (the pinned path's mechanism) gave 28.026 s
+against 27.480 s — ~2%, inside noise but on the wrong side, and the probes demonstrably attached
+(225 events, 1–2 probes per split). Rows the operator drops one step later cost little enough that
+paying the decode-side selection is not worth it. **Not kept**: a mechanism that measures negative
+should not sit behind a comment claiming it pays.
+
+**The corrected SF1000 cold headline, gates ON:** parquet 57.178 s vs `.hpln` **52.174 s (−8.8%)**,
+1049.9 vs 949.8 GB. §6.8's +2.4% was the ungated number.
+
+### 6.10 What parquet's scan still has that `.hpln`'s does not
+
+| | parquet | `.hpln` |
+|---|---|---|
+| projection pushdown | yes | yes |
+| static filter pushdown + stats pruning | row groups | chunks + 1024-row decode chunks |
+| null-count pruning | yes | `IS NULL` only |
+| decode-time row filtering | inside cuDF's reader | decompression pushdown (rows never reconstructed) |
+| dynamic filters inside the scan | yes (merged into the reader AST) | no — equal end benefit downstream (§6.9) |
+| **survivors reporting** (`can_report_survivors`) | **true** | **false** |
+| **hive partitions** | yes | no |
+| **multiple files per table** | yes | no — one `.hpln` is one table |
+| `output_assembly_is_leading_identity` | yes | no (has the equivalent `_needs_assembly`) |
+| **prefetch hints** (`fadvise_entries`) | yes | no — reverted, on evidence now known to be invalid |
+| dictionary-answered equality in the decode | n/a | no, deliberately — "the obvious next win" |
+| disk → device without a host bounce | yes | no — always stages into pinned host first |
+
+Two of these are worth acting on:
+
+- **`can_report_survivors() == false` disables late materialization for a filtering `.hpln`**
+  (`sirius_scan_manager.cpp:1024` declines the substitution). `post_filter_and_project` takes the
+  `survivors` out-parameter and deliberately leaves it untouched. Parquet answers it, so a
+  filtering parquet scan keeps late-mat and a `.hpln` one does not.
+- **The prefetch revert rests on dead evidence.** `fadvise_entries` "measured zero, twice" — but
+  both runs went through the `std::ifstream` fallback, which has no prefetcher at all (§6.8). The
+  experiment never tested what it claimed to. Worth re-running now that the transport is attached,
+  bearing in mind that O_DIRECT bypasses the page cache, so a page-cache warm is the wrong target.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
