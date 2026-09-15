@@ -32,10 +32,12 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -332,15 +334,43 @@ class templated_ioctx : public ioctx {
         std::vector<std::vector<prepared_io_slice>> partitions(partition_count);
         std::vector<std::size_t> partition_bytes(partition_count, 0);
 
+        // Balance whole RUNS of adjacent slices, not individual slices.
+        //
+        // Greedy per-slice least-loaded balancing splits physically contiguous
+        // reads across reactors, because it routes by size alone. On a projected
+        // parquet scan the columns of one row group are exactly contiguous but
+        // differ in width by several times, so the widest column is repeatedly
+        // sent to the other partition -- leaving a hole in the middle of a run
+        // that was contiguous on disk. Measured on TPC-H SF3000 lineitem, a
+        // 7-column projection arrived as runs of 2.33 slices rather than 7, with
+        // the 3.2 MB column consistently separated from its 0.2-1.6 MB neighbours.
+        //
+        // Runs are the unit a reactor can later fuse into one request, so keeping
+        // them whole is what makes larger requests possible at all. Balance is
+        // preserved across runs, which is the granularity that actually matters:
+        // a run is bounded by the projection's per-row-group footprint.
+        std::ranges::sort(slices, {}, [](prepared_io_slice const& s) { return s.rng.offset; });
+
         // Keep the originals until every queue entry has been allocated. If an
         // allocation fails, their callbacks can still release all claimed cache
         // chunks and every coordinator credit can be settled.
-        for (auto const& slice : slices) {
+        for (std::size_t begin = 0; begin < slices.size();) {
+          std::size_t end       = begin + 1;
+          std::size_t run_bytes = slices[begin].size();
+          // Contiguous or overlapping: exactly what a later merge could fuse.
+          while (end < slices.size() &&
+                 slices[end].rng.offset <= slices[end - 1].rng.offset + slices[end - 1].rng.size) {
+            run_bytes += slices[end].size();
+            ++end;
+          }
           auto const smallest = static_cast<std::size_t>(
             std::min_element(partition_bytes.begin(), partition_bytes.end()) -
             partition_bytes.begin());
-          partition_bytes[smallest] += slice.size();
-          partitions[smallest].push_back(slice);
+          partition_bytes[smallest] += run_bytes;
+          for (std::size_t i = begin; i < end; ++i) {
+            partitions[smallest].push_back(slices[i]);
+          }
+          begin = end;
         }
 
         std::vector<std::unique_ptr<grouped_io_request>> requests;

@@ -386,6 +386,8 @@ class rest_reactor {
     std::uint64_t inflight_sum{0};   ///< sum of in-flight depth over those samples
     std::uint64_t inflight_peak{0};  ///< deepest concurrency observed
     std::uint64_t request_nanos{0};  ///< summed per-request wall time, across slots
+    std::uint64_t groups{0};         ///< grouped_io_requests enqueued
+    std::uint64_t group_slices{0};   ///< logical slices inside them
   };
 
   /// Snapshot the counters and zero them. Reading resets, matching the rest of
@@ -399,6 +401,8 @@ class rest_reactor {
     out.inflight_sum  = _stat_inflight_sum.exchange(0, std::memory_order_relaxed);
     out.inflight_peak = _stat_inflight_peak.exchange(0, std::memory_order_relaxed);
     out.request_nanos = _stat_request_nanos.exchange(0, std::memory_order_relaxed);
+    out.groups        = _stat_groups.exchange(0, std::memory_order_relaxed);
+    out.group_slices  = _stat_group_slices.exchange(0, std::memory_order_relaxed);
     return out;
   }
 
@@ -413,6 +417,17 @@ class rest_reactor {
 
   /// Record the in-flight depth after a submit pass -- the number that says
   /// whether the reactor is being kept fed.
+  /// Record one enqueued group and how many logical slices it carried. Slices per
+  /// group bounds what any coalescing could merge: a group of one has nothing to
+  /// fuse regardless of whether the ranges are adjacent.
+  /// Record one enqueued group and the logical slices it carried. Slices per group
+  /// against requests shows how much fusion the reactor achieved.
+  void note_group(std::uint64_t slices) noexcept
+  {
+    _stat_groups.fetch_add(1, std::memory_order_relaxed);
+    _stat_group_slices.fetch_add(slices, std::memory_order_relaxed);
+  }
+
   void note_inflight(std::uint64_t depth) noexcept
   {
     _stat_submit_events.fetch_add(1, std::memory_order_relaxed);
@@ -429,6 +444,8 @@ class rest_reactor {
   std::atomic<std::uint64_t> _stat_inflight_sum{0};
   std::atomic<std::uint64_t> _stat_inflight_peak{0};
   std::atomic<std::uint64_t> _stat_request_nanos{0};
+  std::atomic<std::uint64_t> _stat_groups{0};
+  std::atomic<std::uint64_t> _stat_group_slices{0};
 
   std::jthread _worker;
 };

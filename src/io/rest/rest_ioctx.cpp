@@ -274,6 +274,8 @@ std::string rest_ioctx::perf_report_and_reset() noexcept
       total.inflight_sum += s.inflight_sum;
       total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
       total.request_nanos += s.request_nanos;
+      total.groups += s.groups;
+      total.group_slices += s.group_slices;
       ++reactors;
     }
     if (total.requests == 0) { return {}; }
@@ -297,7 +299,8 @@ std::string rest_ioctx::perf_report_and_reset() noexcept
       "  mean request size         : {:.2f} MB\n"
       "  mean request duration     : {:.1f} ms  ({:.0f} MB/s per request)\n"
       "  mean in-flight (realised) : {:.1f} of {} slots\n"
-      "  peak in-flight            : {}\n",
+      "  peak in-flight            : {}\n"
+      "  groups enqueued           : {} ({:.2f} slices per group, {:.2f} fused per request)\n",
       reactors,
       total.requests,
       static_cast<double>(total.bytes) / 1e9,
@@ -306,7 +309,10 @@ std::string rest_ioctx::perf_report_and_reset() noexcept
       per_req_mb_s,
       mean_inflight,
       ceiling,
-      total.inflight_peak);
+      total.inflight_peak,
+      total.groups,
+      total.groups ? static_cast<double>(total.group_slices) / total.groups : 0.0,
+      total.requests ? static_cast<double>(total.group_slices) / total.requests : 0.0);
   } catch (...) {
     return {};
   }

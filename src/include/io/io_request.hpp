@@ -239,6 +239,8 @@ class grouped_io_request final {
   }
 
   [[nodiscard]] bool empty() const noexcept { return _next == slices.size(); }
+  [[nodiscard]] std::size_t slice_count() const noexcept { return slices.size(); }
+  [[nodiscard]] std::span<const prepared_io_slice> slice_view() const noexcept { return slices; }
 
   [[nodiscard]] std::size_t remaining_slices() const noexcept { return slices.size() - _next; }
 
@@ -251,10 +253,38 @@ class grouped_io_request final {
     return bytes;
   }
 
+  /// Unconsumed slice @p i, relative to the current head.
+  [[nodiscard]] prepared_io_slice const& slice_at(std::size_t i) const noexcept
+  {
+    assert(_next + i < slices.size());
+    return slices[_next + i];
+  }
+
   [[nodiscard]] prepared_io_slice& front() noexcept
   {
     assert(!empty());
     return slices[_next];
+  }
+
+  /// How many leading slices form a contiguous (or overlapping) run, stopping
+  /// before the run would exceed @p max_bytes. Slices are offset-ordered by the
+  /// submitting ioctx, so a run is always a prefix.
+  [[nodiscard]] std::size_t leading_run(std::size_t max_bytes) const noexcept
+  {
+    if (empty()) return 0;
+    std::size_t n     = 1;
+    std::size_t bytes = slices[_next].size();
+    auto end          = slices[_next].rng.offset + slices[_next].rng.size;
+    while (_next + n < slices.size()) {
+      auto const& nxt = slices[_next + n];
+      if (nxt.rng.offset > end) break;
+      auto const nxt_end = nxt.rng.offset + nxt.rng.size;
+      if (nxt_end > end && (nxt_end - slices[_next].rng.offset) > max_bytes) break;
+      bytes += nxt.size();
+      end = std::max(end, nxt_end);
+      ++n;
+    }
+    return n;
   }
 
   [[nodiscard]] prepared_io_slice take_front() noexcept
@@ -357,6 +387,18 @@ struct device_cpy_request {
  * Every terminal path must call exactly one of finish_success/finish_error;
  * the cache callback runs before the final coordinator decrement.
  */
+/// One extra logical slice riding on a fused physical operation.
+///
+/// A backend may serve several adjacent logical slices with a single read: the
+/// first stays in the operation's own fields, the rest live here. device_cpy_request
+/// already copies only `intersect(req_rng, io_rng)` out of the shared buffers, so a
+/// constituent needs nothing beyond its own window and destination.
+struct fused_constituent {
+  std::unique_ptr<device_cpy_request> device_copy;
+  std::shared_ptr<prepared_io_completion> on_complete;
+  std::vector<cache::cached_chunk*> completion_chunks;
+};
+
 struct io_op_request {
   std::shared_ptr<const io_object> obj;
   range io_rng;
@@ -366,12 +408,24 @@ struct io_op_request {
   std::shared_ptr<grouped_coordinator> coordinator;
   std::shared_ptr<prepared_io_completion> on_complete;
   std::vector<cache::cached_chunk*> completion_chunks;
+  /// Empty for an unfused operation, which is every backend that does not build
+  /// them -- their completion and credit accounting is unchanged.
+  std::vector<fused_constituent> fused_extra;
+
+  /// Logical slices this operation settles: itself plus any fused constituents.
+  /// The coordinator was credited per logical slice, so it must be settled that
+  /// many times however many physical reads served them.
+  [[nodiscard]] std::size_t logical_slices() const noexcept { return 1 + fused_extra.size(); }
 
   void finish_success() noexcept
   {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
     if (on_complete != nullptr) { (*on_complete)(completion_chunks, true); }
     coordinator->on_complete();
+    for (auto& part : fused_extra) {
+      if (part.on_complete != nullptr) { (*part.on_complete)(part.completion_chunks, true); }
+      coordinator->on_complete();
+    }
   }
 
   void finish_error(grouped_coordinator::error_type const& error,
@@ -380,6 +434,12 @@ struct io_op_request {
     if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
     if (on_complete != nullptr) { (*on_complete)(completion_chunks, host_data_valid); }
     coordinator->report_error(error);
+    for (auto& part : fused_extra) {
+      if (part.on_complete != nullptr) {
+        (*part.on_complete)(part.completion_chunks, host_data_valid);
+      }
+      coordinator->report_error(error);
+    }
   }
 
   [[nodiscard]] bool terminal() const noexcept { return _terminal.load(std::memory_order_acquire); }
