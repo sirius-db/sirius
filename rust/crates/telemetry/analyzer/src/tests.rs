@@ -3,10 +3,12 @@
 
 //! Tests for Batch ingestion and the data-flow distribution timeline.
 
-use quent_analyzer::{AnalyzerError, resource::collection::ResourceCollection};
+use quent_analyzer::{AnalyzerError, fsm::Fsm, resource::collection::ResourceCollection};
 use quent_events::{EntityRef, Event};
 use quent_io::{ExporterOptions, FileSystemExporterOptions, FileSystemFormat};
-use quent_query_engine_analyzer::{QueryEngineModel, ui::UiAnalyzer};
+use quent_query_engine_analyzer::{
+    QueryEngineModel, model::QueryEvent as NormalizedQueryEvent, ui::UiAnalyzer,
+};
 use quent_query_engine_ui::{OperatorFilter, QueryFilter};
 use quent_store::event::{ModelEventStore, filesystem::Store};
 use quent_ui::entities::request::{
@@ -442,7 +444,18 @@ fn generated_ndjson_round_trips_through_store_and_analyzer() {
     let analyzer = SiriusUiAnalyzer::try_new(engine_id, events.into_iter())
         .expect("filesystem events build a Sirius analyzer");
     assert!(analyzer.query_engine_model().engine().is_ok());
-    assert!(analyzer.query_engine_model().query(query_id).is_ok());
+    let query = analyzer
+        .model
+        .query_engine
+        .query(query_id)
+        .expect("round-trip query is present");
+    let terminal_transition = query
+        .transition(query.len())
+        .expect("round-trip query has a terminal transition");
+    assert!(matches!(
+        &terminal_transition.data,
+        NormalizedQueryEvent::Done { seq: 3 }
+    ));
 }
 
 /// A request for the full query window [0, 1000) ns in 10 bins of 100 ns.

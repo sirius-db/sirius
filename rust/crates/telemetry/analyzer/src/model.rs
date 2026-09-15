@@ -19,6 +19,10 @@ use quent_analyzer::{
 use quent_events::Event;
 use quent_query_engine_analyzer::{
     OperatorEntityMut, QueryEngineEntityId, QueryEngineModel, QueryEngineModelMut,
+    model::{
+        self as query_engine, Engine, InMemoryQueryEngineModel, InMemoryQueryEngineModelBuilder,
+        Operator, Plan, Port, Query, QueryEngineEvent, QueryGroup, Worker,
+    },
     plan_tree::PlanTree,
 };
 use quent_query_engine_ui::EntityRef;
@@ -28,12 +32,148 @@ use uuid::Uuid;
 use crate::{
     batch_placement::{BatchPlacement, BatchPlacementBuilder},
     data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
-    query_engine::{
-        Engine, Operator, Plan, Port, Query, QueryEngine, QueryEngineBuilder, QueryGroup, Worker,
-    },
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
 };
+
+trait IntoQueryEngineEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent;
+}
+
+impl IntoQueryEngineEvent for schema::EngineEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        QueryEngineEvent::Engine(match self {
+            Self::Init {
+                implementation,
+                instance_name,
+            } => query_engine::EngineEvent::Init {
+                implementation: query_engine::EngineImplementation {
+                    name: implementation.name,
+                    version: implementation.version,
+                    custom_attributes: implementation.custom_attributes,
+                },
+                instance_name,
+            },
+            Self::Exit => query_engine::EngineEvent::Exit,
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::WorkerEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        QueryEngineEvent::Worker(match self {
+            Self::Init {
+                parent_engine_id,
+                instance_name,
+            } => query_engine::WorkerEvent::Init {
+                parent_engine_id: parent_engine_id.target,
+                instance_name,
+            },
+            Self::Exit => query_engine::WorkerEvent::Exit,
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::QueryGroupEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        let Self::Declaration {
+            instance_name,
+            engine_id,
+        } = self;
+        QueryEngineEvent::QueryGroup(query_engine::QueryGroupEvent {
+            instance_name,
+            engine_id: engine_id.target,
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::QueryEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        QueryEngineEvent::Query(match self {
+            Self::Init {
+                seq,
+                instance_name,
+                query_group_id,
+            } => query_engine::QueryEvent::Init {
+                seq,
+                instance_name,
+                query_group_id: query_group_id.target,
+            },
+            Self::Planning { seq } => query_engine::QueryEvent::Planning { seq },
+            Self::Executing { seq } => query_engine::QueryEvent::Executing { seq },
+            Self::Exit { seq } => query_engine::QueryEvent::Done { seq },
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::PlanEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        let Self::Declaration {
+            parent,
+            instance_name,
+            edges,
+            worker_id,
+        } = self;
+        QueryEngineEvent::Plan(query_engine::PlanEvent {
+            parent: query_engine::PlanParent {
+                query_id: parent.query_id.target,
+                plan_id: parent.plan_id.map(|plan| plan.target),
+            },
+            instance_name,
+            edges: edges
+                .into_iter()
+                .map(|edge| query_engine::Edge {
+                    source: edge.source.target,
+                    target: edge.target.target,
+                })
+                .collect(),
+            worker_id: worker_id.map(|worker| worker.target),
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::OperatorEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        QueryEngineEvent::Operator(match self {
+            Self::Declaration {
+                plan_id,
+                parent_operator_ids,
+                instance_name,
+                type_name,
+                custom_attributes,
+            } => query_engine::OperatorEvent::Declaration {
+                plan_id: plan_id.target,
+                parent_operator_ids: parent_operator_ids
+                    .into_iter()
+                    .map(|operator| operator.target)
+                    .collect(),
+                instance_name,
+                type_name,
+                custom_attributes,
+            },
+            Self::Statistics { custom_attributes } => {
+                query_engine::OperatorEvent::Statistics { custom_attributes }
+            }
+        })
+    }
+}
+
+impl IntoQueryEngineEvent for schema::PortEvent {
+    fn into_query_engine_event(self) -> QueryEngineEvent {
+        QueryEngineEvent::Port(match self {
+            Self::Declaration {
+                operator_id,
+                instance_name,
+            } => query_engine::PortEvent::Declaration {
+                operator_id: operator_id.target,
+                instance_name,
+            },
+            Self::Statistics { custom_attributes } => {
+                query_engine::PortEvent::Statistics { custom_attributes }
+            }
+        })
+    }
+}
 
 const GPU_DEVICE_GROUP_TYPE_NAME: &str = "gpu_device";
 const THREAD_GROUP_TYPE_NAME: &str = "thread_group";
@@ -206,7 +346,7 @@ impl ResourceCollection for SiriusResources {
 
 /// The analyzed Sirius engine model.
 pub struct SiriusModel {
-    pub(crate) query_engine: QueryEngine,
+    pub(crate) query_engine: InMemoryQueryEngineModel,
     pub(crate) sirius_resources: SiriusResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
@@ -418,7 +558,7 @@ impl ResourceCollection for SiriusModel {
 }
 
 pub struct SiriusModelBuilder {
-    query_engine: QueryEngineBuilder,
+    query_engine: InMemoryQueryEngineModelBuilder,
     sirius_resources: SiriusResources,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
@@ -428,7 +568,7 @@ pub struct SiriusModelBuilder {
 impl SiriusModelBuilder {
     pub(crate) fn try_new(engine_id: Uuid) -> AnalyzerResult<Self> {
         Ok(Self {
-            query_engine: QueryEngineBuilder::try_new(engine_id)?,
+            query_engine: InMemoryQueryEngineModelBuilder::try_new(engine_id)?,
             sirius_resources: SiriusResources::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
@@ -451,27 +591,41 @@ impl SiriusModelBuilder {
                 task_builder.push_transition(Event::new(id, timestamp, t));
                 Ok(())
             }
-            SiriusEvent::Engine(event) => self
-                .query_engine
-                .push_engine(Event::new(id, timestamp, event)),
-            SiriusEvent::Worker(event) => self
-                .query_engine
-                .push_worker(Event::new(id, timestamp, event)),
-            SiriusEvent::QueryGroup(event) => self
-                .query_engine
-                .push_query_group(Event::new(id, timestamp, event)),
-            SiriusEvent::Query(event) => self
-                .query_engine
-                .push_query(Event::new(id, timestamp, event)),
-            SiriusEvent::Plan(event) => self
-                .query_engine
-                .push_plan(Event::new(id, timestamp, event)),
-            SiriusEvent::Operator(event) => self
-                .query_engine
-                .push_operator(Event::new(id, timestamp, event)),
-            SiriusEvent::Port(event) => self
-                .query_engine
-                .push_port(Event::new(id, timestamp, event)),
+            SiriusEvent::Engine(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::Worker(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::QueryGroup(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::Query(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::Plan(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::Operator(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
+            SiriusEvent::Port(event) => self.query_engine.try_push(Event::new(
+                id,
+                timestamp,
+                event.into_query_engine_event(),
+            )),
             SiriusEvent::GpuDevice(schema::GpuDeviceEvent::Declaration {
                 instance_name,
                 parent_group_id,
@@ -663,7 +817,7 @@ impl SiriusModelBuilder {
             }
             if let Some(operator_id) = task.pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
                 && let Some(task_span) = task.active_span()
-                && let Some(operator) = query_engine.operators.get_mut(&operator_id)
+                && let Ok(operator) = query_engine.operator_mut(operator_id)
             {
                 operator.extend_active_span(task_span);
             }
@@ -691,7 +845,7 @@ impl SiriusModelBuilder {
                     }
                     if let Some(operator_id) = data_batch.producer_pipeline_uuid() // Sirius Pipeline Uuid is Quent Operator Id
                         && let Some(data_batch_span) = data_batch.active_span()
-                        && let Some(operator) = query_engine.operators.get_mut(&operator_id)
+                        && let Ok(operator) = query_engine.operator_mut(operator_id)
                     {
                         operator.extend_active_span(data_batch_span);
                     }

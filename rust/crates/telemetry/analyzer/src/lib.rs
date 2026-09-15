@@ -75,7 +75,6 @@ use crate::{
 pub mod batch_placement;
 pub mod data_batch;
 pub mod model;
-mod query_engine;
 pub mod task;
 #[cfg(test)]
 mod tests;
@@ -1648,7 +1647,7 @@ impl SiriusUiAnalyzer {
                 if let Some(task) = self.model.tasks.get(&id) {
                     let pipeline_name = task
                         .pipeline_uuid()
-                        .and_then(|id| self.model.query_engine.operators.get(&id))
+                        .and_then(|id| self.model.query_engine.operator(id).ok())
                         .map(|operator| operator.instance_name());
                     Some(task.try_to_ui_fsm(epoch, pipeline_name))
                 } else if let Some(db) = self.model.data_batches.get(&id) {

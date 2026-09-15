@@ -9,7 +9,11 @@ use quent_analyzer::{
     },
 };
 use quent_query_engine_analyzer::{
-    QueryEngineEntityId as QeEntityRef, QueryEngineModel, plan_tree::PlanTree,
+    QueryEngineEntityId as QeEntityRef, QueryEngineModel,
+    model::{
+        Engine, InMemoryQueryEngineModelView, Operator, Plan, Port, Query, QueryGroup, Worker,
+    },
+    plan_tree::PlanTree,
 };
 use quent_query_engine_ui::EntityRef;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -19,7 +23,6 @@ use crate::{
     batch_placement::{BatchPlacement, BatchPlacementExt},
     data_batch::{DataBatch, DataBatchExt},
     model::{DeclaredResource, SiriusModel},
-    query_engine::{Engine, Operator, Plan, Port, Query, QueryEngineView, QueryGroup, Worker},
     task::{Task, TaskExt},
 };
 
@@ -31,7 +34,7 @@ use crate::{
 pub(crate) struct SiriusModelQueryView<'a> {
     resource_types: HashMap<String, &'a ResourceTypeDecl>,
     resource_group_types: HashMap<String, &'a ResourceGroupTypeDecl>,
-    query_engine: QueryEngineView<'a>,
+    query_engine: InMemoryQueryEngineModelView<'a>,
     resources: HashMap<Uuid, &'a DeclaredResource>,
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
@@ -45,7 +48,8 @@ impl<'a> SiriusModelQueryView<'a> {
         query_id: Uuid,
     ) -> AnalyzerResult<SiriusModelQueryView<'a>> {
         // QE scoped to single query
-        let query_engine_view = QueryEngineView::try_new(&model.query_engine, query_id)?;
+        let query_engine_view =
+            InMemoryQueryEngineModelView::try_new(&model.query_engine, query_id)?;
 
         let mut resource_groups = HashMap::default();
         let mut resources = HashMap::default();
@@ -124,7 +128,7 @@ impl<'a> SiriusModelQueryView<'a> {
 
     fn collect_sirius_resource_ancestors(
         model: &'a SiriusModel,
-        query_engine: &QueryEngineView<'a>,
+        query_engine: &InMemoryQueryEngineModelView<'a>,
         mut parent_id: Uuid,
         groups: &mut HashMap<Uuid, &'a RtResourceGroup>,
     ) -> AnalyzerResult<bool> {
