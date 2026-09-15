@@ -64,10 +64,10 @@ struct gpu_string_column_decode_input {
   bool has_nulls;
 };
 
-/// Decode one varchar column to a cudf strings column. Async modulo at most
-/// one host sync (the chars-buffer sizing read-back, which only fires when
-/// the per-segment length upper bound is unknown or pathological). Throws
-/// on malformed segment metadata or unsupported codecs.
+/// Decode a varchar column; throws on invalid segment metadata or unsupported codecs.
+/// Host syncs: headers per non-empty DICTIONARY/FSST/DICT_FSST run; prepared data per
+/// DICT_FSST run with rows; descriptor uploads; optional chars sizing when the length
+/// bound is unknown or pathological; null-count read-back when a mask is present.
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
                                                         rmm::cuda_stream_view stream,
                                                         rmm::device_async_resource_ref mr);

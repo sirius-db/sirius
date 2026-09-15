@@ -29,9 +29,10 @@
 
 namespace sirius::cuda::scan {
 
-//! @brief Build per-segment descriptors for a DICTIONARY codec run, bucketed into the short- and
-//! long-string gather paths by `max_string_length`.
-prepared_dict prepare_dict(gpu_string_codec_run const& run);
+//! @brief Prepare DICTIONARY descriptors, bucketed by max_string_length.
+//! For a non-empty run, read non-zero-row headers with one stream sync. Invalid header
+//! bounds throw std::runtime_error before decoding; payload contents are not validated here.
+prepared_dict prepare_dict(gpu_string_codec_run const& run, rmm::cuda_stream_view stream);
 
 //! @brief Pass 1: write each row's decoded length into @p d_lengths. Same kernel for the short and
 //! long buckets — call once per bucket. No-op when @p n_chunks is 0.
