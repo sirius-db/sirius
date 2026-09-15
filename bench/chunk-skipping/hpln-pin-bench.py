@@ -35,18 +35,38 @@ import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "test/tpch_performance"))
-EXTENSION_PATH = os.path.join(REPO, "build/release/extension/sirius/sirius.duckdb_extension")
+EXTENSION_PATH = os.path.join(
+    REPO, "build/release/extension/sirius/sirius.duckdb_extension"
+)
 QUERY_DIR = os.path.join(REPO, "test/tpch_performance/tpch_queries/orig")
-TABLES = ["lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"]
+TABLES = [
+    "lineitem",
+    "orders",
+    "customer",
+    "part",
+    "partsupp",
+    "supplier",
+    "nation",
+    "region",
+]
 
 # Which tables the .hpln arms sort, mirroring mk-hpln.py, so the clustered parquet arm asks for
 # the same order at pin time and the two are comparable.
 CLUSTER_KEYS = {"lineitem": "l_shipdate", "orders": "o_orderdate"}
+# Restrict which tables the parquet-clustered arm sorts, so it can be matched against a .hpln
+# whose clustering was baked in for only some tables. Comma-separated; empty means all of the above.
+_only = [t for t in os.environ.get("SIRIUS_BENCH_CLUSTER_TABLES", "").split(",") if t]
+if _only:
+    CLUSTER_KEYS = {t: k for t, k in CLUSTER_KEYS.items() if t in _only}
 
 
 def parquet_source(d, table):
     files = []
-    for pattern in (f"{table}.parquet", f"{table}_*.parquet", os.path.join(table, "*.parquet")):
+    for pattern in (
+        f"{table}.parquet",
+        f"{table}_*.parquet",
+        os.path.join(table, "*.parquet"),
+    ):
         files.extend(glob.glob(os.path.join(d, pattern)))
     if not files:
         raise FileNotFoundError(f"no parquet for {table} in {d}")
@@ -73,14 +93,20 @@ def arm_config(arm, args):
         cols_by_table = union_columns_by_table()
         pins = []
         for t in TABLES:
-            cols = "" if args.pin_all_columns else ", cols => [%s]" % ",".join(
-                f"'{c}'" for c in cols_by_table.get(t, [])
+            cols = (
+                ""
+                if args.pin_all_columns
+                else ", cols => [%s]"
+                % ",".join(f"'{c}'" for c in cols_by_table.get(t, []))
             )
             if not cols_by_table.get(t):
                 cols = ""
             pins.append(
-                (t, f"CALL pin_table('{os.path.join(d, f'{t}.hpln')}', format => 'simpatico', "
-                    f"tier => 'host', name => '{t}'{cols});")
+                (
+                    t,
+                    f"CALL pin_table('{os.path.join(d, f'{t}.hpln')}', format => 'simpatico', "
+                    f"tier => 'host', name => '{t}'{cols});",
+                )
             )
         return views, pins
 
@@ -95,8 +121,13 @@ def arm_config(arm, args):
             if key and key in cols:
                 cluster = f", cluster_by=['{key}']"
         path = detect_pin_glob(args.parquet, table)
-        pins.append((table, f"CALL pin_table('{path}', tier => '{args.tier}', name => '{table}', "
-                            f"cols=[{col_literals}]{cluster});"))
+        pins.append(
+            (
+                table,
+                f"CALL pin_table('{path}', tier => '{args.tier}', name => '{table}', "
+                f"cols=[{col_literals}]{cluster});",
+            )
+        )
     return views, pins
 
 
@@ -111,8 +142,12 @@ def drop_cache(paths):
     for path in paths:
         try:
             with open(path, "rb") as fh:
-                os.posix_fadvise(fh.fileno(), 0, os.fstat(fh.fileno()).st_size,
-                                 os.POSIX_FADV_DONTNEED)
+                os.posix_fadvise(
+                    fh.fileno(),
+                    0,
+                    os.fstat(fh.fileno()).st_size,
+                    os.POSIX_FADV_DONTNEED,
+                )
         except OSError as e:
             print(f"  WARNING: fadvise({path}): {e}", flush=True)
 
@@ -132,6 +167,7 @@ def arm_files(arm, args):
 def normalize(rows):
     def cell(v):
         return f"{v:.4f}" if isinstance(v, float) else str(v)
+
     return [tuple(cell(v) for v in r) for r in rows]
 
 
@@ -148,7 +184,9 @@ def run_arm(arm, args, reference):
     # measures a configuration the project does not use: no late materialization, no fused scan
     # filter, no ast_jit -- which at SF1000 both OOMs at 2GB batches and makes pin-time clustering
     # look worthless. Passed the same way the sweep passes them, so the two cannot drift.
-    for stmt in filter(None, (x.strip() for x in os.environ.get("SIRIUS_PRE_SQL", "").split(";"))):
+    for stmt in filter(
+        None, (x.strip() for x in os.environ.get("SIRIUS_PRE_SQL", "").split(";"))
+    ):
         con.execute(stmt)
     if not arm.startswith("hpln"):
         # The parquet arm has to compress at pin time to be the same representation the .hpln
@@ -170,9 +208,11 @@ def run_arm(arm, args, reference):
         con.execute(sql)
         pin_times[table] = time.time() - t0
     pin_total = time.time() - t_pin0
-    print(f"  pin: {pin_total:7.2f}s total  " +
-          "  ".join(f"{t}={pin_times[t]:.1f}" for t, _ in pins if pin_times[t] >= 0.05),
-          flush=True)
+    print(
+        f"  pin: {pin_total:7.2f}s total  "
+        + "  ".join(f"{t}={pin_times[t]:.1f}" for t, _ in pins if pin_times[t] >= 0.05),
+        flush=True,
+    )
 
     best, results = {}, {}
     for q in args.queries:
@@ -188,14 +228,24 @@ def run_arm(arm, args, reference):
     mismatched = []
     if reference is not None:
         for q in args.queries:
-            if results[q] != reference[q] and sorted(results[q]) != sorted(reference[q]):
+            if results[q] != reference[q] and sorted(results[q]) != sorted(
+                reference[q]
+            ):
                 mismatched.append(q)
 
     for table, _ in pins:
         con.execute(f"CALL unpin_table('{table}');")
     con.close()
-    return dict(pin_total=pin_total, pin_times=pin_times, best=best,
-                suite=sum(best.values()), mismatched=mismatched), results
+    return (
+        dict(
+            pin_total=pin_total,
+            pin_times=pin_times,
+            best=best,
+            suite=sum(best.values()),
+            mismatched=mismatched,
+        ),
+        results,
+    )
 
 
 def main():
@@ -203,10 +253,14 @@ def main():
     ap.add_argument("--parquet", required=True)
     ap.add_argument("--hpln-sorted")
     ap.add_argument("--hpln-unsorted")
-    ap.add_argument("--arms", default="parquet,parquet-clustered,hpln-sorted,hpln-unsorted")
+    ap.add_argument(
+        "--arms", default="parquet,parquet-clustered,hpln-sorted,hpln-unsorted"
+    )
     ap.add_argument("--iterations", type=int, default=3)
     ap.add_argument("--queries", default=",".join(str(i) for i in range(1, 23)))
-    ap.add_argument("--plan-dir", default=os.path.join(REPO, "bench/chunk-skipping/plans-hpln"))
+    ap.add_argument(
+        "--plan-dir", default=os.path.join(REPO, "bench/chunk-skipping/plans-hpln")
+    )
     ap.add_argument(
         "--pin-all-columns",
         action="store_true",
@@ -221,9 +275,14 @@ def main():
         "the host representation -- so 'gpu' is what the project's tuned SF1000 config uses and "
         "what the format cannot match",
     )
-    ap.add_argument("--drop-cache", action="store_true",
-                    help="evict the arm's input files from the page cache before pinning")
-    ap.add_argument("--out", default=os.path.join(REPO, "bench/chunk-skipping/results-hpln-pin"))
+    ap.add_argument(
+        "--drop-cache",
+        action="store_true",
+        help="evict the arm's input files from the page cache before pinning",
+    )
+    ap.add_argument(
+        "--out", default=os.path.join(REPO, "bench/chunk-skipping/results-hpln-pin")
+    )
     args = ap.parse_args()
     args.queries = [int(q) for q in args.queries.split(",")]
 
@@ -236,14 +295,22 @@ def main():
         if reference is None:
             reference = results
         report[arm] = r
-        print(f"  suite: {r['suite']:7.3f}s (sum of per-query bests over {args.iterations} iters)"
-              + (f"  *** MISMATCHED {r['mismatched']}" if r["mismatched"] else "  results agree"),
-              flush=True)
+        print(
+            f"  suite: {r['suite']:7.3f}s (sum of per-query bests over {args.iterations} iters)"
+            + (
+                f"  *** MISMATCHED {r['mismatched']}"
+                if r["mismatched"]
+                else "  results agree"
+            ),
+            flush=True,
+        )
 
     base = report.get("parquet")
     print("\narm                 pin (s)   suite (s)   vs parquet")
     for arm, r in report.items():
-        delta = f"{(r['suite'] / base['suite'] - 1) * 100:+6.2f}%" if base else "     --"
+        delta = (
+            f"{(r['suite'] / base['suite'] - 1) * 100:+6.2f}%" if base else "     --"
+        )
         print(f"{arm:<18} {r['pin_total']:8.2f}  {r['suite']:9.3f}   {delta}")
 
     with open(os.path.join(args.out, "report.json"), "w") as fh:
