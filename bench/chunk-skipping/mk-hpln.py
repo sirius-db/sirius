@@ -23,10 +23,19 @@ import threading
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-EXTENSION_PATH = os.path.join(REPO, "build/release/extension/sirius/sirius.duckdb_extension")
+EXTENSION_PATH = os.path.join(
+    REPO, "build/release/extension/sirius/sirius.duckdb_extension"
+)
 
 TABLES = [
-    "lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region",
+    "lineitem",
+    "orders",
+    "customer",
+    "part",
+    "partsupp",
+    "supplier",
+    "nation",
+    "region",
 ]
 
 # Sort keys mirror the clustered dataset the rest of the study uses: the date column each
@@ -53,7 +62,9 @@ def resolve_files(parquet_dir, table):
 
     def key(path):
         name = os.path.basename(path)
-        digits = [int(p) for p in "".join(c if c.isdigit() else " " for c in name).split()]
+        digits = [
+            int(p) for p in "".join(c if c.isdigit() else " " for c in name).split()
+        ]
         return (digits, name)
 
     return sorted(set(candidates), key=key)
@@ -118,12 +129,13 @@ class cache_trimmer:
             drop_from_page_cache(self._paths)
             try:
                 rss_kb = int(
-                    subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+                    subprocess.check_output(
+                        ["ps", "-o", "rss=", "-p", str(os.getpid())]
+                    )
                 )
                 with open("/proc/meminfo") as fh:
                     info = {
-                        k: int(v.split()[0])
-                        for k, v in (l.split(":", 1) for l in fh)
+                        k: int(v.split()[0]) for k, v in (l.split(":", 1) for l in fh)
                     }
                 print(
                     f"   [mem] rss {rss_kb/1e6:.1f} GB  free {info['MemFree']/1e6:.0f} GB  "
@@ -177,17 +189,28 @@ def decoded_bytes_per_row(con, source):
     and a full pass over lineitem to size a chunk would cost more than it saves.
     """
     fixed = {
-        "BOOLEAN": 1, "TINYINT": 1, "SMALLINT": 2, "INTEGER": 4, "BIGINT": 8,
-        "UTINYINT": 1, "USMALLINT": 2, "UINTEGER": 4, "UBIGINT": 8,
-        "FLOAT": 4, "DOUBLE": 8, "DATE": 4, "TIME": 8,
-        "TIMESTAMP": 8, "TIMESTAMP WITH TIME ZONE": 8,
+        "BOOLEAN": 1,
+        "TINYINT": 1,
+        "SMALLINT": 2,
+        "INTEGER": 4,
+        "BIGINT": 8,
+        "UTINYINT": 1,
+        "USMALLINT": 2,
+        "UINTEGER": 4,
+        "UBIGINT": 8,
+        "FLOAT": 4,
+        "DOUBLE": 8,
+        "DATE": 4,
+        "TIME": 8,
+        "TIMESTAMP": 8,
+        "TIMESTAMP WITH TIME ZONE": 8,
     }
     schema = con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()
     total, varchars = 0, []
     for name, dtype, *_ in schema:
         base = dtype.split("(")[0].strip()
         if base == "DECIMAL":
-            precision = int(dtype[dtype.index("(") + 1: dtype.index(",")])
+            precision = int(dtype[dtype.index("(") + 1 : dtype.index(",")])
             total += 4 if precision <= 9 else (8 if precision <= 18 else 16)
         elif base in ("VARCHAR", "BLOB"):
             total += 4  # cuDF's per-row offset
@@ -213,7 +236,9 @@ def chunk_rows_for(bytes_per_row, chunk_bytes):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="TPC-H parquet directory")
-    ap.add_argument("--output", required=True, help="directory to write <table>.hpln into")
+    ap.add_argument(
+        "--output", required=True, help="directory to write <table>.hpln into"
+    )
     ap.add_argument("--tables", default=",".join(TABLES))
     ap.add_argument("--chunk-rows", type=int, default=1 << 20)
     ap.add_argument(
@@ -228,14 +253,18 @@ def main():
     ap.add_argument("--group-rows", type=int, default=8192)
     ap.add_argument(
         "--plan-dir",
-        default=os.path.join(REPO, "src/compression/simpatico_codegen/plans/tpch_sf1000"),
+        default=os.path.join(
+            REPO, "src/compression/simpatico_codegen/plans/tpch_sf1000"
+        ),
         help="compression plans; a table with no <table>.txt is stored uncompressed",
     )
     ap.add_argument(
         "--sort",
-        choices=["global", "none"],
+        choices=["global", "cluster", "none"],
         default="global",
-        help="global: ORDER BY the table's sort key in the COPY query",
+        help="global: ORDER BY the table's sort key in the COPY query (whole chunks prune). "
+        "cluster: sort each chunk as it is written, the analogue of pin_table's cluster_by "
+        "(chunks still span the key range; the group index does the pruning). none: file order",
     )
     ap.add_argument("--config", default=os.environ.get("SIRIUS_CONFIG_FILE"))
     ap.add_argument(
@@ -290,16 +319,29 @@ def main():
         if args.sort == "global" and key:
             order = f" ORDER BY {key}"
         select = f"SELECT * FROM read_parquet([{file_list}]){order}"
+        # `cluster_by` sorts each chunk as it is written, the way pin_table's cluster_by sorts each
+        # pin chunk: every chunk still spans the whole key range, so nothing prunes at chunk level,
+        # but the 8192-row groups inside it narrow and the group index does the work. Strictly
+        # cheaper than --sort global (no whole-table sort) and strictly weaker.
+        cluster = ""
+        if args.sort == "cluster" and key:
+            cluster = f", cluster_by '{key}'"
         opts = (
             f"FORMAT simpatico, chunk_rows {chunk_rows}, "
-            f"group_rows {args.group_rows}, plan_table '{table}'"
+            f"group_rows {args.group_rows}, plan_table '{table}'{cluster}"
         )
         has_plan = os.path.exists(os.path.join(args.plan_dir, f"{table}.txt"))
         if not has_plan:
-            opts = f"FORMAT simpatico, chunk_rows {chunk_rows}, group_rows {args.group_rows}"
+            opts = (
+                f"FORMAT simpatico, chunk_rows {chunk_rows}, "
+                f"group_rows {args.group_rows}{cluster}"
+            )
 
         if args.resume and hpln_is_complete(out):
-            print(f"== {table}: already complete at {out}, skipping (--resume)", flush=True)
+            print(
+                f"== {table}: already complete at {out}, skipping (--resume)",
+                flush=True,
+            )
             continue
 
         print(
@@ -318,28 +360,52 @@ def main():
         hpln_bytes = os.path.getsize(out)
         rows = -1
         if not args.no_verify:
-            rows = con.execute(f"SELECT count(*) FROM read_simpatico('{out}')").fetchone()[0]
+            rows = con.execute(
+                f"SELECT count(*) FROM read_simpatico('{out}')"
+            ).fetchone()[0]
             drop_from_page_cache([out])
         print(
             f"   -> {hpln_bytes/1e9:.2f} GB ({parquet_bytes/hpln_bytes:.2f}x parquet), "
             f"{rows} rows, {elapsed:.1f} s, "
             f"{max(1, -(-rows // chunk_rows))} chunk(s) of {chunk_rows} rows"
-            + (f" (~{bytes_per_row * chunk_rows / 1e9:.2f} GB decoded)" if bytes_per_row else ""),
+            + (
+                f" (~{bytes_per_row * chunk_rows / 1e9:.2f} GB decoded)"
+                if bytes_per_row
+                else ""
+            ),
             flush=True,
         )
         report.append(
-            dict(table=table, rows=rows, chunk_rows=chunk_rows, seconds=round(elapsed, 2),
-                 parquet_bytes=parquet_bytes, hpln_bytes=hpln_bytes,
-                 sort_key=key if order else None, plan=has_plan)
+            dict(
+                table=table,
+                rows=rows,
+                chunk_rows=chunk_rows,
+                seconds=round(elapsed, 2),
+                parquet_bytes=parquet_bytes,
+                hpln_bytes=hpln_bytes,
+                sort_key=key if order else None,
+                plan=has_plan,
+            )
         )
 
     with open(os.path.join(args.output, "mk-hpln.json"), "w") as fh:
-        json.dump(dict(input=args.input, chunk_bytes=args.chunk_bytes,
-                       group_rows=args.group_rows, sort=args.sort, tables=report), fh, indent=2)
+        json.dump(
+            dict(
+                input=args.input,
+                chunk_bytes=args.chunk_bytes,
+                group_rows=args.group_rows,
+                sort=args.sort,
+                tables=report,
+            ),
+            fh,
+            indent=2,
+        )
     total_p = sum(r["parquet_bytes"] for r in report)
     total_h = sum(r["hpln_bytes"] for r in report)
-    print(f"\nTOTAL: parquet {total_p/1e9:.2f} GB -> hpln {total_h/1e9:.2f} GB "
-          f"({total_p/max(total_h,1):.2f}x), {sum(r['seconds'] for r in report):.1f} s")
+    print(
+        f"\nTOTAL: parquet {total_p/1e9:.2f} GB -> hpln {total_h/1e9:.2f} GB "
+        f"({total_p/max(total_h,1):.2f}x), {sum(r['seconds'] for r in report):.1f} s"
+    )
 
 
 if __name__ == "__main__":

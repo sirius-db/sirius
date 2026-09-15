@@ -1734,6 +1734,46 @@ every cold read — decodes at 195 GB/s against `str_split`'s 823, and **q12 pay
 pinned against parquet's 0.6407 (+26%)**, which is most of the format's +4.2% pinned deficit. One
 plan choice has to serve both a cold read and a pinned query, and they want opposite things.
 
+### 6.12 `.hpln` + `cluster_by` at WRITE time — the arm that was missing (2026-09-15)
+
+`mk-hpln.py` only offered `--sort {global,none}`; the COPY writer has accepted `cluster_by` since
+`783d98e0` and nothing exercised it. Added `--sort cluster`, which sorts each chunk as it is
+written — the exact analogue of `pin_table`'s `cluster_by`, and verified at the writer
+(`cluster_by 1 column(s)` on lineitem/orders, `0` on a table with no key).
+
+**SF1000, lineitem clustered only** (disk: a second full dataset does not fit, so the parquet arm
+is restricted to lineitem too via `SIRIUS_BENCH_CLUSTER_TABLES` — the comparison is matched):
+
+| | parquet | parquet + `cluster_by` | `.hpln` | `.hpln` + `cluster_by` |
+|---|---|---|---|---|
+| cold suite | 57.314 s | — | 52.521 s | **48.896 s (−14.7%)** |
+| cold bytes | 949.8 GB | — | 1049.9 GB | **823.2 GB (−13.3%)** |
+| host-pinned suite | 10.826 s | **10.016 s (−7.5%)** | 10.949 s | 10.366 s (−4.3%) |
+| pin time | 25.16 s | 25.97 s | 11.17 s | **9.84 s (2.6x)** |
+
+Clustering is worth −6.9% cold, −5.3% host-pinned and −11.9% on the pin, and it **shrinks the
+file**: lineitem 186.4 → 175.9 GB (−5.7%), which is §5.5's "footprint-neutral overall, strictly
+better for lineitem" holding at SF1000. The cold byte drop is much larger than the file shrink
+(1049.9 → 823.2 GB, −21.6%): that is the group index feeding range-skipped fetch, which is what
+clustering exists to enable.
+
+**SF100, all four arms, host-pinned:** parquet 1.507 s · parquet+`cluster_by` 1.397 (−7.3%) ·
+`.hpln`+`cluster_by` 1.225 (**−18.7%**) · `.hpln` global `ORDER BY` 1.124 (**−25.4%**). Global sort
+beats per-chunk clustering, as §5.2 predicts — it prunes whole chunks where clustering only narrows
+the groups inside them — but clustering is the cheap option and needs no whole-table sort.
+
+**Pin-time `cluster_by` for `.hpln` stays refused, and the numbers say that is right.** A parquet
+pin is already decoding and recompressing, so sorting rides along for +0.8 s at SF1000 (25.16 →
+25.97). A `.hpln` pin never decodes, which is exactly why it costs 9.84 s against 25.97. Clustering
+it at pin time means decode → sort → recompress — the work the I/O copy exists to avoid — so its
+pin would land at or above parquet's, spending a 2.6x advantage on a row order the writer bakes in
+once and every later pin gets free. The refusal in `sirius_extension.cpp:1355` says as much; this
+measures it.
+
+Together with the plan-inheritance gap (§6.11), the shape of the format is now clear: **a `.hpln`
+pin chooses neither its row order nor its compression plans — both are properties of the file —
+and that is the price of the pin being pure I/O.**
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
