@@ -219,8 +219,8 @@ fn check_single_visible_device(exported: Option<&str>) -> Result<(), String> {
 }
 
 /// Bytes of the log-only first-contact bandwidth canary. Tunable via
-/// `SIRIUS_CN_NIXL_CANARY_BYTES`. The study never gates on the measured GiB/s (MIG 0→1
-/// host-bounces on this box).
+/// `SIRIUS_CN_NIXL_CANARY_BYTES`. The GROUP BY shuffle path never gates on the measured GiB/s
+/// (MIG 0→1 host-bounces on this box).
 fn canary_bytes() -> u64 {
     parse_u64_env("SIRIUS_CN_NIXL_CANARY_BYTES").unwrap_or(16 << 20)
 }
@@ -265,9 +265,8 @@ mod agent_tier {
         /// agent is ready — or bring-up fails — so a missing libnixl, plugin dir, or
         /// arena surfaces here, before any cross-node query is accepted.
         ///
-        /// The study start signature takes the [`sirius::StagingArena`] handle directly
-        /// (not a `FragmentExecutor`) so this commit does not need executor staging
-        /// verbs yet.
+        /// Takes the [`sirius::StagingArena`] handle directly (not a `FragmentExecutor`)
+        /// so bring-up does not need executor staging verbs.
         pub fn start(agent_name: String, arena: sirius::StagingArena) -> Result<Self, String> {
             let (request_tx, request_rx) = channel::<TransportRequest>();
             let (ready_tx, ready_rx) = channel::<Result<Vec<u8>, String>>();
@@ -666,7 +665,7 @@ mod agent_tier {
 
         /// GPU + libnixl smoke for the agent tier in one process: two real agents come up
         /// over the engine's `cudaMalloc` staging arena (registered as VRAM by both, like
-        /// the two CNs of the study), the metadata handshake loads, and a cross-agent
+        /// the two CNs of a GROUP BY shuffle), the metadata handshake loads, and a cross-agent
         /// WRITE between two leases reaches DONE. The measured bandwidth is logged only
         /// — this test does not assert a floor (MIG 0→1 host-bounces). It does NOT verify
         /// the transferred bytes (Rust has no view into the device leases). nixl 1.3.2

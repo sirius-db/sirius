@@ -43,7 +43,7 @@ source "$SR_DIR/scripts/cn-env.sh"
 
 E2E=${SIRIUS_2CN_E2E_DIR:-/opt/dlami/nvme/tmp/sirius-2cn-e2e}
 CN_BIN=${CN_BIN:-$SR_DIR/target/release/sirius-starrocks-cn}
-DEMO_FE=${DEMO_FE:-/home/ubuntu/sirius-wt/demo/experimental/starrocks/starrocks/output/fe}
+STARROCKS_FE=${STARROCKS_FE:-/home/ubuntu/sirius-wt/demo/experimental/starrocks/starrocks/output/fe}
 MYSQL=${MYSQL:-/home/ubuntu/sirius-wt/demo/experimental/starrocks/.pixi/envs/client/bin/mysql}
 PYTHON=${PYTHON:-/home/ubuntu/sirius-wt/base/.pixi/envs/default/bin/python}
 SIRIUS_LIB=${SIRIUS_LIB:-$REPO_ROOT/build/release/extension/sirius}
@@ -59,8 +59,8 @@ export UCX_TLS=${UCX_TLS:-cuda_copy,cuda_ipc,tcp,self}
     echo "no CN binary at $CN_BIN — build with: cargo build --release -p sirius-starrocks-cn" >&2
     exit 1
 }
-[ -x "$DEMO_FE/bin/start_fe.sh" ] || {
-    echo "no packaged demo FE at $DEMO_FE" >&2
+[ -x "$STARROCKS_FE/bin/start_fe.sh" ] || {
+    echo "no packaged StarRocks FE at $STARROCKS_FE" >&2
     exit 1
 }
 [ -x "$MYSQL" ] || {
@@ -200,13 +200,13 @@ sirius:
 YAML
 
 echo "== packaging isolated FE =="
-cp -a "$DEMO_FE/bin" "$E2E/fe/bin"
-cp -a "$DEMO_FE/conf/." "$E2E/fe/conf/"
-ln -sfn "$DEMO_FE/lib" "$E2E/fe/lib"
-ln -sfn "$DEMO_FE/webroot" "$E2E/fe/webroot"
-ln -sfn "$DEMO_FE/hive-udf" "$E2E/fe/hive-udf"
-ln -sfn "$DEMO_FE/spark-dpp" "$E2E/fe/spark-dpp"
-ln -sfn "$DEMO_FE/plugins" "$E2E/fe/plugins"
+cp -a "$STARROCKS_FE/bin" "$E2E/fe/bin"
+cp -a "$STARROCKS_FE/conf/." "$E2E/fe/conf/"
+ln -sfn "$STARROCKS_FE/lib" "$E2E/fe/lib"
+ln -sfn "$STARROCKS_FE/webroot" "$E2E/fe/webroot"
+ln -sfn "$STARROCKS_FE/hive-udf" "$E2E/fe/hive-udf"
+ln -sfn "$STARROCKS_FE/spark-dpp" "$E2E/fe/spark-dpp"
+ln -sfn "$STARROCKS_FE/plugins" "$E2E/fe/plugins"
 set_fe_conf "$E2E/fe/conf/fe.conf" meta_dir "$E2E/fe/meta"
 set_fe_conf "$E2E/fe/conf/fe.conf" sys_log_dir "$E2E/fe/log"
 set_fe_conf "$E2E/fe/conf/fe.conf" audit_log_dir "$E2E/fe/log"
