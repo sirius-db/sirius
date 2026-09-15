@@ -1,12 +1,10 @@
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::SocketAddr;
+use std::time::Duration;
 
-#[cfg(test)]
-use crate::proto::brpc::policy::RpcRequestMeta;
-use crate::proto::brpc::policy::{RpcMeta, RpcResponseMeta};
+use crate::proto::brpc::policy::{RpcMeta, RpcRequestMeta, RpcResponseMeta};
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-#[cfg(test)]
-use std::io::Read;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Magic prefix for Baidu PRPC frames. StarRocks FE sends backend RPCs with
@@ -145,12 +143,38 @@ impl Error {
     }
 
     /// Returns a generic PRPC server error.
-    fn server(text: impl Into<String>) -> Self {
+    pub(crate) fn server(text: impl Into<String>) -> Self {
         Self {
             code: PRPC_ERROR,
             text: text.into(),
         }
     }
+}
+
+/// One-shot PRPC call: connect, write one request, read one response, close.
+pub(crate) fn call_blocking(
+    peer: SocketAddr,
+    service_name: impl Into<String>,
+    method_name: impl Into<String>,
+    body: Vec<u8>,
+    attachment: Vec<u8>,
+    timeout: Duration,
+) -> std::result::Result<(Vec<u8>, Vec<u8>), Error> {
+    let mut stream = std::net::TcpStream::connect_timeout(&peer, timeout)
+        .map_err(|err| Error::server(format!("PRPC connect {peer}: {err}")))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| Error::server(format!("PRPC read timeout: {err}")))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| Error::server(format!("PRPC write timeout: {err}")))?;
+    Frame::for_request(service_name, method_name, body, attachment, Some(1))
+        .write(&mut stream)
+        .map_err(|err| Error::server(format!("PRPC write: {err}")))?;
+    let frame = Frame::read(&mut stream)
+        .map_err(|err| Error::server(format!("PRPC read: {err}")))?
+        .ok_or_else(|| Error::server("PRPC peer closed before sending a response"))?;
+    frame.into_response()
 }
 
 impl std::fmt::Display for Error {
@@ -193,6 +217,23 @@ impl Frame {
         ))
     }
 
+    /// Consumes a response frame, returning the protobuf body and attachment when PRPC succeeded.
+    pub(crate) fn into_response(self) -> std::result::Result<(Vec<u8>, Vec<u8>), Error> {
+        let Some(response) = self.meta.response else {
+            return Err(Error::server("missing PRPC response metadata"));
+        };
+        let code = response.error_code.unwrap_or(PRPC_SUCCESS);
+        if code != PRPC_SUCCESS {
+            return Err(Error {
+                code,
+                text: response
+                    .error_text
+                    .unwrap_or_else(|| format!("PRPC error {code}")),
+            });
+        }
+        Ok((self.body, self.attachment))
+    }
+
     /// Builds a response frame for `correlation_id`, wrapping a service result in PRPC response
     /// metadata. `encode` is the single source of truth for `attachment_size`, so it is left unset.
     pub(crate) fn response_frame(
@@ -224,7 +265,6 @@ impl Frame {
     }
 
     /// Builds a request frame without going through the TCP reader.
-    #[cfg(test)]
     pub(crate) fn for_request(
         service_name: impl Into<String>,
         method_name: impl Into<String>,
@@ -258,8 +298,16 @@ impl Frame {
         }
     }
 
+    /// Writes this encoded PRPC frame to a blocking stream.
+    pub(crate) fn write(&self, stream: &mut impl Write) -> Result<()> {
+        stream
+            .write_all(&self.encode())
+            .context("failed to write PRPC frame")?;
+        stream.flush().context("failed to flush PRPC frame")?;
+        Ok(())
+    }
+
     /// Reads one PRPC frame from a stream, returning `None` on normal connection close.
-    #[cfg(test)]
     pub(crate) fn read(stream: &mut impl Read) -> Result<Option<Self>> {
         let mut header = [0u8; PRPC_HEAD_SIZE];
         match stream.read_exact(&mut header) {
@@ -397,8 +445,7 @@ async fn read_payload(stream: &mut (impl AsyncRead + Unpin), len: usize) -> Resu
     Ok(payload)
 }
 
-/// Synchronous counterpart to [`read_payload`] used by the test frame reader.
-#[cfg(test)]
+/// Synchronous counterpart to [`read_payload`] used by blocking clients and tests.
 fn read_payload_sync(stream: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(len.min(PRPC_READ_CHUNK));
     while payload.len() < len {
