@@ -8,6 +8,12 @@ Sessions](streaming-sessions.md) covers the primitives underneath
 plan becomes a fragment, how declared streams get a schema before the plan is bound, and how
 `relay_from()` chains fragments, including across processes.
 
+Names used here:
+
+- Host process: `sirius::ffi::Context` plus `sirius::ffi::Fragment`. The embedding process
+  (Rust compute node, C++ tests). This is not GPU host memory.
+- `streaming_fragment`: the engine class that owns the query window and both terminals.
+
 Two classes sit at two layers:
 
 | | `exec::streaming_fragment` | `sirius::ffi::Fragment` |
@@ -15,14 +21,41 @@ Two classes sit at two layers:
 | **Files** | `src/include/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp` | `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp` |
 | **Caller** | C++ already inside a live `duckdb::ClientContext` and transaction, such as the transparent path or `Context::execute_substrait` | A caller that must not include DuckDB or cuDF headers, such as the Rust bindings |
 | **Owns the connection?** | No. It borrows the caller's `ClientContext`. | Yes. `Context` brings up an embedded `duckdb::DuckDB` and `Connection`. |
-| **Transaction / query window** | The caller supplies a DuckDB transaction when `plan_source` needs one. `streaming_fragment` opens and closes `StandaloneQueryScope`. | Host manages DuckDB transactions. `streaming_fragment` still owns the query window. |
+| **Transaction / query window** | The caller supplies a DuckDB transaction when `plan_source` needs one. `streaming_fragment` opens and closes `StandaloneQueryScope`. | The host process manages DuckDB transactions. `streaming_fragment` still owns the query window. |
 | **Shape** | Empty `outputs` is a `RESULT_COLLECTOR`. One or more outputs is a `STREAMING_SINK`. `spec.plan_source` is a `LogicalOperator` factory. | Declare, `build`, `relay_from`, `run`. Streams are addressed by id. |
 
 `sirius::ffi::Fragment` is a PIMPL around one `exec::streaming_fragment`, covering both a
-`STREAMING_SINK` terminal and a `RESULT_COLLECTOR` terminal. It gives a cross-language caller a
-connection, a transaction, and a bind catalog without exposing them. Host does not own the query
-window. `streaming_fragment::build()` opens it. `run()`, a failed `build()`, or destruction closes
-it.
+`STREAMING_SINK` terminal and a `RESULT_COLLECTOR` terminal. Together with `Context` it is the
+host process: a connection, a transaction, and a bind catalog, without exposing DuckDB or cuDF
+headers. The host process does not own the query window. `streaming_fragment::build()` opens it.
+`run()`, a failed `build()`, or destruction closes it.
+
+```mermaid
+flowchart LR
+  HP["Host process<br/>sirius::ffi::Context + Fragment"]
+  SF["streaming_fragment"]
+  HP -->|always one| SF
+
+  subgraph ResultPath["Result · zero outputs"]
+    RC["RESULT_COLLECTOR"]
+    AR["Arrow"]
+    RC --> AR
+  end
+
+  subgraph Intermediate["Intermediate · local GPU pipeline"]
+    SES["stream_session"]
+    OP["SOURCE / SINK"]
+    REPO["shared_data_repository"]
+    SES --> OP --> REPO
+  end
+
+  SF -->|zero outputs| RC
+  SF -->|declare_output| SES
+```
+
+Zero outputs and `declare_output` both leave `streaming_fragment`. They no longer split in the
+host process. `RESULT_COLLECTOR` is inside `streaming_fragment`, not a second plan owned by
+`sirius::ffi::Fragment`.
 
 ## Quick path
 
@@ -39,7 +72,8 @@ drain(frag, 0);                        // pull() until drained
 ```
 
 ```cpp
-// sirius::ffi::Fragment. Cross-language. Owns the connection.
+// Host process: sirius::ffi::Context plus Fragment. Cross-language. Owns the connection.
+// Not GPU host memory.
 auto ctx = make_context();
 auto sender = make_fragment(*ctx);
 sender->declare_output(0);
@@ -110,21 +144,21 @@ streaming_fragment::build() / Fragment::build()  ── reads catalog->get(id).b
 
 ### Contracts
 
-- **Several fragments may share one connection.** A Host `Context` can hold several live
+- **Several fragments may share one connection.** One `sirius::ffi::Context` can hold several live
   `Fragment` objects so `relay_from()` can chain them. `clear()` drops every declaration on the
   connection. Only a caller that owns the whole catalog may call it. A fragment that shares a
   connection must call `erase()` on the ids it declared. `streaming_fragment` does this in its
-  destructor and at the start of `build()`. Host `Fragment::Impl` does the same. Neither calls
-  `clear()`.
+  destructor and at the start of `build()`. `sirius::ffi::Fragment::Impl` does the same. Neither
+  calls `clear()`.
 - **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind
   for an id that already has one. Without that, a plan that reads the same stream twice would
   orphan the first leaf. Only the last bind's operator would be registered, so the earlier leaf
   would never see a push or a close and its pipeline would wait forever. Give each reader its own
   stream id.
 - **The catalog must exist before bind.** The transparent SQL path installs it in
-  `SiriusContextExtensionCallback::OnConnectionOpened`. Host installs it in
-  `Context::Impl::bring_up()`. Both remove it on close. Without it, `catalog_for()` throws on the
-  first `sirius_stream_source` bind or `streaming_fragment::build()`.
+  `SiriusContextExtensionCallback::OnConnectionOpened`. The host process installs it in
+  `sirius::ffi::Context::Impl::bring_up()`. Both remove it on close. Without it, `catalog_for()`
+  throws on the first `sirius_stream_source` bind or `streaming_fragment::build()`.
 
 ## `exec::streaming_fragment`
 
@@ -193,17 +227,20 @@ exists to stop.
 **`relay_from(source, source_stream, input_stream, sender)`** lives on `streaming_fragment`. It
 checks that both fragments are built, the source has run, they share a `ClientContext`, the
 source is not a result fragment, the input was declared, the sender is expected, and
-`sink_types()` agree. Then it moves batches and closes once. Host `Fragment::relay_from` forwards
-to this.
+`sink_types()` agree. Then it moves batches and closes once. `sirius::ffi::Fragment::relay_from`
+forwards to this.
 
 **`sink_types()`** is the plan root's output column types, set during `build()`. Relay uses it to
 check column count and type ids against the target's declared input types before any batch
 moves. `pull`, `push`, `close_input`, `drained`, and `fail_output` wrap the session. The session
 itself is not public.
 
-## `sirius::ffi::Fragment`
+## Host process: `sirius::ffi::Context` plus `Fragment`
 
 **Files:** `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`
+
+The host process is the embedding process. `Context` plus `Fragment` are its public types. This
+is not GPU host memory.
 
 `Context` is an RAII handle to one embedded engine: a `duckdb::SiriusContext`, a
 `duckdb::DuckDB` plus `Connection`, and a `stream_bind_catalog`. Every `Fragment` created with
@@ -325,18 +362,19 @@ FFI tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings 
 `SiriusContext` and GPU memory pools. The Catch2 listener in `test/cpp/unittest.cpp` pauses the
 shared test environments around that tag so they do not share GPU memory with it.
 
-`test_sirius_ffi_host.cpp` drives public methods (`declare_*`, `build`, `relay_from`, `run`,
-`result_to_arrow`) and builds Substrait in the test because the FFI has no SQL passthrough. It
-covers a leaf result, a `relay_from` chain, nested `build()`, and drop after `build()`. Spec
-errors stay in `test_streaming_fragment.cpp`. Failed-build rollback stays in
-`test_sirius_ffi_fragment.cpp`.
+`test_sirius_ffi_host.cpp` drives host-process methods (`declare_*`, `build`, `relay_from`,
+`run`, `result_to_arrow`). The file name means the embedding process, not GPU host memory. It
+builds Substrait in the test because the FFI has no SQL passthrough. It covers a leaf result, a
+`relay_from` chain, nested `build()`, and drop after `build()`. Spec errors stay in
+`test_streaming_fragment.cpp`. Failed-build rollback stays in `test_sirius_ffi_fragment.cpp`.
 
 ## Not yet ported
 
 `Fragment::run()` blocks. It goes through `streaming_fragment::run()` into
 `sirius_engine::execute()`, which waits on the future from `start_query()`. Fragments therefore
 run store-and-forward, one at a time. `relay_from(...)` must finish before `run()`, and only one
-fragment may sit between its own `build()` and `run()`. Remote senders still need Host
-`push_arrow`, `pull_arrow`, and `drained` from the Arrow shuffle stack, not this change.
+fragment may sit between its own `build()` and `run()`. Remote senders still need
+`sirius::ffi::Fragment` `push_arrow`, `pull_arrow`, and `drained` from the Arrow shuffle stack,
+not this change.
 `relay_from()` only moves batches already sitting in a local, finished source fragment's output
 repository. Non-blocking scheduling is tracked separately.

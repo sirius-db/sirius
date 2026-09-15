@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-// Implementation of the public FFI surface (sirius_ffi.hpp). This is the one
-// translation unit that sees the heavy internal types, so consumers (e.g. the
-// Rust bindings) never include sirius_context.hpp.
+// Implementation of the public FFI surface (sirius_ffi.hpp). This is the host
+// process: Context plus Fragment. Not GPU host memory. This translation unit
+// sees the heavy internal types so consumers (e.g. the Rust bindings) never
+// include sirius_context.hpp.
 
 #include "sirius_ffi.hpp"
 
@@ -222,6 +223,7 @@ std::unique_ptr<Context> make_context_from_config(const std::string& config_path
 // Fragment
 // ---------------------------------------------------------------------------
 
+// Host-process PIMPL around one streaming_fragment. Not GPU host memory.
 struct Fragment::Impl {
   explicit Impl(Context::Impl& ctx) : ctx(ctx) {}
 
@@ -508,9 +510,9 @@ void Fragment::run()
     impl_->ran = true;
   } catch (...) {
     // Fail every output before unwinding. Otherwise a peer in wait() blocks forever.
-    // streaming_fragment::run() already poisons and closes the window. Repeat here so a
-    // Host caller still fails peers if that path changes. First failure wins. A result
-    // fragment has no outputs, so the loop is a no-op there.
+    // streaming_fragment::run() already poisons and closes the window. Repeat here so
+    // ffi::Fragment::run still fails peers if that path changes. First failure wins. A
+    // result fragment has no outputs, so the loop is a no-op there.
     auto const cause = std::current_exception();
     for (auto id : impl_->outputs) {
       try {

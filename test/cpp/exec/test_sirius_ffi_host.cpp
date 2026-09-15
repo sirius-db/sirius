@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// Public Host methods only. Builds Substrait in the test because the FFI has no SQL helper.
+// Public sirius::ffi::Fragment methods only (host process, not GPU host memory).
+// Builds Substrait in the test because the FFI has no SQL helper.
 // Covers a result fragment, a relay_from chain, the one-window-at-a-time rule, and drop after
 // build(). Spec errors and failed-build rollback live in test_streaming_fragment.cpp and
 // test_sirius_ffi_fragment.cpp.
