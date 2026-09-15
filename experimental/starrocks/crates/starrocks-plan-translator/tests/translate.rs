@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use starrocks_plan_translator::{
-    ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
+    ExchangeInput, ExtensionRegistry, PlanTranslator, TranslateError, URN_BOOLEAN, URN_COMPARISON,
     translate_fragment,
 };
+use starrocks_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
 use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
@@ -19,8 +20,9 @@ use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
     TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
-    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
-    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
+    TExchangeNode, TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp,
+    TNestLoopJoinNode, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -2761,18 +2763,17 @@ fn multi_distinct_count_translates_to_distinct_count() {
     assert!(names.contains(&"count".to_string()), "{names:?}");
 }
 
-/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
+/// Merge-serialize (a 3/4-phase DISTINCT plan) is still rejected; two-phase merge SUM is not.
 #[test]
-fn merge_aggregation_is_rejected() {
+fn merge_serialize_aggregation_is_rejected() {
     let mut aggregate = aggregate_expr(
         "sum",
         scalar_type(TPrimitiveType::BIGINT),
         Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
     );
     aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
-    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
-    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
-    // single aggregate output slot.
+    let mut agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    agg.agg_node.as_mut().unwrap().need_finalize = false;
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
@@ -2787,7 +2788,10 @@ fn merge_aggregation_is_rejected() {
         None,
     ))
     .unwrap_err();
-    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected unsupported plan node, got {err:?}");
+    };
+    assert!(reason.contains("merge-serialize"), "{reason}");
 }
 
 /// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
@@ -3202,11 +3206,10 @@ fn nestloop_join_without_a_liftable_comparison_still_translates() {
     }
 }
 
-/// Verifies an exchange node is still rejected: fragments are translated in isolation and
-/// multi-fragment plans are a later milestone.
+/// Verifies an exchange node without a bound input stream is rejected.
 #[test]
-fn exchange_node_is_rejected() {
-    let exchange = base_plan_node(1, TPlanNodeType::EXCHANGE_NODE, 0, vec![0]);
+fn exchange_node_without_a_bound_stream_is_rejected() {
+    let exchange = exchange_node(1, vec![0]);
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![exchange])),
         Some(base_desc()),
@@ -3220,6 +3223,229 @@ fn exchange_node_is_rejected() {
             ..
         }
     ));
+}
+
+/// Builds an EXCHANGE_NODE `node_id` over `input_row_tuples`.
+fn exchange_node(node_id: i32, input_row_tuples: Vec<i32>) -> TPlanNode {
+    let mut exchange = base_plan_node(
+        node_id,
+        TPlanNodeType::EXCHANGE_NODE,
+        0,
+        input_row_tuples.clone(),
+    );
+    exchange.exchange_node = Some(TExchangeNode::new(
+        input_row_tuples,
+        None,
+        None,
+        Some(TPartitionType::HASH_PARTITIONED),
+        Some(true),
+        None,
+    ));
+    exchange
+}
+
+/// Binds exchange node `node_id` to `sirius_stream_<node_id>` with the given sender names.
+fn stream_input(node_id: i32, names: &[&str]) -> ExchangeInput {
+    ExchangeInput {
+        node_id,
+        stream_view: format!("sirius_stream_{node_id}"),
+        names: names.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// Translates `plan` over `desc` with the given input streams bound.
+fn translate_with_streams(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    inputs: &[ExchangeInput],
+) -> Result<starrocks_plan_translator::TranslatedPlan, TranslateError> {
+    PlanTranslator::new()
+        .translate_fragment_with_exchange_inputs(&params(Some(plan), Some(desc), None), inputs)
+}
+
+/// A bound exchange becomes a named-table read of `sirius_stream_<node_id>` with the sender's
+/// column names, which is the stream the CN declares before `build()`.
+#[test]
+fn exchange_translates_to_stream_read() {
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange_node(7, vec![0])]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+    assert_eq!(translated.output_names, vec!["id", "name"]);
+    assert_eq!(translated.stream_inputs.len(), 1);
+    assert_eq!(translated.stream_inputs[0].node_id, 7);
+    assert_eq!(translated.stream_inputs[0].stream_view, "sirius_stream_7");
+    assert_eq!(
+        translated.stream_inputs[0]
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.ty.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("id", "BIGINT"), ("name", "VARCHAR")]
+    );
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a stream read");
+    };
+    let read_rel::ReadType::NamedTable(table) = read.read_type.as_ref().unwrap() else {
+        panic!("expected a named table");
+    };
+    assert_eq!(table.names, vec!["sirius_stream_7"]);
+}
+
+/// Partial and merge SUM stay SUM: two-phase GROUP BY re-aggregates partial sums.
+#[test]
+fn two_phase_sum_stays_sum() {
+    let mut partial = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    partial.agg_node.as_mut().unwrap().need_finalize = false;
+    let partial_plan = translate_fragment(&params(
+        Some(TPlan::new(vec![partial, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+    assert!(
+        extension_function_names(&partial_plan.plan).contains(&"sum".to_string()),
+        "{:?}",
+        extension_function_names(&partial_plan.plan)
+    );
+
+    let mut merge_sum = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    merge_sum.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let merge = aggregation_node(
+        8,
+        1,
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![merge_sum],
+    );
+    let merge_plan = translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        agg_desc(),
+        &[stream_input(7, &["name", "total"])],
+    )
+    .unwrap();
+    assert!(
+        extension_function_names(&merge_plan.plan).contains(&"sum".to_string()),
+        "{:?}",
+        extension_function_names(&merge_plan.plan)
+    );
+    let rel::RelType::Aggregate(aggregate) = root(&merge_plan.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected merge aggregate");
+    };
+    assert_eq!(aggregate.measures.len(), 1);
+}
+
+/// Two-phase AVG is rejected: this study slice only lowers SUM.
+#[test]
+fn two_phase_avg_is_rejected() {
+    let mut avg = aggregate_expr(
+        "avg",
+        scalar_type(TPrimitiveType::DOUBLE),
+        Some(slot_ref(1, 1, scalar_type(TPrimitiveType::DOUBLE))),
+    );
+    avg.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let merge = aggregation_node(8, 1, Vec::new(), vec![avg]);
+    // Merge AVG reads the exchange's partial-state column (tuple 1), not the scan tuple.
+    let err = translate_with_streams(
+        TPlan::new(vec![merge, exchange_node(7, vec![1])]),
+        scalar_agg_desc_for_avg(),
+        &[stream_input(7, &["total"])],
+    )
+    .unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected unsupported plan node, got {err:?}");
+    };
+    assert!(reason.contains("SUM"), "{reason}");
+}
+
+/// Descriptor for a grouping-free merge of one DOUBLE measure.
+fn scalar_agg_desc_for_avg() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "total", scalar_type(TPrimitiveType::DOUBLE)),
+        ],
+    )
+}
+
+/// Builds fragment params whose output sink is a data-stream sink with `partition`.
+fn params_with_stream_sink(
+    plan: TPlan,
+    desc: TDescriptorTable,
+    partition: TDataPartition,
+) -> TExecPlanFragmentParams {
+    let mut params = params(Some(plan), Some(desc), None);
+    params.fragment.as_mut().unwrap().output_sink = Some(TDataSink::new(
+        TDataSinkType::DATA_STREAM_SINK,
+        Some(TDataStreamSink::new(
+            9, partition, None, None, None, None, None,
+        )),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    params
+}
+
+/// A hash-partitioned sink's keys resolve to output column indices in partition-expression
+/// order.
+#[test]
+fn hash_partitioned_sink_resolves_partition_keys_to_output_columns() {
+    let translated = translate_fragment(&params_with_stream_sink(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        TDataPartition::new(
+            TPartitionType::HASH_PARTITIONED,
+            Some(vec![
+                slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+                slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            ]),
+            None,
+            None,
+        ),
+    ))
+    .unwrap();
+    assert_eq!(translated.output_partition_columns, Some(vec![1, 0]));
 }
 
 /// Returns every extension function name declared by the plan.

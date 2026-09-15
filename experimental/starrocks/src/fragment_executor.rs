@@ -1,14 +1,30 @@
 //! Execution of a translated fragment into Arrow result batches.
 //!
-//! The engine→CN result interchange is the Arrow C Data Interface (see the `SiriusExecutor`
-//! TODO). Today a [`StubExecutor`] stands in for the GPU engine so the StarRocks dispatch and
-//! result-return plumbing can be exercised end to end without a build tree or a GPU.
+//! A result fragment returns Arrow for `fetch_data`. A sender fragment parks native GPU output
+//! under [`SenderSlot`]s; a same-CN receiver relays those slots, a remote hop pulls them as
+//! Arrow. [`StubExecutor`] fabricates rows so dispatch can be exercised without a GPU.
 
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use starrocks_plan_translator::TranslatedPlan;
+
+use crate::result_store::FragmentInstanceId;
+
+/// Where one sender fragment's output is parked until its receiver runs.
+///
+/// Keyed by the *receiver* it feeds: a sender is addressed by the exchange it produces into,
+/// not by its own identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SenderSlot {
+    /// Receiver fragment instance the output is destined for.
+    pub(crate) fragment_instance_id: FragmentInstanceId,
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Sender ordinal within that exchange's sender set.
+    pub sender_id: i32,
+}
 
 /// Output of executing one plan fragment: Arrow batches matching the fragment output schema.
 #[derive(Clone, Debug)]
@@ -29,20 +45,52 @@ impl FragmentResult {
     }
 }
 
-/// Runs a translated fragment and returns its result batches.
+/// One fragment to run: the plan, where its exchange inputs come from, and where its output goes.
+#[derive(Debug)]
+pub struct FragmentRun<'a> {
+    /// Translated plan, including the schema of every exchange lowered to a stream read.
+    pub plan: &'a TranslatedPlan,
+    /// Parked sender outputs to relay into this fragment, keyed by receiver exchange node id.
+    pub inputs: Vec<(i32, Vec<SenderSlot>)>,
+    /// Remote sender batches already on this CN, as `(exchange node id, sender id, batches)`.
+    /// Pushed with `push_arrow` then `close_input` before `run()`.
+    pub remote_inputs: Vec<(i32, i32, Vec<RecordBatch>)>,
+    /// Non-empty for a sender fragment: park once, output stream i belongs to `outputs[i]`.
+    pub outputs: Vec<SenderSlot>,
+    /// Every destination receives the full output (a broadcast sink).
+    pub broadcast: bool,
+    /// Hash-partition key columns for a hash fan-out (empty otherwise).
+    pub hash_keys: Vec<usize>,
+}
+
+/// Runs a translated fragment, either parking its output for a downstream fragment or returning
+/// its rows.
 ///
-/// This is intentionally a synchronous, fully-materializing seam for the single-fragment
-/// milestone: `exec_plan_fragment` runs it to completion before returning, and `fetch_data` then
-/// drains the buffered rows.
-///
-/// TODO(starrocks-execute): a real GPU executor should not block dispatch on full materialization.
-/// Evolve this into a streaming contract — dispatch registers a running fragment and returns after
-/// startup, the executor pushes Arrow batches (e.g. via an Arrow C stream) into a bounded channel
-/// the `ResultStore` drains, and execution is cancellable from `cancel_plan_fragment`. Large/slow
-/// result queries then stream through `fetch_data` instead of risking dispatch-time timeout/OOM.
+/// The seam is synchronous and one fragment at a time: the engine serializes queries. A sender's
+/// output is parked on the GPU until its receiver is dispatched. `exec_plan_fragment` runs this
+/// on a `spawn_blocking` worker so the BRPC runtime stays free for `fetch_data`.
 pub trait FragmentExecutor: std::fmt::Debug + Send + Sync {
-    /// Executes `translated` and returns its Arrow result batches.
+    /// Executes `translated` as a result fragment (no exchange inputs, no output streams).
     fn execute(&self, translated: &TranslatedPlan) -> Result<FragmentResult, String>;
+
+    /// Runs one fragment. Returns rows only when `outputs` is empty (a result fragment).
+    /// The default path ignores parked/remote inputs and is enough for the stub.
+    fn run_fragment(&self, run: FragmentRun<'_>) -> Result<Option<FragmentResult>, String> {
+        if !run.outputs.is_empty() {
+            return Ok(None);
+        }
+        self.execute(run.plan).map(Some)
+    }
+
+    /// Next parked Arrow batches on `slot`, or `None` when that output stream is drained.
+    fn pull_arrow(&self, _slot: &SenderSlot) -> Result<Option<Vec<RecordBatch>>, String> {
+        Ok(None)
+    }
+
+    /// Drops this destination's claim on parked output. The fragment is freed with the last claim.
+    fn drop_parked(&self, _slot: &SenderSlot) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Placeholder executor that fabricates one row so the result path works without a GPU.
@@ -86,6 +134,8 @@ mod tests {
         TranslatedPlan {
             plan: Default::default(),
             output_names: names.iter().map(|name| name.to_string()).collect(),
+            output_partition_columns: None,
+            stream_inputs: Vec::new(),
         }
     }
 

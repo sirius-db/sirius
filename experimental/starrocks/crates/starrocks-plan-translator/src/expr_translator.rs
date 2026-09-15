@@ -673,18 +673,6 @@ pub(crate) fn aggregate_call(expr: &TExpr, ctx: &mut ExprContext<'_>) -> Result<
             reason: "aggregate function root is not an aggregate expression",
         });
     }
-    // One-phase aggregation only: a merge aggregate consumes partial states this translator
-    // does not model (run with `new_planner_agg_stage = 1`).
-    if root
-        .agg_expr
-        .as_ref()
-        .is_some_and(|agg_expr| agg_expr.is_merge_agg)
-    {
-        return Err(TranslateError::UnsupportedExpression {
-            node_type: root.node_type,
-            reason: "merge-phase aggregate functions are not supported (one-phase only)",
-        });
-    }
     let function = root.fn_.as_ref().ok_or(TranslateError::MissingField {
         context: "aggregate expression",
         field: "fn",
