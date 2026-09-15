@@ -3,8 +3,8 @@
 // the encode/decode JIT renderers (`encode/jit/renderer.cpp`,
 // `decode/jit/renderer.cpp`) walk it and emit plain CUDA source text,
 // which is then compiled at runtime via NVRTC and cached by shape (see
-// `KernelCache`/`ShapeKey` in `kernel_cache.hpp`, keyed on a hash of
-// the rendered source).  The beam-search explorer enumerates hundreds
+// `KernelCache`/`ShapeKey` in `kernel_cache.hpp`, keyed on the rendered source
+// and embedded CCCL fingerprint). The beam-search explorer enumerates hundreds
 // of thousands of candidate shapes, so this has to be a runtime value
 // rather than a compile-time template instantiation per shape.
 //
