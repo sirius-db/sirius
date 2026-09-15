@@ -13,7 +13,9 @@ and renders as an interactive timeline in your browser.
 The canonical telemetry model is
 [`rust/crates/telemetry/model.yaml`](../../rust/crates/telemetry/model.yaml). The Rust
 instrumentation types, stored-event types, and C++ bridge are generated from that same schema during
-the build. Change the YAML schema rather than generated bridge files.
+the build. Change the YAML schema rather than generated bridge files. The
+[`Task` FSM reference](../../rust/crates/telemetry/TASK_FSM.md) documents its runtime paths,
+attributes, and resource usages.
 
 > **Trace compatibility.** The schema-based Quent format is not compatible with traces emitted by
 > the previous macro-based instrumentation model. Generate new telemetry after upgrading Sirius;
