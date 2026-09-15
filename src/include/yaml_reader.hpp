@@ -60,6 +60,12 @@ struct fraction {
 };
 
 template <typename T>
+struct positive_fraction {
+  bool operator()(const T& v) const noexcept { return v > T{0} && v <= T{1}; }
+  static constexpr const char* description() { return "must be greater than 0.0 and at most 1.0"; }
+};
+
+template <typename T>
 struct greater_than {
   T threshold;
   bool operator()(const T& v) const noexcept { return v > threshold; }
