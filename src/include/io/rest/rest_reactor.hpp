@@ -371,6 +371,65 @@ class rest_reactor {
   // work and therefore never get counted a second time.
   std::atomic<std::size_t> _queued_bytes{0};
 
+ public:
+  /// Per-reactor read counters, for SIRIUS_IO_PROFILE.
+  ///
+  /// What a read path costs is not visible from wall time alone: the same bytes
+  /// can arrive as a few large GETs or many small ones, and a reactor can be
+  /// saturated or starved while both look identical from outside. These record
+  /// which, so a slow scan can be attributed to request size, to concurrency, or
+  /// to neither.
+  struct io_stats {
+    std::uint64_t requests{0};       ///< ranged GETs completed (retries counted again)
+    std::uint64_t bytes{0};          ///< payload bytes delivered
+    std::uint64_t submit_events{0};  ///< in-flight samples taken, one per submit pass
+    std::uint64_t inflight_sum{0};   ///< sum of in-flight depth over those samples
+    std::uint64_t inflight_peak{0};  ///< deepest concurrency observed
+    std::uint64_t request_nanos{0};  ///< summed per-request wall time, across slots
+  };
+
+  /// Snapshot the counters and zero them. Reading resets, matching the rest of
+  /// the SIRIUS_IO_PROFILE surface.
+  [[nodiscard]] io_stats stats_snapshot_and_reset() noexcept
+  {
+    io_stats out;
+    out.requests      = _stat_requests.exchange(0, std::memory_order_relaxed);
+    out.bytes         = _stat_bytes.exchange(0, std::memory_order_relaxed);
+    out.submit_events = _stat_submit_events.exchange(0, std::memory_order_relaxed);
+    out.inflight_sum  = _stat_inflight_sum.exchange(0, std::memory_order_relaxed);
+    out.inflight_peak = _stat_inflight_peak.exchange(0, std::memory_order_relaxed);
+    out.request_nanos = _stat_request_nanos.exchange(0, std::memory_order_relaxed);
+    return out;
+  }
+
+  /// Record one completed GET. Called from the worker thread only, but the
+  /// counters are atomic because the reader is whichever thread ends the query.
+  void note_request(std::uint64_t bytes, std::uint64_t nanos) noexcept
+  {
+    _stat_requests.fetch_add(1, std::memory_order_relaxed);
+    _stat_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    _stat_request_nanos.fetch_add(nanos, std::memory_order_relaxed);
+  }
+
+  /// Record the in-flight depth after a submit pass -- the number that says
+  /// whether the reactor is being kept fed.
+  void note_inflight(std::uint64_t depth) noexcept
+  {
+    _stat_submit_events.fetch_add(1, std::memory_order_relaxed);
+    _stat_inflight_sum.fetch_add(depth, std::memory_order_relaxed);
+    auto peak = _stat_inflight_peak.load(std::memory_order_relaxed);
+    while (depth > peak &&
+           !_stat_inflight_peak.compare_exchange_weak(peak, depth, std::memory_order_relaxed)) {}
+  }
+
+ private:
+  std::atomic<std::uint64_t> _stat_requests{0};
+  std::atomic<std::uint64_t> _stat_bytes{0};
+  std::atomic<std::uint64_t> _stat_submit_events{0};
+  std::atomic<std::uint64_t> _stat_inflight_sum{0};
+  std::atomic<std::uint64_t> _stat_inflight_peak{0};
+  std::atomic<std::uint64_t> _stat_request_nanos{0};
+
   std::jthread _worker;
 };
 

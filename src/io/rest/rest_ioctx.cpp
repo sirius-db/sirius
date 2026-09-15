@@ -260,4 +260,56 @@ std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string pa
                                           std::move(probe.etag));
 }
 
+std::string rest_ioctx::perf_report_and_reset() noexcept
+{
+  try {
+    rest_reactor::io_stats total;
+    std::size_t reactors = 0;
+    for (auto& reactor : _reactors) {
+      if (!reactor) { continue; }
+      auto const s = reactor->stats_snapshot_and_reset();
+      total.requests += s.requests;
+      total.bytes += s.bytes;
+      total.submit_events += s.submit_events;
+      total.inflight_sum += s.inflight_sum;
+      total.inflight_peak = std::max(total.inflight_peak, s.inflight_peak);
+      total.request_nanos += s.request_nanos;
+      ++reactors;
+    }
+    if (total.requests == 0) { return {}; }
+
+    auto const mean_req_mb = static_cast<double>(total.bytes) / total.requests / (1024.0 * 1024.0);
+    auto const mean_req_ms = static_cast<double>(total.request_nanos) / total.requests / 1.0e6;
+    auto const mean_inflight =
+      total.submit_events ? static_cast<double>(total.inflight_sum) / total.submit_events : 0.0;
+    // Per-request throughput, i.e. what one GET achieved while it was open. Below
+    // the link's per-stream rate this is a request-shape problem; at it, the only
+    // lever left is more of them in flight.
+    auto const per_req_mb_s = mean_req_ms > 0.0 ? mean_req_mb / (mean_req_ms / 1000.0) : 0.0;
+    auto const ceiling =
+      reactors * (_reactors.empty() ? 0 : _reactors.front()->get_config().max_connections);
+
+    return std::format(
+      "=== rest io ===\n"
+      "  reactors                  : {}\n"
+      "  requests                  : {}\n"
+      "  bytes                     : {:.2f} GB\n"
+      "  mean request size         : {:.2f} MB\n"
+      "  mean request duration     : {:.1f} ms  ({:.0f} MB/s per request)\n"
+      "  mean in-flight (realised) : {:.1f} of {} slots\n"
+      "  peak in-flight            : {}\n",
+      reactors,
+      total.requests,
+      static_cast<double>(total.bytes) / 1e9,
+      mean_req_mb,
+      mean_req_ms,
+      per_req_mb_s,
+      mean_inflight,
+      ceiling,
+      total.inflight_peak);
+  } catch (...) {
+    return {};
+  }
+}
+
 }  // namespace sirius::io::rest
