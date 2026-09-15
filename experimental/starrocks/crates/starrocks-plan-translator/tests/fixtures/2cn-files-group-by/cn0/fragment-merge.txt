@@ -1,0 +1,1930 @@
+TExecPlanFragmentParams {
+    protocol_version: InternalServiceVersion(
+        0,
+    ),
+    fragment: Some(
+        TPlanFragment {
+            plan: Some(
+                TPlan {
+                    nodes: [
+                        TPlanNode {
+                            node_id: 3,
+                            node_type: TPlanNodeType(
+                                6,
+                            ),
+                            num_children: 1,
+                            limit: -1,
+                            row_tuples: [
+                                3,
+                            ],
+                            nullable_tuples: [
+                                false,
+                            ],
+                            conjuncts: None,
+                            compact_data: false,
+                            common: None,
+                            hash_join_node: None,
+                            agg_node: Some(
+                                TAggregationNode {
+                                    grouping_exprs: Some(
+                                        [
+                                            TExpr {
+                                                nodes: [
+                                                    TExprNode {
+                                                        node_type: TExprNodeType(
+                                                            16,
+                                                        ),
+                                                        type_: TTypeDesc {
+                                                            types: Some(
+                                                                [
+                                                                    TTypeNode {
+                                                                        type_: TTypeNodeType(
+                                                                            0,
+                                                                        ),
+                                                                        scalar_type: Some(
+                                                                            TScalarType {
+                                                                                type_: TPrimitiveType(
+                                                                                    15,
+                                                                                ),
+                                                                                len: Some(
+                                                                                    1048576,
+                                                                                ),
+                                                                                precision: None,
+                                                                                scale: None,
+                                                                            },
+                                                                        ),
+                                                                        struct_fields: None,
+                                                                        is_named: None,
+                                                                    },
+                                                                ],
+                                                            ),
+                                                        },
+                                                        opcode: None,
+                                                        num_children: 0,
+                                                        agg_expr: None,
+                                                        bool_literal: None,
+                                                        case_expr: None,
+                                                        date_literal: None,
+                                                        float_literal: None,
+                                                        int_literal: None,
+                                                        in_predicate: None,
+                                                        is_null_pred: None,
+                                                        like_pred: None,
+                                                        literal_pred: None,
+                                                        slot_ref: Some(
+                                                            TSlotRef {
+                                                                slot_id: 1,
+                                                                tuple_id: 2,
+                                                            },
+                                                        ),
+                                                        string_literal: None,
+                                                        tuple_is_null_pred: None,
+                                                        info_func: None,
+                                                        decimal_literal: None,
+                                                        output_scale: -1,
+                                                        fn_call_expr: None,
+                                                        large_int_literal: None,
+                                                        output_column: None,
+                                                        output_type: None,
+                                                        vector_opcode: None,
+                                                        fn_: None,
+                                                        vararg_start_idx: None,
+                                                        child_type: None,
+                                                        vslot_ref: None,
+                                                        used_subfield_names: None,
+                                                        binary_literal: None,
+                                                        copy_flag: None,
+                                                        check_is_out_of_bounds: None,
+                                                        use_vectorized: None,
+                                                        has_nullable_child: Some(
+                                                            false,
+                                                        ),
+                                                        is_nullable: Some(
+                                                            true,
+                                                        ),
+                                                        child_type_desc: None,
+                                                        is_monotonic: Some(
+                                                            true,
+                                                        ),
+                                                        dict_query_expr: None,
+                                                        dictionary_get_expr: None,
+                                                        is_index_only_filter: Some(
+                                                            false,
+                                                        ),
+                                                        is_nondeterministic: None,
+                                                        cast_struct_by_name: None,
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    ),
+                                    aggregate_functions: [
+                                        TExpr {
+                                            nodes: [
+                                                TExprNode {
+                                                    node_type: TExprNodeType(
+                                                        0,
+                                                    ),
+                                                    type_: TTypeDesc {
+                                                        types: Some(
+                                                            [
+                                                                TTypeNode {
+                                                                    type_: TTypeNodeType(
+                                                                        0,
+                                                                    ),
+                                                                    scalar_type: Some(
+                                                                        TScalarType {
+                                                                            type_: TPrimitiveType(
+                                                                                6,
+                                                                            ),
+                                                                            len: None,
+                                                                            precision: None,
+                                                                            scale: None,
+                                                                        },
+                                                                    ),
+                                                                    struct_fields: None,
+                                                                    is_named: None,
+                                                                },
+                                                            ],
+                                                        ),
+                                                    },
+                                                    opcode: None,
+                                                    num_children: 1,
+                                                    agg_expr: Some(
+                                                        TAggregateExpr {
+                                                            is_merge_agg: true,
+                                                        },
+                                                    ),
+                                                    bool_literal: None,
+                                                    case_expr: None,
+                                                    date_literal: None,
+                                                    float_literal: None,
+                                                    int_literal: None,
+                                                    in_predicate: None,
+                                                    is_null_pred: None,
+                                                    like_pred: None,
+                                                    literal_pred: None,
+                                                    slot_ref: None,
+                                                    string_literal: None,
+                                                    tuple_is_null_pred: None,
+                                                    info_func: None,
+                                                    decimal_literal: None,
+                                                    output_scale: -1,
+                                                    fn_call_expr: None,
+                                                    large_int_literal: None,
+                                                    output_column: None,
+                                                    output_type: None,
+                                                    vector_opcode: None,
+                                                    fn_: Some(
+                                                        TFunction {
+                                                            name: TFunctionName {
+                                                                db_name: None,
+                                                                function_name: "sum",
+                                                            },
+                                                            binary_type: TFunctionBinaryType(
+                                                                0,
+                                                            ),
+                                                            arg_types: [
+                                                                TTypeDesc {
+                                                                    types: Some(
+                                                                        [
+                                                                            TTypeNode {
+                                                                                type_: TTypeNodeType(
+                                                                                    0,
+                                                                                ),
+                                                                                scalar_type: Some(
+                                                                                    TScalarType {
+                                                                                        type_: TPrimitiveType(
+                                                                                            6,
+                                                                                        ),
+                                                                                        len: None,
+                                                                                        precision: None,
+                                                                                        scale: None,
+                                                                                    },
+                                                                                ),
+                                                                                struct_fields: None,
+                                                                                is_named: None,
+                                                                            },
+                                                                        ],
+                                                                    ),
+                                                                },
+                                                            ],
+                                                            ret_type: TTypeDesc {
+                                                                types: Some(
+                                                                    [
+                                                                        TTypeNode {
+                                                                            type_: TTypeNodeType(
+                                                                                0,
+                                                                            ),
+                                                                            scalar_type: Some(
+                                                                                TScalarType {
+                                                                                    type_: TPrimitiveType(
+                                                                                        6,
+                                                                                    ),
+                                                                                    len: None,
+                                                                                    precision: None,
+                                                                                    scale: None,
+                                                                                },
+                                                                            ),
+                                                                            struct_fields: None,
+                                                                            is_named: None,
+                                                                        },
+                                                                    ],
+                                                                ),
+                                                            },
+                                                            has_var_args: false,
+                                                            comment: None,
+                                                            signature: None,
+                                                            hdfs_location: None,
+                                                            scalar_fn: None,
+                                                            aggregate_fn: Some(
+                                                                TAggregateFunction {
+                                                                    intermediate_type: TTypeDesc {
+                                                                        types: Some(
+                                                                            [
+                                                                                TTypeNode {
+                                                                                    type_: TTypeNodeType(
+                                                                                        0,
+                                                                                    ),
+                                                                                    scalar_type: Some(
+                                                                                        TScalarType {
+                                                                                            type_: TPrimitiveType(
+                                                                                                6,
+                                                                                            ),
+                                                                                            len: None,
+                                                                                            precision: None,
+                                                                                            scale: None,
+                                                                                        },
+                                                                                    ),
+                                                                                    struct_fields: None,
+                                                                                    is_named: None,
+                                                                                },
+                                                                            ],
+                                                                        ),
+                                                                    },
+                                                                    update_fn_symbol: None,
+                                                                    init_fn_symbol: None,
+                                                                    serialize_fn_symbol: None,
+                                                                    merge_fn_symbol: None,
+                                                                    finalize_fn_symbol: None,
+                                                                    get_value_fn_symbol: None,
+                                                                    remove_fn_symbol: None,
+                                                                    is_analytic_only_fn: Some(
+                                                                        false,
+                                                                    ),
+                                                                    symbol: Some(
+                                                                        "",
+                                                                    ),
+                                                                    is_asc_order: None,
+                                                                    nulls_first: None,
+                                                                    is_distinct: Some(
+                                                                        false,
+                                                                    ),
+                                                                },
+                                                            ),
+                                                            id: Some(
+                                                                0,
+                                                            ),
+                                                            checksum: None,
+                                                            agg_state_desc: None,
+                                                            fid: Some(
+                                                                0,
+                                                            ),
+                                                            table_fn: None,
+                                                            could_apply_dict_optimize: Some(
+                                                                false,
+                                                            ),
+                                                            ignore_nulls: Some(
+                                                                false,
+                                                            ),
+                                                            isolated: Some(
+                                                                true,
+                                                            ),
+                                                            input_type: None,
+                                                            content: None,
+                                                            cloud_configuration: None,
+                                                        },
+                                                    ),
+                                                    vararg_start_idx: None,
+                                                    child_type: None,
+                                                    vslot_ref: None,
+                                                    used_subfield_names: None,
+                                                    binary_literal: None,
+                                                    copy_flag: None,
+                                                    check_is_out_of_bounds: None,
+                                                    use_vectorized: None,
+                                                    has_nullable_child: Some(
+                                                        true,
+                                                    ),
+                                                    is_nullable: Some(
+                                                        true,
+                                                    ),
+                                                    child_type_desc: None,
+                                                    is_monotonic: Some(
+                                                        false,
+                                                    ),
+                                                    dict_query_expr: None,
+                                                    dictionary_get_expr: None,
+                                                    is_index_only_filter: Some(
+                                                        false,
+                                                    ),
+                                                    is_nondeterministic: None,
+                                                    cast_struct_by_name: None,
+                                                },
+                                                TExprNode {
+                                                    node_type: TExprNodeType(
+                                                        16,
+                                                    ),
+                                                    type_: TTypeDesc {
+                                                        types: Some(
+                                                            [
+                                                                TTypeNode {
+                                                                    type_: TTypeNodeType(
+                                                                        0,
+                                                                    ),
+                                                                    scalar_type: Some(
+                                                                        TScalarType {
+                                                                            type_: TPrimitiveType(
+                                                                                6,
+                                                                            ),
+                                                                            len: None,
+                                                                            precision: None,
+                                                                            scale: None,
+                                                                        },
+                                                                    ),
+                                                                    struct_fields: None,
+                                                                    is_named: None,
+                                                                },
+                                                            ],
+                                                        ),
+                                                    },
+                                                    opcode: None,
+                                                    num_children: 0,
+                                                    agg_expr: None,
+                                                    bool_literal: None,
+                                                    case_expr: None,
+                                                    date_literal: None,
+                                                    float_literal: None,
+                                                    int_literal: None,
+                                                    in_predicate: None,
+                                                    is_null_pred: None,
+                                                    like_pred: None,
+                                                    literal_pred: None,
+                                                    slot_ref: Some(
+                                                        TSlotRef {
+                                                            slot_id: 3,
+                                                            tuple_id: 2,
+                                                        },
+                                                    ),
+                                                    string_literal: None,
+                                                    tuple_is_null_pred: None,
+                                                    info_func: None,
+                                                    decimal_literal: None,
+                                                    output_scale: -1,
+                                                    fn_call_expr: None,
+                                                    large_int_literal: None,
+                                                    output_column: None,
+                                                    output_type: None,
+                                                    vector_opcode: None,
+                                                    fn_: None,
+                                                    vararg_start_idx: None,
+                                                    child_type: None,
+                                                    vslot_ref: None,
+                                                    used_subfield_names: None,
+                                                    binary_literal: None,
+                                                    copy_flag: None,
+                                                    check_is_out_of_bounds: None,
+                                                    use_vectorized: None,
+                                                    has_nullable_child: Some(
+                                                        false,
+                                                    ),
+                                                    is_nullable: Some(
+                                                        true,
+                                                    ),
+                                                    child_type_desc: None,
+                                                    is_monotonic: Some(
+                                                        true,
+                                                    ),
+                                                    dict_query_expr: None,
+                                                    dictionary_get_expr: None,
+                                                    is_index_only_filter: Some(
+                                                        false,
+                                                    ),
+                                                    is_nondeterministic: None,
+                                                    cast_struct_by_name: None,
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                    intermediate_tuple_id: 3,
+                                    output_tuple_id: 3,
+                                    need_finalize: true,
+                                    use_streaming_preaggregation: Some(
+                                        false,
+                                    ),
+                                    has_outer_join_child: Some(
+                                        false,
+                                    ),
+                                    streaming_preaggregation_mode: Some(
+                                        TStreamingPreaggregationMode(
+                                            0,
+                                        ),
+                                    ),
+                                    sql_grouping_keys: Some(
+                                        "1: region",
+                                    ),
+                                    sql_aggregate_functions: Some(
+                                        "sum(3: sum)",
+                                    ),
+                                    agg_func_set_version: Some(
+                                        3,
+                                    ),
+                                    intermediate_aggr_exprs: Some(
+                                        [
+                                            TExpr {
+                                                nodes: [
+                                                    TExprNode {
+                                                        node_type: TExprNodeType(
+                                                            16,
+                                                        ),
+                                                        type_: TTypeDesc {
+                                                            types: Some(
+                                                                [
+                                                                    TTypeNode {
+                                                                        type_: TTypeNodeType(
+                                                                            0,
+                                                                        ),
+                                                                        scalar_type: Some(
+                                                                            TScalarType {
+                                                                                type_: TPrimitiveType(
+                                                                                    6,
+                                                                                ),
+                                                                                len: None,
+                                                                                precision: None,
+                                                                                scale: None,
+                                                                            },
+                                                                        ),
+                                                                        struct_fields: None,
+                                                                        is_named: None,
+                                                                    },
+                                                                ],
+                                                            ),
+                                                        },
+                                                        opcode: None,
+                                                        num_children: 0,
+                                                        agg_expr: None,
+                                                        bool_literal: None,
+                                                        case_expr: None,
+                                                        date_literal: None,
+                                                        float_literal: None,
+                                                        int_literal: None,
+                                                        in_predicate: None,
+                                                        is_null_pred: None,
+                                                        like_pred: None,
+                                                        literal_pred: None,
+                                                        slot_ref: Some(
+                                                            TSlotRef {
+                                                                slot_id: 3,
+                                                                tuple_id: 3,
+                                                            },
+                                                        ),
+                                                        string_literal: None,
+                                                        tuple_is_null_pred: None,
+                                                        info_func: None,
+                                                        decimal_literal: None,
+                                                        output_scale: -1,
+                                                        fn_call_expr: None,
+                                                        large_int_literal: None,
+                                                        output_column: None,
+                                                        output_type: None,
+                                                        vector_opcode: None,
+                                                        fn_: None,
+                                                        vararg_start_idx: None,
+                                                        child_type: None,
+                                                        vslot_ref: None,
+                                                        used_subfield_names: None,
+                                                        binary_literal: None,
+                                                        copy_flag: None,
+                                                        check_is_out_of_bounds: None,
+                                                        use_vectorized: None,
+                                                        has_nullable_child: Some(
+                                                            false,
+                                                        ),
+                                                        is_nullable: Some(
+                                                            true,
+                                                        ),
+                                                        child_type_desc: None,
+                                                        is_monotonic: Some(
+                                                            true,
+                                                        ),
+                                                        dict_query_expr: None,
+                                                        dictionary_get_expr: None,
+                                                        is_index_only_filter: Some(
+                                                            false,
+                                                        ),
+                                                        is_nondeterministic: None,
+                                                        cast_struct_by_name: None,
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    ),
+                                    interpolate_passthrough: Some(
+                                        false,
+                                    ),
+                                    use_sort_agg: Some(
+                                        false,
+                                    ),
+                                    use_per_bucket_optimize: Some(
+                                        false,
+                                    ),
+                                    enable_pipeline_share_limit: Some(
+                                        true,
+                                    ),
+                                    build_runtime_filters: None,
+                                    group_by_min_max: None,
+                                },
+                            ),
+                            sort_node: None,
+                            merge_node: None,
+                            exchange_node: None,
+                            mysql_scan_node: None,
+                            olap_scan_node: None,
+                            file_scan_node: None,
+                            schema_scan_node: None,
+                            meta_scan_node: None,
+                            analytic_node: None,
+                            union_node: None,
+                            resource_profile: None,
+                            es_scan_node: None,
+                            repeat_node: None,
+                            assert_num_rows_node: None,
+                            intersect_node: None,
+                            except_node: None,
+                            merge_join_node: None,
+                            raw_values_node: None,
+                            use_vectorized: None,
+                            hdfs_scan_node: None,
+                            project_node: None,
+                            table_function_node: None,
+                            probe_runtime_filters: None,
+                            decode_node: None,
+                            local_rf_waiting_set: Some(
+                                {},
+                            ),
+                            filter_null_value_columns: None,
+                            need_create_tuple_columns: Some(
+                                false,
+                            ),
+                            jdbc_scan_node: None,
+                            connector_scan_node: None,
+                            cross_join_node: None,
+                            lake_scan_node: None,
+                            nestloop_join_node: None,
+                            stream_scan_node: None,
+                            stream_join_node: None,
+                            stream_agg_node: None,
+                            select_node: None,
+                            fetch_node: None,
+                            look_up_node: None,
+                            cache_stats_scan_node: None,
+                        },
+                        TPlanNode {
+                            node_id: 2,
+                            node_type: TPlanNodeType(
+                                9,
+                            ),
+                            num_children: 0,
+                            limit: -1,
+                            row_tuples: [
+                                2,
+                            ],
+                            nullable_tuples: [
+                                false,
+                            ],
+                            conjuncts: None,
+                            compact_data: false,
+                            common: None,
+                            hash_join_node: None,
+                            agg_node: None,
+                            sort_node: None,
+                            merge_node: None,
+                            exchange_node: Some(
+                                TExchangeNode {
+                                    input_row_tuples: [
+                                        2,
+                                    ],
+                                    sort_info: None,
+                                    offset: Some(
+                                        0,
+                                    ),
+                                    partition_type: Some(
+                                        TPartitionType(
+                                            2,
+                                        ),
+                                    ),
+                                    enable_parallel_merge: Some(
+                                        true,
+                                    ),
+                                    parallel_merge_late_materialize_mode: Some(
+                                        TLateMaterializeMode(
+                                            0,
+                                        ),
+                                    ),
+                                },
+                            ),
+                            mysql_scan_node: None,
+                            olap_scan_node: None,
+                            file_scan_node: None,
+                            schema_scan_node: None,
+                            meta_scan_node: None,
+                            analytic_node: None,
+                            union_node: None,
+                            resource_profile: None,
+                            es_scan_node: None,
+                            repeat_node: None,
+                            assert_num_rows_node: None,
+                            intersect_node: None,
+                            except_node: None,
+                            merge_join_node: None,
+                            raw_values_node: None,
+                            use_vectorized: None,
+                            hdfs_scan_node: None,
+                            project_node: None,
+                            table_function_node: None,
+                            probe_runtime_filters: None,
+                            decode_node: None,
+                            local_rf_waiting_set: Some(
+                                {},
+                            ),
+                            filter_null_value_columns: None,
+                            need_create_tuple_columns: Some(
+                                false,
+                            ),
+                            jdbc_scan_node: None,
+                            connector_scan_node: None,
+                            cross_join_node: None,
+                            lake_scan_node: None,
+                            nestloop_join_node: None,
+                            stream_scan_node: None,
+                            stream_join_node: None,
+                            stream_agg_node: None,
+                            select_node: None,
+                            fetch_node: None,
+                            look_up_node: None,
+                            cache_stats_scan_node: None,
+                        },
+                    ],
+                },
+            ),
+            output_exprs: None,
+            output_sink: Some(
+                TDataSink {
+                    type_: TDataSinkType(
+                        0,
+                    ),
+                    stream_sink: Some(
+                        TDataStreamSink {
+                            dest_node_id: 4,
+                            output_partition: TDataPartition {
+                                type_: TPartitionType(
+                                    0,
+                                ),
+                                partition_exprs: Some(
+                                    [],
+                                ),
+                                partition_infos: None,
+                                bucket_properties: None,
+                            },
+                            ignore_not_found: None,
+                            is_merge: Some(
+                                false,
+                            ),
+                            dest_dop: Some(
+                                8,
+                            ),
+                            output_columns: None,
+                            limit: None,
+                        },
+                    ),
+                    result_sink: None,
+                    mysql_table_sink: None,
+                    export_sink: None,
+                    olap_table_sink: None,
+                    memory_scratch_sink: None,
+                    multi_cast_stream_sink: None,
+                    schema_table_sink: None,
+                    iceberg_table_sink: None,
+                    hive_table_sink: None,
+                    table_function_table_sink: None,
+                    dictionary_cache_sink: None,
+                    multi_olap_table_sinks: None,
+                    sink_id: None,
+                    split_stream_sink: None,
+                },
+            ),
+            partition: TDataPartition {
+                type_: TPartitionType(
+                    2,
+                ),
+                partition_exprs: Some(
+                    [
+                        TExpr {
+                            nodes: [
+                                TExprNode {
+                                    node_type: TExprNodeType(
+                                        16,
+                                    ),
+                                    type_: TTypeDesc {
+                                        types: Some(
+                                            [
+                                                TTypeNode {
+                                                    type_: TTypeNodeType(
+                                                        0,
+                                                    ),
+                                                    scalar_type: Some(
+                                                        TScalarType {
+                                                            type_: TPrimitiveType(
+                                                                15,
+                                                            ),
+                                                            len: Some(
+                                                                1048576,
+                                                            ),
+                                                            precision: None,
+                                                            scale: None,
+                                                        },
+                                                    ),
+                                                    struct_fields: None,
+                                                    is_named: None,
+                                                },
+                                            ],
+                                        ),
+                                    },
+                                    opcode: None,
+                                    num_children: 0,
+                                    agg_expr: None,
+                                    bool_literal: None,
+                                    case_expr: None,
+                                    date_literal: None,
+                                    float_literal: None,
+                                    int_literal: None,
+                                    in_predicate: None,
+                                    is_null_pred: None,
+                                    like_pred: None,
+                                    literal_pred: None,
+                                    slot_ref: Some(
+                                        TSlotRef {
+                                            slot_id: 1,
+                                            tuple_id: 2,
+                                        },
+                                    ),
+                                    string_literal: None,
+                                    tuple_is_null_pred: None,
+                                    info_func: None,
+                                    decimal_literal: None,
+                                    output_scale: -1,
+                                    fn_call_expr: None,
+                                    large_int_literal: None,
+                                    output_column: None,
+                                    output_type: None,
+                                    vector_opcode: None,
+                                    fn_: None,
+                                    vararg_start_idx: None,
+                                    child_type: None,
+                                    vslot_ref: None,
+                                    used_subfield_names: None,
+                                    binary_literal: None,
+                                    copy_flag: None,
+                                    check_is_out_of_bounds: None,
+                                    use_vectorized: None,
+                                    has_nullable_child: Some(
+                                        false,
+                                    ),
+                                    is_nullable: Some(
+                                        true,
+                                    ),
+                                    child_type_desc: None,
+                                    is_monotonic: Some(
+                                        true,
+                                    ),
+                                    dict_query_expr: None,
+                                    dictionary_get_expr: None,
+                                    is_index_only_filter: Some(
+                                        false,
+                                    ),
+                                    is_nondeterministic: None,
+                                    cast_struct_by_name: None,
+                                },
+                            ],
+                        },
+                    ],
+                ),
+                partition_infos: None,
+                bucket_properties: None,
+            },
+            min_reservation_bytes: None,
+            initial_reservation_total_claims: None,
+            query_global_dicts: None,
+            load_global_dicts: None,
+            cache_param: None,
+            query_global_dict_exprs: None,
+            group_execution_param: None,
+        },
+    ),
+    desc_tbl: Some(
+        TDescriptorTable {
+            slot_descriptors: Some(
+                [
+                    TSlotDescriptor {
+                        id: Some(
+                            1,
+                        ),
+                        parent: Some(
+                            0,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        15,
+                                                    ),
+                                                    len: Some(
+                                                        1048576,
+                                                    ),
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "region",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            true,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            2,
+                        ),
+                        parent: Some(
+                            0,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        6,
+                                                    ),
+                                                    len: None,
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "amount",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            true,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            0,
+                        ),
+                        parent: Some(
+                            1,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        15,
+                                                    ),
+                                                    len: Some(
+                                                        1048576,
+                                                    ),
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "region",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            1,
+                        ),
+                        parent: Some(
+                            1,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        6,
+                                                    ),
+                                                    len: None,
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "amount",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            1,
+                        ),
+                        parent: Some(
+                            2,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        15,
+                                                    ),
+                                                    len: Some(
+                                                        1048576,
+                                                    ),
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            3,
+                        ),
+                        parent: Some(
+                            2,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        6,
+                                                    ),
+                                                    len: None,
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            1,
+                        ),
+                        parent: Some(
+                            3,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        15,
+                                                    ),
+                                                    len: Some(
+                                                        1048576,
+                                                    ),
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    TSlotDescriptor {
+                        id: Some(
+                            3,
+                        ),
+                        parent: Some(
+                            3,
+                        ),
+                        slot_type: Some(
+                            TTypeDesc {
+                                types: Some(
+                                    [
+                                        TTypeNode {
+                                            type_: TTypeNodeType(
+                                                0,
+                                            ),
+                                            scalar_type: Some(
+                                                TScalarType {
+                                                    type_: TPrimitiveType(
+                                                        6,
+                                                    ),
+                                                    len: None,
+                                                    precision: None,
+                                                    scale: None,
+                                                },
+                                            ),
+                                            struct_fields: None,
+                                            is_named: None,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        column_pos: Some(
+                            -1,
+                        ),
+                        byte_offset: Some(
+                            -1,
+                        ),
+                        null_indicator_byte: Some(
+                            -1,
+                        ),
+                        null_indicator_bit: Some(
+                            1,
+                        ),
+                        col_name: Some(
+                            "",
+                        ),
+                        slot_idx: Some(
+                            -1,
+                        ),
+                        is_materialized: Some(
+                            true,
+                        ),
+                        is_output_column: Some(
+                            false,
+                        ),
+                        is_nullable: Some(
+                            true,
+                        ),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                ],
+            ),
+            tuple_descriptors: [
+                TTupleDescriptor {
+                    id: Some(
+                        0,
+                    ),
+                    byte_size: Some(
+                        -1,
+                    ),
+                    num_null_bytes: Some(
+                        -1,
+                    ),
+                    table_id: None,
+                    num_null_slots: Some(
+                        -1,
+                    ),
+                },
+                TTupleDescriptor {
+                    id: Some(
+                        1,
+                    ),
+                    byte_size: Some(
+                        -1,
+                    ),
+                    num_null_bytes: Some(
+                        -1,
+                    ),
+                    table_id: None,
+                    num_null_slots: Some(
+                        -1,
+                    ),
+                },
+                TTupleDescriptor {
+                    id: Some(
+                        2,
+                    ),
+                    byte_size: Some(
+                        -1,
+                    ),
+                    num_null_bytes: Some(
+                        -1,
+                    ),
+                    table_id: None,
+                    num_null_slots: Some(
+                        -1,
+                    ),
+                },
+                TTupleDescriptor {
+                    id: Some(
+                        3,
+                    ),
+                    byte_size: Some(
+                        -1,
+                    ),
+                    num_null_bytes: Some(
+                        -1,
+                    ),
+                    table_id: None,
+                    num_null_slots: Some(
+                        -1,
+                    ),
+                },
+            ],
+            table_descriptors: None,
+            is_cached: Some(
+                false,
+            ),
+        },
+    ),
+    params: Some(
+        TPlanFragmentExecParams {
+            query_id: TUniqueId {
+                hi: 117255939833754521,
+                lo: -5220435452681048285,
+            },
+            fragment_instance_id: TUniqueId {
+                hi: 117255939833754521,
+                lo: -5220435452681048283,
+            },
+            per_node_scan_ranges: {},
+            per_exch_num_senders: {
+                2: 1,
+            },
+            destinations: Some(
+                [
+                    TPlanFragmentDestination {
+                        fragment_instance_id: TUniqueId {
+                            hi: 117255939833754521,
+                            lo: -5220435452681048284,
+                        },
+                        deprecated_server: Some(
+                            TNetworkAddress {
+                                hostname: "127.0.0.1",
+                                port: 9101,
+                            },
+                        ),
+                        brpc_server: Some(
+                            TNetworkAddress {
+                                hostname: "127.0.0.1",
+                                port: 9102,
+                            },
+                        ),
+                        pipeline_driver_sequence: None,
+                    },
+                ],
+            ),
+            sender_id: Some(
+                0,
+            ),
+            num_senders: Some(
+                2,
+            ),
+            send_query_statistics_with_every_batch: Some(
+                false,
+            ),
+            use_vectorized: Some(
+                true,
+            ),
+            runtime_filter_params: None,
+            instances_number: Some(
+                3,
+            ),
+            enable_exchange_pass_through: Some(
+                true,
+            ),
+            node_to_per_driver_seq_scan_ranges: Some(
+                {},
+            ),
+            enable_exchange_perf: Some(
+                false,
+            ),
+            pipeline_sink_dop: None,
+            report_when_finish: Some(
+                false,
+            ),
+            exec_debug_options: None,
+        },
+    ),
+    coord: Some(
+        TNetworkAddress {
+            hostname: "127.0.0.1",
+            port: 9020,
+        },
+    ),
+    backend_num: Some(
+        1,
+    ),
+    query_globals: Some(
+        TQueryGlobals {
+            now_string: "2026-09-12 03:27:32",
+            timestamp_ms: Some(
+                1789183652248,
+            ),
+            time_zone: Some(
+                "Etc/UTC",
+            ),
+            last_query_id: Some(
+                "01a093a7-f197-7adc-8be6-d8b07d7bd200",
+            ),
+            timestamp_us: Some(
+                1789183652248399,
+            ),
+            connector_scan_node_number: Some(
+                1,
+            ),
+        },
+    ),
+    query_options: Some(
+        TQueryOptions {
+            max_errors: None,
+            batch_size: Some(
+                4096,
+            ),
+            mem_limit: Some(
+                2147483648,
+            ),
+            abort_on_default_limit_exceeded: None,
+            query_timeout: Some(
+                300,
+            ),
+            enable_profile: Some(
+                false,
+            ),
+            query_type: Some(
+                TQueryType(
+                    0,
+                ),
+            ),
+            load_mem_limit: Some(
+                0,
+            ),
+            max_scan_key_num: None,
+            max_pushdown_conditions_per_column: None,
+            enable_spill: Some(
+                false,
+            ),
+            transmission_compression_type: Some(
+                TCompressionType(
+                    13,
+                ),
+            ),
+            runtime_join_filter_pushdown_limit: Some(
+                1024000,
+            ),
+            runtime_filter_wait_timeout_ms: Some(
+                20,
+            ),
+            runtime_filter_send_timeout_ms: Some(
+                400,
+            ),
+            pipeline_dop: Some(
+                0,
+            ),
+            pipeline_profile_level: Some(
+                TPipelineProfileLevel(
+                    1,
+                ),
+            ),
+            load_dop: None,
+            runtime_filter_scan_wait_time_ms: Some(
+                20,
+            ),
+            query_mem_limit: Some(
+                0,
+            ),
+            enable_tablet_internal_parallel: Some(
+                true,
+            ),
+            query_delivery_timeout: Some(
+                300,
+            ),
+            enable_query_debug_trace: Some(
+                false,
+            ),
+            load_transmission_compression_type: Some(
+                TCompressionType(
+                    2,
+                ),
+            ),
+            tablet_internal_parallel_mode: Some(
+                TTabletInternalParallelMode(
+                    0,
+                ),
+            ),
+            load_job_type: None,
+            enable_scan_datacache: Some(
+                true,
+            ),
+            enable_pipeline_query_statistic: Some(
+                true,
+            ),
+            transmission_encode_level: Some(
+                7,
+            ),
+            enable_populate_datacache: Some(
+                true,
+            ),
+            allow_throw_exception: Some(
+                false,
+            ),
+            hudi_mor_force_jni_reader: Some(
+                false,
+            ),
+            rpc_http_min_size: Some(
+                2147482624,
+            ),
+            spill_mem_table_size: None,
+            spill_mem_table_num: None,
+            spill_mem_limit_threshold: None,
+            spill_operator_min_bytes: None,
+            spill_operator_max_bytes: None,
+            spill_encode_level: None,
+            spill_revocable_max_bytes: None,
+            spill_enable_direct_io: None,
+            spill_rand_ratio: None,
+            spill_options: None,
+            spill_mode: None,
+            io_tasks_per_scan_operator: Some(
+                4,
+            ),
+            connector_io_tasks_per_scan_operator: Some(
+                16,
+            ),
+            runtime_filter_early_return_selectivity: Some(
+                OrderedFloat(
+                    0.05000000074505806,
+                ),
+            ),
+            enable_dynamic_prune_scan_range: Some(
+                true,
+            ),
+            log_rejected_record_num: None,
+            use_page_cache: Some(
+                true,
+            ),
+            enable_connector_adaptive_io_tasks: Some(
+                true,
+            ),
+            connector_io_tasks_slow_io_latency_ms: Some(
+                50,
+            ),
+            scan_use_query_mem_ratio: Some(
+                OrderedFloat(
+                    0.3,
+                ),
+            ),
+            connector_scan_use_query_mem_ratio: Some(
+                OrderedFloat(
+                    0.3,
+                ),
+            ),
+            spillable_operator_mask: None,
+            load_profile_collect_second: None,
+            group_concat_max_len: Some(
+                1024,
+            ),
+            runtime_profile_report_interval: Some(
+                10,
+            ),
+            enable_collect_table_level_scan_stats: Some(
+                true,
+            ),
+            interleaving_group_size: Some(
+                10,
+            ),
+            overflow_mode: Some(
+                TOverflowMode(
+                    0,
+                ),
+            ),
+            use_column_pool: None,
+            enable_agg_spill_preaggregation: None,
+            global_runtime_filter_build_max_size: Some(
+                67108864,
+            ),
+            runtime_filter_rpc_http_min_size: Some(
+                67108864,
+            ),
+            big_query_profile_threshold: Some(
+                30000,
+            ),
+            query_queue_options: None,
+            enable_file_metacache: Some(
+                true,
+            ),
+            enable_pipeline_level_shuffle: Some(
+                true,
+            ),
+            enable_hyperscan_vec: Some(
+                true,
+            ),
+            jit_level: Some(
+                1,
+            ),
+            big_query_profile_threshold_unit: Some(
+                TTimeUnit(
+                    2,
+                ),
+            ),
+            sql_dialect: Some(
+                "starrocks",
+            ),
+            error_for_division_by_zero: None,
+            enable_result_sink_accumulate: Some(
+                true,
+            ),
+            enable_connector_split_io_tasks: Some(
+                true,
+            ),
+            connector_max_split_size: Some(
+                67108864,
+            ),
+            enable_connector_sink_writer_scaling: Some(
+                true,
+            ),
+            binary_encoding_format: Some(
+                TBinaryEncodingFormat(
+                    1,
+                ),
+            ),
+            binary_encoding_level: Some(
+                TBinaryEncodingLevel(
+                    1,
+                ),
+            ),
+            enable_wait_dependent_event: Some(
+                false,
+            ),
+            orc_use_column_names: Some(
+                false,
+            ),
+            enable_datacache_async_populate_mode: Some(
+                true,
+            ),
+            enable_datacache_io_adaptor: Some(
+                true,
+            ),
+            datacache_priority: Some(
+                0,
+            ),
+            datacache_ttl_seconds: Some(
+                0,
+            ),
+            enable_cache_select: Some(
+                false,
+            ),
+            datacache_sharing_work_period: None,
+            enable_file_pagecache: Some(
+                true,
+            ),
+            catalog: Some(
+                "default_catalog",
+            ),
+            datacache_evict_probability: Some(
+                100,
+            ),
+            enable_pipeline_event_scheduler: Some(
+                true,
+            ),
+            ann_params: Some(
+                {},
+            ),
+            pq_refine_factor: Some(
+                OrderedFloat(
+                    1.0,
+                ),
+            ),
+            k_factor: Some(
+                OrderedFloat(
+                    1.0,
+                ),
+            ),
+            enable_join_runtime_filter_pushdown: Some(
+                true,
+            ),
+            enable_join_runtime_bitset_filter: Some(
+                true,
+            ),
+            enable_hash_join_range_direct_mapping_opt: Some(
+                true,
+            ),
+            enable_hash_join_linear_chained_opt: Some(
+                true,
+            ),
+            enable_hash_join_serialize_fixed_size_string: Some(
+                true,
+            ),
+            enable_parquet_reader_bloom_filter: Some(
+                true,
+            ),
+            enable_parquet_reader_page_index: Some(
+                true,
+            ),
+            lower_upper_support_utf8: Some(
+                false,
+            ),
+            column_view_concat_rows_limit: Some(
+                -1,
+            ),
+            column_view_concat_bytes_limit: Some(
+                -1,
+            ),
+            enable_full_sort_use_german_string: Some(
+                true,
+            ),
+            exchange_hash_function_version: Some(
+                1,
+            ),
+            enable_predicate_col_late_materialize: Some(
+                true,
+            ),
+            enable_global_late_materialization: Some(
+                false,
+            ),
+            enable_schedule_log: None,
+            http_request_ssl_verification_required: None,
+            http_request_security_level: None,
+            http_request_ip_allowlist: Some(
+                "",
+            ),
+            http_request_host_allowlist_regexp: Some(
+                "",
+            ),
+            http_request_allow_private_in_allowlist: None,
+            enable_cache_udaf: Some(
+                false,
+            ),
+        },
+    ),
+    enable_profile: None,
+    resource_info: None,
+    import_label: None,
+    db_name: None,
+    load_job_id: None,
+    load_error_hub_info: None,
+    is_pipeline: Some(
+        true,
+    ),
+    pipeline_dop: Some(
+        8,
+    ),
+    per_scan_node_dop: None,
+    workgroup: Some(
+        TWorkGroup {
+            name: Some(
+                "default_wg",
+            ),
+            id: Some(
+                2,
+            ),
+            cpu_core_limit: Some(
+                1,
+            ),
+            mem_limit: Some(
+                OrderedFloat(
+                    1.0,
+                ),
+            ),
+            concurrency_limit: None,
+            workgroup_type: Some(
+                TWorkGroupType(
+                    1,
+                ),
+            ),
+            version: Some(
+                2,
+            ),
+            state: None,
+            num_drivers: None,
+            big_query_mem_limit: None,
+            big_query_scan_rows_limit: None,
+            big_query_cpu_second_limit: None,
+            spill_mem_limit_threshold: None,
+            exclusive_cpu_cores: Some(
+                0,
+            ),
+            mem_pool: Some(
+                "default_mem_pool",
+            ),
+            cpu_weight_percent: Some(
+                100,
+            ),
+            exclusive_cpu_percent: None,
+            warehouses: None,
+            inactive: None,
+            max_cpu_cores: None,
+        },
+    ),
+    enable_resource_group: Some(
+        true,
+    ),
+    func_version: Some(
+        8,
+    ),
+    enable_shared_scan: Some(
+        false,
+    ),
+    is_stream_pipeline: Some(
+        false,
+    ),
+    adaptive_dop_param: None,
+    group_execution_scan_dop: Some(
+        8,
+    ),
+    pred_tree_params: Some(
+        TPredicateTreeParams {
+            enable_or: Some(
+                true,
+            ),
+            enable_show_in_profile: Some(
+                false,
+            ),
+            max_pushdown_or_predicates: Some(
+                32,
+            ),
+        },
+    ),
+    exec_stats_node_ids: Some(
+        [
+            0,
+            1,
+            3,
+        ],
+    ),
+    arrow_flight_sql_version: Some(
+        1,
+    ),
+}

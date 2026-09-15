@@ -1,0 +1,38 @@
+Explain String
+PLAN FRAGMENT 0
+ OUTPUT EXPRS:1: region | 3: sum
+  PARTITION: UNPARTITIONED
+
+  RESULT SINK
+
+  4:EXCHANGE
+
+PLAN FRAGMENT 1
+ OUTPUT EXPRS:
+  PARTITION: HASH_PARTITIONED: 1: region
+
+  STREAM DATA SINK
+    EXCHANGE ID: 04
+    UNPARTITIONED
+
+  3:AGGREGATE (merge finalize)
+  |  output: sum(3: sum)
+  |  group by: 1: region
+  |  
+  2:EXCHANGE
+
+PLAN FRAGMENT 2
+ OUTPUT EXPRS:
+  PARTITION: RANDOM
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: 1: region
+
+  1:AGGREGATE (update serialize)
+  |  STREAMING
+  |  output: sum(2: amount)
+  |  group by: 1: region
+  |  
+  0:FileScanNode
+     BROKER: 
