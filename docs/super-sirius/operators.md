@@ -380,6 +380,23 @@ Repartitions data into N buckets based on partition keys. Partition keys are alw
 - **Sibling coordination:** Build-side partition normally determines the shared count. For RIGHT-family hash joins other than `RIGHT_DELIM_JOIN`, the retained probe side determines it instead.
 - **Key members:** `_partition_keys`, `_partition_type`, `_num_partitions`, `_is_build`, `_drives_partition_count`, `_sibling_partition_op`
 
+Hash partitioning passes the original payload and a separate key table to cuDF. Any temporary key
+casts therefore affect hashing without becoming part of, or remaining owned by, the partitioned
+payload. After cuDF produces one partition-ordered table, Sirius chooses storage independently for
+each payload column:
+
+- childless, non-nullable fixed-width columns use offset-zero aliases into a shared combined column;
+- nullable fixed-width, string, nested, dictionary, and other unsupported columns are copied into
+  independently owned per-partition columns;
+- every batch-visible column has offset zero, preserving spill and peer-copy converter contracts;
+- empty partitions are independent owning empty tables and do not retain the shared fixed-width
+  allocation family.
+
+Consequently, one unsupported column does not disable zero-copy aliases for eligible siblings.
+View batches retain type-erased owners for their backing storage, and Sirius synchronizes the
+operator stream before publication. Their GPU representations also record the producer's writer
+event so cross-stream or cross-device consumers can order reads without materializing the view.
+
 ### `sirius_physical_concat` — `CONCAT`
 **File:** `src/include/op/sirius_physical_concat.hpp`
 
