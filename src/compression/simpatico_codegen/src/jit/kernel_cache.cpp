@@ -1,5 +1,7 @@
 #include "codegen/jit/kernel_cache.hpp"
 
+#include "codegen/jit/cccl_embedded_headers.h"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -61,9 +63,9 @@ const std::string& disk_cache_dir()
   return dir;
 }
 
-// Cubin filename mirrors the in-memory ShapeKey: source+entry digest plus the
-// arch / cuda-runtime / driver the cubin was built against, so a stale
-// toolchain or renderer change never yields a false hit.
+// Cubin filename mirrors the in-memory ShapeKey: source+entry+embedded-CCCL
+// digest plus the arch / cuda-runtime / driver the cubin was built against, so
+// a stale header closure, toolchain, or renderer never yields a false hit.
 std::string cubin_path_for(const std::string& key_material, int arch_cc)
 {
   int driver = 0;
@@ -161,10 +163,18 @@ std::size_t ShapeKeyHash::operator()(const ShapeKey& k) const noexcept
   h          = mix(h, static_cast<uint64_t>(k.arch_cc));
   h          = mix(h, static_cast<uint64_t>(k.cuda_runtime));
   h          = mix(h, static_cast<uint64_t>(k.driver_version));
+  h = mix(h, fnv1a_64(k.cccl_headers_fingerprint.data(), k.cccl_headers_fingerprint.size()));
   return static_cast<std::size_t>(h);
 }
 
 ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc)
+{
+  return shape_key_from(rendered_source, arch_cc, kCcclEmbeddedHeadersFingerprint);
+}
+
+ShapeKey shape_key_from(const std::string& rendered_source,
+                        int arch_cc,
+                        std::string_view cccl_headers_fingerprint)
 {
   int driver_version = 0;
   cuDriverGetVersion(&driver_version);
@@ -174,7 +184,29 @@ ShapeKey shape_key_from(const std::string& rendered_source, int arch_cc)
     arch_cc,
     static_cast<uint32_t>(CUDART_VERSION),
     static_cast<uint32_t>(driver_version),
+    std::string(cccl_headers_fingerprint),
   };
+}
+
+std::string cubin_key_material_from(std::string_view kernel_key_material)
+{
+  return cubin_key_material_from(kernel_key_material, kCcclEmbeddedHeadersFingerprint);
+}
+
+std::string cubin_key_material_from(std::string_view kernel_key_material,
+                                    std::string_view cccl_headers_fingerprint)
+{
+  // Length-prefix both components so arbitrary rendered source text cannot
+  // make two (kernel material, fingerprint) pairs serialize identically.
+  std::string material;
+  material.reserve(kernel_key_material.size() + cccl_headers_fingerprint.size() + 48);
+  material += std::to_string(kernel_key_material.size());
+  material += ':';
+  material.append(kernel_key_material);
+  material += std::to_string(cccl_headers_fingerprint.size());
+  material += ':';
+  material.append(cccl_headers_fingerprint);
+  return material;
 }
 
 KernelCache& KernelCache::instance()
@@ -207,7 +239,7 @@ const CompiledKernel* KernelCache::get_or_compile_plain(const std::string& sourc
   const std::string& cdir = disk_cache_dir();
   std::string path;
   if (!cdir.empty()) {
-    path = cubin_path_for(key_material, opts.arch_cc);
+    path = cubin_path_for(cubin_key_material_from(key_material), opts.arch_cc);
     std::vector<char> bytes;
     if (read_cubin_file(path, bytes)) {
       try {
