@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "event/query_event_publisher.hpp"
 #include "exec/bounded_thread_pool.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
@@ -87,6 +88,22 @@ struct task_creation_request {
   int device_id = exec::no_preferred_device;
 };
 
+/// Why @ref task_creator::get_operator_for_next_task stopped.
+enum class next_task_state {
+  /// An operator is ready to have a task created for it.
+  ready,
+  /// No operator in the chain can produce right now.  Not necessarily terminal:
+  /// an operator waiting on input reports this until its input arrives.
+  depleted,
+};
+
+/// The operator @ref task_creator::get_operator_for_next_task settled on,
+/// together with what it means -- see @c next_task_state.
+struct next_task_result {
+  op::sirius_physical_operator* op{nullptr};
+  next_task_state state{next_task_state::depleted};
+};
+
 class task_creator {
  public:
   /**
@@ -134,6 +151,17 @@ class task_creator {
 
   /// \brief sets pipeline executor reference
   void set_task_scheduler(sirius::pipeline::task_scheduler& task_scheduler);
+
+  /// Attach the query-event observer. Until called, events go to an unsubscribed publisher.
+  void set_query_event_publisher(sirius::event::query_event_publisher& publisher)
+  {
+    _query_event_publisher = publisher.shared_from_this();
+  }
+
+  /// Report that a pipeline has closed for the specified query.
+  void publish_pipeline_closure(sirius::query_id_t query_id,
+                                std::size_t pipeline_id,
+                                std::size_t source_operator_id) noexcept;
 
   /// \brief Register the per-query state for @p query's pipelines.
   ///
@@ -252,11 +280,17 @@ class task_creator {
   /**
    * @brief Find the operator for which to create the next task based on operator hints.
    *
-   * This method queries the given node for a hint about what task to create next.
+   * This method queries the given node for a hint about what task to create next,
+   * walking through operators that are themselves waiting on input.
    *
    * @param node The operator node to get the next task hint from.
-   * @return The operator node that should be scheduled next, or nullptr if no task should be
-   * scheduled.
+   * @return The operator and what it means.  On @c ready, the operator is the
+   *         one to schedule.  On @c depleted, it is the operator that was asked
+   *         last and could not produce -- which is what makes the failure
+   *         attributable: the walk can descend several operators past the one
+   *         the request named, and reporting the request's own operator would
+   *         name a node that is waiting perfectly happily.  Null only when
+   *         @p node is null.
    */
   /// Follows WAITING_FOR_INPUT_DATA hints upstream to the operator that can
   /// produce next. get_next_task_hint() is side-effecting at every level (it
@@ -264,7 +298,7 @@ class task_creator {
   /// walk visits is appended to @p visited_pipelines for the caller to
   /// re-evaluate — a pipeline whose tasks all completed earlier gets no later
   /// mark_task_completed() to do it.
-  op::sirius_physical_operator* get_operator_for_next_task(
+  [[nodiscard]] next_task_result get_operator_for_next_task(
     op::sirius_physical_operator* node,
     std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
@@ -288,6 +322,11 @@ class task_creator {
   ::duckdb::ClientContext* _client_context;
   // Non-owning; SiriusContext stops and joins this creator before destroying the scheduler.
   sirius::pipeline::task_scheduler* _task_scheduler{nullptr};
+  /// Observer of query event transitions.  Never null: seeded with an
+  /// unsubscribed publisher so the reporting paths need no check, and replaced by
+  /// the context's own in set_query_event_publisher.
+  std::shared_ptr<sirius::event::query_event_publisher> _query_event_publisher{
+    std::make_shared<sirius::event::query_event_publisher>()};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 
