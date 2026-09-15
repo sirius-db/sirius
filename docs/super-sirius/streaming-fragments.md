@@ -15,25 +15,27 @@ Two classes do this, at two different layers:
 | **Files** | `src/include/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp` | `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp` |
 | **Caller** | C++ code already inside a live `duckdb::ClientContext` and transaction (e.g. the transparent path, `Context::execute_substrait`) | Any caller that must not include DuckDB/cuDF headers — the Rust bindings, or a standalone C++ embedder |
 | **Owns the connection?** | No — borrows the caller's `ClientContext` | Yes — brings up its own embedded `duckdb::DuckDB` + `Connection` (`Context`) |
-| **Transaction / query window** | Caller's responsibility to bracket | Manages its own, internally, across two phases (see below) |
-| **Shape** | One output-only or gather sink; `spec.plan_source` is a `LogicalOperator` factory | Declare → build → relay → run, addressable by stream id from outside the process |
+| **Transaction / query window** | Caller supplies a DuckDB transaction when `plan_source` needs one; the Assembler opens and closes `StandaloneQueryScope` itself | Manages its own DuckDB transactions; the Assembler owns the query window |
+| **Shape** | Empty outputs → `RESULT_COLLECTOR`; one or more outputs → `STREAMING_SINK`. `spec.plan_source` is a `LogicalOperator` factory | Declare → build → relay → run, addressable by stream id from outside the process |
 
-`sirius::ffi::Fragment` is a PIMPL wrapper around exactly one `exec::streaming_fragment` (or, for a
-result fragment, around the single-shot `sirius_interface` path) — it exists to give a
-cross-language caller everything `streaming_fragment` needs (a connection, a transaction, a query
-window, a bind catalog) without exposing any of it.
+`sirius::ffi::Fragment` is a PIMPL wrapper around exactly one `exec::streaming_fragment` — both
+intermediate (`STREAMING_SINK`) and result (`RESULT_COLLECTOR`) terminals. It exists to give a
+cross-language caller everything `streaming_fragment` needs (a connection, a transaction, a bind
+catalog) without exposing any of it. The query window is not Host-owned; `streaming_fragment::build()`
+opens it and `run()` / failure / destruction closes it.
 
 ## Quick path
 
 ```cpp
-// exec::streaming_fragment — caller already owns the transaction/window.
+// exec::streaming_fragment — caller already owns the DuckDB transaction if the plan source
+// needs one. Do not open a second StandaloneQueryScope around build()/run().
 fragment_spec spec;
 spec.plan_source = my_plan_source;     // ClientContext& -> LogicalOperator
-spec.outputs     = {0};                // one output stream
+spec.outputs     = {0};                // one output stream; omit for a result fragment
 streaming_fragment frag(client, std::move(spec));
-frag.build(query_id);
-frag.run();                            // blocks
-drain(frag.session(), 0);              // pull() until drained
+frag.build();                          // opens the query window
+frag.run();                            // blocks; closes the query window
+drain(frag, 0);                        // pull() until drained
 ```
 
 ```cpp
@@ -97,7 +99,7 @@ create_streaming_source_plan()  (physical planning, builds STREAMING_SOURCE)  �
                                                                                           │
                                                                                 catalog->set_built(id, source.get())
                                                                                           │
-streaming_fragment::build() / Fragment::build()  ── reads catalog->get(id).built ──►  session().add_source(id, *built)
+streaming_fragment::build() / Fragment::build()  ── reads catalog->get(id).built ──►  session add_source(id, *built)
 ```
 
 `set_built()` is how the physical operator (created deep inside `create_plan()`, which does not
@@ -128,27 +130,31 @@ otherwise return anything the fragment layer can see) gets back to the session t
 
 ## `exec::streaming_fragment` — plan builder + blocking runner
 
-Owns one fragment's complete life cycle: declares inputs into the catalog, plans, constructs the
-sink, runs, and keeps the output pullable after `run()` returns.
+Owns one fragment's complete life cycle: declares inputs into the catalog, opens the query
+window, plans, constructs the sink or result collector, runs, and keeps the output pullable
+after `run()` returns.
 
 ```cpp
 struct fragment_spec {
   logical_plan_source plan_source;                    // ClientContext& -> LogicalOperator
   std::map<stream_id_t, stream_input_spec> inputs;     // schema + expected senders per input
-  std::vector<stream_id_t> outputs;                    // positional: outputs[i] = partition i
-  std::optional<op::partition_spec> partitioning;       // absent = single destination
+  std::vector<stream_id_t> outputs;                    // positional: outputs[i] = partition i; empty = result
+  std::optional<op::partition_spec> partitioning;       // illegal when outputs.size() < 2
+  duckdb::shared_ptr<duckdb::PreparedStatementData> prepared;  // optional; result names/types
 };
 ```
 
-**Construction validates the spec eagerly:** a plan source is required, at least one output stream
-is required (a fragment with none is not this class's job — see the FFI's *result fragment* below),
-and more than one output requires a `partitioning` mode (a bare `N`-output gather sink would leave
-`N-1` streams permanently empty with no way to tell a caller why).
+**Construction validates the spec eagerly:** a plan source is required, more than one output
+requires a `partitioning` mode (a bare `N`-output gather sink would leave `N-1` streams permanently
+empty with no way to tell a caller why), and a `partitioning` mode on fewer than two outputs is
+rejected — including a result fragment (`outputs` empty). Empty outputs without partitioning are a
+`RESULT_COLLECTOR` terminal, not an error.
 
-**`build(query_id)`** erases (not clears — see above) this fragment's own catalog ids, redeclares
-them so a rebuild after a caught, corrected failure is idempotent, runs `plan_source` to get a
-bound `LogicalOperator`, lowers it to a physical plan, and roots that plan in one
-`sirius_physical_streaming_sink`:
+**`build()`** opens a `StandaloneQueryScope` on this connection's `sirius_state`, erases (not
+clears — see above) this fragment's own catalog ids, redeclares them so a rebuild after a caught,
+corrected failure is idempotent, runs `plan_source` to get a bound `LogicalOperator`, lowers it to
+a physical plan, and roots that plan in either a `sirius_physical_streaming_sink` or a
+`sirius_physical_materialized_collector`:
 
 - **Hash-key cast normalization.** When `partitioning`'s `key_cast_types` is left empty, `build()`
   derives one per key column so independently-planned senders always hash the same logical value
@@ -166,24 +172,37 @@ bound `LogicalOperator`, lowers it to a physical plan, and roots that plan in on
 
 **Member declaration order is the lifetime contract.** C++ destroys members in reverse declaration
 order, and `streaming_fragment` relies on it: repositories are declared first (so they outlive
-everything that could still be writing to or reading from them), the engine next (it owns the
-physical plan, which holds raw pointers into the operators the session also points at), and
-`_session` last — so it is torn down *first*, before the engine it borrows operator pointers from
-can go away. Reordering these members is a use-after-free waiting to happen, not a style choice.
+everything that could still be writing to or reading from them), `_result_plan` next (a
+`RESULT_COLLECTOR` holds a reference into it), the engine next (it owns the plan, which holds raw
+pointers into the operators the session also points at), `_session` after that — so it is torn
+down *before* the engine it borrows operator pointers from can go away — and the query window last
+so a drop after `build()` releases the slot first. Reordering these members is a use-after-free
+waiting to happen, not a style choice.
 
-**`run()`** reuses the caller's query window rather than opening a second one (a second
+**`run()`** reuses the window `build()` opened rather than opening a second one (a second
 `StandaloneQueryScope` would reset the task creator and scan manager `build()` already populated,
-and the fragment would run zero tasks). On any exception from the engine, it poisons every declared
-output (`_session.fail_output(id, ...)`, swallowing secondary failures per id) **before**
-rethrowing — otherwise a peer parked in `wait()` on that stream would block forever with no error
-anywhere, the same S2/S3 hazard [Streaming Sessions](streaming-sessions.md#execbatch_stream)
-documents for `batch_stream` itself. `fail_output()` is idempotent (first failure wins), so this is
-safe to do at this layer even when a caller above it (`sirius::ffi::Fragment::run()`) also poisons
-the same outputs — see [Other contracts](#other-contracts) below.
+and the fragment would run zero tasks). On success it calls `finish()` and releases the window. On
+any exception from the engine, it poisons every declared output (`fail_output(id, ...)`, swallowing
+secondary failures per id) **before** closing the window and rethrowing — otherwise a peer parked
+in `wait()` on that stream would block forever with no error anywhere, the same S2/S3 hazard
+[Streaming Sessions](streaming-sessions.md#execbatch_stream) documents for `batch_stream` itself.
+`fail_output()` is idempotent (first failure wins), so this is safe to do at this layer even when a
+caller above it (`sirius::ffi::Fragment::run()`) also poisons the same outputs — see
+[Other contracts](#other-contracts) below.
+
+Callers (including tests) must **not** open their own `StandaloneQueryScope` around
+`streaming_fragment::build()` / `run()`. A second window is the silent-empty-output bug this
+ownership move exists to prevent.
+
+**`relay_from(source, source_stream, input_stream, sender)`** is owned by the Assembler: it
+validates that both fragments are built, the source has run, they share a `ClientContext`, the
+source is not a result fragment, the input was declared, the sender is expected, and `sink_types()`
+agree, then moves batches and closes once. Host `Fragment::relay_from` is a thin forwarder.
 
 **`sink_types()`** exposes the plan root's output column types, set during `build()`. Relay steps
 use it to validate schema agreement (column count and type ids) against a target fragment's
-declared input types before any batch moves.
+declared input types before any batch moves. Hop verbs (`pull` / `push` / `close_input` /
+`drained` / `fail_output`) wrap the session without publishing it.
 
 ## `sirius::ffi::Fragment` — the cross-language lifecycle
 
@@ -194,10 +213,10 @@ declared input types before any batch moves.
 brought up once and shared by every `Fragment` created on it via `make_fragment(context)`.
 
 `Fragment` is either an **intermediate** fragment (has declared output streams, rooted in a
-`STREAMING_SINK`, wraps one `exec::streaming_fragment`) or a **result** fragment (no declared
-outputs, executes once via `sirius_interface` and produces Arrow through `result_to_arrow()`).
-Which one a `Fragment` becomes is decided implicitly, by whether `declare_output()` was ever
-called (`is_result() == outputs.empty()`) — there is no separate constructor flag.
+`STREAMING_SINK`) or a **result** fragment (no declared outputs, rooted in a `RESULT_COLLECTOR`,
+produces Arrow through `result_to_arrow()`). Both are one `exec::streaming_fragment`. Which one a
+`Fragment` becomes is decided implicitly, by whether `declare_output()` was ever called
+(`is_result() == outputs.empty()`) — there is no separate constructor flag.
 
 ### `build()`: two phases, two different windows
 
@@ -214,33 +233,39 @@ declare_input_column / declare_input_sender / declare_output / declare_output_br
                           └────────────────────────────────────┘
                                           │
                                           ▼
-                          ┌─── Phase 2: query window ─────────┐
-                          │  StandaloneQueryScope acquired     │
-                          │  partition-mode guard               │
-                          │  is_result() ? single-shot execute-plan path
-                          │              : construct + build() an exec::streaming_fragment
-                          └────────────────────────────────────┘
+                          ┌─── Phase 2: lower + Assembler build ─┐
+                          │  BeginTransaction()                   │
+                          │  lower_substrait()                    │
+                          │  construct exec::streaming_fragment   │
+                          │  fragment->build()  (opens the window)│
+                          │  Commit()                             │
+                          └───────────────────────────────────────┘
 ```
 
 Phase 1 exists because parsing a DuckDB type name and creating a view both need an active
-transaction, and that transaction **must be committed before Phase 2 begins** — `StandaloneQueryScope`
-acquires the engine's single-flight lifecycle slot, and the two are sequential, not nested. This is
-also why a `Fragment::build()` failure can fall into two different states depending on *which*
-phase it fails in:
+transaction, and that transaction **must be committed before Phase 2 begins** —
+`StandaloneQueryScope` acquires the engine's single-flight lifecycle slot, and the two are
+sequential, not nested. Phase 2 opens a *second* short DuckDB transaction so Substrait lowering
+can bind `parquet_scan` / views (same `ActiveTransaction` requirement as
+`Context::execute_substrait`); the Assembler opens the query window inside `build()` while that
+transaction is still open. This is also why a `Fragment::build()` failure can fall into two
+different states depending on *which* phase it fails in:
 
 - A failure during Phase 1 (a bad type name, a stream id that fails to bind at `CREATE VIEW` time)
   leaves the transaction open — `transaction_open` was set the instant `BeginTransaction()` returned
   and is only cleared once `Commit()` itself succeeds.
-- A failure during Phase 2 happens with the transaction already closed; only the query-window slot
-  needs releasing.
+- A failure during Phase 2 happens with the setup transaction already closed; the lowering
+  transaction may still be open, and the Assembler closes the query-window slot on a failed
+  `build()`.
 
 `end_lifecycle()` (called from the catch blocks of both phases, and unconditionally from
-`~Fragment::Impl()`) handles both uniformly and is `noexcept`:
+`~Fragment::Impl()`) is `noexcept` and only rolls back a still-open DuckDB transaction. The
+Assembler owns the query window, so destroying `fragment` (or `streaming_fragment::build()`'s
+own catch) is what releases the slot:
 
 ```cpp
 void end_lifecycle() noexcept
 {
-  if (lifecycle) { lifecycle.reset(); }               // release the query-window slot, if held
   if (transaction_open) {
     transaction_open = false;
     ctx.conn->Rollback();                              // NOT Commit — see below
@@ -282,7 +307,7 @@ enforced before anything moves:
   `result_to_arrow()`, not a relayable stream, so it is rejected explicitly rather than falling
   through to undefined behavior.
 
-Only then does the schema check run — column count and type-id agreement between the target's
+The Assembler then runs the schema check — column count and type-id agreement between the target's
 declared types and the source's `sink_types()` — before any batch actually moves, so a mismatch
 throws instead of silently corrupting a downstream cuDF operation.
 
@@ -308,22 +333,20 @@ throws instead of silently corrupting a downstream cuDF operation.
 | `test/cpp/exec/test_stream_bind_catalog.cpp` | `[stream_bind_catalog]` |
 | `test/cpp/exec/test_streaming_fragment.cpp` | `[integration][streaming_fragment]`, `[integration][streaming_fragment_control]` |
 | `test/cpp/exec/test_sirius_ffi_fragment.cpp` | `[isolated_context][sirius_ffi]` |
+| `test/cpp/exec/test_sirius_ffi_host.cpp` | `[isolated_context][sirius_ffi]` |
 
 The FFI-level tests are tagged `[isolated_context]` because `sirius::ffi::Context` brings up its own
 `SiriusContext` (its own GPU memory pools) — the Catch2 listener in `test/cpp/unittest.cpp` pauses
 the shared test environments around any test with that tag so it doesn't contend with them for GPU
-memory. `sirius::ffi::Context`/`Fragment` have no raw-SQL or catalog-introspection escape hatch, so
-FFI-level tests are necessarily built around observable, public-API behavior (a failed `build()`
-throws, and a subsequent independent `Fragment` on the same `Context` can attempt its own `build()`
-right after) rather than inspecting DuckDB catalog state directly.
+memory. Host tests drive only public methods (`declare_*` / `build` / `relay_from` / `run` /
+`result_to_arrow`) and construct Substrait in the test because the FFI has no SQL passthrough.
 
 ## Not yet ported
 
 `Fragment::run()` blocks — it goes through `streaming_fragment::run()` → `sirius_engine::execute()`,
 which takes the future from `start_query()` and waits immediately. Fragments therefore run
 store-and-forward, one at a time (`relay_from(...)` orders strictly before `run()`, and only one
-fragment may sit between its own `build()` and `run()`). The `Fragment` surface exposes no
-`push`/`pull`/`wait`, so a genuinely remote sender cannot feed a fragment yet — `relay_from()` only
-moves batches that are already sitting in a *local*, already-finished source fragment's output
-repository. Non-blocking scheduling and a `push`/`pull`/`wait` FFI are tracked separately, not
-claimed here.
+fragment may sit between its own `build()` and `run()`). Remote senders still need Host
+`push_arrow` / `pull_arrow` / `drained` (added by the Arrow shuffle stack, not this Assembler);
+`relay_from()` only moves batches that are already sitting in a *local*, already-finished source
+fragment's output repository. Non-blocking scheduling is tracked separately, not claimed here.

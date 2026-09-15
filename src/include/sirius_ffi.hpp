@@ -88,9 +88,10 @@ class SIRIUS_FFI_EXPORT Context {
 /// Usage order: declare inputs/outputs → build → relay_from every sender → run →
 /// drain via relay_from or result_to_arrow.
 ///
-/// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
-/// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
-/// build() but before run() closes the lifecycle itself.
+/// build() opens a query lifecycle inside the Assembler; run() closes it. Exactly one
+/// fragment may sit between its own build() and run() at a time (the engine serializes
+/// queries). A Fragment destroyed after build() but before run() closes the lifecycle
+/// itself.
 class SIRIUS_FFI_EXPORT Fragment {
  public:
   ~Fragment();
