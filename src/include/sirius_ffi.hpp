@@ -163,8 +163,11 @@ class SIRIUS_FFI_EXPORT StagingArena {
 /// or a **result** fragment (no output streams, produces Arrow). Both kinds may declare input
 /// streams fed by other fragments without copying.
 ///
-/// Usage order: declare inputs/outputs → build → relay_from every sender → run →
-/// drain via relay_from or result_to_arrow.
+/// Usage order: declare inputs/outputs → build → fill inputs → run → drain.
+/// Fill inputs with relay_from (same process, native batches) or export_packed +
+/// push_packed + close_input (packed GPU bytes at a process edge). Drain with
+/// relay_from / export_packed on an intermediate fragment, or result_to_arrow on a
+/// result fragment.
 ///
 /// build() opens a query lifecycle; run() closes it. Exactly one fragment may sit between its
 /// own build() and run() at a time (the engine serializes queries). A Fragment destroyed after
@@ -219,8 +222,42 @@ class SIRIUS_FFI_EXPORT Fragment {
                          std::uint64_t input_stream_id,
                          std::uint32_t sender_id);
 
+  /// Pack the next batch parked on output stream `stream_id` into a fresh staging-arena lease
+  /// (`cudf::chunked_pack` gathers directly into the lease). Returns the cudf pack metadata the
+  /// receiver's `push_packed` needs, or nullptr when nothing is parked right now; on success
+  /// writes the lease offset, packed payload length, and row count.
+  ///
+  /// The packing stream is synchronized before returning, so the caller may transmit from
+  /// `[staging_base()+offset, +length)` immediately. The lease outlives this call by design:
+  /// releasing it — via `Context::staging_release(offset)`, after the transmit completes — is
+  /// the caller's responsibility.
+  ///
+  /// A zero-row batch is metadata-only: it returns the pack metadata with `offset == 0` and
+  /// `length == 0` and holds NO lease — the caller must not release anything for it.
+  /// @throws before `build()`/`run()`, on an unknown output stream, when no arena is configured,
+  /// on lease exhaustion, or on a parked batch that is not GPU-resident.
+  std::unique_ptr<std::vector<std::uint8_t>> export_packed(std::uint64_t stream_id,
+                                                           std::uint64_t& offset,
+                                                           std::uint64_t& length,
+                                                           std::uint64_t& rows);
+
+  /// Unpack the `length` packed bytes at staging offset `offset` using the pack metadata at
+  /// `metadata_addr` (`metadata_len` bytes, host memory), deep-copy the table out of the lease
+  /// into ordinary pool memory, push it into input stream `stream_id`, and release the receiver
+  /// lease when `length != 0`. The copy is synchronized before returning.
+  ///
+  /// Legal between `build()` and `run()`, exactly where `relay_from` sits. Does not close the
+  /// sender (the caller `close_input()`s).
+  /// @throws before `build()`, on an unknown input stream, when no arena is configured, on an
+  /// out-of-bounds lease range or empty metadata, or when the stream already ended.
+  void push_packed(std::uint64_t stream_id,
+                   std::uintptr_t metadata_addr,
+                   std::size_t metadata_len,
+                   std::uint64_t offset,
+                   std::uint64_t length);
+
   /// Close sender `sender_id` on input stream `stream_id`. EOS mirror for remote senders
-  /// (relay_from closes its own sender). Idempotent per sender.
+  /// (relay_from closes its own sender; push_packed does not). Idempotent per sender.
   /// @throws before build() or on unknown stream/sender.
   void close_input(std::uint64_t stream_id, std::uint32_t sender_id);
 
@@ -232,6 +269,11 @@ class SIRIUS_FFI_EXPORT Fragment {
   /// `out_stream_addr` (Arrow C Data Interface). Same contract as Context::execute_substrait.
   /// @throws on an intermediate fragment or before run().
   void result_to_arrow(std::uintptr_t out_stream_addr);
+
+  /// True when output stream `stream_id` has ended (every sender closed, queue empty, no
+  /// error). False means "not done" — including "nothing parked right now".
+  /// @throws before build(), on a result fragment, or on an unknown output stream.
+  [[nodiscard]] bool drained(std::uint64_t stream_id);
 
   /// Batches currently parked on output stream `stream_id`. For diagnostics.
   [[nodiscard]] std::size_t output_batch_count(std::uint64_t stream_id) const;
