@@ -172,6 +172,19 @@ jobs:
           nvidia-smi
           timeout 45m ./build/release/extension/sirius/test/cpp/sirius_unittest --abort 2>&1 | tee /tmp/unittest.log
 
+      - name: Compare dynamic Bloom-filter policies
+        if: github.event_name == 'pull_request' && github.event.pull_request.number == 1775
+        run: |
+          set -o pipefail
+          ./build/release/extension/sirius/test/cpp/sirius_unittest \
+            '[bloom_policy_bench]' 2>&1 | tee /tmp/bloom-policy-benchmark.log
+          {
+            echo '## Dynamic Bloom-filter policy A/B'
+            echo '```csv'
+            grep -E '^(policy|legacy|default),' /tmp/bloom-policy-benchmark.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The late-materialization gate is read from the environment once per process, so the
       # feature is entirely absent from the run above. Without this step the end-to-end case
       # (planning -> scan substitution -> transport -> restoration) returns successfully without
