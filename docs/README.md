@@ -245,8 +245,8 @@ For a full list of current limitations and ongoing work, please refer to our [Gi
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="logo/combined-logos.png">
-    <source media="(prefers-color-scheme: light)" srcset="logo/combined-logos-light.png">
-    <img src="logo/combined-logos-light.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
+    <source media="(prefers-color-scheme: light)" srcset="logo/combined-logos-light-transparent.png">
+    <img src="logo/combined-logos-light-transparent.png" alt="Contributors and partners: NVIDIA, University of Wisconsin-Madison, DuckDB, and VAST Data" width="700"/>
   </picture>
 </p>
 
