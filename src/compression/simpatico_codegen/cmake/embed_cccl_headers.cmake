@@ -5,8 +5,9 @@
 # -I into a CCCL tree, so a binary distribution needs only the driver + the
 # nvrtc runtime it already links. Invoked via `cmake -P`.
 #
-# Inputs (-D): CCCL_DIR  the build-time CCCL include root (contains cuda/, cub/,
-# and thrust/) OUT       path of the .cpp to generate
+# Required -D inputs: CCCL_DIR is the build-time CCCL include root containing
+# cuda/, cub/, and thrust/; OUT is the path of the .cpp to generate. DEPFILE is
+# optional and names a Make/Ninja depfile for the transitively scanned headers.
 #
 # The scan follows every literal `#include` line (both #ifdef branches) from the
 # fixed kernel-prelude roots below. Dependencies reached through macro-expanded
@@ -19,6 +20,13 @@ if(NOT IS_DIRECTORY "${CCCL_DIR}")
   message(
     FATAL_ERROR "embed_cccl_headers: CCCL_DIR '${CCCL_DIR}' is not a directory")
 endif()
+foreach(marker cub/version.cuh cuda/std/cstdint thrust/version.h)
+  if(NOT EXISTS "${CCCL_DIR}/${marker}")
+    message(
+      FATAL_ERROR
+        "embed_cccl_headers: CCCL_DIR '${CCCL_DIR}' is missing '${marker}'")
+  endif()
+endforeach()
 
 # Union of the includes emitted by the encode + decode kernel preludes. CUDA 12
 # reaches execution_policy.h through a macro-expanded include, which the
@@ -86,6 +94,9 @@ endwhile()
 list(REMOVE_DUPLICATES found)
 list(SORT found)
 list(LENGTH found n)
+if(n EQUAL 0)
+  message(FATAL_ERROR "embed_cccl_headers: the scanned CCCL closure is empty")
+endif()
 
 # Raw-string delimiter (<=16 chars, C++ limit) chosen so it cannot appear in a
 # CCCL header.
@@ -97,13 +108,25 @@ string(APPEND body "#include \"codegen/jit/cccl_embedded_headers.h\"\n")
 string(APPEND body "namespace codegen::jit {\n")
 
 set(idx 0)
+set(_fingerprint_manifest "")
 foreach(rel IN LISTS found)
   file(READ "${CCCL_DIR}/${rel}" hsrc)
+  # Hash each source independently, then hash an unambiguous ordered manifest.
+  # This avoids retaining a second full copy of the (large) closure while still
+  # binding the final fingerprint to every relative name and byte of content.
+  string(SHA256 hsrc_sha256 "${hsrc}")
+  string(LENGTH "${rel}" rel_length)
+  string(APPEND _fingerprint_manifest "${rel_length}:${rel}:${hsrc_sha256}\n")
   string(APPEND body "static const char* kCcclName${idx} = \"${rel}\";\n")
   string(APPEND body
          "static const char* kCcclSrc${idx} =\nR\"${D}(${hsrc})${D}\";\n")
   math(EXPR idx "${idx}+1")
 endforeach()
+string(SHA256 cccl_fingerprint "${_fingerprint_manifest}")
+string(TOLOWER "${cccl_fingerprint}" cccl_fingerprint)
+string(
+  APPEND body
+  "const char kCcclEmbeddedHeadersFingerprint[] = \"${cccl_fingerprint}\";\n")
 
 string(APPEND body "const EmbeddedJitHeader kCcclEmbeddedHeaders[] = {\n")
 set(idx 0)
@@ -115,5 +138,40 @@ string(APPEND body "};\n")
 string(APPEND body "const int kCcclEmbeddedHeaderCount = ${n};\n")
 string(APPEND body "}  // namespace codegen::jit\n")
 
+get_filename_component(out_dir "${OUT}" DIRECTORY)
+file(MAKE_DIRECTORY "${out_dir}")
 file(WRITE "${OUT}" "${body}")
-message(STATUS "embed_cccl_headers: embedded ${n} CCCL headers into ${OUT}")
+
+# Teach the build graph about the dynamically discovered closure. If any scanned
+# header changes (including gaining a new literal include), the custom command
+# reruns and discovers the updated closure.
+if(DEFINED DEPFILE AND NOT DEPFILE STREQUAL "")
+  # Escape a path for a Make/Ninja depfile and return it through output.
+  function(escape_depfile_path input output)
+    set(escaped "${input}")
+    string(REPLACE "\\" "/" escaped "${escaped}")
+    string(REPLACE "$" "$$" escaped "${escaped}")
+    string(REPLACE "#" "\\#" escaped "${escaped}")
+    string(REPLACE " " "\\ " escaped "${escaped}")
+    string(REPLACE ":" "\\:" escaped "${escaped}")
+    set(${output}
+        "${escaped}"
+        PARENT_SCOPE)
+  endfunction()
+
+  get_filename_component(depfile_dir "${DEPFILE}" DIRECTORY)
+  file(MAKE_DIRECTORY "${depfile_dir}")
+  escape_depfile_path("${OUT}" depfile_out)
+  set(_depfile_body "${depfile_out}:")
+  foreach(rel IN LISTS found)
+    escape_depfile_path("${CCCL_DIR}/${rel}" depfile_header)
+    string(APPEND _depfile_body " \\\n  ${depfile_header}")
+  endforeach()
+  string(APPEND _depfile_body "\n")
+  file(WRITE "${DEPFILE}" "${_depfile_body}")
+endif()
+
+message(
+  STATUS
+    "embed_cccl_headers: embedded ${n} CCCL headers (${cccl_fingerprint}) into ${OUT}"
+)

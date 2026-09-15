@@ -6,6 +6,7 @@
 //   3. A different shape gets its own slot.
 
 #include "codegen/decode/jit/renderer.hpp"
+#include "codegen/jit/cccl_embedded_headers.h"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "test_utils.hpp"
@@ -37,6 +38,59 @@ static double timed_ms(F&& fn)
 int main()
 {
   if (cudaSetDevice(0) != cudaSuccess) return report_fail("cudaSetDevice(0) failed");
+
+  // Cache identity must change with the exact CCCL closure supplied to NVRTC.
+  // Exercise an injected alternate fingerprint so this remains deterministic
+  // within one build and does not need an old binary/cache artifact.
+  {
+    const std::string current_fingerprint = jit::kCcclEmbeddedHeadersFingerprint;
+    if (current_fingerprint.size() != 64) {
+      return report_fail("embedded CCCL fingerprint length != 64", "got: " + current_fingerprint);
+    }
+    for (char ch : current_fingerprint) {
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+        return report_fail("embedded CCCL fingerprint is not lowercase hex",
+                           "got: " + current_fingerprint);
+      }
+    }
+
+    const std::string alternate_fingerprint = current_fingerprint + "-alternate";
+    const auto current_key = jit::shape_key_from("same rendered source|same_entry", 90);
+    const auto explicit_current_key =
+      jit::shape_key_from("same rendered source|same_entry", 90, current_fingerprint);
+    const auto alternate_key =
+      jit::shape_key_from("same rendered source|same_entry", 90, alternate_fingerprint);
+
+    if (!(current_key == explicit_current_key)) {
+      return report_fail("default ShapeKey does not use embedded CCCL fingerprint");
+    }
+    if (current_key.cccl_headers_fingerprint != current_fingerprint) {
+      return report_fail("ShapeKey does not retain embedded CCCL fingerprint");
+    }
+    if (current_key == alternate_key) {
+      return report_fail("ShapeKey ignores embedded CCCL fingerprint changes");
+    }
+    if (jit::ShapeKeyHash{}(current_key) == jit::ShapeKeyHash{}(alternate_key)) {
+      return report_fail("ShapeKey hash ignores embedded CCCL fingerprint changes");
+    }
+
+    const auto current_cubin_material =
+      jit::cubin_key_material_from("same rendered source|same_entry");
+    const auto explicit_current_cubin_material =
+      jit::cubin_key_material_from("same rendered source|same_entry", current_fingerprint);
+    const auto alternate_cubin_material =
+      jit::cubin_key_material_from("same rendered source|same_entry", alternate_fingerprint);
+    if (current_cubin_material != explicit_current_cubin_material) {
+      return report_fail("default cubin key material does not use embedded CCCL fingerprint");
+    }
+    if (current_cubin_material == alternate_cubin_material) {
+      return report_fail("persistent cubin key ignores embedded CCCL fingerprint changes");
+    }
+    if (jit::source_digest(current_cubin_material) ==
+        jit::source_digest(alternate_cubin_material)) {
+      return report_fail("persistent cubin filename digest ignores CCCL fingerprint changes");
+    }
+  }
 
   {
     auto a = jit::source_digest("hello world");

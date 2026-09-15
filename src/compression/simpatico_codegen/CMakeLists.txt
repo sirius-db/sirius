@@ -24,17 +24,13 @@ else()
 endif()
 
 if(VCPKG_BUILD)
-  # vcpkg ships CCCL 3.4 next to rmm/cudf; the CUDA toolkit (and any active
-  # conda env) ship older ones, so vcpkg's include dir has to be searched first
-  # or RMM's "requires CCCL 3.3 or newer" guard fires. Checked before
-  # CONDA_PREFIX so a vcpkg build started from a pixi shell still picks vcpkg.
+  # Checked before CONDA_PREFIX so a vcpkg build started from a pixi shell still
+  # gets its libraries and general include paths from vcpkg.
   find_package(CUDAToolkit REQUIRED)
   list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
   set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
   set(_SIMPATICO_VCPKG_INC
       "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include")
-  # cccl installs cub/, thrust/ and libcudacxx straight into <prefix>/include.
-  set(CUDA_CCCL_INCLUDE "${_SIMPATICO_VCPKG_INC}")
   set(_SIMPATICO_INCLUDE_DIRS "${_SIMPATICO_VCPKG_INC}"
                               "${CUDA_TOOLKIT_INCLUDE}")
   set(_SIMPATICO_LIB_DIR "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
@@ -44,11 +40,6 @@ elseif(CONDA_PREFIX)
       CACHE FILEPATH "nvcc from prefix")
   set(CUDA_TOOLKIT_INCLUDE
       "${CONDA_PREFIX}/targets/${CUDA_TARGET_TRIPLE}/include")
-  if(EXISTS "${CUDA_TOOLKIT_INCLUDE}/cccl")
-    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}/cccl")
-  else()
-    set(CUDA_CCCL_INCLUDE "${CUDA_TOOLKIT_INCLUDE}")
-  endif()
   set(_SIMPATICO_INCLUDE_DIRS
       "${CONDA_PREFIX}/include" "${CONDA_PREFIX}/include/rapids"
       "${CUDA_TOOLKIT_INCLUDE}")
@@ -59,11 +50,6 @@ else()
   find_package(CUDAToolkit REQUIRED)
   list(GET CUDAToolkit_INCLUDE_DIRS 0 _cuda_inc0)
   set(CUDA_TOOLKIT_INCLUDE "${_cuda_inc0}")
-  if(EXISTS "${_cuda_inc0}/cccl")
-    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}/cccl")
-  else()
-    set(CUDA_CCCL_INCLUDE "${_cuda_inc0}")
-  endif()
   set(_SIMPATICO_INCLUDE_DIRS "/usr/include" "/usr/include/rapids"
                               "${CUDA_TOOLKIT_INCLUDE}")
   set(_SIMPATICO_LIB_DIR "/usr/lib")
@@ -73,6 +59,111 @@ else()
   )
 endif()
 
+# Resolve the CCCL headers from libcudf's exported CUB target. In particular, do
+# not infer this from the CUDA toolkit: libcudf can intentionally use a newer
+# CCCL installed elsewhere (for example <prefix>/include/rapids). Standalone
+# simpatico builds have not run the repository-level find_package, so load
+# libcudf's config here when necessary.
+set(SIMPATICO_CCCL_INCLUDE_DIR
+    ""
+    CACHE
+      PATH
+      "Override libcudf's CCCL include root (must contain cuda/, cub/, and thrust/)"
+)
+
+if((NOT SIMPATICO_CCCL_INCLUDE_DIR AND NOT TARGET CUB::CUB)
+   OR (VCPKG_BUILD AND NOT TARGET cudf::cudf))
+  find_package(cudf REQUIRED CONFIG)
+endif()
+
+if(SIMPATICO_CCCL_INCLUDE_DIR)
+  set(_simpatico_cccl_candidate "${SIMPATICO_CCCL_INCLUDE_DIR}")
+  cmake_path(
+    ABSOLUTE_PATH
+    _simpatico_cccl_candidate
+    BASE_DIRECTORY
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    NORMALIZE
+    OUTPUT_VARIABLE
+    CUDA_CCCL_INCLUDE)
+  set(_simpatico_cccl_source "SIMPATICO_CCCL_INCLUDE_DIR override")
+else()
+  if(NOT TARGET CUB::CUB)
+    message(
+      FATAL_ERROR
+        "libcudf did not provide the expected CUB::CUB target. Set "
+        "SIMPATICO_CCCL_INCLUDE_DIR to libcudf's CCCL include root explicitly.")
+  endif()
+
+  # CUB::CUB is an alias in supported CCCL packages. Resolve it before reading
+  # usage requirements so diagnostics name the target that owns the property.
+  get_target_property(_simpatico_cub_aliased_target CUB::CUB ALIASED_TARGET)
+  if(_simpatico_cub_aliased_target)
+    set(_simpatico_cub_target "${_simpatico_cub_aliased_target}")
+  else()
+    set(_simpatico_cub_target CUB::CUB)
+  endif()
+  get_target_property(_simpatico_cub_include_dirs "${_simpatico_cub_target}"
+                      INTERFACE_INCLUDE_DIRECTORIES)
+
+  set(_simpatico_cccl_candidates "")
+  set(_simpatico_cccl_rejected "")
+  foreach(raw_include IN LISTS _simpatico_cub_include_dirs)
+    set(_simpatico_cccl_candidate "${raw_include}")
+    if(_simpatico_cccl_candidate MATCHES "^\\$<BUILD_INTERFACE:([^<>$]+)>$")
+      set(_simpatico_cccl_candidate "${CMAKE_MATCH_1}")
+    elseif(_simpatico_cccl_candidate MATCHES "\\$<")
+      list(APPEND _simpatico_cccl_rejected "${raw_include}")
+      continue()
+    endif()
+
+    if(NOT IS_ABSOLUTE "${_simpatico_cccl_candidate}")
+      list(APPEND _simpatico_cccl_rejected "${raw_include}")
+      continue()
+    endif()
+    cmake_path(NORMAL_PATH _simpatico_cccl_candidate)
+
+    if(EXISTS "${_simpatico_cccl_candidate}/cub/version.cuh"
+       AND EXISTS "${_simpatico_cccl_candidate}/cuda/std/cstdint"
+       AND EXISTS "${_simpatico_cccl_candidate}/thrust/version.h")
+      list(APPEND _simpatico_cccl_candidates "${_simpatico_cccl_candidate}")
+    else()
+      list(APPEND _simpatico_cccl_rejected "${raw_include}")
+    endif()
+  endforeach()
+
+  list(REMOVE_DUPLICATES _simpatico_cccl_candidates)
+  list(LENGTH _simpatico_cccl_candidates _simpatico_cccl_candidate_count)
+  if(NOT _simpatico_cccl_candidate_count EQUAL 1)
+    message(
+      FATAL_ERROR
+        "Could not resolve one concrete CCCL root from ${_simpatico_cub_target}'s "
+        "INTERFACE_INCLUDE_DIRECTORIES='${_simpatico_cub_include_dirs}'. Valid "
+        "candidates='${_simpatico_cccl_candidates}', rejected="
+        "'${_simpatico_cccl_rejected}'. Set SIMPATICO_CCCL_INCLUDE_DIR to "
+        "libcudf's include root (containing cub/version.cuh, cuda/std/cstdint, "
+        "and thrust/version.h).")
+  endif()
+  list(GET _simpatico_cccl_candidates 0 CUDA_CCCL_INCLUDE)
+  set(_simpatico_cccl_source "${_simpatico_cub_target}")
+endif()
+
+# Validate overrides as strictly as target-derived paths. This also catches a
+# stale package prefix during configure rather than much later in NVRTC.
+foreach(cccl_marker cub/version.cuh cuda/std/cstdint thrust/version.h)
+  if(NOT EXISTS "${CUDA_CCCL_INCLUDE}/${cccl_marker}")
+    message(
+      FATAL_ERROR
+        "CCCL root '${CUDA_CCCL_INCLUDE}' from ${_simpatico_cccl_source} is "
+        "missing '${cccl_marker}'. Set SIMPATICO_CCCL_INCLUDE_DIR "
+        "to libcudf's CCCL include root.")
+  endif()
+endforeach()
+message(
+  STATUS
+    "Simpatico CCCL headers: ${CUDA_CCCL_INCLUDE} (${_simpatico_cccl_source})")
+
+include_directories(BEFORE "${CUDA_CCCL_INCLUDE}")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
                     ${_SIMPATICO_INCLUDE_DIRS})
 
@@ -110,13 +201,15 @@ add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
 set(EMBED_CCCL_HEADERS_OUT
     "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/cccl_embedded_headers.cpp"
 )
+set(EMBED_CCCL_HEADERS_DEPFILE "${EMBED_CCCL_HEADERS_OUT}.d")
 add_custom_command(
   OUTPUT "${EMBED_CCCL_HEADERS_OUT}"
   COMMAND
     ${CMAKE_COMMAND} "-DCCCL_DIR=${CUDA_CCCL_INCLUDE}"
-    "-DOUT=${EMBED_CCCL_HEADERS_OUT}" -P
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+    "-DOUT=${EMBED_CCCL_HEADERS_OUT}" "-DDEPFILE=${EMBED_CCCL_HEADERS_DEPFILE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+  DEPFILE "${EMBED_CCCL_HEADERS_DEPFILE}"
   COMMENT
     "Scanning + embedding CCCL JIT header closure into ${EMBED_CCCL_HEADERS_OUT}"
   VERBATIM)
@@ -165,15 +258,19 @@ add_library(
   src/simpatico_codegen.cpp
   src/api/compressed_table_io.cpp
   src/explore/compression_explorer.cpp)
-set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                           NO_SYSTEM_FROM_IMPORTED ON)
 target_compile_features(simpatico PUBLIC cxx_std_20)
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
+# Keep libcudf's CCCL ahead of the CUDA toolkit's bundled version for every
+# Simpatico translation unit. NO_SYSTEM_FROM_IMPORTED above prevents the same
+# path arriving through an imported target from being demoted to -isystem.
+target_include_directories(simpatico BEFORE PRIVATE "${CUDA_CCCL_INCLUDE}")
 target_include_directories(
   simpatico
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
-          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
-          "${CUDA_CCCL_INCLUDE}")
+          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
 # Standalone / pixi builds fall back to the conda shared 'nvrtc'.

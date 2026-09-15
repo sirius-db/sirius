@@ -10,5 +10,9 @@ namespace codegen::jit {
 
 extern const EmbeddedJitHeader kCcclEmbeddedHeaders[];
 extern const int kCcclEmbeddedHeaderCount;
+// Deterministic digest of the names and contents of the embedded CCCL header
+// closure. This is part of every JIT cache identity so changing the headers
+// cannot reuse a cubin compiled against an older closure.
+extern const char kCcclEmbeddedHeadersFingerprint[];
 
 }  // namespace codegen::jit
