@@ -17,13 +17,15 @@
 #pragma once
 
 #include "io/rest/rest_reactor.hpp"
-#include "io/s3/s3_list_parser.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/templated_ioctx.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,7 +41,7 @@ namespace sirius::io::rest {
  * @brief RESTful object-store (s3://) ioctx. Specialisation of
  *        @c templated_ioctx<rest_reactor>.
  *
- * Owns a pool of @c rest_reactor workers (round-robined by the base) that share
+ * Owns a pool of @c rest_reactor workers (load-balanced by the base) that share
  * one @p authorizer.  Overrides @c create_io_object to resolve an object's size
  * via a blocking HEAD before constructing the @c rest_io_object — the static
  * reactor factory cannot do this since it needs the authorizer + a round-trip.
@@ -54,11 +56,6 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   rest_ioctx(std::size_t n_reactors, std::shared_ptr<rest_reactor::reactor_context> ctx);
 
   [[nodiscard]] io_context_type type() const noexcept override { return io_context_type::restful; }
-
-  /// Pool-aggregated perf counters: every reactor's snapshot summed (ns totals,
-  /// counts, retries, terminal, device-sync), maxes maxed, and ttfb the first
-  /// non-zero reactor value.  Lock-free; drives the s3-bench JSON baseline.
-  [[nodiscard]] rest_perf_snapshot perf_snapshot() const noexcept;
 
   /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
   /// per page (a page holds at most 1000 entries, so peak memory is one page
@@ -90,22 +87,36 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// when the pool is empty (never in practice).
   [[nodiscard]] std::size_t list_max_matches() const;
 
+  /// Open every reactor's connection pool against @p bucket_url's bucket, so the
+  /// query's first reads find pooled connections instead of paying TCP+TLS on
+  /// the hot path.  Fans the work out to the reactors and returns immediately:
+  /// each reactor's connection cache is thread-confined, so only its own worker
+  /// can fill it.
+  ///
+  /// Rate-limited rather than run once, because what goes stale is the
+  /// connection, not the bucket.  @c conn_max_age is a hard cap on reusing a
+  /// pooled connection (@c CURLOPT_MAXAGE_CONN), so a pool warmed before an idle
+  /// gap longer than that is cold again by the next query -- a warm-once flag
+  /// would serve the first query and no other.  Re-warms when the endpoint
+  /// changes or the last warm-up is at least @c conn_max_age old, which is free
+  /// for back-to-back queries and self-correcting for spaced-out ones.
+  void warmup(std::string_view bucket_url) noexcept override;
+
  protected:
-  /// Backend hook invoked by @c sirius_ioctx::open_datasource: parse @p path
+  /// Backend hook invoked by @c ioctx::open_datasource: parse @p path
   /// (s3://bucket/key), HEAD it for the size, and build a @c rest_io_object.
   /// Throws on a non-s3 scheme or a failed HEAD.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path) override;
+  std::shared_ptr<io_object> create_io_object(std::string path) override;
 
   /// @c open_hint::parquet_footer_probe resolves the size and stashes the
   /// parquet footer together via a single suffix-range GET, carried on the
   /// returned io_object; every other hint falls back to the plain HEAD path above.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path, open_hint hint) override;
+  std::shared_ptr<io_object> create_io_object(std::string path, open_hint hint) override;
 
   /// Known-size open: the caller already learned the object's size (e.g. from a
   /// ListObjectsV2 response), so the io_object is built with ZERO network — no
   /// HEAD, no probe.
-  std::shared_ptr<sirius_io_object> create_io_object(std::string path,
-                                                     std::uint64_t known_size) override;
+  std::shared_ptr<io_object> create_io_object(std::string path, std::uint64_t known_size) override;
 
  private:
   /// Resolve @p path with a single suffix-range GET: it discovers the size and
@@ -113,7 +124,15 @@ class rest_ioctx : public templated_ioctx<rest_reactor> {
   /// footer reads are served locally by @c rest_reactor::host_read.  Falls back
   /// to a HEAD when the suffix response is unusable.  The stash lives only as
   /// long as the returned io_object — a per-open transport shortcut, not a cache.
-  std::shared_ptr<sirius_io_object> create_footer_probe_object(std::string path);
+  std::shared_ptr<io_object> create_footer_probe_object(std::string path);
+
+  /// Guards the warm-up rate limiter.  Contended once per query at most, and
+  /// never on a read path.
+  std::mutex _warm_mtx;
+  /// Bucket the pools were last warmed against, and when.  An unset time means
+  /// "never warmed", which no elapsed comparison can express.
+  std::string _warmed_bucket;
+  std::optional<std::chrono::steady_clock::time_point> _warmed_at;
 };
 
 }  // namespace sirius::io::rest

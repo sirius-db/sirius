@@ -20,8 +20,8 @@
 
 namespace sirius::io::cache {
 
-void metadata_store::register_metadata(sirius_io_object const& obj,
-                                       std::shared_ptr<sirius_io_object_metadata> metadata)
+void metadata_store::register_metadata(io_object const& obj,
+                                       std::shared_ptr<io_object_metadata> metadata)
 {
   if (!metadata) return;
   auto const& key = obj.raw_file_cache_id();
@@ -29,14 +29,12 @@ void metadata_store::register_metadata(sirius_io_object const& obj,
   _by_key[key] = std::move(metadata);
 }
 
-std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
-  sirius_io_object const& obj) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(io_object const& obj) const
 {
   return get_metadata(obj.raw_file_cache_id());
 }
 
-std::shared_ptr<sirius_io_object_metadata> metadata_store::get_metadata(
-  std::string const& cache_key) const
+std::shared_ptr<io_object_metadata> metadata_store::get_metadata(std::string_view cache_key) const
 {
   std::shared_lock lk(_mtx);
   auto it = _by_key.find(cache_key);

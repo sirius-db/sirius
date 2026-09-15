@@ -16,24 +16,37 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
+
 #include <cudf/io/datasource.hpp>
-#include <cudf/io/text/byte_range_info.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
-#include <sys/uio.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
+
+namespace sirius::io::cache {
+class cached_chunk;
+}
 
 namespace sirius::io {
 
-static constexpr size_t IO_BLOCK_SIZE = 4096;  // O_DIRECT page size
+inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
 
 /**
  * @brief RAII wrapper for a POSIX file descriptor.
@@ -65,7 +78,7 @@ struct file_descriptor {
 };
 
 // ---------------------------------------------------------------------------
-// sirius_io_object
+// io_object
 // ---------------------------------------------------------------------------
 
 /**
@@ -78,9 +91,9 @@ struct file_descriptor {
  * @c shared_from_this() — this enforces at call sites that every io_object
  * passed in is already owned by a @c std::shared_ptr.
  */
-class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
+class io_object : public std::enable_shared_from_this<io_object> {
  public:
-  virtual ~sirius_io_object() = default;
+  virtual ~io_object() = default;
 
   /// Stable identifier used as the prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
@@ -99,113 +112,170 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
   /// Consumers compare it only for equality against a tag they captured
   /// earlier; an empty tag disables validation-based caching above —
   /// degraded performance, never wrong bytes.
-  [[nodiscard]] virtual std::string_view validation_etag() const noexcept { return {}; }
+  [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
 
-class sirius_io_object_metadata {
+class io_object_metadata {
  public:
-  virtual ~sirius_io_object_metadata() = default;
+  virtual ~io_object_metadata() = default;
 };
 
-/// A read of @c size bytes starting at file @c offset, scattered into one or
-/// more destination buffers (@c buffers, in file order).  A single-buffer
-/// segment is a plain read; a multi-buffer segment is a vectored (readv) read
-/// whose iovecs cover @c [offset, offset + size) contiguously in the file but
-/// may land in discontiguous host allocations.
-///
-/// Invariant: @c size == Σ buffers[i].iov_len.  The merge step that fuses
-/// neighboring segments during request preparation maintains this by routing
-/// every growth through @c append.
-class io_object_segment {
- public:
-  io_object_segment() = default;
+struct range {
+  std::size_t offset{0};
+  std::size_t size{0};
 
-  io_object_segment(size_t offset, size_t size)
-    : offset(offset), size(size), buffers{iovec{nullptr, size}}
+  [[nodiscard]] std::size_t end() const noexcept
   {
+    return size > std::numeric_limits<std::size_t>::max() - offset
+             ? std::numeric_limits<std::size_t>::max()
+             : offset + size;
   }
 
-  io_object_segment(size_t offset, size_t size, uint8_t* buffer)
-    : offset(offset), size(size), buffers{iovec{static_cast<void*>(buffer), size}}
-  {
-  }
-
-  /// Set the destination of a single-buffer segment (the bounce-slot path
-  /// assigns the reactor's internal buffer late, once a slot is acquired).
-  void set_data(uint8_t* buffer)
-  {
-    assert(buffers.size() == 1 && "set_data is only valid for a single-buffer segment");
-    buffers.front().iov_base = static_cast<void*>(buffer);
-  }
-
-  [[nodiscard]] uint8_t* data() const noexcept
-  {
-    return buffers.empty() ? nullptr : static_cast<uint8_t*>(buffers.front().iov_base);
-  }
-
-  [[nodiscard]] bool is_buffer_allocated() const noexcept { return data() != nullptr; }
-
-  /// Number of destination buffers (== number of iovecs in a readv).
-  [[nodiscard]] size_t n_chunks() const noexcept { return buffers.size(); }
-
-  /// True iff this segment must be submitted via io_uring_prep_readv (rather
-  /// than a single io_uring_prep_read).
-  [[nodiscard]] bool is_vectored() const noexcept { return buffers.size() > 1; }
-
-  /// O_DIRECT requires the file offset, the total length, and every iovec base
-  /// and length to be block-aligned.
-  [[nodiscard]] bool is_odirect_compatible() const noexcept
-  {
-    if (offset % IO_BLOCK_SIZE != 0 || size % IO_BLOCK_SIZE != 0) { return false; }
-    for (auto const& b : buffers) {
-      if (b.iov_len % IO_BLOCK_SIZE != 0) { return false; }
-      if (b.iov_base != nullptr && reinterpret_cast<uintptr_t>(b.iov_base) % IO_BLOCK_SIZE != 0) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /// Append a destination buffer, fusing a contiguous neighbor into this
-  /// segment.  Grows @c size by the buffer length to preserve the invariant.
-  void append(iovec iov) noexcept
-  {
-    buffers.push_back(iov);
-    size += iov.iov_len;
-  }
-
-  /// Rebuild the iovec list for resuming a short read after @p skip bytes were
-  /// already read: drops fully-consumed buffers and advances into the
-  /// straddling one.  Fills @p out in place (reusing its capacity across
-  /// resubmissions); @c buffers is untouched.
-  void fill_remaining_buffers(size_t skip, std::vector<iovec>& out) const
-  {
-    out.clear();
-    out.reserve(buffers.size());
-    for (auto const& iov : buffers) {
-      if (skip >= iov.iov_len) {
-        skip -= iov.iov_len;
-        continue;
-      }
-      out.push_back(iovec{static_cast<uint8_t*>(iov.iov_base) + skip, iov.iov_len - skip});
-      skip = 0;
-    }
-  }
-
-  size_t offset{0};
-  size_t size{0};
-  // Destination buffers in file order.  Owned here so the iovec array stays
-  // alive until the SQE referencing it is reaped.
-  std::vector<iovec> buffers;
+  [[nodiscard]] bool empty() const noexcept { return size == 0; }
 };
 
-/// True iff @p a immediately precedes @p b in the file (no gap, no overlap):
-/// a.offset + a.size == b.offset.  Used to decide whether two segments can be
-/// fused into a single vectored (readv) submission over one contiguous range.
-[[nodiscard]] inline bool contiguous(const io_object_segment& a,
-                                     const io_object_segment& b) noexcept
+[[nodiscard]] inline range intersect(range lhs, range rhs) noexcept
 {
-  return a.offset + a.size == b.offset;
+  auto const begin = std::max(lhs.offset, rhs.offset);
+  auto const end   = std::min(lhs.end(), rhs.end());
+  return end > begin ? range{begin, end - begin} : range{begin, 0};
 }
+
+struct slice {
+  slice() noexcept = default;
+
+  explicit slice(std::size_t offset, std::size_t size, std::uint8_t* dst) noexcept
+    : rng{offset, size}, dst{dst}
+  {
+    assert(dst != nullptr);
+    assert(size > 0);
+  }
+
+  [[nodiscard]] size_t size() const noexcept { return rng.size; }
+
+  [[nodiscard]] std::size_t offset() const noexcept { return rng.offset; }
+
+  range rng;
+  std::uint8_t* dst{nullptr};
+};
+
+struct host_buffer {
+  host_buffer() noexcept = default;
+
+  explicit host_buffer(std::uint8_t* dst) noexcept : buffer(dst) { assert(dst != nullptr); }
+
+  explicit host_buffer(std::span<cache::cached_chunk*> cached_chunks)
+    : buffer(std::vector<cache::cached_chunk*>{cached_chunks.begin(), cached_chunks.end()})
+  {
+    assert(!cached_chunks.empty());
+  }
+
+  explicit host_buffer(std::vector<cache::cached_chunk*> cached_chunks)
+    : buffer(std::move(cached_chunks))
+  {
+    assert(!std::get<std::vector<cache::cached_chunk*>>(buffer).empty());
+  }
+
+  [[nodiscard]] bool needs_staging() const noexcept
+  {
+    return std::holds_alternative<std::monostate>(buffer);
+  }
+
+  [[nodiscard]] bool is_fragmented() const noexcept
+  {
+    return std::holds_alternative<std::vector<cache::cached_chunk*>>(buffer);
+  }
+
+  [[nodiscard]] bool is_contiguous() const noexcept
+  {
+    return std::holds_alternative<std::uint8_t*>(buffer);
+  }
+
+  [[nodiscard]] bool is_staged() const noexcept { return needs_staging(); }
+
+  [[nodiscard]] std::span<cache::cached_chunk* const> fragments() const noexcept
+  {
+    if (!is_fragmented()) return {};
+    return std::get<std::vector<cache::cached_chunk*>>(buffer);
+  }
+
+  std::variant<std::monostate, std::uint8_t*, std::vector<cache::cached_chunk*>> buffer;
+};
+
+struct device_buffer {
+  device_buffer() noexcept = default;
+
+  explicit device_buffer(std::uint8_t* dst,
+                         rmm::cuda_stream_view stream,
+                         int device_id = -1) noexcept
+    : data(dst), stream(stream), device_id(device_id)
+  {
+    assert(dst != nullptr);
+  }
+
+  std::uint8_t* data{nullptr};
+  rmm::cuda_stream_view stream;
+  int device_id{-1};
+};
+
+class prepared_io_completion final {
+ public:
+  using callback_type = exec::invocable<void(std::span<cache::cached_chunk* const>, bool) noexcept>;
+
+  template <typename Callback>
+  explicit prepared_io_completion(Callback&& callback) : _callback(std::forward<Callback>(callback))
+  {
+  }
+
+  prepared_io_completion(prepared_io_completion const&)            = delete;
+  prepared_io_completion& operator=(prepared_io_completion const&) = delete;
+
+  void operator()(std::span<cache::cached_chunk* const> chunks, bool success) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    _callback(chunks, success);
+  }
+
+ private:
+  std::mutex _mutex;
+  callback_type _callback;
+};
+
+struct prepared_io_slice {
+  /// The logical caller-requested window. A reactor may widen the physical I/O
+  /// for alignment or a cached chunk's advertised fill, but device copies and
+  /// returned byte accounting remain limited to this range.
+  range rng;
+  host_buffer h_buffer;  // monostate if using reactor-owned staging
+  device_buffer d_buffer;
+  std::shared_ptr<prepared_io_completion> on_complete;
+
+  prepared_io_slice() noexcept = default;
+  explicit prepared_io_slice(range r, host_buffer h) noexcept : rng(r), h_buffer(std::move(h)) {}
+  explicit prepared_io_slice(range r, device_buffer d) noexcept : rng(r), d_buffer(std::move(d)) {}
+  explicit prepared_io_slice(range r, host_buffer h, device_buffer d) noexcept
+    : rng(r), h_buffer(std::move(h)), d_buffer(std::move(d))
+  {
+  }
+
+  [[nodiscard]] bool is_staged() const noexcept { return h_buffer.needs_staging(); }
+
+  [[nodiscard]] bool is_fragmented() const noexcept { return h_buffer.is_fragmented(); }
+
+  [[nodiscard]] bool is_contiguous() const noexcept { return h_buffer.is_contiguous(); }
+
+  [[nodiscard]] bool has_host_request() const noexcept { return !h_buffer.needs_staging(); }
+
+  [[nodiscard]] bool has_device_request() const noexcept { return d_buffer.data != nullptr; }
+
+  [[nodiscard]] bool is_host_request() const noexcept
+  {
+    return !h_buffer.needs_staging() && !has_device_request();
+  }
+
+  [[nodiscard]] size_t size() const noexcept { return rng.size; }
+
+  [[nodiscard]] size_t offset() const noexcept { return rng.offset; }
+};
 
 }  // namespace sirius::io

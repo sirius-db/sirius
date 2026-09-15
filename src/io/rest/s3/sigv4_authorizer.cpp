@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-#include "io/s3/sirius_sigv4_authorizer.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
 
 #include "io/io_errors.hpp"
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -25,7 +25,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 namespace {
 
@@ -44,19 +44,16 @@ std::string to_lower(std::string_view s)
 /// a specific bucket or object.
 std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
 {
-  if (endpoint.empty()) {
-    throw credential_error("sirius_sigv4_presigned_authorizer: empty endpoint");
-  }
+  if (endpoint.empty()) { throw credential_error("sigv4_presigned_authorizer: empty endpoint"); }
   auto sep = endpoint.find("://");
   if (sep == std::string_view::npos) {
     throw credential_error(
-      "sirius_sigv4_presigned_authorizer: endpoint missing scheme (expected http:// or https://)");
+      "sigv4_presigned_authorizer: endpoint missing scheme (expected http:// or https://)");
   }
   std::string scheme = to_lower(endpoint.substr(0, sep));
   if (scheme != "http" && scheme != "https") {
     throw credential_error(
-      "sirius_sigv4_presigned_authorizer: endpoint scheme must be http or https (got '" + scheme +
-      "')");
+      "sigv4_presigned_authorizer: endpoint scheme must be http or https (got '" + scheme + "')");
   }
   std::string remainder{endpoint.substr(sep + 3)};
   // Anything past host[:port] (path, query, fragment) is rejected — endpoint
@@ -64,22 +61,22 @@ std::pair<std::string, std::string> parse_endpoint(std::string_view endpoint)
   auto bad = remainder.find_first_of("/?#");
   if (bad != std::string::npos) {
     throw credential_error(
-      "sirius_sigv4_presigned_authorizer: endpoint must be scheme://host[:port] only (got "
+      "sigv4_presigned_authorizer: endpoint must be scheme://host[:port] only (got "
       "trailing '" +
       remainder.substr(bad) + "')");
   }
   if (remainder.empty()) {
-    throw credential_error("sirius_sigv4_presigned_authorizer: endpoint missing host");
+    throw credential_error("sigv4_presigned_authorizer: endpoint missing host");
   }
   return {std::move(scheme), to_lower(remainder)};
 }
 
 /// Path-style canonical URI "/<bucket>/<key>", RFC3986-encoded. Bucket encodes
 /// '/' (none valid in bucket names); key leaves '/' so nested keys pass through.
-std::string make_canonical_uri(s3_object_ref const& obj)
+std::string make_canonical_uri(object_ref const& obj)
 {
-  if (obj.bucket.empty()) { throw credential_error("sirius_sigv4_authorizer: empty bucket"); }
-  if (obj.key.empty()) { throw credential_error("sirius_sigv4_authorizer: empty key"); }
+  if (obj.bucket.empty()) { throw credential_error("sigv4_authorizer: empty bucket"); }
+  if (obj.key.empty()) { throw credential_error("sigv4_authorizer: empty key"); }
   std::string uri = "/";
   uri += uri_encode(obj.bucket, /*encode_slash=*/true);
   uri += '/';
@@ -100,11 +97,11 @@ sigv4_signer_config make_signer(static_credentials const& creds, std::string con
   return signer;
 }
 
-std::string_view method_to_str(s3_request_method method)
+std::string_view method_to_str(request_method method)
 {
   switch (method) {
-    case s3_request_method::GET: return "GET";
-    case s3_request_method::HEAD: return "HEAD";
+    case request_method::GET: return "GET";
+    case request_method::HEAD: return "HEAD";
   }
   return "GET";  // unreachable; all enumerators handled
 }
@@ -131,7 +128,7 @@ void reject_amz_query_params(std::string_view canonical_query)
       }
       if (amz) {
         throw credential_error(
-          "sirius_sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
+          "sigv4_authorizer: X-Amz-* keys are not allowed in a LIST canonical query (got '" +
           std::string{key} + "')");
       }
     }
@@ -142,40 +139,37 @@ void reject_amz_query_params(std::string_view canonical_query)
 
 }  // namespace
 
-sirius_sigv4_authorizer_base::sirius_sigv4_authorizer_base(static_credentials creds,
-                                                           std::string region,
-                                                           std::string endpoint)
+sigv4_authorizer_base::sigv4_authorizer_base(static_credentials creds,
+                                             std::string region,
+                                             std::string endpoint)
   : _creds(std::move(creds)), _region(std::move(region))
 {
   if (_creds.access_key_id.empty() || _creds.secret_access_key.empty()) {
     throw credential_error(
-      "sirius_sigv4_authorizer: access_key_id and secret_access_key must be non-empty");
+      "sigv4_authorizer: access_key_id and secret_access_key must be non-empty");
   }
-  if (_region.empty()) {
-    throw credential_error("sirius_sigv4_authorizer: region must be non-empty");
-  }
+  if (_region.empty()) { throw credential_error("sigv4_authorizer: region must be non-empty"); }
 
   auto [scheme, host] = parse_endpoint(endpoint);
   _scheme             = std::move(scheme);
   _host               = std::move(host);
 }
 
-sirius_sigv4_presigned_authorizer::sirius_sigv4_presigned_authorizer(
-  static_credentials creds,
-  std::string region,
-  std::string endpoint,
-  std::chrono::seconds default_ttl)
-  : sirius_sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint)),
+sigv4_presigned_authorizer::sigv4_presigned_authorizer(static_credentials creds,
+                                                       std::string region,
+                                                       std::string endpoint,
+                                                       std::chrono::seconds default_ttl)
+  : sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint)),
     _ttl(default_ttl)
 {
   if (_ttl.count() <= 0) {
-    throw credential_error("sirius_sigv4_presigned_authorizer: default_ttl must be positive");
+    throw credential_error("sigv4_presigned_authorizer: default_ttl must be positive");
   }
 }
 
-s3_authorized_request sirius_sigv4_presigned_authorizer::authorize(s3_object_ref const& obj,
-                                                                   s3_request_method method,
-                                                                   std::chrono::seconds timeout)
+authorized_request sigv4_presigned_authorizer::authorize(object_ref const& obj,
+                                                         request_method method,
+                                                         std::chrono::seconds timeout)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
@@ -187,25 +181,26 @@ s3_authorized_request sirius_sigv4_presigned_authorizer::authorize(s3_object_ref
   try {
     // Auth lives entirely in the URL query, so the URL is returned with EMPTY
     // headers.
-    return s3_authorized_request{presign_url(method_to_str(method),
-                                             _scheme,
-                                             _host,
-                                             canonical_uri,
-                                             signer,
-                                             std::time(nullptr),
-                                             effective_ttl),
-                                 {}};
+    return authorized_request{presign_url(method_to_str(method),
+                                          _scheme,
+                                          _host,
+                                          canonical_uri,
+                                          signer,
+                                          std::time(nullptr),
+                                          effective_ttl),
+                              {}};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
-    throw credential_error(std::string("sirius_sigv4_presigned_authorizer: ") + e.what());
+    throw credential_error(std::string("sigv4_presigned_authorizer: ") + e.what());
   }
 }
 
-s3_authorized_request sirius_sigv4_presigned_authorizer::authorize_list(
-  std::string_view bucket, std::string_view canonical_query, std::chrono::seconds timeout)
+authorized_request sigv4_presigned_authorizer::authorize_list(std::string_view bucket,
+                                                              std::string_view canonical_query,
+                                                              std::chrono::seconds timeout)
 {
-  if (bucket.empty()) { throw credential_error("sirius_sigv4_authorizer: empty bucket"); }
+  if (bucket.empty()) { throw credential_error("sigv4_authorizer: empty bucket"); }
   reject_amz_query_params(canonical_query);
   std::string const canonical_uri = "/" + uri_encode(bucket, /*encode_slash=*/true);
   auto const signer               = make_signer(_creds, _region);
@@ -214,32 +209,32 @@ s3_authorized_request sirius_sigv4_presigned_authorizer::authorize_list(
   try {
     // The list params are merged into the signed canonical query by presign_url,
     // so the URL carries both them and the X-Amz-* auth params; headers empty.
-    return s3_authorized_request{presign_url(/*method=*/"GET",
-                                             _scheme,
-                                             _host,
-                                             canonical_uri,
-                                             signer,
-                                             std::time(nullptr),
-                                             effective_ttl,
-                                             canonical_query),
-                                 {}};
+    return authorized_request{presign_url(/*method=*/"GET",
+                                          _scheme,
+                                          _host,
+                                          canonical_uri,
+                                          signer,
+                                          std::time(nullptr),
+                                          effective_ttl,
+                                          canonical_query),
+                              {}};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
-    throw credential_error(std::string("sirius_sigv4_presigned_authorizer: ") + e.what());
+    throw credential_error(std::string("sigv4_presigned_authorizer: ") + e.what());
   }
 }
 
-sirius_sigv4_header_authorizer::sirius_sigv4_header_authorizer(static_credentials creds,
-                                                               std::string region,
-                                                               std::string endpoint)
-  : sirius_sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint))
+sigv4_header_authorizer::sigv4_header_authorizer(static_credentials creds,
+                                                 std::string region,
+                                                 std::string endpoint)
+  : sigv4_authorizer_base(std::move(creds), std::move(region), std::move(endpoint))
 {
 }
 
-s3_authorized_request sirius_sigv4_header_authorizer::authorize(s3_object_ref const& obj,
-                                                                s3_request_method method,
-                                                                std::chrono::seconds /*timeout*/)
+authorized_request sigv4_header_authorizer::authorize(object_ref const& obj,
+                                                      request_method method,
+                                                      std::chrono::seconds /*timeout*/)
 {
   auto const canonical_uri = make_canonical_uri(obj);
   auto const signer        = make_signer(_creds, _region);
@@ -257,18 +252,19 @@ s3_authorized_request sirius_sigv4_header_authorizer::authorize(s3_object_ref co
                                    signer,
                                    std::time(nullptr));
     std::string url = _scheme + "://" + _host + canonical_uri;
-    return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
+    return authorized_request{std::move(url), std::move(signed_req.headers)};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
-    throw credential_error(std::string("sirius_sigv4_header_authorizer: ") + e.what());
+    throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
   }
 }
 
-s3_authorized_request sirius_sigv4_header_authorizer::authorize_list(
-  std::string_view bucket, std::string_view canonical_query, std::chrono::seconds /*timeout*/)
+authorized_request sigv4_header_authorizer::authorize_list(std::string_view bucket,
+                                                           std::string_view canonical_query,
+                                                           std::chrono::seconds /*timeout*/)
 {
-  if (bucket.empty()) { throw credential_error("sirius_sigv4_authorizer: empty bucket"); }
+  if (bucket.empty()) { throw credential_error("sigv4_authorizer: empty bucket"); }
   reject_amz_query_params(canonical_query);
   std::string const canonical_uri = "/" + uri_encode(bucket, /*encode_slash=*/true);
   auto const signer               = make_signer(_creds, _region);
@@ -289,12 +285,12 @@ s3_authorized_request sirius_sigv4_header_authorizer::authorize_list(
       url += '?';
       url += canonical_query;
     }
-    return s3_authorized_request{std::move(url), std::move(signed_req.headers)};
+    return authorized_request{std::move(url), std::move(signed_req.headers)};
   } catch (credential_error const&) {
     throw;
   } catch (std::exception const& e) {
-    throw credential_error(std::string("sirius_sigv4_header_authorizer: ") + e.what());
+    throw credential_error(std::string("sigv4_header_authorizer: ") + e.what());
   }
 }
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

@@ -17,7 +17,7 @@
 #pragma once
 
 #include "io/io_errors.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/authorizer.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -25,20 +25,20 @@
 #include <string>
 #include <utility>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest {
 
 /**
- * @brief Test-only @c s3_request_authorizer that returns a canned
- *        @c s3_authorized_request or throws.
+ * @brief Test-only @c request_authorizer that returns a canned
+ *        @c authorized_request or throws.
  *
  * Header-only so the S3 reactor PR (PR3) and downstream test suites can
  * include it without a separate library target. Produces deterministic
- * output for unit tests of code that consumes @c s3_request_authorizer through
+ * output for unit tests of code that consumes @c request_authorizer through
  * the abstract base class — typical pattern is:
  *
  * @code
- *   auto provider = std::make_shared<mock_request_authorizer>(
- *     s3_authorized_request{"https://canned/url", {}});
+ *   auto provider = std::make_shared<mock_authorizer>(
+ *     authorized_request{"https://canned/url", {}});
  *   reactor->set_credentials(provider);
  *   reactor->read(obj);
  *   CHECK(provider->call_count() == 1);
@@ -46,7 +46,7 @@ namespace sirius::io::s3 {
  * @endcode
  *
  * Default behavior: every call to @c authorize returns the
- * @c s3_authorized_request passed to the constructor verbatim (independent of
+ * @c authorized_request passed to the constructor verbatim (independent of
  * @p obj / @p method) so tests can verify "the reactor passed our URL +
  * headers to libcurl unchanged". To exercise error paths, call @c set_throw to
  * make subsequent calls throw @c sirius::io::credential_error.
@@ -55,17 +55,17 @@ namespace sirius::io::s3 {
  * guarded by an internal mutex. Safe to share across threads when tests
  * exercise concurrent reactor paths.
  */
-class mock_request_authorizer final : public s3_request_authorizer {
+class mock_authorizer final : public request_authorizer {
  public:
-  explicit mock_request_authorizer(s3_authorized_request canned) : _canned(std::move(canned)) {}
+  explicit mock_authorizer(authorized_request canned) : _canned(std::move(canned)) {}
 
-  s3_authorized_request authorize(s3_object_ref const& obj,
-                                  s3_request_method method,
-                                  std::chrono::seconds timeout) override
+  authorized_request authorize(object_ref const& obj,
+                               request_method method,
+                               std::chrono::seconds timeout) override
   {
     ++_call_count;
-    if (method == s3_request_method::GET) ++_get_count;
-    if (method == s3_request_method::HEAD) ++_head_count;
+    if (method == request_method::GET) ++_get_count;
+    if (method == request_method::HEAD) ++_head_count;
     {
       std::scoped_lock lk{_last_mtx};
       _last_bucket  = obj.bucket;
@@ -76,8 +76,7 @@ class mock_request_authorizer final : public s3_request_authorizer {
       std::string msg;
       {
         std::scoped_lock lk{_last_mtx};
-        msg =
-          _throw_msg.empty() ? std::string{"mock_request_authorizer: forced failure"} : _throw_msg;
+        msg = _throw_msg.empty() ? std::string{"mock_authorizer: forced failure"} : _throw_msg;
       }
       throw credential_error(msg);
     }
@@ -125,7 +124,7 @@ class mock_request_authorizer final : public s3_request_authorizer {
   }
 
  private:
-  s3_authorized_request _canned;
+  authorized_request _canned;
   std::atomic<int> _call_count{0};
   std::atomic<int> _get_count{0};
   std::atomic<int> _head_count{0};
@@ -137,4 +136,4 @@ class mock_request_authorizer final : public s3_request_authorizer {
   std::string _throw_msg;
 };
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest

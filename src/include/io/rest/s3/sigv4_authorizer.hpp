@@ -16,13 +16,13 @@
 
 #pragma once
 
-#include "io/s3/s3_request_authorizer.hpp"
-#include "io/s3/static_credentials.hpp"
+#include "io/rest/authorizer.hpp"
+#include "io/rest/s3/static_credentials.hpp"
 
 #include <chrono>
 #include <string>
 
-namespace sirius::io::s3 {
+namespace sirius::io::rest::s3 {
 
 /**
  * @brief Common base for the built-in SigV4 authorizers: hand-rolled SigV4 over
@@ -34,16 +34,16 @@ namespace sirius::io::s3 {
  * externally-rotated temporary credentials (reconstruct the authorizer on
  * rotation; these impls do not refresh). Downstream projects that want
  * refresh-aware credentials (IMDS / STS chain / SSO) ship their own
- * @c s3_request_authorizer; the public surface is a single @c authorize() call
+ * @c request_authorizer; the public surface is a single @c authorize() call
  * so they can do so without exposing raw keys to Sirius.
  */
-class sirius_sigv4_authorizer_base : public s3_request_authorizer {
+class sigv4_authorizer_base : public request_authorizer {
  protected:
   /// @param region    Signing region (e.g. @c "us-east-1").
   /// @param endpoint  scheme://host[:port], no path / query / fragment.
   /// @throw sirius::io::credential_error on empty creds, empty region, or
   ///        malformed endpoint.
-  sirius_sigv4_authorizer_base(static_credentials creds, std::string region, std::string endpoint);
+  sigv4_authorizer_base(static_credentials creds, std::string region, std::string endpoint);
 
   static_credentials _creds;
   std::string _region;
@@ -60,30 +60,30 @@ class sirius_sigv4_authorizer_base : public s3_request_authorizer {
  * overrides it. Inline-at-request-time presigning keeps TTLs short, limiting the
  * blast radius of an accidentally-leaked URL.
  */
-class sirius_sigv4_presigned_authorizer final : public sirius_sigv4_authorizer_base {
+class sigv4_presigned_authorizer final : public sigv4_authorizer_base {
  public:
   /// @throw sirius::io::credential_error on empty creds/region, malformed
   ///        endpoint, or non-positive @p default_ttl.
-  sirius_sigv4_presigned_authorizer(static_credentials creds,
-                                    std::string region,
-                                    std::string endpoint,
-                                    std::chrono::seconds default_ttl = std::chrono::minutes{5});
+  sigv4_presigned_authorizer(static_credentials creds,
+                             std::string region,
+                             std::string endpoint,
+                             std::chrono::seconds default_ttl = std::chrono::minutes{5});
 
   /// Thread-safe: @c sigv4::presign_url is pure and members are immutable after
   /// construction.
   /// @throw sirius::io::credential_error on empty bucket / key or SigV4 failure.
-  s3_authorized_request authorize(s3_object_ref const& obj,
-                                  s3_request_method method,
-                                  std::chrono::seconds timeout) override;
+  authorized_request authorize(object_ref const& obj,
+                               request_method method,
+                               std::chrono::seconds timeout) override;
 
   /// Presigned bucket-level ListObjectsV2: the request params are merged into
   /// the signed query, so the returned URL carries both the list params and the
   /// X-Amz-* auth params; headers are empty.
   /// @throw sirius::io::credential_error on empty bucket, an X-Amz-* key inside
   ///        @p canonical_query (signing-param smuggling), or SigV4 failure.
-  s3_authorized_request authorize_list(std::string_view bucket,
-                                       std::string_view canonical_query,
-                                       std::chrono::seconds timeout) override;
+  authorized_request authorize_list(std::string_view bucket,
+                                    std::string_view canonical_query,
+                                    std::chrono::seconds timeout) override;
 
  private:
   std::chrono::seconds _ttl;
@@ -100,20 +100,18 @@ class sirius_sigv4_presigned_authorizer final : public sirius_sigv4_authorizer_b
  * auth over presigned query strings. @c timeout is unused (header auth carries
  * no explicit expiry).
  */
-class sirius_sigv4_header_authorizer final : public sirius_sigv4_authorizer_base {
+class sigv4_header_authorizer final : public sigv4_authorizer_base {
  public:
   /// @throw sirius::io::credential_error on empty creds/region or malformed
   ///        endpoint.
-  sirius_sigv4_header_authorizer(static_credentials creds,
-                                 std::string region,
-                                 std::string endpoint);
+  sigv4_header_authorizer(static_credentials creds, std::string region, std::string endpoint);
 
   /// Thread-safe: @c sigv4::sign_request is pure and members are immutable after
   /// construction.
   /// @throw sirius::io::credential_error on empty bucket / key or SigV4 failure.
-  s3_authorized_request authorize(s3_object_ref const& obj,
-                                  s3_request_method method,
-                                  std::chrono::seconds timeout) override;
+  authorized_request authorize(object_ref const& obj,
+                               request_method method,
+                               std::chrono::seconds timeout) override;
 
   /// Header-signed bucket-level ListObjectsV2: returns a plain
   /// @c "{scheme}://{host}/{bucket}?{canonical_query}" URL plus the signed
@@ -121,9 +119,9 @@ class sirius_sigv4_header_authorizer final : public sirius_sigv4_authorizer_base
   /// no explicit expiry).
   /// @throw sirius::io::credential_error on empty bucket, an X-Amz-* key inside
   ///        @p canonical_query (signing-param smuggling), or SigV4 failure.
-  s3_authorized_request authorize_list(std::string_view bucket,
-                                       std::string_view canonical_query,
-                                       std::chrono::seconds timeout) override;
+  authorized_request authorize_list(std::string_view bucket,
+                                    std::string_view canonical_query,
+                                    std::chrono::seconds timeout) override;
 };
 
-}  // namespace sirius::io::s3
+}  // namespace sirius::io::rest::s3

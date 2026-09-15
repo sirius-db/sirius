@@ -250,7 +250,7 @@ void load_sirius_extension(duckdb::DuckDB& db)
 
 class sirius_httpfs_config_env_guard {
  public:
-  explicit sirius_httpfs_config_env_guard(s3_test_env const& env, bool perf_instrumentation = false)
+  explicit sirius_httpfs_config_env_guard(s3_test_env const& env)
   {
     if (auto* current = std::getenv("SIRIUS_CONFIG_FILE"); current != nullptr) {
       had_original_config_env_ = true;
@@ -285,7 +285,8 @@ class sirius_httpfs_config_env_guard {
            "        block_size: 1 MiB\n"
            "  executor:\n"
            "    scan_manager:\n"
-           "      enable_prefetch_cache: false\n"
+           "      cache:\n"
+           "        mode: none\n"
            "      object_store:\n"
            "        endpoint: "
         << yaml_quote(env.endpoint)
@@ -301,9 +302,7 @@ class sirius_httpfs_config_env_guard {
         << "\n"
            "        tls_verify: false\n"
            "      rest:\n"
-           "        max_connections: 8\n"
            "        request_timeout_s: 30\n";
-    if (perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
     REQUIRE(out);
 
@@ -338,8 +337,7 @@ class sirius_httpfs_config_env_guard {
 
 class sirius_httpfs_fixture {
  public:
-  explicit sirius_httpfs_fixture(s3_test_env const& env, bool perf_instrumentation = false)
-    : config_env(env, perf_instrumentation), db(nullptr), con(db)
+  explicit sirius_httpfs_fixture(s3_test_env const& env) : config_env(env), db(nullptr), con(db)
   {
     load_sirius_extension(db);
     REQUIRE(con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state"));
@@ -543,7 +541,7 @@ TEST_CASE("sirius_httpfs opens through FileOpener and reads positional ranges",
   auto datasource = require_rest_datasource(fixture, uri);
   auto const size = handle->GetFileSize();
   REQUIRE(size > 16);
-  CHECK(static_cast<std::size_t>(size) == datasource->io_object().size());
+  CHECK(static_cast<std::size_t>(size) == datasource->get_io_object().size());
   CHECK_FALSE(handle->OnDiskFile());
 
   std::vector<std::uint8_t> fs_bytes(8);
@@ -657,14 +655,10 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
     return;
   }
 
-  sirius_httpfs_fixture fixture(*env, /*perf_instrumentation=*/true);
+  sirius_httpfs_fixture fixture(*env);
   set_gpu_execution(fixture.con, true);
   require_query_ok(fixture.con, "SET enable_external_file_cache = true");
   auto const uri = s3_uri(env->bucket, key);
-
-  auto routed_datasource = require_rest_datasource(fixture, uri);
-  auto* rest = dynamic_cast<sirius::io::rest::rest_ioctx*>(routed_datasource->io_ctx().get());
-  REQUIRE(rest != nullptr);
 
   auto caching_fs        = duckdb::CachingFileSystem::Get(*fixture.con.context);
   auto read_cached_range = [&] {
@@ -688,11 +682,7 @@ TEST_CASE("DuckDB external file cache invalidates an overwritten S3 range by ETa
   CHECK(cache_rows->GetValue(0, 0).GetValue<std::int64_t>() >= 1);
 
   REQUIRE(sirius::test::put_s3_container_object(key, second));
-  auto const before_second = rest->perf_snapshot();
-  auto second_read         = read_cached_range();
-  auto const after_second  = rest->perf_snapshot();
-
-  CHECK(after_second.chunk_get_count > before_second.chunk_get_count);
+  auto second_read = read_cached_range();
   CHECK(std::equal(second_read.begin(), second_read.end(), second.begin() + read_offset));
 }
 

@@ -16,28 +16,27 @@
 
 #pragma once
 
-// Backend-agnostic request-lifecycle primitives shared by every reactor
-// (io_uring, REST/curl, ...).  A reactor splits one caller request into N
-// per-chunk requests that share a single request_manager; each chunk reports
-// completion or error, and the manager fulfills one future when all chunks are
-// done.  device_cpy_request batches the host->device copies for GPU-bound
-// reads.  rx_request_t is the per-reactor container that the templated_ioctx
-// dispatch layer splits across the reactor pool.
-
+#include "cuda/device_copy_batch.hpp"
 #include "exec/semi_future.hpp"
+#include "io/types.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
 #include <cuda_runtime.h>
 
+#include <sys/uio.h>
+
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <source_location>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -47,209 +46,346 @@
 
 namespace sirius::io {
 
-/// Fan-in for one caller request that a reactor splits into @c total_chunks
-/// per-chunk reads.  Each chunk calls @c chunk_complete (or @c report_error);
-/// the future returned by @c get_future is fulfilled from the destructor once
-/// the last owning reference drops — with the first reported error if any, or
-/// @c bytes_requested otherwise.
-class request_manager {
+/**
+ * @brief Fan-in shared by every physical operation derived from one logical read.
+ *
+ * The initial task count is one credit per prepared slice. Before a reactor
+ * expands a slice into N physical operations it adds N-1 credits, then every
+ * success, failure, or cancellation settles exactly one credit. The first
+ * error stops further dispatch immediately, but the future is not fulfilled
+ * until all already-published operations have drained.
+ */
+class grouped_coordinator final {
  public:
   using error_type = std::variant<std::exception_ptr, cudaError_t, std::error_code>;
-  // @p bytes_requested is the number of bytes the *caller* asked for; it is the
-  // value handed back through the future.  The reactor frequently reads more
-  // than that (O_DIRECT/chunk alignment over-reads whole blocks), so the
-  // physically-read total tracked in @c bytes_read is only used to assert that
-  // the request was fully covered — it is never returned to the caller.
-  explicit request_manager(std::size_t bytes_requested, std::size_t total_chunks)
-    : bytes_requested(bytes_requested), total_chunks(total_chunks)
+
+  grouped_coordinator(std::size_t bytes_requested, std::size_t initial_tasks)
+    : _bytes_requested(bytes_requested), _tasks_remaining(initial_tasks)
   {
   }
 
-  ~request_manager()
+  grouped_coordinator(grouped_coordinator const&)            = delete;
+  grouped_coordinator& operator=(grouped_coordinator const&) = delete;
+
+  [[nodiscard]] bool should_continue() const noexcept
   {
-    if (has_error()) {
-      promise.set_exception(first_exception);
-    } else {
-      assert(bytes_read >= bytes_requested &&
-             "All chunks completed but fewer bytes were read than requested");
-      assert(chunks_completed == total_chunks &&
-             "All chunks completed but total chunks completed does not match expected");
-      promise.set_value(bytes_requested);
+    return _continue.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool has_error() const noexcept { return !should_continue(); }
+
+  [[nodiscard]] std::size_t bytes_requested() const noexcept { return _bytes_requested; }
+
+  [[nodiscard]] std::size_t tasks_remaining() const noexcept
+  {
+    return _tasks_remaining.load(std::memory_order_acquire);
+  }
+
+  /**
+   * @brief Add credits for a slice expansion.
+   *
+   * This must happen before any derived operation can become visible to a
+   * worker. The original slice credit keeps the count non-zero while it is
+   * being expanded.
+   */
+  void add_tasks(std::size_t count) noexcept
+  {
+    if (count == 0) return;
+
+    auto current = _tasks_remaining.load(std::memory_order_acquire);
+    while (current != 0) {
+      assert(current <= std::numeric_limits<std::size_t>::max() - count);
+      if (_tasks_remaining.compare_exchange_weak(
+            current, current + count, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+      }
     }
+    assert(false && "cannot expand a completed grouped I/O request");
   }
 
-  void chunk_complete(std::size_t n_bytes)
-  {
-    bytes_read.fetch_add(n_bytes, std::memory_order_acq_rel);
-    chunks_completed.fetch_add(1, std::memory_order_acq_rel);
-  }
+  void on_complete() noexcept { settle_one(); }
 
-  void report_error(const error_type& e, std::source_location loc = std::source_location::current())
+  void report_error(error_type const& error,
+                    std::source_location loc = std::source_location::current()) noexcept
   {
-    if (!error_reported.exchange(true, std::memory_order_acq_rel)) {
-      first_exception = to_exception_ptr(e, loc);
+    bool expected = true;
+    if (_continue.compare_exchange_strong(
+          expected, false, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      std::exception_ptr converted;
+      try {
+        converted = to_exception_ptr(error, loc);
+        if (converted == nullptr) {
+          converted = std::make_exception_ptr(std::runtime_error("unknown I/O error"));
+        }
+      } catch (...) {
+        converted = std::current_exception();
+      }
+
+      std::lock_guard lock(_state_mutex);
+      assert(_first_exception == nullptr);
+      _first_exception = std::move(converted);
     }
+    settle_one();
   }
-
-  [[nodiscard]] bool has_error() const noexcept
+  [[nodiscard]] exec::semi_future<std::size_t> get_future()
   {
-    return error_reported.load(std::memory_order_acquire);
+    exec::semi_future<std::size_t> future;
+    {
+      std::lock_guard lock(_state_mutex);
+      assert(!_future_taken && "grouped coordinator future may only be retrieved once");
+      future        = _promise.get_semi_future();
+      _future_taken = true;
+    }
+    resolve_if_ready();
+    return future;
   }
-
-  [[nodiscard]] exec::semi_future<size_t> get_future() noexcept
-  {
-    return promise.get_semi_future();
-  }
-
-  const std::size_t bytes_requested;
-  const std::size_t total_chunks;
 
  private:
-  [[nodiscard]] std::exception_ptr to_exception_ptr(const error_type& e,
-                                                    std::source_location loc) const noexcept
+  [[nodiscard]] static std::exception_ptr to_exception_ptr(error_type const& error,
+                                                           std::source_location loc)
   {
-    if (std::holds_alternative<std::exception_ptr>(e)) {
-      return std::get<std::exception_ptr>(e);
-    } else if (std::holds_alternative<cudaError_t>(e)) {
-      auto err = std::get<cudaError_t>(e);
-      return std::make_exception_ptr(
-        std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)) + " at " +
-                           loc.file_name() + ":" + std::to_string(loc.line())));
-    } else if (std::holds_alternative<std::error_code>(e)) {
-      auto err = std::get<std::error_code>(e);
-      return std::make_exception_ptr(std::system_error(
-        err, "System error at " + std::string(loc.file_name()) + ":" + std::to_string(loc.line())));
+    if (std::holds_alternative<std::exception_ptr>(error)) {
+      return std::get<std::exception_ptr>(error);
     }
-    return nullptr;  // Should never reach here
+    if (std::holds_alternative<cudaError_t>(error)) {
+      auto const value = std::get<cudaError_t>(error);
+      return std::make_exception_ptr(
+        std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(value)) + " at " +
+                           loc.file_name() + ":" + std::to_string(loc.line())));
+    }
+
+    auto const value = std::get<std::error_code>(error);
+    return std::make_exception_ptr(std::system_error(
+      value, "System error at " + std::string(loc.file_name()) + ":" + std::to_string(loc.line())));
   }
 
-  std::atomic<std::size_t> bytes_read{0};
-  std::atomic<std::size_t> chunks_completed{0};
-  std::atomic<bool> error_reported{false};
-  std::exception_ptr first_exception{nullptr};
-  exec::promise<size_t> promise;
+  void settle_one() noexcept
+  {
+    auto current = _tasks_remaining.load(std::memory_order_acquire);
+    while (current != 0) {
+      if (_tasks_remaining.compare_exchange_weak(
+            current, current - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        if (current == 1) resolve_if_ready();
+        return;
+      }
+    }
+    assert(false && "a grouped I/O task was completed more than once");
+  }
+
+  void resolve_if_ready() noexcept
+  {
+    std::exception_ptr error;
+    {
+      std::lock_guard lock(_state_mutex);
+      if (_tasks_remaining.load(std::memory_order_acquire) != 0 || !_future_taken || _fulfilled) {
+        return;
+      }
+      _fulfilled = true;
+      error      = _first_exception;
+    }
+
+    if (error != nullptr) {
+      _promise.set_exception(std::move(error));
+    } else {
+      _promise.set_value(_bytes_requested);
+    }
+  }
+
+  std::size_t const _bytes_requested;
+  std::atomic<std::size_t> _tasks_remaining;
+  std::atomic<bool> _continue{true};
+
+  mutable std::mutex _state_mutex;
+  std::exception_ptr _first_exception;
+  bool _future_taken{false};
+  bool _fulfilled{false};
+  exec::promise<std::size_t> _promise;
+};
+
+/**
+ * @brief A queue entry containing logical slices and their shared fan-in.
+ *
+ * The object and fragment-pointer arrays are owned for the full asynchronous
+ * lifetime. Reactors keep an active request locally and consume its slices in
+ * order; they do not explode the group into queue entries before slot capacity
+ * is known.
+ */
+class grouped_io_request final {
+ public:
+  static std::unique_ptr<grouped_io_request> create(
+    std::shared_ptr<const io_object> object,
+    std::vector<prepared_io_slice> slices,
+    std::shared_ptr<grouped_coordinator> coordinator)
+  {
+    if (object == nullptr || coordinator == nullptr) {
+      throw std::invalid_argument("grouped_io_request requires an object and coordinator");
+    }
+    return std::unique_ptr<grouped_io_request>(
+      new grouped_io_request(std::move(object), std::move(slices), std::move(coordinator)));
+  }
+
+  static std::unique_ptr<grouped_io_request> create(std::shared_ptr<const io_object> object,
+                                                    std::vector<prepared_io_slice> slices)
+  {
+    std::size_t bytes = 0;
+    for (auto const& slice : slices) {
+      if (slice.size() > std::numeric_limits<std::size_t>::max() - bytes) {
+        throw std::overflow_error("grouped I/O byte count overflow");
+      }
+      bytes += slice.size();
+    }
+    auto coordinator = std::make_shared<grouped_coordinator>(bytes, slices.size());
+    return create(std::move(object), std::move(slices), std::move(coordinator));
+  }
+
+  [[nodiscard]] bool empty() const noexcept { return _next == slices.size(); }
+
+  [[nodiscard]] std::size_t remaining_slices() const noexcept { return slices.size() - _next; }
+
+  [[nodiscard]] std::size_t remaining_bytes() const noexcept
+  {
+    std::size_t bytes = 0;
+    for (std::size_t i = _next; i < slices.size(); ++i) {
+      bytes += slices[i].size();
+    }
+    return bytes;
+  }
+
+  [[nodiscard]] prepared_io_slice& front() noexcept
+  {
+    assert(!empty());
+    return slices[_next];
+  }
+
+  [[nodiscard]] prepared_io_slice take_front() noexcept
+  {
+    assert(!empty());
+    return std::move(slices[_next++]);
+  }
+
+  void cancel_remaining(grouped_coordinator::error_type const& error) noexcept
+  {
+    while (!empty()) {
+      auto slice = take_front();
+      if (slice.on_complete != nullptr) { (*slice.on_complete)(slice.h_buffer.fragments(), false); }
+      coordinator->report_error(error);
+    }
+  }
+
+  std::shared_ptr<const io_object> obj;
+  std::vector<prepared_io_slice> slices;
+  std::shared_ptr<grouped_coordinator> coordinator;
+
+ private:
+  grouped_io_request(std::shared_ptr<const io_object> object,
+                     std::vector<prepared_io_slice> request_slices,
+                     std::shared_ptr<grouped_coordinator> group)
+    : obj(std::move(object)), slices(std::move(request_slices)), coordinator(std::move(group))
+  {
+  }
+
+  std::size_t _next{0};
 };
 
 struct device_cpy_request {
-  // One host->device copy.  @c src is resolved as @c host_buffer + @c src_off
-  // when @c src is null (the bounce-slot path assigns its host buffer late,
-  // once a slot is acquired); otherwise @c src is an absolute caller-owned host
-  // pointer (the multi-buffer readv path, whose buffers are separate host
-  // allocations and so cannot share one base).
-  struct copy {
-    uint8_t* dst{nullptr};
-    uint8_t* src{nullptr};
-    size_t src_off{0};
-    size_t size{0};
-  };
-
-  // Issue every copy on @p stream (a batch when there is more than one), then
-  // record @p event once after the last so a single wait covers them all.
-  cudaError_t copy_async(uint8_t* host_buffer, size_t bytes, cudaEvent_t event = nullptr) noexcept
-  {
-    assert(host_buffer != nullptr && "Caller must provide a valid host buffer for the copy.");
-    rmm::cuda_set_device_raii device_guard(rmm::cuda_device_id{device_id});
-    cudaError_t err = cudaSuccess;
-    for (auto const& c : copies) {
-      assert(c.dst != nullptr &&
-             "Caller must provide a valid device destination buffer for the copy.");
-      assert((c.src != nullptr || c.src_off + c.size <= bytes) &&
-             "Caller must ensure the copy fits in the host buffer.");
-      // Resolve the host source.  The asserts above are compiled out in release,
-      // so validate *before* forming the pointer: for a bounce-staged copy
-      // (c.src == nullptr) the source is host_buffer + c.src_off, but a null
-      // host_buffer or an out-of-range [src_off, src_off + size) would otherwise
-      // produce UB (nullptr + offset) or a wild in-range pointer that the
-      // near-null check below cannot catch.  A null-buffer segment must reach
-      // here as c.src == nullptr, never as a non-null "nullptr + offset" pointer.
-      uint8_t* src_ptr = nullptr;
-      if (c.src != nullptr) {
-        src_ptr = c.src;
-      } else if (host_buffer != nullptr && c.src_off <= bytes && c.size <= bytes - c.src_off) {
-        src_ptr = host_buffer + c.src_off;
-      }
-      if (c.dst == nullptr || src_ptr == nullptr ||
-          reinterpret_cast<std::uintptr_t>(src_ptr) < 4096U) {
-        return cudaErrorInvalidValue;
-      }
-      err = cudaMemcpyAsync(c.dst, src_ptr, c.size, cudaMemcpyHostToDevice, stream);
-      if (err != cudaSuccess) { return err; }
-    }
-    if (event != nullptr) { err = cudaEventRecord(event, stream); }
-    return err;
-  }
-
-  std::vector<copy> copies;
-  rmm::cuda_stream_view stream;
+  range req_rng;
+  device_buffer d_buffer;
   int device_id{-1};
+
+  /**
+   * @brief Copy the logical request window out of physical I/O buffers.
+   *
+   * @p host_buf represents all bytes in @p io_rng in order. Aligned physical
+   * over-read is skipped, fragmented sources are batched, and the optional
+   * event is recorded after the final copy on the destination stream.
+   */
+  [[nodiscard]] cudaError_t copy_async(range io_rng,
+                                       std::span<iovec const> host_buf,
+                                       cudaEvent_t event = nullptr) const noexcept
+  {
+    try {
+      if (d_buffer.data == nullptr) return cudaErrorInvalidValue;
+
+      auto const copy_rng = intersect(req_rng, io_rng);
+      if (copy_rng.empty()) return req_rng.empty() ? cudaSuccess : cudaErrorInvalidValue;
+
+      int target_device = device_id >= 0 ? device_id : d_buffer.device_id;
+      if (target_device < 0) {
+        auto const status = cudaGetDevice(&target_device);
+        if (status != cudaSuccess) return status;
+      }
+      rmm::cuda_set_device_raii const guard{rmm::cuda_device_id{target_device}};
+
+      std::size_t skip      = copy_rng.offset - io_rng.offset;
+      std::size_t copied    = 0;
+      auto* device_dst      = d_buffer.data + (copy_rng.offset - req_rng.offset);
+      std::size_t remaining = copy_rng.size;
+
+      sirius::cuda::device_copy_batch batch;
+      batch.reserve(host_buf.size());
+      for (auto const& entry : host_buf) {
+        auto const length = entry.iov_len;
+        if (skip >= length) {
+          skip -= length;
+          continue;
+        }
+
+        auto const available = length - skip;
+        auto const bytes     = std::min(available, remaining);
+        auto const* source   = static_cast<std::uint8_t const*>(entry.iov_base) + skip;
+        batch.add(device_dst + copied, source, bytes);
+        copied += bytes;
+        remaining -= bytes;
+        skip = 0;
+        if (remaining == 0) break;
+      }
+
+      if (remaining != 0) return cudaErrorInvalidValue;
+      auto const copy_status = batch.enqueue(d_buffer.stream);
+      if (copy_status != cudaSuccess) return copy_status;
+      return event == nullptr ? cudaSuccess : cudaEventRecord(event, d_buffer.stream.value());
+    } catch (...) {
+      return cudaErrorUnknown;
+    }
+  }
 };
 
-/// Per-reactor container of per-chunk requests for one split of a caller
-/// request.  @c Chunk is the backend-specific chunk type (it must expose a
-/// @c manager member of type @c std::shared_ptr<request_manager>).  The
-/// templated_ioctx dispatch layer builds one of these, retrieves its future,
-/// then @c splits it across the reactor pool and enqueues each split.
-template <class Chunk>
-struct rx_request_t {
-  static std::unique_ptr<rx_request_t> create(std::vector<std::unique_ptr<Chunk>> reqs) noexcept
+/**
+ * @brief Backend-neutral physical operation produced by a reactor worker.
+ *
+ * Reactor-specific transfer state may be retained through @ref staging_owner.
+ * Every terminal path must call exactly one of finish_success/finish_error;
+ * the cache callback runs before the final coordinator decrement.
+ */
+struct io_op_request {
+  std::shared_ptr<const io_object> obj;
+  range io_rng;
+  std::vector<iovec> iovecs;
+  std::shared_ptr<void> staging_owner;
+  std::unique_ptr<device_cpy_request> device_copy;
+  std::shared_ptr<grouped_coordinator> coordinator;
+  std::shared_ptr<prepared_io_completion> on_complete;
+  std::vector<cache::cached_chunk*> completion_chunks;
+
+  void finish_success() noexcept
   {
-    return std::unique_ptr<rx_request_t>(new rx_request_t(std::move(reqs)));
+    if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
+    if (on_complete != nullptr) { (*on_complete)(completion_chunks, true); }
+    coordinator->on_complete();
   }
 
-  [[nodiscard]] std::size_t size() const noexcept { return requests.size(); }
-
-  static std::vector<std::unique_ptr<rx_request_t>> splits(std::unique_ptr<rx_request_t> req,
-                                                           std::size_t n_splits) noexcept
+  void finish_error(grouped_coordinator::error_type const& error,
+                    bool host_data_valid = false) noexcept
   {
-    std::vector<std::unique_ptr<rx_request_t>> result;
-    auto chunks = req->get_all_chunks();
-    req.reset(nullptr);
-    if (n_splits == 0 || chunks.empty()) return result;
-
-    std::size_t chunks_per_split = (chunks.size() + n_splits - 1) / n_splits;
-    std::vector<std::unique_ptr<Chunk>> current_batch;
-
-    for (auto& chunk : chunks) {
-      current_batch.push_back(std::move(chunk));
-      if (current_batch.size() >= chunks_per_split) {
-        result.push_back(create(std::move(current_batch)));
-        current_batch.clear();
-      }
-    }
-
-    if (!current_batch.empty()) { result.push_back(create(std::move(current_batch))); }
-    return result;
+    if (_terminal.exchange(true, std::memory_order_acq_rel)) return;
+    if (on_complete != nullptr) { (*on_complete)(completion_chunks, host_data_valid); }
+    coordinator->report_error(error);
   }
 
-  std::unique_ptr<Chunk> get_next_chunk() noexcept
-  {
-    if (requests.empty()) return nullptr;
-    auto next_req = std::move(requests.back());
-    requests.pop_back();
-    return next_req;
-  }
-
-  std::vector<std::unique_ptr<Chunk>> get_all_chunks() noexcept { return std::move(requests); }
-
-  exec::semi_future<size_t> get_future() noexcept
-  {
-    if (requests.empty()) {
-      // Nothing to read (e.g. all segments were already in flight): hand back a
-      // ready, zero-byte future.  The semi_future must be retrieved BEFORE the
-      // promise is satisfied — set_value() releases the shared core, after which
-      // get_semi_future() would throw promise_already_satisfied.
-      exec::promise<size_t> promise;
-      auto fut = promise.get_semi_future();
-      promise.set_value(0);
-      return fut;
-    }
-    return requests.front()->manager->get_future();
-  }
+  [[nodiscard]] bool terminal() const noexcept { return _terminal.load(std::memory_order_acquire); }
 
  private:
-  std::vector<std::unique_ptr<Chunk>> requests;
-
-  explicit rx_request_t(std::vector<std::unique_ptr<Chunk>> reqs) : requests(std::move(reqs)) {}
+  std::atomic<bool> _terminal{false};
 };
 
 }  // namespace sirius::io

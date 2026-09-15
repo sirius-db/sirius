@@ -32,7 +32,7 @@
 #include <vector>
 
 namespace sirius::io {
-class sirius_ioctx;
+class ioctx;
 }  // namespace sirius::io
 
 namespace sirius::op::scan {
@@ -110,7 +110,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   duckdb::ClientContext& context,
   std::string const& table_path,
-  sirius::io::sirius_ioctx* metadata_ioctx,
+  sirius::io::ioctx* metadata_ioctx,
   std::optional<uint64_t> snapshot_id = std::nullopt);
 
 /**

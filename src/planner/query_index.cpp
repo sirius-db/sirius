@@ -18,8 +18,11 @@
 
 #include "planner/query.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 namespace sirius::planner {
 
@@ -137,6 +140,119 @@ std::vector<pipeline_ptr> walk_branch(const pipeline_dag& dag,
   return chain;
 }
 
+// ---------------------------------------------------------------------------
+// Prefetch ordering
+// ---------------------------------------------------------------------------
+//
+// A second, port-level view of the same DAG. build_dag above is deliberately not reused: it
+// drops the consumer *operator* (needed here to name the branch), and build_probe rewrites
+// hash-join probe barriers to PIPELINE, which would erase exactly the FULL edges this
+// traversal keys on.
+
+/// An edge tagged with the barrier of the port it enters and the operator owning that port.
+struct pf_edge {
+  pipeline_ptr other;  ///< producer for an incoming edge, consumer for an outgoing one
+  op::MemoryBarrierType barrier;
+  op::sirius_physical_operator* consumer_op;  ///< owns the port; the branch operator at a fan-in
+};
+
+struct pf_dag {
+  std::unordered_map<pipeline_ptr, std::vector<pf_edge>> outgoing;
+  std::unordered_map<pipeline_ptr, std::vector<pf_edge>> incoming;
+
+  [[nodiscard]] const std::vector<pf_edge>& out(pipeline_ptr p) const
+  {
+    return lookup(outgoing, p);
+  }
+  [[nodiscard]] const std::vector<pf_edge>& in(pipeline_ptr p) const { return lookup(incoming, p); }
+
+  /// A fan-in: more than one pipeline feeds it. This is what "branch" means here.
+  [[nodiscard]] bool is_branch(pipeline_ptr p) const { return in(p).size() > 1; }
+
+ private:
+  static const std::vector<pf_edge>& lookup(
+    const std::unordered_map<pipeline_ptr, std::vector<pf_edge>>& m, pipeline_ptr p)
+  {
+    static const std::vector<pf_edge> empty;
+    auto it = m.find(p);
+    return it == m.end() ? empty : it->second;
+  }
+};
+
+pf_dag build_pf_dag(const std::vector<pipeline_ptr>& pipelines)
+{
+  pf_dag dag;
+  for (pipeline_ptr producer : pipelines) {
+    if (producer == nullptr) { continue; }
+    for (const auto& next : producer->get_next_ports_after_sink()) {
+      auto* consumer_op = next.next_operator;
+      if (consumer_op == nullptr) { continue; }
+      pipeline_ptr consumer = consumer_op->get_pipeline().get();
+      if (consumer == nullptr || consumer == producer) { continue; }
+      auto barrier = op::MemoryBarrierType::FULL;  // conservative when the port is unreadable
+      if (auto* port = consumer_op->get_port(next.next_operator_port_name)) {
+        barrier = port->type;
+      }
+      dag.outgoing[producer].push_back({consumer, barrier, consumer_op});
+      dag.incoming[consumer].push_back({producer, barrier, consumer_op});
+    }
+  }
+  return dag;
+}
+
+[[nodiscard]] bool is_gpu_scan(const op::sirius_physical_operator* o)
+{
+  return o != nullptr && o->type == op::SiriusPhysicalOperatorType::GPU_SCAN;
+}
+
+/// The GPU scan a leaf pipeline reads through, or null. A scan pipeline may stack operators
+/// above the scan (e.g. DYNAMIC_FILTER), so the source is checked first and then the chain.
+op::sirius_physical_operator* scan_of(pipeline_ptr p)
+{
+  if (p == nullptr) { return nullptr; }
+  if (auto source = p->get_source(); is_gpu_scan(source.get())) { return source.get(); }
+  for (auto& ref : p->get_operators()) {
+    if (is_gpu_scan(&ref.get())) { return &ref.get(); }
+  }
+  return nullptr;
+}
+
+/// Classify a scan by walking *downstream* from its pipeline until the barrier that gates it
+/// is known.
+///
+///   - first branch reached through a FULL port          -> barrier_all
+///   - a later branch reached through a FULL port        -> barrier_serial
+///   - no branch is ever reached through a FULL port     -> pipeline
+///
+/// The branch id reported is the branch whose FULL port decided the answer. In the @c pipeline
+/// case nothing gates the scan, so no branch is named here and the caller substitutes the first
+/// branch of the traversal -- note a branch is only this scan's gate if the scan's own data
+/// passes through its FULL port; a branch with a FULL port on some *other* side does not gate it.
+std::pair<scheduling_mode, std::size_t> classify_scan(const pf_dag& dag, pipeline_ptr scan_pipe)
+{
+  bool at_first_branch = true;
+  std::unordered_set<pipeline_ptr> seen;
+
+  pipeline_ptr cur = scan_pipe;
+  while (cur != nullptr && seen.insert(cur).second) {
+    const auto& outs = dag.out(cur);
+    if (outs.empty()) { break; }  // reached the plan's final operator
+    const auto& edge = outs.front();
+
+    if (dag.is_branch(edge.other)) {
+      if (edge.barrier == op::MemoryBarrierType::FULL) {
+        auto const branch_id =
+          edge.consumer_op != nullptr ? edge.consumer_op->get_operator_id() : 0;
+        return {at_first_branch ? scheduling_mode::barrier_all : scheduling_mode::barrier_serial,
+                branch_id};
+      }
+      at_first_branch = false;  // passed a branch without a FULL gate; keep looking downstream
+    }
+    cur = edge.other;
+  }
+  return {scheduling_mode::pipeline, 0};
+}
+
 }  // namespace
 
 std::shared_ptr<const query_index> query_index::build_index(const query& q,
@@ -157,6 +273,11 @@ std::shared_ptr<const query_index> query_index::build_index(
 
   // Not std::make_shared: the constructor is private.
   std::shared_ptr<query_index> index(new query_index());
+
+  index->_pipelines.reserve(pipelines.size());
+  for (const auto& p : pipelines) {
+    if (p != nullptr) { index->_pipelines.push_back(p.get()); }
+  }
 
   // Emit one branch per branch head, iterating pipelines in execution order so branches come out
   // in plan order (scans first).
@@ -188,6 +309,81 @@ query_index::branch query_index::get_consumer_pipelines_till_next_branch(
   auto it = _head_op_to_branch.find(op->get_operator_id());
   if (it == _head_op_to_branch.end()) { return {}; }
   return _branch_views[it->second];
+}
+
+std::vector<prefetch_step> query_index::prefetching_orders(std::size_t concat_batch_bytes,
+                                                           std::size_t scan_task_batch_size) const
+{
+  std::vector<prefetch_step> steps;
+  if (_pipelines.empty()) { return steps; }
+
+  const pf_dag dag = build_pf_dag(_pipelines);
+
+  // A concat batch's worth of scan splits, at least one.
+  auto const serial_count =
+    std::max<std::size_t>(concat_batch_bytes / std::max<std::size_t>(scan_task_batch_size, 1), 1);
+
+  std::unordered_set<pipeline_ptr> visited;
+  // The first branch the walk enters -- the fallback owner for scans nothing gates. Recorded
+  // during the walk rather than derived per scan: an ungated scan belongs to the traversal's
+  // leading branch, which is not necessarily the last branch on that scan's own path once a
+  // plan has more than one independent branch subtree.
+  std::size_t first_branch_id = 0;
+  bool have_first_branch      = false;
+
+  // Upstream DFS. At a fan-in, the FULL side goes first: nothing downstream of that branch can
+  // produce a task until the FULL side has run to completion, so its scans are wanted first.
+  auto visit = [&](pipeline_ptr p, auto&& self) -> void {
+    if (p == nullptr || !visited.insert(p).second) { return; }
+
+    auto producers = dag.in(p);  // by value: sorted below
+    if (producers.empty()) {
+      if (auto* scan = scan_of(p)) {
+        auto [mode, branch_id] = classify_scan(dag, p);
+        // Nothing imposes a FULL barrier on this scan, so it is owned by the leading branch.
+        if (mode == scheduling_mode::pipeline) { branch_id = first_branch_id; }
+        auto const count = mode == scheduling_mode::barrier_all
+                             ? std::numeric_limits<std::size_t>::max()
+                           : mode == scheduling_mode::barrier_serial ? serial_count
+                                                                     : 1;
+        steps.push_back({scan, branch_id, mode, count});
+      }
+      return;
+    }
+
+    if (!have_first_branch && producers.size() > 1) {
+      auto* branch_op   = producers.front().consumer_op;
+      first_branch_id   = branch_op != nullptr ? branch_op->get_operator_id() : 0;
+      have_first_branch = true;
+    }
+
+    // FULL first; ties (neither FULL, or both) broken by the lower pipeline id so the walk is
+    // deterministic rather than dependent on port registration order.
+    std::stable_sort(producers.begin(), producers.end(), [](const pf_edge& a, const pf_edge& b) {
+      bool const a_full = a.barrier == op::MemoryBarrierType::FULL;
+      bool const b_full = b.barrier == op::MemoryBarrierType::FULL;
+      if (a_full != b_full) { return a_full; }
+      return a.other->get_pipeline_id() < b.other->get_pipeline_id();
+    });
+
+    for (const auto& edge : producers) {
+      self(edge.other, self);
+    }
+  };
+
+  // Roots: pipelines nothing consumes. Walking from each covers every reachable pipeline; the
+  // visited set makes a shared subtree emit its scans once, at its first (highest-priority)
+  // encounter.
+  for (pipeline_ptr p : _pipelines) {
+    if (dag.out(p).empty()) { visit(p, visit); }
+  }
+  // Defensive: a cycle (delim-join distribution edges) can leave a pipeline with no root above
+  // it. Sweep anything still unvisited so no scan is silently dropped.
+  for (pipeline_ptr p : _pipelines) {
+    visit(p, visit);
+  }
+
+  return steps;
 }
 
 }  // namespace sirius::planner
