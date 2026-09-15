@@ -149,7 +149,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: num_partitions unset retur
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
     0,
     f.hash_join.get()};
-  REQUIRE(part.no_history_peak_memory_estimate({1, 1000}) == 2000);
+  REQUIRE(part.no_history_peak_memory_estimate({1, 1000}) == 1000);
 }
 
 TEST_CASE("partition no_history_peak_memory_estimate: 1 partition returns 0",
@@ -173,7 +173,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: 2 partitions returns bytes
     0,
     f.hash_join.get()};
   part.set_num_partitions(2);
-  REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 4000);
+  REQUIRE(part.no_history_peak_memory_estimate({3, 2000}) == 2000);
 }
 
 TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns bytes",
@@ -185,7 +185,7 @@ TEST_CASE("partition no_history_peak_memory_estimate: many partitions returns by
     0,
     f.hash_join.get()};
   part.set_num_partitions(8);
-  REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 8192);
+  REQUIRE(part.no_history_peak_memory_estimate({5, 4096}) == 4096);
 }
 
 TEST_CASE("GPU scan preserves fresh-read expansion and filter-only accounting",

@@ -331,10 +331,10 @@ TEST_CASE("streaming_sink SNK-9: memory estimate follows the routing mode", "[st
     REQUIRE(op->no_history_peak_memory_estimate(stats) == 0);
   }
 
-  SECTION("hash holds the reorder buffer alongside the slices")
+  SECTION("hash holds the reorder buffer, which the slices view rather than copy")
   {
     auto [op, repos] = make_partitioned_sink(4);
-    REQUIRE(op->no_history_peak_memory_estimate(stats) == stats.bytes * 2);
+    REQUIRE(op->no_history_peak_memory_estimate(stats) == stats.bytes);
   }
 
   SECTION("broadcast holds the original plus one clone per extra destination")
@@ -692,7 +692,7 @@ TEST_CASE("streaming_sink PART-6: a single destination bypasses partitioning", "
   REQUIRE(op.no_history_peak_memory_estimate(stats) == 0);
 
   auto [partitioned, repos_2] = make_partitioned_sink(2);
-  REQUIRE(partitioned->no_history_peak_memory_estimate(stats) == stats.bytes * 2);
+  REQUIRE(partitioned->no_history_peak_memory_estimate(stats) == stats.bytes);
 }
 
 // ============================================================================
