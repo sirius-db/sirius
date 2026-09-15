@@ -49,9 +49,9 @@ uuid = "1"
 default = ["sirius-engine", "nixl-transport"]
 # Bring up an embedded Sirius engine context for the compute node.
 sirius-engine = ["dep:sirius"]
-# Cross-node exchange over nixl. Needs a libnixl install at build time
-# (NIXL_PREFIX; set NIXL_NO_STUBS_FALLBACK=1 or nixl-sys silently builds a
-# stub). HTTP control-plane routes land in a later commit.
+# Packed SendFragment hops GPU bytes over NIXL WRITE; control uses unpatched
+# `transmit_chunk`. Needs a libnixl install at build time (NIXL_PREFIX; set
+# NIXL_NO_STUBS_FALLBACK=1 or nixl-sys silently builds a stub).
 nixl-transport = ["sirius-engine", "dep:nixl-sys"]
 
 [dependencies]
