@@ -1583,6 +1583,59 @@ Dataset regenerated in 40 min at `--chunk-bytes 2GB --sort none` (4 GB still kil
 lineitem 219.2 → **186.4 GB (−15.0%)**, matching the −15.5% SF100 predicted. Total 409 → 406 GB:
 orders and partsupp are unchanged because their comment plans were reverted.
 
+**What the zone maps prune in a COLD, UNPINNED scan — and what parquet's stats prune beside
+them (2026-09-15).** Nothing is pinned here: the bounds come from the file's own `zone_maps`
+segment, and a pruned chunk never becomes a split, so it is never read at all.
+
+| dataset | `.hpln` zone maps | parquet row groups |
+|---|---|---|
+| SF1000, natural order | **0 chunks, 0 decode chunks** | **0 of 22,560** |
+| SF100, globally sorted `.hpln` vs natural parquet | q6 **38/39 chunks + 578,423/585,983 decode chunks** (98.7%); q14/q15 32–36/39 | **0 of 2,256** |
+
+So on SF1000 *neither* format prunes anything, for the same reason: the data is orderkey-clustered
+and every group spans the whole date range (§3.1 recorded parquet's 0.00% two years of work ago;
+this confirms `.hpln` is no better off). The +2.4% cold result above is therefore a pure
+scan-throughput number with zero pruning on either side — the zone maps contribute nothing to it.
+
+Where they do fire, they dominate: the sorted SF100 file reads **1.9 GB against parquet's 16.4 GB
+(−88.3%)** on those four queries and runs in **0.250 s against 1.152 s (−78.3%)**. That comparison
+is sorted `.hpln` against natural-order parquet, which is deliberate rather than generous: parquet
+sorted on `l_shipdate` would prune too, and §3.13/§6.7 measured it costing more than it returns
+(cold SF1000 86.3 s sorted vs 58.4 s natural) because the sort destroys the orderkey clustering the
+joins prune on. The asymmetry is the point — a `.hpln` can be written in the order its predicates
+want without paying that, because its scan is fast enough that the ordering is free.
+
+**The `.hpln` scan does NOT support dynamic filters, and that is now the largest gap
+(2026-09-15).** `simpatico_ingestible_table_info::sirius_dynamic_filters` is populated at bind and
+**never read anywhere in `simpatico_gpu_ingestible.cpp`** — not by `plan_pruning`, not by the
+decode pushdown, both of which build from static `table_filters` only. Parquet merges them into the
+reader AST (`merge_dynamic_filters_into_ast` -> `opts.set_filter`) in `materialize_metadata_to_table`.
+
+SF1000, 8 join-heavy queries (3,5,7,8,9,10,17,19), `operator_params.enable_dynamic_filter`:
+
+| | parquet | `.hpln` |
+|---|---|---|
+| on | 27.483 s | 27.859 s (+1.4%) |
+| off | 31.782 s | 28.867 s (−9.2%) |
+| **gain** | **−13.5%** | **−3.5%** |
+
+Without them `.hpln` is **9.2% faster** than parquet; with them parquet closes the gap and passes it.
+**That ~10 points is what the format forgoes**, and it is a bigger item than either the alignment or
+the transport fix. The residual 3.5% is dynamic filters acting downstream of the scan, not in it.
+
+**Why this matters more than the decode work it would save.** §3.1's "TPC-H prunes 0.00% of row
+groups" and the 0-chunks result above are both measured against STATIC date predicates, and the
+conclusion drawn from them — "natural order cannot be pruned" — is wrong as stated. Natural-order
+TPC-H *is* clustered, on `l_orderkey`/`o_orderkey`; a date predicate simply cannot exploit that.
+**Join-derived orderkey filters can**, and dynamic filters are what produce them. So wiring them
+into `plan_pruning` would let whole-chunk pruning fire on unsorted data for the first time — the
+case the format has never been able to exploit, and the one a user actually has.
+
+Note also that parquet's 13.5% here is NOT bytes: 467.4 GB read either way. It is decode-time row
+filtering. And the `0 of 22,560 row groups` figure recorded above covers only the static site in
+`build_file_scan_info`, which is the one that logs; cuDF may prune again inside `read_parquet` with
+the merged AST, uninstrumented.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
