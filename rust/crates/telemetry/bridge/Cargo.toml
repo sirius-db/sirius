@@ -9,14 +9,14 @@ crate-type = ["staticlib"]
 
 [dependencies]
 cxx.workspace = true
-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
-nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d", features = ["static-injection"] }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d", features = ["io-collector", "io-msgpack", "io-ndjson", "io-postcard"] }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260", features = ["static-injection"] }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260", features = ["io-collector", "io-msgpack", "io-ndjson", "io-postcard"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
 sirius-telemetry-instrumentation = { path = "../instrumentation", features = ["collector"] }
 
 [build-dependencies]
 cxx-build.workspace = true
-quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
