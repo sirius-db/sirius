@@ -1691,6 +1691,49 @@ Two of these are worth acting on:
   experiment never tested what it claimed to. Worth re-running now that the transport is attached,
   bearing in mind that O_DIRECT bypasses the page cache, so a page-cache warm is the wrong target.
 
+### 6.11 New SF1000 baselines, and three things that turned out not to be there (2026-09-15)
+
+All with the project's gates (`SIRIUS_EXP_LATE_MAT`, `SIRIUS_EXP_FUSED_SCAN_FILTER`), natural
+order both sides, 22/22 correct.
+
+| | parquet | parquet + `cluster_by` | `.hpln` |
+|---|---|---|---|
+| **cold, unpinned** (`ast_interpret`) | 56.952 s | — | **52.521 s (−7.8%)** |
+| **host-pinned suite** (2 GB, `ast_interpret`) | 10.623 s | **9.916 s (−6.7%)** | 11.071 s (+4.2%) |
+| **pin time** | 24.64 s | 26.58 s | **11.18 s (2.2x faster)** |
+
+So the format wins the cold read and the pin, and loses the pinned query suite. Use these, not the
+ungated numbers earlier in this section.
+
+**`ast_jit` is a COLD-PATH REGRESSION.** It is −4.17% on the GPU-pinned suite
+(`bench/sf1000-repro/run.sh`) and the other way round on a cold scan: `.hpln` 52.521 → **59.833 s
+(+13.9%)**, parquet 56.952 → 59.449 (+4.4%). On a host pin it is a wash (parquet 10.623 vs 10.530;
+`.hpln` 11.071 vs 11.239). `hpln-suite.py` therefore does NOT set it — the comment there says why,
+because defaulting it is the obvious mistake.
+
+**`fadvise_entries`: restored, measured properly, still zero — reverted again.** This time the
+mechanism was verifiably live (110 calls per query, 18–36 payload ranges each, `io_ctx present`),
+where the original experiment returned `{}` on every call because a coalesced split carried no
+`io_ctx` (§6.8). With it live the cold suite measures 52.521 s against 52.174 s without — noise.
+The prefetch cache arm is still the wrong lever anyway: O_DIRECT bypasses the page cache it warms,
+and enabling it costs parquet ~7% (63.569 vs 59.449). **The original revert was right for the
+wrong reason; it is now right for the right one.**
+
+**Late materialization cannot be given to `.hpln`, and it is not an `.hpln` gap.** §6.10 listed
+`can_report_survivors() == false` as the blocker. It is unreachable: late-mat declines far earlier,
+at **"the pinned entry is not device-resident"** — 1512 declines across all three arms of the
+host-pinned run, parquet included. Late-mat is inactive for EVERY host-tier pin, both formats, so
+`SIRIUS_EXP_LATE_MAT` is inert in every host-pinned number in this document. The prerequisite is a
+GPU-tier `.hpln` pin, which is refused by construction; survivors reporting is dead code until then.
+
+**A `.hpln` pin inherits the FILE's compression plans and cannot retune per tier.** A parquet pin
+re-compresses with `pin_table_input_compression_plan_dir`, so it picks plans for the tier it is
+pinning into; a `.hpln` pin stages bytes that were chosen when the file was written. The
+`l_shipmode` dictionary plan of §6.8 — 21.589x, and the right call for a file that pays bytes on
+every cold read — decodes at 195 GB/s against `str_split`'s 823, and **q12 pays for it: 0.8065 s
+pinned against parquet's 0.6407 (+26%)**, which is most of the format's +4.2% pinned deficit. One
+plan choice has to serve both a cold read and a pinned query, and they want opposite things.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
