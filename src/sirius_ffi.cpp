@@ -806,7 +806,7 @@ void Fragment::push_packed(std::uint64_t stream_id,
   auto data_batch = sirius::make_data_batch(
     std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
   bool const pushed = impl_->session().push(stream_id, std::move(data_batch));
-  // Study path has no InboundStore: the receiver lease is consumed here. length==0 means the
+  // GROUP BY shuffle has no InboundStore: the receiver lease is consumed here. length==0 means the
   // sender never leased, so offset 0 must not be released.
   if (length != 0) { arena.release(offset); }
   if (!pushed) {

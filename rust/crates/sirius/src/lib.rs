@@ -20,7 +20,7 @@ use std::path::Path;
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
-use cxx::{let_cxx_string, Exception, UniquePtr};
+use cxx::{Exception, UniquePtr, let_cxx_string};
 
 /// An initialized Sirius engine context.
 ///
@@ -299,7 +299,7 @@ impl Fragment<'_> {
     /// exists for it, and the caller must not release anything.
     ///
     /// In a same-process loopback the receiver's [`push_packed`](Fragment::push_packed) consumes
-    /// that lease (this study path has no inbound ticket store). A remote hop still releases the
+    /// that lease (this GROUP BY shuffle path has no inbound ticket store). A remote hop still releases the
     /// exporter's lease after the write, on this process.
     pub fn export_packed(&mut self, stream_id: u64) -> Result<Option<PackedBatch>, Exception> {
         let mut offset = 0u64;
@@ -408,7 +408,7 @@ impl Fragment<'_> {
 /// `offset`/`len` locate the packed device payload inside the staging arena. The exporter's
 /// lease at `offset` stays outstanding until [`SiriusContext::staging_release`] — except for a
 /// metadata-only zero-row batch (`offset == 0`, `len == 0`), which holds no lease and must not
-/// be released. On this study path, [`Fragment::push_packed`] also releases a nonzero receiver
+/// be released. On this GROUP BY shuffle path, [`Fragment::push_packed`] also releases a nonzero receiver
 /// lease, so a same-process loopback must not release again after a successful push.
 pub struct PackedBatch {
     /// cudf pack metadata bytes (host memory).
@@ -524,12 +524,12 @@ mod tests {
     use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
     use substrait::proto::read_rel::{NamedTable, ReadType};
     use substrait::proto::{
-        aggregate_function, aggregate_rel, expression, function_argument, plan_rel, r#type, rel,
         AggregateFunction, AggregateRel, Expression, FunctionArgument, NamedStruct, Plan, PlanRel,
-        ReadRel, Rel, RelRoot, Type,
+        ReadRel, Rel, RelRoot, Type, aggregate_function, aggregate_rel, expression,
+        function_argument, plan_rel, rel, r#type,
     };
 
-    use super::{stream_view_name, Fragment, SiriusContext, SubstraitResult};
+    use super::{Fragment, SiriusContext, SubstraitResult, stream_view_name};
 
     /// The engine keeps process-global GPU state, so at most one context may be
     /// live at a time; context-constructing tests hold this for their duration.
@@ -590,11 +590,11 @@ mod tests {
     }
 
     fn local_files_read(path: &str) -> Rel {
+        use substrait::proto::read_rel::LocalFiles;
+        use substrait::proto::read_rel::local_files::FileOrFiles;
         use substrait::proto::read_rel::local_files::file_or_files::{
             FileFormat, ParquetReadOptions, PathType,
         };
-        use substrait::proto::read_rel::local_files::FileOrFiles;
-        use substrait::proto::read_rel::LocalFiles;
 
         Rel {
             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {

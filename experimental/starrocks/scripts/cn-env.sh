@@ -9,7 +9,7 @@
 # already exported by the operator always win.
 #
 # Packed hop control uses unpatched PInternalService.transmit_chunk (SRNX envelope). Do not
-# apply patches/nixl-exchange-proto.patch — this study does not add new RPC names.
+# apply patches/nixl-exchange-proto.patch — this GROUP BY shuffle path does not add new RPC names.
 #
 # For the environment variables the CN itself reads, see docs/TUNABLES.md.
 

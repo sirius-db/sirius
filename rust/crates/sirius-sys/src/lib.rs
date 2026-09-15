@@ -249,6 +249,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    make_context, make_context_from_config, make_fragment, stream_view_name, Context, Fragment,
-    StagingArena,
+    Context, Fragment, StagingArena, make_context, make_context_from_config, make_fragment,
+    stream_view_name,
 };

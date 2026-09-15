@@ -3363,7 +3363,7 @@ fn two_phase_sum_stays_sum() {
     assert_eq!(aggregate.measures.len(), 1);
 }
 
-/// Two-phase AVG is rejected: this study slice only lowers SUM.
+/// Two-phase AVG is rejected: this GROUP BY shuffle path only lowers SUM.
 #[test]
 fn two_phase_avg_is_rejected() {
     let mut avg = aggregate_expr(

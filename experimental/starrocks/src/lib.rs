@@ -71,7 +71,7 @@ pub use nixl_chunk::{NixlMdHandler, RemoteLease, StagingLeaseHandler};
 pub use nixl_transport::NixlTransport;
 
 /// Serializes GPU-using tests inside this process. Cross-process GPU exclusion is the
-/// `gpu-lock.sh` wrapper used by the study scripts, not this mutex.
+/// `gpu-lock.sh` wrapper used by the e2e scripts, not this mutex.
 #[cfg(all(test, feature = "nixl-transport"))]
 pub(crate) static GPU_ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
