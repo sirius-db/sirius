@@ -6,9 +6,9 @@
 //! invariants over breadth: it translates one fragment at a time, and everything
 //! outside the supported surface returns a structured [`TranslateError`] that
 //! names the offending node/type — so the next contributor knows exactly what to
-//! implement next. In particular `EXCHANGE_NODE` is rejected: a fragment is
-//! translated in isolation, and multi-fragment plans (every exchange is a
-//! fragment boundary) are a later milestone.
+//! implement next. An `EXCHANGE_NODE` is a fragment boundary: it translates to a
+//! stream read of `sirius_stream_<node_id>` when the compute node binds an
+//! [`ExchangeInput`].
 //!
 //! # Wire format: flat preorder
 //!
@@ -31,7 +31,8 @@
 //! | `HDFS_SCAN_NODE`     | `ReadRel` (named table) |
 //! | `SELECT_NODE`        | `FilterRel`        |
 //! | `PROJECT_NODE`       | `ProjectRel` (common slots materialized first as hidden `ProjectRel`s) |
-//! | `AGGREGATION_NODE`   | `AggregateRel` (finalized one-phase only, `new_planner_agg_stage=1`) |
+//! | `AGGREGATION_NODE`   | `AggregateRel` (one-phase, or two-phase `SUM` via `agg_phase`) |
+//! | `EXCHANGE_NODE`      | `ReadRel` (named table = the engine's `sirius_stream_<node_id>` view) |
 //! | `SORT_NODE`          | `ProjectRel` (sort tuple) + `SortRel` (global row-number top-N only) |
 //! | `HASH_JOIN_NODE`      | `JoinRel` (inner/outer/left-semi; left/right anti as outer join + `is_null` filter, null-aware left anti as mark join + `not`) |
 //! | `NESTLOOP_JOIN_NODE` | `JoinRel` (constant-key inner) + optional `FilterRel`, inner/cross only |
@@ -57,7 +58,8 @@
 //!
 //! Aggregate functions (`sum`, `count`, `min`, `max`, `avg`, and the
 //! `multi_distinct_*` distinct forms) are decomposed by `expr_translator::aggregate_call` for
-//! `AggregateRel` measures; only non-merge (one-phase) aggregates are accepted.
+//! `AggregateRel` measures. Two-phase plans accept **SUM only** (partial and merge both stay
+//! `sum`); AVG and distinct in a partial/merge node are rejected.
 //!
 //! Type mapping lives in `type_mapper`. Intentional v1 omissions return
 //! [`TranslateError::UnsupportedType`]: `LARGEINT` (128-bit), `DECIMAL256` and
@@ -89,6 +91,7 @@ use std::fmt;
 use prost::Message;
 use starrocks_thrift::exprs::{TExpr, TExprNodeType};
 use starrocks_thrift::internal_service::TExecPlanFragmentParams;
+use starrocks_thrift::partitions::TPartitionType;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
 use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
@@ -97,6 +100,7 @@ use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 // commits to is intentionally small: `PlanTranslator`, `translate_fragment`,
 // `TranslatedPlan`, `TranslateError`, and the extension registry. Widen a module
 // to `pub` only when a real consumer needs it.
+pub(crate) mod agg_phase;
 pub(crate) mod descriptor_table;
 pub mod error;
 mod expr_translator;
@@ -128,6 +132,45 @@ pub struct TranslatedPlan {
     pub plan: Plan,
     /// Root output names as emitted in the Substrait plan.
     pub output_names: Vec<String>,
+    /// For a fragment whose data-stream sink is HASH_PARTITIONED: the output column index of
+    /// each partition key, in the sink's partition-expression order. `None` for UNPARTITIONED
+    /// / result sinks.
+    pub output_partition_columns: Option<Vec<usize>>,
+    /// One entry per exchange node lowered to a stream read. The caller declares these on the
+    /// engine before handing it the plan: a stream has no file to infer a schema from.
+    pub stream_inputs: Vec<StreamInputSchema>,
+}
+
+/// The input stream bound to one StarRocks exchange node.
+#[derive(Clone, Debug)]
+pub struct ExchangeInput {
+    /// Receiver `EXCHANGE_NODE` id.
+    pub node_id: i32,
+    /// Name of the engine view this exchange's input stream is read through.
+    pub stream_view: String,
+    /// Sender output names, which become the stream's column names. Bound by position: one per
+    /// column of the exchange's `input_row_tuples`, in row order.
+    pub names: Vec<String>,
+}
+
+/// The schema one exchange's input stream must be declared with, as the plan reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInputSchema {
+    /// Receiver `EXCHANGE_NODE` id, which is also the engine-side stream id.
+    pub node_id: i32,
+    /// Name of the engine view the plan reads this stream through.
+    pub stream_view: String,
+    /// Columns in plan order.
+    pub columns: Vec<StreamInputColumn>,
+}
+
+/// One column of a declared input stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInputColumn {
+    /// Column name, matching the read's base schema.
+    pub name: String,
+    /// DuckDB type name the engine parses when declaring the stream.
+    pub ty: String,
 }
 
 impl TranslatedPlan {
@@ -147,6 +190,8 @@ impl fmt::Debug for TranslatedPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TranslatedPlan")
             .field("output_names", &self.output_names)
+            .field("output_partition_columns", &self.output_partition_columns)
+            .field("stream_inputs", &self.stream_inputs)
             .field("plan", &self.explain())
             .finish()
     }
@@ -200,7 +245,19 @@ impl PlanTranslator {
     }
 
     /// Translates a StarRocks execution fragment into a Substrait plan.
+    ///
+    /// Equivalent to [`Self::translate_fragment_with_exchange_inputs`] with no bound streams, so
+    /// a fragment containing an `EXCHANGE_NODE` is refused until the compute node binds one.
     pub fn translate_fragment(&self, params: &TExecPlanFragmentParams) -> Result<TranslatedPlan> {
+        self.translate_fragment_with_exchange_inputs(params, &[])
+    }
+
+    /// Translates a fragment whose exchange nodes read the given input streams.
+    pub fn translate_fragment_with_exchange_inputs(
+        &self,
+        params: &TExecPlanFragmentParams,
+        exchange_inputs: &[ExchangeInput],
+    ) -> Result<TranslatedPlan> {
         let fragment = params
             .fragment
             .as_ref()
@@ -222,9 +279,21 @@ impl PlanTranslator {
 
         let desc = DescriptorTable::try_from(desc_tbl)?;
         let scan_paths = ScanFilePaths::from_fragment(params, &desc)?;
+        let exchange_inputs = exchange_inputs
+            .iter()
+            .map(|input| (input.node_id, input))
+            .collect::<HashMap<_, _>>();
         let mut registry = ExtensionRegistry::new();
-        let mut translated =
-            node_translator::translate_plan(plan, &desc, &scan_paths, &mut registry)?;
+        let node_translator::TranslatedFragment {
+            root: mut translated,
+            stream_inputs,
+        } = node_translator::translate_plan(
+            plan,
+            &desc,
+            &scan_paths,
+            &exchange_inputs,
+            &mut registry,
+        )?;
 
         let output_names = if let Some(output_exprs) = fragment
             .output_exprs
@@ -246,6 +315,55 @@ impl PlanTranslator {
         };
 
         let output_names = unique_names(output_names).collect::<Vec<_>>();
+
+        let output_partition_columns = match fragment
+            .output_sink
+            .as_ref()
+            .and_then(|sink| sink.stream_sink.as_ref())
+            .map(|stream_sink| &stream_sink.output_partition)
+        {
+            Some(partition) if partition.type_ == TPartitionType::HASH_PARTITIONED => {
+                if fragment
+                    .output_exprs
+                    .as_ref()
+                    .is_some_and(|exprs| !exprs.is_empty())
+                {
+                    return Err(TranslateError::malformed(
+                        "a hash-partitioned stream sink with output_exprs cannot map its \
+                         partition keys onto the sink row (never emitted by the FE)",
+                    ));
+                }
+                let exprs = partition.partition_exprs.as_deref().unwrap_or_default();
+                if exprs.is_empty() {
+                    return Err(TranslateError::malformed(
+                        "a hash-partitioned stream sink carries no partition expressions",
+                    ));
+                }
+                let mut columns = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    let slot_ref = match expr.nodes.as_slice() {
+                        [node] if node.node_type == TExprNodeType::SLOT_REF => {
+                            node.slot_ref.as_ref()
+                        }
+                        _ => None,
+                    };
+                    let Some(slot_ref) = slot_ref else {
+                        return Err(TranslateError::malformed(
+                            "a hash-partition key is not a bare slot reference; hashing a \
+                             transformed key would silently split equal keys across senders",
+                        ));
+                    };
+                    columns.push(desc.slot_global_index(
+                        slot_ref.tuple_id,
+                        slot_ref.slot_id,
+                        &translated.row_tuples,
+                    )?);
+                }
+                Some(columns)
+            }
+            _ => None,
+        };
+
         let (extension_urns, extensions) = registry.into_extensions();
         let substrait_plan = Plan {
             // Source the spec version from the `substrait` crate so it tracks the
@@ -268,6 +386,8 @@ impl PlanTranslator {
         Ok(TranslatedPlan {
             plan: substrait_plan,
             output_names,
+            output_partition_columns,
+            stream_inputs,
         })
     }
 }
