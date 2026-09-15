@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-// Public Host methods only: leaf → relay_from → result_to_arrow. Substrait is built
-// here because the public FFI surface has no SQL→Substrait helper.
+// Public Host methods only. Builds Substrait in the test because the FFI has no SQL helper.
+// Covers a result fragment, a relay_from chain, the one-window-at-a-time rule, and drop after
+// build(). Spec errors and failed-build rollback live in test_streaming_fragment.cpp and
+// test_sirius_ffi_fragment.cpp.
 
 #include "sirius/exception.hpp"
 #include "sirius_ffi.hpp"
@@ -50,7 +52,6 @@ std::string serialize_plan(substrait::Plan const& plan)
   return bytes;
 }
 
-// local_files parquet read — the shape DuckDB's Substrait reader resolves to parquet_scan.
 std::string local_files_plan(std::string const& path)
 {
   substrait::Plan plan;
@@ -62,8 +63,7 @@ std::string local_files_plan(std::string const& path)
   return serialize_plan(plan);
 }
 
-// Named-table read of sirius_stream_<id>.
-std::string stream_read_plan(std::uint64_t stream_id, bool as_i32 = false)
+std::string stream_read_plan(std::uint64_t stream_id)
 {
   substrait::Plan plan;
   auto* root = plan.add_relations()->mutable_root();
@@ -74,13 +74,8 @@ std::string stream_read_plan(std::uint64_t stream_id, bool as_i32 = false)
   schema->add_names("a");
   auto* st = schema->mutable_struct_();
   st->set_nullability(::substrait::Type_Nullability_NULLABILITY_REQUIRED);
-  if (as_i32) {
-    st->add_types()->mutable_i32()->set_nullability(
-      ::substrait::Type_Nullability_NULLABILITY_NULLABLE);
-  } else {
-    st->add_types()->mutable_i64()->set_nullability(
-      ::substrait::Type_Nullability_NULLABILITY_NULLABLE);
-  }
+  st->add_types()->mutable_i64()->set_nullability(
+    ::substrait::Type_Nullability_NULLABILITY_NULLABLE);
   return serialize_plan(plan);
 }
 
@@ -142,16 +137,6 @@ std::vector<std::int64_t> result_i64s(sirius::ffi::Fragment& fragment)
   return collect_i64_column(stream);
 }
 
-std::unique_ptr<sirius::ffi::Fragment> run_parquet_sender(sirius::ffi::Context& ctx,
-                                                          std::string const& plan)
-{
-  auto sender = sirius::ffi::make_fragment(ctx);
-  sender->declare_output(0);
-  sender->build(plan);
-  sender->run();
-  return sender;
-}
-
 }  // namespace
 
 TEST_CASE("FFI leaf result_to_arrow returns parquet rows", "[isolated_context][sirius_ffi]")
@@ -174,44 +159,18 @@ TEST_CASE("FFI relay_from chain matches a single-fragment parquet scan",
   auto const path = scratch.file("ids.parquet");
   write_ids_parquet(path);
 
-  auto ctx = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto const sender_plan = local_files_plan(path);
-  auto sender            = run_parquet_sender(*ctx, sender_plan);
+  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
+  auto sender = sirius::ffi::make_fragment(*ctx);
+  sender->declare_output(0);
+  sender->build(local_files_plan(path));
+  sender->run();
 
   auto receiver = sirius::ffi::make_fragment(*ctx);
   receiver->declare_input_column(0, "a", "BIGINT");
   receiver->build(stream_read_plan(0));
-  auto moved = receiver->relay_from(*sender, 0, 0, 0);
-  REQUIRE(moved > 0);
+  REQUIRE(receiver->relay_from(*sender, 0, 0, 0) > 0);
   receiver->run();
   REQUIRE(result_i64s(*receiver) == std::vector<std::int64_t>{1, 2, 3, 4, 5});
-}
-
-TEST_CASE("FFI close_input with no batches is clean EOS", "[isolated_context][sirius_ffi]")
-{
-  auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto receiver = sirius::ffi::make_fragment(*ctx);
-  receiver->declare_input_column(0, "a", "BIGINT");
-  receiver->build(stream_read_plan(0));
-  receiver->close_input(0, 0);
-  receiver->run();
-  REQUIRE(result_i64s(*receiver).empty());
-}
-
-TEST_CASE("FFI relay_from rejects a schema mismatch before moving batches",
-          "[isolated_context][sirius_ffi]")
-{
-  sirius::test::scratch_dir scratch("ffi_host_schema");
-  auto const path = scratch.file("ids.parquet");
-  write_ids_parquet(path);
-
-  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto sender = run_parquet_sender(*ctx, local_files_plan(path));
-
-  auto receiver = sirius::ffi::make_fragment(*ctx);
-  receiver->declare_input_column(0, "a", "INTEGER");
-  receiver->build(stream_read_plan(0, /*as_i32=*/true));
-  REQUIRE_THROWS_AS(receiver->relay_from(*sender, 0, 0, 0), sirius::invalid_input_exception);
 }
 
 TEST_CASE("FFI only one fragment may sit between build() and run()",
@@ -250,30 +209,4 @@ TEST_CASE("FFI drop after build releases the query window", "[isolated_context][
   next->build(plan);
   next->run();
   REQUIRE(next->output_batch_count(0) > 0);
-}
-
-TEST_CASE("FFI partition mode on a result fragment is rejected", "[isolated_context][sirius_ffi]")
-{
-  sirius::test::scratch_dir scratch("ffi_host_partition_result");
-  auto const path = scratch.file("ids.parquet");
-  write_ids_parquet(path);
-
-  auto ctx      = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto fragment = sirius::ffi::make_fragment(*ctx);
-  fragment->declare_output_hash_key(0);
-  REQUIRE_THROWS_AS(fragment->build(local_files_plan(path)), sirius::invalid_input_exception);
-}
-
-TEST_CASE("FFI result_to_arrow is invalid on an intermediate fragment",
-          "[isolated_context][sirius_ffi]")
-{
-  sirius::test::scratch_dir scratch("ffi_host_result_on_sink");
-  auto const path = scratch.file("ids.parquet");
-  write_ids_parquet(path);
-
-  auto ctx    = sirius::ffi::make_context_from_config(isolated_memory_config_path().string());
-  auto sender = run_parquet_sender(*ctx, local_files_plan(path));
-  ArrowArrayStream stream{};
-  REQUIRE_THROWS_AS(sender->result_to_arrow(reinterpret_cast<std::uintptr_t>(&stream)),
-                    sirius::invalid_input_exception);
 }

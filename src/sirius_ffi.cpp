@@ -104,7 +104,7 @@ struct Context::Impl {
   duckdb::shared_ptr<duckdb::SiriusContext> context;
   duckdb::unique_ptr<duckdb::DuckDB> db;
   duckdb::unique_ptr<duckdb::Connection> conn;
-  //! stream_bind_catalog: also in registered_state; held here past registered_state resets.
+  //! Also stored in registered_state. Held here so it outlives registered_state resets.
   duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
 
   void bring_up(sirius::sirius_config& config)
@@ -178,15 +178,14 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   impl_->conn->BeginTransaction();
   duckdb::unique_ptr<duckdb::QueryResult> result;
   try {
-    // 1+2. Substrait → optimized DuckDB LogicalOperator.
+    // Lower Substrait to an optimized DuckDB LogicalOperator.
     auto lowered = lower_substrait(*impl_->conn, plan);
 
-    // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly
-    // on the engine, inside an execution window: begin mutations and slot
-    // acquire in the constructor, mandatory cleanup and release in finish().
-    // This standalone path bypasses DuckDB's normal query entry point, so
-    // nothing else would clean up for it. (The old manual QueryBegin/QueryEnd
-    // pairing could call QueryEnd twice when the first cleanup threw.)
+    // Lower the LogicalOperator to a Sirius GPU plan and execute it. StandaloneQueryScope
+    // begins mutations and takes the lifecycle slot in its constructor, then cleans up in
+    // finish(). This path does not go through DuckDB's normal query entry, so nothing else
+    // would clean up. The old QueryBegin/QueryEnd pairing could call QueryEnd twice when
+    // the first cleanup threw.
     {
       duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
       auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(
@@ -206,9 +205,8 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   impl_->conn->Commit();
   if (result->HasError()) { result->ThrowError(); }
 
-  // 4. Hand the result to the caller as a self-owning Arrow C Data Interface stream,
-  //    written into the caller's ArrowArrayStream (addressed by `out_stream_addr`);
-  //    its `release` callback deletes the heap wrapper (ResultArrowArrayStreamWrapper).
+  // Write the result into the caller's ArrowArrayStream at out_stream_addr.
+  // The stream's release callback deletes the ResultArrowArrayStreamWrapper.
   auto* wrapper = new duckdb::ResultArrowArrayStreamWrapper(std::move(result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
 }
@@ -229,15 +227,15 @@ struct Fragment::Impl {
 
   ~Impl()
   {
-    // If the caller dropped a Fragment during an open setup/lowering transaction, roll it
-    // back. The Assembler owns the query window; destroying `fragment` releases that slot.
+    // If the caller dropped a Fragment during an open setup or lowering transaction, roll
+    // it back. Destroying `fragment` closes the query window.
     end_lifecycle();
   }
 
   Context::Impl& ctx;
 
-  // One column declared before build(); type_name is the DuckDB type string parsed at build()
-  // time (parsing may need a catalog lookup → must be inside a transaction).
+  // One column declared before build(). type_name is the DuckDB type string parsed at
+  // build() time. Parsing may need a catalog lookup, so it must run inside a transaction.
   struct declared_input {
     std::vector<std::string> names;
     std::vector<std::string> type_names;
@@ -249,7 +247,7 @@ struct Fragment::Impl {
   bool broadcast_outputs{false};
   std::vector<int> hash_key_columns;
 
-  // One Assembler for both terminals (empty outputs → RESULT_COLLECTOR).
+  // One streaming_fragment for both terminals. Empty outputs is a RESULT_COLLECTOR.
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
 
   bool built{false};
@@ -284,10 +282,10 @@ struct Fragment::Impl {
     return resolved;
   }
 
-  // Populate the bind catalog so DuckDB can bind a view of each declared input stream.
-  // These repositories are throwaways: streaming_fragment::build() erases the ids and
-  // redeclares them against the Assembler's own repos. Must NOT call catalog.clear() —
-  // this catalog is shared by every Fragment on the same Context.
+  // Fill the bind catalog so DuckDB can bind a view of each declared input stream.
+  // These repositories are throwaways. streaming_fragment::build() erases the ids and
+  // redeclares them on its own repositories. Do not call catalog.clear(). This catalog is
+  // shared by every Fragment on the same Context.
   void declare_streams(
     const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
   {
@@ -301,7 +299,7 @@ struct Fragment::Impl {
   }
 
   // CREATE OR REPLACE VIEW sirius_stream_<id> AS SELECT * FROM sirius_stream_source(<id>)
-  // Requires an open transaction. Must happen after declare_streams (bind resolves the schema).
+  // Needs an open transaction. Call after declare_streams so bind can resolve the schema.
   void create_stream_views()
   {
     for (const auto& [id, _] : inputs) {
@@ -314,16 +312,15 @@ struct Fragment::Impl {
     }
   }
 
-  // Idempotent; called from build() catch blocks and ~Impl(). The Assembler owns the
+  // Idempotent. Called from build() catch blocks and ~Impl(). streaming_fragment owns the
   // query window, so this only rolls back a still-open DuckDB transaction.
   void end_lifecycle() noexcept
   {
     if (transaction_open) {
       transaction_open = false;
-      // Reached only when the transaction is STILL open, which by construction means setup
-      // or lowering failed — build() clears the flag the moment its own Commit() succeeds.
-      // Committing here would persist a half-declared fragment (or throw again out of a
-      // noexcept path).
+      // Reached only while the transaction is still open, which means setup or lowering
+      // failed. build() clears the flag after its own Commit succeeds. Committing here
+      // would keep a half-declared fragment, or throw from a noexcept path.
       try {
         ctx.conn->Rollback();
       } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -387,9 +384,9 @@ void Fragment::build(const std::string& substrait_plan)
 {
   impl_->require_not_built("build");
 
-  // Transaction must be open for: type-name parsing (catalog lookup) and CREATE VIEW.
-  // Committed before the Assembler opens StandaloneQueryScope so QueryBeginStandalone does
-  // not take the lifecycle slot while this connection still holds the setup transaction.
+  // Type-name parsing and CREATE VIEW need a transaction. Commit it before
+  // streaming_fragment::build() opens StandaloneQueryScope, or QueryBeginStandalone waits
+  // on a slot this connection still holds.
   impl_->ctx.conn->BeginTransaction();
   impl_->transaction_open = true;
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved;
@@ -405,10 +402,8 @@ void Fragment::build(const std::string& substrait_plan)
   }
 
   try {
-    // A routing mode needs at least two destinations to mean anything: with 0 or 1 declared
-    // outputs every row goes to the same place either way, so accepting it here would hide a
-    // fan-out that never happened. Also catches a partition mode declared on a 0-output result
-    // fragment, not just a 1-output one.
+    // Broadcast or hash with 0 or 1 outputs does not change where rows go. Reject it so a
+    // result fragment with a hash key is not treated as routed.
     if (impl_->outputs.size() <= 1 &&
         (impl_->broadcast_outputs || !impl_->hash_key_columns.empty())) {
       throw sirius::invalid_input_exception(
@@ -419,10 +414,9 @@ void Fragment::build(const std::string& substrait_plan)
 
     auto& client = *impl_->ctx.conn->context;
 
-    // Substrait lowering binds parquet_scan / views through DuckDB catalog — same
-    // ActiveTransaction requirement as Context::execute_substrait. A second short
-    // transaction, after setup is committed, so local_files plans can bind. The
-    // Assembler opens the query window inside build() while this transaction is open.
+    // Substrait lowering binds parquet_scan and views, so it needs an active transaction,
+    // same as Context::execute_substrait. Commit setup first, then open this short
+    // transaction. streaming_fragment::build() opens the query window while it is still open.
     impl_->ctx.conn->BeginTransaction();
     impl_->transaction_open = true;
 
@@ -446,7 +440,7 @@ void Fragment::build(const std::string& substrait_plan)
       broadcast.mode    = sirius::op::partition_mode::broadcast;
       spec.partitioning = std::move(broadcast);
     } else if (!impl_->hash_key_columns.empty() && impl_->outputs.size() > 1) {
-      // key_cast_types left empty; streaming_fragment::build() derives them from output types.
+      // key_cast_types left empty. streaming_fragment::build() fills them from output types.
       sirius::op::partition_spec hash;
       hash.mode         = sirius::op::partition_mode::hash;
       hash.key_columns  = impl_->hash_key_columns;
@@ -477,7 +471,7 @@ std::size_t Fragment::relay_from(Fragment& source,
     throw sirius::invalid_input_exception(
       "Fragment: relay_from() requires the source fragment to have been built");
   }
-  // Kept at this layer so the public error names `Fragment:` rather than `streaming_fragment:`.
+  // Keep this layer so the public error says "Fragment:" rather than "streaming_fragment:".
   if (!source.impl_->ran) {
     throw sirius::invalid_input_exception(
       "Fragment: relay_from() requires the source fragment to have run — call source.run() first, "
@@ -513,11 +507,10 @@ void Fragment::run()
     impl_->fragment->run();
     impl_->ran = true;
   } catch (...) {
-    // Poison every output before unwinding. Without this the streams are neither closed nor
-    // failed, so a peer parked in wait() blocks forever with no error anywhere — the S2/S3
-    // hazard the design doc calls out. First-failure-wins, so this cannot mask a real cause.
-    // A result fragment has no outputs, so this is a no-op there. The Assembler already
-    // poisons and closes the window; doing it here too is safe.
+    // Fail every output before unwinding. Otherwise a peer in wait() blocks forever.
+    // streaming_fragment::run() already poisons and closes the window. Repeat here so a
+    // Host caller still fails peers if that path changes. First failure wins. A result
+    // fragment has no outputs, so the loop is a no-op there.
     auto const cause = std::current_exception();
     for (auto id : impl_->outputs) {
       try {
