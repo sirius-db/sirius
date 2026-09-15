@@ -1066,6 +1066,13 @@ void SiriusContext::terminate()
     executor->stop();
   }
 
+  // The asynchronous spill-plan explorer runs beam searches on its own thread and
+  // allocates from compression_device_mr(). Stop it here: after the downgrade
+  // executors (the only submitters, so no new search can be queued) and before the
+  // memory manager and CUDA context below. Left to its static destructor at process
+  // exit it would run nvrtc/CUDA work against a context that is already gone.
+  sirius::shutdown_explore_worker();
+
   task_scheduler_.reset();
   task_creator_.reset();
   downgrade_executors_.clear();

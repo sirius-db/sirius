@@ -29,6 +29,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/reduction/approx_distinct_count.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
@@ -582,18 +583,44 @@ class explore_worker {
     _cv.notify_one();
   }
 
-  ~explore_worker()
+  /// Stop the worker and join its thread. Idempotent.
+  ///
+  /// Queued searches are DISCARDED rather than drained: a search costs seconds
+  /// (11.8 s worst measured), and its result is pure optimisation -- the edge
+  /// keeps the seeded/default plan it is already spilling with. Draining would
+  /// both stall shutdown and, worse, run CUDA work during teardown.
+  ///
+  /// Must be called while the CUDA context is still alive. SiriusContext does
+  /// this explicitly (see shutdown_explore_worker); relying on the static
+  /// destructor instead runs the explorer's nvrtc/CUDA work after the context
+  /// and the RMM pools are gone, which segfaults inside nvrtcCompileProgram.
+  void stop()
   {
+    std::lock_guard<std::mutex> stop_lock(_stop_mutex);
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _stopping = true;
+      // Abandon the sample columns rather than destroying them. submit_async_explore
+      // allocates them on the *caller's* spill stream, which is destroyed when its
+      // query ends -- long before shutdown. Running ~device_buffer here would call
+      // deallocate_async on that dead stream and fault in cuStreamGetId (and
+      // terminate() itself runs from ~SiriusContext, so the context may be going
+      // away too). The process is exiting and the driver reclaims the device
+      // allocation, so dropping the pointers is the safe move; a search that never
+      // ran has no result anyone is waiting for.
+      for (auto& t : _queue) {
+        for (auto& col : t.columns) { (void)col.release(); }
+      }
+      _queue.clear();
     }
     _cv.notify_all();
     if (_thread.joinable()) { _thread.join(); }
   }
 
+  ~explore_worker() { stop(); }
+
  private:
-  explore_worker() : _thread([this] { run(); }) {}
+  explore_worker() : _thread([this] { run(); }) { s_instance.store(this); }
 
   void run()
   {
@@ -653,11 +680,22 @@ class explore_worker {
   }
 
   std::mutex _mutex;
+  /// Serialises stop() so a shutdown call and the static destructor cannot both
+  /// reach _thread.join().
+  std::mutex _stop_mutex;
   std::condition_variable _cv;
   std::deque<task> _queue;
   bool _stopping{false};
   std::thread _thread;
+
+ public:
+  /// Set once, in the constructor. Lets shutdown reach an already-constructed
+  /// worker without instance() constructing (and immediately joining) one that
+  /// was never needed.
+  static std::atomic<explore_worker*> s_instance;
 };
+
+std::atomic<explore_worker*> explore_worker::s_instance{nullptr};
 
 /// Spills an edge must serve before an asynchronous explore is worth starting.
 /// Exploring on the very first spill fired a beam search for every port the query
@@ -691,13 +729,25 @@ void submit_async_explore(cudf::table_view view,
       ctx.explore_sample_rows > 0
         ? std::min<cudf::size_type>(rows, static_cast<cudf::size_type>(ctx.explore_sample_rows))
         : rows;
+    // Copy the samples on the DEFAULT stream, not the caller's. rmm::device_buffer
+    // records its allocating stream and reuses it in deallocate_async, and the
+    // caller here is a spill stream that is destroyed when its query ends -- while
+    // the sample can outlive that, either queued or mid-search on the worker. Freeing
+    // it then calls deallocate_async on a dead stream and faults in cuStreamGetId.
+    // The default stream outlives every query, so the sample is safe to destroy
+    // whenever the worker is done with it.
+    //
+    // Sync the caller first (rather than after, as the copy-on-caller-stream version
+    // could): the source must be materialised before a different stream reads it.
+    stream.synchronize();
+    auto const sample_stream = cudf::get_default_stream();
     for (std::size_t i = 0; i < num_cols; ++i) {
       auto col   = view.column(static_cast<cudf::size_type>(i));
       auto slice = (take < rows) ? cudf::slice(col, {0, take}).front() : col;
       t.columns.push_back(
-        std::make_unique<cudf::column>(slice, stream, compression::compression_device_mr()));
+        std::make_unique<cudf::column>(slice, sample_stream, compression::compression_device_mr()));
     }
-    stream.synchronize();  // the worker reads these on its own stream
+    sample_stream.synchronize();  // the worker reads these on its own stream
     explore_worker::instance().submit(std::move(t));
   } catch (const std::exception& e) {
     SIRIUS_LOG_DEBUG("[compression_converters] repo={} could not sample for async explore: {}",
@@ -2212,6 +2262,13 @@ std::unique_ptr<cucascade::idata_representation> decompress_disk_to_gpu(
 }
 
 }  // namespace
+
+void shutdown_explore_worker()
+{
+  // Only touches a worker that was actually constructed: reaching through
+  // instance() here would spawn a thread during shutdown purely to join it.
+  if (auto* w = explore_worker::s_instance.load()) { w->stop(); }
+}
 
 void register_compression_converters(cucascade::representation_converter_registry& registry)
 {

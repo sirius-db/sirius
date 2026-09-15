@@ -72,4 +72,21 @@ void register_compression_converters(cucascade::representation_converter_registr
 [[nodiscard]] std::size_t estimated_materialization_bytes(
   const cucascade::idata_representation& data);
 
+/**
+ * @brief Stop the asynchronous spill-plan explorer and join its thread.
+ *
+ * The explorer runs beam searches on its own worker thread and allocates from
+ * compression_device_mr(), so it must be stopped while the CUDA context and the
+ * RMM pools are still alive. SiriusContext calls this during shutdown, ahead of
+ * tearing those down.
+ *
+ * Without it the worker is only destroyed at process exit, by which point the
+ * context is gone -- the queued searches it drains then fault inside
+ * nvrtcCompileProgram. Queued searches are discarded, not drained; their result
+ * is an optimisation the spilling edge does not need.
+ *
+ * Idempotent, and a no-op if no explore has ever been submitted.
+ */
+void shutdown_explore_worker();
+
 }  // namespace sirius
