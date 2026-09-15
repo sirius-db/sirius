@@ -20,10 +20,8 @@
  * forward-declares the heavy internal type — so consumers bind it without
  * pulling in sirius_context.hpp (and its cudf/rmm/duckdb includes).
  *
- * Symbols are exported with default visibility so they survive the loadable
- * extension's `-fvisibility=hidden`. This is the seed of the public C++ API
- * `libsirius` will expose; today it is compiled into the DuckDB extension, which
- * the bindings link against until a dedicated `libsirius` exists.
+ * Symbols are exported with default visibility for both libsirius and the
+ * loadable extension. This header is the public C++ API installed by libsirius.
  */
 
 #pragma once
