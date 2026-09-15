@@ -8,12 +8,15 @@ name = "telemetry_bridge"
 crate-type = ["staticlib"]
 
 [dependencies]
-cxx = "1"
-instrumentation-model = { path = "../model" }
-nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
-nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1", features = ["static-injection"] }
+cxx.workspace = true
+nvtx-bridge = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+nvtx-injection = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d", features = ["static-injection"] }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d", features = ["io-collector", "io-msgpack", "io-ndjson", "io-postcard"] }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+sirius-telemetry-instrumentation = { path = "../instrumentation", features = ["collector"] }
 
 [build-dependencies]
-cxx-build = "1"
-instrumentation-model = { path = "../model" }
-quent-codegen = { git = "https://github.com/rapidsai/quent.git", rev = "b21933d06dbb0c46339ded31d0fdaacae03cc3b1" }
+cxx-build.workspace = true
+quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "35f8546dba50b2dbca4cf5e6f903c7970737ad7d" }

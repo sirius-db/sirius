@@ -1,39 +1,36 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use instrumentation_model::{SiriusEvent, batch, channel, gpu_device, memory, task, thread_group};
-use quent_time::TimeUnixNanoSec;
+use std::collections::hash_map::Entry;
+
 use rustc_hash::FxHashMap as HashMap;
+use sirius_telemetry_store::{self as schema, SiriusEvent};
 
 use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model,
+    fsm::collection::FsmCollection,
     resource::{
         CapacityDecl, CapacityValue, Resource, ResourceCapacities, ResourceGroup,
         ResourceGroupTypeDecl, ResourceTypeDecl, Usage, Using,
-        collection::{
-            InMemoryResources, InMemoryResourcesBuilder, ResourceCollection,
-            derive_resource_group_types,
-        },
-        runtime::RtResourceTransition,
+        collection::{ResourceCollection, derive_resource_group_types},
+        runtime::RtResourceGroup,
     },
 };
 use quent_events::Event;
 use quent_query_engine_analyzer::{
-    OperatorEntityMut, QueryEngineModel,
-    plain::legacy::{
-        Engine, InMemoryQueryEngineModel, InMemoryQueryEngineModelBuilder, Operator, Plan, Port,
-        Query, QueryEngineEntityId, QueryGroup, Worker,
-    },
+    OperatorEntityMut, QueryEngineEntityId, QueryEngineModel, QueryEngineModelMut,
     plan_tree::PlanTree,
 };
-use quent_query_engine_model::QueryEngineEvent;
-use quent_simulator_ui::EntityRef;
+use quent_query_engine_ui::EntityRef;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     batch_placement::{BatchPlacement, BatchPlacementBuilder},
     data_batch::{DataBatch, DataBatchBuilder, DataBatchExt},
+    query_engine::{
+        Engine, Operator, Plan, Port, Query, QueryEngine, QueryEngineBuilder, QueryGroup, Worker,
+    },
     task::{Task, TaskBuilder, TaskExt},
     view::SiriusModelQueryView,
 };
@@ -43,69 +40,174 @@ const THREAD_GROUP_TYPE_NAME: &str = "thread_group";
 const TASK_QUEUE_TYPE_NAME: &str = "task_queue";
 const TASK_MANAGER_LOOP_THREAD_TYPE_NAME: &str = "task_manager_loop_thread";
 const EXECUTOR_THREAD_TYPE_NAME: &str = "executor_thread";
-const QUEUE_ENTRIES_CAPACITY_NAME: &str = "capacity_entries";
+const QUEUE_ENTRIES_CAPACITY_NAME: &str = "entries";
 const MEMORY_TYPE_NAME: &str = "memory";
 const CHANNEL_TYPE_NAME: &str = "channel";
-const MEMORY_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
-const CHANNEL_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
+const MEMORY_BYTES_CAPACITY_NAME: &str = "bytes";
+const CHANNEL_BYTES_CAPACITY_NAME: &str = "bytes";
 /// Type name of the MemoryTier resources as recorded by the model.
 pub(crate) const MEMORY_TIER_TYPE_NAME: &str = "memory_tier";
 /// Capacity name of the MemoryTier `bytes` capacity as recorded by the model.
-pub(crate) const MEMORY_TIER_BYTES_CAPACITY_NAME: &str = "capacity_bytes";
+pub(crate) const MEMORY_TIER_BYTES_CAPACITY_NAME: &str = "bytes";
 
-fn validate_resource_type(actual: &str, expected: &str, id: Uuid) -> AnalyzerResult<()> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(AnalyzerError::InvalidArgument(format!(
-            "resource {id} declared type {actual:?}, expected {expected:?}"
-        )))
+pub(crate) struct DeclaredResource {
+    id: Uuid,
+    instance_name: String,
+    type_name: String,
+    parent_group_id: Uuid,
+    bounds: ResourceCapacities,
+}
+
+impl DeclaredResource {
+    pub(crate) fn bounds(&self) -> &ResourceCapacities {
+        &self.bounds
     }
 }
 
-fn insert_sirius_specific_resource_types(resources: &mut InMemoryResources) {
-    resources.resource_types.insert(
-        TASK_QUEUE_TYPE_NAME.to_string(),
-        ResourceTypeDecl::new(
-            TASK_QUEUE_TYPE_NAME,
-            [CapacityDecl::new_occupancy(QUEUE_ENTRIES_CAPACITY_NAME)],
-        ),
-    );
-    resources.resource_types.insert(
-        TASK_MANAGER_LOOP_THREAD_TYPE_NAME.to_string(),
-        ResourceTypeDecl::unit(TASK_MANAGER_LOOP_THREAD_TYPE_NAME),
-    );
-    resources.resource_types.insert(
-        EXECUTOR_THREAD_TYPE_NAME.to_string(),
-        ResourceTypeDecl::unit(EXECUTOR_THREAD_TYPE_NAME),
-    );
-    resources.resource_types.insert(
-        MEMORY_TYPE_NAME.to_string(),
-        ResourceTypeDecl::new(
-            MEMORY_TYPE_NAME,
-            [CapacityDecl::new_occupancy(MEMORY_BYTES_CAPACITY_NAME)],
-        ),
-    );
-    resources.resource_types.insert(
-        CHANNEL_TYPE_NAME.to_string(),
-        ResourceTypeDecl::new(
-            CHANNEL_TYPE_NAME,
-            [CapacityDecl::new_occupancy(CHANNEL_BYTES_CAPACITY_NAME)],
-        ),
-    );
-    resources.resource_types.insert(
-        MEMORY_TIER_TYPE_NAME.to_string(),
-        ResourceTypeDecl::new(
-            MEMORY_TIER_TYPE_NAME,
-            [CapacityDecl::new_occupancy(MEMORY_TIER_BYTES_CAPACITY_NAME)],
-        ),
-    );
+impl Entity for DeclaredResource {
+    fn id(&self) -> Uuid {
+        self.id
+    }
+
+    fn type_name(&self) -> &str {
+        &self.type_name
+    }
+
+    fn instance_name(&self) -> &str {
+        &self.instance_name
+    }
 }
 
-/// A model of the simulator engine
+impl Resource for DeclaredResource {
+    fn parent_group_id(&self) -> Uuid {
+        self.parent_group_id
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SiriusResources {
+    pub(crate) resource_types: HashMap<String, ResourceTypeDecl>,
+    pub(crate) resources: HashMap<Uuid, DeclaredResource>,
+    pub(crate) resource_groups: HashMap<Uuid, RtResourceGroup>,
+}
+
+impl SiriusResources {
+    fn insert_resource_type(&mut self, declaration: ResourceTypeDecl) {
+        self.resource_types
+            .entry(declaration.name.clone())
+            .or_insert(declaration);
+    }
+
+    fn insert_resource(
+        &mut self,
+        id: Uuid,
+        type_name: &str,
+        instance_name: String,
+        parent_group_id: Uuid,
+        bounds: ResourceCapacities,
+    ) -> AnalyzerResult<()> {
+        if id.is_nil() {
+            return Err(AnalyzerError::InvalidId(id));
+        }
+        if self.resources.contains_key(&id) {
+            return Err(AnalyzerError::Validation(format!(
+                "resource {id} has multiple declarations"
+            )));
+        }
+
+        self.resources.insert(
+            id,
+            DeclaredResource {
+                id,
+                instance_name,
+                type_name: type_name.to_owned(),
+                parent_group_id,
+                bounds,
+            },
+        );
+        Ok(())
+    }
+
+    fn push_group_raw(
+        &mut self,
+        id: Uuid,
+        type_name: &str,
+        instance_name: &str,
+        parent_group_id: Option<Uuid>,
+    ) {
+        self.resource_groups.insert(
+            id,
+            RtResourceGroup {
+                id,
+                type_name: type_name.to_owned(),
+                instance_name: instance_name.to_owned(),
+                parent_group_id,
+            },
+        );
+    }
+}
+
+impl ResourceCollection for SiriusResources {
+    fn resources(&self) -> impl Iterator<Item = &dyn Resource> {
+        self.resources
+            .values()
+            .map(|resource| resource as &dyn Resource)
+    }
+
+    fn resource_groups(&self) -> impl Iterator<Item = &dyn ResourceGroup> {
+        self.resource_groups
+            .values()
+            .map(|group| group as &dyn ResourceGroup)
+    }
+
+    fn resource(&self, resource_id: Uuid) -> AnalyzerResult<&dyn Resource> {
+        self.resources
+            .get(&resource_id)
+            .map(|resource| resource as &dyn Resource)
+            .ok_or(AnalyzerError::InvalidId(resource_id))
+    }
+
+    fn resource_type(&self, resource_type_name: &str) -> AnalyzerResult<&ResourceTypeDecl> {
+        self.resource_types
+            .get(resource_type_name)
+            .ok_or_else(|| AnalyzerError::InvalidTypeName(resource_type_name.to_owned()))
+    }
+
+    fn resource_group(&self, resource_group_id: Uuid) -> AnalyzerResult<&dyn ResourceGroup> {
+        self.resource_groups
+            .get(&resource_group_id)
+            .map(|group| group as &dyn ResourceGroup)
+            .ok_or(AnalyzerError::InvalidId(resource_group_id))
+    }
+
+    fn resource_group_child_groups(
+        &self,
+        resource_group_id: Uuid,
+    ) -> AnalyzerResult<impl Iterator<Item = Uuid>> {
+        self.resource_group(resource_group_id)?;
+        Ok(self.resource_groups.values().filter_map(move |group| {
+            group
+                .parent_group_id
+                .is_some_and(|parent| parent == resource_group_id)
+                .then_some(group.id)
+        }))
+    }
+
+    fn resource_group_child_resources(
+        &self,
+        resource_group_id: Uuid,
+    ) -> AnalyzerResult<impl Iterator<Item = Uuid>> {
+        self.resource_group(resource_group_id)?;
+        Ok(self.resources.values().filter_map(move |resource| {
+            (resource.parent_group_id == resource_group_id).then_some(resource.id)
+        }))
+    }
+}
+
+/// The analyzed Sirius engine model.
 pub struct SiriusModel {
-    pub(crate) query_engine: InMemoryQueryEngineModel,
-    pub(crate) arbitrary_resources: InMemoryResources,
+    pub(crate) query_engine: QueryEngine,
+    pub(crate) sirius_resources: SiriusResources,
     pub(crate) tasks: HashMap<Uuid, Task>,
     pub(crate) data_batches: HashMap<Uuid, DataBatch>,
     pub(crate) batch_placements: HashMap<Uuid, BatchPlacement>,
@@ -126,18 +228,37 @@ impl Model for SiriusModel {
                 QueryEngineEntityId::Operator(uuid) => EntityRef::Operator(uuid),
                 QueryEngineEntityId::Port(uuid) => EntityRef::Port(uuid),
             })
-        } else if self.arbitrary_resources.resources.contains_key(&entity_id) {
+        } else if self.sirius_resources.resources.contains_key(&entity_id) {
             Ok(EntityRef::Resource(entity_id))
         } else if self
-            .arbitrary_resources
+            .sirius_resources
             .resource_groups
             .contains_key(&entity_id)
         {
             Ok(EntityRef::ResourceGroup(entity_id))
         } else {
             self.tasks
-                .contains_key(&entity_id)
-                .then_some(EntityRef::Task(entity_id))
+                .get(&entity_id)
+                .map(|task| EntityRef::Application {
+                    type_name: task.type_name().to_owned(),
+                    id: entity_id,
+                })
+                .or_else(|| {
+                    self.data_batches
+                        .get(&entity_id)
+                        .map(|data_batch| EntityRef::Application {
+                            type_name: data_batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
+                .or_else(|| {
+                    self.batch_placements
+                        .get(&entity_id)
+                        .map(|batch| EntityRef::Application {
+                            type_name: batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
                 .ok_or(AnalyzerError::InvalidId(entity_id))
         }
     }
@@ -200,6 +321,20 @@ impl QueryEngineModel for SiriusModel {
     }
 }
 
+impl QueryEngineModelMut for SiriusModel {
+    fn operator_mut(&mut self, operator_id: Uuid) -> AnalyzerResult<&mut Operator> {
+        self.query_engine.operator_mut(operator_id)
+    }
+}
+
+impl FsmCollection for SiriusModel {
+    type Fsm = Task;
+
+    fn fsms(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.values()
+    }
+}
+
 impl SiriusModel {
     pub(crate) fn query_view(&self, query_id: Uuid) -> AnalyzerResult<SiriusModelQueryView<'_>> {
         SiriusModelQueryView::try_new(self, query_id)
@@ -208,29 +343,29 @@ impl SiriusModel {
 
 impl ResourceCollection for SiriusModel {
     fn resources(&self) -> impl Iterator<Item = &dyn Resource> {
-        self.arbitrary_resources
+        self.sirius_resources
             .resources()
             .chain(self.query_engine.resources())
     }
     fn resource_groups(&self) -> impl Iterator<Item = &dyn ResourceGroup> {
-        self.arbitrary_resources
+        self.sirius_resources
             .resource_groups()
             .chain(self.query_engine.resource_groups())
     }
     fn resource(&self, resource_id: Uuid) -> AnalyzerResult<&dyn Resource> {
-        self.arbitrary_resources
+        self.sirius_resources
             .resource(resource_id)
             .or_else(|_| self.query_engine.resource(resource_id))
     }
     fn resource_type(&self, resource_type_name: &str) -> AnalyzerResult<&ResourceTypeDecl> {
         self.query_engine
             .resource_type(resource_type_name)
-            .or_else(|_| self.arbitrary_resources.resource_type(resource_type_name))
+            .or_else(|_| self.sirius_resources.resource_type(resource_type_name))
     }
     fn resource_group(&self, resource_group_id: Uuid) -> AnalyzerResult<&dyn ResourceGroup> {
         self.query_engine
             .resource_group(resource_group_id)
-            .or_else(|_| self.arbitrary_resources.resource_group(resource_group_id))
+            .or_else(|_| self.sirius_resources.resource_group(resource_group_id))
     }
 
     fn resource_group_child_groups(
@@ -246,7 +381,7 @@ impl ResourceCollection for SiriusModel {
             .ok();
 
         let sim = self
-            .arbitrary_resources
+            .sirius_resources
             .resource_groups
             .values()
             .filter_map(move |group| {
@@ -271,7 +406,7 @@ impl ResourceCollection for SiriusModel {
             .ok();
 
         let sim = self
-            .arbitrary_resources
+            .sirius_resources
             .resources
             .values()
             .filter_map(move |resource| {
@@ -283,8 +418,8 @@ impl ResourceCollection for SiriusModel {
 }
 
 pub struct SiriusModelBuilder {
-    query_engine: InMemoryQueryEngineModelBuilder,
-    arbitrary_resources: InMemoryResourcesBuilder,
+    query_engine: QueryEngineBuilder,
+    sirius_resources: SiriusResources,
     tasks: HashMap<Uuid, TaskBuilder>,
     data_batches: HashMap<Uuid, DataBatchBuilder>,
     batch_placements: HashMap<Uuid, BatchPlacementBuilder>,
@@ -293,8 +428,8 @@ pub struct SiriusModelBuilder {
 impl SiriusModelBuilder {
     pub(crate) fn try_new(engine_id: Uuid) -> AnalyzerResult<Self> {
         Ok(Self {
-            query_engine: InMemoryQueryEngineModelBuilder::try_new(engine_id)?,
-            arbitrary_resources: InMemoryResourcesBuilder::default(),
+            query_engine: QueryEngineBuilder::try_new(engine_id)?,
+            sirius_resources: SiriusResources::default(),
             tasks: HashMap::default(),
             data_batches: HashMap::default(),
             batch_placements: HashMap::default(),
@@ -309,326 +444,209 @@ impl SiriusModelBuilder {
         } = event;
         match data {
             SiriusEvent::Task(t) => {
-                let task_builder = self
-                    .tasks
-                    .entry(id)
-                    .or_insert_with(|| TaskBuilder::try_new(id).unwrap());
-                task_builder.push(Event::new(id, timestamp, t));
+                let task_builder = match self.tasks.entry(id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(TaskBuilder::try_new(id)?),
+                };
+                task_builder.push_transition(Event::new(id, timestamp, t));
                 Ok(())
             }
-            SiriusEvent::Engine(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Engine(e)))
-            }
-            SiriusEvent::Worker(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Worker(e)))
-            }
-            SiriusEvent::QueryGroup(e) => self.query_engine.try_push(Event::new(
-                id,
-                timestamp,
-                QueryEngineEvent::QueryGroup(e),
-            )),
-            SiriusEvent::Query(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Query(e)))
-            }
-            SiriusEvent::Plan(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Plan(e)))
-            }
-            SiriusEvent::Operator(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Operator(e)))
-            }
-            SiriusEvent::Port(e) => {
-                self.query_engine
-                    .try_push(Event::new(id, timestamp, QueryEngineEvent::Port(e)))
-            }
-            SiriusEvent::GpuDevice(e) => {
-                let gpu_device::GpuDeviceEvent::Declaration(d) = e;
-                self.arbitrary_resources.push_group_raw(
+            SiriusEvent::Engine(event) => self
+                .query_engine
+                .push_engine(Event::new(id, timestamp, event)),
+            SiriusEvent::Worker(event) => self
+                .query_engine
+                .push_worker(Event::new(id, timestamp, event)),
+            SiriusEvent::QueryGroup(event) => self
+                .query_engine
+                .push_query_group(Event::new(id, timestamp, event)),
+            SiriusEvent::Query(event) => self
+                .query_engine
+                .push_query(Event::new(id, timestamp, event)),
+            SiriusEvent::Plan(event) => self
+                .query_engine
+                .push_plan(Event::new(id, timestamp, event)),
+            SiriusEvent::Operator(event) => self
+                .query_engine
+                .push_operator(Event::new(id, timestamp, event)),
+            SiriusEvent::Port(event) => self
+                .query_engine
+                .push_port(Event::new(id, timestamp, event)),
+            SiriusEvent::GpuDevice(schema::GpuDeviceEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                ..
+            }) => {
+                self.sirius_resources.push_group_raw(
                     id,
                     GPU_DEVICE_GROUP_TYPE_NAME,
-                    &d.instance_name,
-                    Some(d.parent_group_id),
+                    &instance_name,
+                    Some(parent_group_id.target),
                 );
                 Ok(())
             }
-            SiriusEvent::ThreadGroup(e) => {
-                let thread_group::ThreadGroupEvent::Declaration(d) = e;
-                self.arbitrary_resources.push_group_raw(
+            SiriusEvent::ThreadGroup(schema::ThreadGroupEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                ..
+            }) => {
+                self.sirius_resources.push_group_raw(
                     id,
                     THREAD_GROUP_TYPE_NAME,
-                    &d.instance_name,
-                    Some(d.parent_group_id),
+                    &instance_name,
+                    Some(parent_group_id.target),
                 );
                 Ok(())
             }
-            SiriusEvent::TaskQueue(e) => self.push_task_queue(id, timestamp, e),
-            SiriusEvent::TaskManagerLoopThread(e) => {
-                self.push_task_manager_loop_thread(id, timestamp, e)
-            }
-            SiriusEvent::ExecutorThread(e) => self.push_executor_thread(id, timestamp, e),
-            SiriusEvent::Memory(e) => self.push_memory(id, timestamp, e),
-            SiriusEvent::Channel(e) => self.push_channel(id, timestamp, e),
+            SiriusEvent::TaskQueue(schema::TaskQueueEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                bounds,
+                ..
+            }) => self.declare_resource(
+                id,
+                TASK_QUEUE_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::new(
+                    TASK_QUEUE_TYPE_NAME,
+                    [CapacityDecl::new_occupancy(QUEUE_ENTRIES_CAPACITY_NAME)],
+                ),
+                ResourceCapacities(vec![CapacityValue::new(
+                    QUEUE_ENTRIES_CAPACITY_NAME,
+                    bounds.entries,
+                )]),
+            ),
+            SiriusEvent::TaskManagerLoopThread(
+                schema::TaskManagerLoopThreadEvent::Declaration {
+                    instance_name,
+                    parent_group_id,
+                    ..
+                },
+            ) => self.declare_resource(
+                id,
+                TASK_MANAGER_LOOP_THREAD_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::unit(TASK_MANAGER_LOOP_THREAD_TYPE_NAME),
+                ResourceCapacities(vec![CapacityValue::new("unit", 1)]),
+            ),
+            SiriusEvent::ExecutorThread(schema::ExecutorThreadEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                ..
+            }) => self.declare_resource(
+                id,
+                EXECUTOR_THREAD_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::unit(EXECUTOR_THREAD_TYPE_NAME),
+                ResourceCapacities(vec![CapacityValue::new("unit", 1)]),
+            ),
+            SiriusEvent::Memory(schema::MemoryEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                bounds,
+            }) => self.declare_resource(
+                id,
+                MEMORY_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::new(
+                    MEMORY_TYPE_NAME,
+                    [CapacityDecl::new_occupancy(MEMORY_BYTES_CAPACITY_NAME)],
+                ),
+                ResourceCapacities(vec![CapacityValue::new(
+                    MEMORY_BYTES_CAPACITY_NAME,
+                    bounds.bytes,
+                )]),
+            ),
+            SiriusEvent::Channel(schema::ChannelEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                bounds,
+                ..
+            }) => self.declare_resource(
+                id,
+                CHANNEL_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::new(
+                    CHANNEL_TYPE_NAME,
+                    [CapacityDecl::new_rate(CHANNEL_BYTES_CAPACITY_NAME)],
+                ),
+                ResourceCapacities(vec![CapacityValue::new(
+                    CHANNEL_BYTES_CAPACITY_NAME,
+                    bounds.bytes,
+                )]),
+            ),
             SiriusEvent::DataBatch(d) => {
-                let data_batch_builder = self
-                    .data_batches
-                    .entry(id)
-                    .or_insert_with(|| DataBatchBuilder::try_new(id).unwrap());
-                data_batch_builder.push(Event::new(id, timestamp, d));
+                let data_batch_builder = match self.data_batches.entry(id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(DataBatchBuilder::try_new(id)?),
+                };
+                data_batch_builder.push_transition(Event::new(id, timestamp, d));
                 Ok(())
             }
             SiriusEvent::BatchPlacement(b) => {
-                let batch_builder = self
-                    .batch_placements
-                    .entry(id)
-                    .or_insert_with(|| BatchPlacementBuilder::try_new(id).unwrap());
-                batch_builder.push(Event::new(id, timestamp, b));
+                let batch_builder = match self.batch_placements.entry(id) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(BatchPlacementBuilder::try_new(id)?),
+                };
+                batch_builder.push_transition(Event::new(id, timestamp, b));
                 Ok(())
             }
-            SiriusEvent::MemoryTier(e) => self.push_memory_tier(id, timestamp, e),
+            SiriusEvent::MemoryTier(schema::MemoryTierEvent::Declaration {
+                instance_name,
+                parent_group_id,
+                bounds,
+            }) => self.declare_resource(
+                id,
+                MEMORY_TIER_TYPE_NAME,
+                instance_name,
+                parent_group_id.target,
+                ResourceTypeDecl::new(
+                    MEMORY_TIER_TYPE_NAME,
+                    [CapacityDecl::new_occupancy(MEMORY_TIER_BYTES_CAPACITY_NAME)],
+                ),
+                ResourceCapacities(vec![CapacityValue::new(
+                    MEMORY_TIER_BYTES_CAPACITY_NAME,
+                    bounds.bytes,
+                )]),
+            ),
         }
     }
 
-    fn push_memory_tier(
+    fn declare_resource(
         &mut self,
         id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: batch::MemoryTierEvent,
+        type_name: &str,
+        instance_name: String,
+        parent_group_id: Uuid,
+        declaration: ResourceTypeDecl,
+        bounds: ResourceCapacities,
     ) -> AnalyzerResult<()> {
-        use batch::MemoryTierTransition;
-        match event.state {
-            MemoryTierTransition::MemoryTierInitializing(init) => {
-                validate_resource_type(&init.resource_type_name, MEMORY_TIER_TYPE_NAME, id)?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            MemoryTierTransition::MemoryTierOperating(operating) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![CapacityValue::new(
-                        MEMORY_TIER_BYTES_CAPACITY_NAME,
-                        operating.capacity_bytes.value.unwrap_or(0),
-                    )]),
-                ));
-            }
-            MemoryTierTransition::MemoryTierFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            MemoryTierTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
-    }
-
-    fn push_memory(
-        &mut self,
-        id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: memory::MemoryEvent,
-    ) -> AnalyzerResult<()> {
-        use memory::MemoryTransition;
-        match event.state {
-            MemoryTransition::MemoryInitializing(init) => {
-                validate_resource_type(&init.resource_type_name, MEMORY_TYPE_NAME, id)?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            MemoryTransition::MemoryOperating(operating) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![CapacityValue::new(
-                        MEMORY_BYTES_CAPACITY_NAME,
-                        operating.capacity_bytes.value.unwrap_or(0),
-                    )]),
-                ));
-            }
-            MemoryTransition::MemoryFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            MemoryTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
-    }
-
-    fn push_channel(
-        &mut self,
-        id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: channel::ChannelEvent,
-    ) -> AnalyzerResult<()> {
-        use channel::ChannelTransition;
-        match event.state {
-            ChannelTransition::ChannelInitializing(init) => {
-                validate_resource_type(&init.resource_type_name, CHANNEL_TYPE_NAME, id)?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            ChannelTransition::ChannelOperating(operating) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![CapacityValue::new(
-                        CHANNEL_BYTES_CAPACITY_NAME,
-                        operating.capacity_bytes.value.unwrap_or(0),
-                    )]),
-                ));
-            }
-            ChannelTransition::ChannelFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            ChannelTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
-    }
-
-    fn push_task_queue(
-        &mut self,
-        id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: task::TaskQueueEvent,
-    ) -> AnalyzerResult<()> {
-        use task::TaskQueueTransition;
-        match event.state {
-            TaskQueueTransition::TaskQueueInitializing(init) => {
-                validate_resource_type(&init.resource_type_name, TASK_QUEUE_TYPE_NAME, id)?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            TaskQueueTransition::TaskQueueOperating(operating) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![CapacityValue::new(
-                        QUEUE_ENTRIES_CAPACITY_NAME,
-                        operating.capacity_entries.value.unwrap_or(0),
-                    )]),
-                ));
-            }
-            TaskQueueTransition::TaskQueueFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            TaskQueueTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
-    }
-
-    fn push_executor_thread(
-        &mut self,
-        id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: task::ExecutorThreadEvent,
-    ) -> AnalyzerResult<()> {
-        use task::ExecutorThreadTransition;
-        match event.state {
-            ExecutorThreadTransition::ExecutorThreadInitializing(init) => {
-                validate_resource_type(&init.resource_type_name, EXECUTOR_THREAD_TYPE_NAME, id)?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            ExecutorThreadTransition::ExecutorThreadOperating(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![]),
-                ));
-            }
-            ExecutorThreadTransition::ExecutorThreadFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            ExecutorThreadTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
-    }
-
-    fn push_task_manager_loop_thread(
-        &mut self,
-        id: Uuid,
-        timestamp: TimeUnixNanoSec,
-        event: task::TaskManagerLoopThreadEvent,
-    ) -> AnalyzerResult<()> {
-        use task::TaskManagerLoopThreadTransition;
-        match event.state {
-            TaskManagerLoopThreadTransition::TaskManagerLoopThreadInitializing(init) => {
-                validate_resource_type(
-                    &init.resource_type_name,
-                    TASK_MANAGER_LOOP_THREAD_TYPE_NAME,
-                    id,
-                )?;
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Init(timestamp));
-                builder.set_type_name(init.resource_type_name);
-                builder.set_instance_name(Some(init.instance_name));
-                builder.set_parent_group_id(init.parent_group_id);
-            }
-            TaskManagerLoopThreadTransition::TaskManagerLoopThreadOperating(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Operating(
-                    timestamp,
-                    ResourceCapacities(vec![]),
-                ));
-            }
-            TaskManagerLoopThreadTransition::TaskManagerLoopThreadFinalizing(_) => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Finalizing(timestamp));
-            }
-            TaskManagerLoopThreadTransition::Exit => {
-                let builder = self.arbitrary_resources.try_builder(id)?;
-                builder.push(RtResourceTransition::Exit(timestamp));
-            }
-        }
-        Ok(())
+        self.sirius_resources.insert_resource_type(declaration);
+        self.sirius_resources
+            .insert_resource(id, type_name, instance_name, parent_group_id, bounds)
     }
 
     pub(crate) fn try_build(self) -> AnalyzerResult<SiriusModel> {
         // Build resources first. As we iterate over task builders and build all
         // tasks, we can populate the leaf resources used_by field.
-        let mut resources = self.arbitrary_resources.try_build()?;
-        insert_sirius_specific_resource_types(&mut resources);
+        let mut resources = self.sirius_resources;
+        for resource in resources.resources.values() {
+            let resource_type = resources.resource_type(resource.type_name())?;
+            for bound in &resource.bounds().0 {
+                resource_type.try_capacity(bound.name)?;
+            }
+        }
 
         let mut query_engine = self.query_engine.try_build()?;
 
         let mut tasks = HashMap::default();
         for (task_id, task_builder) in self.tasks.into_iter() {
-            let task = task_builder.try_build()?;
+            let task = Task::from_builder(task_builder)?;
             for usage in task.usages() {
                 let resource_type_name = resources
                     .resource(usage.resource_id())?
@@ -655,7 +673,7 @@ impl SiriusModelBuilder {
 
         let mut data_batches = HashMap::default();
         for (data_batch_id, data_batch_builder) in self.data_batches.into_iter() {
-            match data_batch_builder.try_build() {
+            match DataBatch::from_builder(data_batch_builder) {
                 Ok(data_batch) => {
                     for usage in data_batch.usages() {
                         let resource_type_name = resources
@@ -686,7 +704,7 @@ impl SiriusModelBuilder {
 
         let mut batch_placements = HashMap::default();
         for (batch_id, batch_builder) in self.batch_placements.into_iter() {
-            let batch = batch_builder.try_build()?;
+            let batch = BatchPlacement::from_builder(batch_builder)?;
             for usage in batch.usages() {
                 let resource_type_name = resources
                     .resource(usage.resource_id())?
@@ -708,7 +726,7 @@ impl SiriusModelBuilder {
         // will populate it based on the resource tree.
         let temp_model = SiriusModel {
             query_engine,
-            arbitrary_resources: resources,
+            sirius_resources: resources,
             tasks,
             data_batches,
             batch_placements,
@@ -719,7 +737,7 @@ impl SiriusModelBuilder {
         for group_type_decl in resource_group_types.values_mut() {
             for contained_resource_type in &group_type_decl.contains_resource_types {
                 if let Ok(resource_type) = temp_model
-                    .arbitrary_resources
+                    .sirius_resources
                     .resource_type(contained_resource_type)
                 {
                     for entity_type in &resource_type.used_by {
@@ -733,7 +751,7 @@ impl SiriusModelBuilder {
 
         Ok(SiriusModel {
             query_engine: temp_model.query_engine,
-            arbitrary_resources: temp_model.arbitrary_resources,
+            sirius_resources: temp_model.sirius_resources,
             tasks: temp_model.tasks,
             data_batches: temp_model.data_batches,
             batch_placements: temp_model.batch_placements,

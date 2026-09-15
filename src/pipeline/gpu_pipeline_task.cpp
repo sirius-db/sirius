@@ -38,16 +38,41 @@
 #include <data/data_batch_utils.hpp>
 
 #include <cstdint>
+#include <exception>
 #include <format>
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace sirius {
 namespace pipeline {
 
 namespace {
+
+void log_cleanup_failure(uint64_t task_id,
+                         std::string_view operation,
+                         std::optional<uint64_t> batch_id,
+                         const char* error) noexcept
+{
+  try {
+    if (batch_id && error != nullptr) {
+      SIRIUS_LOG_WARN(
+        "gpu_pipeline_task {}: {} failed for batch {}: {}", task_id, operation, *batch_id, error);
+    } else if (batch_id) {
+      SIRIUS_LOG_WARN("gpu_pipeline_task {}: {} failed for batch {}: unknown exception",
+                      task_id,
+                      operation,
+                      *batch_id);
+    } else if (error != nullptr) {
+      SIRIUS_LOG_WARN("gpu_pipeline_task {}: {} failed: {}", task_id, operation, error);
+    } else {
+      SIRIUS_LOG_WARN("gpu_pipeline_task {}: {} failed: unknown exception", task_id, operation);
+    }
+  } catch (...) {
+  }
+}
 
 void validate_operator_output_types(const op::operator_data* data,
                                     const op::sirius_physical_operator& op)
@@ -350,20 +375,35 @@ gpu_pipeline_task::gpu_pipeline_task(
     auto& registry = telemetry::batch_telemetry_registry::instance();
     for (const auto& weak_batch : _subscribed_batches) {
       if (auto batch = weak_batch.lock()) {
-        registry.on_packaged(batch, pipeline->pipeline_uuid(), telemetry_handle().uuid());
+        registry.on_packaged(
+          batch, pipeline->get_query_id(), pipeline->pipeline_uuid(), telemetry_uuid());
         _claimed_batch_ids.push_back(batch->get_batch_id());
       }
     }
   }
 }
 
-gpu_pipeline_task::~gpu_pipeline_task()
+gpu_pipeline_task::~gpu_pipeline_task() noexcept
 {
-  {
-    auto& registry       = telemetry::batch_telemetry_registry::instance();
-    const auto task_uuid = telemetry_handle().uuid();
+  const auto task_id = get_task_id();
+  std::optional<quent::Uuid> task_uuid;
+  try {
+    task_uuid = telemetry_uuid();
+  } catch (const std::exception& error) {
+    log_cleanup_failure(task_id, "read telemetry id", std::nullopt, error.what());
+  } catch (...) {
+    log_cleanup_failure(task_id, "read telemetry id", std::nullopt, nullptr);
+  }
+  if (task_uuid.has_value()) {
+    auto& registry = telemetry::batch_telemetry_registry::instance();
     for (const auto batch_id : _claimed_batch_ids) {
-      registry.on_consumed(batch_id, task_uuid);
+      try {
+        registry.on_consumed(batch_id, *task_uuid);
+      } catch (const std::exception& error) {
+        log_cleanup_failure(task_id, "finalize telemetry", batch_id, error.what());
+      } catch (...) {
+        log_cleanup_failure(task_id, "finalize telemetry", batch_id, nullptr);
+      }
     }
   }
 
@@ -372,9 +412,10 @@ gpu_pipeline_task::~gpu_pipeline_task()
     if (!batch) { continue; }
     try {
       batch->unsubscribe();
+    } catch (const std::exception& error) {
+      log_cleanup_failure(task_id, "unsubscribe", batch->get_batch_id(), error.what());
     } catch (...) {
-      // The destructor must not throw; log if possible.
-      SIRIUS_LOG_WARN("gpu_pipeline_task: unsubscribe failed for batch {}", batch->get_batch_id());
+      log_cleanup_failure(task_id, "unsubscribe", batch->get_batch_id(), nullptr);
     }
   }
   _subscribed_batches.clear();
@@ -407,9 +448,9 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
                     operators.size());
   }
 
-  auto executor_thread_resource_id = uuid::new_nil();
+  auto executor_thread_resource_id = quent::nil_uuid();
   if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle.id().raw();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute_operator: executor thread telemetry handle is not "
@@ -419,8 +460,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   for (size_t i = start_index; i < operators.size(); i++) {
     auto& op = operators[i].get();
     try {
-      this->telemetry_handle().computing({
-        .instance_name       = std::format("{}({})", op.get_name(), op.get_operator_id()),
+      this->telemetry_computing({
         .current_operator_id = static_cast<uint32_t>(
           op.get_operator_id()),  // TODO(dhruv9vats): look into possible overflow
         .input_bytes          = operator_input_output_data->get_estimated_size_in_bytes(),
@@ -610,9 +650,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
   }
 
-  auto executor_thread_resource_id = uuid::new_nil();
+  auto executor_thread_resource_id = quent::nil_uuid();
   if (telemetry::executor_thread_telemetry_handle.has_value()) {
-    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle->uuid();
+    executor_thread_resource_id = telemetry::executor_thread_telemetry_handle->handle.id().raw();
   } else {
     SIRIUS_LOG_ERROR(
       "gpu_pipeline_task::execute: executor thread telemetry handle is not initialized");
@@ -622,8 +662,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     _reservation_tier_resource_id = telemetry::batch_telemetry_registry::instance().tier_resource(
       requested_memory_space->get_tier(), requested_memory_space->get_id().device_id);
   }
-  telemetry_handle().preparing({
-    .instance_name               = "",
+  telemetry_preparing({
     .origin_tier                 = local_state._input_data->get_origin_tiers(),
     .target_tier                 = "GPU",
     .input_bytes                 = local_state._input_data->get_estimated_size_in_bytes(),
@@ -686,7 +725,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // is destroyed after the first operator's execute() consumes it.
   {
     auto& registry       = telemetry::batch_telemetry_registry::instance();
-    const auto task_uuid = telemetry_handle().uuid();
+    const auto task_uuid = telemetry_uuid();
     std::unordered_set<uint64_t> live_ids;
     for (const auto& weak_batch : _subscribed_batches) {
       if (auto batch = weak_batch.lock()) {
