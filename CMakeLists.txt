@@ -994,7 +994,6 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
-    test/cpp/scan/bench_dynamic_bloom_policies.cu
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
     test/cpp/scan/test_duckdb_insert_delta.cpp
