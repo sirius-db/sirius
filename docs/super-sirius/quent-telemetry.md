@@ -10,6 +10,15 @@ traces describing the engine, the plan (operators, ports, edges), executor
 as newline-delimited JSON (ndjson) files by default that Quent's analyzer server then ingests
 and renders as an interactive timeline in your browser.
 
+The canonical telemetry model is
+[`rust/crates/telemetry/model.yaml`](../../rust/crates/telemetry/model.yaml). The Rust
+instrumentation types, stored-event types, and C++ bridge are generated from that same schema during
+the build. Change the YAML schema rather than generated bridge files.
+
+> **Trace compatibility.** The schema-based Quent format is not compatible with traces emitted by
+> the previous macro-based instrumentation model. Generate new telemetry after upgrading Sirius;
+> the current analyzer does not import pre-migration traces.
+
 ## 1. Enable the exporter
 
 Telemetry is controlled entirely by the Sirius YAML config (see the

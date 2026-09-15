@@ -418,6 +418,19 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
     ls->set_reservation(std::move(reservation), info);
   }
 
+  auto const telemetry_info = task->get_estimated_reservation_size_info(f.gpu_space);
+  task->telemetry_queued({
+    .queue_resource_id      = quent::nil_uuid(),
+    .queue_capacity_entries = 0,
+  });
+  task->telemetry_reserving({
+    .requested_bytes            = telemetry_info.reservation_size,
+    .input_basis                = telemetry_info.input_basis,
+    .peak_estimate              = telemetry_info.peak_memory_estimate,
+    .bytes_to_materialize       = telemetry_info.bytes_to_materialize_input,
+    .manager_thread_resource_id = quent::nil_uuid(),
+  });
+
   return task;
 }
 
@@ -1044,6 +1057,19 @@ TEST_CASE("gpu_pipeline_task resumed at the sink sentinel restores and publishes
     REQUIRE(ls != nullptr);
     ls->set_reservation(std::move(reservation), info);
   }
+
+  auto const telemetry_info = retry->get_estimated_reservation_size_info(f.gpu_space);
+  retry->telemetry_queued({
+    .queue_resource_id      = quent::nil_uuid(),
+    .queue_capacity_entries = 0,
+  });
+  retry->telemetry_reserving({
+    .requested_bytes            = telemetry_info.reservation_size,
+    .input_basis                = telemetry_info.input_basis,
+    .peak_estimate              = telemetry_info.peak_memory_estimate,
+    .bytes_to_materialize       = telemetry_info.bytes_to_materialize_input,
+    .manager_thread_resource_id = quent::nil_uuid(),
+  });
 
   retry->execute(stream);
 

@@ -299,7 +299,7 @@ void sirius_physical_operator::push_data_batch(std::string_view port_id,
 
 void sirius_physical_operator::add_next_port_after_sink(next_port_info port_info)
 {
-  port_info.pseudo_sink_port_uuid = uuid::now_v7();
+  port_info.pseudo_sink_port_uuid = quent::now_v7();
   next_port_after_sink.push_back(port_info);
 }
 
@@ -419,7 +419,7 @@ std::shared_ptr<like_multiliteral_cache const> sirius_physical_operator::like_ca
 
 telemetry::batch_telemetry_info sirius_physical_operator::batch_telemetry() const
 {
-  if (not _pipeline) { return {nullptr, uuid::UUID{}}; }
+  if (not _pipeline) { return {nullptr, quent::Uuid{}}; }
   return {_pipeline->get_telemetry_context(), _pipeline->pipeline_uuid()};
 }
 

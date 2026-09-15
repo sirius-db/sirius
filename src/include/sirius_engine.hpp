@@ -27,8 +27,7 @@
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "telemetry-bridge/gen/query.rs.h"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry/runtime_fsm_handle.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
@@ -60,7 +59,7 @@ class sirius_engine {
   explicit sirius_engine(duckdb::ClientContext& context,
                          sirius_interface& sirius_iface,
                          sirius::query_id_t query_id);
-  ~sirius_engine();
+  ~sirius_engine() noexcept;
 
   /// \brief The query_id this engine belongs to.
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
@@ -106,9 +105,20 @@ class sirius_engine {
   bool query_finished;
 
  private:
+  using query_state = telemetry::runtime_fsm_handle<quent::Query,
+                                                    quent::query_state::Init,
+                                                    quent::query_state::Planning,
+                                                    quent::query_state::Executing,
+                                                    quent::query_state::Exit>;
+
+  void telemetry_planning();
+  void telemetry_executing();
+  void telemetry_exit();
+  [[nodiscard]] quent::Uuid telemetry_query_id() const;
+
   sirius::query_id_t query_id_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
-  rust::Box<quent::query::QueryHandle> query_handle_;
+  query_state query_state_;
 };
 
 }  // namespace sirius

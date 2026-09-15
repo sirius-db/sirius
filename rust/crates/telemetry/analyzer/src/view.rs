@@ -5,30 +5,25 @@ use quent_analyzer::{
     AnalyzerError, AnalyzerResult, Entity, Model,
     resource::{
         Resource, ResourceGroup, ResourceGroupTypeDecl, ResourceTypeDecl,
-        collection::ResourceCollection,
-        runtime::{RtResource, RtResourceGroup},
+        collection::ResourceCollection, runtime::RtResourceGroup,
     },
 };
 use quent_query_engine_analyzer::{
-    QueryEngineModel,
-    plain::legacy::{
-        Engine, InMemoryQueryEngineModelView, Operator, Plan, Port, Query,
-        QueryEngineEntityId as QeEntityRef, QueryGroup, Worker,
-    },
-    plan_tree::PlanTree,
+    QueryEngineEntityId as QeEntityRef, QueryEngineModel, plan_tree::PlanTree,
 };
-use quent_simulator_ui::EntityRef;
+use quent_query_engine_ui::EntityRef;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use uuid::Uuid;
 
 use crate::{
     batch_placement::{BatchPlacement, BatchPlacementExt},
     data_batch::{DataBatch, DataBatchExt},
-    model::SiriusModel,
+    model::{DeclaredResource, SiriusModel},
+    query_engine::{Engine, Operator, Plan, Port, Query, QueryEngineView, QueryGroup, Worker},
     task::{Task, TaskExt},
 };
 
-/// A view of the simulator model filtered to a specific query
+/// A view of the Sirius model filtered to a specific query.
 // TODO(johanpel): figure out a better way to construct these views, or to
 // filter the data on a per query basis. This is generally tricky because the
 // state of resources of engines that are shared across query groups or across
@@ -36,8 +31,8 @@ use crate::{
 pub(crate) struct SiriusModelQueryView<'a> {
     resource_types: HashMap<String, &'a ResourceTypeDecl>,
     resource_group_types: HashMap<String, &'a ResourceGroupTypeDecl>,
-    query_engine: InMemoryQueryEngineModelView<'a>,
-    resources: HashMap<Uuid, &'a RtResource>,
+    query_engine: QueryEngineView<'a>,
+    resources: HashMap<Uuid, &'a DeclaredResource>,
     resource_groups: HashMap<Uuid, &'a RtResourceGroup>,
     tasks: HashMap<Uuid, &'a Task>,
     data_batches: HashMap<Uuid, &'a DataBatch>,
@@ -50,14 +45,13 @@ impl<'a> SiriusModelQueryView<'a> {
         query_id: Uuid,
     ) -> AnalyzerResult<SiriusModelQueryView<'a>> {
         // QE scoped to single query
-        let query_engine_view =
-            InMemoryQueryEngineModelView::try_new(&model.query_engine, query_id)?;
+        let query_engine_view = QueryEngineView::try_new(&model.query_engine, query_id)?;
 
         let mut resource_groups = HashMap::default();
         let mut resources = HashMap::default();
 
-        for (resource_id, resource) in &model.arbitrary_resources.resources {
-            if Self::collect_runtime_resource_ancestors(
+        for (resource_id, resource) in &model.sirius_resources.resources {
+            if Self::collect_sirius_resource_ancestors(
                 model,
                 &query_engine_view,
                 resource.parent_group_id(),
@@ -68,7 +62,7 @@ impl<'a> SiriusModelQueryView<'a> {
         }
 
         let resource_types = model
-            .arbitrary_resources
+            .sirius_resources
             .resource_types
             .iter()
             .map(|(k, v)| (k.clone(), v))
@@ -128,13 +122,13 @@ impl<'a> SiriusModelQueryView<'a> {
         Ok(result)
     }
 
-    fn collect_runtime_resource_ancestors(
+    fn collect_sirius_resource_ancestors(
         model: &'a SiriusModel,
-        query_engine: &InMemoryQueryEngineModelView<'a>,
+        query_engine: &QueryEngineView<'a>,
         mut parent_id: Uuid,
         groups: &mut HashMap<Uuid, &'a RtResourceGroup>,
     ) -> AnalyzerResult<bool> {
-        // Accumulate runtime groups between the resource and the query-engine tree.
+        // Accumulate Sirius groups between the resource and the query-engine tree.
         // We only publish them if the chain eventually reaches a QE group visible in
         // this query view.
         let mut path = Vec::<&'a RtResourceGroup>::new();
@@ -149,16 +143,16 @@ impl<'a> SiriusModelQueryView<'a> {
                 return Ok(true);
             }
 
-            if let Some(group) = model.arbitrary_resources.resource_groups.get(&parent_id) {
+            if let Some(group) = model.sirius_resources.resource_groups.get(&parent_id) {
                 path.push(group);
-                // A runtime group without a parent cannot connect back to the QE tree, so
+                // A Sirius group without a parent cannot connect back to the QE tree, so
                 // do not expose this resource or its partial ancestor path.
                 let Some(next_parent_id) = group.parent_group_id() else {
                     return Ok(false);
                 };
                 parent_id = next_parent_id;
             } else {
-                // The next parent is not a runtime group we know about, and it was not a
+                // The next parent is not a Sirius group we know about, and it was not a
                 // QE group above. This resource is outside the current query view.
                 return Ok(false);
             };
@@ -177,15 +171,15 @@ impl<'a> SiriusModelQueryView<'a> {
         self.batch_placements.values().copied()
     }
 
-    pub(crate) fn runtime_resources(&self) -> impl Iterator<Item = &'a RtResource> + '_ {
+    pub(crate) fn sirius_resources(&self) -> impl Iterator<Item = &'a DeclaredResource> + '_ {
         self.resources.values().copied()
     }
 
-    pub(crate) fn runtime_resource_groups(&self) -> impl Iterator<Item = &'a RtResourceGroup> + '_ {
+    pub(crate) fn sirius_resource_groups(&self) -> impl Iterator<Item = &'a RtResourceGroup> + '_ {
         self.resource_groups.values().copied()
     }
 
-    pub(crate) fn runtime_resource_types(
+    pub(crate) fn sirius_resource_types(
         &self,
     ) -> impl Iterator<Item = (&str, &'a ResourceTypeDecl)> + '_ {
         self.resource_types
@@ -193,7 +187,7 @@ impl<'a> SiriusModelQueryView<'a> {
             .map(|(name, resource_type)| (name.as_str(), *resource_type))
     }
 
-    pub(crate) fn runtime_resource_group_types(
+    pub(crate) fn sirius_resource_group_types(
         &self,
     ) -> impl Iterator<Item = (&str, &'a ResourceGroupTypeDecl)> + '_ {
         self.resource_group_types
@@ -274,8 +268,27 @@ impl<'a> Model for SiriusModelQueryView<'a> {
             Ok(EntityRef::ResourceGroup(entity_id))
         } else {
             self.tasks
-                .contains_key(&entity_id)
-                .then_some(EntityRef::Task(entity_id))
+                .get(&entity_id)
+                .map(|task| EntityRef::Application {
+                    type_name: task.type_name().to_owned(),
+                    id: entity_id,
+                })
+                .or_else(|| {
+                    self.data_batches
+                        .get(&entity_id)
+                        .map(|data_batch| EntityRef::Application {
+                            type_name: data_batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
+                .or_else(|| {
+                    self.batch_placements
+                        .get(&entity_id)
+                        .map(|batch| EntityRef::Application {
+                            type_name: batch.type_name().to_owned(),
+                            id: entity_id,
+                        })
+                })
                 .ok_or(AnalyzerError::InvalidId(entity_id))
         }
     }

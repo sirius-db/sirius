@@ -18,9 +18,13 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
+#include <string>
+#include <utility>
 
 namespace {
+
 std::string tier_to_string(cucascade::memory::Tier tier)
 {
   switch (tier) {
@@ -30,29 +34,26 @@ std::string tier_to_string(cucascade::memory::Tier tier)
     default: return "unknown";
   }
 }
+
 }  // namespace
 
 namespace sirius::telemetry {
 
-memory_context::memory_context(uuid::UUID engine_uuid,
+memory_context::memory_context(quent::Uuid engine_uuid,
                                const quent::Context& context,
                                const cucascade::memory::memory_reservation_manager* manager)
 {
   if (manager == nullptr) { return; }
 
   for (const auto& mem_space : manager->get_all_memory_spaces()) {
-    auto handle = quent::memory::create(context,
-                                        {
-                                          .instance_name   = mem_space->to_string(),
-                                          .parent_group_id = engine_uuid,
-                                        });
-    handle->operating({
-      .capacity_bytes = mem_space->get_max_memory(),
+    auto instance_name = mem_space->to_string();
+    auto handle        = context.memory_observer()->handle();
+    handle.declaration(quent::memory::Declaration{
+      .instance_name   = instance_name,
+      .parent_group_id = quent::engine::EngineId(engine_uuid),
+      .bounds          = quent::records::MemoryBounds{.bytes = mem_space->get_max_memory()},
     });
-    memory_handles_.insert({
-      mem_space->get_id(),
-      std::move(handle),
-    });
+    memory_handles_.emplace(mem_space->get_id(), std::move(handle));
   }
 
   for (const auto& [space_id_1, handle_1] : memory_handles_) {
@@ -60,61 +61,43 @@ memory_context::memory_context(uuid::UUID engine_uuid,
       if (space_id_1 == space_id_2) {
         continue;  // skip inserting a channel between the same space.
       }
-      channel_handles_.insert({
-        channel_key{.source = space_id_1, .destination = space_id_2},
-        quent::channel::create(context,
-                               {
-                                 .instance_name   = std::format("{}-{}->{}-{}",
-                                                              tier_to_string(space_id_1.tier),
-                                                              space_id_1.device_id,
-                                                              tier_to_string(space_id_2.tier),
-                                                              space_id_2.device_id),
-                                 .parent_group_id = engine_uuid,
-                                 .source_id       = handle_1->uuid(),
-                                 .target_id       = handle_2->uuid(),
-                               }),
+      auto instance_name = std::format("{}-{}->{}-{}",
+                                       tier_to_string(space_id_1.tier),
+                                       space_id_1.device_id,
+                                       tier_to_string(space_id_2.tier),
+                                       space_id_2.device_id);
+      auto handle        = context.channel_observer()->handle();
+      handle.declaration(quent::channel::Declaration{
+        .instance_name   = instance_name,
+        .parent_group_id = quent::engine::EngineId(engine_uuid),
+        .source_id       = handle_1.id(),
+        .target_id       = handle_2.id(),
+        .bounds = quent::records::ChannelBounds{.bytes = std::numeric_limits<uint64_t>::max()},
       });
+      channel_handles_.emplace(channel_key{.source = space_id_1, .destination = space_id_2},
+                               std::move(handle));
     }
   }
-
-  for (auto& [_, c_handle] : channel_handles_) {
-    c_handle->operating({
-      .capacity_bytes = std::numeric_limits<uint64_t>::max(),
-    });
-  }
 }
 
-memory_context::~memory_context()
-{
-  for (auto& [_, handle] : memory_handles_) {
-    handle->finalizing();
-    handle->exit();
-  }
+memory_context::~memory_context() noexcept = default;
 
-  for (auto& [_, handle] : channel_handles_) {
-    handle->finalizing();
-    handle->exit();
-  }
-}
-
-std::optional<std::reference_wrapper<const quent::memory::MemoryHandle>>
-memory_context::get_memory_handle(cucascade::memory::memory_space_id mem_space) const noexcept
+std::optional<std::reference_wrapper<const memory_handle>> memory_context::get_memory_handle(
+  cucascade::memory::memory_space_id mem_space) const noexcept
 {
-  if (auto it = memory_handles_.find(mem_space); it != memory_handles_.end()) {
-    return *(it->second);
-  }
+  if (auto it = memory_handles_.find(mem_space); it != memory_handles_.end()) { return it->second; }
   return std::nullopt;
 }
 
-std::optional<std::reference_wrapper<const quent::channel::ChannelHandle>>
-memory_context::get_channel_handle(cucascade::memory::memory_space_id source,
-                                   cucascade::memory::memory_space_id destination) const noexcept
+std::optional<std::reference_wrapper<const channel_handle>> memory_context::get_channel_handle(
+  cucascade::memory::memory_space_id source,
+  cucascade::memory::memory_space_id destination) const noexcept
 {
   const channel_key key{
     .source      = source,
     .destination = destination,
   };
-  if (auto it = channel_handles_.find(key); it != channel_handles_.end()) { return *(it->second); }
+  if (auto it = channel_handles_.find(key); it != channel_handles_.end()) { return it->second; }
   return std::nullopt;
 }
 

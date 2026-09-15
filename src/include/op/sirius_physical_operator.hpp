@@ -24,7 +24,7 @@
 #include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "sirius/exception.hpp"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cudf/types.hpp>
 
@@ -708,7 +708,7 @@ class sirius_physical_operator {
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
-    uuid::UUID source_port_uuid{uuid::now_v7()};
+    quent::Uuid source_port_uuid{quent::now_v7()};
   };
 
   /// Describes a downstream operator's port to which data is pushed
@@ -728,7 +728,7 @@ class sirius_physical_operator {
     // │ └────┘   │ └─ port ──┘     │  │  │  │     └────────┘  │   └────┘ │
     // │          └─────────────────┘  │  │  └─────────────────┘          │
     // └───────────────────────────────┘  └───────────────────────────────┘
-    uuid::UUID pseudo_sink_port_uuid;
+    quent::Uuid pseudo_sink_port_uuid;
   };
 
   // source pipeline pushed to repo of the ports

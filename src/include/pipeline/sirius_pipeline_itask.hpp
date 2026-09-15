@@ -19,7 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
-#include "telemetry-bridge/gen/task.rs.h"
+#include "telemetry/runtime_fsm_handle.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace sirius {
@@ -48,7 +49,7 @@ class sirius_pipeline_itask : public parallel::itask {
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
-  ~sirius_pipeline_itask() override;
+  ~sirius_pipeline_itask() noexcept override;
 
   /**
    * @brief Compute and return the output data batches for this task.
@@ -107,8 +108,56 @@ class sirius_pipeline_itask : public parallel::itask {
     return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
   }
 
-  [[nodiscard]] quent::task::TaskHandle& telemetry_handle() noexcept;
-  void set_telemetry_finalized() noexcept { _telemetry_finalized = true; }
+  struct telemetry_queued_data {
+    quent::Uuid queue_resource_id;
+    uint64_t queue_capacity_entries;
+  };
+
+  struct telemetry_routing_data {
+    int64_t preferred_device_id;
+    quent::Uuid manager_thread_resource_id;
+  };
+
+  struct telemetry_reserving_data {
+    uint64_t requested_bytes;
+    uint64_t input_basis;
+    uint64_t peak_estimate;
+    uint64_t bytes_to_materialize;
+    quent::Uuid manager_thread_resource_id;
+  };
+
+  struct telemetry_downgrading_data {
+    uint64_t shortfall_bytes;
+    uint64_t partial_bytes;
+    quent::Uuid manager_thread_resource_id;
+  };
+
+  struct telemetry_preparing_data {
+    std::string origin_tier;
+    std::string target_tier;
+    uint64_t input_bytes;
+    quent::Uuid executor_thread_resource_id;
+    quent::Uuid reservation_resource_id;
+    uint64_t reservation_capacity_bytes;
+  };
+
+  struct telemetry_computing_data {
+    uint32_t current_operator_id;
+    uint64_t input_bytes;
+    uint64_t peak_allocated_bytes;
+    quent::Uuid executor_thread_resource_id;
+    quent::Uuid reservation_resource_id;
+    uint64_t reservation_capacity_bytes;
+  };
+
+  [[nodiscard]] quent::Uuid telemetry_uuid() const;
+  void telemetry_queued(telemetry_queued_data data);
+  void telemetry_routing(telemetry_routing_data data);
+  void telemetry_reserving(telemetry_reserving_data data);
+  void telemetry_downgrading(telemetry_downgrading_data data);
+  void telemetry_preparing(telemetry_preparing_data data);
+  void telemetry_computing(telemetry_computing_data data);
+  void finalize_telemetry(bool success);
 
  protected:
   /**
@@ -123,7 +172,17 @@ class sirius_pipeline_itask : public parallel::itask {
                         std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
  private:
-  rust::Box<quent::task::TaskHandle> _telemetry_task_handle;
+  using task_state = telemetry::runtime_fsm_handle<quent::Task,
+                                                   quent::task_state::Created,
+                                                   quent::task_state::Queued,
+                                                   quent::task_state::Routing,
+                                                   quent::task_state::Reserving,
+                                                   quent::task_state::Downgrading,
+                                                   quent::task_state::Preparing,
+                                                   quent::task_state::Computing,
+                                                   quent::task_state::Finalizing>;
+
+  task_state _telemetry_task_state;
   bool _telemetry_finalized{false};
 };
 

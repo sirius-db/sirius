@@ -20,7 +20,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <atomic>
@@ -105,7 +105,7 @@ class query {
   //! window rather than minted here — see sirius::query_id_t.
   sirius::query_id_t _query_id;
   //! Unique ID for this plan
-  uuid::UUID _plan_id;
+  quent::Uuid _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the
   // query.
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
