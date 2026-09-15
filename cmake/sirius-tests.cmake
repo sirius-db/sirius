@@ -19,6 +19,11 @@ target_include_directories(
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB
                       Catch2::Catch2)
+
+target_include_directories(
+  sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
+                                 ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
+
 link_extension_libraries(sirius_unittest "")
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for
