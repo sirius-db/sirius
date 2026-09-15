@@ -1524,6 +1524,70 @@ at the measured 18.11 GB/s is 1.546 s, which IS the cold time, against a 21.7 GB
 So a staging/decode pipeline is worth at most ~16%, not the ~50% the old number implied. Left
 undone deliberately.
 
+**The two changes are a PACKAGE, and measuring half of one inverts its sign (2026-09-15).**
+Measured on the SAME aligned SF100 dataset, cold, 22 queries:
+
+| binary | `.hpln` | vs parquet |
+|---|---|---|
+| before the transport fix (ifstream) | 8.670 s | +28.4% |
+| after it | **4.545 s** | **−32.8%** |
+
+**1.9x from one line.** But against the UNALIGNED SF1000 dataset the same line is a 30% REGRESSION
+(6 heavy queries: 31.779 s → 41.394 s), and the full 22-query suite reads +84% over parquet against
+the 83.6 s it used to. The rule behind both:
+
+- **aligned + io_context** → O_DIRECT, and it beats everything: the SF100 lineitem pin goes
+  **11.21 → 24.65 GB/s**, past the 21.7 GB/s buffered ceiling, because it bypasses the page cache.
+- **unaligned + io_context** → buffered readv through a handful of reactors, which is SLOWER than
+  the 18 scan threads each blocking on their own `pread` that the ifstream fallback gave.
+
+`next_reactor` hands a batch to exactly one reactor, so the io_context's host path is only as
+parallel as its reactor count — and raising it does not recover the difference (4/16/32 reactors:
+41.4 / 42.9 / 47.8 s, and the config key was verified to be read). So a `.hpln` written tight is
+better off on the fallback, and a `.hpln` written aligned is much better off on the io_context.
+A file from before `kPayloadAlign` therefore wants regenerating, not just a newer binary.
+
+**SF1000, on a regenerated (aligned, new-plan) dataset — the shipped configuration (2026-09-15).**
+Natural order both sides, page cache dropped before every query, 22/22 correct:
+
+| | suite | bytes | rate |
+|---|---|---|---|
+| parquet | 58.369 s | 949.8 GB | 16.27 GB/s |
+| `.hpln`, old dataset + old binary | 83.556 s (+42.3%) | 1011.0 GB | 12.10 GB/s |
+| `.hpln`, old dataset + new binary | 105.354 s (+84.0%) | 1006.5 GB | 9.55 GB/s |
+| **`.hpln`, regenerated + new binary** | **59.767 s (+2.4%)** | 1049.9 GB | **17.57 GB/s** |
+
+**83.6 → 59.8 s, and the gap to parquet closes from +42.3% to +2.4%.** Per byte the format is now
+AHEAD of parquet (17.57 vs 16.27 GB/s); what is left is that it still reads 10.5% more bytes.
+
+That deficit is one query. **q13 alone reads 84.99 GB against parquet's 33.22 GB and costs 4.760 s
+against 1.862 s** — it is the `o_comment` LIKE, and `o_comment` is stored raw because every plan
+that beats it routes through deflate. **Excluding q13 the suite is 55.007 s against parquet's
+56.507 s, i.e. `.hpln` is 2.7% FASTER.** So the remaining cold gap is not the format, the
+transport, or the layout: it is high-cardinality text with no non-LZ codec.
+
+**The pin, SF1000 lineitem, 14 columns:**
+
+| | time | bytes | rate |
+|---|---|---|---|
+| parquet (decode + re-compress) | 14.54 s | 105.46 GB | 7.25 GB/s |
+| `.hpln` before | 12.60 s | 143.85 GB | 11.42 GB/s |
+| **`.hpln` after** | **4.86 s** | 110.54 GB | **22.76 GB/s** |
+
+**3.0x faster than the parquet pin**, from two independent halves: −23% bytes (the `l_shipmode`
+dictionary) and 2.0x on the rate (O_DIRECT). §7.9's "4.4x faster pin", which never reproduced and
+was measured at 1.1x in §6.7, is most of the way back — and now it is the I/O copy actually being
+an I/O copy rather than a claim.
+
+Dataset regenerated in 40 min at `--chunk-bytes 2GB --sort none` (4 GB still kills partsupp);
+lineitem 219.2 → **186.4 GB (−15.0%)**, matching the −15.5% SF100 predicted. Total 409 → 406 GB:
+orders and partsupp are unchanged because their comment plans were reverted.
+
+**Three sweeps in this project have now measured nothing because the machinery was not in the
+path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
+silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
+any I/O sweep here.
+
 **Still open:** `l_quantity` (2.2x parquet) has no better plan in the codec set — explored, nothing
 found. `ps_comment` and `o_comment` are stored raw and dominate the dataset's size on disk; the
 plans that beat them all route through deflate, which is out of bounds here, so the size gap on
