@@ -61,6 +61,31 @@
 
 namespace simpatico {
 
+/// Every payload buffer starts at a multiple of this, and a chunk's payload is padded up to it.
+///
+/// It is the O_DIRECT block size. A reader can only take the unbuffered path when a request's file
+/// offset, its length and every destination pointer are block-aligned, and a payload packed tight
+/// satisfies none of those — so a .hpln read fell back to buffered I/O and paid a page-cache copy
+/// per byte. The padding is a few KB per buffer per chunk against a payload of hundreds of MB.
+///
+/// Recorded sizes are NOT padded: a buffer still declares the bytes it actually holds, and the
+/// slack after it is simply never read. That keeps the decode side unchanged and old files
+/// readable — their offsets are merely unaligned, which costs speed and not correctness.
+inline constexpr std::uint64_t kPayloadAlign = 4096;
+
+/// @p value rounded up to the next multiple of @ref kPayloadAlign.
+[[nodiscard]] inline constexpr std::uint64_t align_payload(std::uint64_t value) noexcept
+{
+  return (value + kPayloadAlign - 1) & ~(kPayloadAlign - 1);
+}
+
+/// @p value rounded up to the next multiple of @p align; @p align <= 1 means no rounding.
+[[nodiscard]] inline constexpr std::uint64_t align_up_to(std::uint64_t value,
+                                                         std::uint64_t align) noexcept
+{
+  return align <= 1 ? value : ((value + align - 1) / align) * align;
+}
+
 // ─── Self-locating files: trailer + postscript ──────────────────────────────
 //
 // The original layout was [header][payload] with nothing saying where the header ends, so a
@@ -293,11 +318,18 @@ struct payload_buffer_ref {
 /// bytes are copied — the caller stages each buffer from its `device_ptr` into
 /// its own payload store, then reconstructs later via
 /// read_compressed_table_from_memory. Returns an empty string on success.
+///
+/// @p payload_align starts each buffer on a multiple of itself, and rounds the total up to one.
+/// Only a writer targeting a FILE wants this (@ref kPayloadAlign, for O_DIRECT); a payload staged
+/// into memory is never read through a block device, and padding it would both waste space and
+/// inflate the size a caller compares against the uncompressed form. Declared sizes are unchanged
+/// either way — the slack is written and never read.
 std::string build_compressed_table_header(compressed_table const& table,
                                           std::vector<std::uint8_t>& out_header,
                                           std::vector<payload_buffer_ref>& out_buffers,
                                           std::uint64_t& out_payload_bytes,
-                                          ::cuda::stream_ref stream = cudf::get_default_stream());
+                                          ::cuda::stream_ref stream    = cudf::get_default_stream(),
+                                          std::uint64_t payload_align = 1);
 
 /// Copies @p size bytes of the external payload at logical @p offset into the
 /// pre-allocated device buffer @p dst_device, enqueued on @p stream.

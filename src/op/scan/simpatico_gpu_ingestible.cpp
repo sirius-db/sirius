@@ -102,6 +102,10 @@ class simpatico_batch_coalescer : public batch_coalescer {
     if (!_current) {
       _current       = std::make_unique<simpatico_scan_info>();
       _current->path = split->path;
+      // The transport travels with the split. Dropping it here does not fail, it silently demotes
+      // the read to the std::ifstream fallback in open_hpln_source -- no io_uring, no O_DIRECT, no
+      // reads in flight -- for every coalesced split, which is all of them.
+      _current->io_ctx = split->io_ctx;
     }
     // Ascending ids keep a batch's rows in file order and its reads sequential. The walk hands
     // chunks out in order, but several dispatcher threads may claim them, so the coalescer can
@@ -184,11 +188,11 @@ std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   info->physical_types      = schema->physical_types;
   info->num_rows            = schema->num_rows;
   info->chunk_rows          = schema->chunk_rows;
-  info->group_bounds = std::shared_ptr<sirius::scan_manager::group_bounds_arena const>(
-    schema, &schema->group_bounds);
+  info->group_bounds =
+    std::shared_ptr<sirius::scan_manager::group_bounds_arena const>(schema, &schema->group_bounds);
   info->column_has_nulls = schema->column_has_nulls;
-  info->host_space          = &host_space;
-  info->io_ctx              = std::move(io_ctx);
+  info->host_space       = &host_space;
+  info->io_ctx           = std::move(io_ctx);
   // Whole file by default; a caller with a narrower projection overwrites this.
   info->column_ids.resize(info->names.size());
   std::iota(info->column_ids.begin(), info->column_ids.end(), std::size_t{0});

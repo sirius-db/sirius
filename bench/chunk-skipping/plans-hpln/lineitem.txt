@@ -71,10 +71,13 @@ dictionary.keys_offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
-# column: l_shipmode  dtype: str  ratio: 1.700x  depth: 2
-# comp: 330.83 GB/s  decomp: 822.91 GB/s
-input -> str_split -> offsets, chars
-str_split.offsets -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
+# column: l_shipmode  dtype: str  ratio: 21.589x  depth: 2
+# comp: 137.01 GB/s  decomp: 195.03 GB/s
+# Below the 250 GB/s decode floor on purpose: a FILE pays for bytes on every cold read, and
+# str_split cost 12.7x the size for 4x the decode rate. It is also what makes the column
+# chunk-addressable, so q12 stops forcing a whole-chunk serve.
+input -> dictionary -> keys_offsets, keys_chars, indices
+dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed
 
 ---
 # column: l_comment  dtype: str  ratio: 2.510x  depth: 4

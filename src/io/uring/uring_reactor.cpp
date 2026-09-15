@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -715,7 +716,17 @@ request_type_ptr uring_reactor::prep_host_rxv_request(const reactor_config_type&
   // Fuse contiguous, same-fd segments into vectored reads (1 buffer => plain
   // read, >1 => readv).  total_chunks == number of merged segments: each emitted
   // chunked_rx_request calls chunk_complete exactly once.
-  auto merged  = merge_contiguous(segments, cfg.max_n_chunks, fd_for);
+  auto merged = merge_contiguous(segments, cfg.max_n_chunks, fd_for);
+  // Which fd a host read landed on. The difference is a page-cache copy per byte and it is
+  // otherwise invisible -- the bytes are identical either way.
+  if (!merged.empty()) {
+    std::size_t direct = 0;
+    for (auto const& m : merged) {
+      if (m.fd == file.odirect_handle()) { ++direct; }
+    }
+    SIRIUS_LOG_DEBUG(
+      "[uring_reactor] host read: {} of {} merged segments O_DIRECT", direct, merged.size());
+  }
   auto manager = std::make_shared<request_manager>(bytes_requested, merged.size());
 
   std::vector<chunk_io_request_type_ptr> chunks;
