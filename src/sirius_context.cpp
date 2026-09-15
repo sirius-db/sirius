@@ -34,6 +34,7 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -340,10 +341,23 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd()
 {
-  // The DuckDB query-end callback releases nothing: slot ownership is
+  // The DuckDB query-end callback releases no slot or repository state: slot ownership is
   // scope-bound and the mandatory cleanup runs inside the execution window
-  // (StandaloneQueryScope::finish), before the result is exposed. Kept as the
-  // ClientContextState interface hook.
+  // (StandaloneQueryScope::finish), before the result is exposed.
+  //
+  // The iceberg delete-data memo is the one thing that must still be dropped here rather than
+  // in run_mandatory_cleanup(). It is populated at PLAN time, and this scan path deliberately
+  // declines unsupported iceberg tables at plan time — those queries never open an execution
+  // window, so a clear living only in the window would never run for them. An entry that
+  // outlives its query can serve a previous snapshot's deletes, i.e. return rows the table has
+  // since removed. This hook fires per statement for GPU and CPU queries alike.
+  //
+  // The internal-query bracket is checked by the QueryEnd(ClientContext&) overload above this
+  // one, which is the only path DuckDB delivers (client_context.cpp calls QueryEnd(ctx, error)).
+  // The memo is filled by internal connections during planning, so a clear that ran for those
+  // would drop the entry the plan just built; iceberg_delete_data_uncached_read_count() is the
+  // assertion that holds this honest.
+  sirius::op::scan::clear_iceberg_delete_data_cache();
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)
