@@ -1125,6 +1125,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cmake-4.3.4-hc85cc9f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/compiler-rt-21.1.8-ha770c72_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/compiler-rt21-21.1.8-hb700be7_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/croaring-5.2.0-hd2095e1_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-crt-tools-13.3.33-ha770c72_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-cudart-13.3.29-hecca717_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-cudart-dev-13.3.29-hecca717_0.conda
@@ -1287,6 +1288,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cmake-4.3.4-hc9d863e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/compiler-rt-21.1.8-h8af1aa0_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/compiler-rt21-21.1.8-hfefdfc9_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/croaring-5.2.0-h4154aff_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-crt-tools-13.3.33-h579c4fd_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-cudart-13.3.29-h8f3c8d4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-cudart-dev-13.3.29-h8f3c8d4_0.conda
@@ -3591,6 +3593,21 @@ packages:
     - croaring >=4.4.2,<4.4.3.0a0
   size: 237867
   timestamp: 1760547932775
+- conda: https://conda.anaconda.org/conda-forge/linux-64/croaring-5.2.0-hd2095e1_0.conda
+  sha256: 41e2eff4cd302411c90b13a1299d9d4f5196fcd08100bf5ea0701da139be53ae
+  md5: ecc086937551dbbe390ffae887b0571a
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  - libgcc >=15
+  - libstdcxx >=15
+  license: Apache-2.0
+  license_family: APACHE
+  purls: []
+  run_exports:
+    weak:
+    - croaring >=5.2.0,<5.2.1.0a0
+  size: 275174
+  timestamp: 1788924206293
 - conda: https://conda.anaconda.org/conda-forge/linux-64/cuda-bindings-12.9.7-py312h6ec95bb_1.conda
   sha256: db9d54a9205d424e670226187120f0e784c43a7a0c626eccb61289783933a1c2
   md5: 343c1eee3ba82710b12e1a90df90dc22
@@ -9436,6 +9453,20 @@ packages:
     - croaring >=4.4.2,<4.4.3.0a0
   size: 221719
   timestamp: 1760548075574
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/croaring-5.2.0-h4154aff_0.conda
+  sha256: 88d73a48457f91c25ece320a0d0194d362a404ae49cdbf74049b7896b9f87bb2
+  md5: 72e979416fb73ee32f2e36b2ea23de4f
+  depends:
+  - libgcc >=15
+  - libstdcxx >=15
+  license: Apache-2.0
+  license_family: APACHE
+  purls: []
+  run_exports:
+    weak:
+    - croaring >=5.2.0,<5.2.1.0a0
+  size: 302426
+  timestamp: 1788924179966
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cuda-bindings-12.9.7-py312hdebd348_1.conda
   sha256: 9f4878be4f23dda46fb4f0c6d93c9d23fae4771e973a567beac55ea637a1909b
   md5: d328b89bcb5eb29857c00fddf4a25e52
@@ -14105,7 +14136,7 @@ packages:
   license: Apache-2.0
   license_family: Apache
   purls:
-  - pkg:pypi/boto3?source=compressed-mapping
+  - pkg:pypi/boto3?source=hash-mapping
   run_exports: {}
   size: 88579
   timestamp: 1786466255577
@@ -14135,7 +14166,7 @@ packages:
   license: Apache-2.0
   license_family: Apache
   purls:
-  - pkg:pypi/botocore?source=compressed-mapping
+  - pkg:pypi/botocore?source=hash-mapping
   run_exports: {}
   size: 8942251
   timestamp: 1786452286508

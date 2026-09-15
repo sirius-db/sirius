@@ -39,6 +39,7 @@ libprotobuf = "*"
 rust = "*"
 cuda-nvrtc-dev = "*"
 boto3 = ">=1.43.68,<2"
+croaring = "*"
 
 [pypi-dependencies]
 rumdl = "==0.2.44"
@@ -80,11 +81,6 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
 cuda-version = "13.2.*"
-# 26.08 for the hybrid-scan multi-file reader
-# (cudf/io/experimental/hybrid_scan_multifile.hpp), which does not exist in
-# 26.06. Pinned to the release build on the `rapidsai` channel rather than a
-# nightly, so a build is reproducible instead of tracking whatever was
-# published that day.
 libcudf = "==26.08.01"
 libcuvs = "==26.08.01"
 
