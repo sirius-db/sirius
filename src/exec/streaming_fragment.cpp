@@ -429,6 +429,27 @@ std::size_t streaming_fragment::relay_from(streaming_fragment& source,
   return moved;
 }
 
+bool streaming_fragment::push(stream_id_t id, std::shared_ptr<cucascade::data_batch> batch)
+{
+  require_built("push()");
+  if (_phase != phase::built) {
+    throw sirius::invalid_input_exception(
+      "streaming_fragment: push() must run before this fragment's run()");
+  }
+  static_cast<void>(input_spec(id));
+  return _session.push(id, std::move(batch));
+}
+
+const stream_input_spec& streaming_fragment::input_spec(stream_id_t id) const
+{
+  auto it = _spec.inputs.find(id);
+  if (it == _spec.inputs.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: input stream " + std::to_string(id) +
+                                          " was never declared on this fragment");
+  }
+  return it->second;
+}
+
 void streaming_fragment::close_input(stream_id_t id, sender_id_t sender)
 {
   require_built("close_input()");
