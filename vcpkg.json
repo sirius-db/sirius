@@ -20,8 +20,13 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl",
-    "roaring"
+    "roaring",
+    {
+      "features": [
+        "http2"
+      ],
+      "name": "curl"
+    }
   ],
   "overrides": [
     {

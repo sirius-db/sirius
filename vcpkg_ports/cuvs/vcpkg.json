@@ -12,6 +12,8 @@
     "cccl",
     "cuco",
     "fmt",
+    "nvjitlink",
+    "nvrtc",
     "nvtx3",
     "raft",
     "rmm",
@@ -20,5 +22,5 @@
   "license": "Apache-2.0",
   "name": "cuvs",
   "supports": "linux",
-  "version-string": "26.06.00"
+  "version-string": "26.08.01"
 }
