@@ -41,6 +41,20 @@ Alternatively, load the extension into an existing DuckDB shell:
 LOAD 'build/release/extension/sirius/sirius.duckdb_extension';
 ```
 
+### Distributed builds (optional, NVIDIA-internal)
+
+Builds can optionally be routed through the RAPIDS sccache distributed build farm and shared
+S3 compilation cache — useful for sharing build results across machines when running
+experiments. After a one-time `scripts/sccache_dist_setup.sh`, enable it per shell with:
+
+```bash
+source scripts/sccache_dist_env.sh
+pixi run make
+```
+
+Normal builds and CI are unaffected unless the mode is enabled. See
+[docs/sccache-dist.md](sccache-dist.md) for setup, health checks, and troubleshooting.
+
 ## Pre-commit
 
 Sirius uses [pre-commit](https://pre-commit.com/) hooks to enforce formatting and linting. Install the hooks after cloning so every commit is checked automatically:
