@@ -39,16 +39,13 @@ namespace {
 
 constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
 
-// Derive a per-key cuDF cast type so independently-planned senders always hash identically.
-// Different planners may bind the same logical column to different native widths (e.g. INT32 vs
-// INT64). cuDF's murmur3 hashes bytes, not values, so without normalization matching keys land in
-// different partitions and groups are silently split.
-//
-// Rules:
-//   TINYINT / SMALLINT / INTEGER → INT64   (all sub-64-bit integers → canonical 64-bit)
-//   BIGINT / BOOLEAN / VARCHAR   → EMPTY   (already canonical; hash as-is)
-//   DECIMAL (any precision/scale) → FLOAT64 (normalized floating representation)
-//   anything else                → throw
+// Fill a per-key cuDF cast type so independently planned senders hash the same logical value.
+// Planners may bind one column to INT32 in one fragment and INT64 in another. cuDF murmur3
+// hashes bytes, so matching keys would otherwise land in different partitions.
+// TINYINT, SMALLINT, INTEGER become INT64.
+// BIGINT, BOOLEAN, VARCHAR stay as-is (EMPTY).
+// DECIMAL becomes FLOAT64.
+// Any other type throws.
 cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 {
   switch (t.id()) {
@@ -67,15 +64,15 @@ cudf::data_type derive_key_cast_type(const sirius::logical_type& t)
 }
 
 // Fill partition_spec::key_cast_types when the caller left it empty.
-// No-op when the caller supplied their own cast types.
+// No-op when the caller already set cast types.
 void normalize_key_cast_types(op::partition_spec& spec,
                               const duckdb::vector<sirius::logical_type>& output_types)
 {
   if (!spec.key_cast_types.empty()) { return; }
   spec.key_cast_types.reserve(spec.key_columns.size());
   for (int key : spec.key_columns) {
-    // The sink validates key ranges too, but it is constructed after this runs — so an
-    // out-of-range or negative key would index output_types out of bounds first.
+    // The sink also checks key ranges, but it is constructed after this. An out-of-range
+    // or negative key would index output_types first.
     if (key < 0 || static_cast<std::size_t>(key) >= output_types.size()) {
       throw sirius::invalid_input_exception("streaming_fragment: partition key column " +
                                             std::to_string(key) + " is out of range for a " +
@@ -125,7 +122,7 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
       " output streams need a partition spec; a gather fragment has exactly one");
   }
 
-  // Repositories escape data_repository_manager_ cleanup so sender output outlives this fragment.
+  // Repositories outlive data_repository_manager_ cleanup so sender output outlives this fragment.
   for (const auto& [id, _] : _spec.inputs) {
     _input_repos[id] = std::make_shared<cucascade::shared_data_repository>();
   }
@@ -140,8 +137,8 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
 
 streaming_fragment::~streaming_fragment()
 {
-  // Drop only the ids this fragment declared. clear() would wipe the whole per-connection
-  // catalog, including a peer fragment's declarations; swallow in dtor.
+  // Drop only the ids this fragment declared. clear() would wipe a peer fragment's
+  // declarations on this connection. Swallow in the destructor.
   try {
     auto catalog = catalog_for(_context);
     for (const auto& [id, _] : _spec.inputs) {
@@ -196,7 +193,7 @@ void streaming_fragment::register_sources()
   for (const auto& [id, _] : _spec.inputs) {
     auto* built = catalog->get(id).built;
     if (built == nullptr) {
-      // Declared but unread = hang; fail loudly.
+      // Declared but unread would hang. Fail here.
       throw sirius::invalid_input_exception("streaming_fragment: input stream " +
                                             std::to_string(id) +
                                             " was declared but the plan does not read it");
@@ -267,13 +264,13 @@ void streaming_fragment::build()
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
 
   auto catalog = catalog_for(_context);
-  // Same reason as the destructor: erase our own ids so a rebuild is idempotent without
-  // discarding declarations that belong to another fragment on this connection.
+  // Same as the destructor: erase our own ids so a rebuild is idempotent and does not
+  // drop another fragment's declarations on this connection.
   for (const auto& [id, _] : _spec.inputs) {
     catalog->erase(id);
   }
 
-  // Declare before planning: bind resolves schema; create_plan reads repo + senders.
+  // Declare before planning. Bind resolves schema. create_plan reads the repository and senders.
   for (const auto& [id, input] : _spec.inputs) {
     catalog->declare(
       id,
@@ -299,7 +296,7 @@ void streaming_fragment::build()
     _built = true;
   } catch (...) {
     // Release the slot so a later fragment on this connection can build. The destructor
-    // backstop would do the same, but only when *this* is dropped.
+    // would do the same, but only when this object is dropped.
     try {
       close_window(false);
     } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -314,16 +311,14 @@ void streaming_fragment::run()
   if (_ran) { throw sirius::invalid_input_exception("streaming_fragment: already run"); }
 
   try {
-    // The window opened in build() must stay the one execute() uses: a second
-    // StandaloneQueryScope would reset task_creator / scan manager that build() populated
-    // → zero tasks, empty output, no error.
+    // Reuse the window build() opened. A second StandaloneQueryScope resets the task
+    // creator and scan manager that build() filled, so execute() runs zero tasks and
+    // returns empty output with no error.
     _engine->execute();
     if (is_result()) { _result = _engine->get_result(); }
   } catch (...) {
-    // Poison every output before unwinding: otherwise the streams are neither closed nor
-    // failed, so a peer parked in wait() blocks forever with no error anywhere. fail_output is
-    // idempotent (first-failure-wins), so this stays safe even when a caller (e.g.
-    // sirius::ffi::Fragment::run()) also poisons the same outputs itself.
+    // Fail every output before the window closes. Otherwise a peer in wait() blocks forever.
+    // fail_output is first-failure-wins, so a caller that poisons again is safe.
     poison_outputs(std::current_exception());
     try {
       close_window(false);
