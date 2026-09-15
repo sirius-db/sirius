@@ -1774,6 +1774,41 @@ Together with the plan-inheritance gap (§6.11), the shape of the format is now 
 pin chooses neither its row order nor its compression plans — both are properties of the file —
 and that is the price of the pin being pure I/O.**
 
+### 6.13 What `cluster_by` costs: it trades orderkey locality for date locality (2026-09-15)
+
+`cluster_by` is a **local sort per chunk** (`simpatico_copy_function.cpp:341` → `cluster_pin_chunk`,
+the same call the pin path makes). Rows are accumulated in file order and sorted only WITHIN the
+chunk, so **which rows land in which chunk never changes** — only their order inside it. That
+predicts a precise split, and it measures exactly that way. SF1000 cold, bytes read:
+
+| query | driven by | unclustered | clustered | |
+|---|---|---|---|---|
+| q6 | `l_shipdate` | 40.04 GB | **5.61 GB** | −86% |
+| q14 | `l_shipdate` | 51.47 GB | **1.64 GB** | −97% |
+| q15 | `l_shipdate` | 48.66 GB | **2.59 GB** | −95% |
+| q3 | mixed | 42.66 GB | 27.18 GB | −36% |
+| q9 | orderkey joins | 81.79 GB | 90.24 GB | **+10%** |
+| q21 | orderkey joins | 103.49 GB | 112.31 GB | **+9%** |
+| q18 | orderkey joins | 41.56 GB | 58.46 GB | **+41%** |
+
+**So no, clustering does not keep what natural order was giving — not at group granularity.**
+TPC-H's natural order is orderkey-sorted, so every 8192-row group had a tight `l_orderkey` range
+and a join-derived orderkey filter pruned groups. Sorting a chunk by `l_shipdate` scatters the
+orderkey across all of that chunk's groups, and those groups stop pruning. What survives is
+**chunk-level** orderkey bounds — the row-to-chunk assignment is untouched — but at 2 GB chunks
+that is far too coarse to replace what was lost.
+
+This is the same cause as §5.5's compression finding, seen from the other side: clustering scatters
+`l_orderkey`, which costs its compressibility (12.393x → 2.739x) AND its zone maps. One reordering,
+two symptoms.
+
+**The trade is strongly positive on TPC-H and is NOT guaranteed to be.** The date wins are enormous
+and the orderkey losses are single- to low-double-digit, so the suite nets −21.6% of bytes and
+−6.9% of time. A workload weighted toward orderkey-joined scans rather than date-filtered ones
+would see the sign flip. The cluster key is a workload choice, and picking it automatically (§5.5's
+remaining open question) has to weigh what the ordering DESTROYS, not just what it enables — which
+is the part "choose the column the predicates filter on" misses.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
