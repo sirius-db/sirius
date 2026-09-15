@@ -783,12 +783,30 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
-  /// Bumped on every _pinned_entries mutation; see pin_registry_epoch().
+  /// Bumped on every exit from a registry-mutating member; see pin_registry_epoch().
   std::atomic<std::uint64_t> _pin_registry_epoch{0};
   void bump_pin_registry_epoch() noexcept
   {
     _pin_registry_epoch.fetch_add(1, std::memory_order_release);
   }
+  /// RAII: bumps the epoch when the enclosing scope exits, on EVERY path — normal return, the
+  /// same-row-count merge's early return, and a throw. Declared first in every member that
+  /// touches _pinned_entries. The failure mode this guards against is asymmetric: a mutation
+  /// that escapes without a bump (an erase followed by a throw before the re-insert, a merge
+  /// that returned early) lets a stale finalize-validated plan run against a registry it was
+  /// not built for, whereas a bump after a throw that mutated nothing costs one plan rebuild.
+  class pin_registry_mutation_scope {
+   public:
+    explicit pin_registry_mutation_scope(sirius_scan_manager& manager) noexcept : _manager(manager)
+    {
+    }
+    ~pin_registry_mutation_scope() { _manager.bump_pin_registry_epoch(); }
+    pin_registry_mutation_scope(pin_registry_mutation_scope const&)            = delete;
+    pin_registry_mutation_scope& operator=(pin_registry_mutation_scope const&) = delete;
+
+   private:
+    sirius_scan_manager& _manager;
+  };
   bool _pruning_enabled{true};
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
