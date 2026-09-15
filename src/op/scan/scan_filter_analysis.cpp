@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/interval.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/planner/expression/bound_cast_expression.hpp>
@@ -126,17 +127,34 @@ int128 pow10_128(int e)
   return r;
 }
 
-struct timestamp_ticks {
-  std::int64_t ticks;
-  std::int64_t ticks_per_day;
-};
-
-/// @p value's ticks and day length, for timestamp flavors whose day boundary
-/// is session-independent and whose instant is finite. Refusals are what keep
-/// the day mapping below sound: TIMESTAMP_TZ's midnight moves with the session
-/// time zone, and DuckDB maps DATE ±infinity onto TIMESTAMP ±infinity directly
-/// rather than through day arithmetic, off the linear mapping entirely.
-std::optional<timestamp_ticks> finite_timestamp_ticks(duckdb::Value const& value)
+/// A timestamp constant lowered into the stored-day domain of a DATE column,
+/// as an inclusive [minimum, maximum] pair of whole days (see to_decoded_bound).
+///
+/// DuckDB's DATE -> TIMESTAMP* cast (cast_operators.cpp, TryCast<date_t,
+/// timestamp_t> and the *_S/_MS/_NS wrappers that run through it) behaves in
+/// three regimes, and the lowering has to be right for each:
+///
+///  1. Finite day d that fits the target: midnight(d) = d * ticks_per_day,
+///     strictly monotonic in d. The constant lowers to floor/ceil of
+///     ticks / ticks_per_day; a midnight lands on one day, anything else falls
+///     strictly between two days. Exact for every comparison op.
+///
+///  2. DATE +/-infinity: mapped straight onto TIMESTAMP +/-infinity, NOT
+///     through day arithmetic. Order is still preserved, because the stored
+///     days of DATE +/-infinity (+/-INT32_MAX) are the extremes of the day
+///     domain just as TIMESTAMP +/-infinity are the extremes of the tick
+///     domain. So a finite constant needs no special casing, and an infinite
+///     constant lowers exactly to the infinite date's stored day count.
+///
+///  3. Finite day d whose midnight does not fit the target (roughly beyond
+///     +/-292,000 years for TIMESTAMP/_MS/_S, +/-292 years for TIMESTAMP_NS):
+///     DuckDB raises a ConversionException for the whole query. A decode-time
+///     range cannot raise, and neither does the residual GPU cast it replaces
+///     (cudf::cast wraps silently), so the range treats the mapping as if the
+///     tick domain were unbounded: such a row is kept or dropped exactly as the
+///     instant it denotes would be. That is the only divergence from DuckDB,
+///     and it exists only on queries DuckDB refuses to answer at all.
+std::optional<sirius::numeric_range> lower_timestamp_to_days(duckdb::Value const& value)
 {
   std::int64_t ticks;
   std::int64_t per_day;
@@ -158,13 +176,37 @@ std::optional<timestamp_ticks> finite_timestamp_ticks(duckdb::Value const& value
       ticks   = duckdb::TimestampNSValue::Get(value).value;
       per_day = duckdb::Interval::NANOS_PER_DAY;
       break;
-    default: return std::nullopt;  // TIMESTAMP_TZ and non-timestamp types
+    default:
+      // TIMESTAMP_TZ: midnight moves with the session time zone, so there is
+      // no fixed day mapping. Non-timestamp types are not this shape at all.
+      return std::nullopt;
   }
-  if (ticks == std::numeric_limits<std::int64_t>::max() ||
-      ticks == -std::numeric_limits<std::int64_t>::max()) {
-    return std::nullopt;  // ±infinity
+
+  auto const whole_day = [](int128 days) {
+    return sirius::numeric_range{sirius::numeric_range_domain::SIGNED_INTEGER, days, days, 0};
+  };
+  // Regime 2: +/-infinity are the same extreme in both domains. Every flavor
+  // shares timestamp_t's sentinels (timestamp_t::infinity() == INT64_MAX,
+  // ninfinity() == -INT64_MAX).
+  if (ticks == duckdb::timestamp_t::infinity().value) {
+    return whole_day(duckdb::date_t::infinity().days);
   }
-  return timestamp_ticks{ticks, per_day};
+  if (ticks == duckdb::timestamp_t::ninfinity().value) {
+    return whole_day(duckdb::date_t::ninfinity().days);
+  }
+  // INT64_MIN is below -infinity and is not a representable instant; DuckDB
+  // never produces it as a timestamp constant. Refuse rather than order it.
+  if (ticks == std::numeric_limits<std::int64_t>::min()) { return std::nullopt; }
+
+  // Regime 1 (and, by extension, 3): floor / ceil of the rational
+  // ticks / ticks_per_day.
+  auto const t     = static_cast<int128>(ticks);
+  auto const day   = static_cast<int128>(per_day);
+  int128 quotient  = t / day;
+  int128 const rem = t % day;
+  if (rem != 0 && t < 0) { quotient -= 1; }  // truncation -> floor
+  return sirius::numeric_range{
+    sirius::numeric_range_domain::SIGNED_INTEGER, quotient, quotient + (rem != 0 ? 1 : 0), 0};
 }
 
 /// The constant a conjunct compares against, lowered into the DECODED integer
@@ -195,22 +237,8 @@ std::optional<sirius::numeric_range> to_decoded_bound(duckdb::Value const& value
     // A timestamp constant against a DATE column: DuckDB constant-folds
     // qgen-style date arithmetic (`d <= DATE '1998-12-01' - INTERVAL '72'
     // DAY`) into `CAST(d AS TIMESTAMP) <= TIMESTAMP '1998-09-20 00:00:00'`.
-    // CAST maps day d to d * ticks_per_day (midnight), strictly monotonic in
-    // d, so the constant lowers to the rational ticks / ticks_per_day —
-    // floor/ceil exactly like a finer-scale decimal. Midnight lands on an
-    // integer (floor == ceil); any other instant falls strictly between two
-    // days, which is what makes the resulting bound exact for every
-    // comparison op rather than merely sound.
-    if (auto const ts = finite_timestamp_ticks(value)) {
-      auto const per_day = static_cast<int128>(ts->ticks_per_day);
-      auto const t       = static_cast<int128>(ts->ticks);
-      int128 quotient    = t / per_day;
-      int128 const rem   = t % per_day;
-      if (rem != 0 && t < 0) { quotient -= 1; }  // truncation → floor
-      return sirius::numeric_range{
-        sirius::numeric_range_domain::SIGNED_INTEGER, quotient, quotient + (rem != 0 ? 1 : 0), 0};
-    }
-    return std::nullopt;
+    // lower_timestamp_to_days states the mapping and its edge cases.
+    return lower_timestamp_to_days(value);
   }
 
   if (!col_type.is_decimal() && !col_type.is_integer()) { return std::nullopt; }

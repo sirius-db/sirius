@@ -406,6 +406,140 @@ TEST_CASE("cast-through range extraction: extreme finite timestamps",
                kInt64Max);
 }
 
+// ── ±infinity constants: the same extreme in both domains ───────────────────
+//
+// DuckDB casts DATE ±infinity straight to TIMESTAMP ±infinity instead of
+// multiplying days, so the linear formula does not apply to the sentinels. It
+// does not need to: DATE ±infinity is stored as ±INT32_MAX days, the extreme of
+// the day domain, exactly as TIMESTAMP ±infinity is the extreme of the tick
+// domain. An infinite constant therefore lowers to the infinite date's stored
+// day count and stays exact for every op: `< +inf` keeps everything but the
+// +infinity rows, `>= +inf` keeps only them, and so on.
+
+TEST_CASE("cast-through range extraction: ±infinity constants lower to DATE ±infinity days",
+          "[scan][range_pushdown][fused_scan_filter]")
+{
+  auto const pos_inf_ts          = duckdb::timestamp_t::infinity().value;
+  auto const neg_inf_ts          = duckdb::timestamp_t::ninfinity().value;
+  std::int64_t const pos_inf_day = duckdb::date_t::infinity().days;   // +INT32_MAX
+  std::int64_t const neg_inf_day = duckdb::date_t::ninfinity().days;  // -INT32_MAX
+  REQUIRE(pos_inf_day == std::numeric_limits<std::int32_t>::max());
+  REQUIRE(neg_inf_day == -std::numeric_limits<std::int32_t>::max());
+
+  SECTION("+infinity")
+  {
+    expect_range(
+      run_extraction(cast_cmp_filter(ExpressionType::COMPARE_LESSTHANOREQUALTO, pos_inf_ts)),
+      kInt64Min,
+      pos_inf_day);  // every date, +infinity included
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_LESSTHAN, pos_inf_ts)),
+                 kInt64Min,
+                 pos_inf_day - 1);  // every date except +infinity
+    expect_range(
+      run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, pos_inf_ts)),
+      pos_inf_day,
+      kInt64Max);  // only +infinity
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHAN, pos_inf_ts)),
+                 pos_inf_day + 1,
+                 kInt64Max);  // nothing is above +infinity: empty for an int32 column
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_EQUAL, pos_inf_ts)),
+                 pos_inf_day,
+                 pos_inf_day);
+  }
+  SECTION("-infinity")
+  {
+    expect_range(
+      run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, neg_inf_ts)),
+      neg_inf_day,
+      kInt64Max);  // every date, -infinity included
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHAN, neg_inf_ts)),
+                 neg_inf_day + 1,
+                 kInt64Max);  // every date except -infinity
+    expect_range(
+      run_extraction(cast_cmp_filter(ExpressionType::COMPARE_LESSTHANOREQUALTO, neg_inf_ts)),
+      kInt64Min,
+      neg_inf_day);  // only -infinity
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_LESSTHAN, neg_inf_ts)),
+                 kInt64Min,
+                 neg_inf_day - 1);  // nothing is below -infinity
+    expect_range(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_EQUAL, neg_inf_ts)),
+                 neg_inf_day,
+                 neg_inf_day);
+  }
+  SECTION("constant on the left flips the same way")
+  {
+    expect_range(run_extraction(cast_cmp_filter(
+                   ExpressionType::COMPARE_GREATERTHAN, pos_inf_ts, /*const_on_left=*/true)),
+                 kInt64Min,
+                 pos_inf_day - 1);  // +inf > CAST(d) ⇔ CAST(d) < +inf
+  }
+  SECTION("every flavor shares timestamp_t's sentinels")
+  {
+    struct flavor {
+      duckdb::LogicalType type;
+      duckdb::Value value;
+    };
+    auto const flavors = {
+      flavor{duckdb::LogicalType::TIMESTAMP_S,
+             duckdb::Value::TIMESTAMPSEC(duckdb::timestamp_sec_t(pos_inf_ts))},
+      flavor{duckdb::LogicalType::TIMESTAMP_MS,
+             duckdb::Value::TIMESTAMPMS(duckdb::timestamp_ms_t(pos_inf_ts))},
+      flavor{duckdb::LogicalType::TIMESTAMP_NS,
+             duckdb::Value::TIMESTAMPNS(duckdb::timestamp_ns_t(pos_inf_ts))},
+    };
+    for (auto const& f : flavors) {
+      DYNAMIC_SECTION("flavor " << f.type.ToString())
+      {
+        auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+          ExpressionType::COMPARE_LESSTHAN,
+          cast_expr(date_col_ref(), f.type),
+          duckdb::make_uniq<duckdb::BoundConstantExpression>(f.value));
+        expect_range(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr))),
+                     kInt64Min,
+                     pos_inf_day - 1);
+      }
+    }
+  }
+}
+
+// ── Dates that cannot be cast at all ─────────────────────────────────────────
+//
+// A finite DATE whose midnight overflows the target's int64 ticks makes DuckDB
+// raise a ConversionException (~±292,000 years for TIMESTAMP/_S/_MS, all of
+// which route through the micros cast; ~±292 years for TIMESTAMP_NS). A range
+// cannot raise, and the residual GPU cast it stands in for does not either, so
+// the range is deliberately NOT clipped to the castable day window: such a row
+// is kept or dropped by the instant it denotes. These pin that the bound on the
+// unconstrained side stays the full domain rather than the castable window.
+
+TEST_CASE("cast-through range extraction: bounds are not clipped to the castable day window",
+          "[scan][range_pushdown][fused_scan_filter]")
+{
+  auto const k = cutoff_days();
+  // Largest stored day whose midnight still fits int64 micros.
+  std::int64_t const castable_max_micros = (kInt64Max - 1) / kDayMicros;
+  REQUIRE(castable_max_micros < std::numeric_limits<std::int32_t>::max());
+
+  // >= midnight(k): the open side is INT64_MAX, not the last castable day.
+  auto const ge =
+    run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, k * kDayMicros));
+  expect_range(ge, k, kInt64Max);
+  CHECK(ge.ranges.at(0).hi > castable_max_micros);
+
+  // Same for TIMESTAMP_NS, whose window (~±106,751 days) excludes ordinary
+  // historical dates such as 1500-01-01.
+  std::int64_t const castable_max_nanos = (kInt64Max - 1) / duckdb::Interval::NANOS_PER_DAY;
+  REQUIRE(castable_max_nanos < duckdb::Date::FromDate(2263, 1, 1).days);
+  auto expr = duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+    ExpressionType::COMPARE_LESSTHANOREQUALTO,
+    cast_expr(date_col_ref(), duckdb::LogicalType::TIMESTAMP_NS),
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(
+      duckdb::Value::TIMESTAMPNS(duckdb::timestamp_ns_t(k * duckdb::Interval::NANOS_PER_DAY))));
+  auto const le_ns = run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr)));
+  expect_range(le_ns, kInt64Min, k);
+  CHECK(le_ns.ranges.at(0).lo < -castable_max_nanos);
+}
+
 // ── Refusals: coverage cleared, no range extracted ───────────────────────────
 
 TEST_CASE("cast-through range extraction: refused shapes keep the residual filter",
@@ -431,14 +565,10 @@ TEST_CASE("cast-through range extraction: refused shapes keep the residual filte
         duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(midnight))));
     expect_refusal(run_extraction(duckdb::make_uniq<duckdb::ExpressionFilter>(std::move(expr))));
   }
-  SECTION("infinite constants: DATE ±infinity does not follow the linear day mapping")
+  SECTION("INT64_MIN ticks: below -infinity, not a representable instant")
   {
-    expect_refusal(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_LESSTHANOREQUALTO,
-                                                  duckdb::timestamp_t::infinity().value)));
-    expect_refusal(run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-                                                  duckdb::timestamp_t::ninfinity().value)));
-    expect_refusal(run_extraction(
-      cast_cmp_filter(ExpressionType::COMPARE_EQUAL, duckdb::timestamp_t::infinity().value)));
+    expect_refusal(
+      run_extraction(cast_cmp_filter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, kInt64Min)));
   }
   SECTION("NULL constant")
   {

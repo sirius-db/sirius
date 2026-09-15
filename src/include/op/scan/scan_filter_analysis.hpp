@@ -79,11 +79,24 @@ struct scan_filter_analysis {
  * inequalities tighten by one; a decimal constant finer than the column's scale
  * is floored or ceiled on the side that cannot drop a surviving row.
  *
- * The EXPRESSION_FILTER shape `CAST(date_col AS TIMESTAMP[_S|_MS|_NS]) CMP
- * <timestamp constant>` — what DuckDB's constant folding makes of qgen-style
- * date arithmetic — is recognized too, in either operand order, by lowering
- * the constant to the stored-day domain. That range is exact, so it keeps
- * full coverage; TRY_CAST, TIMESTAMP_TZ, and ±infinity constants are refused.
+ * One EXPRESSION_FILTER shape is recognized as well. DuckDB rewrites date
+ * arithmetic such as `d <= DATE '1998-12-01' - INTERVAL '72' DAY` into
+ * `CAST(d AS TIMESTAMP) <= TIMESTAMP '1998-09-20 00:00:00'`, so the scan
+ * receives a comparison between a cast of the DATE column and a timestamp
+ * constant instead of a plain constant comparison. For DATE columns, the five
+ * comparison ops, either operand order, and every timestamp flavor except
+ * TIMESTAMP_TZ, the constant is converted into a bound on the stored day
+ * count: midnight of day d is d * ticks_per_day, so a constant that is itself a
+ * midnight names one day, and any other instant falls strictly between two
+ * days and is rounded toward the side that keeps the predicate exact. Because
+ * the bound is exact, coverage stays full and the residual filter is dropped.
+ * DATE +/-infinity rows and +/-infinity constants compare correctly too, since
+ * both domains put infinity beyond every finite value. Dates too far from the
+ * epoch to be a timestamp at all make DuckDB raise an error; a decode range
+ * cannot raise, so those rows are kept or dropped by the instant they denote
+ * (see lower_timestamp_to_days in the .cpp). TRY_CAST is refused because it
+ * yields NULL instead of raising there, and TIMESTAMP_TZ because its midnight
+ * depends on the session time zone; both keep the residual filter.
  *
  * Filters that do not restrict the emitted rows are skipped WITHOUT clearing
  * coverage — OPTIONAL_FILTER and IS_NOT_NULL, which
