@@ -153,19 +153,21 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
 
   /**
-   * @brief Apply post-decode filter and/or projection to the materialized
-   *        table. Called by @c sirius_gpu_scan_operator::execute whenever
-   *        @ref materialize_metadata_to_table did not return
-   *        @c filter_state::ROW_FILTERED_AND_PROJECTED.
+   * @brief Apply pending post-decode filtering and projection
+   *
+   * Called by @c sirius_gpu_scan_operator::execute unless materialization already returned
+   * @c filter_state::ROW_FILTERED_AND_PROJECTED. Implementations preserve the ownership form
+   * naturally produced by their filtering and projection steps; the scan operator decides whether
+   * to forward a returned view or materialize it.
    *
    * Takes the input by owning unique_ptr so implementations that call
    * @c assemble_scan_output (which consumes its input by rvalue) can
    * move-forward without an extra view→owning copy on the dominant
    * fresh-read + assembly path.
    *
-   * @param input Materialized table and filtering state
-   * @param mem_space Destination memory space
-   * @param stream Task-local CUDA stream
+   * @param input Materialized table and filter state to consume
+   * @param mem_space Memory space whose allocator is used for any new columns
+   * @param stream Stream used for filtering, projection, and allocation
    * @param like_swar_fastpath Whether eligible LIKE expressions use the SWAR kernel. Defaults
    *        fail closed for non-query callers.
    * @param like_cache Query-owned immutable LIKE classifications. A null value gives any
@@ -184,9 +186,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    *        before it is realized, so the copy never reads them; the caller puts
    *        columns back at those positions and restores the arity. Ignored when
    *        it would leave nothing to size the batch by.
-   * @return Filtered and projected table
+   * @return Filtered and projected table with the ownership needed to keep its view valid
    */
-  virtual std::unique_ptr<cudf::table> post_filter_and_project(
+  virtual owning_table_view post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,

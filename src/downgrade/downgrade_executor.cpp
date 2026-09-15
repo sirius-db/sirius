@@ -233,7 +233,10 @@ void downgrade_executor::processing_loop()
         for (auto& candidate : candidates) {
           if (req->satisfied.load()) break;
 
-          auto candidate_bytes = candidate->bytes_in_space(source_space);
+          auto candidate_bytes = candidate->reclaimable_bytes_in_space(source_space);
+          // A concurrent worker may have converted the batch since the snapshot; skip before
+          // reserving a pool slot.
+          if (candidate_bytes == 0) { continue; }
 
           auto slot = _pool->reserve();
           if (!slot) {
@@ -301,7 +304,10 @@ void downgrade_executor::processing_loop()
         if (!candidate) break;
         tasks_converted++;
 
-        auto candidate_bytes = candidate->bytes_in_space(source_space);
+        auto candidate_bytes = candidate->reclaimable_bytes_in_space(source_space);
+        // A concurrent worker may have converted the batches since the pop; skip before
+        // reserving a pool slot (the wrapper returns the task to the queue via RAII).
+        if (candidate_bytes == 0) { continue; }
 
         auto slot = _pool->reserve();
         if (!slot) break;  // interrupted
