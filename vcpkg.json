@@ -20,7 +20,7 @@
     "numactl",
     "liburing",
     "openssl",
-    "roaring"
+    "roaring",
     {
       "features": [
         "http2"
