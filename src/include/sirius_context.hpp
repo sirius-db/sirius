@@ -270,6 +270,13 @@ class SiriusContext : public ClientContextState {
     uint64_t scan_narrow_targets_retracted = 0;
   };
 
+  /// Counts grouped-aggregation partitions by sizing basis.
+  struct size_estimation_stats {
+    uint64_t partitions_sized_from_measured          = 0;
+    uint64_t partitions_sized_from_projection        = 0;
+    uint64_t partitions_sized_from_upstream_complete = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -620,6 +627,18 @@ class SiriusContext : public ClientContextState {
   /// \brief Record narrow scan targets flipped back to native by the tier narrowing policy.
   void record_compressed_materialization_scan_narrow_targets_retracted(uint64_t count = 1) noexcept;
 
+  /// \brief Snapshot runtime size-estimation counters.
+  [[nodiscard]] size_estimation_stats get_size_estimation_stats() const noexcept;
+
+  /// \brief Record a partition sized from bytes already received.
+  void record_partition_sized_from_measured() noexcept;
+
+  /// \brief Record a partition sized from a projected total.
+  void record_partition_sized_from_projection() noexcept;
+
+  /// \brief Record a partition sized from a finished upstream.
+  void record_partition_sized_from_upstream_complete() noexcept;
+
  private:
   void throw_if_not_initialized() const;
   /// Acquire the slot. Errors on same-thread reacquire — a nested acquire on
@@ -741,6 +760,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> compressed_materialization_scan_sidecars_installed_count_{0};
   std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
+  std::atomic<uint64_t> partitions_sized_from_measured_count_{0};
+  std::atomic<uint64_t> partitions_sized_from_projection_count_{0};
+  std::atomic<uint64_t> partitions_sized_from_upstream_complete_count_{0};
 };
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).

@@ -322,8 +322,47 @@ which is why `STREAMING_LIMIT` has to opt out by hand — see [capped pipelines]
 `NESTED_LOOP_JOIN` uses the same port names and could take the identical fan-in treatment; leaving
 it unnominated preserves fall-back-to-waiting behaviour.
 
-## Consumers
+The estimator is tested against a synthetic pipeline DAG in
+`test/cpp/pipeline/test_data_size_estimator.cpp`.
 
-None in-tree yet. The API is exercised by `test/cpp/pipeline/test_data_size_estimator.cpp` against
-a synthetic pipeline DAG, which covers each terminating case, the sample floors, overflow, and the
-fan-in rules above.
+## Consumer: grouped-aggregation partition
+
+A grouped aggregation runs as:
+
+```
+[scan → … → HASH_GROUP_BY] → [PARTITION] → [MERGE_GROUP_BY]
+```
+
+`PARTITION` must choose its count once because rows are assigned by `hash(key) % count`; changing
+the count could split one group across buckets and produce duplicate results. Previously it waited
+for all input before choosing a count from the bytes in its port.
+
+When `enable_runtime_size_estimation` is on, the partition ingress uses a `PARTIAL` barrier and
+sizes from an estimated total. It still waits if no estimate is available.
+`PARTITION → MERGE_GROUP_BY` remains `FULL`.
+
+Projected totals are multiplied by `size_estimate_safety_factor` and floored at the bytes already
+received. Exact totals are not scaled. The feature is enabled only on the grouped-aggregation
+partition, so delim-join partitions retain their existing barrier.
+
+## Observability
+
+Each partition records whether its count came from measured input, a projection, or an already
+finished upstream pipeline. `SiriusContext::get_size_estimation_stats()` exposes those counters,
+and the partition logs estimated-versus-actual bytes when it finalizes.
+
+Integration tests verify that the enabled path uses an estimator result and produces the same rows
+as the disabled and CPU paths.
+
+## Configuration
+
+Both settings are DuckDB `SET` variables and YAML options under `sirius.operator_params`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `enable_runtime_size_estimation` | `false` | Enable projected sizing for grouped-aggregation partitions. |
+| `size_estimate_safety_factor` | `1.0` | Multiplier for projected totals; must be finite and in `(0, 1000]`. |
+
+The feature is off by default because tests confirmed that projections arrive before sizing with
+about 0.5% error, but the tested TPC-H workloads showed no measurable wall-clock improvement.
+See [Configuration](configuration.md#runtime-data-size-estimation) for the full reference.

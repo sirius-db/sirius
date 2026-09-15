@@ -501,12 +501,15 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       hgb_ptr->types = grouped.get_count_distinct_local_output_types();
     }
 
-    auto partition =
-      duckdb::make_uniq<sirius::op::sirius_physical_partition>(hgb_ptr->types,
-                                                               hgb_ptr->estimated_cardinality,
-                                                               /*key_source=*/hgb_ptr,
-                                                               /*is_build=*/false,
-                                                               compressed_materialization_observer);
+    // Only aggregate-fanout partitions use runtime size estimation.
+    auto partition = duckdb::make_uniq<sirius::op::sirius_physical_partition>(
+      hgb_ptr->types,
+      hgb_ptr->estimated_cardinality,
+      /*key_source=*/hgb_ptr,
+      /*is_build=*/false,
+      compressed_materialization_observer,
+      op_params.enable_runtime_size_estimation,
+      op_params.size_estimate_safety_factor);
     auto* partition_ptr = partition.get();
     if (hgb_ptr->has_physical_overrides()) {
       partition->set_physical_types(hgb_ptr->get_physical_types());
