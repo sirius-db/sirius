@@ -185,7 +185,7 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
     auto const input_strings = cudf::strings_column_view(input.get_column_view());
-    auto result_column = cudf::strings::slice_strings(input_strings,
+    auto result_column       = cudf::strings::slice_strings(input_strings,
                                                       std::optional<cudf::size_type>{start_val},
                                                       std::optional<cudf::size_type>{stop_val},
                                                       std::optional<cudf::size_type>{1},
