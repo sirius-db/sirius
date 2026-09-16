@@ -806,6 +806,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
@@ -846,6 +847,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
+    test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
@@ -931,6 +933,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+    test/cpp/scan/test_duckdb_native_deferred_walk.cpp
     test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp

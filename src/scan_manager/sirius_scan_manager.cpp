@@ -1457,6 +1457,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       _scan_op_order.push_back(op);
       continue;
     }
+    // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
+    // query thread: GetPartitionStats touches ClientContext/LocalStorage.
+    op->get_ingestible().ensure_metadata_prepared();
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
       [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
@@ -2048,6 +2051,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
   // there is exactly one
@@ -2333,6 +2337,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
@@ -2415,6 +2420,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cucascade::memory::memory_space& memory_space,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
     if (chunk.compressed) {
@@ -2468,6 +2474,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
                                                duckdb_mvcc_metadata metadata)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
@@ -2480,6 +2487,7 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 void sirius_scan_manager::attach_proven_unique_columns(
   const std::string& name, std::span<std::string const> unique_column_names)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_proven_unique_columns] no pinned entry named '" + name +
@@ -2499,6 +2507,7 @@ void sirius_scan_manager::attach_proven_unique_columns(
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   retire_late_mat_handle(name);
   _pinned_entries.erase(name);
 }

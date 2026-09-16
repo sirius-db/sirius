@@ -56,6 +56,7 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <functional>
@@ -650,6 +651,24 @@ class sirius_scan_manager {
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
 
+  /// \brief Counter bumped by every mutation of the pinned-entry registry.
+  ///
+  /// Pin-derived decisions baked into a physical plan (deferred metadata walks,
+  /// compressed-materialization sidecars, the cache-or-CPU refusals) are only valid for the
+  /// registry state they were built against. A plan built in one lifecycle-slot window and
+  /// executed in a later one must re-check this: pin and unpin take the slot, so they cannot
+  /// interleave with a window, but they can land between two. Read and compare inside the
+  /// window that will use the plan.
+  [[nodiscard]] std::uint64_t pin_registry_epoch() const noexcept
+  {
+    return _pin_registry_epoch.load(std::memory_order_acquire);
+  }
+
+  /// TEST-ONLY: move the epoch without touching the registry, to simulate a pin or unpin
+  /// landing in the gap between a plan's finalize window and its execution window (a real but
+  /// microsecond-wide race that a single-threaded test cannot schedule).
+  void bump_pin_registry_epoch_for_testing() noexcept { bump_pin_registry_epoch(); }
+
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
@@ -764,6 +783,30 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  /// Bumped on every exit from a registry-mutating member; see pin_registry_epoch().
+  std::atomic<std::uint64_t> _pin_registry_epoch{0};
+  void bump_pin_registry_epoch() noexcept
+  {
+    _pin_registry_epoch.fetch_add(1, std::memory_order_release);
+  }
+  /// RAII: bumps the epoch when the enclosing scope exits, on EVERY path — normal return, the
+  /// same-row-count merge's early return, and a throw. Declared first in every member that
+  /// touches _pinned_entries. The failure mode this guards against is asymmetric: a mutation
+  /// that escapes without a bump (an erase followed by a throw before the re-insert, a merge
+  /// that returned early) lets a stale finalize-validated plan run against a registry it was
+  /// not built for, whereas a bump after a throw that mutated nothing costs one plan rebuild.
+  class pin_registry_mutation_scope {
+   public:
+    explicit pin_registry_mutation_scope(sirius_scan_manager& manager) noexcept : _manager(manager)
+    {
+    }
+    ~pin_registry_mutation_scope() { _manager.bump_pin_registry_epoch(); }
+    pin_registry_mutation_scope(pin_registry_mutation_scope const&)            = delete;
+    pin_registry_mutation_scope& operator=(pin_registry_mutation_scope const&) = delete;
+
+   private:
+    sirius_scan_manager& _manager;
+  };
   bool _pruning_enabled{true};
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
