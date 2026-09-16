@@ -16,8 +16,8 @@
 | Alexander Ocsa| NVIDIA| aocsa |
 | Joshua Patterson | NVIDIA | datametrician |
 | Johan Peltenburg | NVIDIA | johanpel |
-| Yu Teng | TBD | ran-yuan-rui |
+| Yu Teng | NVIDIA | ran-yuan-rui |
 | Dhruv Vats | NVIDIA | dhruv9vats |
 | Mike Wendt | NVIDIA | mike-wendt |
 | Bobbi Yogatama| NVIDIA | bwyogatama |
-| Xiangyao Yu | UW-Madison | yxymit |
+| Xiangyao Yu | NVIDIA | yxymit |
