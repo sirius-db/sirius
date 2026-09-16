@@ -312,7 +312,7 @@ void gpu_pipeline_executor::manager_loop()
        completion = std::move(completion),
        pipeline]() mutable {
         try {
-          task->execute(exc_stream);
+          task->execute(rmm::cuda_stream_view{exc_stream.get()});
           _tasks_executed.fetch_add(1, std::memory_order_relaxed);
         } catch (task_reschedule_exception& ex) {
           // Only THIS query's error state suppresses the reschedule. Previously one query's

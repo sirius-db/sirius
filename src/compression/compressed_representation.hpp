@@ -22,6 +22,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
+
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -150,7 +152,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
 
   /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 
@@ -284,7 +286,7 @@ class compressed_device_representation : public simpatico_compressed_representat
 
   /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   /// Projection sharing the same cached blob; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(

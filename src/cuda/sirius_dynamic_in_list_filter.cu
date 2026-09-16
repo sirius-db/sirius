@@ -307,8 +307,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
             detail::scoped_replica_reservation::try_acquire(target, reservation_bytes, stream);
           if (!reservation) { return std::unique_ptr<set_replica>{}; }
 
-          auto destination_set = make_set<key_type>(
-            capacity, reservation->allocator(), cuda::stream_ref{stream.value()});
+          auto destination_set =
+            make_set<key_type>(capacity, reservation->allocator(), cuda::stream_ref{stream.get()});
           if (destination_set->capacity() != capacity) {
             throw std::runtime_error("destination static_set capacity changed during replication");
           }

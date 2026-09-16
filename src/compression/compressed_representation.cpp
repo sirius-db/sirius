@@ -131,7 +131,7 @@ compressed_host_representation::compressed_host_representation(
 // ── idata_representation interface ───────────────────────────────────────────
 
 std::unique_ptr<cucascade::idata_representation> compressed_host_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same backing blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_host_representation>(
@@ -298,7 +298,7 @@ const simpatico::compressed_table& compressed_device_representation::table() con
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same cached blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_device_representation>(
