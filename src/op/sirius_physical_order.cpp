@@ -21,8 +21,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/order/gpu_order_impl.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -43,7 +42,7 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<sirius::logical_type
 std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_data& input_data,
                                                               rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_order::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_order::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 

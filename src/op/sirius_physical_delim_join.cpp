@@ -24,8 +24,7 @@
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -197,7 +196,7 @@ void sirius_physical_right_delim_join::build_pipelines(
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
   return std::make_unique<pipelineable_operator_data>(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
 }
@@ -205,7 +204,7 @@ std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
   return std::make_unique<pipelineable_operator_data>(
     dynamic_cast<const pipelineable_operator_data&>(input_data).get_read_only_batches(false));
 }

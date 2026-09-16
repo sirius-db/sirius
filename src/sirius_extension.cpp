@@ -22,14 +22,13 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -1831,7 +1830,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   auto& gstate = data_p.global_state->Cast<CreateAnnIndexGlobalState>();
   if (gstate.finished) { return; }
 
-  nvtx3::scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
+  sirius::nvtx_scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
@@ -2374,7 +2373,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
 static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext& context,
                                                                    TableFunctionInitInput& input)
 {
-  nvtx3::scoped_range nvtx_range{"SiriusVectorSearchInit"};
+  sirius::nvtx_scoped_range nvtx_range{"SiriusVectorSearchInit"};
   auto& bind_data = input.bind_data->Cast<SiriusVectorSearchBindData>();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");

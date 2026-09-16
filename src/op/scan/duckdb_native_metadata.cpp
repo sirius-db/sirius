@@ -17,8 +17,7 @@
 #include "op/scan/duckdb_native_metadata.hpp"
 
 #include "log/logging.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
@@ -515,7 +514,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   const duckdb::TableFilterSet* table_filters,
   const duckdb::vector<duckdb::ColumnIndex>* column_ids)
 {
-  nvtx3::scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
+  nvtx_scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
 
   duckdb_native_walk_plan plan;
   plan.viable          = false;
@@ -557,7 +556,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   duckdb::vector<duckdb::PartitionStatistics> partition_stats;
   {
     /// @note Synchronous pread()s happen here when cold.
-    nvtx3::scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
+    nvtx_scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
     partition_stats = storage.GetPartitionStats(context);
   }
 
@@ -702,7 +701,7 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   // Walk segment metadata for surviving row groups only — reading the typed
   // segment trees directly
   {
-    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    nvtx_scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
     auto& row_groups = *plan.storage->GetRowGroupCollection();
     for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
       auto const local_rgi = local_index_by_rg[rg - rg_begin];

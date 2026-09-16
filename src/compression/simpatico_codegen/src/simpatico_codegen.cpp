@@ -5,6 +5,7 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/nvtx.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/column/column.hpp>
@@ -18,7 +19,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -950,7 +950,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[serial]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
 
   compressed_table out;
@@ -976,7 +976,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[threads]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
   leased_pool lp(column_threads);
   return compress_columns_parallel(table, plans, lp.pool, mr, column_names);
@@ -988,7 +988,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[pool]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
   return compress_columns_parallel(table, plans, pool, mr, column_names);
 }
@@ -999,7 +999,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(table.num_columns());
   for (auto const& col : table.columns) {
@@ -1016,7 +1016,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
   leased_pool lp(column_threads);
   return decompress_columns_parallel(table, lp.pool, mr);
 }
@@ -1025,7 +1025,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
   return decompress_columns_parallel(table, pool, mr);
 }
 
@@ -1034,7 +1034,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,serial]"};
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(selected_columns.size());
   for (auto const idx : selected_columns) {
@@ -1153,7 +1153,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
   leased_pool lp(column_threads);
   return decompress_columns_parallel(table, selected_columns, lp.pool, mr);
 }
@@ -1163,7 +1163,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
   return decompress_columns_parallel(table, selected_columns, pool, mr);
 }
 
@@ -1173,7 +1173,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
   if (predicates.size() != selected_columns.size()) {
     throw plan_error("decompress: predicates and selected_columns must be the same length");
   }
@@ -1190,7 +1190,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
     if (sirius::codegen::decompression_pushdown_diag_enabled()) {

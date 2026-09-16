@@ -24,6 +24,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -39,8 +40,6 @@
 #include <cudf/unary.hpp>
 
 #include <rmm/aligned.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -448,7 +447,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
   operator_data const& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
   auto const& input          = dynamic_cast<dense_count_join_input const&>(input_data);
   auto const ro_batches      = input.get_read_only_batches();
   auto const preserved_count = input.preserved_count();
