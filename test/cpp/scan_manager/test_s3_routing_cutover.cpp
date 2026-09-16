@@ -259,11 +259,10 @@ sirius::planner::query make_empty_query()
   auto tctx           = sirius::test::make_test_telemetry_context();
   const auto query_id = sirius::make_query_id(1);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
-  return sirius::planner::query(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo);
+  return sirius::planner::query(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                                tctx->context(),
+                                query_id,
+                                tinfo);
 }
 
 struct range_fault_policy {

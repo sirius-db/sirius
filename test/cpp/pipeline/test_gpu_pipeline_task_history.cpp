@@ -282,7 +282,7 @@ struct pipeline_task_history_fixture {
 // Pipeline context: minimal pipeline shell and stub operator.
 //------------------------------------------------------------------------------
 struct pipeline_context {
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<stub_operator> stub_source;
   std::unique_ptr<stub_operator> stub_op;
 };
@@ -291,7 +291,7 @@ pipeline_context create_pipeline_context()
 {
   pipeline_context ctx;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(42);
   ctx.stub_source = std::make_unique<stub_operator>();
   ctx.stub_op     = std::make_unique<stub_operator>();
@@ -302,13 +302,13 @@ pipeline_context create_pipeline_context()
   build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
 
   // Number the stubs as the converter does in production; task execution reads operator ids.
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
   sirius::pipeline::assign_operator_ids(pipelines);
   return ctx;
 }
 
 struct cached_scan_pipeline_context {
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
   std::unique_ptr<sirius::op::scan::sirius_gpu_scan_operator> scan_op;
 };
 
@@ -316,7 +316,7 @@ cached_scan_pipeline_context create_cached_scan_pipeline_context()
 {
   cached_scan_pipeline_context ctx;
   const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
-  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
   ctx.pipeline->set_pipeline_id(43);
   ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
     duckdb::vector<sirius::logical_type>{}, 0, nullptr);

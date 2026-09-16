@@ -131,8 +131,8 @@ class mock_pipeline_builder {
                                                 const std::string& port_id,
                                                 MemoryBarrierType barrier_type,
                                                 cucascade::shared_data_repository* repo,
-                                                duckdb::shared_ptr<sirius_pipeline> src_pipeline,
-                                                duckdb::shared_ptr<sirius_pipeline> dest_pipeline)
+                                                std::shared_ptr<sirius_pipeline> src_pipeline,
+                                                std::shared_ptr<sirius_pipeline> dest_pipeline)
   {
     auto port           = std::make_unique<sirius_physical_operator::port>();
     port->type          = barrier_type;
@@ -191,7 +191,7 @@ class testable_task_creator : public task_creator {
     return _scheduled_nodes;
   }
 
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> get_scheduled_pipelines()
+  std::vector<std::shared_ptr<sirius_pipeline>> get_scheduled_pipelines()
   {
     std::lock_guard<std::mutex> lock(_scheduled_mutex);
     return _scheduled_pipelines;
@@ -213,7 +213,7 @@ class testable_task_creator : public task_creator {
  private:
   std::atomic<size_t> _schedule_count{0};
   std::vector<sirius_physical_operator*> _scheduled_nodes;
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
   sirius::query_id_t _query_id;
   std::mutex _scheduled_mutex;
 };
@@ -258,9 +258,9 @@ class test_fixture {
   /**
    * @brief Create a mock GPU pipeline with controllable finished state.
    */
-  duckdb::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
+  std::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
   {
-    return duckdb::make_shared_ptr<mock_gpu_pipeline>(build_ctx);
+    return std::make_shared<mock_gpu_pipeline>(build_ctx);
   }
 
   duckdb::DuckDB db;
@@ -268,7 +268,7 @@ class test_fixture {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   pipeline::pipeline_build_context build_ctx{nullptr, true};
   task_scheduler pipeline_exec;
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> empty_pipelines;
 };
 
 //===----------------------------------------------------------------------===//
@@ -377,8 +377,8 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
   testable_task_creator creator(
     2, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
-  auto pipeline_a = duckdb::make_shared_ptr<mock_gpu_pipeline>(fixture.build_ctx);
-  auto pipeline_b = duckdb::make_shared_ptr<mock_gpu_pipeline>(fixture.build_ctx);
+  auto pipeline_a = std::make_shared<mock_gpu_pipeline>(fixture.build_ctx);
+  auto pipeline_b = std::make_shared<mock_gpu_pipeline>(fixture.build_ctx);
 
   // Upstream operator whose hint sweep finds nothing to do — the case where
   // get_next_task_hint() may have just drained its ports.
@@ -391,7 +391,7 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
   op_a->set_custom_hint(
     task_creation_hint{.hint = TaskCreationHint::WAITING_FOR_INPUT_DATA, .producer = op_b.get()});
 
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto* next = creator.get_operator_for_next_task(op_a.get(), visited);
 
   REQUIRE(next == nullptr);
@@ -417,7 +417,7 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
 
   // process_next_task should just return nullptr because there its not really connected to anything
   // and has no data
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
 
   // Nothing should be scheduled
@@ -458,7 +458,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
     task_creation_hint{.hint = TaskCreationHint::READY, .producer = hint_op.get()});
 
   // Following source_op's READY hint must land on hint_op.
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> visited;
+  std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto next_op = creator.get_operator_for_next_task(source_op.get(), visited);
 
   REQUIRE(next_op == hint_op.get());
@@ -636,7 +636,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   // Create a mock src_pipeline - we use nullptr for simplicity but wrap in shared_ptr
 //   // In real usage this would be a valid pipeline
-//   auto src_pipeline = duckdb::shared_ptr<sirius_pipeline>(nullptr);
+//   auto src_pipeline = std::shared_ptr<sirius_pipeline>(nullptr);
 
 //   // Create a simple mock pipeline to return as src_pipeline hint
 //   // Since we can't easily create a real sirius_pipeline, we'll test the path
@@ -783,8 +783,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   // src_pipeline is not finished → should return the src_pipeline
 //   auto hint = op.get_next_task_hint();
-//   REQUIRE(std::holds_alternative<duckdb::shared_ptr<sirius_pipeline>>(hint));
-//   REQUIRE(std::get<duckdb::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline);
+//   REQUIRE(std::holds_alternative<std::shared_ptr<sirius_pipeline>>(hint));
+//   REQUIRE(std::get<std::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline);
 // }
 
 // TEST_CASE("get_next_task_hint FULL barrier with finished pipeline returns this",
@@ -860,8 +860,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   // One pipeline is not finished → should return that unfinished pipeline
 //   auto hint = op.get_next_task_hint();
-//   REQUIRE(std::holds_alternative<duckdb::shared_ptr<sirius_pipeline>>(hint));
-//   REQUIRE(std::get<duckdb::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline2);
+//   REQUIRE(std::holds_alternative<std::shared_ptr<sirius_pipeline>>(hint));
+//   REQUIRE(std::get<std::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline2);
 // }
 
 // TEST_CASE("get_next_task_hint mixed PIPELINE and FULL barriers", "[get_next_task_hint]")
@@ -916,8 +916,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   // FULL port is not ready → should return the unfinished src_pipeline
 //   auto hint = op.get_next_task_hint();
-//   REQUIRE(std::holds_alternative<duckdb::shared_ptr<sirius_pipeline>>(hint));
-//   REQUIRE(std::get<duckdb::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline);
+//   REQUIRE(std::holds_alternative<std::shared_ptr<sirius_pipeline>>(hint));
+//   REQUIRE(std::get<std::shared_ptr<sirius_pipeline>>(hint) == mock_pipeline);
 // }
 
 // TEST_CASE("get_next_task_hint mixed barriers with PIPELINE empty", "[get_next_task_hint]")
@@ -951,8 +951,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 
 //   // PIPELINE port is empty → should return its src_pipeline
 //   auto hint = op.get_next_task_hint();
-//   REQUIRE(std::holds_alternative<duckdb::shared_ptr<sirius_pipeline>>(hint));
-//   REQUIRE(std::get<duckdb::shared_ptr<sirius_pipeline>>(hint) == pipeline_src);
+//   REQUIRE(std::holds_alternative<std::shared_ptr<sirius_pipeline>>(hint));
+//   REQUIRE(std::get<std::shared_ptr<sirius_pipeline>>(hint) == pipeline_src);
 // }
 
 // //===----------------------------------------------------------------------===//

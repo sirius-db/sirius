@@ -69,7 +69,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
    * @param telemetry_context SiriusContext-wide telemetry context for task events
    */
   explicit sirius_pipeline_task_global_state(
-    duckdb::shared_ptr<sirius_pipeline> pipeline,
+    std::shared_ptr<sirius_pipeline> pipeline,
     std::shared_ptr<const telemetry::telemetry_context> telemetry_context)
     : _pipeline(std::move(pipeline)), _telemetry_context(std::move(telemetry_context))
   {
@@ -84,10 +84,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
     return _pipeline ? _pipeline->get_pipeline_id() : 0;
   }
 
-  void set_pipeline(duckdb::shared_ptr<sirius_pipeline> pipeline)
-  {
-    _pipeline = std::move(pipeline);
-  }
+  void set_pipeline(std::shared_ptr<sirius_pipeline> pipeline) { _pipeline = std::move(pipeline); }
 
   [[nodiscard]] const telemetry::telemetry_context& get_telemetry_context() const noexcept
   {
@@ -167,7 +164,7 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
   }
 
  private:
-  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  std::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
   /// Test fallback when @c _pipeline is null.
   pipeline_memory_history _detached_memory_history;
   std::optional<int> _preferred_device_id;  ///< Pipeline-level preferred GPU device

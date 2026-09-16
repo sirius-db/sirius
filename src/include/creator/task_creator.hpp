@@ -266,7 +266,7 @@ class task_creator {
   /// mark_task_completed() to do it.
   op::sirius_physical_operator* get_operator_for_next_task(
     op::sirius_physical_operator* node,
-    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
+    std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines);
 
   /// \brief report_fatal_error for callers that already hold the query's handler (the creation
   /// worker), avoiding a second lookup of a state it has in scope.

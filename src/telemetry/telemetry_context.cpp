@@ -195,11 +195,10 @@ telemetry_context::~telemetry_context()
   engine_observer_->exit(engine_uuid_);
 }
 
-void emit_plan_telemetry(
-  const quent::Context& context,
-  const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  const uuid::UUID plan_id,
-  const query_telemetry_info telemetry_info)
+void emit_plan_telemetry(const quent::Context& context,
+                         const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+                         const uuid::UUID plan_id,
+                         const query_telemetry_info telemetry_info)
 {
   auto operator_obs = quent::operator_::create_observer(context);
   auto port_obs     = quent::port::create_observer(context);

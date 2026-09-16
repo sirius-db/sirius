@@ -73,9 +73,9 @@ class sirius_engine {
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 
   //! All pipelines of the query plan
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
   //! The root pipelines of the query
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
   //! The current root pipeline index
   std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
@@ -95,9 +95,9 @@ class sirius_engine {
   //! Cancel the tasks
   void cancel_tasks();
   //! Create a child pipeline
-  duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
+  std::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
   //! Wait for the query to finish
   void wait_for_query_finish();
   //! Mutex for thread-safe access to query finish

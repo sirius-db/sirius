@@ -129,11 +129,10 @@ struct query_telemetry_info {
 
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)
 /// for the given set of pipelines. Called once during query construction.
-void emit_plan_telemetry(
-  const quent::Context& context,
-  const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  uuid::UUID plan_id,
-  query_telemetry_info telemetry_info);
+void emit_plan_telemetry(const quent::Context& context,
+                         const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+                         uuid::UUID plan_id,
+                         query_telemetry_info telemetry_info);
 
 struct ExecutorThreadHandleWrapper {
   ExecutorThreadHandleWrapper(const telemetry_context& context,

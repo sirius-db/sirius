@@ -16,11 +16,11 @@
 
 #pragma once
 
-#include "duckdb/common/common.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 
+#include <memory>
 #include <string_view>
 #include <vector>
 
@@ -48,9 +48,9 @@ struct repository_wiring {
   //! is a sub-operator of the sink.
   op::sirius_physical_operator* source_op;
   //! Pipeline that produces the data.
-  duckdb::shared_ptr<sirius_pipeline> source_pipeline;
+  std::shared_ptr<sirius_pipeline> source_pipeline;
   //! Pipeline that consumes the data.
-  duckdb::shared_ptr<sirius_pipeline> dest_pipeline;
+  std::shared_ptr<sirius_pipeline> dest_pipeline;
 };
 
 //! Materialize a list of plan-time `repository_wiring` descriptors into runtime state.
@@ -89,7 +89,7 @@ void materialize_repository_wiring(const std::vector<repository_wiring>& wirings
  * @param pipelines The query's pipelines, in scheduling order.
  * @return The number of operators numbered (i.e. one past the highest id assigned).
  */
-size_t assign_operator_ids(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
+size_t assign_operator_ids(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines);
 
 }  // namespace pipeline
 }  // namespace sirius
