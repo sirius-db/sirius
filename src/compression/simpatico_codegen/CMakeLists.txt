@@ -167,6 +167,17 @@ add_library(
   src/explore/compression_explorer.cpp)
 set_target_properties(simpatico PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(simpatico PUBLIC cxx_std_20)
+# Name of the NVTX domain simpatico's (and Sirius's) ranges are published into.
+# The parent project sets this from its own project name; the fallback only
+# applies to the standalone simpatico_codegen build, whose PROJECT_NAME is not
+# "sirius". PUBLIC so consumers — sirius_extension and, transitively,
+# sirius_unittest and parquet_benchmark — compile their copy of the tag type
+# against the same name.
+if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
+  set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
+endif()
+target_compile_definitions(
+  simpatico PUBLIC SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(

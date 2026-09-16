@@ -25,6 +25,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
@@ -32,8 +33,6 @@
 #include <cudf/sorting.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
@@ -183,7 +182,7 @@ sirius_physical_top_n::~sirius_physical_top_n() {}
 std::unique_ptr<operator_data> sirius_physical_top_n::execute(const operator_data& input_data,
                                                               rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {
@@ -269,7 +268,7 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 std::unique_ptr<operator_data> sirius_physical_top_n_merge::execute(const operator_data& input_data,
                                                                     rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_top_n_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (limit == 0) {

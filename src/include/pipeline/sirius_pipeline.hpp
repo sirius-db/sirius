@@ -28,8 +28,7 @@
 #include "pipeline/pipeline_memory_history.hpp"
 #include "query_id.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <memory>
 #include <mutex>

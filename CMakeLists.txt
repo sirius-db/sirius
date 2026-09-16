@@ -204,6 +204,11 @@ set(CUCASCADE_BUILD_IO
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+# Name of the NVTX domain every Sirius range is published into. Derived from the
+# project name so it has a single authoritative source; simpatico turns it into
+# the SIRIUS_NVTX_DOMAIN_NAME compile definition both include trees consume.
+set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
+
 # Simpatico GPU compression engine Tests disabled here — run them via the
 # standalone simpatico_codegen build. Benchmark harness
 # (compress_with_plan_benchmark) is built by default.

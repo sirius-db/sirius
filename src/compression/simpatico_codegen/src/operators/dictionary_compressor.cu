@@ -4,6 +4,7 @@
  */
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -27,7 +28,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/logical.h>
@@ -280,7 +280,7 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress"};
+  nvtx_scoped_range r{"dictionary_decompress"};
   // Decode from the stored dictionary column.
   if (dict_column == nullptr) { return nullptr; }
   if (dict_column->size() == 0) {
@@ -306,7 +306,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress_predicate"};
+  nvtx_scoped_range r{"dictionary_decompress_predicate"};
   if (dict_column == nullptr || !pred.active()) { return nullptr; }
 
   auto const n_rows = dict_column->size();

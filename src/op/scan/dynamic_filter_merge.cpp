@@ -20,11 +20,10 @@
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <nvtx3/nvtx3.hpp>
-
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <telemetry/nvtx.hpp>
 
 #include <algorithm>
 #include <mutex>
@@ -70,7 +69,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   dynamic_filter_gate* gate,
   int device_id)
 {
-  nvtx3::scoped_range nvtx_range{"dynfilter::apply_output"};
+  nvtx_scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
 
   device_id           = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);

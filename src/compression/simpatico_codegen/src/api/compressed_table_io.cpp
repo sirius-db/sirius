@@ -8,6 +8,7 @@
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -18,7 +19,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <array>
@@ -423,7 +423,7 @@ struct ColRecord {
 // concatenated file layout). Returns false and sets *err on any structural error.
 static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::parse_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::parse_header"};
   auto bad = [&](std::string const& m) {
     if (err) *err = m;
     return false;
@@ -507,7 +507,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
                                                  rmm::device_async_resource_ref leaf_mr,
                                                  std::string* err)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::fetch_payload"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::fetch_payload"};
   auto fail = [&](std::string const& m) -> compressed_table {
     if (err) *err = m;
     return {};
@@ -576,7 +576,7 @@ std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
                                    rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
   // Build the header + payload buffer list once (shared with the in-memory
   // writer), then gather the payload into one contiguous blob for the file.
   std::vector<std::uint8_t> hdr;
@@ -611,7 +611,7 @@ compressed_table read_compressed_table(std::string const& path,
                                        rmm::device_async_resource_ref mr,
                                        std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[file]"};
   auto fail = [&](std::string const& msg) -> compressed_table {
     if (error_out) *error_out = msg;
     return {};
@@ -738,7 +738,7 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::uint64_t& out_payload_bytes,
                                           rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
 
   out_header.clear();
@@ -824,7 +824,7 @@ compressed_table read_compressed_table_from_memory(
   std::string* error_out,
   std::optional<rmm::device_async_resource_ref> leaf_mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
@@ -841,7 +841,7 @@ compressed_table read_compressed_table_subset_from_memory(
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};

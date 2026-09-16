@@ -20,8 +20,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -171,7 +170,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
     throw std::runtime_error(
@@ -208,7 +207,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
   auto const partition_idx_opt = partitioned_output_data->get_partition_idx();
   if (!partition_idx_opt.has_value()) {
