@@ -689,7 +689,6 @@ set_target_properties(
              INSTALL_REMOVE_ENVIRONMENT_RPATH ON
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
-             LINKER_TYPE BFD
              CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(
   sirius_shared
@@ -699,6 +698,10 @@ target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
           "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
+# The standalone library is substantially larger than the loadable extension.
+# Do not force BFD: the normal presets use Mold, which emits AArch64 range
+# extension thunks. Discard unused sections pulled in by whole archives too.
+target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections")
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
