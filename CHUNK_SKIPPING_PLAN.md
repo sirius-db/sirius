@@ -1850,6 +1850,43 @@ rows. A global sort costs bytes before a single query runs.
 `ORDER BY`** — cheaper to produce (no whole-table sort), smaller on disk, and measurably faster on
 this suite.
 
+### 6.15 Cluster lineitem, NOT orders (2026-09-16)
+
+The §6.14 clustered arm only clustered lineitem, because disk forced it. Rebuilt with both keys
+(`l_shipdate` AND `o_orderdate`, 395.3 GB, 40 min) and it is **worse**:
+
+| `.hpln` ordering (SF1000 cold) | `.hpln` | parquet | vs parquet | bytes |
+|---|---|---|---|---|
+| natural order | 52.521 s | 56.952 s | −7.8% | 1049.9 GB |
+| **`cluster_by` lineitem only** | **48.896 s** | 57.314 s | **−14.7%** | 823.2 GB |
+| `cluster_by` lineitem + orders | 52.958 / 52.928 s | 58.286 / 59.165 s | −9.1% / −10.5% | **804.8 GB** |
+| global `ORDER BY` | 54.706 s | 59.003 s | −7.3% | 940.7 GB |
+
+Host-pinned, both arms clustering the same two tables (so no handicap this time):
+
+| | pin | suite | vs parquet |
+|---|---|---|---|
+| parquet | 25.11 s | 10.539 s | — |
+| parquet + `cluster_by` | 26.63 s | **9.797 s** | −7.0% |
+| `.hpln` + `cluster_by` (both) | **9.77 s** | 10.282 s | −2.4% |
+
+(`.hpln` + `cluster_by` lineitem-only measured 10.366 s, −4.3%, on the same harness.)
+
+**Clustering orders costs ~4 s cold and ~0.8 s pinned while READING FEWER BYTES** (804.8 vs
+823.2 GB). It is not an I/O effect: q9, q18 and q21 each slow by 0.5–1.0 s on byte counts that
+barely move (q18 58.46 → 58.70 GB but 3.12 → 3.46–3.60 s). orders' natural order is
+`o_orderkey`-ordered and orders is the BUILD side of most of this suite's joins, so sorting it by
+`o_orderdate` scatters the join key — the §6.13 trade, landing on the join rather than the scan.
+
+**So the key choice is per table, and "cluster the column the predicates filter on" is wrong for a
+table whose value is its join order.** lineitem is scanned with date predicates and benefits;
+orders is joined on its key and does not.
+
+Confidence: the `.hpln` arm is very stable across repeats (52.958 / 52.928, 0.06% apart) while the
+parquet arm drifts ~1.5%, so the ~4 s gap is well outside noise. The caveat is that the
+lineitem-only dataset was deleted, so that arm could not be re-run under today's machine state —
+its numbers are single runs normalized against their own parquet arm (0.853 vs 0.895–0.909).
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
