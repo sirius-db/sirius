@@ -698,9 +698,9 @@ target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
           "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
-# The standalone library is substantially larger than the loadable extension. Do
-# not force BFD: the normal presets use Mold, which emits AArch64 range
-# extension thunks. Discard unused sections pulled in by whole archives too.
+set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+
+# Discard unused sections pulled in by whole archives.
 target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections")
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
