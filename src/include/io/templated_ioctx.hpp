@@ -33,6 +33,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -238,8 +239,23 @@ class templated_ioctx : public ioctx {
                                              [[maybe_unused]] io_op_type type,
                                              [[maybe_unused]] int device_id = -1)
   {
-    constexpr std::size_t dispatch_fanout = 2;
-    auto const count                      = _reactors.size();
+    // Reactors a single read is spread over. Hard-coded to 2 historically, which
+    // means extra reactors add NO service capacity to any one read: with 4 or 8
+    // configured, each call still used 2, picked by queued_bytes from a rotating
+    // start. That made 4+ reactors bimodal -- identical runs measured 6.0 s and
+    // 20.3 s, with the whole difference in bulk::read wait (4.1 s vs 18.5 s) while
+    // request count, size, duration and in-flight were unchanged; the requests were
+    // simply queued behind an unlucky reactor pick. SIRIUS_DISPATCH_FANOUT overrides
+    // it (0 or unset keeps the historical 2; "all" uses every reactor).
+    static std::size_t const fanout_override = [] () -> std::size_t {
+      char const* v = std::getenv("SIRIUS_DISPATCH_FANOUT");
+      if (v == nullptr) return 0;
+      if (std::string_view{v} == "all") return std::numeric_limits<std::size_t>::max();
+      auto const n = std::strtoul(v, nullptr, 10);
+      return n == 0 ? 0 : static_cast<std::size_t>(n);
+    }();
+    std::size_t const dispatch_fanout = fanout_override != 0 ? fanout_override : 2;
+    auto const count                  = _reactors.size();
     if (count == 0) return {};
 
     auto const start = _next.fetch_add(1, std::memory_order_relaxed) % count;
@@ -373,17 +389,29 @@ class templated_ioctx : public ioctx {
           begin = end;
         }
 
+        // Only non-empty partitions are published. Balancing whole runs can leave a
+        // partition with nothing -- a single contiguous run goes to one partition,
+        // so any run count below partition_count starves the rest. Per-slice
+        // balancing could not do this (min_element round-robins while the loads are
+        // all zero), so an empty group never reached a reactor before. A reactor
+        // that dequeues one parks on it forever: expand_active() returns early on an
+        // empty group without clearing it, so the reactor never takes another and
+        // every request routed to it is stranded.
         std::vector<std::unique_ptr<grouped_io_request>> requests;
+        std::vector<std::size_t> targets;
         requests.reserve(partition_count);
+        targets.reserve(partition_count);
         for (std::size_t i = 0; i < partition_count; ++i) {
+          if (partitions[i].empty()) continue;
           requests.push_back(
             grouped_io_request::create(owner, std::move(partitions[i]), coordinator));
+          targets.push_back(i);
         }
 
         // enqueue is noexcept by reactor contract, so once publication starts
         // ownership cannot be stranded between reactors.
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          reactors[i]->enqueue(std::move(requests[i]));
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+          reactors[targets[i]]->enqueue(std::move(requests[i]));
         }
         return future;
       } catch (...) {

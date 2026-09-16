@@ -1460,6 +1460,13 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             return std::unique_ptr<rest_io_op_request>{};
           }
           if (active_group == nullptr) continue;
+          // An empty group would park this reactor: expand_active() returns early
+          // on one without clearing it, so active_group would never go null again
+          // and no further group would ever be dequeued.
+          if (active_group->empty()) {
+            active_group.reset();
+            continue;
+          }
         }
         expand_active(free_connections);
       }
