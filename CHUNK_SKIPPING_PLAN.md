@@ -1919,6 +1919,39 @@ This is also the strongest remaining argument for the `.hpln` layout: its chunks
 that a parquet pin cannot, which is exactly why choosing its cluster key needs care that the
 parquet path never needed.
 
+### 6.17 Why parquet still wins the PINNED suite: 30% more batches for the same work (2026-09-16)
+
+`.hpln` + `cluster_by` is 10.282 s against parquet + `cluster_by`'s 9.790 — and the deficit is
+**broad, not concentrated**: ~+0.05–0.08 s on nearly every query, 0.485 s total, with q12 actually
+0.127 s AHEAD (its `l_shipmode` dictionary now pays for itself once the data is clustered). Ruled
+out first: **plan inheritance is not the cause.** An SF100 `.hpln` written with the decode-picked
+PIN plans instead of the size-picked file plans measures 1.215 s against 1.231 — 1.3%, nothing.
+
+The cause is batch COUNT. Both arms prune identically — 5,088,780,288 / 5,769,412,608 /
+5,921,628,160 rows against parquet's 5,088,501,760 / 5,769,273,344 / 5,921,374,208, i.e. the same
+rows to within 0.005% — but:
+
+| | chunks served |
+|---|---|
+| parquet + `cluster_by` | **297** |
+| `.hpln` + `cluster_by` | **387** (+30%) |
+
+**A `.hpln` chunk is sized by the WHOLE row; a parquet pin's batch is sized by the columns it
+PINS.** `mk-hpln.py`'s `decoded_bytes_per_row` measures `SELECT *`, and its own docstring states the
+goal it misses — "sizing chunks in decoded bytes is what makes a `.hpln` pin's batches the same size
+as a parquet pin's at the same `scan_task_batch_size`". For lineitem the gap is almost entirely
+`l_comment`, which no TPC-H query materializes: it inflates the row width used to pick `chunk_rows`,
+so every chunk holds ~30% fewer rows and the pin serves ~30% more, smaller batches — paying
+per-batch cost (header parse, subset synthesis, table construction, launches, reservation) that the
+parquet pin does not.
+
+**This is a property of the harness, not the format.** Writing the file with
+`--chunk-bytes ≈ 2.6GB` (2 GB × 387/297) would land the read subset at the same ~2 GB per batch and
+is the test that would confirm it. Until then the pinned deficit should be read as "≈30% more
+batches", not as a serve-path or compression disadvantage — the serve path is literally the same
+converter for both arms, since a compressed host pin of either format is a
+`compressed_host_representation`.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
