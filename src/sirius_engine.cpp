@@ -39,8 +39,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -173,7 +172,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
-  nvtx3::scoped_range nvtx_range{"sirius::query"};
+  nvtx_scoped_range nvtx_range{"sirius::query"};
   query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");

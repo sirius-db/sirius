@@ -22,12 +22,11 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -202,7 +201,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() == 0) {

@@ -32,8 +32,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_context.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <algorithm>
 #include <mutex>
@@ -215,7 +214,7 @@ MemoryBarrierType sirius_physical_partition::input_barrier_for(
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (input_batches.size() != 1) {
@@ -292,7 +291,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::sink"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_partition::sink"};
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = pipelineable_input.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned

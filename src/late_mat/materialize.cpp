@@ -18,6 +18,7 @@
 
 #include "compression/compressed_representation.hpp"
 #include "late_mat/multi_source_gather.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
@@ -30,7 +31,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/simpatico_codegen.hpp>
 #include <codegen/selection/chunk_row_set.hpp>
@@ -282,7 +282,7 @@ std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           rmm::cuda_stream_view stream,
                                           rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::late_mat::materialize"};
+  nvtx_scoped_range nvtx_range{"sirius::late_mat::materialize"};
   auto const& layout = selection.layout();
   if (column.batches.size() != layout.num_batches()) {
     throw std::runtime_error(

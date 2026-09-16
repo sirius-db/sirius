@@ -51,12 +51,12 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -169,11 +169,7 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
                                                     cudf::null_equality compare_nulls,
                                                     rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return cudf::filtered_join(right_keys, compare_nulls, stream);
-#else
-  return cudf::filtered_join(right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Heap-allocated variant for BUILD_PROBE mode, where one filtered_join is built once on the right
@@ -183,12 +179,7 @@ static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
   cudf::null_equality compare_nulls,
   rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return std::make_unique<cudf::filtered_join>(right_keys, compare_nulls, stream);
-#else
-  return std::make_unique<cudf::filtered_join>(
-    right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Build the semi-join hash table on the left/output side and probe with the (larger) right side.
@@ -1744,7 +1735,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -2322,7 +2313,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
       port_id, batch, partition_idx);
 
-    nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
+    nvtx_scoped_range nvtx_range{"dynfilter::publish_hook"};
     auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
     bool const gpu_resident =
       ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;

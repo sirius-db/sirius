@@ -16,7 +16,12 @@
 
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
-project(sirius LANGUAGES CXX CUDA)
+project(
+  sirius
+  VERSION 0.0.0
+  LANGUAGES CXX CUDA)
+
+include(GNUInstallDirs)
 
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -198,6 +203,11 @@ set(CUCASCADE_BUILD_IO
     OFF
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+
+# Name of the NVTX domain every Sirius range is published into. Derived from the
+# project name so it has a single authoritative source; simpatico turns it into
+# the SIRIUS_NVTX_DOMAIN_NAME compile definition both include trees consume.
+set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 
 # Simpatico GPU compression engine Tests disabled here — run them via the
 # standalone simpatico_codegen build. Benchmark harness
@@ -571,6 +581,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
       "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
   )
+  target_compile_definitions(${_target}
+                             PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -672,6 +684,32 @@ target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
 target_link_options(sirius_loadable_extension PRIVATE
                     "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
 
+add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
+add_library(sirius::sirius ALIAS sirius_shared)
+set_target_properties(
+  sirius_shared
+  PROPERTIES OUTPUT_NAME sirius
+             EXPORT_NAME sirius
+             VERSION "${PROJECT_VERSION}"
+             SOVERSION 0
+             INSTALL_RPATH "$ORIGIN"
+             INSTALL_REMOVE_ENVIRONMENT_RPATH ON
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  sirius_shared
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(
+  sirius_shared
+  PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
+          "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
+set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+
+# Discard unused sections pulled in by whole archives.
+target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections")
+
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
 # discovers the Sirius headers (repo + conda) and links the libsirius artifact
@@ -726,6 +764,33 @@ install(
 
 install(DIRECTORY include/sirius DESTINATION include)
 install(FILES include/sirius_extension.hpp DESTINATION include)
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMinorVersion)
+
+install(
+  TARGETS sirius_shared
+  EXPORT sirius-targets
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT sirius_library)
+install(
+  EXPORT sirius-targets
+  FILE sirius-targets.cmake
+  NAMESPACE sirius::
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  COMPONENT sirius_library)
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  COMPONENT sirius_library)
 
 if(ENABLE_STREAM_CHECK)
   message(
@@ -1040,6 +1105,7 @@ set_target_properties(
 target_compile_definitions(
   sirius_unittest
   PRIVATE
+    CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
@@ -1053,6 +1119,9 @@ endif()
 # test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+target_compile_definitions(parquet_benchmark
+                           PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
 if(VCPKG_BUILD)
   set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
