@@ -196,6 +196,10 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
       opt.n_max_concurrent_scans_explicit = true;
     }
   }
+  // Connections per reactor. Observed peak in-flight pins at this value
+  // regardless of reactor count or scan budget, so it has to be reachable
+  // from config to test the concurrency ceiling.
+  r.optional("max_connections", opt.max_connections, yaml::greater_than<std::size_t>{0});
   r.optional("request_timeout_s", opt.request_timeout_s);
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
