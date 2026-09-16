@@ -1040,6 +1040,7 @@ set_target_properties(
 target_compile_definitions(
   sirius_unittest
   PRIVATE
+    CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
@@ -1053,6 +1054,8 @@ endif()
 # test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+target_compile_definitions(parquet_benchmark PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
 if(VCPKG_BUILD)
   set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)

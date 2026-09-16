@@ -20,7 +20,6 @@
 #define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
 
 #include <cudf/table/table.hpp>
-#if CUDF_VERSION_NUM > 2504
 #include <cudf/detail/aggregation/aggregation.hpp>
 #include <cudf/detail/stream_compaction.hpp>
 #include <cudf/join/conditional_join.hpp>
@@ -28,9 +27,6 @@
 #include <cudf/join/hash_join.hpp>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
-#else
-#include <cudf/join.hpp>
-#endif
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -38,9 +34,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/reduction.hpp>
-#if CUDF_VERSION_NUM >= 2604
 #include <cudf/reduction/distinct_count.hpp>
-#endif
 #include "helper/logical_type.hpp"
 #include "sirius/exception.hpp"
 
@@ -75,10 +69,7 @@
 namespace sirius {
 
 /**
- * @brief Apply a boolean retention mask across supported cuDF releases.
- *
- * cuDF 26.10 renamed apply_boolean_mask() to apply_retention_mask(). Keep the
- * compatibility decision here so call sites use the non-deprecated name.
+ * @brief Apply a boolean retention mask using the cuDF 26.08 API.
  */
 inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
                                                        cudf::column_view const& retention_mask,
