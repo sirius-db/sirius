@@ -212,6 +212,10 @@ struct telemetry_config {
   std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
+  /// Optional override naming an NVTX injection library. Normally Sirius uses
+  /// its loadable DSO or the initializer embedded in a static DuckDB host. An
+  /// NVTX_INJECTION64_PATH already in the environment takes precedence.
+  std::string nvtx_injection_lib{};
 };
 
 /// Parameters controlling Simpatico compression for pin_table(tier=>'host').

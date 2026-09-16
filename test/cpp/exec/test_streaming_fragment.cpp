@@ -320,22 +320,28 @@ TEST_CASE_METHOD(fragment_fixture,
   // Assert row count, not merely that execute() succeeded.
   auto row_count_of = [&](const std::string& query) -> std::size_t {
     std::size_t rows = 0;
-    // with_initialized_engine synthesizes its own query id, but execute() still needs a real
-    // window open: only a window begin points the task creator at this connection.
+    // execute() routes through task_creator::prepare_for_query, which requires
+    // set_client_context to have already run for the engine's exact query id — that only
+    // happens for the window's own id (begin_execution_window calls it), so the engine must be
+    // built on window.query_id() rather than with_initialized_engine's default synthesized one.
     auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     query_window window(*sirius_ctx, *con->context, "frag_control");
-    sirius::test::with_initialized_engine(*con, query, [&](sirius::sirius_engine& engine) {
-      REQUIRE(engine.has_result_collector());
-      engine.execute();
-      auto result = engine.get_result();
-      REQUIRE(result != nullptr);
-      REQUIRE_FALSE(result->HasError());
-      auto materialized =
-        duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
-          std::move(result));
-      rows = materialized->RowCount();
-    });
+    sirius::test::with_initialized_engine(
+      *con,
+      query,
+      [&](sirius::sirius_engine& engine) {
+        REQUIRE(engine.has_result_collector());
+        engine.execute();
+        auto result = engine.get_result();
+        REQUIRE(result != nullptr);
+        REQUIRE_FALSE(result->HasError());
+        auto materialized =
+          duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
+            std::move(result));
+        rows = materialized->RowCount();
+      },
+      window.query_id());
     window.finish();
     return rows;
   };

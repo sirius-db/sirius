@@ -337,9 +337,12 @@ constexpr std::size_t kMaxSelectionSources = 8;
 /// decode applies or falls back internally, the column's slot carries the BOOL8
 /// answer (compacted to the surviving rows when the decode compacted), so the
 /// scan's residual filter reads a boolean instead of re-comparing strings.
+///
+/// @p keep_mask is one additional AND source, keeping a masked chunk compactable.
 std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_table const& chunk,
                                                       std::span<const std::size_t> selected,
                                                       pushdown_request const& request,
+                                                      decode_visibility_mask const& keep_mask,
                                                       rmm::cuda_stream_view stream,
                                                       rmm::device_async_resource_ref mr,
                                                       pushdown_outcome& outcome)
@@ -416,6 +419,12 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] wave-1 sources, ascending expected keep:{}", order_echo);
   wave_request.source_generation = request.membership_generation;
+  // Safe as a raw pointer: the source representation owns the words, and
+  // decompress_scan_filter synchronizes on every return path.
+  if (keep_mask.has_mask()) {
+    wave_request.keep_mask_words = keep_mask.words.get();
+    wave_request.keep_mask_rows  = static_cast<std::int64_t>(keep_mask.row_count);
+  }
 
   sirius::codegen::scan_filter_result result;
   std::string error;
@@ -441,7 +450,8 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   // wave 2 ran, so on an applied decode the surviving rows already satisfy
   // them. On any other outcome the equality answers come from the plain
   // predicated rerun, which drops no rows.
-  outcome.predicates_enforced = result.applied && !wave_request.bool8_filters.empty();
+  outcome.predicates_enforced     = result.applied && !wave_request.bool8_filters.empty();
+  outcome.visibility_mask_applied = result.keep_mask_applied;
   SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
     "[decompression-pushdown] decode {} (status={} generation={}): ranges={} equalities={} "
     "join_filters={} survivors={}/{} column(s)={} covers_whole_filter={} row_filtered={} "
@@ -585,6 +595,7 @@ decompression_pushdown_scan::compaction_forecast decompression_pushdown_scan::fo
 decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    std::span<const std::size_t> selected,
                                    decompression_pushdown_scan const* scan,
+                                   decode_visibility_mask const& keep_mask,
                                    rmm::cuda_stream_view stream,
                                    rmm::device_async_resource_ref mr)
 {
@@ -600,7 +611,8 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
     request.empty());
 
   if (!request.empty() && !request.row_selection_disabled) {
-    out.table = decompress_with_pushdown(chunk, selected, request, stream, mr, out.outcome);
+    out.table =
+      decompress_with_pushdown(chunk, selected, request, keep_mask, stream, mr, out.outcome);
   }
   if (!out.table) {
     out.table = predicates.empty()

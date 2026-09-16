@@ -93,6 +93,16 @@ struct membership_probe {
   std::uint64_t num_keys        = 0;
 };
 
+/// One chunk's MVCC visibility mask: ceil(row_count / 32) packed words in cuDF bitmask
+/// convention (bit `row % 32` of word `row / 32`, 1 = keep). Bits past @ref row_count
+/// must be zero — the decode's tail-zero invariant depends on it.
+struct decode_visibility_mask {
+  std::shared_ptr<const std::uint32_t[]> words;
+  std::size_t row_count = 0;
+
+  [[nodiscard]] bool has_mask() const noexcept { return words != nullptr; }
+};
+
 /// What one scan asks the decoder to do to one chunk.
 ///
 /// Immutable once built and shared by every batch; per-batch variations (a
@@ -199,9 +209,14 @@ struct pushdown_outcome {
   /// dropped for them, so the scan must still evaluate them.
   bool predicates_enforced = false;
 
+  /// The decode ANDed the chunk's @ref decode_visibility_mask into its selection, so the
+  /// scan must not re-apply it: a positional mask over a compacted batch selects wrongly.
+  bool visibility_mask_applied = false;
+
   [[nodiscard]] bool any() const noexcept
   {
-    return row_filtered || selection_unprofitable || !predicate_columns.empty();
+    return row_filtered || selection_unprofitable || !predicate_columns.empty() ||
+           visibility_mask_applied;
   }
 };
 
@@ -274,12 +289,17 @@ class decompression_pushdown_scan {
  * only means rows the scan must still reject itself. @ref decompress_result::outcome
  * says what happened. With @p scan null this is an ordinary decompress.
  *
+ * @p keep_mask is one additional AND source, keeping a masked chunk eligible for
+ * compaction. Never a source on its own; only an applied decode consumes it
+ * (@c pushdown_outcome::visibility_mask_applied).
+ *
  * Never returns a null table: every way the filtering can decline ends in the
  * plain decode of the same columns.
  */
 decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    std::span<const std::size_t> selected,
                                    decompression_pushdown_scan const* scan,
+                                   decode_visibility_mask const& keep_mask,
                                    rmm::cuda_stream_view stream,
                                    rmm::device_async_resource_ref mr);
 

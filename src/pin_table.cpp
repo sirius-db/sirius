@@ -470,6 +470,34 @@ std::string compression_failure_warning(std::string_view what,
   return message;
 }
 
+/// Per-pin compression coverage, always at INFO. Skipped when compression wasn't
+/// requested for this pin (else "0/N compressed" would misreport by-design
+/// uncompressed pinning as a fallback). Points at "warnings above" only when a
+/// chunk actually WARNed (@p compression_failed) — a chunk can also land
+/// uncompressed silently (below min_batch_size_bytes, or under
+/// max_compressed_fraction), which gets a different reason instead.
+void log_pin_compression_coverage(std::string_view log_tag,
+                                  op::scan::gpu_ingestible& ingestible,
+                                  compression_pin_config const& compression,
+                                  std::size_t compressed_count,
+                                  std::size_t total_chunks,
+                                  bool compression_failed)
+{
+  if (!compression.enabled) { return; }
+  std::string_view suffix;
+  if (compressed_count != total_chunks) {
+    suffix = compression_failed ? " — remainder pinned UNCOMPRESSED (see warnings above)"
+                                : " — remainder pinned UNCOMPRESSED (below the compression "
+                                  "size/ratio threshold)";
+  }
+  SIRIUS_LOG_INFO("[{}] pin '{}': {}/{} chunk(s) compressed{}",
+                  log_tag,
+                  ingestible.table_info().display_name(),
+                  compressed_count,
+                  total_chunks,
+                  suffix);
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -696,6 +724,21 @@ host_pin_result materialize_pin_to_host(
       }
     });
 
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (dynamic_cast<sirius::compressed_host_representation const*>(chunk.get()) != nullptr) {
+        ++compressed_count;
+      }
+    }
+    log_pin_compression_coverage("materialize_pin_to_host",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
+
   return out;
 }
 
@@ -866,6 +909,19 @@ device_pin_result materialize_all_batches_compressed(
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
     });
+
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (chunk.compressed) { ++compressed_count; }
+    }
+    log_pin_compression_coverage("materialize_all_batches_compressed",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
 
   return out;
 }

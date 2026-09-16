@@ -34,7 +34,7 @@
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
 #include <cuda/std/functional>
 #include <cuda/std/limits>
-#include <cuda/stream_ref>
+#include <cuda/stream>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>

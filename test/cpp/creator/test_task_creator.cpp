@@ -158,15 +158,20 @@ class testable_task_creator : public task_creator {
   testable_task_creator(int num_threads,
                         duckdb::ClientContext& client_context,
                         task_scheduler& task_sched,
-                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
+                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr,
+                        sirius::query_id_t query_id = sirius::make_query_id(1))
     : task_creator(
         creator::task_creator_config{
           .thread_pool = {.num_threads = num_threads, .thread_name_prefix = "task_creator"}},
-        mem_res_mgr)
+        mem_res_mgr),
+      _query_id(query_id)
   {
-    this->set_client_context(client_context);
+    // Binding a client context is what registers the query's state.
+    this->set_client_context(query_id, client_context);
     this->set_task_scheduler(task_sched);
   }
+
+  [[nodiscard]] sirius::query_id_t query_id() const noexcept { return _query_id; }
 
   void schedule(op::sirius_physical_operator* request) override
   {
@@ -209,6 +214,7 @@ class testable_task_creator : public task_creator {
   std::atomic<size_t> _schedule_count{0};
   std::vector<sirius_physical_operator*> _scheduled_nodes;
   std::vector<duckdb::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
+  sirius::query_id_t _query_id;
   std::mutex _scheduled_mutex;
 };
 

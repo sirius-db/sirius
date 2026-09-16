@@ -146,32 +146,40 @@ class task_scheduler {
   }
 
   /**
-   * @brief Prepare scheduler state for a query.
+   * @brief Kick off query execution by scheduling its first scan.
    *
-   * Drains tasks left by the previous query, installs the new query and completion handler,
-   * and resets per-query scheduler state.
+   * Completion is signalled through the query's own completion_handler, which its sirius_engine
+   * owns and already holds the future for, so nothing is returned here.
    *
-   * @param query Query whose tasks will be scheduled
+   * @param query The query to start; must have at least one schedulable scan source.
    */
-  void prepare_for_query(duckdb::shared_ptr<planner::query> query);
+  void start_query(const planner::query& query);
 
   /**
-   * @brief Start query execution and return a future for completion.
+   * @brief Drop every queued task belonging to @p query_id.
    *
-   * Sets up the completion handler and returns a future that will be satisfied
-   * when the query completes or errors. Note: prepare_for_query must be called
-   * before this method.
+   * Clears the scheduler's queue and each GPU executor's queue of that query's pending work,
+   * leaving every other query's tasks in place. In-flight tasks are unaffected.
    *
-   * @return A future that will be satisfied when the query completes.
+   * Called from the per-query cleanup so a finished or failed query leaves nothing queued that
+   * points into the plan about to be destroyed.
    */
-  std::future<void> start_query();
+  void drain_query_tasks(sirius::query_id_t query_id);
 
   /**
-   * @brief Terminate the query execution and report the error to duckdb.
+   * @brief Report a fatal query error via the completion future.
+   *
+   * Deliberately does NOT stop or drain any executor itself: callers can run on a GPU executor's
+   * or the task_creator's own worker thread (e.g. notify_downstream_pipelines() from
+   * ~gpu_pipeline_task), and synchronously stopping a pool from its own worker thread self-
+   * deadlocks in bounded_thread_pool::wait_all(). Fulfilling the future here is what makes the
+   * query thread's future.get() throw; its catch block then calls drain_after_error() to perform
+   * the actual cancellation from a thread that is never a pool worker.
    *
    * @param error The error to report.
    */
-  void terminate_query(std::exception_ptr error);
+  void terminate_query(const std::shared_ptr<completion_handler>& handler,
+                       std::exception_ptr error);
 
   /**
    * @brief Drain all in-flight tasks after a query error.
@@ -182,7 +190,7 @@ class task_scheduler {
    * tasks.  Each GPU executor's manager thread is restarted so the executor is
    * ready for the next query.
    */
-  void drain_after_error();
+  void drain_after_error(sirius::query_id_t query_id);
 
   /**
    * @brief This function interrupts executors and waits for all in-flight tasks to complete.
@@ -191,13 +199,10 @@ class task_scheduler {
    * the plan.
    * @throws std::runtime_error if any tasks are still in flight.
    */
-  void wait_for_completion();
+  void wait_for_completion(sirius::query_id_t query_id);
 
  private:
   void management_eventloop();
-
-  std::mutex _query_mutex;
-  duckdb::shared_ptr<planner::query> _query;
 
   /// Pipeline-level task queue, ordered by task priority (highest dispatched first).
   exec::multi_index_priority_queue<sirius::parallel::itask> _task_queue;
@@ -217,10 +222,7 @@ class task_scheduler {
 
   /// Device ID to GPU executor.
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;
-
   sirius::creator::task_creator* _task_creator{nullptr};
-  /// Strong owner for the weak completion references held by terminal pipelines.
-  std::shared_ptr<completion_handler> _completion_handler;
   std::shared_ptr<const telemetry::telemetry_context> _telemetry_context;
   std::unique_ptr<telemetry::TaskQueueHandleWrapper> _task_queue_telemetry;
 };

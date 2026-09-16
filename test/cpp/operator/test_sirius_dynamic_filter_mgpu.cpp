@@ -34,6 +34,7 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
@@ -189,7 +190,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
     // explicit replication, a GPU 1 caller skips the optional filter and never touches GPU 0's set.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      auto const probe_stream = cudf::get_default_stream();
+      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -206,7 +207,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(
@@ -434,7 +435,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     // Positions 0, 2, and 4 are build keys. Misses may be Bloom false positives, so only the
     // no-false-negative contract is asserted for them.
     auto probe = make_values<std::int64_t>(
@@ -482,8 +483,8 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
-    auto probe        = cudf::sequence(10,
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
+    auto probe                         = cudf::sequence(10,
                                 cudf::numeric_scalar<std::int64_t>(0, true, stream),
                                 cudf::numeric_scalar<std::int64_t>(1, true, stream),
                                 stream,
@@ -537,7 +538,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
     // published; it must never dereference the source GPU's buffer.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      auto const probe_stream = cudf::get_default_stream();
+      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -554,7 +555,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(

@@ -94,6 +94,9 @@ struct mvcc_mask_job_request {
   /// The pinned-entry key: dedups requests within a query and routes each
   /// completed set back to its entry's providers (also names diagnostics).
   std::string entry_name;
+  /// Set when @ref masks came from the entry's version cache (mvcc_mask_cache.hpp);
+  /// prepare_mvcc_mask_tasks then skips the request entirely.
+  bool masks_ready{false};
 };
 
 /**

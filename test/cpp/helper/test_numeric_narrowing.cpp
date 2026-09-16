@@ -27,6 +27,7 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
@@ -94,7 +95,8 @@ template <typename T>
 std::vector<T> copy_values_to_host(cudf::column_view const& column)
 {
   std::vector<T> values(static_cast<std::size_t>(column.size()));
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  stream.sync();
   if (!values.empty() && cudaMemcpy(values.data(),
                                     column.data<T>(),
                                     values.size() * sizeof(T),
@@ -111,7 +113,8 @@ std::vector<bool> copy_valids_to_host(cudf::column_view const& column)
 
   auto const words = cudf::num_bitmask_words(column.offset() + column.size());
   std::vector<cudf::bitmask_type> mask(static_cast<std::size_t>(words));
-  cudf::get_default_stream().synchronize();
+  cuda::stream_ref const stream = cudf::get_default_stream();
+  stream.sync();
   if (cudaMemcpy(mask.data(),
                  column.null_mask(),
                  mask.size() * sizeof(cudf::bitmask_type),
