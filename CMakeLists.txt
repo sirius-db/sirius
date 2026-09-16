@@ -571,6 +571,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
       "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
   )
+  target_compile_definitions(${_target} PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
