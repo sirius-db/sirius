@@ -114,19 +114,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   void clear_source();
   void schedule(std::shared_ptr<duckdb::Event>& event);
 
-  // std::string to_string() const;
-  // void print() const;
-  // void print_dependencies() const;
-
-  //! Returns query progress
-  // bool get_progress(double &current_percentage, std::size_t &estimated_cardinality);
-
-  //! Returns a list of all operators (including source and sink) involved in this pipeline
-  // std::vector<duckdb::reference<op::sirius_physical_operator>> get_all_operators();
-
-  // std::vector<duckdb::const_reference<op::sirius_physical_operator>> get_all_operators()
-  // const;
-
   //! Returns a list of all operators (including source and sink) involved in this pipeline
   std::vector<std::reference_wrapper<op::sirius_physical_operator>> get_operators();
   std::vector<std::reference_wrapper<const op::sirius_physical_operator>> get_operators() const;
@@ -199,7 +186,6 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   std::size_t update_batch_index(std::size_t old_index, std::size_t new_index);
 
   //! The dependencies of this pipeline
-  // std::vector<std::weak_ptr<sirius_pipeline>> dependencies;
   std::vector<std::shared_ptr<sirius_pipeline>> dependencies;
 
   //! Updates the pipeline status

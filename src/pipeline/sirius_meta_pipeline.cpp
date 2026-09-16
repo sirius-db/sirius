@@ -18,6 +18,8 @@
 
 #include "config.hpp"
 
+#include <algorithm>
+
 namespace sirius {
 namespace pipeline {
 
@@ -145,8 +147,10 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
                                                  bool including)
 {
   // find 'start'
-  auto it = pipelines.begin();
-  for (; &**it != &start; it++) {}
+  auto it = std::find_if(pipelines.begin(), pipelines.end(), [&start](const auto& pipeline) {
+    return pipeline.get() == &start;
+  });
+  D_ASSERT(it != pipelines.end());
 
   if (!including) { it++; }
 

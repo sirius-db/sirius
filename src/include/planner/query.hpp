@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "duckdb/common/unordered_map.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
@@ -26,6 +25,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius {
@@ -114,7 +114,7 @@ class query {
   //! Cached scan operators in pipeline execution order
   duckdb::vector<op::sirius_physical_operator*> _scan_operators;
   //! Map from operator pointer to its containing pipeline
-  duckdb::unordered_map<op::sirius_physical_operator*, std::shared_ptr<pipeline::sirius_pipeline>>
+  std::unordered_map<op::sirius_physical_operator*, std::shared_ptr<pipeline::sirius_pipeline>>
     _operator_to_pipeline;
 };
 
