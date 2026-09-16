@@ -1952,6 +1952,53 @@ batches", not as a serve-path or compression disadvantage — the serve path is 
 converter for both arms, since a compressed host pin of either format is a
 `compressed_host_representation`.
 
+### 6.18 Matched to parquet's best config, `.hpln` wins all three axes (2026-09-16)
+
+**First: parquet's best host-tier batch is 8 GB, not 2 GB.** §0 recorded "host-tier pins should use
+a 2 GB batch, not the tuned 8 GB — reproducible across runs." That was measured on unclustered data
+with no working pruning. Re-swept:
+
+| parquet host-pinned | plain | + `cluster_by` |
+|---|---|---|
+| 2 GB | 10.628 s | 9.830 s |
+| 4 GB | 9.922 s | 9.073 s |
+| **8 GB** | **9.757 s** | **8.958 s** |
+
+2 GB is now the WORST of the three, by 9.7%. **Every host-pinned number earlier in this document
+used the 2 GB config and understates both formats.**
+
+**Then size the `.hpln` chunks to match.** §6.17 showed the pin served 387 chunks against parquet's
+297 because a chunk is sized over the whole row while a parquet batch is sized over the columns it
+pins. The fix is capped by cuDF's 2^31 string-chars limit, applied to a column no query reads:
+
+| table | widest string | cap | max chunk | used |
+|---|---|---|---|---|
+| lineitem | `l_comment` 26.5 B | 81.0M rows | 10.4 GB | 8 GB |
+| orders | `o_comment` 48.5 B | 44.2M rows | 5.2 GB | 4 GB |
+| partsupp | `ps_comment` 123.4 B | 17.4M rows | 2.56 GB | 2 GB |
+
+**Result — parquet at its best 8 GB config, `.hpln` chunked to match, SF1000:**
+
+| | pin | host-pinned suite | cold suite | cold bytes |
+|---|---|---|---|---|
+| parquet | 21.67 s | 9.760 s | 58.571 s | 949.8 GB |
+| parquet + `cluster_by` | 25.32 s | 8.915 s (−8.7%) | — | — |
+| **`.hpln` + `cluster_by`** | **9.66 s (2.6x)** | **8.739 s (−10.5%)** | **49.595 s (−15.3%)** | **790.8 GB (−16.7%)** |
+
+**`.hpln` now wins every axis**, including the pinned suite it had been losing — 8.739 s against
+parquet's best-ever 8.915. The chunk sizing was worth −1.54 s pinned (10.282 → 8.739, of which
+~0.86 s is the 8 GB batch and ~0.68 s the matched chunking) and −3.3 s cold (52.94 → 49.595) while
+reading FEWER bytes (804.8 → 790.8 GB), because larger chunks mean fewer, larger reads.
+
+Note the pin gap WIDENS as batches grow: parquet's clustered pin costs 25.32 s against `.hpln`'s
+9.66 s, because clustering a parquet pin sorts every batch at pin time while a `.hpln` was sorted
+once at write.
+
+**Still unmatched, and structural:** `.hpln` serves ~97 lineitem chunks against parquet's ~73 even
+at 8 GB, because the cap above is set by a column no query reads. The durable fixes are for
+`mk-hpln` to size chunks over a projection, or for the format to let a pin re-chunk — both of which
+would remove the last measured disadvantage rather than work around it.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
