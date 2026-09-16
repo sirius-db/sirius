@@ -8,8 +8,8 @@
 # overhead is irrelevant.
 #
 # Prerequisites: SF1 native .duckdb (generate_tpch_data.sh 1 --format duckdb)
-# and SF1 refresh sets (generate_tpch_refresh.sh 1 4), plus the run-power.sh
-# prerequisites (patched libcudf).
+# and SF1 refresh sets (generate_tpch_refresh.sh 1 4). CUDF_SO is optional
+# (see run-power.sh).
 #
 # Usage: pixi run bash bench/sf1000-repro/verify-memcheck-sf1.sh [tool] [streams]
 set -uo pipefail

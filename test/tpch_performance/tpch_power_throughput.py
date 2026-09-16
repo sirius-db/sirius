@@ -70,6 +70,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 
 import duckdb
@@ -845,19 +846,22 @@ def compressed_pin_count(log_dir, timeout_s=10.0):
 # Connections deliberately kept open by --rollback-scratch (see benchmark_db);
 # _rollback_exit's os._exit prevents their destructors from checkpointing.
 _ROLLBACK_KEEPALIVE = []
+# Absolute scratch path once a --rollback-scratch connection is open (armed);
+# None otherwise. Read by _rollback_exit on every exit path, including crashes.
+_ROLLBACK_SCRATCH = None
 
 
-def _rollback_exit(args, code):
+def _rollback_exit(code):
     """End a --rollback-scratch run without a clean DuckDB shutdown.
 
     A clean close (or interpreter teardown of the kept-alive connection)
     force-checkpoints the WAL into the base file, consuming the scratch.
     os._exit skips both; the caller then deletes <scratch>.wal and the scratch
-    is content-pristine for the next offset-0 run.
+    is content-pristine for the next offset-0 run. No-op unless armed.
     """
-    if not args.rollback_scratch:
+    scratch = _ROLLBACK_SCRATCH
+    if scratch is None:
         return
-    scratch = os.path.abspath(args.scratch_db)
     log(
         f"rollback-scratch: exiting without close; delete {scratch}.wal "
         "to finish the restore (run-power.sh ROLLBACK=1 does this)"
@@ -871,6 +875,7 @@ def _rollback_exit(args, code):
 def benchmark_db(args, run_dir, filename):
     """Copy the base DB into run_dir, open it with the TPC-H tables pinned, and
     unpin/close/delete the copy on exit."""
+    global _ROLLBACK_SCRATCH
     if args.scratch_db:
         # Reuse a pristine copy from a previous attempt instead of re-copying
         # ~SF GB (the copy takes ~15 min at SF1000, a long window for another
@@ -878,6 +883,8 @@ def benchmark_db(args, run_dir, filename):
         # consumed exactly like the internal copy: mutated by RF1/RF2 and
         # deleted at the end unless --keep-scratch-db.
         scratch = os.path.abspath(args.scratch_db)
+        if not os.path.isfile(scratch):
+            raise SystemExit(f"--scratch-db {scratch} does not exist")
         if os.path.getsize(scratch) != os.path.getsize(args.input):
             if args.update_set_offset == 0 and not args.rollback_scratch:
                 raise SystemExit(
@@ -925,6 +932,7 @@ def benchmark_db(args, run_dir, filename):
             f"SET auto_checkpoint_skip_wal_threshold={1 << 40}",
         ):
             sql(con, stmt)
+        _ROLLBACK_SCRATCH = scratch
         log("Rollback scratch armed: WAL-only mutations, restore = delete .wal")
     try:
         if args.pin_compression:
@@ -1813,11 +1821,25 @@ def main():
             if val.get(label):
                 failures.append(f"validation {label}: {sorted(val[label])}")
     if failures:
-        log("FAILED: " + "; ".join(failures))
-        _rollback_exit(args, 1)
         raise SystemExit("FAILED: " + "; ".join(failures))
-    _rollback_exit(args, 0)
+    _rollback_exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as e:  # noqa: BLE001 - every exit path must honor rollback
+        # A --rollback-scratch run must not reach interpreter teardown on ANY
+        # path: the kept-alive connection's destructor would checkpoint the WAL
+        # into the base and consume the scratch — on a crashed run, precisely
+        # the one whose scratch has to be restored. Report, then hard-exit if
+        # armed; a plain re-raise otherwise.
+        if isinstance(e, SystemExit):
+            code = e.code if isinstance(e.code, int) else 1
+            if e.code and not isinstance(e.code, int):
+                print(e.code, file=sys.stderr)
+        else:
+            code = 1
+            traceback.print_exc()
+        _rollback_exit(code)
+        raise

@@ -42,7 +42,8 @@ DB=/path/to/tpch_sf1000.duckdb pixi run bash bench/sf1000-repro/run-power.sh
 ### run-power.sh knobs
 
 All knobs are environment variables with working defaults; extra arguments after the script name
-are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--update-set-offset`).
+are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--update-set-offset`,
+`--no-staged-refresh`).
 
 | knob | default | effect |
 |---|---|---|
@@ -53,7 +54,7 @@ are forwarded to `tpch_power_throughput.py` verbatim (e.g. `--scratch-db`, `--up
 | `ROLLBACK` | `0` | `1`: append `--rollback-scratch` and delete `<scratch>.wal` after the run — refresh mutations stay in the WAL, so discarding it restores the scratch DB to content-pristine without a 440 GB re-copy. Requires passing `--scratch-db <path>` in the forwarded args. |
 | `PROBE_TRIES` | `20` | Attempts (60 s apart) of the GPU-pool probe before giving up. On a shared box the pool reservation fails for minutes after another workload exits (lazy driver reclaim) — the failing LOAD itself is the only reliable gate; nvidia-smi lies. |
 | `SF`, `DB`, `REFRESH` | SF1000 paths | Scale factor, native `.duckdb` input, refresh-set directory. |
-| `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Patched libcudf to `LD_PRELOAD`, compression-plan dir, pin-layout JSON, Sirius config YAML. |
+| `CUDF_SO`, `PLANS`, `LAYOUT`, `CFG` | repro-kit paths | Optional patched libcudf to `LD_PRELOAD` (unset = pixi-provided, like `run.sh`), compression-plan dir, pin-layout JSON, Sirius config YAML. |
 | `SIRIUS_PRE_SQL` | `ast_jit` SET | SQL run after `LOAD`, before any pin; override for diagnosis runs (e.g. append a log-level SET). |
 
 ### Diagnostics: sanitizer sweeps and concurrency gates

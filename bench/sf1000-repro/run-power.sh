@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # TPC-H OFFICIAL power + throughput run (RF1/RF2 refresh functions) with the
-# same performance stack as run.sh: patched libcudf, ast_jit, fused scan-filter
+# same performance stack as run.sh: optional patched libcudf, ast_jit, fused scan-filter
 # + late materialization gates, and Simpatico-compressed pins from this kit's
 # plans. Reports Power@Size / Throughput@Size / QphH@Size.
 #
@@ -30,7 +30,8 @@
 # Prerequisites (see README.md for the full story):
 #   - SF1000 native .duckdb:  generate_tpch_data.sh 1000 --format duckdb
 #   - Refresh sets:           generate_tpch_refresh.sh 1000 9   (>= streams+1)
-#   - Patched libcudf:        bench/sf1000-repro/build-libcudf.sh
+#   - Optional patched libcudf (CUDF_SO=...): bench/sf1000-repro/build-libcudf.sh;
+#     unset uses the pixi-provided libcudf, like run.sh.
 #
 # Run from the repo root:  pixi run bash bench/sf1000-repro/run-power.sh
 set -euo pipefail
@@ -40,7 +41,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SF="${SF:-1000}"
 DB="${DB:-$HOME/tpch_sf${SF}.duckdb}"              # native TPC-H .duckdb
 REFRESH="${REFRESH:-$REPO/test_datasets/tpch_refresh_sf${SF}}"
-CUDF_SO="${CUDF_SO:-$HOME/cudf-src/cpp/build/libcudf.so}"
+CUDF_SO="${CUDF_SO:-}"                             # leave unset to use pixi-provided libcudf
 PLANS="${PLANS:-$HERE/plans}"
 LAYOUT="${LAYOUT:-$HERE/pin-layout-sf1000.json}"
 CFG="${CFG:-$HERE/sirius-sf1000.yaml}"
@@ -50,10 +51,13 @@ NSYS="${NSYS:-0}"                                  # 1: per-query nsys capture (
 
 [ -f "$DB" ]      || { echo "ERROR: no .duckdb at $DB (set DB=)"; exit 1; }
 [ -d "$REFRESH" ] || { echo "ERROR: no refresh sets at $REFRESH -- run generate_tpch_refresh.sh $SF 9"; exit 1; }
-[ -f "$CUDF_SO" ] || { echo "ERROR: no patched libcudf at $CUDF_SO -- run build-libcudf.sh first"; exit 1; }
 
-# LD_PRELOAD, not LD_LIBRARY_PATH (the extension's DT_RPATH wins otherwise).
-export LD_PRELOAD="$CUDF_SO"
+# LD_PRELOAD the patched libcudf only when explicitly provided; unset, the loader finds
+# libcudf via the extension's DT_RPATH (pixi env). Not LD_LIBRARY_PATH: DT_RPATH wins over it.
+if [ -n "$CUDF_SO" ]; then
+  [ -f "$CUDF_SO" ] || { echo "ERROR: CUDF_SO set but not found at $CUDF_SO"; exit 1; }
+  export LD_PRELOAD="$CUDF_SO"
+fi
 
 # QUENT=1: derive a telemetry-enabled config from $CFG. Telemetry files land in
 # $QUENT_DIR (absolute; view with `pixi run quent $QUENT_DIR`). Adds a small
@@ -79,18 +83,17 @@ fi
 # Overridable from the environment (diagnosis runs append e.g. a log-level SET).
 export SIRIUS_PRE_SQL="${SIRIUS_PRE_SQL:-SET expression_evaluator_strategy = 'ast_jit'}"
 
-# Experimental gates of the fused scan-filter / late-materialization engine
-# PRs (the PR #1409 stack). No-ops on an engine that does not read them —
-# harmless to leave exported until those PRs land.
+# Fused decode-time filtering and late materialization, same gates and defaults
+# as run.sh (see docs/super-sirius/late-materialization.md). Late-mat is inert on
+# duckdb pins (the defer policy refuses non-parquet sources) but stays on for
+# parity; fused scan-filter engages on the compressed GPU pins.
 export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
 export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
-export SIRIUS_EXP_LATE_MAT_V2="${SIRIUS_EXP_LATE_MAT_V2:-1}"
-export SIRIUS_EXP_LATE_MAT_V3="${SIRIUS_EXP_LATE_MAT_V3:-1}"
-export SIRIUS_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_LATE_MAT_PIN_UNIQUE_COLS:-all}"
+export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
 
 echo "db        : $DB"
 echo "refresh   : $REFRESH"
-echo "libcudf   : $CUDF_SO"
+echo "libcudf   : ${CUDF_SO:-<pixi-provided>}"
 echo "plans     : $PLANS"
 echo "layout    : $LAYOUT"
 echo "config    : $CFG"
@@ -142,7 +145,7 @@ if [ "$NSYS" = "1" ]; then
             nsys profile --trace=cuda,nvtx --sample=none --cudabacktrace=none
             --capture-range=cudaProfilerApi --capture-range-end=repeat::sync
             --output "$NSYS_DIR/range" --stats=false
-            env "LD_PRELOAD=$CUDF_SO" "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}")
+            env "LD_PRELOAD=${LD_PRELOAD:-}" "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}")
   EXTRA_ARGS=(--nsys-per-query)
   echo "nsys      : $NSYS_DIR"
 fi
@@ -175,14 +178,16 @@ fi
 # --warmup-pass burns one discarded pass so JIT compilation and first-touch pin
 # costs land nowhere: the clean baseline stays honest and the post-RF1 stream
 # (the one Power@Size is computed from) is steady-state.
+# `|| RC=$?` keeps a failed run from tripping `set -e` before the rollback
+# below finishes — a crashed run is exactly the one whose scratch must be restored.
+RC=0
 "${LAUNCHER[@]}" python3 test/tpch_performance/tpch_power_throughput.py \
   --sf "$SF" --input "$DB" --refresh-dir "$REFRESH" \
   --mode "$MODE" --pin gpu --pin-compression \
   --compression-plan-dir "$PLANS" \
   --pin-layout "$LAYOUT" \
   --config "$CFG" \
-  --warmup-pass "${EXTRA_ARGS[@]}" "$@"
-RC=$?
+  --warmup-pass "${EXTRA_ARGS[@]}" "$@" || RC=$?
 
 # Finish the rollback: the runner exited without closing (a clean close would
 # checkpoint the WAL into the base); dropping the WAL completes the restore.
