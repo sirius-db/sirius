@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-// Implementation of the public FFI surface (sirius_ffi.hpp). This is the one
+// Implementation of the public FFI surface (sirius/ffi.hpp). This is the one
 // translation unit that sees the heavy internal types, so consumers (e.g. the
 // Rust bindings) never include sirius_context.hpp.
 
-#include "sirius_ffi.hpp"
+#include "sirius/ffi.hpp"
 
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry

@@ -83,8 +83,8 @@ os.rename(
     f"src/{string_to_find}_extension.cpp", f"src/{string_to_replace}_extension.cpp"
 )
 os.rename(
-    f"src/include/{string_to_find}_extension.hpp",
-    f"src/include/{string_to_replace}_extension.hpp",
+    f"src/{string_to_find}_extension.hpp",
+    f"src/{string_to_replace}_extension.hpp",
 )
 
 # remove template-specific files

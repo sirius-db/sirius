@@ -5,7 +5,7 @@ Crates for driving [Sirius](https://github.com/sirius-db/sirius) from Rust
 
 | Crate | Role |
 |-------|------|
-| [`sirius-sys`](crates/sirius-sys) | Low-level [`cxx`](https://cxx.rs) bindings to Sirius's public C-ABI (`src/include/sirius_ffi.h`). |
+| [`sirius-sys`](crates/sirius-sys) | Low-level [`cxx`](https://cxx.rs) bindings to Sirius's public C-ABI (`include/sirius/ffi.hpp`). |
 | [`sirius`](crates/sirius) | Safe, idiomatic wrapper over `sirius-sys`. |
 
 (The `telemetry/*` crates are unrelated — Rust linked *into* the C++ extension via
@@ -45,7 +45,7 @@ dependency list:
 - **`--features static`** → `libsirius.a` (self-contained, no runtime deps — the
   fully static vcpkg build). Requires that bundled archive to exist.
 
-`build.rs` only needs `src/include` to compile the shim, because the bound
+`build.rs` only needs `include` to compile the shim, because the bound
 surface is the lightweight `sirius_ffi.h`. That header is the seed of the public
 C++ API `libsirius` will expose; today it is compiled into the DuckDB extension,
 which the bindings link until a dedicated `libsirius` ships (at which point the

@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -271,7 +271,7 @@ sirius:
 
 ## Executor Configuration
 
-**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
+**Files:** `src/exec/config.hpp`, `src/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
 per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
@@ -309,7 +309,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/io/uring/config.hpp`, `src/io/rest/config.hpp`, `src/io/cache/config.hpp`, `src/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -396,7 +396,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -573,7 +573,7 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -757,7 +757,7 @@ when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset
 
 ### Static flags
 
-**File:** `src/include/config.hpp`
+**File:** `src/config.hpp`
 
 Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
 
@@ -777,11 +777,11 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
+| `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

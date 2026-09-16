@@ -91,12 +91,12 @@ add_custom_command(
   OUTPUT "${EMBED_JIT_HEADERS_OUT}"
   COMMAND
     ${CMAKE_COMMAND}
-    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
     "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-          "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
@@ -171,8 +171,8 @@ target_compile_features(simpatico PUBLIC cxx_std_20)
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
   simpatico
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
-          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
           "${CUDA_CCCL_INCLUDE}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
