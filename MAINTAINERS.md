@@ -20,4 +20,4 @@
 | Dhruv Vats | NVIDIA | dhruv9vats |
 | Mike Wendt | NVIDIA | mike-wendt |
 | Bobbi Yogatama| NVIDIA | bwyogatama |
-| Xiangyao Yu | NVIDIA | yxymit |
+| Xiangyao Yu | UW-Madison, NVIDIA | yxymit |
