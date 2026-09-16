@@ -1887,6 +1887,38 @@ parquet arm drifts ~1.5%, so the ~4 s gap is well outside noise. The caveat is t
 lineitem-only dataset was deleted, so that arm could not be re-run under today's machine state —
 its numbers are single runs normalized against their own parquet arm (0.853 vs 0.895–0.909).
 
+### 6.16 Why clustering orders helps parquet and hurts `.hpln` (2026-09-16)
+
+Same question asked of parquet, one session, host-pinned, each arm against its own baseline:
+
+| parquet | suite | vs baseline |
+|---|---|---|
+| natural (no `cluster_by`) | 10.563 / 10.507 s | — |
+| `cluster_by` lineitem only | 9.895 s | −6.32% |
+| **`cluster_by` lineitem + orders** | **9.790 s** | **−6.83%** |
+
+**Parquet gains a little from clustering orders; `.hpln` loses ~0.8 s pinned and ~4 s cold (§6.15).
+Opposite signs, and §3.8 already explains it.**
+
+A parquet `cluster_by` runs at PIN time, over pin chunks the coalescer assembled by **interleaving
+row groups** — §3.8 measured that a globally sorted file still yields pin chunks spanning the whole
+key range (a one-day predicate pruned 13 of 37 chunks; 24 contained that day). So a parquet pin
+chunk's `o_orderkey` locality was **already destroyed before anything sorted it**. Clustering can
+only add date locality; there is nothing left to lose.
+
+A `.hpln` `cluster_by` runs at WRITE time over chunks filled in **file order**, so every chunk holds
+a contiguous run of `o_orderkey` — real locality, and orders is the build side of most of this
+suite's joins. Sorting by `o_orderdate` spends it.
+
+**So the rule is not a property of clustering, it is a property of what the chunk held first.**
+Cluster whatever you like in a parquet pin, because its chunks are already scrambled. In a `.hpln`,
+clustering is only free where the file's existing order is worth nothing to the workload — which
+for TPC-H means lineitem yes, orders no.
+
+This is also the strongest remaining argument for the `.hpln` layout: its chunks preserve an order
+that a parquet pin cannot, which is exactly why choosing its cluster key needs care that the
+parquet path never needed.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
