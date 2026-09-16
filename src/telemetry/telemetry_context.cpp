@@ -36,15 +36,35 @@
 
 namespace sirius::telemetry {
 
+rust::Box<quent::Context> make_quent_context(const sirius::telemetry_config& config)
+{
+  return quent::create_context([&config] {
+    if (!config.enable_quent) { return quent::ExporterOptions::none(); }
+    if (config.exporter == "ndjson") {
+      return quent::ExporterOptions::ndjson(config.output_directory);
+    }
+    if (config.exporter == "msgpack") {
+      return quent::ExporterOptions::msgpack(config.output_directory);
+    }
+    if (config.exporter == "postcard") {
+      return quent::ExporterOptions::postcard(config.output_directory);
+    }
+    throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
+  }());
+}
+
 std::shared_ptr<const telemetry_context> telemetry_context::create(
+  rust::Box<quent::Context>&& context,
   const sirius::telemetry_config& config,
   const cucascade::memory::memory_reservation_manager* manager,
   const std::vector<int>& gpu_device_ids)
 {
-  return std::shared_ptr<telemetry_context>(new telemetry_context(config, manager, gpu_device_ids));
+  return std::shared_ptr<telemetry_context>(
+    new telemetry_context(std::move(context), config, manager, gpu_device_ids));
 }
 
-telemetry_context::telemetry_context(const sirius::telemetry_config& config,
+telemetry_context::telemetry_context(rust::Box<quent::Context>&& context,
+                                     const sirius::telemetry_config& config,
                                      const cucascade::memory::memory_reservation_manager* manager,
                                      const std::vector<int>& gpu_device_ids)
   : engine_uuid_(uuid::now_v7()),
@@ -52,19 +72,7 @@ telemetry_context::telemetry_context(const sirius::telemetry_config& config,
     query_group_uuid_(uuid::now_v7()),
     shared_group_uuid_(uuid::now_v7()),
     engine_name_(config.engine_name),
-    context_(quent::create_context([&config] {
-      if (!config.enable_quent) { return quent::ExporterOptions::none(); }
-      if (config.exporter == "ndjson") {
-        return quent::ExporterOptions::ndjson(config.output_directory);
-      }
-      if (config.exporter == "msgpack") {
-        return quent::ExporterOptions::msgpack(config.output_directory);
-      }
-      if (config.exporter == "postcard") {
-        return quent::ExporterOptions::postcard(config.output_directory);
-      }
-      throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
-    }())),
+    context_(std::move(context)),
     engine_observer_(quent::engine::create_observer(*context_)),
     worker_observer_(quent::worker::create_observer(*context_)),
     query_group_observer_(quent::query_group::create_observer(*context_))

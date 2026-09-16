@@ -669,7 +669,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
 
-  config_ = config;
+  config_            = config;
+  auto quent_context = sirius::telemetry::make_quent_context(config_.get_telemetry_config());
+
   // Validate the cached topology before any downstream construction so a stub
   // topology fails loudly rather than producing zero-GPU executors silently.
   // get_hw_topology() is the only authorised source of physical GPU/NUMA discovery — never call
@@ -709,8 +711,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   std::sort(active_gpu_ids.begin(), active_gpu_ids.end());
   active_gpu_ids.erase(std::unique(active_gpu_ids.begin(), active_gpu_ids.end()),
                        active_gpu_ids.end());
-  telemetry_context_ = sirius::telemetry::telemetry_context::create(
-    config_.get_telemetry_config(), memory_manager_.get(), active_gpu_ids);
+  telemetry_context_ = sirius::telemetry::telemetry_context::create(std::move(quent_context),
+                                                                    config_.get_telemetry_config(),
+                                                                    memory_manager_.get(),
+                                                                    active_gpu_ids);
 
   if (config_.get_telemetry_config().enable_quent &&
       config_.get_telemetry_config().enable_batch_events) {
