@@ -2068,6 +2068,47 @@ format wins every cold measurement and why it used to lose the pinned suite.
 | parquet + `cluster_by` | 25.32 s | 8.853 s | — | — |
 | **`.hpln` + `cluster_by`** | **9.92 s** | **8.721 s** | **49.873 s (−15.2%)** | **795.4 GB (−16.3%)** |
 
+### 6.20 A clustered parquet dataset cannot be measured today, and the cold win is partly a reader gap (2026-09-16)
+
+Asked whether a clustered PARQUET dataset would finish the cold comparison. It would measure
+nothing, for two compounding reasons, and the second one qualifies this project's headline result.
+
+**1. Clustering inside a row group cannot change that row group's statistics.** The row group holds
+the same rows, so its min/max are identical and `filter_row_groups_with_stats` — the only pruning
+Sirius's parquet scan performs — prunes exactly as much as before, which §6 measured at **0 of
+22,560** row groups. The only mechanism that can exploit intra-row-group order is the page index.
+
+**2. Sirius reads no page index, and the datasets do not carry one.** cuDF's hybrid scan reader
+offers four pruning stages; the scan calls one:
+
+| cuDF capability | call sites in `parquet_gpu_ingestible.cpp` |
+|---|---|
+| `filter_row_groups_with_stats` | yes |
+| `setup_page_index` / `build_row_mask_with_page_index_stats` | **0** |
+| `filter_row_groups_with_dictionary_pages` | **0** |
+| `filter_row_groups_with_bloom_filters` | **0** |
+
+And `/datasets/tpch_sf1000` has `column_index_offset: None` — **no page index was ever written**.
+Note also that Sirius materializes through plain `cudf::io::read_parquet`
+(`parquet_gpu_ingestible.cpp:1089`) and uses `hybrid_scan_reader` only for the footer and row-group
+stats, so page-level pruning is not a flag: it means adopting the hybrid pipeline (row mask →
+filter column chunks → payload column chunks) in place of that call.
+
+**What it would be worth, estimated before committing to it.** q6's predicate measures 15.2%
+selective on real SF1000 data. In a shipdate-clustered row group of 1,063,968 rows the surviving
+rows are one contiguous run, so at a 20k-row page only ~9.1 of 53 pages survive — **~17% read, ~83%
+pruned**. `.hpln` measured 84% fewer bytes on q6 (5.63 GB against parquet's 35.02). **Those are the
+same number.**
+
+**So a material part of §6.18's −15.2% cold advantage is a READER gap, not a format gap.** The
+result is true of Sirius today and reproducible, but `.hpln` is being compared against a parquet
+reader with its finest pruning stage switched off and against data written without the statistics
+that stage needs. The format's durable cold advantages are narrower and should be claimed as such:
+it carries fine-grained zone maps that a reader already uses, it needs no second metadata fetch,
+and its pin is an I/O copy. "Parquet cannot prune below a row group" is NOT one of them — it can,
+via the page index, and closing that is the honest next step before quoting the cold number as a
+format comparison.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
