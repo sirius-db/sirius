@@ -1809,6 +1809,47 @@ would see the sign flip. The cluster key is a workload choice, and picking it au
 remaining open question) has to weigh what the ordering DESTROYS, not just what it enables — which
 is the part "choose the column the predicates filter on" misses.
 
+### 6.14 The sorted `.hpln`, re-measured — and SF100 had the ordering answer backwards (2026-09-16)
+
+The last globally sorted SF1000 measurement predates the transport fix, the payload alignment, the
+`l_shipmode` plan and the harness gates, and it was taken against **shipdate-sorted parquet**, which
+§6.7 later showed is parquet's worst arm. Rebuilt and re-measured against parquet's NATURAL order,
+cold, 22/22 correct, all three orderings on the same volume:
+
+| `.hpln` ordering | `.hpln` | parquet | vs parquet | bytes |
+|---|---|---|---|---|
+| natural order | 52.521 s | 56.952 s | −7.8% | 1049.9 GB |
+| **`cluster_by` (per chunk)** | **48.896 s** | 57.314 s | **−14.7%** | **823.2 GB** |
+| global `ORDER BY` | 54.706 s | 59.003 s | −7.3% | 940.7 GB |
+
+**A global sort is worth nothing net, and per-chunk `cluster_by` is twice as good.** That reverses
+what SF100 said (§6.12: global 1.124 s beat cluster 1.225 s), so **SF100 is not a safe proxy for the
+ordering decision** — at SF100 the join-derived pruning that a global sort destroys is not large
+enough to show up.
+
+Why, per query — the §6.13 trade taken to its extreme. A global sort scatters `l_orderkey` across
+chunk AND group boundaries, where `cluster_by` scatters it only within a chunk:
+
+| bytes read | natural | `cluster_by` | global sort |
+|---|---|---|---|
+| q14 (`l_shipdate`) | 51.47 GB | 1.64 GB | **0.76 GB** |
+| q15 (`l_shipdate`) | 48.66 GB | 2.59 GB | **1.90 GB** |
+| q18 (orderkey join) | 41.56 GB | 58.46 GB (+41%) | **84.06 GB (+102%)** |
+| q21 (orderkey join) | 103.49 GB | 112.31 GB (+9%) | **151.14 GB (+46%)** |
+
+The date wins keep improving (q14 reaches **0.162 s against parquet's 2.824, a 17x**), but the
+orderkey losses grow faster: q13 goes 1.869 → **5.549 s** and q18 2.461 → 4.908. `cluster_by` sits
+at the better point because it keeps **chunk-level** orderkey bounds — the row-to-chunk assignment
+is untouched — while still narrowing the groups on the date.
+
+It shows in the file too: globally sorted lineitem is **187.0 GB** against clustered **175.9 GB**,
+and the sorted PARQUET input is 223.53 GB against natural order's 177.21 GB (+26%) for identical
+rows. A global sort costs bytes before a single query runs.
+
+**Recommendation: `cluster_by` at write time is the operating point for a `.hpln`, not a global
+`ORDER BY`** — cheaper to produce (no whole-table sort), smaller on disk, and measurably faster on
+this suite.
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing
