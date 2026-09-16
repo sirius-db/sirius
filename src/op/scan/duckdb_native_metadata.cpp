@@ -475,6 +475,25 @@ void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 
 }  // namespace
 
+std::optional<std::string> unsupported_projected_type_reason(
+  const std::vector<projected_column>& projected_cols,
+  const std::vector<sirius::logical_type>& projected_types)
+{
+  if (projected_cols.empty()) { return "no projected columns"; }
+  if (projected_cols.size() != projected_types.size()) {
+    return "projected_cols and projected_types size mismatch";
+  }
+  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
+    if (projected_cols[ci].is_rowid) { continue; }
+    std::string reason;
+    if (!is_supported_logical_type(projected_types[ci], reason)) {
+      return "column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
+             reason;
+    }
+  }
+  return std::nullopt;
+}
+
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
   switch (c) {
@@ -532,24 +551,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
                      plan.viability_failure_reason);
   };
 
-  if (projected_cols.empty()) {
-    refuse("no projected columns");
+  if (auto reason = unsupported_projected_type_reason(projected_cols, projected_types)) {
+    refuse(std::move(*reason));
     return plan;
-  }
-  if (projected_cols.size() != projected_types.size()) {
-    refuse("projected_cols and projected_types size mismatch");
-    return plan;
-  }
-
-  // Type gate
-  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
-    if (projected_cols[ci].is_rowid) { continue; }
-    std::string reason;
-    if (!is_supported_logical_type(projected_types[ci], reason)) {
-      refuse("column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
-             reason);
-      return plan;
-    }
   }
 
   // GetPartitionStats touches LocalStorage/ClientContext. Runs before the
