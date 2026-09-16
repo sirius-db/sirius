@@ -616,6 +616,15 @@ bool compress_and_stage_batch(cudf::table const& tbl,
       column_sizes->compressed[b.column_index] += b.size_bytes;
     }
   }
+  // What this chunk actually costs the pin, against what it decodes to. Reported because
+  // "does one format pin more than the other" was otherwise only answerable by inference from
+  // bytes read, which is the FILE's size for a .hpln and the SOURCE's for parquet -- neither of
+  // which is the pinned footprint.
+  SIRIUS_LOG_DEBUG("[{}] pinned chunk: {} B compressed of {} B decoded, {} column(s)",
+                   log_tag,
+                   compressed_bytes,
+                   uncompressed_bytes,
+                   column_sizes->compressed.size());
 
   {
     nvtx_scoped_range stage_range{"sirius::compression::stage_payload"};

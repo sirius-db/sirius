@@ -2019,6 +2019,55 @@ ways out, in increasing order of value: lift the int32 offsets above; size chunk
 in `mk-hpln`; or let a pin re-chunk. The first is a day's work and would let lineitem chunk at
 memory limits rather than at the width of a column nobody reads.
 
+### 6.19 The int32 lift, and what a `.hpln` pin actually holds (2026-09-16)
+
+**The staging limit is lifted.** `duckdb_chunk_staging` now carries `std::int64_t` offsets and
+builds a 32-bit offsets child while the chars fit in one, a 64-bit child when they do not
+(libcudf large strings). A normal column is byte-identical to before; an oversized one is written
+rather than refused. Verified end to end: SF1000-scale partsupp at a 4 GB chunk writes 27.1M rows
+with `ps_comment` at ~3.3 G chars, and reading that column back is byte-identical to parquet
+(9,880,047,603 chars, same min/max strings). 88/88 compression tests; the wider gate is 18 failures
+against a 17-failure baseline, the extra being the documented rotating IVF-Flat ANN flake, which
+passes in isolation.
+
+**And it is worth nothing measurable here — §6.17's diagnosis was only half right.**
+
+| | before the lift | after |
+|---|---|---|
+| lineitem chunks served | 97 (vs parquet 73) | **78** (vs 73) |
+| host-pinned suite | 8.739 s | 8.721 s |
+| cold suite | 49.595 s / 790.8 GB | 49.873 s / 795.4 GB |
+
+Closing the chunk-count gap from 1.33x to 1.07x moved 0.2%, inside noise. The −1.54 s §6.17
+attributed to "matched chunking" came almost entirely from the batch SIZE change (2 GB → 8 GB,
+which moved both arms), not from the count. **Keep the lift for the constraint it removes — a
+column no query reads capping the chunking of every column that matters, which bites harder at
+larger scale or wider strings — but not on a performance claim.**
+
+**What a `.hpln` pin actually holds, and it is LESS than parquet's.** `cols=` is honoured exactly:
+the ingest reports 143.62 GB read for 143.62 GB wanted, and a lineitem pin touches 63% of the file.
+For the same 14 columns:
+
+| lineitem pin | footprint | time |
+|---|---|---|
+| parquet (re-compressed at pin) | 143.48 GB | 12.31 s |
+| **`.hpln`** (I/O copy) | **99.02 GB (−31%)** | **4.40 s (2.8x)** |
+
+The expectation going in was that `.hpln` would hold slightly MORE, from §6.11's plan inheritance.
+It holds 31% less, and that sharpens what the inheritance actually is: the file's plans are
+**size**-picked (max ratio) while a pin's are **decode**-picked (a ≥250 GB/s floor that deliberately
+spends bytes on speed). A `.hpln` pin therefore inherits a *smaller, slower-decoding* representation
+— not a worse one. That single fact explains both halves of this project's results: it is why the
+format wins every cold measurement and why it used to lose the pinned suite.
+
+**Standing at parquet's best (8 GB) config, SF1000:**
+
+| | pin | host-pinned | cold | cold bytes |
+|---|---|---|---|---|
+| parquet | 21.75 s | 9.859 s | 58.824 s | 949.8 GB |
+| parquet + `cluster_by` | 25.32 s | 8.853 s | — | — |
+| **`.hpln` + `cluster_by`** | **9.92 s** | **8.721 s** | **49.873 s (−15.2%)** | **795.4 GB (−16.3%)** |
+
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
 silently reading through `std::ifstream`. Check `hpln_source::stats().transport` before believing

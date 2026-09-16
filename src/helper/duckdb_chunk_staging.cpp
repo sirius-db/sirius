@@ -150,17 +150,12 @@ void duckdb_chunk_staging::stage_column(column_staging& s,
       auto const r = offset + i;
       if (validity.RowIsValid(r)) {
         auto const& str = string_data[r];
-        if (s.chars.size() + str.GetSize() >
-            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-          throw std::runtime_error(
-            "[duckdb_chunk_staging] string column exceeds cudf int32 offset limit");
-        }
         s.chars.insert(s.chars.end(), str.GetData(), str.GetData() + str.GetSize());
         set_valid(_num_rows + static_cast<cudf::size_type>(i));
       } else {
         s.null_count++;
       }
-      s.offsets.push_back(static_cast<std::int32_t>(s.chars.size()));
+      s.offsets.push_back(static_cast<std::int64_t>(s.chars.size()));
     }
     return;
   }
@@ -189,7 +184,7 @@ void duckdb_chunk_staging::append_null_row()
   for (std::size_t c = 0; c < _columns.size(); c++) {
     auto& s = _columns[c];
     if (s.is_varchar) {
-      s.offsets.push_back(static_cast<std::int32_t>(s.chars.size()));
+      s.offsets.push_back(static_cast<std::int64_t>(s.chars.size()));
     } else {
       s.fixed_data.insert(s.fixed_data.end(), _types[c].fixed_width_byte_size(), std::uint8_t{0});
     }
@@ -217,12 +212,30 @@ std::unique_ptr<cudf::table> duckdb_chunk_staging::build(rmm::cuda_stream_view s
     }
 
     if (s.is_varchar) {
-      auto offsets_col = std::make_unique<cudf::column>(
-        cudf::data_type{cudf::type_id::INT32},
-        _num_rows + 1,
-        to_device(s.offsets.data(), s.offsets.size() * sizeof(std::int32_t), stream, mr),
-        rmm::device_buffer{0, stream, mr},
-        0);
+      // A 32-bit offsets child while the chars fit in one, a 64-bit child when they do not --
+      // libcudf's large-strings representation. Staging kept int64 throughout and narrows here, so
+      // a normal column is byte-identical to what it was before large strings were supported and
+      // an oversized one is written rather than refused. The chunk's size is then bounded by
+      // memory, not by the widest string column in the table (CHUNK_SKIPPING_PLAN.md 6.18).
+      bool const wide =
+        s.chars.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+      std::unique_ptr<cudf::column> offsets_col;
+      if (wide) {
+        offsets_col = std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT64},
+          _num_rows + 1,
+          to_device(s.offsets.data(), s.offsets.size() * sizeof(std::int64_t), stream, mr),
+          rmm::device_buffer{0, stream, mr},
+          0);
+      } else {
+        std::vector<std::int32_t> narrow(s.offsets.begin(), s.offsets.end());
+        offsets_col = std::make_unique<cudf::column>(
+          cudf::data_type{cudf::type_id::INT32},
+          _num_rows + 1,
+          to_device(narrow.data(), narrow.size() * sizeof(std::int32_t), stream, mr),
+          rmm::device_buffer{0, stream, mr},
+          0);
+      }
       columns.push_back(
         cudf::make_strings_column(_num_rows,
                                   std::move(offsets_col),
