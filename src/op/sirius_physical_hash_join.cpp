@@ -169,11 +169,7 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
                                                     cudf::null_equality compare_nulls,
                                                     rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return cudf::filtered_join(right_keys, compare_nulls, stream);
-#else
-  return cudf::filtered_join(right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Heap-allocated variant for BUILD_PROBE mode, where one filtered_join is built once on the right
@@ -183,12 +179,7 @@ static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
   cudf::null_equality compare_nulls,
   rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return std::make_unique<cudf::filtered_join>(right_keys, compare_nulls, stream);
-#else
-  return std::make_unique<cudf::filtered_join>(
-    right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Build the semi-join hash table on the left/output side and probe with the (larger) right side.
