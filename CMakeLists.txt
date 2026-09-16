@@ -587,9 +587,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_include_directories(
     ${_target}
-    PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-      $<INSTALL_INTERFACE:include>
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+           $<INSTALL_INTERFACE:include>
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
@@ -726,6 +725,7 @@ install(
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
 install(DIRECTORY include/sirius DESTINATION include)
+install(FILES include/sirius_extension.hpp DESTINATION include)
 
 if(ENABLE_STREAM_CHECK)
   message(

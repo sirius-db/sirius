@@ -2,9 +2,9 @@
 # #includes, as raw-string literals, so a binary distribution needs no simpatico
 # source tree on disk. Invoked via `cmake -P` from an add_custom_command.
 #
-# Inputs (passed with -D): IN_STDINT  path to src/codegen/stdint_shim.hpp
-# IN_RLE     path to src/codegen/decode/rle_block.cuh OUT        path of the
-# header to generate
+# Inputs (passed with -D): IN_STDINT  path to src/codegen/stdint_shim.hpp IN_RLE
+# path to src/codegen/decode/rle_block.cuh OUT        path of the header to
+# generate
 #
 # The embedded contents are handed to nvrtcCreateProgram() as named in-memory
 # headers, so the include NAMES below must match the `#include "..."` strings
