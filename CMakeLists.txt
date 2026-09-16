@@ -698,9 +698,8 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(
-  sirius_shared
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  sirius_shared PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
