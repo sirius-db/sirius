@@ -29,6 +29,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -36,6 +37,7 @@
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -56,6 +58,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -72,17 +75,15 @@ namespace {
 
 struct pool_mr_guard {
   rmm::mr::cuda_async_memory_resource mr{};
-  rmm::device_async_resource_ref previous{rmm::mr::get_current_device_resource_ref()};
-  bool installed = false;
+  std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>> previous;
 
   void install()
   {
-    rmm::mr::set_current_device_resource_ref(mr);
-    installed = true;
+    previous.emplace(cudf::set_current_device_resource(rmm::device_async_resource_ref{mr}));
   }
   ~pool_mr_guard()
   {
-    if (installed) rmm::mr::set_current_device_resource_ref(previous);
+    if (previous) { cudf::set_current_device_resource(std::move(*previous)); }
   }
 };
 
