@@ -1969,7 +1969,7 @@ used the 2 GB config and understates both formats.**
 
 **Then size the `.hpln` chunks to match.** §6.17 showed the pin served 387 chunks against parquet's
 297 because a chunk is sized over the whole row while a parquet batch is sized over the columns it
-pins. The fix is capped by cuDF's 2^31 string-chars limit, applied to a column no query reads:
+pins. The fix is capped by an int32 string-offset limit applied to a column no query reads — **ours, not cuDF's** (see below):
 
 | table | widest string | cap | max chunk | used |
 |---|---|---|---|---|
@@ -1994,10 +1994,30 @@ Note the pin gap WIDENS as batches grow: parquet's clustered pin costs 25.32 s a
 9.66 s, because clustering a parquet pin sorts every batch at pin time while a `.hpln` was sorted
 once at write.
 
-**Still unmatched, and structural:** `.hpln` serves ~97 lineitem chunks against parquet's ~73 even
-at 8 GB, because the cap above is set by a column no query reads. The durable fixes are for
-`mk-hpln` to size chunks over a projection, or for the format to let a pin re-chunk — both of which
-would remove the last measured disadvantage rather than work around it.
+**The cap is SELF-IMPOSED and liftable (2026-09-16).** It is not cuDF's:
+`src/helper/duckdb_chunk_staging.cpp:148-163` accumulates `std::int32_t` offsets and throws
+`"string column exceeds cudf int32 offset limit"`, then builds the column with an explicit
+`cudf::data_type{INT32}` offsets child. This repo is on **libcudf 26.06**; large strings with
+64-bit offsets landed in 24.08 and have been the default since ~24.12. The fix is local to that
+file — int64 offsets (or promotion past the threshold) into `make_strings_column`; the decode side
+only needs matching work if a query actually READS such a column, and none here do.
+
+**Parquet never meets it for two separate reasons:** a parquet PIN stages only the pinned column
+union, so `l_comment`/`ps_comment` never enter a batch; and the parquet READ path goes through
+cuDF's own reader, never through `duckdb_chunk_staging`, which exists only for the DuckDB→cudf COPY
+the `.hpln` writer uses.
+
+**Correction to the record.** §6.18 above and the earlier note both called this "cuDF's 2^31
+limit". The source was a memory note reading "most likely ... overflowing cuDF's 2^31 string-chars
+limit" — a hypothesis, repeated as fact. That note also recorded partsupp being "killed every time
+(3/3)" at 4 GB, and *killed* is an OOM signal, not this exception: today's generation was
+OOM-killed at **2 GB**, the size the note says works. Two different failure modes were conflated,
+and only one of them is this limit.
+
+**Still unmatched:** `.hpln` serves ~97 lineitem chunks against parquet's ~73 even at 8 GB. Three
+ways out, in increasing order of value: lift the int32 offsets above; size chunks over a PROJECTION
+in `mk-hpln`; or let a pin re-chunk. The first is a day's work and would let lineitem chunk at
+memory limits rather than at the width of a column nobody reads.
 
 **Three sweeps in this project have now measured nothing because the machinery was not in the
 path** — `fadvise_entries`, `uring_n_reactors`, `max_bytes_in_flight` — all against a scan that was
