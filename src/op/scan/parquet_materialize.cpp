@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <future>
 #include "op/scan/parquet_materialize.hpp"
 
 #include "io/io_context.hpp"
@@ -82,7 +83,22 @@ struct fetched_chunks {
 /// request, so a split costs one round trip per file rather than one per chunk.
 /// That is the whole point of the bulk route against an object store, where
 /// every extra request is another round trip.
-fetched_chunks fetch_chunks(parquet_source const& src,
+/// A source's chunks with their read still in flight.  Splitting issue from wait
+/// is what lets a multi-file split have every file's ranges outstanding at once:
+/// fetching file-by-file bounded in-flight depth to ONE file's ranges (measured
+/// ~34 concurrent requests), which is far short of what a 100 Gbit link needs.
+///
+/// The spans are filled at issue time deliberately -- they name device pointers,
+/// which are valid as soon as the buffers are allocated and do not depend on the
+/// data having arrived.  Only the bytes need the wait.
+struct pending_chunks {
+  fetched_chunks chunks;
+  std::future<std::size_t> done;
+};
+
+/// Allocate this source's chunk buffers and START its vectored read. The caller
+/// must wait on @c done before touching the data.
+pending_chunks issue_chunks(parquet_source const& src,
                             cudf::io::parquet_reader_options const& options,
                             std::span<cudf::io::text::byte_range_info const> ranges,
                             rmm::cuda_stream_view stream,
@@ -110,16 +126,28 @@ fetched_chunks fetch_chunks(parquet_source const& src,
                        static_cast<std::uint8_t*>(out.buffers[i].data()));
   }
 
-  {
-    CTRACK_NAME("materialize_parquet::bulk::read");
-    std::ignore = src.datasource->device_read_ranges_async(reads, stream).get();
-  }
+  pending_chunks pending;
+  pending.done = src.datasource->device_read_ranges_async(reads, stream);
 
   out.spans.reserve(out.buffers.size());
   for (auto const& buf : out.buffers) {
     out.spans.emplace_back(static_cast<std::uint8_t const*>(buf.data()), buf.size());
   }
-  return out;
+  pending.chunks = std::move(out);
+  return pending;
+}
+
+/// Issue and wait: the single-source path, where there is nothing to overlap.
+fetched_chunks fetch_chunks(parquet_source const& src,
+                            cudf::io::parquet_reader_options const& options,
+                            std::span<cudf::io::text::byte_range_info const> ranges,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr)
+{
+  auto pending = issue_chunks(src, options, ranges, stream, mr);
+  CTRACK_NAME("materialize_parquet::bulk::read");
+  std::ignore = pending.done.get();
+  return std::move(pending.chunks);
 }
 
 /// Ranges for source @p i, or an empty span when the caller supplied none.
@@ -172,8 +200,26 @@ std::unique_ptr<cudf::table> materialize_bulk(
   metadatas.reserve(sources.size());
   rg_per_src.reserve(sources.size());
 
+  // Issue EVERY source's read before waiting on any of them. Fetching per source
+  // serialised the split: file i+1's ranges were not even submitted until file i
+  // had fully landed, so the backend never saw more than one file's worth of
+  // requests at a time. Peak device memory is unchanged -- every source's buffers
+  // were already held until the decode either way.
+  std::vector<pending_chunks> pending;
+  pending.reserve(sources.size());
   for (std::size_t i = 0; i < sources.size(); ++i) {
-    auto chunks = fetch_chunks(sources[i], options, ranges_for(ranges, i), stream, mr);
+    pending.push_back(issue_chunks(sources[i], options, ranges_for(ranges, i), stream, mr));
+  }
+
+  {
+    CTRACK_NAME("materialize_parquet::bulk::read");
+    for (auto& p : pending) {
+      std::ignore = p.done.get();
+    }
+  }
+
+  for (std::size_t i = 0; i < sources.size(); ++i) {
+    auto& chunks = pending[i].chunks;
     spans.insert(spans.end(), chunks.spans.begin(), chunks.spans.end());
     // Moving a device_buffer keeps its device pointer, so the spans stay valid;
     // the buffers just have to outlive the decode.
