@@ -98,8 +98,11 @@ class duckdb_chunk_staging {
   /// the sources feeding this are either small (VALUES) or bounded by one chunk, so neither a
   /// pinned allocation nor the IO machinery is warranted.
   struct column_staging {
-    std::vector<std::uint8_t> fixed_data;        // fixed-width payload
-    std::vector<std::int32_t> offsets;           // varchar: num_rows + 1 entries
+    std::vector<std::uint8_t> fixed_data;  // fixed-width payload
+    /// varchar: num_rows + 1 entries. int64 because a chunk's chars may exceed INT32_MAX; the
+    /// column is built with a 32-bit offsets child when it fits and a 64-bit one when it does not
+    /// (libcudf large strings), so the common case is byte-identical to what it always was.
+    std::vector<std::int64_t> offsets;
     std::vector<char> chars;                     // varchar payload
     std::vector<cudf::bitmask_type> mask_words;  // cudf validity bitmask (1 = valid)
     cudf::size_type null_count = 0;
