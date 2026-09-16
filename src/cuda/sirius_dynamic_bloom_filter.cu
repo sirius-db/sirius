@@ -280,9 +280,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
             target, detail::tracked_replica_allocation_bytes(bytes), stream);
           if (!reservation) { return std::unique_ptr<bloom_replica>{}; }
 
-          auto destination_bloom = make_bloom<filter_type>(source_bloom->block_extent(),
-                                                           reservation->allocator(),
-                                                           cuda::stream_ref{stream.value()});
+          auto destination_bloom = make_bloom<filter_type>(
+            source_bloom->block_extent(), reservation->allocator(), cuda::stream_ref{stream.get()});
           auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
           auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
           copy_filter_storage(*source_bloom,

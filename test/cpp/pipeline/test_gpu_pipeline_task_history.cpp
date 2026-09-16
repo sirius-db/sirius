@@ -39,6 +39,8 @@
 #include <rmm/device_buffer.hpp>
 #include <rmm/error.hpp>
 
+#include <cuda/stream>
+
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -142,8 +144,7 @@ class fake_compressed_representation : public sirius::simpatico_compressed_repre
   {
     return uncompressed_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view) override
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
   {
     return nullptr;
   }
@@ -166,8 +167,7 @@ class fake_noncompressed_representation : public cucascade::idata_representation
   {
     return logical_;
   }
-  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view) override
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(::cuda::stream_ref) override
   {
     return nullptr;
   }

@@ -2357,7 +2357,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
     auto publish_stream = ms->acquire_stream();
     if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
-      auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
+      auto const status = cudaStreamWaitEvent(publish_stream.get(), writer_event, 0);
       if (status != cudaSuccess) {
         throw std::runtime_error(
           std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "
