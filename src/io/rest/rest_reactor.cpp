@@ -1262,8 +1262,67 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       request.op->staging_owner = std::shared_ptr<allocation_type>(std::move(allocation));
     };
 
+    // Serve `run` leading contiguous slices of @p group with one read. Adjacent
+    // slices otherwise become adjacent GETs, and against an object store a GET
+    // costs its round trip until the range reaches a few MB. Returns false if the
+    // run is not fusable, leaving the per-slice path below to handle it.
+    auto make_fused_operation = [&](grouped_io_request& group, std::size_t run) -> bool {
+      auto const head = group.front().rng;
+      std::size_t lo = head.offset, hi = head.offset + head.size;
+      for (std::size_t i = 0; i < run; ++i) {
+        auto const& sl = group.slice_at(i);
+        // Only staged device reads fuse: their host side is reactor-owned, so one
+        // staging allocation backs every constituent. A caller-owned host
+        // destination would have to be scattered into, which this does not do.
+        if (!sl.is_staged() || !sl.has_device_request()) return false;
+        lo = std::min(lo, sl.rng.offset);
+        hi = std::max(hi, sl.rng.offset + sl.rng.size);
+      }
+      auto const* file = dynamic_cast<rest_io_object const*>(group.obj.get());
+      if (file == nullptr) return false;
+      if (hi > file->size()) hi = file->size();
+      if (hi <= lo) return false;
+
+      auto op         = std::make_unique<io_op_request>();
+      op->obj         = group.obj;
+      op->io_rng      = range{lo, hi - lo};
+      op->coordinator = group.coordinator;
+      // iovecs stay empty; allocate_staging binds them to the staging blocks.
+
+      std::size_t logical = 0;
+      for (std::size_t i = 0; i < run; ++i) {
+        auto slice = group.take_front();
+        logical += slice.size();
+        auto copy = std::make_unique<device_cpy_request>(
+          device_cpy_request{slice.rng, slice.d_buffer, slice.d_buffer.device_id});
+        if (i == 0) {
+          op->device_copy = std::move(copy);
+          op->on_complete = std::move(slice.on_complete);
+        } else {
+          op->fused_extra.push_back(
+            fused_constituent{std::move(copy), std::move(slice.on_complete), {}});
+        }
+      }
+
+      auto request           = std::make_unique<rest_io_op_request>();
+      request->object        = file->get_object_ref();
+      request->needs_staging = true;
+      request->logical_bytes = logical;
+      request->op            = std::move(op);
+      // Credited once per logical slice and settled `run` times, so no add_tasks.
+      pending.push_back(std::move(request));
+      return true;
+    };
+
     auto expand_active = [&](std::size_t free_connections) {
       if (active_group == nullptr || active_group->empty()) return;
+      // Capped at the same ceiling a split physical plan uses.
+      if (auto const run = active_group->leading_run(rest_max_segment_bytes); run > 1) {
+        if (make_fused_operation(*active_group, run)) {
+          if (active_group->empty()) { active_group.reset(); }
+          return;
+        }
+      }
       auto slice            = active_group->take_front();
       auto const slice_size = slice.size();
       try {
