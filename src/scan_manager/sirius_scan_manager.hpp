@@ -699,15 +699,13 @@ class sirius_scan_manager {
     duckdb::vector<duckdb::ColumnIndex> const* requested_ids  = nullptr,
     duckdb::vector<duckdb::LogicalType> const* returned_types = nullptr) const;
 
-  /// Find a same-name pin for an older table incarnation when no later checkpoint
-  /// proves that a fresh disk read is safe. An unknown checkpoint iteration is
-  /// treated as unsafe.
+  /// Find a same-name pin for an older table incarnation: same qualified name,
+  /// different catalog object id. Used to report a superseded pin, never to serve.
   [[nodiscard]] std::optional<std::string> pinned_entry_name_for_superseded_duckdb_table(
     std::string_view catalog_name,
     std::string_view schema_name,
     std::string_view table_name,
-    duckdb::idx_t table_oid,
-    std::optional<std::uint64_t> current_checkpoint_iteration) const;
+    duckdb::idx_t table_oid) const;
 
   /// The pinned entry whose parquet identity matches @p resolved_file_paths
   /// (cache_entry_info::matches_parquet_files), or nullptr. Non-owning; obtain

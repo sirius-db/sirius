@@ -2628,20 +2628,13 @@ std::optional<std::string> sirius_scan_manager::pinned_entry_name_for_superseded
   std::string_view catalog_name,
   std::string_view schema_name,
   std::string_view table_name,
-  duckdb::idx_t table_oid,
-  std::optional<std::uint64_t> current_checkpoint_iteration) const
+  duckdb::idx_t table_oid) const
 {
   for (auto const& [name, entry] : _pinned_entries) {
-    if (!entry.cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) ||
-        entry.cache_info.table_oid == table_oid) {
-      continue;
+    if (entry.cache_info.matches_duckdb_table_name(catalog_name, schema_name, table_name) &&
+        entry.cache_info.table_oid != table_oid) {
+      return name;
     }
-    // A later checkpoint makes the fresh disk read safe.
-    if (entry.mvcc != nullptr && current_checkpoint_iteration.has_value() &&
-        entry.mvcc->checkpoint_iteration != *current_checkpoint_iteration) {
-      continue;
-    }
-    return name;
   }
   return std::nullopt;
 }
