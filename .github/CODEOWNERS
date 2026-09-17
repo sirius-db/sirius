@@ -8,15 +8,12 @@
 # Teams follow the pattern: @sirius-db/sirius-<component|language>
 
 # ── Core (Planner, Executors & Operators/Expressions) ─────────────────────────
-include/sirius/                     @sirius-db/sirius-core
-include/sirius_extension.hpp        @sirius-db/sirius-core
+include/                            @sirius-db/sirius-core
 src/*.cpp                           @sirius-db/sirius-core
 src/*.hpp                           @sirius-db/sirius-core
 src/creator/                        @sirius-db/sirius-core
 src/common/                         @sirius-db/sirius-core
 src/cudf/                           @sirius-db/sirius-core
-src/pipeline/                       @sirius-db/sirius-core
-src/planner/                        @sirius-db/sirius-core
 src/pipeline/                       @sirius-db/sirius-core
 src/planner/                        @sirius-db/sirius-core
 src/**/cuda/                        @sirius-db/sirius-core

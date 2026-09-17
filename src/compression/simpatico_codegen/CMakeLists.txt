@@ -73,8 +73,7 @@ else()
   )
 endif()
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
-                    ${_SIMPATICO_INCLUDE_DIRS})
+include_directories(${_SIMPATICO_INCLUDE_DIRS})
 
 add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
@@ -182,8 +181,8 @@ target_compile_definitions(
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
   simpatico
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+          "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
           "${CUDA_CCCL_INCLUDE}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.

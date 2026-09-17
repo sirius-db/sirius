@@ -46,7 +46,7 @@ dependency list:
   fully static vcpkg build). Requires that bundled archive to exist.
 
 `build.rs` only needs `include` to compile the shim, because the bound
-surface is the lightweight `sirius_ffi.h`. That header is the seed of the public
+surface is the lightweight `sirius/ffi.hpp`. That header is the seed of the public
 C++ API `libsirius` will expose; today it is compiled into the DuckDB extension,
 which the bindings link until a dedicated `libsirius` ships (at which point the
 symlink stopgap is no longer used).
