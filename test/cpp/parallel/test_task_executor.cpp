@@ -21,6 +21,8 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
+#include <sched.h>
+
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -93,6 +95,19 @@ TEST_CASE("Executor can start and stop gracefully", "[task_executor]")
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
+}
+
+TEST_CASE("Executor affinity startup failure leaves stop destruction and retry safe",
+          "[task_executor][cpu_affinity]")
+{
+  sirius::exec::thread_pool_config config{1, "invalid_affinity", {CPU_SETSIZE}};
+  dummy_task_executor executor(config);
+
+  CHECK_THROWS_WITH(executor.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(executor.stop());
+  // A poisoned _running flag would turn this retry into a silent no-op.
+  CHECK_THROWS_WITH(executor.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(executor.stop());
 }
 
 TEST_CASE("Executor executes scheduled tasks", "[task_executor]")

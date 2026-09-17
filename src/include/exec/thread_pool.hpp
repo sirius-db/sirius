@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "exec/cpu_affinity.hpp"
+#include "exec/thread_pool_startup.hpp"
 #include "log/logging.hpp"
 
 #include <absl/functional/any_invocable.h>
@@ -23,7 +25,6 @@
 #include <concepts>
 #include <condition_variable>
 #include <exception>
-#include <latch>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -40,48 +41,26 @@ class static_thread_pool {
                               std::vector<int> cpu_ids                            = {},
                               absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
   {
+    validated_cpu_affinity const affinity(cpu_ids);
     threads_.reserve(num_threads);
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    std::for_each(
-      cpu_ids.begin(), cpu_ids.end(), [&cpuset](int cpu_id) { CPU_SET(cpu_id, &cpuset); });
-
-    std::unique_ptr<std::latch> init_latch;
-    if (per_thread_init) { init_latch = std::make_unique<std::latch>(num_threads); }
-
     auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
-    auto* latch_ptr   = init_latch.get();
-
-    for (int i = 0; i < num_threads; ++i) {
-      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
-        if (init_fn_ptr) {
-          (*init_fn_ptr)();
-          latch_ptr->count_down();
-        }
-        work_loop();
-      });
-      if (!name.empty()) {
-        pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
-      }
-      if (!cpu_ids.empty()) {
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
-      }
-    }
-
-    if (init_latch) { init_latch->wait(); }
+    detail::start_thread_pool_workers(
+      threads_,
+      num_threads,
+      name,
+      [affinity, init_fn_ptr] {
+        affinity.apply_to_current_thread();
+        if (init_fn_ptr) { (*init_fn_ptr)(); }
+      },
+      [this] { work_loop(); },
+      [this] { stop(); });
   }
 
   static_thread_pool(const static_thread_pool&)            = delete;
   static_thread_pool& operator=(const static_thread_pool&) = delete;
 
-  ~static_thread_pool()
-  {
-    stop();
-    for (auto& t : threads_) {
-      if (t.joinable()) { t.join(); }
-    }
-  }
+  ~static_thread_pool() { stop_and_join(); }
 
   void schedule(std::invocable auto&& fn)
   {
@@ -113,6 +92,14 @@ class static_thread_pool {
   }
 
  private:
+  void stop_and_join() noexcept
+  {
+    stop();
+    for (auto& t : threads_) {
+      if (t.joinable()) { t.join(); }
+    }
+  }
+
   [[nodiscard]] bool has_work_or_stopped() const { return !queue_.empty() || stop_requested_; }
 
   void work_loop()

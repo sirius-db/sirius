@@ -39,6 +39,8 @@
 
 #include <rmm/cuda_stream.hpp>
 
+#include <sched.h>
+
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -151,6 +153,25 @@ TEST_CASE("Downgrade executor starts and stops cleanly", "[downgrade_executor]")
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
+}
+
+TEST_CASE("Downgrade affinity startup failure leaves stop destruction and retry safe",
+          "[downgrade_executor][cpu_affinity]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  sirius::data::data_repository_manager_registry repo_registry;
+  sirius::exec::downgrade_executor_config config{
+    .thread_pool    = {.num_threads        = 1,
+                       .thread_name_prefix = "invalid_affinity",
+                       .cpu_affinity_list  = {CPU_SETSIZE}},
+    .monitor_period = std::chrono::milliseconds{0}};
+  downgrade_executor executor(config, repo_registry, GPU_SPACE_ID, gpu_space, *mem_mgr);
+
+  CHECK_THROWS_WITH(executor.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(executor.stop());
+  CHECK_THROWS_WITH(executor.start(), Catch::Contains("CPU_SETSIZE"));
+  CHECK_NOTHROW(executor.stop());
 }
 
 TEST_CASE("request_free_memory_and_wait with no repositories returns 0", "[downgrade_executor]")
