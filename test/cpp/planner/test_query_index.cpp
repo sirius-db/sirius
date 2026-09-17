@@ -57,10 +57,10 @@ struct test_operator : sirius_physical_operator {
 class dag_builder {
  public:
   // Add a pipeline labelled `id`; each pipeline gets a single source+sink operator of `type`.
-  duckdb::shared_ptr<sirius_pipeline> add(
+  std::shared_ptr<sirius_pipeline> add(
     int id, SiriusPhysicalOperatorType type = SiriusPhysicalOperatorType::PROJECTION)
   {
-    auto pipeline = duckdb::make_shared_ptr<sirius_pipeline>(_ctx);
+    auto pipeline = std::make_shared<sirius_pipeline>(_ctx);
     auto op       = std::make_unique<test_operator>(type);
     op->set_pipeline(pipeline);
     _bs.set_pipeline_source(*pipeline, *op);
@@ -73,8 +73,8 @@ class dag_builder {
 
   // Wire a data-flow edge from -> to carrying `barrier`, pushed into port `port_name` on the
   // consumer (auto-generated when empty; use "build"/"default" to model hash-join sides).
-  void connect(const duckdb::shared_ptr<sirius_pipeline>& from,
-               const duckdb::shared_ptr<sirius_pipeline>& to,
+  void connect(const std::shared_ptr<sirius_pipeline>& from,
+               const std::shared_ptr<sirius_pipeline>& to,
                MemoryBarrierType barrier,
                const std::string& port_name = "")
   {
@@ -98,7 +98,7 @@ class dag_builder {
   // Numbers the DAG before handing it out, mirroring sirius_engine: query_index keys its
   // branch map on operator ids, so they must be stamped first. Idempotent — operators
   // already numbered keep their id.
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines()
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines()
   {
     sirius::pipeline::assign_operator_ids(_pipelines);
     return _pipelines;
@@ -124,7 +124,7 @@ class dag_builder {
   std::vector<std::unique_ptr<test_operator>> _ops;
   std::deque<std::string> _names;  // stable storage backing the port-name string_views
   std::unordered_map<sirius_pipeline*, int> _ids;
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> _pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> _pipelines;
 };
 
 bool contains(const std::vector<std::vector<int>>& all, const std::vector<int>& one)
@@ -217,7 +217,7 @@ TEST_CASE("query_index barrier_order with a partial barrier also extends", "[que
 namespace {
 struct join_dag {
   dag_builder b;
-  duckdb::shared_ptr<sirius_pipeline> probe, build, join, tail;
+  std::shared_ptr<sirius_pipeline> probe, build, join, tail;
   join_dag()
   {
     probe = b.add(1);
