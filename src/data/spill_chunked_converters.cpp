@@ -19,6 +19,8 @@
 #include "data/chunked_spill_copy.hpp"
 #include "log/logging.hpp"
 
+#include <absl/cleanup/cleanup.h>
+
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -279,12 +281,17 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   auto mr = target_memory_space
               ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   auto allocation = mr->allocate_multiple_blocks(total_size, reservation);
+  bool copies_pending          = false;
+  absl::Cleanup sync_on_failure = [&]() noexcept {
+    if (copies_pending) { stream.synchronize_no_throw(); }
+  };
 
   // Pass 3: collect D2H ops, flushing every ~chunk_bytes as the tree is walked.
   std::vector<void*> dsts;
   std::vector<const void*> srcs;
   std::vector<std::size_t> sizes;
   chunked_copy_batcher batcher(chunk_bytes, [&](std::span<const copy_op> ops) {
+    copies_pending = true;
     submit_chunk(ops, stream, dsts, srcs, sizes);
   });
   for (cudf::size_type i = 0; i < view.num_columns(); ++i) {
@@ -293,6 +300,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   }
   batcher.flush_pending();
   stream.synchronize();
+  copies_pending = false;
 
   auto host_alloc = cucascade::memory::host_table_allocation::create(
     std::move(allocation), std::move(columns), total_size);
@@ -312,8 +320,7 @@ void register_chunked_spill_converters(cucascade::representation_converter_regis
       "monolithic GPU->HOST converter");
     return;
   }
-  // register_converter throws on duplicate keys, so drop the existing registration first. This
-  // also makes the call idempotent across context re-initializations.
+  // register_converter throws on duplicate keys, so drop the existing registration first.
   registry.unregister_converter<cucascade::gpu_table_representation,
                                 cucascade::host_data_representation>();
   registry

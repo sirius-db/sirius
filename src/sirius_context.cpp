@@ -19,7 +19,6 @@
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "data/spill_chunked_converters.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -821,14 +820,6 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   // Managers are created per execution window (begin_execution_window), not here; the registry
   // starts empty and only ever holds entries for in-flight queries.
-
-  // Swap the builtin GPU->HOST spill converter for the chunked one before any executor can
-  // spill. Done here rather than at converter_registry::initialize() because the chunk size
-  // comes from the loaded config, which does not exist yet at extension load.
-  if (sirius::converter_registry::is_initialized()) {
-    sirius::spill::register_chunked_spill_converters(
-      sirius::converter_registry::get(), config_.get_downgrade_executor_config().copy_chunk_bytes);
-  }
 
   // Create one downgrade executor per GPU memory space BEFORE task_scheduler,
   // so pointers are available for injection into gpu_pipeline_executors.
@@ -1708,6 +1699,8 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
     config_.apply_defaults();
   }
 
+  sirius::converter_registry::initialize(
+    config_.get_downgrade_executor_config().copy_chunk_bytes);
   context_ = duckdb::make_shared_ptr<SiriusContext>();
   context_->initialize(config_);
 }

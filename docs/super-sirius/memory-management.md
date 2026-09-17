@@ -120,7 +120,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 **Byte-targeted requests** (`downgrade_request::target_bytes`, set by monitor requests and `request_free_memory`) additionally stop dispatching once the *planned* bytes (freed + in-flight) cover the target, bounding overshoot to less than one batch regardless of pool width, and right-size the final pick per repository (`spill_policy.hpp`: smallest candidate that still covers the remaining deficit, ties in policy order). Together these keep a marginal overflow from evicting a whole extra multi-GB partition — the q9-class partition-spill cliff, where +0.1% of input rows doubled the spilled set and its host round-trips.
 
-**Monitor spill sizing** (`overflow_proportional_spill`, default true): a monitor-issued request stops as soon as live pressure drops back below the *trigger* threshold, so each episode spills roughly the overflow rather than force-flushing the entire trigger→stop band (several GB on a large card). Set it to false in `executor.downgrade` to restore the historical band-flush behavior.
+**Monitor spill sizing:** crossing the *trigger* threshold starts a monitor-issued request sized to reach the *stop* threshold. The request also observes live pressure and stops once usage reaches that threshold, preserving the trigger→stop hysteresis band.
 
 **Pipeline integration:** When `gpu_pipeline_executor` gets a partial memory reservation (shortfall), it issues a single `request_downgrade(predicate)` where the predicate attempts `make_reservation_or_null(bytes_needed)`. The downgrade stops as soon as the reservation succeeds -- single request, no over-freeing.
 

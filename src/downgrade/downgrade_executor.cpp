@@ -22,6 +22,7 @@
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
 
+#include <absl/cleanup/cleanup.h>
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
@@ -207,25 +208,44 @@ void downgrade_executor::processing_loop()
     // Workers evaluate the predicate after each conversion; evaluating it before each dispatch
     // too means a request already satisfied by other means (the caller's reservation landing,
     // the running query freeing memory) spills nothing at all instead of at least one batch.
-    auto predicate_satisfied = [&req]() {
-      if (req->satisfied.load(std::memory_order_acquire)) { return true; }
-      if (req->predicate && req->predicate()) {
-        req->satisfied.store(true, std::memory_order_release);
-        return true;
+    auto predicate_satisfied = [](downgrade_request* req_ptr) noexcept {
+      if (req_ptr->satisfied.load(std::memory_order_acquire)) { return true; }
+      try {
+        if (req_ptr->predicate && req_ptr->predicate()) {
+          req_ptr->satisfied.store(true, std::memory_order_release);
+          return true;
+        }
+      } catch (const std::exception& e) {
+        try {
+          SIRIUS_LOG_ERROR("[downgrade] predicate evaluation failed: {}", e.what());
+        } catch (...) {
+        }
+      } catch (...) {
+        try {
+          SIRIUS_LOG_ERROR("[downgrade] predicate evaluation failed");
+        } catch (...) {
+        }
       }
       return false;
     };
 
-    // Bytes dispatched (freed or still in flight) toward the request's byte target. Stopping on
-    // the planned set rather than on completed conversions bounds overshoot to one batch; the
-    // predicate alone only flips once a conversion COMPLETES, so overshoot scaled with
-    // (pool width) x (batch size). A conversion that later fails leaves the request
-    // under-delivered, which is safe: callers treat the result as best-effort and the monitor
-    // re-fires while pressure persists.
-    std::size_t planned_bytes = 0;
-    auto target_reached       = [&req, &planned_bytes]() {
-      return req->target_bytes.has_value() && planned_bytes >= *req->target_bytes;
+    // Bytes freed or still in flight toward the request's byte target. Failed conversions remove
+    // their contribution so another candidate can be attempted.
+    std::atomic<std::size_t> planned_bytes{0};
+    auto target_reached = [&req, &planned_bytes]() {
+      return req->target_bytes.has_value() &&
+             planned_bytes.load(std::memory_order_relaxed) >= *req->target_bytes;
     };
+    auto target_completed = [&req]() {
+      return req->target_bytes.has_value() &&
+             req->bytes_freed.load(std::memory_order_relaxed) >= *req->target_bytes;
+    };
+    auto wait_if_target_reached =
+      [this, &req, &predicate_satisfied, &target_reached, &target_completed]() {
+        if (!target_reached()) { return false; }
+        _pool->wait_all();
+        return predicate_satisfied(req.get()) || target_completed();
+      };
 
     // === TIER 1: Data repositories ===
     // Memory pressure is a global condition, so candidates are drawn from EVERY in-flight
@@ -249,10 +269,10 @@ void downgrade_executor::processing_loop()
     bool pool_interrupted = false;
     auto const managers   = _data_repo_registry.get_all();
     for (auto const& manager : std::views::reverse(managers)) {
-      if (req->satisfied.load() || pool_interrupted || target_reached()) break;
+      if (req->satisfied.load() || pool_interrupted || target_completed()) break;
       auto repos = manager->get_repositories();
       for (auto* repo : repos) {
-        if (req->satisfied.load() || target_reached()) break;
+        if (req->satisfied.load() || target_completed()) break;
 
         convertible_data_batch_provider provider(repo);
         auto candidates = provider.get_all_convertible(
@@ -268,11 +288,11 @@ void downgrade_executor::processing_loop()
         std::vector<bool> already_dispatched(candidates.size(), false);
 
         for (std::size_t n = 0; n < candidates.size(); ++n) {
-          if (predicate_satisfied() || target_reached()) break;
+          if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
 
           std::optional<std::size_t> remaining;
           if (req->target_bytes.has_value()) {
-            remaining = *req->target_bytes - planned_bytes;  // target_reached() was false
+            remaining = *req->target_bytes - planned_bytes.load(std::memory_order_relaxed);
           }
           auto const pick =
             select_next_spill_candidate(candidate_sizes, already_dispatched, remaining);
@@ -291,10 +311,9 @@ void downgrade_executor::processing_loop()
           // have set satisfied while we were blocked waiting for a thread slot.
           if (req->satisfied.load()) break;
 
-          planned_bytes += candidate_bytes;
-
           auto exc_stream = _stream_pool->acquire_stream(
             cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+          planned_bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
 
           _pool->dispatch(
             std::move(slot),
@@ -305,13 +324,19 @@ void downgrade_executor::processing_loop()
              exc_stream = std::move(exc_stream),
              candidate_bytes,
              host_end_idx,
+             &planned_bytes,
              &repo_stats,
              &host_target_stats,
-             &disk_target_stats]() mutable {
+             &disk_target_stats,
+             predicate_satisfied]() mutable {
+              absl::Cleanup rollback = [&planned_bytes, candidate_bytes]() {
+                planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
+              };
               try {
                 nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_batch"};
                 auto result = cand->convert(targets, exc_stream, res_mgr, false);
                 if (result) {
+                  std::move(rollback).Cancel();
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                   repo_stats.batches.fetch_add(1, std::memory_order_relaxed);
@@ -326,12 +351,12 @@ void downgrade_executor::processing_loop()
                       disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
                     }
                   }
-                  if (req_ptr->predicate && req_ptr->predicate()) {
-                    req_ptr->satisfied.store(true);
-                  }
+                  predicate_satisfied(req_ptr);
                 }
               } catch (const std::exception& e) {
                 SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository: {}", e.what());
+              } catch (...) {
+                SIRIUS_LOG_ERROR("[downgrade] convert failed from data repository");
               }
             });
         }
@@ -340,12 +365,15 @@ void downgrade_executor::processing_loop()
     }
 
     // === TIER 2: task_scheduler task queue ===
-    if (!req->satisfied.load() && !target_reached() && _pipeline_task_queue) {
+    std::mutex failed_pipeline_candidates_mutex;
+    std::vector<std::unique_ptr<convertible_data>> failed_pipeline_candidates;
+    if (!req->satisfied.load() && !target_completed() && _pipeline_task_queue) {
       size_t max_tasks_to_convert = _pipeline_task_queue->size();
       size_t tasks_converted      = 0;
+      failed_pipeline_candidates.reserve(max_tasks_to_convert);
       convertible_gpu_pipeline_task_provider pipeline_provider(*_pipeline_task_queue);
       while (!req->satisfied.load() && tasks_converted < max_tasks_to_convert) {
-        if (predicate_satisfied() || target_reached()) break;
+        if (predicate_satisfied(req.get()) || wait_if_target_reached()) break;
         auto candidate =
           pipeline_provider.get_next_convertible(source_space, /*front_to_back=*/false);
         if (!candidate) break;
@@ -358,10 +386,9 @@ void downgrade_executor::processing_loop()
 
         if (req->satisfied.load()) break;
 
-        planned_bytes += candidate_bytes;
-
         auto exc_stream = _stream_pool->acquire_stream(
           cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
+        planned_bytes.fetch_add(candidate_bytes, std::memory_order_relaxed);
 
         _pool->dispatch(
           std::move(slot),
@@ -372,13 +399,23 @@ void downgrade_executor::processing_loop()
            exc_stream = std::move(exc_stream),
            candidate_bytes,
            host_end_idx,
+           &planned_bytes,
+           &failed_pipeline_candidates_mutex,
+           &failed_pipeline_candidates,
            &pipeline_queue_stats,
            &host_target_stats,
-           &disk_target_stats]() mutable {
+           &disk_target_stats,
+           predicate_satisfied]() mutable {
+            absl::Cleanup rollback = [&]() {
+              planned_bytes.fetch_sub(candidate_bytes, std::memory_order_relaxed);
+              std::lock_guard lock(failed_pipeline_candidates_mutex);
+              failed_pipeline_candidates.push_back(std::move(cand));
+            };
             try {
               nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_task_batches"};
               auto result = cand->convert(targets, exc_stream, res_mgr, false);
               if (result) {
+                std::move(rollback).Cancel();
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
                 pipeline_queue_stats.batches.fetch_add(1, std::memory_order_relaxed);
@@ -393,10 +430,12 @@ void downgrade_executor::processing_loop()
                     disk_target_stats.bytes.fetch_add((*result)[i], std::memory_order_relaxed);
                   }
                 }
-                if (req_ptr->predicate && req_ptr->predicate()) { req_ptr->satisfied.store(true); }
+                predicate_satisfied(req_ptr);
               }
             } catch (const std::exception& e) {
               SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue: {}", e.what());
+            } catch (...) {
+              SIRIUS_LOG_ERROR("[downgrade] convert failed from task queue");
             }
           });
       }
@@ -437,7 +476,7 @@ void downgrade_executor::processing_loop()
       total_batches,
       total_bytes,
       req->target_bytes.has_value() ? std::to_string(*req->target_bytes) : std::string("none"),
-      planned_bytes,
+      planned_bytes.load(std::memory_order_relaxed),
       duration_ms,
       throughput_mbs,
       repo_stats.batches.load(std::memory_order_relaxed),
@@ -518,29 +557,16 @@ void downgrade_executor::monitor_loop()
       // frees or pressure drops -- there is no latched state to get wedged on.
       if (has_viable_downgrade_target()) {
         backed_off = false;
-        // `amount` is consumed-minus-stop-threshold, i.e. the whole trigger->stop band (several
-        // GB on a large card) no matter how marginal the crossing was. It stays the byte target
-        // (an upper bound) in both modes.
         size_t amount = _memory_space->get_amount_to_downgrade();
         if (amount > 0) {
           auto req                = std::make_unique<downgrade_request>();
           req->is_monitor_request = true;
           req->target_bytes       = amount;
-          if (_config.overflow_proportional_spill) {
-            // Stop as soon as live pressure drops back below the *trigger* threshold, so a
-            // marginal crossing spills roughly the overflow instead of the whole band. The
-            // check is live, so memory the running query frees concurrently counts as relief.
-            // Headroom is preserved because reservations need the trigger->limit gap, not the
-            // stop threshold, and the reservation path issues its own targeted requests.
-            req->predicate = [space = _memory_space, &freed = req->bytes_freed, amount]() {
-              return freed.load(std::memory_order_relaxed) >= amount ||
-                     !space->should_downgrade_memory();
-            };
-          } else {
-            req->predicate = [&freed = req->bytes_freed, amount]() {
-              return freed.load(std::memory_order_relaxed) >= amount;
-            };
-          }
+          // Count concurrent memory releases and stop once usage reaches the stop threshold.
+          req->predicate = [space = _memory_space, &freed = req->bytes_freed, amount]() {
+            return freed.load(std::memory_order_relaxed) >= amount ||
+                   space->should_stop_downgrading_memory();
+          };
           _monitor_requests_issued.fetch_add(1, std::memory_order_relaxed);
           _monitor_request_enqueued.store(true, std::memory_order_relaxed);
           // Fire-and-forget: monitor does not wait for the result

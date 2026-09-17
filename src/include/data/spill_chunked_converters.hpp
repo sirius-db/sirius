@@ -37,10 +37,8 @@ namespace spill {
  * self-describing column_metadata, so overriding it doubles the correctness surface for
  * little gain.
  *
- * Idempotent; safe to call again (e.g. across context re-initializations).
- *
  * @param registry    The converter registry to modify (the builtin pair must already be
- *                    registered).
+ *                    registered and the registry must not yet be published).
  * @param chunk_bytes Copy submission granularity. 0 keeps the builtin converter.
  */
 void register_chunked_spill_converters(cucascade::representation_converter_registry& registry,

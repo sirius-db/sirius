@@ -51,12 +51,6 @@ struct downgrade_executor_config {
   /// the column tree is still being walked. 0 keeps the builtin converter.
   std::size_t copy_chunk_bytes{1ull << 30};
 
-  /// When true (default), a monitor-issued downgrade request stops as soon as live pressure
-  /// drops back below the *trigger* threshold, so the spilled set is proportional to the actual
-  /// overflow. When false, it runs down to the stop threshold, flushing the whole trigger->stop
-  /// band.
-  bool overflow_proportional_spill{true};
-
   /// Preferred HOST memory_space device_id (NUMA node) for the downgrade target.
   /// When set, the GPU->HOST downgrade dispatch uses
   /// cucascade::memory::any_memory_space_in_tier_with_preference{Tier::HOST, *preferred_numa_node}

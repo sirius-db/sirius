@@ -44,7 +44,6 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
-#include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -2841,7 +2840,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // unknown backend name is reported here rather than swallowed by the ctor.
   install_configured_log_sink(&db);
 
-  sirius::converter_registry::initialize();
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
   SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
