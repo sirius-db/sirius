@@ -749,9 +749,12 @@ compressed_representation& make_decode_dictionary(std::span<decode_column_slot c
       outputs[1]->type().id() != cudf::type_id::UINT8) {
     throw std::invalid_argument("dictionary: invalid key offsets/chars types");
   }
+  auto const offsets = outputs[0]->size();
+  if (offsets < 1 || outputs[0]->null_count() != 0) {
+    throw std::invalid_argument("dictionary: key offsets must be nonempty and null-free");
+  }
   auto const rows         = outputs[2]->size();
-  auto const offsets      = outputs[0]->size();
-  auto const keys         = offsets > 0 ? offsets - 1 : 0;
+  auto const keys         = offsets - 1;
   auto const indices_type = outputs[2]->type().id();
   cudf::type_id signed_type;
   switch (indices_type) {
@@ -795,7 +798,7 @@ compressed_representation& make_decode_dictionary(std::span<decode_column_slot c
   // children; unlike the by-value factories, allocation failure leaves these owners in the guarded
   // bundle.
   owned.keys_children[0] = frame.release(outputs[0]);
-  owned.chars            = outputs[1]->release();
+  owned.chars            = frame.release(outputs[1])->release();
   owned.dict_children[cudf::dictionary_column_view::keys_column_index] =
     std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
                                    keys,
@@ -803,7 +806,7 @@ compressed_representation& make_decode_dictionary(std::span<decode_column_slot c
                                    rmm::device_buffer{},
                                    0,
                                    std::move(owned.keys_children));
-  owned.indices = outputs[2]->release();
+  owned.indices = frame.release(outputs[2])->release();
   owned.dict_children[cudf::dictionary_column_view::indices_column_index] =
     std::make_unique<cudf::column>(cudf::data_type{signed_type},
                                    rows,
@@ -811,7 +814,7 @@ compressed_representation& make_decode_dictionary(std::span<decode_column_slot c
                                    rmm::device_buffer{},
                                    0,
                                    std::move(owned.indices.children));
-  if (has_mask) { owned.mask = outputs[3]->release(); }
+  if (has_mask) { owned.mask = frame.release(outputs[3])->release(); }
   auto& parent_mask = explicit_null_count > 0 ? *owned.mask.data : *owned.indices.null_mask;
   rep.dict_column   = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::DICTIONARY32},
                                                    rows,

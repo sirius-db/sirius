@@ -1284,7 +1284,7 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree)
       }
       if (has_edge) { return std::nullopt; }
       auto it = node.channels.find(node.output_paths[i]);
-      if (it != node.channels.end() && it->second &&
+      if (it != node.channels.end() && it->second && it->second->kind() == OpId::Identity &&
           it->second->decoded_type().id() == cudf::type_id::UINT8) {
         chars_ok        = true;
         shape.chars_rep = it->second.get();
@@ -1428,18 +1428,19 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out)
 {
+  compressed_representation const* rep = nullptr;
   try {
     validate_plan(tree);
     if (!mask_words || !probe_column(tree).can_produce_mask()) {
       throw std::invalid_argument("decode: plan or destination cannot serve range ballot");
     }
+    auto const root = root_value_producer(tree);
+    rep             = node_rep(root, tree);
+    if (!rep) throw std::invalid_argument("decode: range ballot root has no representation");
   } catch (std::invalid_argument const& e) {
     if (error_out) *error_out = e.what();
     return false;
   }
-  auto const root = root_value_producer(tree);
-  auto const* rep = node_rep(root, tree);
-  if (!rep) throw std::invalid_argument("decode: range ballot root has no representation");
   std::array const streams{stream};
   decode_session session{streams, mr};
   session.append(mask_decode_request{tree, pred, {mask_words, rep->num_rows}});

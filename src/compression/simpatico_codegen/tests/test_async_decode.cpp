@@ -861,6 +861,38 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
            "long-lived dictionary import did not publish eager key width");
     stream.synchronize();
 
+    {
+      std::array const streams{stream.view()};
+      simpatico::decode_session session(streams, mr);
+      auto& frame = simpatico::decode_session_test_access::frame(session);
+      std::vector<simpatico::decode_column_slot> slots;
+      for (auto const& channel : original->named_channels(stream.view())) {
+        auto slot = frame.memo_column(slots.size());
+        slot.adopt(std::make_unique<cudf::column>(channel.view, stream.view(), mr));
+        slots.push_back(slot);
+      }
+      auto const retained = frame.retained_device_bytes();
+      auto& rebuilt       = simpatico::reconstruct_decode_representation(
+        "dictionary", channel_names, slots, simpatico::leaf_meta::none{}, frame);
+      for (std::size_t i = 0; i < slots.size(); ++i) {
+        expect(frame.contains_memo(i) && !frame.find_memo(i) && !slots[i],
+               "dictionary reconstruction left a consumed memo value available");
+      }
+      expect(frame.retained_device_bytes() == retained,
+             "dictionary reconstruction lost or double-counted an owned buffer");
+      expect_failure(
+        [&] {
+          (void)simpatico::reconstruct_decode_representation(
+            "dictionary", channel_names, slots, simpatico::leaf_meta::none{}, frame);
+        },
+        "dictionary reconstruction reused consumed channels");
+      simpatico::decode_standalone(rebuilt, frame, frame.output());
+      stream.synchronize();
+      expect(strings_equal_completed(input->view(), frame.output().view(), stream.view()),
+             "frame-reconstructed dictionary roundtrip mismatch");
+      expect(session.finish().empty(), "raw dictionary fixture published a session result");
+    }
+
     auto tree = simpatico::plan_tree_from_dsl("input -> dictionary\n");
     expect(tree && tree->nodes.size() == 2 && tree->nodes[1].op == "dictionary",
            "dictionary width fixture plan shape");
@@ -906,6 +938,71 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
         "duplicate dictionary projection output mismatch");
     expect(original->constant_key_width == fixture.width,
            "duplicate projection changed shared dictionary width metadata");
+  }
+}
+
+void test_dictionary_offsets_validation(rmm::device_async_resource_ref mr)
+{
+  struct fixture {
+    cudf::size_type offsets;
+    cudf::mask_state mask;
+    bool accepted;
+  };
+  std::array<fixture, 4> const fixtures{{
+    {0, cudf::mask_state::UNALLOCATED, false},
+    {2, cudf::mask_state::ALL_NULL, false},
+    {1, cudf::mask_state::UNALLOCATED, true},
+    {2, cudf::mask_state::ALL_VALID, true},
+  }};
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  std::array const streams{stream.view()};
+  std::vector<std::string> const names{"keys_offsets", "keys_chars", "indices"};
+  for (auto type : {cudf::type_id::INT32, cudf::type_id::INT64}) {
+    for (auto const& fixture : fixtures) {
+      simpatico::decode_session session(streams, mr);
+      auto& frame = simpatico::decode_session_test_access::frame(session);
+      std::array const slots{frame.memo_column(0), frame.memo_column(1), frame.memo_column(2)};
+      slots[0].adopt(cudf::make_numeric_column(
+        cudf::data_type{type}, fixture.offsets, fixture.mask, stream.view(), mr));
+      if (fixture.offsets > 0) {
+        cuda_check(cudaMemsetAsync(slots[0]->mutable_view().head<void>(),
+                                   0,
+                                   fixture.offsets * cudf::size_of(cudf::data_type{type}),
+                                   stream.value()));
+      }
+      slots[1].adopt(cudf::make_empty_column(cudf::data_type{cudf::type_id::UINT8}));
+      slots[2].adopt(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+      stream.synchronize();
+      {
+        stream_observation_scope observed;
+        bool accepted = false;
+        try {
+          auto& rebuilt = static_cast<simpatico::dictionary_compressed_representation&>(
+            simpatico::reconstruct_decode_representation(
+              "dictionary", names, slots, simpatico::leaf_meta::none{}, frame));
+          auto const keys = cudf::dictionary_column_view(rebuilt.dict_column->view()).keys();
+          expect(keys.size() == fixture.offsets - 1 && keys.child(0).null_count() == 0,
+                 "dictionary reconstruction changed key offsets metadata");
+          expect(keys.child(0).nullable() == (fixture.mask == cudf::mask_state::ALL_VALID),
+                 "dictionary reconstruction lost an all-valid offsets mask");
+          accepted = true;
+        } catch (std::invalid_argument const& error) {
+          expect(
+            std::string(error.what()) == "dictionary: key offsets must be nonempty and null-free",
+            "dictionary offsets validation lost its diagnostic");
+        }
+        expect(accepted == fixture.accepted, "dictionary offsets acceptance mismatch");
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+          expect(frame.contains_memo(i) && static_cast<bool>(slots[i]) != accepted,
+                 "dictionary offsets validation consumed an invalid channel or kept a valid one");
+        }
+        for (auto const& calls : stream_fault::counts) {
+          expect(calls.queries == 0 && calls.synchronizations == 0,
+                 "dictionary offsets validation queried or synchronized a stream");
+        }
+      }
+      expect(session.finish().empty(), "offsets validation fixture published a session result");
+    }
   }
 }
 
@@ -2252,6 +2349,7 @@ int main()
     test_completed_public_return(upstream);
     test_identity_owned_children(upstream);
     test_dictionary_width_metadata(upstream);
+    test_dictionary_offsets_validation(upstream);
     test_dictionary_width_sliced_input(upstream);
     test_dictionary_width_large_keys(upstream);
     test_dictionary_width_failures(upstream);

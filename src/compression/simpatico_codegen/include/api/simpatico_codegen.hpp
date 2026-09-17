@@ -270,12 +270,10 @@ std::unique_ptr<cudf::table> decompress(
 /// caller may free or rebind the inputs immediately.
 // ── Per-column decode, for a caller-supplied selection ──────────────────────
 //
-// Late materialization produces ONE deferred column at a time, and the route it
-// can take depends on that column's plan: a bitpack root takes the sparse walk,
-// a dictionary or str_split shape does not. So these are per column, and a
-// route that cannot serve returns nullptr with @p error_out set rather than
-// throwing — a REFUSAL, not a failure. The caller then picks the next route,
-// and the cascade ends at the full decode, which always works.
+// Late materialization produces one deferred column at a time. Unsupported selection routes and
+// invalid selection preflight return nullptr with @p error_out set, allowing the caller to try
+// another route. Full decode is the general capability fallback. Failures during accepted execution
+// throw after draining submitted work; these APIs do not retry them as ordinary decoding.
 //
 // The three functions below (decompress_column_rows, decompress_column_compacted,
 // decompress_column_full) all re-tag the decode's storage type to the column's stored
@@ -307,9 +305,8 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
-/// One column decoded full width — the end of every cascade, so it refuses only
-/// on a genuine decode failure. Re-tags the decode's storage type to the
-/// column's stored dtype (see the per-column decode note above).
+/// One column decoded full width without a selection-route restriction. Re-tags the decode's
+/// storage type to the column's stored dtype (see the per-column decode note above).
 std::unique_ptr<cudf::column> decompress_column_full(
   const compressed_table& table,
   std::size_t column_index,

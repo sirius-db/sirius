@@ -214,7 +214,6 @@ struct decode_session::impl {
   struct result_slot {
     std::unique_ptr<cudf::column> column;
     std::optional<cudf::data_type> stored_type;
-    bool predicate = false;
   };
   struct retained_totals {
     std::size_t device      = 0;
@@ -427,8 +426,6 @@ void decode_session::append(column_decode_request const& request)
     auto& result = state_->results.back();
     if (auto const* values = std::get_if<value_result>(&request.result))
       result.stored_type = values->stored_type;
-    else
-      result.predicate = true;
     auto const lane = state_->next_lane++ % state_->streams.size();
     auto stream     = state_->streams[lane];
     state_->frames.emplace_back(stream, state_->mr, *this, request, lane);
@@ -478,9 +475,6 @@ std::vector<std::unique_ptr<cudf::column>> decode_session::finish()
     outputs.reserve(state_->results.size());
     for (auto& result : state_->results) {
       if (!result.column) throw std::runtime_error("decode result is missing");
-      if (result.predicate && result.column->type().id() != cudf::type_id::BOOL8) {
-        throw std::runtime_error("decode predicate result is not BOOL8");
-      }
       if (result.stored_type)
         result.column = restore_type(std::move(result.column), *result.stored_type);
       outputs.push_back(std::move(result.column));

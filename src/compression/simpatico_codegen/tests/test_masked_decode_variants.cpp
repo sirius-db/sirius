@@ -36,6 +36,7 @@
 #include "gpu_encode.hpp"
 #include "test_utils.hpp"
 
+#include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
@@ -1027,9 +1028,12 @@ bool render_checks()
 
 bool selection_validation_checks()
 {
-  auto const stream = cudf::get_default_stream();
+  rmm::cuda_stream owned_stream(rmm::cuda_stream::flags::non_blocking);
+  auto const stream = owned_stream.view();
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   auto input        = make_int32_table(1, 35, 91);
+  // The fixture's default-stream upload must finish before the nonblocking decode stream reads it.
+  cudf::get_default_stream().synchronize();
   auto compressed  = simpatico::compress_with_plan(input->view(), "input -> bitpack\n", stream, mr);
   auto const& tree = *compressed.columns[0].plan_tree;
   std::vector<std::uint32_t> words(kWordsPerChunk, 0);
@@ -1125,6 +1129,77 @@ bool selection_validation_checks()
   malformed.route = sirius::codegen::decode_route::str_split;
   REQUIRE_MSG(rejects_decode(*split.columns[0].plan_tree, malformed),
               "str_split mask domain mismatch accepted");
+
+  auto refuses_without_work = [&](auto&& operation) {
+    if (cudaStreamBeginCapture(stream.value(), cudaStreamCaptureModeGlobal) != cudaSuccess)
+      throw std::runtime_error("preflight capture failed to start");
+    cudaGraph_t graph = nullptr;
+    bool refused      = false;
+    try {
+      refused = operation();
+    } catch (...) {
+      (void)cudaStreamEndCapture(stream.value(), &graph);
+      if (graph) (void)cudaGraphDestroy(graph);
+      throw;
+    }
+    if (cudaStreamEndCapture(stream.value(), &graph) != cudaSuccess)
+      throw std::runtime_error("preflight submitted non-capturable work");
+    std::size_t nodes         = 0;
+    auto const node_status    = cudaGraphGetNodes(graph, nullptr, &nodes);
+    auto const destroy_status = cudaGraphDestroy(graph);
+    return refused && node_status == cudaSuccess && destroy_status == cudaSuccess && nodes == 0;
+  };
+
+  mask.num_rows         = strings->num_rows();
+  auto expected_strings = make_strings_column({"a", "ccc"}, {}, stream);
+  auto selected_strings = simpatico::decompress_column_compacted(split, 0, mask, stream, mr);
+  bool const selected_equal =
+    selected_strings && strings_equal(selected_strings->view(), expected_strings->view(), stream);
+  // Complete test readbacks before an assertion can release nonblocking-stream owners.
+  rmm::cuda_stream_default.synchronize();
+  REQUIRE_MSG(selected_equal, "raw str_split chars lost selected decode support");
+  auto& split_plan       = *split.columns[0].plan_tree;
+  auto& split_node       = split_plan.nodes[1];
+  auto const chars_index = static_cast<std::size_t>(
+    std::find(split_node.output_names.begin(), split_node.output_names.end(), "chars") -
+    split_node.output_names.begin());
+  REQUIRE_MSG(chars_index < split_node.output_paths.size(), "str_split chars fixture missing");
+  auto& chars         = split_node.channels.at(split_node.output_paths[chars_index]);
+  auto const channels = chars->named_channels(stream);
+  REQUIRE_MSG(channels.size() == 1 && channels.front().view.type().id() == cudf::type_id::UINT8,
+              "str_split chars fixture is not raw UINT8");
+  chars = simpatico::bitcomp_compressor{}.compress(channels.front().view, stream, mr);
+  REQUIRE_MSG(
+    chars->kind() == simpatico::OpId::Bitcomp && chars->decoded_type().id() == cudf::type_id::UINT8,
+    "compressed chars fixture has the wrong representation");
+  REQUIRE_MSG(
+    simpatico::probe_column(split_plan).compact_route == sirius::codegen::decode_route::full,
+    "encoded UINT8 chars were classified as raw chars");
+  REQUIRE_MSG(refuses_without_work([&] {
+                return !simpatico::decompress_column_compacted(
+                         split, 0, mask, stream, mr, &error) &&
+                       error == "decompress_column_compacted: this plan has no compacted route";
+              }),
+              "compressed str_split chars did not refuse before submission");
+  auto full_strings = simpatico::decompress_column_full(split, 0, stream, mr);
+  bool const full_equal =
+    full_strings && strings_equal(full_strings->view(), strings->view().column(0), stream);
+  rmm::cuda_stream_default.synchronize();
+  REQUIRE_MSG(full_equal, "compressed str_split chars full decode mismatch");
+
+  auto missing_root = simpatico::plan_tree_from_dsl("input -> bitpack\n");
+  REQUIRE_MSG(missing_root && simpatico::probe_column(*missing_root).can_produce_mask(),
+              "missing-representation ballot fixture is not range-capable");
+  REQUIRE_MSG(refuses_without_work([&] {
+                return !simpatico::decompress_column_selection_mask(
+                         *missing_root, {0, 1000}, mask.words, stream, mr, &error) &&
+                       error == "decode: range ballot root has no representation";
+              }),
+              "missing ballot representation escaped the preflight refusal contract");
+  REQUIRE_MSG(
+    simpatico::decompress_column_selection_mask(tree, {0, 1000}, mask.words, stream, mr, &error) &&
+      error.empty(),
+    "valid ballot failed after a preflight refusal");
   std::printf("PASS: selected request boundary validation\n");
   return true;
 }

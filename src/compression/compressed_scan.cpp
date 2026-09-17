@@ -435,7 +435,9 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
   result.set_stream(stream);
   if (!error.empty()) {
     SIRIUS_DECOMPRESSION_PUSHDOWN_DIAG(
-      "[decompression-pushdown] assembly REFUSED ({}); the batch decoded plainly", error);
+      "[decompression-pushdown] selection REFUSED ({}); ordinary decode preserves predicate "
+      "substitutions",
+      error);
   }
   // row_filtered only when the decode carried EVERY restricting conjunct: a
   // partially applied request must leave the batch untagged so the scan
