@@ -36,6 +36,27 @@ non-broadcast, more-than-one-hash-partition eligibility for accumulation.
 
 ## GitHub records
 
+Published planning records:
+
+- Umbrella: [sirius-db/sirius#1818](https://github.com/sirius-db/sirius/issues/1818).
+- Design PR: [sirius-db/sirius#1819](https://github.com/sirius-db/sirius/pull/1819),
+  from `kevkrist/sirius:docs/dynamic-filter-stack-20260917` to upstream `dev`.
+- C1 prerequisite: [NVIDIA/cuCascade#199](https://github.com/NVIDIA/cuCascade/issues/199).
+
+| Layer | Implementation task |
+| --- | --- |
+| S1 | [Publication and channel lifecycle — #1820](https://github.com/sirius-db/sirius/issues/1820) |
+| S2 | [Complete-inventory Bloom publication — #1821](https://github.com/sirius-db/sirius/issues/1821) |
+| S3 | [Scan consumer and fused masks — #1822](https://github.com/sirius-db/sirius/issues/1822) |
+| S4 | [H02 and pipelined publication — #1823](https://github.com/sirius-db/sirius/issues/1823) |
+| S5 | [Pinned-domain usefulness — #1824](https://github.com/sirius-db/sirius/issues/1824) |
+| S6 | [Early probe activation — #1825](https://github.com/sirius-db/sirius/issues/1825) |
+
+S1-S6 are native sub-issues of the umbrella, with native blocked-by relationships
+for the linear predecessors and S4's C1 prerequisite. These relationships track
+dependencies; they do not enforce PR merge restrictions or replace S4's merged-API,
+gitlink, and validation gate.
+
 Use one umbrella issue in `sirius-db/sirius` as the progress index, one task issue
 per implementation layer, one cuCascade prerequisite issue, and this
 documentation-only design PR. All PR head branches live in the user's forks:
