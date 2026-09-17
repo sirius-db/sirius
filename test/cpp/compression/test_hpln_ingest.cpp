@@ -663,7 +663,7 @@ TEST_CASE("hpln container - a multi-chunk file keeps its metadata segregated fro
   REQUIRE(found_directory);
   REQUIRE(chunks.size() == static_cast<std::size_t>(kMultiChunks));
 
-  // The claim of CHUNK_SKIPPING_PLAN.md 7.5: every chunk's metadata is reachable in ONE
+  // The claim: every chunk's metadata is reachable in ONE
   // sequential read, never interleaved with bulk data. Interleaved [hdr][pay][hdr][pay] would
   // satisfy the directory just as well and would cost a seek per chunk, so the layout is what is
   // asserted -- but SEGREGATION is the property, not "headers first". The streaming writer emits

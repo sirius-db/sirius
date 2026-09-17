@@ -135,8 +135,7 @@ std::vector<std::uint8_t> read_verified_segment(hpln_source& src,
 ///
 /// One tail read locates everything: the trailer names the postscript, the postscript names every
 /// segment, and the chunk directory subdivides them. That is what makes the format cheap to open
-/// over an object store, where a request costs more than the bytes it moves
-/// (CHUNK_SKIPPING_PLAN.md 7.6).
+/// over an object store, where a request costs more than the bytes it moves.
 hpln_layout locate_hpln(hpln_source& src, std::string const& path)
 {
   auto const file_size = src.size();

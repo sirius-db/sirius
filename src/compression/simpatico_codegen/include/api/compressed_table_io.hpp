@@ -99,7 +99,7 @@ inline constexpr std::uint64_t kPayloadAlign = 4096;
 //
 // Read the last few KB and you know where everything is, in one round trip. New segment kinds are
 // ADDITIVE and a reader skips kinds it does not know, so null masks (in flight separately) or the
-// group->byte table of CHUNK_SKIPPING_PLAN.md 6.1 can be added without another format break.
+// group->byte table can be added without another format break.
 // Same shape as Vortex's postscript, for the same reasons.
 
 enum class hpln_segment : std::uint16_t {
@@ -159,7 +159,7 @@ struct hpln_checksum_entry {
 /// One chunk's extent within a multi-chunk .hpln.
 ///
 /// A chunk is compressed independently, so it needs its own structural header -- but the headers
-/// are written CONTIGUOUSLY, ahead of every payload (see CHUNK_SKIPPING_PLAN.md 7.5), so a reader
+/// are written CONTIGUOUSLY, ahead of every payload, so a reader
 /// gets all of a file's metadata in one sequential read rather than a seek per chunk. That is
 /// what makes the trailer's single tail read pay off over a network, where request count is what
 /// costs (7.6). Offsets are absolute within the file.
@@ -392,7 +392,7 @@ struct hpln_schema {
   std::vector<hpln_column_desc> columns;
   /// Bytes the structural header occupies. In a .hpln FILE the payload starts here — which a
   /// reader can only discover by parsing, since the format carries no length prefix or footer
-  /// (see CHUNK_SKIPPING_PLAN.md 7.5). A reader over a network therefore has to read a
+  /// A reader over a network therefore has to read a
   /// speculative prefix and re-read if it was too short.
   std::uint64_t header_bytes = 0;
   /// End of the payload region, i.e. max(payload_offset + size_bytes) over every buffer.

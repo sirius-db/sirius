@@ -216,7 +216,7 @@ std::unique_ptr<cudf::table> duckdb_chunk_staging::build(rmm::cuda_stream_view s
       // libcudf's large-strings representation. Staging kept int64 throughout and narrows here, so
       // a normal column is byte-identical to what it was before large strings were supported and
       // an oversized one is written rather than refused. The chunk's size is then bounded by
-      // memory, not by the widest string column in the table (CHUNK_SKIPPING_PLAN.md 6.18).
+      // memory, not by the widest string column in the table.
       bool const wide =
         s.chars.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
       std::unique_ptr<cudf::column> offsets_col;

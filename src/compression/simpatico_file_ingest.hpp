@@ -25,8 +25,7 @@
 // than a decode plus a re-compress. Nothing is decoded here and no GPU is touched.
 //
 // The served-from side then needs no new code at all: a compressed_host_representation built this
-// way goes through the same converter as a pinned one, including the range-skipped fetch
-// (CHUNK_SKIPPING_PLAN.md 6.5).
+// way goes through the same converter as a pinned one, including the range-skipped fetch.
 
 #include "compressed_representation.hpp"
 #include "hpln_io.hpp"
@@ -159,8 +158,8 @@ class hpln_metadata final : public sirius::io::sirius_io_object_metadata {
 ///
 /// This is what a `read_simpatico()` bind needs, and what an ingestible's table_info reports. The
 /// logical types come from the file's `logical_types` segment when it has one; otherwise they are
-/// derived from the cuDF physical types in the header, which is lossy in exactly the ways
-/// CHUNK_SKIPPING_PLAN.md 7.9 lists (DECIMAL precision, nullability, time zone) — so a file
+/// derived from the cuDF physical types in the header, which is lossy in exactly the ways that
+/// matter (DECIMAL precision, nullability, time zone) — so a file
 /// written without that segment binds to approximate types rather than failing.
 ///
 /// Throws std::runtime_error if the file cannot be read or parsed.
@@ -234,8 +233,8 @@ class hpln_table_writer {
 /// Read @p path into pinned host memory belonging to @p host_space.
 ///
 /// The header is located from the trailer; a file written before the trailer existed falls back
-/// to reading a speculative prefix and growing it if the parse reports truncation (see
-/// CHUNK_SKIPPING_PLAN.md 7.5). Throws std::runtime_error on a missing, truncated or malformed
+/// to reading a speculative prefix and growing it if the parse reports truncation.
+/// Throws std::runtime_error on a missing, truncated or malformed
 /// file, since a partially ingested table must never become a pinned entry.
 ///
 /// Single-chunk files only: the result is one blob, so a multi-chunk file would have to be
@@ -272,8 +271,8 @@ class hpln_table_writer {
   std::string const& path,
   cucascade::memory::memory_space& host_space,
   std::span<const std::size_t> chunk_ids,
-  hpln_open_options const& options     = {},
-  std::span<const std::size_t> columns = {},
+  hpln_open_options const& options                          = {},
+  std::span<const std::size_t> columns                      = {},
   std::span<const std::vector<std::uint32_t>> decode_chunks = {});
 
 /// Compress @p tables with @p plan_dsl and write them to @p path as one multi-chunk file.

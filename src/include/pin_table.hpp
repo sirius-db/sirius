@@ -58,8 +58,7 @@ struct PinTableArgs {
   ///
   /// Zone maps only prune when a chunk's values are narrow, and TPC-H as generated prunes 0.00%
   /// because every chunk spans the whole key range. Sorting the FILES does not fix that (the scan
-  /// coalescer interleaves row groups), so clustering has to happen here — see
-  /// CHUNK_SKIPPING_PLAN.md 5.
+  /// coalescer interleaves row groups), so clustering has to happen here.
   std::vector<std::string> cluster_by;
 };
 
@@ -185,9 +184,8 @@ void validate_duckdb_pin_chunk(const op::scan::scan_info& batch,
  *
  * The cheapest clustering strategy there is: each chunk independently, no shuffle, one gather over
  * bytes the pin is already moving. It leaves every chunk spanning the whole key range, so it
- * prunes NOTHING at chunk granularity and everything it buys comes through the per-group index —
- * see CHUNK_SKIPPING_PLAN.md 5.2, which measures 72.7% of chunks pruned at G=8 against 0.0% at
- * chunk granularity.
+ * prunes NOTHING at chunk granularity and everything it buys comes through the per-group index:
+ * 72.7% of chunks prune at G=8 against 0.0% at chunk granularity.
  *
  * Declared here to be unit-testable; the pin drivers call it from materialize_pin_batches, before
  * anything observes the chunk.
@@ -226,7 +224,7 @@ struct pin_materialization_options {
   /// streaming pin: measured at ~2.3 s for SF1000 lineitem against a ~151 s pin, and within 0.8
   /// points of a global sort's pruning PROVIDED the zone-map index is per-group rather than
   /// per-chunk (a locally sorted chunk still spans the whole key range, so it prunes exactly
-  /// nothing at chunk granularity). See CHUNK_SKIPPING_PLAN.md 5.2.
+  /// nothing at chunk granularity).
   std::vector<std::size_t> cluster_key_columns;
 };
 
