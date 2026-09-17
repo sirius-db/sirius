@@ -35,6 +35,7 @@
 #include "catch.hpp"
 #include "compression/hpln_io.hpp"
 #include "compression/simpatico_file_ingest.hpp"
+#include "compression/simpatico_test_utils.hpp"
 #include "io/datasource_factory.hpp"
 #include "operator/operator_test_utils.hpp"
 #include "utils/s3_container.hpp"
@@ -362,28 +363,6 @@ class range_server {
 // skipping, it is a statement about the file being smaller than one probe.
 constexpr int kRowsPerChunk = 262144;
 constexpr int kChunks       = 4;
-
-std::unique_ptr<cudf::column> int32_column(std::vector<std::int32_t> const& values)
-{
-  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                       static_cast<cudf::size_type>(values.size()),
-                                       cudf::mask_state::UNALLOCATED);
-  REQUIRE(cudaMemcpy(col->mutable_view().head<std::int32_t>(),
-                     values.data(),
-                     values.size() * sizeof(std::int32_t),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
-  return col;
-}
-
-std::vector<std::int32_t> read_back(cudf::column_view const& v)
-{
-  std::vector<std::int32_t> host(static_cast<std::size_t>(v.size()));
-  REQUIRE(cudaMemcpy(host.data(),
-                     v.head<std::int32_t>(),
-                     host.size() * sizeof(std::int32_t),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
-  return host;
-}
 
 /// A multi-chunk file whose key column encodes the chunk it came from, so reading the wrong chunk
 /// is visible in the values rather than only in the row count.
