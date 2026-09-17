@@ -49,12 +49,23 @@ struct telemetry_config;
 
 namespace sirius::telemetry {
 
+/// Creates the Quent context described by `config`. This also installs the
+/// process-global NVTX injection hook, so call it before anything else emits
+/// NVTX. Throws `std::invalid_argument` for an unrecognised `exporter` value.
+[[nodiscard]] rust::Box<quent::Context> make_quent_context(const sirius::telemetry_config& config);
+
 /// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
+  /// Takes ownership of an already-created Quent context. Building it is the
+  /// caller's job: `quent::create_context` is what installs the process-global
+  /// NVTX injection hook, and Quent drops every event dispatched before that hook
+  /// exists, so the caller must create it before anything else emits NVTX.
+  ///
   /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
   /// child buckets) under the engine, so thread telemetry can nest per device.
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
+    rust::Box<quent::Context>&& context,
     const sirius::telemetry_config& config,
     const cucascade::memory::memory_reservation_manager* manager = nullptr,
     const std::vector<int>& gpu_device_ids                       = {});
@@ -71,6 +82,10 @@ class telemetry_context {
   [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
   /// The single, session-scoped query group that every query in this context is reported under.
   [[nodiscard]] const uuid::UUID& query_group_id() const { return query_group_uuid_; }
+  /// The `{engine}-{session_label}` query group, declared on first use; empty or
+  /// nullopt falls back to the default session-scoped group. Thread-safe.
+  [[nodiscard]] uuid::UUID query_group_id_for(
+    const std::optional<std::string>& session_label) const;
   /// The `gpu-N` device group for `device_id`; falls back to the engine group
   /// (with a warning) when the device was not declared at creation time.
   [[nodiscard]] const uuid::UUID& gpu_device_group_id(int device_id) const;
@@ -87,7 +102,8 @@ class telemetry_context {
   }
 
  private:
-  telemetry_context(const sirius::telemetry_config& config,
+  telemetry_context(rust::Box<quent::Context>&& context,
+                    const sirius::telemetry_config& config,
                     const cucascade::memory::memory_reservation_manager* manager,
                     const std::vector<int>& gpu_device_ids);
 
@@ -103,6 +119,9 @@ class telemetry_context {
   uuid::UUID worker_uuid_;
   uuid::UUID query_group_uuid_;
   uuid::UUID shared_group_uuid_;
+  std::string engine_name_;
+  mutable std::mutex labeled_groups_mutex_;
+  mutable std::map<std::string, uuid::UUID> labeled_group_ids_;
   std::map<int, gpu_device_group_ids> gpu_group_ids_;
   rust::Box<quent::Context> context_;
   rust::Box<quent::engine::EngineObserver> engine_observer_;
@@ -122,11 +141,10 @@ struct query_telemetry_info {
 
 /// Emit plan-level telemetry (operator declarations, port declarations, edges)
 /// for the given set of pipelines. Called once during query construction.
-void emit_plan_telemetry(
-  const quent::Context& context,
-  const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-  uuid::UUID plan_id,
-  query_telemetry_info telemetry_info);
+void emit_plan_telemetry(const quent::Context& context,
+                         const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+                         uuid::UUID plan_id,
+                         query_telemetry_info telemetry_info);
 
 struct ExecutorThreadHandleWrapper {
   ExecutorThreadHandleWrapper(const telemetry_context& context,

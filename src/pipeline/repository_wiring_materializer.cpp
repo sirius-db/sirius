@@ -37,7 +37,7 @@ void assign_if_unassigned(op::sirius_physical_operator& op, size_t& next_id)
 
 }  // namespace
 
-size_t assign_operator_ids(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+size_t assign_operator_ids(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   size_t next_id = 0;
   for (const auto& pipeline : pipelines) {

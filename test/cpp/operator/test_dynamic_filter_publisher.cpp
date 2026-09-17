@@ -54,6 +54,7 @@
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -365,6 +366,37 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
   auto const expected =
     gated_key_index == 0 ? std::vector<std::uint8_t>{0, 1} : std::vector<std::uint8_t>{1, 0};
   REQUIRE(membership_mask(*surviving.front(), probe->view(), fixture) == expected);
+}
+
+// A pinned chunk may store a join key NARROWED -- pin-time compressed materialization casts each
+// column to the narrowest carrier its values fit -- while the filter was published at the key's
+// native carrier. Probing must RESTORE that carrier rather than decline: a decline costs the
+// chunk its whole decode-side compaction (measured: every membership probe declined, filtered
+// decode fell back to a plain one), and the restored probe must answer exactly as the native
+// column would.
+TEST_CASE("membership probes restore a narrowed probe carrier", "[dynamic_filter]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const keys = make_int64_values(fixture, {10, 20, 30});
+  sirius::op::sirius_dynamic_in_list_filter filter(keys->view(), fixture.stream, mr);
+
+  auto const native = make_int64_values(fixture, {10, 15, 20, 999, 30});
+  std::vector<std::uint8_t> const expected{1, 0, 1, 0, 1};
+  REQUIRE(membership_mask(filter, native->view(), fixture) == expected);
+
+  // The same logical values as a narrowed pin serves them.
+  auto const narrowed =
+    cudf::cast(native->view(), cudf::data_type{cudf::type_id::INT32}, fixture.stream, mr);
+  REQUIRE(narrowed->view().type().id() == cudf::type_id::INT32);
+  REQUIRE(membership_mask(filter, narrowed->view(), fixture) == expected);
+
+  // Restoration is exact, never a reinterpretation: an unrelated carrier still declines.
+  auto const wrong       = make_float64_values(fixture, {10.0, 15.0, 20.0, 999.0, 30.0});
+  auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(&filter);
+  REQUIRE(applicable != nullptr);
+  REQUIRE(applicable->compute_mask(wrong->view(), kDeviceId, fixture.stream, mr) == nullptr);
 }
 
 }  // namespace

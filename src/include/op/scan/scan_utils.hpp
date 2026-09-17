@@ -72,12 +72,11 @@ struct resolved_filter_column {
 };
 
 /**
- * @brief Resolve one entry of a TableFilterSet onto the decoded batch.
+ * @brief Resolve one entry of a TableFilterSet onto the decoded batch:
+ * column_index -> primary index -> is it ours -> which batch column.
  *
- * The bookkeeping every walk over a filter set repeats: column_index → primary
- * index → is it ours → which batch column. Shared so the skip rules and the
- * bounds checks are stated once; what each walk does with a given filter TYPE
- * is its own business and deliberately not here.
+ * Shared so the skip rules and bounds checks are stated once. What a walk does
+ * with a given filter TYPE stays with that walk.
  */
 [[nodiscard]] resolved_filter_column resolve_filtered_column(
   duckdb::idx_t column_index,
@@ -89,10 +88,9 @@ struct resolved_filter_column {
  * @brief One top-level conjunct of a scan's pushed-down filter.
  *
  * @c expr is the comparison over batch positions, exactly as
- * @ref convert_table_filters_to_expression would have emitted it. @c primary_index
- * and @c batch_position name the column it constrains, so a caller that learns
- * the column arrived already reduced to a boolean answer can swap this conjunct
- * for a reference to it instead of re-expressing the comparison.
+ * @ref convert_table_filters_to_expression would have emitted it; the indices
+ * name the column it constrains, so a caller can swap the conjunct for a
+ * reference when that column arrives already reduced to a boolean answer.
  */
 struct table_filter_conjunct {
   std::size_t primary_index  = 0;
@@ -103,11 +101,9 @@ struct table_filter_conjunct {
 /**
  * @brief Decompose @p filters into its top-level conjuncts.
  *
- * The conjunct set is exactly what @ref convert_table_filters_to_expression
- * ANDs together — same skips (optional / IS NOT NULL / @p skip_primary_indices),
- * same order — because that function is implemented on top of this one. A caller
- * that needs to vary the conjunction per batch decomposes once here rather than
- * rebuilding the whole expression each time.
+ * Exactly what @ref convert_table_filters_to_expression ANDs together — same
+ * skips, same order — because that function is implemented on top of this one.
+ * Decompose once here instead of rebuilding the expression per batch.
  *
  * @throws std::runtime_error if a filtered column is not present in the batch.
  */

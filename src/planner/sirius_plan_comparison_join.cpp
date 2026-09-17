@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -117,6 +118,21 @@ static std::unordered_set<duckdb::idx_t> prove_unique_columns(duckdb::LogicalOpe
       if (aggr.grouping_sets.size() > 1 || aggr.groups.empty()) { return {}; }
       std::unordered_set<duckdb::idx_t> unique_set;
       for (duckdb::idx_t i = 0; i < aggr.groups.size(); i++) {
+        unique_set.insert(i);
+      }
+      return unique_set;
+    }
+
+    case duckdb::LogicalOperatorType::LOGICAL_DELIM_GET: {
+      // A delim scan replays the enclosing delim join's duplicate-eliminated chunk, which
+      // Sirius materializes with a grouped aggregate over ALL delim columns
+      // (plan_delim_join builds the DISTINCT; wrap_delim_distinct globalizes it via
+      // PARTITION_DISTINCT → DISTINCT_MERGE), so the full row set is unique by
+      // construction — under EQUAL null semantics too, since GROUP BY collapses NULL keys
+      // into one group. Only the complete column set is a key; a subset can repeat.
+      auto& delim_get = op.Cast<duckdb::LogicalDelimGet>();
+      std::unordered_set<duckdb::idx_t> unique_set;
+      for (duckdb::idx_t i = 0; i < delim_get.chunk_types.size(); i++) {
         unique_set.insert(i);
       }
       return unique_set;

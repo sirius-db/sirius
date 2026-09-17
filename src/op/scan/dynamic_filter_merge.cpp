@@ -15,15 +15,15 @@
  */
 
 #include <cudf/binaryop.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <nvtx3/nvtx3.hpp>
-
 #include <log/logging.hpp>
 #include <op/dynamic_filter/dynamic_filter_device.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <telemetry/nvtx.hpp>
 
 #include <algorithm>
 #include <mutex>
@@ -69,7 +69,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   dynamic_filter_gate* gate,
   int device_id)
 {
-  nvtx3::scoped_range nvtx_range{"dynfilter::apply_output"};
+  nvtx_scoped_range nvtx_range{"dynfilter::apply_output"};
   if (input.num_rows() == 0 || input.num_columns() == 0) { return nullptr; }
 
   device_id           = sirius::op::detail::resolve_dynamic_filter_device_id(device_id);
@@ -81,7 +81,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   auto const cascade_step  = [&](std::unique_ptr<cudf::column> mask) -> double {
     if (!mask || current.num_rows() == 0) { return 1.0; }
     auto const rows_before = current.num_rows();
-    owned                  = cudf::apply_boolean_mask(current, mask->view(), stream, mr);
+    owned                  = sirius::ApplyRetentionMask(current, mask->view(), stream, mr);
     current                = owned->view();
     return static_cast<double>(current.num_rows()) / static_cast<double>(rows_before);
   };

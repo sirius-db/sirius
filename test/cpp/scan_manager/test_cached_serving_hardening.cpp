@@ -54,6 +54,8 @@
 
 #include <catch.hpp>
 #include <compression/compressed_representation.hpp>
+#include <compression/compressed_scan.hpp>
+#include <compression/device_compressed_blob.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -72,6 +74,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -333,6 +336,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
 struct stub_table_info final : sirius::op::scan::ingestible_table_info {
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
@@ -360,7 +364,9 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
     const cucascade::memory::memory_space& /*mem_space*/,
     rmm::cuda_stream_view /*stream*/,
     bool /*like_swar_fastpath*/,
-    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
+    std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
+    std::unique_ptr<cudf::column>* /*survivors*/,
+    std::span<std::size_t const> /*elided*/) override
   {
     throw std::logic_error("stub_ingestible::post_filter_and_project is unreachable");
   }
@@ -554,6 +560,103 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
     }
     REQUIRE_FALSE(provider->get_next_batch().data);
   }
+}
+
+// The mask set is slot-sized whenever the entry has any MVCC state, so the attach must
+// read the SLOT, not set emptiness. A masked slot gets the pushdown and its visibility
+// mask; a default slot gets the pushdown alone.
+TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask slot",
+          "[cached_serving][scan_manager]")
+{
+  auto& e = env();
+  constexpr std::size_t rows{64};
+
+  // Empty cached table: a range-only request narrows through for_chunk without probing
+  // any column plan.
+  pinned_entry entry;
+  set_cached_columns(entry, {"k", "v"});
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = e.gpu_space;
+  for (std::size_t c = 0; c < 2; ++c) {
+    sirius::device_pin_chunk chunk;
+    chunk.memory_space = e.gpu_space;
+    chunk.compressed   = std::make_shared<sirius::compressed_device_representation>(
+      *e.gpu_space,
+      std::make_shared<sirius::compressed_device_blob>(),
+      std::vector<std::string>{"k", "v"},
+      /*compressed_bytes=*/64,
+      /*uncompressed_bytes=*/256,
+      /*num_rows=*/static_cast<std::int64_t>(rows));
+    entry.device_chunks.push_back(std::move(chunk));
+  }
+  entry.num_rows = 2 * rows;
+
+  // After deletes commit, only chunks holding deleted rows are masked.
+  sirius::scan_manager::mvcc_chunk_mask_set masks;
+  masks.push_back(make_test_mask(rows));
+  masks.push_back({});
+
+  // Range-only: both chunks attach the same scan, and only the masked one also
+  // carries a visibility mask.
+  sirius::pushdown_request request;
+  request.columns.resize(2);
+  request.columns[0].range          = sirius::decode_range{.lo = 5, .hi = 90};
+  request.ranges_cover_whole_filter = true;
+
+  std::vector<std::size_t> cols{0, 1};
+  sirius::scan_manager::cached_scan_plan plan{.survivor_chunk_indices = {0, 1}};
+  auto provider =
+    sirius::scan_manager::make_provider_for_pinned_entry(entry,
+                                                         cols,
+                                                         std::move(plan),
+                                                         sirius::telemetry::batch_telemetry_info{},
+                                                         masks,
+                                                         /*delta_splits=*/{},
+                                                         /*normalization_targets=*/{},
+                                                         /*has_physical_overrides=*/false,
+                                                         request);
+
+  struct served_attachments {
+    std::shared_ptr<const sirius::decompression_pushdown_scan> scan;
+    sirius::decode_visibility_mask visibility;
+  };
+  auto const served_rep = [](databatch_provider::batch const& b) -> served_attachments {
+    auto ro         = b.data->to_read_only();
+    auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
+    REQUIRE(rep != nullptr);
+    return {rep->pushdown_scan(), rep->visibility_mask()};
+  };
+
+  auto const check_request = [](sirius::pushdown_request const& r) {
+    REQUIRE_FALSE(r.row_selection_disabled);
+    REQUIRE(r.selects_rows());
+    REQUIRE(r.columns.size() == 2);
+    REQUIRE(r.columns[0].range.has_value());
+    REQUIRE(r.columns[0].range->lo == 5);
+    REQUIRE(r.columns[0].range->hi == 90);
+    REQUIRE_FALSE(r.columns[1].range.has_value());
+    REQUIRE(r.ranges_cover_whole_filter);
+  };
+
+  auto a = provider->get_next_batch();
+  REQUIRE(a.data);
+  REQUIRE(a.mvcc_keep_mask.has_mask());
+  auto const a_served = served_rep(a);
+  REQUIRE(a_served.scan != nullptr);
+  check_request(a_served.scan->request());
+  REQUIRE(a_served.visibility.has_mask());
+  REQUIRE(a_served.visibility.row_count == rows);
+  REQUIRE(a_served.visibility.words.get() == masks[0].words.get());
+
+  auto b = provider->get_next_batch();
+  REQUIRE(b.data);
+  REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
+  auto const b_served = served_rep(b);
+  REQUIRE(b_served.scan != nullptr);
+  check_request(b_served.scan->request());
+  REQUIRE_FALSE(b_served.visibility.has_mask());
+
+  REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
 }
 
 TEST_CASE("cached provider marks only selected converting columns",

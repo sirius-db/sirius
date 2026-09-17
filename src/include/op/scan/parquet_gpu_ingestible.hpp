@@ -91,6 +91,11 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   {
     return std::span<std::string const>(resolved_file_paths.data(), resolved_file_paths.size());
   }
+
+  [[nodiscard]] std::string display_name() const override
+  {
+    return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
+  }
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching
@@ -224,6 +229,11 @@ class parquet_file_scan_info : public scan_info {
   /// cannot compare against an AST literal — reader-side pushdown must be
   /// disabled for any split that includes it.
   bool disable_filter_pushdown = false;
+  /// When true, the plan's row-count carrier column (scan_plan::carrier_batch_index)
+  /// could not be resolved in this file — schema evolution, or no row groups —
+  /// so @ref reader_options carries no column projection and the file reads its
+  /// natural batch. Splits never mix files that differ on this.
+  bool carrier_unavailable = false;
 
   [[nodiscard]] std::size_t estimated_bytes() const noexcept override
   {
@@ -303,7 +313,9 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     const cucascade::memory::memory_space& mem_space,
     rmm::cuda_stream_view stream,
     bool like_swar_fastpath,
-    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
+    std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
+    std::unique_ptr<cudf::column>* survivors,
+    std::span<std::size_t const> elided) override;
 
   [[nodiscard]] const ingestible_table_info& table_info() const noexcept override { return *_info; }
 
@@ -315,6 +327,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   {
     return _duckdb_filter_expression != nullptr;
   }
+
+  /// post_filter_and_project routes its filter through
+  /// expression_evaluator::select_with_survivors, which writes the surviving
+  /// positions into the out-parameter.
+  [[nodiscard]] bool can_report_survivors() const noexcept override { return true; }
 
   [[nodiscard]] scan_filter_analysis const& filter_analysis() const override
   {
@@ -334,10 +351,11 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Canonical scan plan — built once in the constructor, shared by every
   // emitted split via its parquet_split_info::plan member.
   std::shared_ptr<scan_plan const> _plan;
-  // Shared reader options (column projection only — never set_filter, which is
-  // a per-split decision applied in materialize_table). Built once in the
-  // constructor and stamped onto every emitted split by the coalescer.
+  // Shared plan-level projection options. Filters are applied per split.
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
+  // The same options without a column projection: stamped onto files whose
+  // carrier column is unavailable (parquet_file_scan_info::carrier_unavailable).
+  std::shared_ptr<cudf::io::parquet_reader_options> _natural_reader_options;
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;

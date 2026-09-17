@@ -16,12 +16,12 @@
 
 #pragma once
 
-#include "duckdb/common/common.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,7 +32,7 @@ namespace pipeline {
 //! Result of converting meta-pipelines into execution-ready pipelines
 struct pipeline_conversion_result {
   //! The execution-ready pipelines in dependency order
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> scheduled_pipelines;
   //! Plan-time wiring descriptors. Materialized into runtime repositories and ports by
   //! `materialize_repository_wiring()` after the converter returns.
   std::vector<repository_wiring> repository_wirings;
@@ -63,8 +63,7 @@ std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
 //! lets a join publish its dynamic filters before the probe-side scans they prune are
 //! launched — probe-first numbering silently degrades those scans to full, unfiltered
 //! reads.
-void reorder_pipelines_topologically(
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
+void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline>>& pipelines);
 
 //! Converts the meta-pipeline tree into Sirius execution-ready pipelines.
 //!
@@ -87,7 +86,7 @@ class sirius_pipeline_converter {
 
  private:
   //! Schedule the meta-pipeline tree's pipelines in dependency order.
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> schedule_pipelines(
+  std::vector<std::shared_ptr<sirius_pipeline>> schedule_pipelines(
     sirius_meta_pipeline& root_pipeline);
 
   //! Compute plan-time wiring descriptors from the operator tree. Assumes post-`is_ready`
@@ -95,10 +94,6 @@ class sirius_pipeline_converter {
   //! Runtime materialization is done by `materialize_repository_wiring()` from
   //! `pipeline/repository_wiring.hpp`.
   void compute_repository_wiring(sirius_pipeline_build_state& state);
-  static std::string_view resolve_port_id(const op::sirius_physical_operator& sink,
-                                          const op::sirius_physical_operator& parent);
-  static op::MemoryBarrierType resolve_barrier(const op::sirius_physical_operator& sink,
-                                               const sirius_pipeline& dest);
 
   //! Set up parent/dependency pipeline edges from the wiring descriptors.
   void setup_pipeline_parents();
@@ -122,7 +117,7 @@ class sirius_pipeline_converter {
   const pipeline_build_context build_ctx_;
 
   // Internal state built during convert(), moved into result
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> scheduled_;
+  std::vector<std::shared_ptr<sirius_pipeline>> scheduled_;
   std::vector<repository_wiring> repository_wirings_;
   std::size_t meta_pipeline_count_ = 0;
 };

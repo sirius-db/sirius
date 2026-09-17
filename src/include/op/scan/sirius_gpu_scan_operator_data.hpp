@@ -18,6 +18,7 @@
 
 // sirius
 #include <compression/compressed_scan.hpp>
+#include <late_mat/column_origin.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <scan_manager/mvcc_chunk_mask.hpp>
@@ -61,18 +62,17 @@ struct membership_snapshot {
 
 /// Snapshot the channel's per-column probes over @p n_slots decoded slots.
 ///
-/// THE MAPPING INVARIANT (single source of truth — both the scan-manager
-/// drain attach and the decode-time refresh call this): slot order ==
-/// materialized_column_order == output columns FIRST, IN OUTPUT ORDER, then
-/// pure-filter columns, while the filter set keys by the consumer's
-/// OUTPUT-COLUMN position (parquet installs set_consumer_column_remap with
-/// scan_plan::output_position_by_column_id). Slot i therefore maps to output
-/// position i for every output column, so slot i's probes are exactly
-/// filters_for_column(i); trailing pure-filter slots query keys the set can
-/// never hold (push_filter rejects non-output columns) and come back empty by
-/// construction. generation is read BEFORE the walk so it never claims probes
-/// the walk did not capture (a racing publish only ADDS an uncounted probe —
-/// the safe direction for the converter's generation echo).
+/// THE MAPPING INVARIANT, stated once here because both callers (the
+/// scan-manager drain attach and the decode-time refresh) depend on it: slot
+/// order is output columns first, in output order, then pure-filter columns,
+/// while the filter set keys by OUTPUT-COLUMN position. Slot i therefore maps
+/// to output position i, so its probes are exactly filters_for_column(i);
+/// trailing pure-filter slots query keys the set can never hold (push_filter
+/// rejects non-output columns) and come back empty by construction.
+///
+/// `generation` is read BEFORE the walk, so it never claims probes the walk did
+/// not capture — a racing publish only ADDS an uncounted one, the safe
+/// direction for the converter's echo.
 [[nodiscard]] membership_snapshot snapshot_membership_probes(
   sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
 
@@ -273,6 +273,11 @@ class scan_operator_input : public op::operator_data {
   /// consumption (scan-internal OOM retry) must fail loudly rather than
   /// serve the emptied wrapper batch as zero rows.
   mutable bool stolen_table_consumed{false};
+  /// Where this split's rows came from, for late materialization: the pinned entry's column
+  /// origins and the contiguous pin-order span this chunk covers. Stamped by
+  /// drain_cached_provider from databatch_provider::batch, which owns the definition; null
+  /// unless the gate is on and the scan is one whose batches are a pinned chunk each.
+  std::shared_ptr<late_mat::scan_batch_origin const> origin;
   /// A fresh owned conversion result that still needs carrier casts. The wrapper retains the
   /// complete source until every replacement column has been built successfully, then the scan
   /// commits by moving unchanged columns and installing the replacements.

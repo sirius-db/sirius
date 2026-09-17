@@ -33,6 +33,7 @@
 #include "helper/logical_type.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -45,10 +46,12 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <utils/dense_count_join_test_builder.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +60,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
+using sirius::test::make_dense_count_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -424,6 +428,26 @@ TEST_CASE("tier_narrowing_policy - join payloads keep narrow, join keys retract"
 
     REQUIRE(!probe.has_physical_overrides());
   }
+}
+
+TEST_CASE("tier_narrowing_policy - dense count restores only the two join keys",
+          "[tier_narrowing_policy]")
+{
+  auto plan = make_dense_count_join(
+    /*preserved_key_idx=*/1,
+    /*counted_key_idx=*/0,
+    /*counted_value_idx=*/1,
+    make_integer_scan(3, {k_int8, k_int16, k_int8}),
+    make_integer_scan(3, {k_int8, k_int16, k_int8}));
+
+  auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+  REQUIRE(retracted == 2);
+  REQUIRE(plan->children[0]->get_physical_types() ==
+          std::vector<cudf::data_type>{k_int8, k_int32, k_int8});
+  REQUIRE(plan->children[1]->get_physical_types() ==
+          std::vector<cudf::data_type>{k_int32, k_int16, k_int8});
+  REQUIRE(!plan->has_physical_overrides());
 }
 
 TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when eligible",

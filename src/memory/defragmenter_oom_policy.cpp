@@ -60,7 +60,7 @@ bool is_pool_fragmented(cudaMemPool_t pool, std::size_t bytes)
 std::string defragmenter_oom_policy::get_policy_name() const noexcept { return "defragmenter"; }
 
 void* defragmenter_oom_policy::do_handle_oom(std::size_t bytes,
-                                             rmm::cuda_stream_view stream,
+                                             ::cuda::stream_ref stream,
                                              std::exception_ptr eptr,
                                              RetryFunc retry_function)
 {

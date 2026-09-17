@@ -22,6 +22,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -29,14 +30,14 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
 
-#include <nvtx3/nvtx3.hpp>
-
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 // Forward-declare CUDA profiler API functions (linked via libcudart).
 extern "C" int cudaProfilerStart();
@@ -95,6 +96,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
+#include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
 #include "op/scan/duckdb_mvcc_visibility.hpp"
@@ -107,7 +109,11 @@ extern "C" int cudaProfilerStop();
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "vss/cuvs_index_cache.hpp"
+#include "vss/distance_metric.hpp"
+#include "vss/ivf_flat_index.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search.hpp"
 
@@ -131,13 +137,50 @@ extern "C" int cudaProfilerStop();
 #include "io/types.hpp"                // sirius::io::sirius_ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
+#include <dlfcn.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+
+// Statically embedded by telemetry_bridge. Rust archives are localized by the
+// extension link (`--exclude-libs,ALL`), so this regular C++ object supplies the
+// public NVTX entry point and forwards it into the same Quent hook state used by
+// Sirius's static-injection pointer.
+extern "C" int quent_InitializeInjectionNvtx2(void* get_export_table);
+extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
+  void* get_export_table)
+{
+  return quent_InitializeInjectionNvtx2(get_export_table);
+}
+
+#ifndef DUCKDB_BUILD_LOADABLE_EXTENSION
+// NVTX v3 discovers an injector independently in each ELF image. libcudf's
+// injection pointer is local to libcudf.so and its process-global preinjection
+// lookup is compiled out, so it can only reach Quent through its dlopen path.
+// A statically linked Sirius has no DSO to name. Interpose just our private
+// sentinel and turn that request into dlopen(NULL), whose handle exposes the
+// initializer exported by the running DuckDB executable. Every other request
+// is forwarded unchanged to libc.
+extern "C" __attribute__((visibility("default"))) void* dlopen(const char* filename, int flags)
+{
+  using dlopen_fn   = void* (*)(const char*, int);
+  auto* real_dlopen = reinterpret_cast<dlopen_fn>(::dlsym(RTLD_NEXT, "dlopen"));
+  if (real_dlopen == nullptr) { return nullptr; }
+
+  if (filename != nullptr &&
+      std::string_view{filename} == sirius::telemetry::detail::static_injection_path) {
+    return real_dlopen(nullptr, flags);
+  }
+  return real_dlopen(filename, flags);
+}
+#endif
 
 namespace duckdb {
 
@@ -677,8 +720,10 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   if (gstate.finished) { return; }
 
   if (!gstate.res) {
-    auto start      = std::chrono::high_resolution_clock::now();
-    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto conn_state    = get_sirius_connection_state(context);
+    auto session_label = conn_state ? conn_state->session_label() : std::optional<std::string>{};
+    auto start         = std::chrono::high_resolution_clock::now();
+    auto sirius_ctx    = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
     ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
@@ -708,8 +753,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
           std::move(prepared), std::move(sirius_physical_plan));
 
-        gstate.sirius_iface = make_uniq<::sirius::sirius_interface>(context, data.query_label);
-        gstate.res          = gstate.sirius_iface->sirius_execute_query(
+        gstate.sirius_iface =
+          make_uniq<::sirius::sirius_interface>(context, data.query_label, session_label);
+        gstate.res = gstate.sirius_iface->sirius_execute_query(
           context, data.query, gpu_prepared, {}, window->query_id());
         if (gstate.res->HasError()) {
           gpu_error = gstate.res->GetErrorObject();
@@ -1164,6 +1210,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  auto compression_it = input.named_parameters.find("compression");
+  if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
+    result->args.compression = compression_it->second.GetValue<bool>();
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1352,15 +1403,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
   const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
-  if (comp_cfg.enable_pin_table_compression && comp_cfg.input_plan_dir.empty()) {
+  bool const compression_requested =
+    data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
+  if (compression_requested && comp_cfg.input_plan_dir.empty()) {
     SIRIUS_LOG_WARN(
-      "[pin_table] '{}': pin_table_compression is enabled but "
+      "[pin_table] '{}': compression was requested but "
       "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
       data.args.name);
   }
-  const bool comp_globally_enabled =
-    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
-  if (comp_globally_enabled) {
+  const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
+  if (compression_active) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1385,7 +1437,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (comp_globally_enabled) {
+  if (compression_active) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -1416,12 +1468,58 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       }
     } else {
       SIRIUS_LOG_WARN(
-        "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "
+        "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
         "pinning uncompressed",
         data.args.name,
         comp_cfg.input_plan_dir);
     }
   }
+
+  // Late-mat uniqueness probe: which pinned columns to observe for whole-table
+  // distinctness (off unless SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS asks for it). The
+  // names outlive cache_info, which every insert path moves from.
+  auto const pinned_column_names = cache_info.column_names();
+  auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+
+  // Record what the probe proved, by name (see attach_proven_unique_columns on
+  // why not by position). A no-op when the probe was off.
+  //
+  // @p stored_columns is what the insert actually cached. A verdict describes the
+  // values this materialization read, so it may only be attached to a column those
+  // values were stored as: the GPU merge path keeps an already-cached column's
+  // previous chunks and drops the incoming ones, and marking THOSE bytes unique on
+  // the strength of bytes that were discarded is how a non-unique column becomes a
+  // group key.
+  auto attach_proven_unique = [&](std::vector<sirius::late_mat::unique_verdict> const& verdicts,
+                                  std::span<std::string const> stored_columns) {
+    if (verdicts.size() != pinned_column_names.size()) { return; }
+    auto const was_stored = [&](std::string const& column) {
+      return std::find(stored_columns.begin(), stored_columns.end(), column) !=
+             stored_columns.end();
+    };
+    std::vector<std::string> proven_names;
+    for (std::size_t i = 0; i < verdicts.size(); ++i) {
+      switch (verdicts[i]) {
+        case sirius::late_mat::unique_verdict::proven:
+          if (was_stored(pinned_column_names[i])) {
+            proven_names.push_back(pinned_column_names[i]);
+          }
+          break;
+        // undecided/refused/not observed: materialize_pin_batches already ran the
+        // exact stage while the values were still uncompressed, so nothing here
+        // can add to what it concluded.
+        default: break;
+      }
+    }
+    if (!proven_names.empty()) {
+      scan_mgr.attach_proven_unique_columns(data.args.name, proven_names);
+    }
+    for (auto const& n : proven_names) {
+      SIRIUS_LOG_INFO("[late-mat] pin '{}': column '{}' proven distinct table-wide (per-chunk)",
+                      data.args.name,
+                      n);
+    }
+  };
 
   auto attach_duckdb_mvcc_metadata = [&](std::vector<std::size_t> base_row_count_per_chunk) {
     if (data.args.format != "duckdb") { return; }
@@ -1447,7 +1545,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       pinned_column_types,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin});
+                                       .enable_compressed_materialization = compressed_pin,
+                                       .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
@@ -1462,6 +1561,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
                                       std::move(host_result.column_storage));
+    // The host path always REPLACES, so every pinned column holds this
+    // materialization's values.
+    attach_proven_unique(host_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(host_result.base_row_count_per_chunk));
   } else if (pin_comp.enabled) {
     // GPU tier, compression enabled: narrow each materialized batch (when narrowing is
@@ -1474,7 +1576,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       *scan_mgr.io_ctx(),
       pinned_column_types,
       pin_comp,
-      {.capture_chunk_stats = false, .enable_compressed_materialization = compressed_pin});
+      {.capture_chunk_stats               = false,
+       .enable_compressed_materialization = compressed_pin,
+       .probe_unique_columns              = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(dev_result.column_storage));
 
@@ -1483,27 +1587,30 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
                                         std::move(dev_result.column_storage));
+    // The compressed device path always REPLACES, as above.
+    attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
     attach_duckdb_mvcc_metadata(std::move(dev_result.base_row_count_per_chunk));
   } else {
     // GPU tier, uncompressed: materialize every batch as a GPU-resident cudf::table
     // (with its GPU placement) and pin them in place.
-    auto mat =
-      sirius::materialize_all_batches(*ingestible,
-                                      gpu_spaces_mut,
-                                      *scan_mgr.io_ctx(),
-                                      pinned_column_types,
-                                      {.capture_chunk_stats               = capture_chunk_stats,
-                                       .enable_compressed_materialization = compressed_pin});
+    auto mat = sirius::materialize_all_batches(*ingestible,
+                                               gpu_spaces_mut,
+                                               *scan_mgr.io_ctx(),
+                                               pinned_column_types,
+                                               {.capture_chunk_stats = capture_chunk_stats,
+                                                .enable_compressed_materialization = compressed_pin,
+                                                .probe_unique_columns = probe_unique_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
-    scan_mgr.insert_pinned_entry(data.args.name,
-                                 std::move(cache_info),
-                                 std::move(mat.tables),
-                                 std::move(mat.chunk_memory_spaces),
-                                 std::move(pinned_column_types),
-                                 std::move(mat.chunk_stats),
-                                 std::move(mat.column_storage));
+    auto const stored             = scan_mgr.insert_pinned_entry(data.args.name,
+                                                     std::move(cache_info),
+                                                     std::move(mat.tables),
+                                                     std::move(mat.chunk_memory_spaces),
+                                                     std::move(pinned_column_types),
+                                                     std::move(mat.chunk_stats),
+                                                     std::move(mat.column_storage));
+    attach_proven_unique(mat.unique_verdicts, stored);
     attach_duckdb_mvcc_metadata(std::move(base_row_count_per_chunk));
   }
 
@@ -1630,6 +1737,433 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct CreateAnnIndexData : public TableFunctionData {
+  std::string table_name;
+  std::string column_name;
+  std::string index_type  = "ivf_flat";  ///< lowercased; only "ivf_flat" supported today
+  std::string metric      = "l2";        ///< lowercased; one of l2 / cosine
+  std::string schema_name = "main";
+  int64_t n_lists         = 0;  ///< IVF-Flat list count; 0 = choose a default at build time
+};
+
+// Per-execution state
+struct CreateAnnIndexGlobalState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusCreateAnnIndexInit(ClientContext& context,
+                                                                     TableFunctionInitInput& input)
+{
+  return make_uniq<CreateAnnIndexGlobalState>();
+}
+
+static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names)
+{
+  auto result = make_uniq<CreateAnnIndexData>();
+
+  if (input.inputs.size() < 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+    throw BinderException(
+      "sirius_create_ann_index requires two non-NULL positional arguments: table and column");
+  }
+  result->table_name  = input.inputs[0].ToString();
+  result->column_name = input.inputs[1].ToString();
+
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_create_ann_index: named parameter '" + kv.first +
+                            "' cannot be NULL");
+    }
+    if (key == "metric") {
+      result->metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "index_type") {
+      result->index_type = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "n_lists") {
+      result->n_lists = kv.second.GetValue<int64_t>();
+    } else if (key == "schema_name") {
+      result->schema_name = kv.second.ToString();
+    }
+  }
+
+  if (result->index_type != "ivf_flat") {
+    throw BinderException("sirius_create_ann_index: unsupported index_type '" + result->index_type +
+                          "'; only 'ivf_flat' is supported");
+  }
+  if (result->metric != "l2" && result->metric != "cosine") {
+    throw BinderException("sirius_create_ann_index: metric must be one of 'l2', 'cosine', got '" +
+                          result->metric + "'");
+  }
+  if (result->n_lists < 0) {
+    throw BinderException("sirius_create_ann_index: n_lists must be >= 0");
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Success");
+  return std::move(result);
+}
+
+// Map the (already-validated) index_type string to its cache index_kind.
+static sirius::vss::index_kind ann_index_kind_from_type(const std::string& index_type)
+{
+  if (index_type == "ivf_flat") { return sirius::vss::index_kind::ivf_flat; }
+  throw InvalidInputException("sirius_create_ann_index: unsupported index_type '" + index_type +
+                              "'");
+}
+
+// Default IVF-Flat list count
+static std::uint32_t default_ivf_n_lists(int64_t n_rows)
+{
+  auto const approx = static_cast<std::uint32_t>(std::sqrt(static_cast<double>(n_rows)));
+  std::uint32_t n   = approx == 0 ? 1u : approx;
+  return n > 1024u ? 1024u : n;
+}
+
+static void SiriusCreateAnnIndexFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto& data   = data_p.bind_data->CastNoConst<CreateAnnIndexData>();
+  auto& gstate = data_p.global_state->Cast<CreateAnnIndexGlobalState>();
+  if (gstate.finished) { return; }
+
+  sirius::nvtx_scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_create_ann_index requires the Sirius context to be initialized");
+  }
+
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
+  // --- Resolve the vector column's fixed dimensionality from the catalog. ---
+  auto const qname          = QualifiedName::Parse(data.table_name);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
+  std::string const& table  = qname.name;
+  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry      = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog     = entry.ParentCatalog().GetName();
+  auto& entry_schema      = entry.ParentSchema().name;
+  auto const& columns     = entry.GetColumns();
+  auto const schema_names = columns.GetColumnNames();
+  auto const schema_types = columns.GetColumnTypes();
+
+  std::size_t col_idx = schema_names.size();
+  for (std::size_t i = 0; i < schema_names.size(); ++i) {
+    if (schema_names[i] == data.column_name) {
+      col_idx = i;
+      break;
+    }
+  }
+  if (col_idx == schema_names.size()) {
+    throw InvalidInputException("sirius_create_ann_index: column '" + data.column_name +
+                                "' not found in table '" + data.table_name + "'");
+  }
+  auto const& col_type = schema_types[col_idx];
+  if (col_type.id() != LogicalTypeId::ARRAY ||
+      ArrayType::GetChildType(col_type).id() != LogicalTypeId::FLOAT) {
+    throw InvalidInputException("sirius_create_ann_index: column '" + data.column_name +
+                                "' must be a FLOAT[N] array column");
+  }
+  auto const dim    = static_cast<int64_t>(ArrayType::GetSize(col_type));
+  auto const metric = sirius::vss::ann_distance_type_from_metric(data.metric);
+
+  // Get the vector column onto a single GPU as one contiguous column for one cuVS index
+  auto& memory_manager = sirius_ctx->get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (gpu_spaces.empty()) {
+    throw InvalidInputException("sirius_create_ann_index: no GPU memory space available");
+  }
+  auto* target_space   = const_cast<cucascade::memory::memory_space*>(gpu_spaces[0]);
+  int const target_gpu = target_space->get_device_id();
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{target_gpu}};
+
+  auto& scan_mgr = sirius_ctx->get_scan_manager();
+  const auto* pin =
+    scan_mgr.find_pinned_entry_for_duckdb_table(entry_catalog, entry_schema, entry.name);
+  if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
+    throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
+                                "' must be pinned on the GPU tier before building an index");
+  }
+
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  auto const& pinned_names = pin->cache_info.column_names();
+  if (std::find(pinned_names.begin(), pinned_names.end(), data.column_name) == pinned_names.end()) {
+    throw InvalidInputException("sirius_create_ann_index: vector column '" + data.column_name +
+                                "' is not pinned on table '" + data.table_name + "';");
+  }
+
+  // Collect the vector column's batches as views:
+  // a full coalesce of a large dataset overflows cudf's 2^31-element per-column limit
+  // in the LIST child. The chunked builder feeds cuVS one chunk at a time via ivf_flat::extend.
+  auto chunk_views = sirius::vss::pinned_column_chunk_views(*pin, data.column_name, *target_space);
+
+  int64_t n_rows = 0;
+  for (auto const& v : chunk_views) {
+    n_rows += static_cast<int64_t>(v.size());
+  }
+  if (n_rows <= 0) { throw InvalidInputException("sirius_create_ann_index: empty vector column"); }
+
+  // Cap n_lists in 64-bit before narrowing to uint32
+  int64_t n_lists64 =
+    data.n_lists > 0 ? data.n_lists : static_cast<int64_t>(default_ivf_n_lists(n_rows));
+  n_lists64          = std::min(n_lists64, n_rows);
+  n_lists64          = std::min<int64_t>(n_lists64, std::numeric_limits<std::uint32_t>::max());
+  auto const n_lists = static_cast<std::uint32_t>(n_lists64);
+
+  // Reject when the largest batch is smaller than n_lists here so a bad n_lists never
+  // removes the existing index.
+  int64_t max_chunk_rows = 0;
+  for (auto const& v : chunk_views) {
+    max_chunk_rows = std::max(max_chunk_rows, static_cast<int64_t>(v.size()));
+  }
+  if (std::cmp_greater(n_lists, max_chunk_rows)) {
+    throw InvalidInputException(
+      "sirius_create_ann_index: n_lists=" + std::to_string(n_lists) +
+      " exceeds the largest batch size (" + std::to_string(max_chunk_rows) +
+      " rows) available to train IVF-Flat centroids; lower n_lists. The existing "
+      "index for this column, if any, was left in place.");
+  }
+
+  // Index building footprint reservation
+  std::size_t const footprint = sirius::vss::ivf_flat_reservation_bytes(n_rows, dim, n_lists);
+
+  [[maybe_unused]] auto* pool =
+    target_space->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  SIRIUS_LOG_DEBUG(
+    "[ann_index] build begin, GPU:{} allocated={} bytes reserved={} bytes footprint={} bytes "
+    "(rows={} dim={} n_lists={})",
+    target_gpu,
+    pool ? pool->get_total_allocated_bytes() : 0,
+    pool ? pool->get_total_reserved_bytes() : 0,
+    footprint,
+    n_rows,
+    dim,
+    n_lists);
+
+  auto& index_cache      = sirius_ctx->get_cuvs_index_cache();
+  std::string index_name = sirius::vss::build_ann_index_cache_key(
+    entry_catalog, entry_schema, entry.name, data.column_name, data.metric);
+
+  // Check if there's enough memory to build the index before releasing the current one
+  auto reservation      = index_cache.reserve_index_memory(footprint, target_gpu);
+  bool released_first   = false;
+  bool removed_existing = false;
+  // Destructive path: not enough memory to hold all indexes so release the current one first
+  if (!reservation) {
+    removed_existing = index_cache.erase_by_column(
+                         entry_catalog, entry_schema, entry.name, data.column_name, metric) > 0;
+    released_first = true;
+    reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
+    if (!reservation) {
+      // Still not enough memory
+      auto const avail = target_space->get_available_memory();
+      std::string msg =
+        "sirius_create_ann_index: not enough free GPU memory to build the index for '" +
+        entry.name + "." + data.column_name + "': need ~" + std::to_string(footprint >> 20) +
+        " MiB, only ~" + std::to_string(avail >> 20) + " MiB free on GPU " +
+        std::to_string(target_gpu) + ".";
+      if (removed_existing) {
+        msg += " The previous index for this column and metric was removed to make room.";
+      }
+      // Look for indexes on this same column under other metrics to inform users
+      auto const others =
+        index_cache.indexes_on_column(entry_catalog, entry_schema, entry.name, data.column_name);
+      if (!others.empty()) {
+        std::size_t held_bytes = 0;
+        std::string listed;
+        for (auto const& o : others) {
+          held_bytes += o.resident_bytes;
+          if (!listed.empty()) { listed += ", "; }
+          listed += std::string(sirius::vss::ann_metric_name(o.metric)) + " (~" +
+                    std::to_string(o.resident_bytes >> 20) + " MiB)";
+        }
+        msg += " Other indexes on this column are still holding ~" +
+               std::to_string(held_bytes >> 20) + " MiB of GPU memory [" + listed +
+               "]; drop one with sirius_drop_ann_index('" + data.table_name + "', '" +
+               data.column_name + "', metric => ...) to free it.";
+      }
+      throw InvalidInputException(msg);
+    }
+  }
+
+  // Bind the reservation to the build stream for the build only. The reservation
+  // is released after the build, so the index is just ordinary allocated GPU memory.
+  rmm::cuda_stream build_stream;
+  auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  if (allocator == nullptr ||
+      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+    throw InvalidInputException(
+      "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
+  }
+  // Release the reservation whether the build succeeds or throws. On release the
+  // arena hands back its unused slack and keeps the resident index accounted.
+  absl::Cleanup reset_reservation = [allocator, &build_stream] {
+    allocator->reset_stream_reservation(build_stream.view());
+  };
+
+  // Build IVF-Flat on the build stream
+  std::unique_ptr<sirius::vss::any_cuvs_index> handle;
+  try {
+    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
+                                                            dim,
+                                                            n_lists,
+                                                            metric,
+                                                            target_space->get_default_allocator(),
+                                                            build_stream.view());
+  } catch (std::exception const& e) {
+    if (removed_existing) {
+      throw InvalidInputException(
+        std::string("sirius_create_ann_index: failed to build the index for '") + entry.name + "." +
+        data.column_name +
+        "' after the previous index was removed to make room, so this column and metric now has "
+        "no index. Underlying error: " +
+        e.what());
+    }
+    throw;
+  }
+
+  sirius::vss::index_metadata meta;
+  meta.kind         = ann_index_kind_from_type(data.index_type);
+  meta.catalog_name = entry_catalog;
+  meta.schema_name  = entry_schema;
+  meta.table_name   = entry.name;
+  meta.column_name  = data.column_name;
+  meta.dim          = dim;
+  meta.num_rows     = n_rows;
+  meta.n_lists      = static_cast<int64_t>(n_lists);
+  meta.metric       = metric;
+  // Resident index footprint, read while the reservation still tracks the arena.
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
+  [[maybe_unused]] std::size_t const build_peak_bytes =
+    allocator->get_peak_allocated_bytes(build_stream.view());
+
+  // Release the reservation before the build stream moves into the cache.
+  std::move(reset_reservation).Invoke();
+
+  SIRIUS_LOG_DEBUG(
+    "[ann_index] build end, GPU:{} allocated={} bytes reserved={} bytes index_footprint={} bytes "
+    "build_peak={} bytes",
+    target_gpu,
+    allocator->get_total_allocated_bytes(),
+    allocator->get_total_reserved_bytes(),
+    meta.resident_bytes,
+    build_peak_bytes);
+
+  // Non-destructive path: remove the old one now that the new one is built
+  if (!released_first) {
+    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+  }
+  index_cache.insert(
+    std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  gstate.finished = true;
+}
+
+struct DropAnnIndexData : public TableFunctionData {
+  std::string table_name;
+  std::string column_name;
+  std::string schema_name = "main";
+  std::string metric;       ///< lowercased l2 / cosine; only read when has_metric
+  bool has_metric = false;  ///< true if a metric was given (drop just that one)
+};
+
+// Per-execution state
+struct DropAnnIndexGlobalState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<GlobalTableFunctionState> SiriusDropAnnIndexInit(ClientContext& context,
+                                                                   TableFunctionInitInput& input)
+{
+  return make_uniq<DropAnnIndexGlobalState>();
+}
+
+static unique_ptr<FunctionData> SiriusDropAnnIndexBind(ClientContext& context,
+                                                       TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types,
+                                                       vector<string>& names)
+{
+  auto result = make_uniq<DropAnnIndexData>();
+
+  if (input.inputs.size() < 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+    throw BinderException(
+      "sirius_drop_ann_index requires two non-NULL positional arguments: table and column");
+  }
+  result->table_name  = input.inputs[0].ToString();
+  result->column_name = input.inputs[1].ToString();
+
+  for (auto& kv : input.named_parameters) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) {
+      throw BinderException("sirius_drop_ann_index: named parameter '" + kv.first +
+                            "' cannot be NULL");
+    }
+    if (key == "metric") {
+      result->has_metric = true;
+      result->metric     = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "schema_name") {
+      result->schema_name = kv.second.ToString();
+    }
+  }
+
+  // A given metric drops just that index; omitting it drops every metric on the column.
+  if (result->has_metric && result->metric != "l2" && result->metric != "cosine") {
+    throw BinderException("sirius_drop_ann_index: metric must be one of 'l2', 'cosine', got '" +
+                          result->metric + "'");
+  }
+
+  return_types.emplace_back(LogicalType::BOOLEAN);
+  names.emplace_back("Dropped");
+  return std::move(result);
+}
+
+static void SiriusDropAnnIndexFunction(ClientContext& context,
+                                       TableFunctionInput& data_p,
+                                       DataChunk& output)
+{
+  auto& data   = data_p.bind_data->CastNoConst<DropAnnIndexData>();
+  auto& gstate = data_p.global_state->Cast<DropAnnIndexGlobalState>();
+  if (gstate.finished) { return; }
+
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_drop_ann_index requires the Sirius context to be initialized");
+  }
+
+  // Hold the query-lifecycle slot while the registry is read and mutated
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
+
+  auto const qname          = QualifiedName::Parse(data.table_name);
+  std::string const catalog = qname.catalog;  // empty => search path
+  std::string const schema  = !qname.schema.empty() ? qname.schema : data.schema_name;
+  std::string const& table  = qname.name;
+  auto& entry_base = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, table);
+  auto& entry      = entry_base.Cast<DuckTableEntry>();
+  auto& entry_catalog = entry.ParentCatalog().GetName();
+  auto& entry_schema  = entry.ParentSchema().name;
+
+  std::optional<cuvs::distance::DistanceType> metric;
+  if (data.has_metric) { metric = sirius::vss::ann_distance_type_from_metric(data.metric); }
+
+  auto& index_cache = sirius_ctx->get_cuvs_index_cache();
+  std::size_t const removed =
+    index_cache.erase_by_column(entry_catalog, entry_schema, entry.name, data.column_name, metric);
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(removed > 0));
+  gstate.finished = true;
+}
+
 struct SiriusVectorSearchBindData : public TableFunctionData {
   sirius::vss::vector_search_request req;
   // Output column types + trailing distance, for the host_table_chunk_reader.
@@ -1687,6 +2221,9 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   // Optional params' default values
   req.metric                    = "l2";
   req.k                         = 10;
+  req.use_index                 = true;
+  req.n_probes                  = 0;
+  req.index_type                = "ivf_flat";
   std::string schema_name       = "main";
   bool output_columns_specified = false;
   for (auto& kv : input.named_parameters) {
@@ -1698,6 +2235,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
       req.k = kv.second.GetValue<int64_t>();
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
+    } else if (key == "use_index") {
+      req.use_index = kv.second.GetValue<bool>();
+    } else if (key == "n_probes") {
+      req.n_probes = kv.second.GetValue<int64_t>();
+    } else if (key == "index_type") {
+      req.index_type = StringUtil::Lower(kv.second.ToString());
     } else if (key == "schema_name") {
       schema_name = kv.second.ToString();
     } else if (key == "output_columns") {
@@ -1708,9 +2251,20 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
     }
   }
   if (req.k <= 0) { throw BinderException("sirius_knn_search: k must be >= 1"); }
+  if (req.n_probes < 0) { throw BinderException("sirius_knn_search: n_probes must be >= 0"); }
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_search: metric must be one of 'l2', 'cosine', got '" +
                           req.metric + "'");
+  }
+  if (req.index_type != "ivf_flat") {
+    throw BinderException("sirius_knn_search: unsupported index_type '" + req.index_type + "'");
+  }
+  // NOTE: cuVS has a bug on approximate search over an IVF-Flat index with metric=cosine and
+  // k>256. Remove this guard once it's fixed.
+  if (req.use_index && req.index_type == "ivf_flat" && req.metric == "cosine" && req.k > 256) {
+    throw BinderException(
+      "sirius_knn_search: cosine ANN search with k > 256 is not supported; "
+      "pass use_index => false to run exact, or chose a lower k (k <= 256).");
   }
   // An explicitly-passed empty list is a user error.
   if (output_columns_specified && req.output_columns.empty()) {
@@ -1739,6 +2293,9 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   if (!sirius_ctx) {
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
   const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
     req.catalog, req.schema, req.table_name);
   if (pin == nullptr) {
@@ -1749,6 +2306,12 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   auto is_pinned           = [&](const std::string& col) {
     return std::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
   };
+
+  // Make sure the vector column is still pinned in case of a pin/unpin
+  if (!is_pinned(req.column_name)) {
+    throw BinderException("sirius_knn_search: vector column '" + req.column_name +
+                          "' is not pinned on table '" + req.table_name + "';");
+  }
 
   if (req.output_columns.empty()) {
     // Default to the columns that are pinned and in catalog schema order.
@@ -1794,8 +2357,10 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   }
 
   for (auto const& col : req.output_columns) {
-    return_types.push_back(type_of(col));
+    auto const& col_type = type_of(col);
+    return_types.push_back(col_type);
     names.push_back(col);
+    req.output_column_types.push_back(sirius::from_duckdb(col_type));
   }
   return_types.push_back(LogicalType::FLOAT);
   names.push_back("distance");
@@ -1807,13 +2372,17 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
 static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext& context,
                                                                    TableFunctionInitInput& input)
 {
-  nvtx3::scoped_range nvtx_range{"SiriusVectorSearchInit"};
+  sirius::nvtx_scoped_range nvtx_range{"SiriusVectorSearchInit"};
   auto& bind_data = input.bind_data->Cast<SiriusVectorSearchBindData>();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
     throw InvalidInputException("sirius_knn_search requires the Sirius context to be initialized");
   }
+
+  // Required to hold the query-lifecycle slot for the whole build since the pinned entry is
+  // non-owning. The slot also serializes the current-device-resource swap the build does.
+  duckdb::SiriusContext::SlotGuard slot(*sirius_ctx, context);
 
   auto state       = make_uniq<SiriusVectorSearchGlobalState>();
   state->host_repr = sirius::vss::run_vector_search(*sirius_ctx, bind_data.req);
@@ -1828,6 +2397,39 @@ static void SiriusVectorSearchFunction(ClientContext& context,
 {
   auto& state = data_p.global_state->Cast<SiriusVectorSearchGlobalState>();
   state.reader->get_next_chunk(output);
+}
+
+// sirius_set_session_label('<label>'): sticky per-connection telemetry query
+// group; '' reverts to the default session group.
+static unique_ptr<FunctionData> SiriusSetSessionLabelBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names)
+{
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException("sirius_set_session_label requires a non-NULL VARCHAR argument");
+  }
+  auto result   = make_uniq<SiriusSetQueryLabelData>();
+  result->label = input.inputs[0].ToString();
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.push_back("ok");
+  return std::move(result);
+}
+
+static void SiriusSetSessionLabelFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<SiriusSetQueryLabelData>();
+  if (data.finished) { return; }
+
+  if (auto conn_state = get_sirius_connection_state(context)) {
+    conn_state->set_session_label(data.label);
+  }
+
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BOOLEAN(true));
+  data.finished = true;
 }
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
@@ -1885,6 +2487,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo set_query_label_info(set_query_label);
   catalog.CreateTableFunction(transaction, set_query_label_info);
 
+  TableFunction set_session_label("sirius_set_session_label",
+                                  {LogicalType::VARCHAR},
+                                  SiriusSetSessionLabelFunction,
+                                  SiriusSetSessionLabelBind);
+  CreateTableFunctionInfo set_session_label_info(set_session_label);
+  catalog.CreateTableFunction(transaction, set_session_label_info);
+
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(
     "profiler_start", {}, ProfilerStartFunction, ProfilerBind, ProfilerInit);
@@ -1905,6 +2514,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
     pin_table_set.AddFunction(std::move(pin_table));
@@ -1919,8 +2529,32 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo unpin_table_info(unpin_table);
   catalog.CreateTableFunction(transaction, unpin_table_info);
 
+  // sirius_create_ann_index(table, column, metric=>, index_type=>, n_lists=>, schema_name=>)
+  TableFunction create_ann_index("sirius_create_ann_index",
+                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                 SiriusCreateAnnIndexFunction,
+                                 SiriusCreateAnnIndexBind,
+                                 SiriusCreateAnnIndexInit);
+  create_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
+  create_ann_index.named_parameters["index_type"]  = LogicalType::VARCHAR;
+  create_ann_index.named_parameters["n_lists"]     = LogicalType::BIGINT;
+  create_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  CreateTableFunctionInfo create_ann_index_info(create_ann_index);
+  catalog.CreateTableFunction(transaction, create_ann_index_info);
+
+  // sirius_drop_ann_index(table, column, metric =>, schema_name =>)
+  TableFunction drop_ann_index("sirius_drop_ann_index",
+                               {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                               SiriusDropAnnIndexFunction,
+                               SiriusDropAnnIndexBind,
+                               SiriusDropAnnIndexInit);
+  drop_ann_index.named_parameters["metric"]      = LogicalType::VARCHAR;
+  drop_ann_index.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  CreateTableFunctionInfo drop_ann_index_info(drop_ann_index);
+  catalog.CreateTableFunction(transaction, drop_ann_index_info);
+
   // sirius_knn_search(table, column, query, k =>, output_columns =>, metric =>,
-  // schema_name =>)
+  // use_index =>, n_probes =>, index_type =>, schema_name =>)
   TableFunction vector_search("sirius_knn_search",
                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
                               SiriusVectorSearchFunction,
@@ -1929,6 +2563,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_search.named_parameters["k"]              = LogicalType::BIGINT;
   vector_search.named_parameters["output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_search.named_parameters["metric"]         = LogicalType::VARCHAR;
+  vector_search.named_parameters["use_index"]      = LogicalType::BOOLEAN;
+  vector_search.named_parameters["n_probes"]       = LogicalType::BIGINT;
+  vector_search.named_parameters["index_type"]     = LogicalType::VARCHAR;
   vector_search.named_parameters["schema_name"]    = LogicalType::VARCHAR;
   CreateTableFunctionInfo vector_search_info(vector_search);
   catalog.CreateTableFunction(transaction, vector_search_info);
@@ -2194,40 +2831,67 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
                                 backend);
   }
-  Config::LOG_BACKEND = std::move(backend);
-  install_configured_log_sink(context.db.get());
+  auto const previous_backend = Config::LOG_BACKEND;
+  Config::LOG_BACKEND         = std::move(backend);
+  try {
+    install_configured_log_sink(context.db.get());
+  } catch (...) {
+    Config::LOG_BACKEND = previous_backend;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_LEVEL = StringValue::Get(parameter);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
-  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  auto level_name   = StringValue::Get(parameter);
+  auto parsed_level = sirius::log::string_to_enum(level_name);
   if (!parsed_level) {
-    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+    throw InvalidInputException(
+      "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
+      level_name);
   }
+  Config::LOG_LEVEL = std::move(level_name);
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
+  sirius::log::get_sink()->set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_DIR = StringValue::Get(parameter);
+  auto const previous_log_dir = Config::LOG_DIR;
+  Config::LOG_DIR             = StringValue::Get(parameter);
   // log_dir only affects the spdlog backend; rebuild it when that one is active.
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_DIR = previous_log_dir;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  auto const seconds = IntegerValue::Get(parameter);
+  if (seconds < 0) {
+    throw InvalidInputException(
+      "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
+      seconds);
+  }
+  auto const previous_flush_seconds = Config::LOG_FLUSH_SECONDS;
+  Config::LOG_FLUSH_SECONDS         = seconds;
   // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
   // the spdlog backend uses it).
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -2325,6 +2989,29 @@ static void SetEnableRuntimeDistinctBuildProbe(ClientContext& context,
   params->enable_runtime_distinct_build_probe = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_DISTINCT_BUILD_PROBE to {}",
                    params->enable_runtime_distinct_build_probe);
+}
+
+static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                       = lock_operator_params_slot(context);
+  params->enable_dense_count_join = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_DENSE_COUNT_JOIN to {}", params->enable_dense_count_join);
+}
+
+static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto const bytes = UBigIntValue::Get(parameter);
+  if (bytes == 0) {
+    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                          = lock_operator_params_slot(context);
+  params->dense_count_join_max_bytes = bytes;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
+                   params->dense_count_join_max_bytes);
 }
 
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -2543,6 +3230,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   // option registration from growing scattered environment checks.
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_pin_registry_change",
+                    "simulate a pin or unpin landing between the finalize and execution windows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_inject_transparent_gpu_error",
                     "force transparent GPU execution to fail at runtime with this message",
                     LogicalType::VARCHAR,
@@ -2590,6 +3283,20 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(operator_defaults.enable_runtime_distinct_build_probe),
                     SetEnableRuntimeDistinctBuildProbe);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "enable_dense_count_join",
+                    "runtime override for dense count-join planning",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(operator_defaults.enable_dense_count_join),
+                    SetEnableDenseCountJoin);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_max_bytes",
+                    "internal test hook for the dense count-join histogram budget",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
+                    SetDenseCountJoinMaxBytes);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",
@@ -2656,7 +3363,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value(Config::LOG_DIR),
                             SetLogDir);
   config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes",
+                            "Interval in seconds between automatic log flushes (0 disables)",
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
@@ -2704,20 +3411,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
 
-  config.AddExtensionOption("pin_table_compression",
-                            "Request Simpatico compression for pin_table chunks. Takes effect only "
-                            "when pin_table_input_compression_plan_dir is non-empty and contains a "
-                            "matching table plan",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
-                            SetEnablePinTableCompression);
+  config.AddExtensionOption(
+    "pin_table_compression",
+    "Default for pin_table calls that omit the compression named "
+    "parameter. Takes effect only when pin_table_input_compression_plan_dir "
+    "is non-empty and contains a matching table plan",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
+    SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
     "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "May be set before pin_table_compression is enabled. Tables with no matching file are pinned "
-    "uncompressed. No effect on spill compression.",
+    "May be set before a compression-enabled pin_table call. Tables with no matching file are "
+    "pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
@@ -2822,6 +3530,66 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
+/// Configure NVTX runtime discovery before the process's first NVTX call.
+///
+/// An existing NVTX_INJECTION64_PATH remains authoritative. Otherwise, an
+/// explicit nvtx_injection_lib from the Sirius config is used. If neither is
+/// present, the loadable extension points NVTX at its own DSO. A statically
+/// linked Sirius instead uses a private dlopen token which resolves to the
+/// running executable. In both cases Quent's injector is embedded in the same
+/// image as Sirius, so dependency images such as libcudf attach to the same hook
+/// without requiring a separately deployed injection library.
+///
+/// NVTX initialises lazily and per image, on that image's first NVTX call, so
+/// setting the variable here — after libcudf is mapped but before any NVTX call
+/// — still reaches it. That holds only while libcudf makes no NVTX call from a
+/// static constructor; should it ever do so, its image initialises during dlopen
+/// and this path becomes invisible to it. Set NVTX_INJECTION64_PATH in the
+/// environment instead if that happens.
+static void maybe_set_nvtx_injection_path(const sirius::telemetry_config& telemetry) noexcept
+{
+  if (std::getenv("NVTX_INJECTION64_PATH") != nullptr || !telemetry.enable_quent) { return; }
+
+  if (!telemetry.nvtx_injection_lib.empty()) {
+    ::setenv("NVTX_INJECTION64_PATH", telemetry.nvtx_injection_lib.c_str(), /*overwrite=*/0);
+    return;
+  }
+
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+  try {
+    Dl_info self{};
+    // Use a private function as the anchor: unlike the public NVTX initializer,
+    // its address cannot be interposed by another ELF image.
+    if (::dladdr(reinterpret_cast<void*>(&maybe_set_nvtx_injection_path), &self) == 0 ||
+        self.dli_fname == nullptr) {
+      return;
+    }
+
+    std::error_code error;
+    auto self_path = std::filesystem::canonical(self.dli_fname, error);
+    if (error) { return; }
+    ::setenv("NVTX_INJECTION64_PATH", self_path.c_str(), /*overwrite=*/0);
+  } catch (...) {
+    // NVTX capture is optional; self-path discovery must not prevent Sirius
+    // from loading.
+  }
+#else
+  // Probe the interposition path before publishing it. NVTX does not fall
+  // back to static injection after a dynamic lookup failure, so a broken
+  // final link must leave the environment unset.
+  auto* handle = ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+  if (handle == nullptr) { return; }
+  auto* initializer = ::dlsym(handle, "InitializeInjectionNvtx2");
+  bool const usable = initializer == reinterpret_cast<void*>(&InitializeInjectionNvtx2);
+  ::dlclose(handle);
+  if (!usable) { return; }
+
+  ::setenv("NVTX_INJECTION64_PATH",
+           sirius::telemetry::detail::static_injection_path,
+           /*overwrite=*/0);
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -2831,8 +3599,16 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
-  auto* callback_ptr = callback.get();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr         = callback.get();
+  bool const sirius_disabled = callback_ptr->is_disabled();
+
+  if (!sirius_disabled) {
+    // Config loading above must remain NVTX-free. Publish discovery after its
+    // validation, but before SiriusContext can make any NVTX call.
+    maybe_set_nvtx_injection_path(callback_ptr->get_loaded_config().get_telemetry_config());
+    callback_ptr->initialize_context();
+  }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the
@@ -2875,10 +3651,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
   // extension binary itself may still be loaded).
-  bool const sirius_disabled = [] {
-    auto* val = std::getenv("SIRIUS_DISABLE");
-    return val != nullptr && std::string(val) != "0";
-  }();
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 

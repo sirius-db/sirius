@@ -16,7 +16,12 @@
 
 cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
 
-project(sirius LANGUAGES CXX CUDA)
+project(
+  sirius
+  VERSION 0.0.0
+  LANGUAGES CXX CUDA)
+
+include(GNUInstallDirs)
 
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -27,6 +32,7 @@ endif()
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
+option(BUILD_WITH_CTRACK "Build with CTrack profiling support" OFF)
 
 # The [s3] integration tests launch MinIO via a patched build of upstream
 # testcontainers-native, fetched + patched at configure time and built as a Go
@@ -92,6 +98,10 @@ find_package(raft REQUIRED CONFIG) # raft must be found before cuvs
 find_package(cuvs REQUIRED CONFIG)
 find_package(spdlog REQUIRED CONFIG)
 find_package(yaml-cpp REQUIRED CONFIG)
+# CRoaring decodes Iceberg Puffin deletion vectors (portable Roaring). Host-side
+# only; the same library duckdb-iceberg uses for the same blob, so the two
+# readers agree by construction.
+find_package(roaring REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -114,6 +124,15 @@ endif()
 # The pixi build has no such target and links the conda shared libnvrtc.so.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
+  find_package(nvjitlink CONFIG REQUIRED)
+  # FindCUDAToolkit also adds nvJitLink through cuSPARSE's link interface.
+  get_target_property(_cusparse_links CUDA::cusparse INTERFACE_LINK_LIBRARIES)
+  if(_cusparse_links)
+    list(TRANSFORM _cusparse_links REPLACE "^CUDA::nvJitLink$"
+                                           "nvjitlink::nvjitlink_static")
+    set_target_properties(CUDA::cusparse PROPERTIES INTERFACE_LINK_LIBRARIES
+                                                    "${_cusparse_links}")
+  endif()
 endif()
 
 # --- cuCollections (cuco) --- #
@@ -130,9 +149,9 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     cuco
-    URL https://github.com/NVIDIA/cuCollections/archive/f517bbb1277753b1852dfd388993383e401eaa38.tar.gz
+    URL https://github.com/NVIDIA/cuCollections/archive/0883368d39296f3bef3a058033141bcc642c5c54.tar.gz
     URL_HASH
-      SHA256=d17e2f6d58cfb2cd473efcbd741c633e7607717102cedc08173a4a69bb2a8ba9
+      SHA256=4ec8320a0372839b991f0b431c7f8bf0e770006cb3c8631c6e373c434471fd45
     SOURCE_SUBDIR do-not-build)
   FetchContent_MakeAvailable(cuco)
   # SOURCE_SUBDIR do-not-build populates headers without running cuco's CMake,
@@ -146,9 +165,35 @@ else()
   endif()
 endif()
 
+# CTrack is retained as an opt-in profiling dependency.
+if(BUILD_WITH_CTRACK)
+  # --- ctrack (profiling instrumentation) --- #
+  include(FetchContent)
+  FetchContent_Declare(
+    ctrack
+    GIT_REPOSITORY https://github.com/Compaile/ctrack.git
+    GIT_TAG 6dfa9b0eef26507cfa9bc17ae4d817ab011a28f5 # v1.1.0
+    SOURCE_SUBDIR do-not-build)
+  FetchContent_MakeAvailable(ctrack)
+  if(NOT TARGET ctrack::ctrack)
+    add_library(ctrack::ctrack INTERFACE IMPORTED)
+    set_target_properties(
+      ctrack::ctrack PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                "${ctrack_SOURCE_DIR}/include")
+  endif()
+
+endif()
+
 pkg_check_modules(NUMA REQUIRED IMPORTED_TARGET numa)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
-pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+if(VCPKG_BUILD)
+  # The CMake target includes curl's private static dependencies.
+  find_package(CURL CONFIG REQUIRED)
+  set(SIRIUS_CURL_TARGET CURL::libcurl)
+else()
+  pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+  set(SIRIUS_CURL_TARGET PkgConfig::CURL)
+endif()
 
 # cuCascade - GPU Memory Reservation Library (submodule)
 set(BUILD_TESTS
@@ -178,6 +223,11 @@ set(CUCASCADE_BUILD_IO
     OFF
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
+
+# Name of the NVTX domain every Sirius range is published into. Derived from the
+# project name so it has a single authoritative source; simpatico turns it into
+# the SIRIUS_NVTX_DOMAIN_NAME compile definition both include trees consume.
+set(SIRIUS_NVTX_DOMAIN_NAME "${PROJECT_NAME}")
 
 # Simpatico GPU compression engine Tests disabled here — run them via the
 # standalone simpatico_codegen build. Benchmark harness
@@ -249,6 +299,15 @@ set(EXTENSION_SOURCES
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/late_mat/prepared_selection.cpp
+    src/late_mat/materialize.cpp
+    src/late_mat/defer_policy.cpp
+    src/late_mat/defer_directive.cpp
+    src/late_mat/port_materialize.cpp
+    src/late_mat/pin_uniqueness.cpp
+    src/planner/late_mat_plan_pass.cpp
+    src/scan_manager/late_mat_resolver.cpp
+    src/late_mat/multi_source_gather.cu
     src/config.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
@@ -314,6 +373,7 @@ set(EXTENSION_SOURCES
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
+    src/op/aggregate/group_key_labels.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
@@ -337,6 +397,12 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/puffin_reader.cpp
+    src/op/scan/positional_delete_filter.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_gpu_ingestible.cpp
     src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
     src/op/dynamic_filter/dynamic_filter_publisher.cpp
     src/op/dynamic_filter/sirius_dynamic_filter.cpp
@@ -346,6 +412,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
     src/op/sirius_physical_delim_join.cpp
+    src/op/sirius_physical_dense_count_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_empty_result.cpp
     src/op/sirius_physical_filter.cpp
@@ -431,10 +498,12 @@ set(EXTENSION_SOURCES
     src/transparent/sirius_optimizer_extension.cpp
     src/util/stream_check_wrapper.cpp
     src/util/segfault_backtrace_handler.cpp
+    src/vss/cuvs_index_cache.cpp
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
     src/vss/pinned_column.cpp
     src/vss/vector_search.cpp
+    src/vss/vector_search_ann.cpp
     src/vss/vector_search_enn.cpp)
 # cmake-format: on
 
@@ -443,6 +512,8 @@ set(EXTENSION_SOURCES
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
     src/op/partition/crc32_partition_hash.cu
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/dense_count_join_impl.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
@@ -458,7 +529,8 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu
     src/cuda/vss/cudf_raft_interop.cu
-    src/cuda/vss/brute_force_search.cu)
+    src/cuda/vss/brute_force_search.cu
+    src/cuda/vss/ivf_flat_index.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -530,6 +602,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
       $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
       "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
   )
+  target_compile_definitions(${_target}
+                             PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -583,20 +657,82 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
+    roaring::roaring
     telemetry_bridge
     core_functions_extension
     parquet_extension
     simpatico)
+  if(BUILD_WITH_CTRACK)
+    target_link_libraries(${_target} ctrack::ctrack)
+  endif()
+
+  # Corrosion exposes telemetry_bridge as an INTERFACE target whose concrete
+  # Rust archive is telemetry_bridge-static. Apply WHOLE_ARCHIVE to that real
+  # archive so the unreferenced NVTX static-injection shim reaches the final
+  # loadable extension instead of being dropped at the nested archive boundary.
+  set_property(
+    TARGET ${_target} PROPERTY "LINK_LIBRARY_OVERRIDE_telemetry_bridge-static"
+                               WHOLE_ARCHIVE)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
 
 # Additional libraries only needed by the static extension
 target_link_libraries(sirius_extension PkgConfig::NUMA PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto absl::any_invocable)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto absl::any_invocable)
+
+# `sirius_extension` is itself an archive, so its LINK_LIBRARY_OVERRIDE does not
+# perform a final link. Carry the concrete Rust archive as a transitive
+# WHOLE_ARCHIVE item instead; DuckDB and every other final consumer then retain
+# the static NVTX pointer shim as well.
+target_link_libraries(sirius_extension
+                      "$<LINK_LIBRARY:WHOLE_ARCHIVE,telemetry_bridge-static>")
+
+# A statically embedded Sirius cannot give NVTX a DSO path. Its private dlopen
+# interposer maps one sentinel path to the running executable instead. Carry
+# both symbols into the final executable's dynamic symbol table so dependency
+# images such as libcudf can resolve the Quent initializer from that handle.
+target_link_options(
+  sirius_extension INTERFACE
+  "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2"
+  "LINKER:--export-dynamic-symbol=dlopen")
 
 target_link_libraries(sirius_loadable_extension PkgConfig::LIBURING
-                      PkgConfig::CURL OpenSSL::Crypto)
+                      ${SIRIUS_CURL_TARGET} OpenSSL::Crypto)
+
+# NVTX's runtime injection lookup dlopens the path named by
+# NVTX_INJECTION64_PATH and resolves InitializeInjectionNvtx2 from it. Export
+# the statically embedded Quent entry point from the loadable extension so
+# Sirius can point NVTX at its own already-loaded DSO without deploying a second
+# injection library.
+target_link_options(sirius_loadable_extension PRIVATE
+                    "LINKER:--export-dynamic-symbol=InitializeInjectionNvtx2")
+
+add_library(sirius_shared SHARED src/sirius_library_anchor.cpp)
+add_library(sirius::sirius ALIAS sirius_shared)
+set_target_properties(
+  sirius_shared
+  PROPERTIES OUTPUT_NAME sirius
+             EXPORT_NAME sirius
+             VERSION "${PROJECT_VERSION}"
+             SOVERSION 0
+             INSTALL_RPATH "$ORIGIN"
+             INSTALL_REMOVE_ENVIRONMENT_RPATH ON
+             CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  sirius_shared
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/sirius>)
+target_link_libraries(
+  sirius_shared
+  PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
+          "$<LINK_LIBRARY:WHOLE_ARCHIVE,dummy_static_extension_loader>")
+set_target_properties(sirius_shared PROPERTIES LINKER_TYPE LLD)
+
+# Discard unused sections pulled in by whole archives.
+target_link_options(sirius_shared PRIVATE "LINKER:--gc-sections")
 
 # The sirius-sys + sirius Rust crates are built by cargo, not CMake (unlike the
 # telemetry bridge above, which CMake drives via Corrosion). Their build.rs
@@ -650,6 +786,37 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY SameMinorVersion)
+
+install(
+  TARGETS sirius_shared
+  EXPORT sirius-targets
+  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
+  RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT sirius_library)
+install(
+  FILES src/include/sirius_ffi.hpp
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius"
+  COMPONENT sirius_library)
+install(
+  EXPORT sirius-targets
+  FILE sirius-targets.cmake
+  NAMESPACE sirius::
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  COMPONENT sirius_library)
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
+  COMPONENT sirius_library)
+
 if(ENABLE_STREAM_CHECK)
   message(
     STATUS "Stream check library will be built (loaded dynamically at runtime)")
@@ -668,6 +835,8 @@ set(TEST_SOURCES
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
     test/cpp/config/test_topology_config.cpp
+    test/cpp/creator/test_task_creator_query_state.cpp
+    test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
@@ -710,6 +879,8 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
     test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
+    test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
+    test/cpp/integration/test_gpu_execution_dense_count_join.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp
@@ -725,7 +896,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_unique_join.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
+    test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
@@ -737,6 +910,18 @@ set(TEST_SOURCES
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
     test/cpp/integration/test_transparent_runtime_fallback.cpp
+    test/cpp/late_mat/test_column_origin.cpp
+    test/cpp/late_mat/test_prepared_selection.cpp
+    test/cpp/late_mat/test_materialize.cpp
+    test/cpp/late_mat/test_port_materialize.cpp
+    test/cpp/integration/test_late_mat_deferred_query.cpp
+    test/cpp/integration/test_late_mat_native_filter.cpp
+    test/cpp/late_mat/test_defer_policy.cpp
+    test/cpp/late_mat/test_defer_directive.cpp
+    test/cpp/late_mat/test_late_mat_plan_pass.cpp
+    test/cpp/late_mat/test_late_mat_resolver.cpp
+    test/cpp/late_mat/test_pin_handle_lifecycle.cpp
+    test/cpp/late_mat/test_pin_uniqueness.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -754,6 +939,8 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
+    test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
+    test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -764,6 +951,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_build_probe_scheduling.cpp
     test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+    test/cpp/operator/aggregate/test_group_key_labels.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
@@ -771,6 +959,7 @@ set(TEST_SOURCES
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
+    test/cpp/operator/test_physical_dense_count_join.cpp
     test/cpp/operator/test_physical_sort_sample.cpp
     test/cpp/operator/test_physical_filter.cpp
     test/cpp/operator/test_physical_limit.cpp
@@ -794,6 +983,7 @@ set(TEST_SOURCES
     test/cpp/parallel/test_task_executor.cpp
     src/planner/dynamic_filter/duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_dense_count_join_detection.cpp
     test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
     test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
@@ -810,6 +1000,7 @@ set(TEST_SOURCES
     test/cpp/planner/test_query_index.cpp
     test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
+    test/cpp/pipeline/test_completion_signal.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
     test/cpp/pipeline/test_pipeline_memory_history.cpp
@@ -822,9 +1013,11 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
+    test/cpp/pipeline/test_per_query_completion_handler.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_streaming_sink_root.cpp
+    test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
@@ -832,10 +1025,14 @@ set(TEST_SOURCES
     test/cpp/scan/test_duckdb_insert_delta.cpp
     test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
+    test/cpp/scan/test_duckdb_native_deferred_walk.cpp
     test/cpp/scan/test_duckdb_native_empty_split_decode.cpp
     test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
+    test/cpp/scan/test_iceberg_batch_layout.cpp
+    test/cpp/scan/test_iceberg_equality_delete.cpp
+    test/cpp/scan/test_puffin_reader.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
@@ -846,6 +1043,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_schema_mapping.cpp
     test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_residual_filter.cpp
+    test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
@@ -855,13 +1053,16 @@ set(TEST_SOURCES
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
+    test/cpp/vss/test_cuvs_index_cache.cpp
     test/cpp/vss/test_distance_metric.cpp
     test/cpp/vss/test_enn_top_k.cpp
+    test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_pinned_column.cpp
     test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/test_child_process_environment.cpp
     test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
@@ -903,6 +1104,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    # Late-materialization headers include codegen/selection/chunk_row_set.hpp
+    # and row_id_space.hpp, so a test that includes
+    # late_mat/prepared_selection.hpp needs the simpatico include root. It was
+    # dropped as dead in #1474 (8a3de03c), which was true until this feature
+    # landed.
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
@@ -914,7 +1121,8 @@ link_extension_libraries(sirius_unittest "")
 # offline/Go-less builds skip it; the harness calls in unittest.cpp are guarded
 # by SIRIUS_HAVE_TESTCONTAINERS.
 if(SIRIUS_BUILD_S3_TESTS)
-  target_link_libraries(sirius_unittest testcontainers_native PkgConfig::CURL)
+  target_link_libraries(sirius_unittest testcontainers_native
+                        ${SIRIUS_CURL_TARGET})
   target_compile_definitions(sirius_unittest
                              PRIVATE SIRIUS_HAVE_TESTCONTAINERS=1)
 endif()
@@ -932,6 +1140,7 @@ set_target_properties(
 target_compile_definitions(
   sirius_unittest
   PRIVATE
+    CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
     $<BUILD_INTERFACE:SIRIUS_DEFAULT_LOG_DIR="${CMAKE_BINARY_DIR}/log">
     $<BUILD_INTERFACE:SIRIUS_UNITTEST_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log">
     $<BUILD_INTERFACE:SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}">)
@@ -945,6 +1154,9 @@ endif()
 # test/io/parquet_benchmark — standalone benchmark binary for sirius_datasource
 # -----------------------------------------------------------------------------
 add_executable(parquet_benchmark test/io/parquet_benchmark.cpp)
+
+target_compile_definitions(parquet_benchmark
+                           PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
 
 if(VCPKG_BUILD)
   set_target_properties(parquet_benchmark PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)

@@ -330,6 +330,10 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
     return join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::RIGHT_SEMI ||
            join_type == duckdb::JoinType::RIGHT_ANTI;
   }
+  [[nodiscard]] std::string_view input_port_for(
+    sirius_physical_operator const& producer) const override;
+  [[nodiscard]] MemoryBarrierType input_barrier_for(
+    sirius_physical_operator const& producer) const override;
 
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;

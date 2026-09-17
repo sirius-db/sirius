@@ -28,7 +28,6 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 
 #include <cuda_runtime.h>
@@ -37,6 +36,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/cudf/host_table.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -83,7 +83,7 @@ bool column_has_data_buffer(const cudf::column_view& col) noexcept
  */
 cucascade::memory::column_metadata plan_column_copy(const cudf::column_view& col,
                                                     std::size_t& current_offset,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   assert(col.offset() == 0 && "column_view with non-zero offset is not supported");
 
@@ -210,7 +210,7 @@ void collect_column_d2h_ops(
 /// @brief Submit one chunk of D2H copies on @p stream. The dsts/srcs/sizes vectors are owned by
 /// the caller and reused across chunks to avoid per-chunk reallocation.
 void submit_chunk(std::span<const copy_op> ops,
-                  rmm::cuda_stream_view stream,
+                  ::cuda::stream_ref stream,
                   std::vector<void*>& dsts,
                   std::vector<const void*>& srcs,
                   std::vector<std::size_t>& sizes)
@@ -235,15 +235,15 @@ void submit_chunk(std::span<const copy_op> ops,
   // parameter that was removed in CUDA 13.
 #if CUDART_VERSION < 13000
   RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, nullptr, stream.value()));
+    dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, nullptr, stream.get()));
 #else
   RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, stream.value()));
+    dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, stream.get()));
 #endif
 #else
   // cudaMemcpyBatchAsync requires CUDA 12.8+.
   for (std::size_t i = 0; i < dsts.size(); ++i) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.value()));
+    RMM_CUDA_TRY(cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream.get()));
   }
 #endif
 }
@@ -259,7 +259,7 @@ void submit_chunk(std::span<const copy_op> ops,
 std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   cucascade::idata_representation& source,
   const cucascade::memory::memory_space* target_memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::reservation* reservation,
   std::size_t chunk_bytes)
 {
@@ -283,7 +283,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   auto allocation = mr->allocate_multiple_blocks(total_size, reservation);
   bool copies_pending          = false;
   absl::Cleanup sync_on_failure = [&]() noexcept {
-    if (copies_pending) { stream.synchronize_no_throw(); }
+    if (copies_pending) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream.get())); }
   };
 
   // Pass 3: collect D2H ops, flushing every ~chunk_bytes as the tree is walked.
@@ -299,7 +299,7 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
       view.column(i), columns[static_cast<std::size_t>(i)], *allocation, batcher);
   }
   batcher.flush_pending();
-  stream.synchronize();
+  stream.sync();
   copies_pending = false;
 
   auto host_alloc = cucascade::memory::host_table_allocation::create(
@@ -327,7 +327,7 @@ void register_chunked_spill_converters(cucascade::representation_converter_regis
     .register_converter<cucascade::gpu_table_representation, cucascade::host_data_representation>(
       [chunk_bytes](cucascade::idata_representation& source,
                     const cucascade::memory::memory_space* target_memory_space,
-                    rmm::cuda_stream_view stream,
+                    ::cuda::stream_ref stream,
                     cucascade::memory::reservation* reservation) {
         return convert_gpu_to_host_chunked(
           source, target_memory_space, stream, reservation, chunk_bytes);

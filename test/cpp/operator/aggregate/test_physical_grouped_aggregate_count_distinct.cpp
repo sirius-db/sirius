@@ -44,6 +44,7 @@
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -638,4 +639,73 @@ TEST_CASE("count distinct: multi-column struct expression",
     dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches()[0],
     expected_table->view(),
     true /*sort*/));
+}
+
+TEST_CASE("count distinct: large low-cardinality input uses group key labels",
+          "[aggregate][group_key_labels][physical_grouped_aggregate_count_distinct]")
+{
+  using KeyTraits = gpu_type_traits<int32_t>;
+  using ValTraits = gpu_type_traits<int32_t>;
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto mr     = get_resource_ref(*space);
+  auto stream = default_stream();
+
+  constexpr std::size_t row_count   = (1U << 20U) + 1024U;
+  constexpr int32_t group_count     = 8;
+  constexpr int32_t distinct_values = 5;
+  std::vector<int32_t> key_a(row_count);
+  std::vector<int32_t> key_b(row_count);
+  std::vector<int32_t> values(row_count);
+  for (std::size_t index = 0; index < row_count; ++index) {
+    auto const group = static_cast<int32_t>(index % group_count);
+    key_a[index]     = group;
+    key_b[index]     = group * 10;
+    values[index]    = static_cast<int32_t>(index % distinct_values);
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> input_columns;
+  input_columns.push_back(vector_to_cudf_column<KeyTraits>(key_a, stream, mr));
+  input_columns.push_back(vector_to_cudf_column<KeyTraits>(key_b, stream, mr));
+  input_columns.push_back(vector_to_cudf_column<ValTraits>(values, stream, mr));
+  auto input_batch =
+    sirius::make_data_batch(std::make_unique<cudf::table>(std::move(input_columns)),
+                            *space,
+                            stream,
+                            sirius::telemetry::batch_telemetry_info{});
+
+  auto aggregate_spec =
+    sirius::test::create_count_distinct_expressions<KeyTraits, ValTraits>({0, 1}, 2);
+  sirius_physical_grouped_aggregate local_op(std::move(aggregate_spec.output_types),
+                                             std::move(aggregate_spec.aggregates),
+                                             std::move(aggregate_spec.groups),
+                                             group_count);
+  sirius_physical_grouped_aggregate_merge merge_op(&local_op);
+
+  auto local_out = run_local(local_op, input_batch);
+  auto final_out = merge_op.execute(
+    pipelineable_operator_data(std::vector<std::shared_ptr<data_batch>>{local_out}), stream);
+
+  std::vector<int32_t> expected_key_a(group_count);
+  std::vector<int32_t> expected_key_b(group_count);
+  std::vector<int64_t> expected_counts(group_count, distinct_values);
+  std::iota(expected_key_a.begin(), expected_key_a.end(), 0);
+  std::transform(
+    expected_key_a.begin(), expected_key_a.end(), expected_key_b.begin(), [](int32_t group) {
+      return group * 10;
+    });
+  std::vector<std::unique_ptr<cudf::column>> expected_columns;
+  expected_columns.push_back(vector_to_cudf_column<KeyTraits>(expected_key_a, stream, mr));
+  expected_columns.push_back(vector_to_cudf_column<KeyTraits>(expected_key_b, stream, mr));
+  expected_columns.push_back(
+    vector_to_cudf_column<gpu_type_traits<int64_t>>(expected_counts, stream, mr));
+  auto expected = std::make_unique<cudf::table>(std::move(expected_columns));
+
+  auto const& output_batches =
+    dynamic_cast<const pipelineable_operator_data&>(*final_out).get_data_batches();
+  REQUIRE(output_batches.size() == 1);
+  REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
+    output_batches.front(), expected->view(), true /*sort*/));
 }

@@ -53,6 +53,10 @@ namespace cucascade::memory {
 class small_pinned_host_memory_resource;
 }  // namespace cucascade::memory
 
+namespace sirius::vss {
+class cuvs_index_cache;
+}  // namespace sirius::vss
+
 namespace sirius::memory {
 class numa_small_pinned_mr;
 class topology_index;
@@ -150,6 +154,20 @@ class SiriusConnectionState : public ClientContextState {
     return label;
   }
 
+  /// Sets the telemetry query-group label for subsequent queries on this connection.
+  ///
+  /// The label remains active until replaced.
+  /// An empty label restores the default session group.
+  void set_session_label(std::string label)
+  {
+    if (label.empty()) {
+      session_label_.reset();
+    } else {
+      session_label_ = std::move(label);
+    }
+  }
+  [[nodiscard]] const std::optional<std::string>& session_label() const { return session_label_; }
+
   void enter_internal_query() noexcept
   {
     internal_query_depth_.fetch_add(1, std::memory_order_relaxed);
@@ -185,6 +203,8 @@ class SiriusConnectionState : public ClientContextState {
   /// Label set by `sirius_set_query_label`, consumed by the next
   /// sirius_interface construction on this connection.
   std::optional<std::string> pending_query_label_;
+  /// Sticky label set by `sirius_set_session_label`; never consumed.
+  std::optional<std::string> session_label_;
   std::atomic<int> internal_query_depth_{0};
   std::atomic<int> cpu_fallback_depth_{0};
   std::optional<std::shared_lock<std::shared_mutex>> pinned_update_guard_;
@@ -513,6 +533,10 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::scan_manager::sirius_scan_manager& get_scan_manager();
   [[nodiscard]] const sirius::scan_manager::sirius_scan_manager& get_scan_manager() const;
 
+  /// \brief Get the session's cuVS ANN index cache (GPU-resident, pinned indexes).
+  [[nodiscard]] sirius::vss::cuvs_index_cache& get_cuvs_index_cache();
+  [[nodiscard]] const sirius::vss::cuvs_index_cache& get_cuvs_index_cache() const;
+
   /// Coordinate update execution with pin-registry mutations.
   std::shared_lock<std::shared_mutex> lock_pinned_table_updates();
   std::unique_lock<std::shared_mutex> lock_pinned_table_registry();
@@ -523,14 +547,19 @@ class SiriusContext : public ClientContextState {
   /// \brief Start a query with its pipelines.
   /// \param pipelines The ordered pipelines for the query.
   /// \param telemetry_info Info useful for emitting identifiable telemetry.
-  void create_query(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
-                    sirius::query_id_t query_id,
-                    sirius::telemetry::query_telemetry_info telemetry_info);
+  /// \param handler The query's completion signal, owned by its sirius_engine. Stamped onto
+  ///        every pipeline's task global state so tasks can report without any shared
+  ///        "current query" handler.
+  /// \return The constructed query. Ownership belongs to the caller (sirius_engine): the query
+  ///         is an index over that engine's plan, so outliving the plan would leave its cached
+  ///         operator pointers dangling for no benefit.
+  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> create_query(
+    std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+    sirius::query_id_t query_id,
+    std::shared_ptr<sirius::pipeline::completion_handler> handler,
+    sirius::telemetry::query_telemetry_info telemetry_info);
 
   /// \brief Get the current query.
-  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
-  [[nodiscard]] duckdb::shared_ptr<const sirius::planner::query> get_query() const;
-
   /// \brief Get the current Sirius configuration (const).
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
@@ -620,9 +649,10 @@ class SiriusContext : public ClientContextState {
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                       std::string_view end_tag) noexcept;
 
-  /// \brief Best-effort task_creator reset for latched-unavailable paths,
-  /// where no later window will ever run the in-cleanup reset.
-  void drop_task_creator_state_best_effort() noexcept;
+  /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
+  /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
+  /// queued tasks. Each step is separately guarded; neither can throw.
+  void drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept;
 
   mutable std::mutex mutex_;
   // The Super Sirius runtime is shared across connections, so plan generation
@@ -650,6 +680,11 @@ class SiriusContext : public ClientContextState {
   bool is_initialized_ = false;
   sirius::sirius_config config_;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  // Session-lifetime cache of GPU-resident, pinned cuVS ANN indexes. Declared
+  // after memory_manager_ so it is destroyed before it: each entry holds a
+  // reservation into the manager's GPU spaces, so the manager must outlive the
+  // cache. Also reset explicitly in terminate() before the manager is torn down.
+  std::unique_ptr<sirius::vss::cuvs_index_cache> cuvs_index_cache_;
   // Single source of truth for the GPU<->NUMA hardware topology, scoped to the
   // memory manager's reserved GPU/HOST spaces. Shared by shared_ptr copy with
   // the small-pinned allocator, downgrade executors, task_creator, and
@@ -694,7 +729,6 @@ class SiriusContext : public ClientContextState {
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
-  duckdb::shared_ptr<sirius::planner::query> query_;
 
   sirius::op::dynamic_filter_stats dynamic_filter_stats_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
@@ -722,6 +756,12 @@ void install_configured_log_sink(DatabaseInstance* db);
 class SiriusContextExtensionCallback : public ExtensionCallback {
  public:
   SiriusContextExtensionCallback();
+
+  /// Finish runtime initialization after process-wide setup that must precede
+  /// the first NVTX/runtime-initialization call.
+  void initialize_context();
+
+  [[nodiscard]] bool is_disabled() const noexcept { return disabled_; }
 
   /// \brief Called when a new connection is opened.
   /// \param context The client context.
@@ -753,6 +793,7 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
  private:
   void read_config_file_if_exists();
 
+  bool disabled_{false};
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };

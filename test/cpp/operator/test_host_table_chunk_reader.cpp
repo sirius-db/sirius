@@ -24,12 +24,16 @@
 #include <op/result/host_table_chunk_reader.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
+
+// duckdb
+#include <duckdb/common/types/timestamp.hpp>
 
 // rmm
 #include <rmm/cuda_stream.hpp>
@@ -244,6 +248,64 @@ host_data_representation const& convert_to_host_table(
   return ro.get_data()->cast<host_data_representation>();
 }
 
+std::unique_ptr<cudf::table> make_timestamp_table(std::vector<int64_t> const& ticks,
+                                                  cudf::type_id ts_type_id,
+                                                  std::vector<cudf::size_type> const& null_rows,
+                                                  rmm::cuda_stream_view stream,
+                                                  rmm::device_async_resource_ref mr)
+{
+  auto col = cudf::make_timestamp_column(cudf::data_type{ts_type_id},
+                                         static_cast<cudf::size_type>(ticks.size()),
+                                         cudf::mask_state::UNALLOCATED,
+                                         stream,
+                                         mr);
+  if (!ticks.empty()) {
+    cudaMemcpy(col->mutable_view().data<int64_t>(),
+               ticks.data(),
+               sizeof(int64_t) * ticks.size(),
+               cudaMemcpyHostToDevice);
+  }
+  apply_null_mask(*col, null_rows, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::shared_ptr<data_batch> make_test_batch(std::unique_ptr<cudf::table> table,
+                                            cucascade::memory::memory_space& gpu_space,
+                                            rmm::cuda_stream_view stream)
+{
+  return sirius::make_data_batch(
+    std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
+}
+
+std::vector<duckdb::timestamp_t> read_timestamp_chunks(
+  duckdb::Connection& con,
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
+  std::shared_ptr<data_batch> const& batch,
+  duckdb::LogicalType const& output_type,
+  rmm::cuda_stream_view stream)
+{
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
+  duckdb::vector<duckdb::LogicalType> types{output_type};
+  sirius::op::result::host_table_chunk_reader reader(
+    *con.context, host_table, sirius::from_duckdb_vec(types));
+
+  std::vector<duckdb::timestamp_t> out;
+  auto const num_chunks = reader.calculate_num_chunks();
+  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+    duckdb::DataChunk chunk;
+    REQUIRE(reader.get_next_chunk(chunk));
+    REQUIRE(chunk.data[0].GetType() == output_type);
+    auto const count = static_cast<size_t>(chunk.size());
+    auto* ts         = duckdb::FlatVector::GetData<duckdb::timestamp_t>(chunk.data[0]);
+    out.insert(out.end(), ts, ts + count);
+  }
+  duckdb::DataChunk empty_chunk;
+  REQUIRE(!reader.get_next_chunk(empty_chunk));
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("host_table_chunk_reader produces correct DataChunks",
@@ -408,4 +470,188 @@ TEST_CASE("host_table_chunk_reader handles null masks",
   duckdb::DataChunk empty_chunk;
   REQUIRE(!reader.get_next_chunk(empty_chunk));
   REQUIRE(row_base == num_rows);
+}
+
+TEST_CASE(
+  "host_table_chunk_reader converts parquet TIMESTAMP_MILLIS to DuckDB TIMESTAMP microseconds",
+  "[operator][result_collector][host_table_chunk_reader][shared_context][timestamp]")
+{
+  // GPU parquet stores TIMESTAMP_MILLIS as cuDF TIMESTAMP_MILLISECONDS (INT64 millis).
+  // DuckDB TIMESTAMP is microseconds. Copying by physical INT64 width (the pre-#1634 path)
+  // leaves values ~1000x too close to the Unix epoch (1970-01-11 instead of 1997-09-05).
+  constexpr int64_t kPickupMillis = 873431589000LL;  // 1997-09-05 03:53:09 UTC
+  constexpr int64_t kEpochMillis  = 0;
+  constexpr int64_t kNegMillis    = -1000;
+
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space      = get_default_gpu_space(sirius_ctx);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+  auto mr = gpu_space->get_default_allocator();
+
+  std::vector<int64_t> millis{kPickupMillis, kEpochMillis, kNegMillis, 1};
+  millis.resize(STANDARD_VECTOR_SIZE + 3, kPickupMillis);
+  auto table = make_timestamp_table(
+    millis, cudf::type_id::TIMESTAMP_MILLISECONDS, {1, STANDARD_VECTOR_SIZE + 1}, stream, mr);
+  auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::TIMESTAMP};
+  sirius::op::result::host_table_chunk_reader reader(
+    *con.context, host_table, sirius::from_duckdb_vec(types));
+
+  size_t row_base       = 0;
+  auto const num_chunks = reader.calculate_num_chunks();
+  REQUIRE(num_chunks >= 2);
+  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+    duckdb::DataChunk chunk;
+    REQUIRE(reader.get_next_chunk(chunk));
+    REQUIRE(chunk.data[0].GetType().id() == duckdb::LogicalTypeId::TIMESTAMP);
+
+    auto const count     = static_cast<size_t>(chunk.size());
+    auto* ts             = duckdb::FlatVector::GetData<duckdb::timestamp_t>(chunk.data[0]);
+    auto& validity       = duckdb::FlatVector::Validity(chunk.data[0]);
+    auto const null_rows = std::vector<size_t>{1, STANDARD_VECTOR_SIZE + 1};
+
+    for (size_t i = 0; i < count; ++i) {
+      auto const row_idx = row_base + i;
+      auto const is_null =
+        std::find(null_rows.begin(), null_rows.end(), row_idx) != null_rows.end();
+      REQUIRE(validity.RowIsValid(static_cast<duckdb::idx_t>(i)) != is_null);
+      if (is_null) { continue; }
+
+      auto const actual          = ts[i].value;
+      auto const expected_micros = millis[row_idx] * 1000;
+      REQUIRE(actual == expected_micros);
+      // Guard the original memcpy-by-INT64 regression: millis ticks must not be
+      // treated as DuckDB TIMESTAMP microseconds.
+      REQUIRE(actual != millis[row_idx]);
+    }
+    row_base += count;
+  }
+
+  duckdb::DataChunk empty_chunk;
+  REQUIRE(!reader.get_next_chunk(empty_chunk));
+  REQUIRE(row_base == millis.size());
+}
+
+TEST_CASE("host_table_chunk_reader preserves matching timestamp units without rescaling",
+          "[operator][result_collector][host_table_chunk_reader][shared_context][timestamp]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space      = get_default_gpu_space(sirius_ctx);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+  auto mr = gpu_space->get_default_allocator();
+
+  SECTION("TIMESTAMP_MICROSECONDS stays microseconds")
+  {
+    std::vector<int64_t> micros{873431589000000LL, 0, -1};
+    auto table =
+      make_timestamp_table(micros, cudf::type_id::TIMESTAMP_MICROSECONDS, {}, stream, mr);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
+    REQUIRE(values.size() == micros.size());
+    for (size_t i = 0; i < micros.size(); ++i) {
+      REQUIRE(values[i].value == micros[i]);
+    }
+  }
+
+  SECTION("TIMESTAMP_MILLISECONDS stays milliseconds when the plan asks for TIMESTAMP_MS")
+  {
+    std::vector<int64_t> millis{873431589000LL, 0, -1000};
+    auto table =
+      make_timestamp_table(millis, cudf::type_id::TIMESTAMP_MILLISECONDS, {}, stream, mr);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP_MS, stream);
+    REQUIRE(values.size() == millis.size());
+    for (size_t i = 0; i < millis.size(); ++i) {
+      REQUIRE(values[i].value == millis[i]);
+    }
+  }
+}
+
+TEST_CASE("host_table_chunk_reader converts TIMESTAMP_SECONDS and TIMESTAMP_NS to TIMESTAMP",
+          "[operator][result_collector][host_table_chunk_reader][shared_context][timestamp]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space      = get_default_gpu_space(sirius_ctx);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+  auto mr = gpu_space->get_default_allocator();
+
+  SECTION("seconds become microseconds")
+  {
+    std::vector<int64_t> seconds{873431589LL, 0, -2};
+    auto table = make_timestamp_table(seconds, cudf::type_id::TIMESTAMP_SECONDS, {}, stream, mr);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
+    REQUIRE(values.size() == seconds.size());
+    for (size_t i = 0; i < seconds.size(); ++i) {
+      REQUIRE(values[i].value == seconds[i] * 1'000'000);
+      if (seconds[i] != 0) { REQUIRE(values[i].value != seconds[i]); }
+    }
+  }
+
+  SECTION("nanoseconds become microseconds")
+  {
+    std::vector<int64_t> nanos{873431589000000000LL, 1'500, -2'000};
+    auto table = make_timestamp_table(nanos, cudf::type_id::TIMESTAMP_NANOSECONDS, {}, stream, mr);
+    auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+    auto values =
+      read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
+    REQUIRE(values.size() == nanos.size());
+    REQUIRE(values[0].value == 873431589000000LL);
+    REQUIRE(values[1].value == 1);
+    REQUIRE(values[2].value == -2);
+  }
+}
+
+TEST_CASE("host_table_chunk_reader maps BOOL8 to DuckDB BOOLEAN",
+          "[operator][result_collector][host_table_chunk_reader][shared_context]")
+{
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  auto sirius_ctx      = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space      = get_default_gpu_space(sirius_ctx);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream stream;
+  auto mr = gpu_space->get_default_allocator();
+
+  std::vector<int8_t> flags{0, 1, 0, 1};
+  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::BOOL8},
+                                       static_cast<cudf::size_type>(flags.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       mr);
+  cudaMemcpy(col->mutable_view().data<int8_t>(),
+             flags.data(),
+             sizeof(int8_t) * flags.size(),
+             cudaMemcpyHostToDevice);
+  apply_null_mask(*col, {2}, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  auto table = std::make_unique<cudf::table>(std::move(cols));
+  auto batch = make_test_batch(std::move(table), *gpu_space, stream);
+
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BOOLEAN};
+  sirius::op::result::host_table_chunk_reader reader(
+    *con.context, host_table, sirius::from_duckdb_vec(types));
+
+  duckdb::DataChunk chunk;
+  REQUIRE(reader.get_next_chunk(chunk));
+  REQUIRE(chunk.size() == flags.size());
+  REQUIRE(chunk.data[0].GetType().id() == duckdb::LogicalTypeId::BOOLEAN);
+  auto* values   = duckdb::FlatVector::GetData<bool>(chunk.data[0]);
+  auto& validity = duckdb::FlatVector::Validity(chunk.data[0]);
+  REQUIRE(values[0] == false);
+  REQUIRE(values[1] == true);
+  REQUIRE(!validity.RowIsValid(2));
+  REQUIRE(values[3] == true);
 }

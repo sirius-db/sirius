@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -53,8 +54,7 @@ struct plan_printer_config {
 ///   std::string combined       = printer.render();
 class sirius_plan_printer {
  public:
-  explicit sirius_plan_printer(
-    const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
+  explicit sirius_plan_printer(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines);
 
   /// Render a compact one-line-per-pipeline summary showing operator chains and dependencies.
   std::string render_pipelines() const;
@@ -79,11 +79,11 @@ class sirius_plan_printer {
   static std::vector<std::string> get_operator_detail_lines(const op::sirius_physical_operator& op);
 
  private:
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines_;
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines_;
   plan_printer_config config_;
 
   /// Find the root pipeline (the one whose sink is RESULT_COLLECTOR).
-  duckdb::shared_ptr<sirius_pipeline> find_root_pipeline() const;
+  std::shared_ptr<sirius_pipeline> find_root_pipeline() const;
 };
 
 }  // namespace sirius::pipeline

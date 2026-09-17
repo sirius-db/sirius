@@ -334,7 +334,8 @@ void downgrade_executor::processing_loop()
               };
               try {
                 nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_batch"};
-                auto result = cand->convert(targets, exc_stream, res_mgr, false);
+                auto result =
+                  cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   std::move(rollback).Cancel();
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
@@ -413,7 +414,8 @@ void downgrade_executor::processing_loop()
             };
             try {
               nvtx3::scoped_range nvtx_range{"sirius::downgrade::convert_task_batches"};
-              auto result = cand->convert(targets, exc_stream, res_mgr, false);
+              auto result =
+                cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
               if (result) {
                 std::move(rollback).Cancel();
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);

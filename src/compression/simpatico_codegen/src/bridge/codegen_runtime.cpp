@@ -31,6 +31,8 @@
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
+#include "codegen/selection/decompression_pushdown_policy.hpp"
+#include "codegen/selection/selection.hpp"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -183,11 +185,9 @@ int compute_bp_offsets(const void* cc_p,
 // Render-side kernel compile: optionally dump the source (``dump_env`` names an
 // env var holding a path), then compile-or-warm-cache the rendered source.
 // Returns the cached kernel, or nullptr on any failure (logged with ``ctx`` as
-// the message prefix). ``default_device`` is nvrtc's -default-device (decode
-// needs it for rle_block.cuh's unannotated constexpr accessors).
+// the message prefix).
 const jit::CompiledKernel* compile_rendered(const std::string& source,
                                             const std::string& entry_symbol,
-                                            bool default_device,
                                             const char* dump_env,
                                             const char* ctx)
 {
@@ -198,8 +198,7 @@ const jit::CompiledKernel* compile_rendered(const std::string& source,
     }
   }
   jit::CompileOptions opts;
-  opts.arch_cc        = jit::arch_cc_for_current_device();
-  opts.default_device = default_device;
+  opts.arch_cc = jit::arch_cc_for_current_device();
   try {
     const jit::CompiledKernel* kernel =
       jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
@@ -465,7 +464,15 @@ struct VariantLaunchArgs {
   CUdeviceptr keys_chars    = 0;  // mask_dict_gather: constant-width key pool chars
   std::int32_t key_width    = 0;  // mask_dict_gather: bytes per key
   CUdeviceptr row_indices   = 0;  // index_consume: ascending global int32 row ids
-  CUdeviceptr len_out       = 0;  // str_split_meta: per-survivor byte lengths (output)
+  CUdeviceptr chunk_ids     = 0;  // chunk_csr: the chunk each block serves
+  CUdeviceptr block_offsets = 0;  // chunk_csr: per-block output bases
+  CUdeviceptr in_chunk_rows = 0;  // chunk_csr: uint16 positions within the chunk
+  // Blocks to launch. 0 = one per chunk of the batch; chunk_csr sets it to the
+  // TOUCHED chunk count, which is the whole point of that enumerator. The
+  // per-chunk metadata bounds check still uses the batch's full chunk count,
+  // since a listed chunk may be any of them.
+  std::int32_t grid_blocks = 0;
+  CUdeviceptr len_out      = 0;  // str_split_meta: per-survivor byte lengths (output)
 };
 
 // Per-variant launch preconditions, checked in ONE place with ONE diagnostic.
@@ -478,6 +485,7 @@ struct VariantContract {
   bool sel_mask      = false;
   bool chunk_offsets = false;
   bool row_indices   = false;
+  bool row_set       = false;  // chunk_ids + block_offsets + in_chunk_rows
   bool keys_chars    = false;  // implies key_width >= 1
   bool len_out       = false;
   bool out           = false;  // the (out, n) slot must be non-null
@@ -494,6 +502,8 @@ VariantContract variant_contract(cdj::DecodeShape shape)
     case cdj::Enumerator::all_rows: break;
     case cdj::Enumerator::mask_bits: c.sel_mask = c.chunk_offsets = true; break;
     case cdj::Enumerator::index_list: c.row_indices = c.chunk_offsets = true; break;
+    // A row set carries its own geometry: no mask words, no chunk_offsets.
+    case cdj::Enumerator::chunk_csr: c.row_set = true; break;
   }
   // Consumer: what it needs to act on a row, and whether `out` is a column.
   switch (shape.consumer) {
@@ -528,6 +538,8 @@ bool check_variant_contract(const VariantLaunchArgs& va,
     missing = "chunk_offsets (did the CNT wave run?)";
   else if (c.row_indices && va.row_indices == 0)
     missing = "row_indices (did the mask->indices wave run?)";
+  else if (c.row_set && (va.chunk_ids == 0 || va.block_offsets == 0 || va.in_chunk_rows == 0))
+    missing = "chunk row set (chunk_ids / block_offsets / in_chunk_rows)";
   else if (c.keys_chars && (va.keys_chars == 0 || va.key_width < 1))
     missing = "dictionary keys_chars/key_width";
   else if (c.len_out && va.len_out == 0)
@@ -575,8 +587,10 @@ struct masked_launch {
   codegen::jit::FusedTree const& tree;
   codegen::jit::LabeledBuffers& labeled;
   char const* dtype;
-  std::int64_t num_rows;  // ROW-space count the mask describes
-  ::sirius::codegen::selection_mask const& mask;
+  std::int64_t num_rows;  // ROW-space count the selection describes
+  /// Null for a selection that arrives after the scan: a row set carries its
+  /// own geometry, so there is no mask to check against.
+  ::sirius::codegen::selection_mask const* mask;
   rmm::cuda_stream_view stream;
 };
 
@@ -587,7 +601,8 @@ struct masked_launch {
 // disagree.  Must outlive the cuLaunchKernel call (args holds pointers into it).
 struct TrailingArgStorage {
   std::int64_t pred_lo, pred_hi;
-  CUdeviceptr sel_mask, chunk_offsets, keys_chars, row_indices, len_out;
+  CUdeviceptr sel_mask, chunk_offsets, keys_chars, row_indices, len_out, chunk_ids, block_offsets,
+    in_chunk_rows;
   std::int32_t key_width;
 
   explicit TrailingArgStorage(const VariantLaunchArgs& va)
@@ -598,6 +613,9 @@ struct TrailingArgStorage {
       keys_chars(va.keys_chars),
       row_indices(va.row_indices),
       len_out(va.len_out),
+      chunk_ids(va.chunk_ids),
+      block_offsets(va.block_offsets),
+      in_chunk_rows(va.in_chunk_rows),
       key_width(va.key_width)
   {
   }
@@ -619,6 +637,9 @@ struct TrailingArgStorage {
     slot[static_cast<std::size_t>(TP::key_width)]                    = &key_width;
     slot[static_cast<std::size_t>(TP::row_indices)]                  = &row_indices;
     slot[static_cast<std::size_t>(TP::len_out)]                      = &len_out;
+    slot[static_cast<std::size_t>(TP::chunk_ids)]                    = &chunk_ids;
+    slot[static_cast<std::size_t>(TP::block_offsets)]                = &block_offsets;
+    slot[static_cast<std::size_t>(TP::in_chunk_rows)]                = &in_chunk_rows;
 
     for (const auto tag : trailing) {
       const auto idx = static_cast<std::size_t>(tag);
@@ -720,19 +741,20 @@ int launch_rendered_spec(const cdj::DecodeKernelSpec& spec,
 
   CUstream stream   = reinterpret_cast<CUstream>(stream_ptr);
   CUfunction fn_dec = kernel.func_for_current_device();
-  SIMPATICO_CU_CHECK(cuLaunchKernel(fn_dec,
-                                    static_cast<unsigned>(num_chunks),
-                                    1,
-                                    1,
-                                    static_cast<unsigned>(spec.block_x),
-                                    1,
-                                    1,
-                                    static_cast<unsigned>(spec.shared_bytes),
-                                    stream,
-                                    args.data(),
-                                    nullptr),
-                     -1,
-                     "cuLaunchKernel failed");
+  SIMPATICO_CU_CHECK(
+    cuLaunchKernel(fn_dec,
+                   static_cast<unsigned>(va.grid_blocks > 0 ? va.grid_blocks : num_chunks),
+                   1,
+                   1,
+                   static_cast<unsigned>(spec.block_x),
+                   1,
+                   1,
+                   static_cast<unsigned>(spec.shared_bytes),
+                   stream,
+                   args.data(),
+                   nullptr),
+    -1,
+    "cuLaunchKernel failed");
   lap("launch");
 
   SIMPATICO_CUDA_CHECK(
@@ -762,13 +784,8 @@ int run_rendered_decode(const jit::FusedTree& tree,
     return -1;
   }
   lap("render");
-  // The rendered decode source includes rle_block.cuh (→ tree.hpp), whose
-  // unannotated constexpr accessors require nvrtc's -default-device.
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/true,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "rendered decode");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "rendered decode");
   if (kernel == nullptr) { return -1; }
   lap("compile");
 
@@ -900,11 +917,100 @@ bool check_and_launch(masked_launch const& m,
                       char const* what,
                       std::int64_t kernel_rows)
 {
-  if (!check_variant_contract(va, &m.mask, m.num_rows, out, m.dtype, what)) { return false; }
+  if (!check_variant_contract(va, m.mask, m.num_rows, out, m.dtype, what)) { return false; }
   return launch_decode_fused_tree_impl(m.tree, m.labeled, m.dtype, kernel_rows, out, m.stream, va);
 }
 
 CUdeviceptr dev(void const* p) { return reinterpret_cast<CUdeviceptr>(const_cast<void*>(p)); }
+
+// Bind the caller's enumeration onto `va`, and report which one ran. The shape
+// follows from the enumeration, so a consumer never chooses it.
+void bind_enumeration(VariantLaunchArgs& va,
+                      cdj::DecodeShape mask_shape,
+                      cdj::DecodeShape index_shape,
+                      cdj::DecodeShape row_set_shape,
+                      ::sirius::codegen::selection_mask const& mask,
+                      row_enumeration rows)
+{
+  if (rows.by_row_set()) {
+    auto const& rs   = *rows.rows;
+    va.shape         = row_set_shape;
+    va.chunk_ids     = dev(rs.chunk_ids);
+    va.block_offsets = dev(rs.block_offsets);
+    va.in_chunk_rows = dev(rs.in_chunk_rows);
+    va.grid_blocks   = static_cast<std::int32_t>(rs.num_touched);
+  } else if (rows.by_index()) {
+    va.shape         = index_shape;
+    va.chunk_offsets = dev(mask.chunk_offsets);
+    va.row_indices   = dev(rows.row_indices);
+  } else {
+    va.shape         = mask_shape;
+    va.chunk_offsets = dev(mask.chunk_offsets);
+    va.sel_mask      = dev(mask.words);
+  }
+}
+
+// One line per launch, so a run can be attributed: which enumeration served a
+// column, and the geometry that decides whether it was the right one — blocks
+// launched against chunks in the batch, and survivors against blocks.
+void report_enumeration(char const* what,
+                        VariantLaunchArgs const& va,
+                        std::int64_t num_rows,
+                        std::int64_t survivors)
+{
+  if (!::sirius::codegen::decompression_pushdown_diag_enabled()) { return; }
+  auto const chunks = (num_rows + ::codegen::kChunkSize - 1) / ::codegen::kChunkSize;
+  char const* how   = va.grid_blocks > 0 ? "row_set" : (va.row_indices != 0 ? "index" : "mask");
+  auto const blocks = static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks);
+  if (survivors < 0) {
+    // Before the CNT wave the count is not known yet; printing the -1 sentinel
+    // as a survivor count (and dividing by it) is how a trace misleads.
+    std::fprintf(stderr,
+                 "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks, survivors not yet "
+                 "counted\n",
+                 what,
+                 how,
+                 blocks,
+                 static_cast<long long>(chunks));
+    return;
+  }
+  // On the mask and index walks every chunk gets a block, so `blocks` says
+  // nothing about how many did work — the touched count is what would have
+  // been launched instead, and the difference is the empty-block tax.
+  auto const touched = va.grid_blocks > 0
+                         ? static_cast<std::int64_t>(va.grid_blocks)
+                         : ::sirius::codegen::count_touched_chunks(
+                             reinterpret_cast<std::uint32_t const*>(va.chunk_offsets), chunks);
+  if (touched >= 0 && va.grid_blocks == 0) {
+    std::fprintf(
+      stderr,
+      "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks touched=%lld "
+      "(%.3f of chunks) survivors=%lld (%.4f of rows, %.1f per block)\n",
+      what,
+      how,
+      blocks,
+      static_cast<long long>(chunks),
+      static_cast<long long>(touched),
+      chunks > 0 ? static_cast<double>(touched) / static_cast<double>(chunks) : 0.0,
+      static_cast<long long>(survivors),
+      num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
+      touched > 0 ? static_cast<double>(survivors) / static_cast<double>(touched) : 0.0);
+    return;
+  }
+  std::fprintf(
+    stderr,
+    "simpatico: %s enumerated by %s: blocks=%lld/%lld chunks survivors=%lld "
+    "(%.4f of rows, %.1f per block)\n",
+    what,
+    how,
+    static_cast<long long>(va.grid_blocks > 0 ? va.grid_blocks : chunks),
+    static_cast<long long>(chunks),
+    static_cast<long long>(survivors),
+    num_rows > 0 ? static_cast<double>(survivors) / static_cast<double>(num_rows) : 0.0,
+    va.grid_blocks > 0
+      ? static_cast<double>(survivors) / static_cast<double>(va.grid_blocks)
+      : (chunks > 0 ? static_cast<double>(survivors) / static_cast<double>(chunks) : 0.0));
+}
 
 }  // namespace
 
@@ -924,7 +1030,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
   va.sel_mask = dev(mask.words);
   // The `out` slot carries the mask words: a ballot writes no column.
   return check_and_launch(
-    {tree, labeled, dtype, num_rows, mask, stream}, va, mask.words, "range ballot", num_rows);
+    {tree, labeled, dtype, num_rows, &mask, stream}, va, mask.words, "range ballot", num_rows);
 }
 
 // Compacting value decode, either enumeration (masked_launch.hpp). The
@@ -935,24 +1041,22 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         char const* dtype,
                                         std::int64_t num_rows,
                                         ::sirius::codegen::selection_mask const& mask,
-                                        std::int32_t const* row_indices,
+                                        row_enumeration rows,
                                         void* out,
                                         rmm::cuda_stream_view stream)
 {
-  bool const by_index = row_indices != nullptr;
   VariantLaunchArgs va;
-  va.shape         = by_index ? cdj::kShapeIndexConsume : cdj::kShapeMaskConsume;
-  va.chunk_offsets = dev(mask.chunk_offsets);
-  if (by_index) {
-    va.row_indices = dev(row_indices);
-  } else {
-    va.sel_mask = dev(mask.words);
-  }
+  bind_enumeration(
+    va, cdj::kShapeMaskConsume, cdj::kShapeIndexConsume, cdj::kShapeSparseConsume, mask, rows);
+  auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
+  report_enumeration("value decode", va, num_rows, survivors);
+  // A row set carries its own geometry, so there is no mask to check it against
+  // — the same exemption the str_split metadata launch already makes.
   return check_and_launch(
-    {tree, labeled, dtype, num_rows, mask, stream},
+    {tree, labeled, dtype, num_rows, rows.by_row_set() ? nullptr : &mask, stream},
     va,
     out,
-    by_index ? "compacted decode (index walk)" : "compacted decode (mask walk)",
+    "compacted value decode",
     num_rows);
 }
 
@@ -963,20 +1067,27 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              char const* dtype,
                                              std::int64_t num_string_rows,
                                              ::sirius::codegen::selection_mask const& mask,
+                                             row_enumeration rows,
                                              std::int64_t* src_offsets_out,
                                              std::int32_t* lengths_out,
                                              rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.shape         = cdj::kShapeStrSplitMeta;
-  va.sel_mask      = dev(mask.words);
-  va.chunk_offsets = dev(mask.chunk_offsets);
-  va.len_out       = dev(lengths_out);
-  return check_and_launch({tree, labeled, dtype, num_string_rows, mask, stream},
-                          va,
-                          src_offsets_out,
-                          "str_split metadata",
-                          num_string_rows + 1);
+  bind_enumeration(va,
+                   cdj::kShapeStrSplitMeta,
+                   cdj::kShapeStrSplitMeta,  // no index-list form: keep the mask walk
+                   cdj::kShapeSparseStrSplitMeta,
+                   mask,
+                   rows.by_index() ? row_enumeration{} : rows);
+  va.len_out           = dev(lengths_out);
+  auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
+  report_enumeration("str_split metadata", va, num_string_rows, survivors);
+  return check_and_launch(
+    {tree, labeled, dtype, num_string_rows, rows.by_row_set() ? nullptr : &mask, stream},
+    va,
+    src_offsets_out,
+    "str_split metadata",
+    num_string_rows + 1);
 }
 
 // Dictionary gather: constant-width key gather (masked_launch.hpp).
@@ -985,19 +1096,25 @@ bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           char const* dtype,
                                           std::int64_t num_rows,
                                           ::sirius::codegen::selection_mask const& mask,
+                                          row_enumeration rows,
                                           void const* keys_chars,
                                           std::int32_t key_width,
                                           void* out_chars,
                                           rmm::cuda_stream_view stream)
 {
   VariantLaunchArgs va;
-  va.shape         = cdj::kShapeDictGather;
-  va.sel_mask      = dev(mask.words);
-  va.chunk_offsets = dev(mask.chunk_offsets);
-  va.keys_chars    = dev(keys_chars);
-  va.key_width     = key_width;
+  bind_enumeration(va,
+                   cdj::kShapeDictGather,
+                   cdj::kShapeDictGather,  // no index-list form: keep the mask walk
+                   cdj::kShapeSparseDictGather,
+                   mask,
+                   rows.by_index() ? row_enumeration{} : rows);
+  va.keys_chars        = dev(keys_chars);
+  va.key_width         = key_width;
+  auto const survivors = rows.by_row_set() ? rows.rows->num_survivors : mask.survivor_count;
+  report_enumeration("dictionary gather", va, num_rows, survivors);
   return check_and_launch(
-    {tree, labeled, dtype, num_rows, mask, stream}, va, out_chars, "dictionary gather", num_rows);
+    {tree, labeled, dtype, num_rows, &mask, stream}, va, out_chars, "dictionary gather", num_rows);
 }
 
 // str_split phase 2: fixed masked char-range copy (masked_launch.hpp).  The
@@ -1017,11 +1134,8 @@ bool launch_masked_char_copy(void const* chars,
     return false;
   }
   const cdj::DecodeKernelSpec spec  = cdj::render_masked_char_copy();
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/false,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "masked char copy");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "masked char copy");
   if (kernel == nullptr) { return false; }
 
   CUdeviceptr d_chars  = reinterpret_cast<CUdeviceptr>(chars);
@@ -1192,11 +1306,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     // same fused-tree shape and dtype hits the cached compile —
     // including different files / different num_rows.  Cache owns the
     // CompiledKernel; we hold a non-owning pointer for the launch.
-    const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                         spec.entry_symbol,
-                                                         /*default_device=*/false,
-                                                         "CODEGEN_JIT_DUMP_ENCODE_SOURCE",
-                                                         "cpp encode");
+    const jit::CompiledKernel* kernel = compile_rendered(
+      spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_ENCODE_SOURCE", "cpp encode");
     if (kernel == nullptr) { return -1; }
 
     // Allocate one rmm::device_buffer per EncodeBufferSpec.  Buffers are moved

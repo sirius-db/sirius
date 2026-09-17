@@ -29,10 +29,12 @@
 #include "helper/numeric_narrowing.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
@@ -45,8 +47,6 @@
 #include <cudf/transform.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cstdio>
 #include <span>
@@ -197,6 +197,14 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
       if (idx < rhs_types.size()) { right_output_col_idxs.push_back(idx); }
     }
   }
+}
+std::string_view sirius_physical_nested_loop_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
 }
 
 bool sirius_physical_nested_loop_join::is_supported(
@@ -576,7 +584,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()

@@ -46,16 +46,17 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -168,11 +169,7 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
                                                     cudf::null_equality compare_nulls,
                                                     rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return cudf::filtered_join(right_keys, compare_nulls, stream);
-#else
-  return cudf::filtered_join(right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Heap-allocated variant for BUILD_PROBE mode, where one filtered_join is built once on the right
@@ -182,12 +179,7 @@ static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
   cudf::null_equality compare_nulls,
   rmm::cuda_stream_view stream)
 {
-#if CUDF_VERSION_MAJOR > 26 || (CUDF_VERSION_MAJOR == 26 && CUDF_VERSION_MINOR >= 6)
   return std::make_unique<cudf::filtered_join>(right_keys, compare_nulls, stream);
-#else
-  return std::make_unique<cudf::filtered_join>(
-    right_keys, compare_nulls, cudf::set_as_build_table::RIGHT, stream);
-#endif
 }
 
 // Build the semi-join hash table on the left/output side and probe with the (larger) right side.
@@ -198,6 +190,23 @@ static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
                                            rmm::cuda_stream_view stream)
 {
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
+}
+
+std::string_view sirius_physical_hash_join::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
+}
+
+MemoryBarrierType sirius_physical_hash_join::input_barrier_for(
+  sirius_physical_operator const& producer) const
+{
+  return producer.type == SiriusPhysicalOperatorType::CONCAT
+           ? MemoryBarrierType::PARTIAL
+           : sirius_physical_operator::input_barrier_for(producer);
 }
 
 bool sirius_physical_hash_join::is_join_type_supported(duckdb::JoinType join_type)
@@ -561,8 +570,8 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
 void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
                                                 pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // is_sink() is true iff the tree parent is a PARTITION (nested-join case); otherwise HJ
-  // contributes to the downstream chain's pipeline as its source.
+  // is_sink() is true iff the tree parent is a sink parent (PARTITION or DENSE_COUNT_JOIN);
+  // otherwise HJ contributes to the downstream chain's pipeline as its source.
   pipeline::sirius_meta_pipeline* host_meta;
   pipeline::sirius_pipeline* host_current;
   if (is_sink()) {
@@ -1726,7 +1735,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -1753,8 +1762,17 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     // With a single partition the task is tagged with operator_id (for cross-join GPU spread), so
     // map any tag back to the lone slot 0; with multiple partitions the tag is the real partition
     // index and selects its slot directly.
-    std::size_t const partition =
-      _partition_build_states.size() == 1 ? std::size_t{0} : partitioned->get_partition_idx();
+    std::size_t partition = 0;
+    if (_partition_build_states.size() != 1) {
+      auto const partition_idx = partitioned->get_partition_idx();
+      if (!partition_idx.has_value()) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join::execute: BUILD_PROBE input carries no partition index "
+          "but the join has " +
+          std::to_string(_partition_build_states.size()) + " build partitions");
+      }
+      partition = *partition_idx;
+    }
     if (partition >= _partition_build_states.size()) {
       throw std::runtime_error(
         "In sirius_physical_hash_join::execute: BUILD_PROBE partition index " +
@@ -2295,7 +2313,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     sirius_physical_partition_consumer_operator::push_data_batch_partitioned(
       port_id, batch, partition_idx);
 
-    nvtx3::scoped_range nvtx_range{"dynfilter::publish_hook"};
+    nvtx_scoped_range nvtx_range{"dynfilter::publish_hook"};
     auto* ms = build_ro.get_data() ? build_ro.get_memory_space() : nullptr;
     bool const gpu_resident =
       ms != nullptr && build_ro.get_current_tier() == ::cucascade::memory::Tier::GPU;
@@ -2330,7 +2348,7 @@ void sirius_physical_hash_join::push_data_batch_partitioned(
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{ms->get_device_id()}};
     auto publish_stream = ms->acquire_stream();
     if (auto const writer_event = build_ro.get_writer_event(); writer_event != nullptr) {
-      auto const status = cudaStreamWaitEvent(publish_stream.value(), writer_event, 0);
+      auto const status = cudaStreamWaitEvent(publish_stream.get(), writer_event, 0);
       if (status != cudaSuccess) {
         throw std::runtime_error(
           std::string("[sirius_physical_hash_join::push_data_batch_partitioned] dynamic-filter "

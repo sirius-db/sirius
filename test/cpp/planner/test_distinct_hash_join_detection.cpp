@@ -20,6 +20,7 @@
  *        build-side keys are proven unique at plan construction time.
  */
 
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 
@@ -32,9 +33,11 @@
 #include <duckdb/planner/planner.hpp>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <vector>
 
 using namespace duckdb;
 
@@ -77,11 +80,14 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> generate_sirius_plan(
 {
   auto& context = *con.context;
 
-  // Disable optimizers that can interfere with plan structure
+  // Disable optimizers that can interfere with plan structure. DELIMINATOR is disabled so
+  // correlated-subquery tests keep their DELIM_JOIN / DELIM_GET shape, which it would
+  // otherwise rewrite away on toy tables; a no-op for the other tests.
   auto original_disabled = DBConfig::GetConfig(context).options.disabled_optimizers;
   auto& disabled         = DBConfig::GetConfig(context).options.disabled_optimizers;
   disabled.insert(OptimizerType::IN_CLAUSE);
   disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+  disabled.insert(OptimizerType::DELIMINATOR);
 
   con.Query("BEGIN TRANSACTION");
 
@@ -140,6 +146,50 @@ sirius::op::sirius_physical_hash_join* find_hash_join(sirius::op::sirius_physica
   return nullptr;
 }
 
+/// Collect every hash join in the tree, recursing into a DELIM JOIN's internal `join` and
+/// `distinct_root` subtrees, which live outside `children[]`.
+void collect_hash_joins(sirius::op::sirius_physical_operator* root,
+                        std::vector<sirius::op::sirius_physical_hash_join*>& out)
+{
+  if (!root) { return; }
+  if (root->type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN) {
+    out.push_back(&root->Cast<sirius::op::sirius_physical_hash_join>());
+  }
+  if (root->type == sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+      root->type == sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+    auto& delim = root->Cast<sirius::op::sirius_physical_delim_join>();
+    collect_hash_joins(delim.join.get(), out);
+    collect_hash_joins(delim.distinct_root.get(), out);
+  }
+  for (auto& child : root->children) {
+    collect_hash_joins(child.get(), out);
+  }
+}
+
+/// True when @p root's subtree contains a DELIM_SCAN (the physical form of LOGICAL_DELIM_GET).
+bool subtree_has_delim_scan(sirius::op::sirius_physical_operator* root)
+{
+  if (!root) { return false; }
+  if (root->type == sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN) { return true; }
+  return std::any_of(root->children.begin(), root->children.end(), [](auto& c) {
+    return subtree_has_delim_scan(c.get());
+  });
+}
+
+/// A hash join's build side is children[1]; the probe side is children[0].
+bool builds_on_delim_scan(sirius::op::sirius_physical_hash_join* hj)
+{
+  REQUIRE(hj->children.size() == 2);
+  return subtree_has_delim_scan(hj->children[1].get());
+}
+
+bool touches_delim_scan(sirius::op::sirius_physical_hash_join* hj)
+{
+  REQUIRE(hj->children.size() == 2);
+  return subtree_has_delim_scan(hj->children[0].get()) ||
+         subtree_has_delim_scan(hj->children[1].get());
+}
+
 /// Shared fixture: one DuckDB + config for all distinct_hash_join tests.
 struct distinct_hash_join_fixture {
   distinct_hash_join_fixture()
@@ -184,6 +234,13 @@ struct distinct_hash_join_fixture {
     con->Query(
       "INSERT INTO probe VALUES (1,1),(1,2),(2,1),(2,2),(3,1),(3,2),(4,1),(4,2),"
       "(5,1),(5,2),(6,1),(6,2),(7,1),(7,2),(8,1),(8,2),(9,1),(9,2),(10,1),(10,2)");
+
+    // delim_fact drives a correlated NOT EXISTS that decorrelates into a DELIM_GET build
+    // side. delim_big is much larger so the DELIM_GET stays the build side.
+    con->Query("CREATE TABLE delim_fact (k INTEGER, grp INTEGER, v INTEGER)");
+    con->Query("INSERT INTO delim_fact SELECT i % 7, (i % 4) + 1, i FROM range(40) t(i)");
+    con->Query("CREATE TABLE delim_big (okey INTEGER, k INTEGER)");
+    con->Query("INSERT INTO delim_big SELECT i, i % 9 FROM range(3000) t(i)");
   }
 
   ~distinct_hash_join_fixture() { unsetenv("SIRIUS_CONFIG_FILE"); }
@@ -371,6 +428,68 @@ TEST_CASE_METHOD(distinct_hash_join_fixture,
   auto* hj = find_hash_join(plan.get());
   REQUIRE(hj);
   CHECK_FALSE(hj->unique_build_keys);
+}
+
+// ---------------------------------------------------------------------------
+// DELIM_GET uniqueness (duplicate-eliminated delim scans)
+// ---------------------------------------------------------------------------
+
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "distinct_hash_join - DELIM_GET build side enables unique_build_keys",
+                 "[distinct_hash_join][isolated_context]")
+{
+  // Decorrelates into a DELIM_JOIN whose inner re-join probes delim_big against a
+  // DELIM_GET replaying the duplicate-eliminated k keys — the TPC-H q22 shape.
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT f.grp, f.v FROM delim_fact f "
+    "WHERE f.v > 3 AND NOT EXISTS (SELECT 1 FROM delim_big o WHERE o.k = f.k)");
+  REQUIRE(plan);
+
+  std::vector<sirius::op::sirius_physical_hash_join*> joins;
+  collect_hash_joins(plan.get(), joins);
+
+  // Exactly one join builds on the DELIM_GET, and that is the one that must be claimed.
+  // (The DELIM_JOIN's own join probes the delim scan and carries an IS NOT DISTINCT FROM
+  // condition, so the pure-equal gate leaves it un-marked.)
+  auto delim_builds = std::count_if(joins.begin(), joins.end(), builds_on_delim_scan);
+  REQUIRE(delim_builds == 1);
+  for (auto* hj : joins) {
+    if (builds_on_delim_scan(hj)) { CHECK(hj->unique_build_keys); }
+  }
+}
+
+TEST_CASE_METHOD(distinct_hash_join_fixture,
+                 "distinct_hash_join - non-unique build still refused alongside DELIM_GET",
+                 "[distinct_hash_join][isolated_context]")
+{
+  // Same delim shape, but the outer query also joins the non-unique delim_fact build.
+  auto plan = generate_sirius_plan(
+    *con,
+    "SELECT p.x FROM probe p JOIN delim_fact f ON p.x = f.grp "
+    "WHERE f.v > 3 AND NOT EXISTS (SELECT 1 FROM delim_big o WHERE o.k = f.k)");
+  REQUIRE(plan);
+
+  std::vector<sirius::op::sirius_physical_hash_join*> joins;
+  collect_hash_joins(plan.get(), joins);
+
+  // Assert per join rather than over the plan as a whole: the DELIM_GET build is claimed,
+  // and the plain probe ⋈ delim_fact join (no delim scan on either side, so it builds over
+  // raw duplicated rows) is refused. A whole-plan "not every join is unique" would pass
+  // even if the wrong join were the refused one.
+  auto delim_builds = std::count_if(joins.begin(), joins.end(), builds_on_delim_scan);
+  REQUIRE(delim_builds == 1);
+
+  bool saw_plain_join = false;
+  for (auto* hj : joins) {
+    if (builds_on_delim_scan(hj)) {
+      CHECK(hj->unique_build_keys);
+    } else if (!touches_delim_scan(hj)) {
+      saw_plain_join = true;
+      CHECK_FALSE(hj->unique_build_keys);
+    }
+  }
+  REQUIRE(saw_plain_join);
 }
 
 // ---------------------------------------------------------------------------
