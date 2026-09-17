@@ -435,10 +435,39 @@ TEST_CASE("simpatico pruning - a batch mixes a subsetted chunk with whole ones",
   REQUIRE(ing->subset_refusals() == 0);
 }
 
+/// Force the decompression-pushdown gate OFF for the duration of a test.
+///
+/// The gate is read LIVE rather than latched (decompression_pushdown_policy.cpp), and a
+/// static-init armer in another translation unit (test_gpu_execution_cast_date_predicates.cpp)
+/// sets it for the whole binary. That armer was written when the gate was a function-local
+/// static, where arming it early was genuinely behaviour-neutral; with a live read it reaches
+/// every test. A case that is ABOUT the unfused path therefore has to say so rather than inherit
+/// whatever ran first.
+struct without_pushdown_gate {
+  bool had;
+  std::string saved;
+  without_pushdown_gate()
+  {
+    char const* v = ::getenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    had           = v != nullptr;
+    if (had) { saved = v; }
+    ::unsetenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+  }
+  ~without_pushdown_gate()
+  {
+    if (had) {
+      ::setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", saved.c_str(), /*overwrite=*/1);
+    } else {
+      ::unsetenv("SIRIUS_EXP_FUSED_SCAN_FILTER");
+    }
+  }
+};
+
 TEST_CASE("simpatico pruning - the predicate is still applied after the decode",
           "[compression][simpatico_pruning]")
 {
   if (no_gpu()) { return; }
+  without_pushdown_gate const unfused;
   fixture_dir fx("residual");
   // Zone maps BOUND rows, they do not test them: group 1 of chunk 0 covers 1024..1499 and survives
   // k >= 1200 whole, so 176 of its rows must be removed after the decode. DuckDB deleted this

@@ -260,6 +260,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
           gathered_payload_fetch{payload, std::move(composed)},
           projection,
           rep.pushdown_scan().get(),
+          rep.visibility_mask(),
           source,
           target_memory_space,
           stream);

@@ -145,6 +145,12 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// first, then the columns read only so a filter can be evaluated.
   std::vector<std::size_t> column_ids;
 
+  /// One `.hpln` is one table, so the resolved path names it the way parquet's does.
+  [[nodiscard]] std::string display_name() const override
+  {
+    return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
+  }
+
   /// Positions into @ref duckdb_column_ids the planner projects: the first @ref scan_output_arity
   /// entries are the scan's output columns in output order, and the rest are columns read ONLY to
   /// evaluate the filter. Empty means "every read column is an output column", which is what a

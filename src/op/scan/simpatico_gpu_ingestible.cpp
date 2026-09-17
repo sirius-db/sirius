@@ -731,7 +731,9 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     // The fetch above only ENQUEUED its H2D copies on `stream`, and decompress_chunk decodes on
     // its own stream pool; sync so no pool stream reads bytes that have not landed yet.
     stream.synchronize();
-    auto result = sirius::decompress_chunk(compressed, selection, chunk_scan.get(), stream, mr);
+    // A file scan carries no MVCC keep-mask: nothing deletes rows out from under a .hpln.
+    auto result = sirius::decompress_chunk(
+      compressed, selection, chunk_scan.get(), sirius::decode_visibility_mask{}, stream, mr);
     _pushdown_offered.fetch_add(1, std::memory_order_relaxed);
     if (result.outcome.row_filtered) {
       _pushdown_row_filtered.fetch_add(1, std::memory_order_relaxed);

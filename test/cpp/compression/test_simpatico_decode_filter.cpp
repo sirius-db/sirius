@@ -90,6 +90,20 @@ bool no_gpu()
 /// test did first. Asserting it afterwards is what makes every case below actually about the
 /// feature: without the assertion a cached-off gate would route them through the OLD path and they
 /// would pass while proving nothing.
+/// True when another translation unit has lifted the fused decode's selectivity caps.
+///
+/// test_gpu_execution_cast_date_predicates.cpp arms them to 1.0 at static init for the whole
+/// binary, and the caps are latched on first read, so a case that needs the product defaults
+/// cannot restore them from inside the process. Detect and skip rather than assert something the
+/// binary cannot produce -- and do NOT make the caps live to work around it: upstream hardened
+/// test_gpu_execution_multi_format.cpp against environment mutation after fork (35c165e4), and a
+/// live read reintroduces exactly that coupling.
+bool selectivity_caps_lifted()
+{
+  char const* v = ::getenv("SIRIUS_EXP_FUSED_SCAN_MAX_SEL");
+  return v != nullptr && std::strtod(v, nullptr) >= 1.0;
+}
+
 void require_pushdown_gate()
 {
   ::setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/1);
@@ -379,6 +393,10 @@ TEST_CASE("simpatico decode filter - the post-decode filter still applies when t
 {
   if (no_gpu()) { return; }
   require_pushdown_gate();
+  if (selectivity_caps_lifted()) {
+    WARN("selectivity caps lifted binary-wide; the decode cannot decline here");
+    return;
+  }
   fixture_dir fx("unprofitable");
   // `v < 900` keeps ~90% of the rows: far above the ceiling at which compacting pays for itself,
   // so the decode measures the survivors and hands back ordinary full-width columns. That is a
