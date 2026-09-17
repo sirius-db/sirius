@@ -1,7 +1,16 @@
 # Handover: measuring this branch against a `dev` baseline
 
+**DONE, 2026-09-17 — the measurement this document asks for has been taken. Results are in
+`CHUNK_SKIPPING_PLAN.md` §6.21; the runner is `run-dev-baseline.sh` and the raw reports are in
+`results-dev-baseline/`. Headline: pinned suite −11.2% (parquet + `cluster_by`) and −11.7%
+(`.hpln` + `cluster_by`) against `dev`, with the unclustered parquet arm within 0.1% of `dev`, i.e.
+no regression on the untouched path. The pin is 9.95 s against `dev`'s 18.69 s. Cold is
+−19.9% (median of 5) but with a 13.7% run-to-run spread that this project had not noticed — read
+§6.21 before quoting any cold number.** The rest of this document is kept as the recipe, and its
+configuration notes all held up.
+
 Written 2026-09-17, after merging `upstream/dev` (`82003512`) and fixing the API drift it
-brought (`04a55c7a`). Nothing below has been measured yet — the merge landed first, deliberately,
+brought (`04a55c7a`). Nothing below had been measured at the time of writing — the merge landed first, deliberately,
 so that any number taken afterwards is against current upstream rather than a three-week-old fork
 point.
 
@@ -72,6 +81,23 @@ invalidates cold comparisons.
 
 Root had ~190 GB free at handover. A full SF1000 `.hpln` is ~400 GB, so a new one means moving or
 deleting an old one first.
+
+## Corrections found while executing this
+
+- **The `dev` worktree at `../sirius-dev` was stale** (`ea1c2783`, cucascade `1b0e7b6c`, built
+  09-11). Fast-forwarded to `c5a6454c` and re-submoduled to `e9929fff`. The incremental build then
+  hit exactly the `testcontainers_native` patch failure predicted below; `pixi run make clean`
+  fixed it, and the rebuild took ~4 min, not 40 (ccache is warm across worktrees).
+- **Trap #4's "lineitem yes, orders no" is about the SF100/§6.12 datasets, not this one.**
+  `/datasets/tpch_sf1000_hpln_cluster` was written by `mk-hpln.py --sort cluster` over the default
+  table set, whose `SORT_KEYS` covers lineitem AND orders. The matched parquet-clustered arm
+  therefore uses the harness's default `CLUSTER_KEYS` (both), NOT
+  `SIRIUS_BENCH_CLUSTER_TABLES=lineitem`. Its `mk-hpln.json` lists only the five small tables —
+  the file was overwritten by a later pass — so it cannot be used to check this.
+- **Cold `.hpln` runs vary by 13.7% run to run** while reading byte-identical data (§6.21). The
+  "numbers to reproduce" below are single runs; the cold one is not reproducible to better than
+  ±7%, and the first repetition taken here landed 2.9 s off it and looked exactly like a cucascade
+  regression. Take a median of 5.
 
 ## Numbers to reproduce (this branch, pre-merge build, 8 GB, ast_interpret)
 
