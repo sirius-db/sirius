@@ -55,9 +55,11 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_device.hpp>
@@ -152,6 +154,18 @@ struct publisher_fixture {
     auto& source_space = replica_spaces.front().get_gpu_space();
     columns.back() =
       cudf::cast(columns.back()->view(), carrier, stream, source_space.get_default_allocator());
+  }
+
+  // Null out rows [begin, end) of the last key column, as a nullable fact-table FK build would.
+  void null_last_key_rows(cudf::size_type begin, cudf::size_type end)
+  {
+    auto& column       = *columns.back();
+    auto& source_space = replica_spaces.front().get_gpu_space();
+    auto mask          = cudf::create_null_mask(
+      column.size(), cudf::mask_state::ALL_VALID, stream, source_space.get_default_allocator());
+    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), begin, end, false, stream);
+    column.set_null_mask(std::move(mask), end - begin);
+    stream.synchronize();
   }
 
   [[nodiscard]] cudf::table_view build_view() const
@@ -495,10 +509,94 @@ TEST_CASE("dynamic-filter Bloom support covers every hash-IN-list key type",
     auto const type = cudf::data_type{t};
     REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(type) ==
             sirius::op::membership_key_supported(type));
-    // The hash IN-list's gate takes a column; a null-free empty column isolates the type gate.
+    // The hash IN-list's gate takes a column; an empty column isolates the type gate. Nulls no
+    // longer enter the gate (null keys are compacted out), so a nullable column agrees too.
     auto const empty = cudf::column_view{type, 0, nullptr, nullptr, 0};
     REQUIRE(sirius::op::sirius_dynamic_in_list_filter::supports(empty) ==
             sirius::op::membership_key_supported(type));
+    if (sirius::op::membership_key_supported(type)) {
+      auto const stream   = cudf::get_default_stream();
+      auto const nullable = cudf::make_fixed_width_column(
+        type, 1, cudf::mask_state::ALL_NULL, stream, cudf::get_current_device_resource_ref());
+      REQUIRE(sirius::op::sirius_dynamic_in_list_filter::supports(nullable->view()));
+    }
+  }
+}
+
+// A fact-table foreign key on the build side carries nulls. Null keys match nothing under the
+// join's null_equality::UNEQUAL, so the publisher must publish an *exact* IN-list over the valid
+// keys (sized and tiered on the valid row count) rather than fall through to Bloom, and the
+// values sitting under the null build slots must not survive a probe.
+TEST_CASE("dynamic-filter publisher builds exact IN-lists from a nullable build column",
+          "[dynamic_filter][publisher][nulls]")
+{
+  publisher_fixture fixture;
+
+  auto const publish = [&]() {
+    auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = false,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kInt64}}});
+    auto replica_spaces = fixture.replica_spaces;
+    dynamic_filter_publish_plan plan{
+      {make_int64_key(0, 0)}, std::move(targets), std::move(replica_spaces)};
+    auto const outcome =
+      sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+    REQUIRE(outcome.keys_considered == 1);
+    REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+    REQUIRE(outcome.membership_filters_built == 1);
+    REQUIRE(outcome.filters_pushed == 1);
+    auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+    REQUIRE(snapshot.size() == 1);
+    return snapshot.front();
+  };
+
+  SECTION("small IN-list tier is gated on the valid rows, not the column length")
+  {
+    // 15 slots, 5 of them null: 10 valid keys {0..9}, under k_max_keys although 15 is over it.
+    auto const rows = sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 3;
+    fixture.add_key_column(rows);
+    fixture.null_last_key_rows(10, static_cast<cudf::size_type>(rows));
+    REQUIRE(fixture.columns.front()->null_count() == 5);
+
+    auto const filter = publish();
+    auto const* small =
+      dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get());
+    REQUIRE(small != nullptr);
+    CHECK(small->size() == 10);
+
+    // 10..14 sit under the null build slots and must not survive; a null probe row is dropped.
+    auto probe = make_int64_values(fixture, {0, 9, 10, 14, 5, 100});
+    REQUIRE(membership_mask(*filter, probe->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 1, 0, 0, 1, 0});
+    auto mask = cudf::create_null_mask(probe->size(),
+                                       cudf::mask_state::ALL_VALID,
+                                       fixture.stream,
+                                       cudf::get_current_device_resource_ref());
+    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(mask.data()), 0, 1, false, fixture.stream);
+    probe->set_null_mask(std::move(mask), 1);
+    REQUIRE(membership_mask(*filter, probe->view(), fixture) ==
+            std::vector<std::uint8_t>{0, 1, 0, 0, 1, 0});
+  }
+
+  SECTION("hash IN-list tier stores exactly the valid keys")
+  {
+    constexpr std::size_t rows = 40;
+    fixture.add_key_column(rows);
+    fixture.null_last_key_rows(0, 8);  // keys 0..7 are null; 32 valid keys remain
+    auto const filter = publish();
+    auto const* hashed =
+      dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get());
+    REQUIRE(hashed != nullptr);
+    REQUIRE(hashed->has_persistent_set());
+    CHECK(hashed->size() == 32);
+    auto const probe = make_int64_values(fixture, {0, 7, 8, 39, 40});
+    REQUIRE(membership_mask(*filter, probe->view(), fixture) ==
+            std::vector<std::uint8_t>{0, 0, 1, 1, 0});
   }
 }
 

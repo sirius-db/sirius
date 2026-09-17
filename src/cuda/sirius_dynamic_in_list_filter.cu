@@ -23,7 +23,9 @@
 
 // cudf
 #include <cudf/column/column_factories.hpp>
-#include <cudf/null_mask.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/traits.hpp>
 
 // cccl
@@ -151,8 +153,9 @@ set_owner<KeyT> build_set(cudf::column_view const& keys,
 }
 
 // The adapter converts probe values into the key domain per element; one the domain cannot
-// represent is a definite non-member. Rows the prior keep-mask killed skip the lookup. A key equal
-// to the set's reserved sentinel cannot be stored, so such a probe is kept conservatively.
+// represent is a definite non-member, and so is a null probe row (the set holds no nulls and the
+// join never matches them). Rows the prior keep-mask killed skip the lookup. A key equal to the
+// set's reserved sentinel cannot be stored, so such a probe is kept conservatively.
 template <class Adapter, class SetRef>
 struct set_contains {
   using key_type = typename Adapter::key_type;
@@ -160,9 +163,10 @@ struct set_contains {
   bool* out;
   SetRef set;
   std::uint32_t const* prior_words;  // packed 1 bit/row, or null
+  detail::probe_validity valid;
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!detail::prior_mask_keeps(prior_words, idx)) {
+    if (!detail::prior_mask_keeps(prior_words, idx) || !valid(idx)) {
       out[idx] = false;
       return;
     }
@@ -217,15 +221,24 @@ struct sirius_dynamic_in_list_filter::set_impl {
 sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view const& keys,
                                                              rmm::cuda_stream_view stream,
                                                              rmm::device_async_resource_ref mr)
-  : _num_keys(static_cast<std::size_t>(keys.size()))
 {
   auto const domain = classify_membership_key(keys.type());
   if (!domain.has_value() || !supports(keys)) {
     throw std::invalid_argument(
-      "[sirius_dynamic_in_list_filter] unsupported key column (integer keys with no nulls "
-      "required).");
+      "[sirius_dynamic_in_list_filter] unsupported key column (integer keys required).");
   }
   _domain = *domain;
+
+  // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are dropped
+  // exactly rather than inserted. The compacted storage stays alive until insert_async is queued
+  // on `stream`; its stream-ordered free then follows the insert.
+  std::unique_ptr<cudf::table> compacted;
+  cudf::column_view build_keys = keys;
+  if (keys.null_count() > 0) {
+    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
+    build_keys = compacted->view().column(0);
+  }
+  _num_keys = static_cast<std::size_t>(build_keys.size());
 
   cuda::stream_ref const s{stream.value()};
   auto const rep_bytes = membership_rep_bytes(_domain.rep);
@@ -238,7 +251,7 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return std::make_unique<set_replica>(_set->source_device,
-                                         build_set<key_type>(keys, capacity, mr, s));
+                                         build_set<key_type>(build_keys, capacity, mr, s));
   });
   SIRIUS_LOG_DEBUG(
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
@@ -253,7 +266,8 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
 
 bool sirius_dynamic_in_list_filter::supports(cudf::column_view const& keys) noexcept
 {
-  return membership_key_supported(keys.type()) && keys.null_count() == 0;
+  // Nullable keys are accepted: null build slots are compacted out at construction.
+  return membership_key_supported(keys.type());
 }
 
 sirius_dynamic_in_list_filter::~sirius_dynamic_in_list_filter() = default;
@@ -419,15 +433,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
         auto ref         = set->ref(cuco::contains);
         cub::DeviceFor::Bulk(
           n,
-          set_contains<decltype(adapter), decltype(ref)>{adapter, outp, ref, prior_mask_words},
+          set_contains<decltype(adapter), decltype(ref)>{
+            adapter, outp, ref, prior_mask_words, detail::probe_validity_of(probe)},
           stream.value());
       });
     },
     replica->set);
   if (!dispatched) { return nullptr; }
-  if (probe.nullable() && probe.null_count() > 0) {
-    out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
-  }
+  // Null probe rows were written as `false` in-kernel: the mask is non-nullable by construction.
   return out;
 }
 

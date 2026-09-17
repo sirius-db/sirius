@@ -20,7 +20,8 @@
  *        present, the membership probes run AFTER the partial combine and receive it as a prior
  *        mask; without one they stay concurrent and prior-free. The probe key stays at its narrow
  *        decoded carrier (INT32, or INT8 for a chunk stored that narrow) against an INT64-built
- *        set — the filtered decode must not require a materialized cast.
+ *        set — the filtered decode must not require a materialized cast — and a nullable probe
+ *        column yields a non-nullable mask that the filtered decode consumes.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -28,6 +29,7 @@
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -424,4 +426,97 @@ TEST_CASE("filtered-decode membership probe reads an INT8-carrier key chunk",
   REQUIRE(out->num_columns() == 2);
   CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   CHECK(column_to_host<std::int8_t>(out->view().column(1), stream) == expect_k);
+}
+
+// The filtered decode requires a non-nullable BOOL8 from every membership probe (a null-masked
+// result is a broken probe contract and throws). A nullable probe column must therefore come back
+// with its null rows written as `false`, not with the probe's null mask copied onto the result.
+//
+// The compression planner fails closed on nullable input to the integer codecs, so a nullable key
+// chunk cannot be produced through compress_with_plan today; the validity is attached to the
+// decoded key column inside the probe directive instead, which is exactly the view the filter
+// sees.
+TEST_CASE("filtered-decode membership probe consumes a nullable probe column",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto table        = make_source_table(stream);
+  auto const ct     = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  // Rows whose key is 10 (a member of the set {0, 5, ..., 45}) are null: they must be dropped.
+  std::vector<std::uint32_t> words((kRows + 31) / 32, 0U);
+  cudf::size_type null_count = 0;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 50 == 10) {
+      ++null_count;
+      continue;
+    }
+    words[static_cast<std::size_t>(i) / 32] |= (1U << (static_cast<std::uint32_t>(i) % 32));
+  }
+  rmm::device_buffer validity{words.data(), words.size() * sizeof(std::uint32_t), stream};
+  stream.synchronize();
+
+  bool saw_prior         = false;
+  bool saw_nullable_mask = false;
+  bool shape_ok          = true;
+  auto filter            = make_key_set(stream);
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});
+  request.membership_filters.push_back(
+    {1,
+     [filter, &validity, null_count, &saw_prior, &saw_nullable_mask, &shape_ok](
+       cudf::column_view keys,
+       std::uint32_t const* prior_mask_words,
+       rmm::cuda_stream_view s,
+       rmm::device_async_resource_ref probe_mr) {
+       // The validity words were laid out for an unsliced kRows-row decode; anything else is a
+       // test-shape surprise, reported after the decode rather than thrown through the codegen.
+       if (keys.offset() != 0 || keys.size() != kRows) {
+         shape_ok = false;
+         return filter->compute_mask(keys, prior_mask_words, /*device_id=*/0, s, probe_mr);
+       }
+       cudf::column_view const nullable{keys.type(),
+                                        keys.size(),
+                                        keys.head(),
+                                        static_cast<cudf::bitmask_type const*>(validity.data()),
+                                        null_count};
+       saw_prior = prior_mask_words != nullptr;
+       auto mask = filter->compute_mask(nullable, prior_mask_words, /*device_id=*/0, s, probe_mr);
+       if (mask && mask->nullable()) { saw_nullable_mask = true; }
+       return mask;
+     }});
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  REQUIRE(result.applied);
+  REQUIRE(shape_ok);
+  CHECK(saw_prior);
+  CHECK_FALSE(saw_nullable_mask);
+
+  // Reference: (i % 100) <= 19 AND (i % 50) % 5 == 0 AND NOT null (i % 50 != 10).
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int32_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19 && (i % 50) % 5 == 0 && i % 50 != 10) {
+      expect_v.push_back(i % 100);
+      expect_k.push_back(i % 50);
+    }
+  }
+  REQUIRE_FALSE(expect_v.empty());
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  CHECK(column_to_host(out->view().column(1), stream) == expect_k);
 }

@@ -210,12 +210,15 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       }
     }
 
+    // Every membership filter compacts null build keys out (they match nothing under the join's
+    // null_equality::UNEQUAL), so the representation is sized and chosen on the valid rows.
+    auto const valid_rows = build_rows - static_cast<std::size_t>(col.null_count());
     auto const set_bytes =
-      sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(build_rows, col.type());
-    auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(build_rows);
+      sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(valid_rows, col.type());
+    auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(valid_rows);
 
     auto const chosen = choose_membership_filter(
-      {.build_rows               = build_rows,
+      {.build_rows               = valid_rows,
        .l2_cache_bytes           = l2_bytes,
        .estimated_hash_set_bytes = set_bytes,
        .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
@@ -252,10 +255,11 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     if (per_key_membership[admitted_key_index]) { ++outcome.membership_filters_built; }
     if (per_key_zone_map[admitted_key_index]) { ++outcome.zone_map_filters_built; }
     SIRIUS_LOG_DEBUG(
-      "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} zone_map={} membership: "
-      "in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
+      "[sirius_physical_hash_join] dynamic filter key {}: build_rows={} (valid={}) zone_map={} "
+      "membership: in_list_set={}B bloom={}B L2={}B inlist_max_l2_fraction={} -> {}",
       admitted_key_index,
       build_rows,
+      valid_rows,
       per_key_zone_map[admitted_key_index] ? "yes" : "no",
       set_bytes,
       bloom_bytes,

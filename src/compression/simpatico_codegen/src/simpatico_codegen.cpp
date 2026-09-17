@@ -674,6 +674,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                            " size=" + std::to_string(flags->size()) + " want=type_id=" +
                            std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
                            " size=" + std::to_string(num_rows) + ")");
+        // The probe contract is a non-nullable BOOL8: a null probe key is a definite non-member
+        // and the filters write `false` for it in-kernel, so a null-masked result is a broken
+        // probe, not a nullable key chunk.
         if (flags->null_count() != 0)
           throw plan_error("filtered decode: null-masked membership probe result");
         sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, dst, stream);
@@ -749,6 +752,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                            " size=" + std::to_string(flags->size()) + " want=type_id=" +
                            std::to_string(static_cast<int>(cudf::type_id::BOOL8)) +
                            " size=" + std::to_string(num_rows) + ")");
+        // Non-nullable BOOL8 is the probe contract (see the concurrent arm above).
         if (flags->null_count() != 0)
           throw plan_error("filtered decode: null-masked membership probe result");
         sc::mask_from_bool8(flags->view().data<std::uint8_t>(), num_rows, member_dst, s0);

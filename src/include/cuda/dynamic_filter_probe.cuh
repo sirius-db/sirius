@@ -18,8 +18,8 @@
 
 // Shared device helpers and host-side dispatch for the membership probe kernels (IN-list, small
 // IN-list, Bloom). Probe keys arrive at whatever carrier the consumer decoded, may carry a prior
-// keep-mask, and are converted per element into the filter's key rep by a *probe adapter*
-// selected on the host from (key domain, probe type); see
+// keep-mask and a validity bitmask, and are converted per element into the filter's key rep by a
+// *probe adapter* selected on the host from (key domain, probe type); see
 // op/dynamic_filter/dynamic_filter_key_domain.hpp for the two axes.
 //
 // cudf::type_dispatcher is deliberately not used for the (key rep, probe carrier) pair: the
@@ -33,6 +33,7 @@
 // cudf
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/bit.hpp>
 
 // cccl
 #include <cuda/std/limits>
@@ -124,6 +125,27 @@ __device__ __forceinline__ bool prior_mask_keeps(std::uint32_t const* words,
   return words == nullptr ||
          ((words[static_cast<std::size_t>(row) >> 5] >> (static_cast<std::uint32_t>(row) & 31U)) &
           1U) != 0U;
+}
+
+/// Validity of the probe rows. A null probe key can never equal a build key: admission never
+/// routes a null-safe (IS NOT DISTINCT FROM) comparison here and the authoritative join runs with
+/// null_equality::UNEQUAL, so a null row is a definite non-member and the kernels write `false`
+/// for it instead of propagating the probe's null mask onto the output. @p words is the probe
+/// column's own bitmask (null = the column has no nulls), read at `offset + row` because a
+/// column_view's mask pointer is not offset-adjusted.
+struct probe_validity {
+  cudf::bitmask_type const* words = nullptr;
+  cudf::size_type offset          = 0;
+  __device__ __forceinline__ bool operator()(cudf::size_type row) const noexcept
+  {
+    return words == nullptr || cudf::bit_is_set(words, offset + row);
+  }
+};
+
+/// The validity of @p probe as the kernels read it; a column without nulls reads no mask.
+inline probe_validity probe_validity_of(cudf::column_view const& probe) noexcept
+{
+  return probe.has_nulls() ? probe_validity{probe.null_mask(), probe.offset()} : probe_validity{};
 }
 
 //===----------------------------------------------------------------------===//

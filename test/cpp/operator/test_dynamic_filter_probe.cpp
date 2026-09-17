@@ -20,10 +20,12 @@
  *        small IN-list, Bloom): heterogeneous integer probe carriers (no materialized cast),
  *        the optional prior keep-mask (dead rows skip the lookup), sentinel conservation, the
  *        refusal of non-integer probe types, INT8/INT16 and unsigned keys, carrier-typed build
- *        sets, and cross-carrier mask identity.
+ *        sets, cross-carrier mask identity, and nulls on both sides (null build keys are dropped,
+ *        null probe rows are definite non-members, the mask is never nullable).
  */
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -115,6 +117,26 @@ rmm::device_buffer upload_prior_mask(std::vector<bool> const& keep, rmm::cuda_st
   rmm::device_buffer out{words.data(), words.size() * sizeof(std::uint32_t), stream};
   stream.synchronize();
   return out;
+}
+
+/// Attach a validity mask to @p col: row i is valid iff valid[i]. cudf's bitmask has the same
+/// packed word layout as the prior keep-mask, but its buffer must be padded to
+/// bitmask_allocation_size_bytes, so the words are copied into a mask-sized allocation.
+void attach_validity(cudf::column& col,
+                     std::vector<bool> const& valid,
+                     rmm::cuda_stream_view stream)
+{
+  REQUIRE(valid.size() == static_cast<std::size_t>(col.size()));
+  auto const null_count =
+    static_cast<cudf::size_type>(std::count(valid.begin(), valid.end(), false));
+  auto const words = upload_prior_mask(valid, stream);
+  rmm::device_buffer mask{cudf::bitmask_allocation_size_bytes(col.size()), stream};
+  REQUIRE(mask.size() >= words.size());
+  REQUIRE(cudaMemcpyAsync(
+            mask.data(), words.data(), words.size(), cudaMemcpyDeviceToDevice, stream.value()) ==
+          cudaSuccess);
+  stream.synchronize();
+  col.set_null_mask(std::move(mask), null_count);
 }
 
 }  // namespace
@@ -379,7 +401,11 @@ TEST_CASE("prior keep-mask gates the membership probes", "[dynamic_filter][probe
   }
 }
 
-TEST_CASE("prior-masked probe still propagates the probe's null mask", "[dynamic_filter][probe]")
+// A null probe key can never match a build key (admission rejects null-safe comparisons and the
+// join runs with null_equality::UNEQUAL), so the probe writes `false` for it in-kernel and the
+// mask carries no null mask of its own -- the filtered decode requires a non-nullable BOOL8.
+TEST_CASE("prior-masked probe writes null probe rows as false and returns a non-nullable mask",
+          "[dynamic_filter][probe]")
 {
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
@@ -387,20 +413,16 @@ TEST_CASE("prior-masked probe still propagates the probe's null mask", "[dynamic
   auto keys = make_int64({1, 2, 3, 4}, stream);
   sirius_dynamic_in_list_filter filter{keys->view(), stream, mr};
 
-  auto probe     = make_int32({1, 2, 9, 4}, stream);
-  auto null_mask = cudf::create_null_mask(4, cudf::mask_state::ALL_VALID, stream, mr);
-  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
-  probe->set_null_mask(std::move(null_mask), 1);
+  auto probe = make_int32({1, 2, 9, 4}, stream);
+  attach_validity(*probe, {true, false, true, true}, stream);  // row 1 (value 2, in set) is null
 
   auto prior = upload_prior_mask({true, true, true, false}, stream);
   auto mask  = filter.compute_mask(
     probe->view(), static_cast<std::uint32_t const*>(prior.data()), kDevice, stream, mr);
   REQUIRE(mask != nullptr);
-  CHECK(mask->null_count() == 1);
-  auto const host = mask_to_host(mask->view(), stream);
-  CHECK(host[0] == 1);  // live, in set
-  CHECK(host[2] == 0);  // live, not in set
-  CHECK(host[3] == 0);  // dead row
+  CHECK_FALSE(mask->nullable());
+  CHECK(mask->null_count() == 0);
+  CHECK(mask_to_host(mask->view(), stream) == std::vector<std::uint8_t>{1, 0, 0, 0});
 }
 
 //===----------------------------------------------------------------------===//
@@ -764,5 +786,196 @@ TEST_CASE("unsigned hash IN-list reserves the maximum as its sentinel, so 0 is e
     sirius_dynamic_in_list_filter filter{keys->view(), stream, mr};
     auto const probe = make_unsigned<std::uint32_t>({u32_max, 3, 4}, stream);
     CHECK(probe_mask(filter, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{1, 1, 0});
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Nulls on both sides
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Host oracle for an exact membership probe under null_equality::UNEQUAL: a row is kept iff it is
+/// valid, survives the prior, and equals a *valid* build key.
+std::vector<std::uint8_t> oracle_mask(std::vector<std::int64_t> const& key_values,
+                                      std::vector<bool> const& key_valid,
+                                      std::vector<std::int64_t> const& probe_values,
+                                      std::vector<bool> const& probe_valid,
+                                      std::vector<bool> const* keep)
+{
+  std::vector<std::uint8_t> out(probe_values.size(), 0);
+  for (std::size_t i = 0; i < probe_values.size(); ++i) {
+    if (!probe_valid[i] || (keep != nullptr && !(*keep)[i])) { continue; }
+    for (std::size_t k = 0; k < key_values.size(); ++k) {
+      if (key_valid[k] && key_values[k] == probe_values[i]) {
+        out[i] = 1;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+// Null build keys are compacted out exactly (the value sitting under a null build slot must not
+// match), null probe rows are definite non-members, and the mask is non-nullable, for all three
+// filters, both signed reps, every signed probe carrier, with and without a prior keep-mask.
+TEST_CASE("membership filters drop null build keys and null probe rows exactly",
+          "[dynamic_filter][probe][nulls]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // 12 build slots, 3 of them null. The nulled slots hold 60, 70, 80 -- values that also appear in
+  // the probe -- so a filter that inserted them would be caught. 9 valid keys keeps the small
+  // IN-list within its gate on valid rows while the 12-slot column exceeds k_max_keys - 1.
+  std::vector<std::int64_t> const key_values{1, 2, 3, 60, 5, 70, 7, 8, 80, 10, 11, 12};
+  std::vector<bool> const key_valid{
+    true, true, true, false, true, false, true, true, false, true, true, true};
+  std::vector<std::int64_t> const clean_keys{1, 2, 3, 5, 7, 8, 10, 11, 12};
+
+  // 256 probe rows over [-128, 127]: every valid key and every nulled build value appears; rows
+  // i % 7 == 0 are null (including rows holding matching keys), and the prior keeps i % 3 == 0.
+  std::vector<std::int64_t> probe_values;
+  std::vector<bool> probe_valid;
+  std::vector<bool> keep;
+  for (std::int64_t v = -128; v <= 127; ++v) {
+    probe_values.push_back(v);
+    auto const i = probe_values.size() - 1;
+    probe_valid.push_back(i % 7 != 0);
+    keep.push_back(i % 3 == 0);
+  }
+  auto prior              = upload_prior_mask(keep, stream);
+  auto const* prior_words = static_cast<std::uint32_t const*>(prior.data());
+
+  auto const expected = oracle_mask(key_values, key_valid, probe_values, probe_valid, nullptr);
+  auto const expected_masked = oracle_mask(key_values, key_valid, probe_values, probe_valid, &keep);
+  REQUIRE(std::count(expected.begin(), expected.end(), 1) > 0);
+  // The nulled build values 60/70/80 sit at valid probe rows and must be reported as non-members.
+  for (auto const v : {60, 70, 80}) {
+    auto const row = static_cast<std::size_t>(v + 128);
+    REQUIRE(probe_valid[row]);
+    REQUIRE(expected[row] == 0);
+  }
+
+  auto const run = [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    auto keys      = make_typed<key_type>(key_values, stream);
+    attach_validity(*keys, key_valid, stream);
+    REQUIRE(keys->null_count() == 3);
+    auto const clean = make_typed<key_type>(clean_keys, stream);
+
+    REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));  // 9 valid keys
+    REQUIRE(sirius_dynamic_bloom_filter::supports(keys->type()));
+
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom_clean{clean->view(), stream, mr};
+    CHECK(in_list.size() == clean_keys.size());
+    CHECK(small_list.size() == clean_keys.size());
+    CHECK(in_list.has_persistent_set());
+
+    for_each_signed_carrier([&](auto carrier_tag) {
+      using carrier_type = decltype(carrier_tag);
+      auto probe         = make_typed<carrier_type>(probe_values, stream);
+      attach_validity(*probe, probe_valid, stream);
+      INFO("key=" << static_cast<int>(keys->type().id())
+                  << " carrier=" << static_cast<int>(probe->type().id()));
+
+      // probe_mask REQUIREs null_count() == 0; also pin that no mask buffer is attached at all.
+      auto raw = in_list.compute_mask(probe->view(), kDevice, stream, mr);
+      REQUIRE(raw != nullptr);
+      CHECK_FALSE(raw->nullable());
+
+      CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+      CHECK(probe_mask(in_list, probe->view(), prior_words, stream) == expected_masked);
+      CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+      CHECK(probe_mask(small_list, probe->view(), prior_words, stream) == expected_masked);
+
+      // Bloom: no false negatives, null probe rows are false, and the nullable build is
+      // bit-identical to the clean one (compaction is exact, the hash policy deterministic).
+      auto const bloom_mask       = probe_mask(bloom, probe->view(), nullptr, stream);
+      auto const bloom_clean_mask = probe_mask(bloom_clean, probe->view(), nullptr, stream);
+      CHECK(bloom_mask == bloom_clean_mask);
+      for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (expected[i] != 0) { REQUIRE(bloom_mask[i] == 1); }
+        if (!probe_valid[i]) { REQUIRE(bloom_mask[i] == 0); }
+      }
+      CHECK(probe_mask(bloom, probe->view(), prior_words, stream) == and_with(bloom_mask, keep));
+    });
+  };
+  run(std::int32_t{});
+  run(std::int64_t{});
+}
+
+// A column_view's null mask is not offset-adjusted; a sliced probe must read validity at
+// offset + row, not at row.
+TEST_CASE("membership probes read a sliced nullable probe's validity at the right offset",
+          "[dynamic_filter][probe][nulls]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto keys = make_int64({1, 2, 3, 4, 5, 6, 7, 8}, stream);
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+
+  // 40 rows so the slice starts inside the second bitmask word; all values are members, and
+  // exactly the rows 35..37 are null. Slicing [34, 40) must yield {1, 0, 0, 0, 1, 1}.
+  std::vector<std::int64_t> values(40, 3);
+  std::vector<bool> valid(40, true);
+  valid[35] = valid[36] = valid[37] = false;
+  auto probe                        = make_int64(values, stream);
+  attach_validity(*probe, valid, stream);
+  auto const sliced = cudf::slice(probe->view(), {34, 40}, stream).front();
+  REQUIRE(sliced.offset() == 34);
+  REQUIRE(sliced.null_count() == 3);
+
+  std::vector<std::uint8_t> const expected{1, 0, 0, 0, 1, 1};
+  CHECK(probe_mask(in_list, sliced, nullptr, stream) == expected);
+  CHECK(probe_mask(small_list, sliced, nullptr, stream) == expected);
+  CHECK(probe_mask(bloom, sliced, nullptr, stream) == expected);
+}
+
+// An all-null probe is entirely non-member; an all-null build column has no valid key, so the
+// small IN-list declines it while the hash IN-list and Bloom build empty structures that keep
+// nothing.
+TEST_CASE("membership filters handle all-null probes and all-null builds",
+          "[dynamic_filter][probe][nulls]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  SECTION("all-null probe")
+  {
+    auto keys = make_int32({1, 2, 3}, stream);
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    auto probe = make_int32({1, 2, 3, 4}, stream);
+    attach_validity(*probe, {false, false, false, false}, stream);
+    std::vector<std::uint8_t> const expected{0, 0, 0, 0};
+    CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+    CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+    CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == expected);
+  }
+
+  SECTION("all-null build")
+  {
+    auto keys = make_int32({1, 2, 3}, stream);
+    attach_validity(*keys, {false, false, false}, stream);
+    CHECK_FALSE(sirius_dynamic_small_in_list_filter::supports(keys->view()));
+    REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    CHECK(in_list.size() == 0);
+    auto probe = make_int32({1, 2, 3, 4}, stream);
+    std::vector<std::uint8_t> const expected{0, 0, 0, 0};
+    CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+    CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == expected);
   }
 }

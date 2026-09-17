@@ -15,7 +15,6 @@
  */
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -133,8 +132,9 @@ bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
 
 /// @brief Per-row Bloom membership probe. The adapter converts probe values into the key domain
 /// per element; an inserted key always fits that domain, so a non-representable value is a
-/// definite non-member and the conversion preserves the no-false-negative contract. Rows the prior
-/// keep-mask killed skip the block fetch.
+/// definite non-member and the conversion preserves the no-false-negative contract. A null probe
+/// row is likewise a definite non-member (null build slots were compacted out and the join never
+/// matches nulls). Rows the prior keep-mask killed skip the block fetch.
 template <class Adapter, class FilterRef>
 struct bloom_contains {
   using key_type = typename FilterRef::key_type;
@@ -142,10 +142,11 @@ struct bloom_contains {
   bool* __restrict__ out;
   FilterRef ref;
   std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
+  sirius::op::detail::probe_validity valid;
 
   __device__ __forceinline__ void operator()(cudf::size_type idx) const noexcept
   {
-    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx)) {
+    if (!sirius::op::detail::prior_mask_keeps(prior_words, idx) || !valid(idx)) {
       out[idx] = false;
       return;
     }
@@ -229,7 +230,8 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::invalid_argument("[sirius_dynamic_bloom_filter] unsupported key type.");
   }
   _domain = *domain;
-  // Keep compacted storage alive until add_async is queued on stream.
+  // Null build keys match nothing under the join's null_equality::UNEQUAL, so they are dropped
+  // exactly. Keep compacted storage alive until add_async is queued on stream.
   std::unique_ptr<cudf::table> compacted;
   cudf::column_view build_keys = keys;
   if (keys.null_count() > 0) {
@@ -400,16 +402,14 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
         auto ref         = bloom->ref();
         cub::DeviceFor::Bulk(
           n,
-          bloom_contains<decltype(adapter), decltype(ref)>{adapter, outp, ref, prior_mask_words},
+          bloom_contains<decltype(adapter), decltype(ref)>{
+            adapter, outp, ref, prior_mask_words, detail::probe_validity_of(probe)},
           stream.value());
       });
     },
     replica->bloom);
   if (!dispatched) { return nullptr; }
-
-  if (probe.nullable() && probe.null_count() > 0) {
-    out->set_null_mask(cudf::copy_bitmask(probe, stream, mr), probe.null_count());
-  }
+  // Null probe rows were written as `false` in-kernel: the mask is non-nullable by construction.
   return out;
 }
 

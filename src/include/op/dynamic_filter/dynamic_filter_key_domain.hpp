@@ -69,7 +69,8 @@ struct membership_key_domain {
  * @brief Single source of truth for the membership filters' `supports()` type gate
  *
  * True iff `classify_membership_key(t)` has a value. Filters add their own non-type gates (the
- * small IN-list size cap, null-free keys) on top of this.
+ * small IN-list size cap) on top of this; nullable build columns are accepted by all three, with
+ * null keys compacted out.
  */
 [[nodiscard]] bool membership_key_supported(cudf::data_type t) noexcept;
 

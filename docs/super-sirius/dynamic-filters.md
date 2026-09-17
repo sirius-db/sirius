@@ -86,9 +86,11 @@ The publisher emits at most one membership representation per admitted key and m
 
 | Representation | Selection | Behavior |
 |---|---|---|
-| Raw IN-list | 1–12 null-free integer build rows | Exact linear membership probe |
-| Hash IN-list | Null-free integer keys whose estimated set fits the configured fraction of the smallest probe-GPU L2 | Exact for represented keys; the reserved sentinel value (`min` for signed, `max` for unsigned reps) conservatively passes |
-| Bloom | Integer keys when the hash IN-list is not selected | Approximate membership with no false negatives; nullable builds are compacted first |
+| Raw IN-list | 1–12 valid (non-null) integer build rows | Exact linear membership probe |
+| Hash IN-list | Integer keys whose estimated set fits the configured fraction of the smallest probe-GPU L2 | Exact for represented keys; the reserved sentinel value (`min` for signed, `max` for unsigned reps) conservatively passes |
+| Bloom | Integer keys when the hash IN-list is not selected | Approximate membership with no false negatives |
+
+All three compact null build keys out before building and size the representation on the valid rows (see "Nulls" below).
 | Zone map | `enable_dynamic_zone_map_filter=true` and a supported non-floating-point key type | One global build-key `[min,max]` range |
 
 If no probe-GPU L2 size is available, the hash IN-list is not selected; the publisher uses Bloom when supported. Two additional gates avoid unproductive work:
@@ -112,6 +114,13 @@ Each supported type is classified into a *key domain*: a **rep** (the device ele
 The rep is the narrowest listed type that holds the *build column as it arrives*. A build column that compressed materialization narrowed (an `INTEGER` key stored as `INT16`, say) therefore builds a 32-bit set at the carrier — the publisher accepts any build carrier that restores losslessly to the plan's recorded storage type instead of counting it as `keys_skipped_type_mismatch` — and each build value widens per element on insert, so no widened build copy is made either. `estimated_set_bytes` sizes slots at the rep, not the carrier.
 
 Adding a key family means one new value of `membership_key_family`, one arm in `classify_membership_key` / `membership_probe_compatible`, and one probe adapter plus its arm in `dispatch_probe_adapter` (`src/include/cuda/dynamic_filter_probe.cuh`); the three filters do not change.
+
+### Nulls
+
+Nullable keys are handled exactly on both sides, not approximately. Admission never routes a null-safe (`IS NOT DISTINCT FROM`) comparison to a dynamic filter (`src/planner/dynamic_filter/dynamic_filter_key_admission.cpp`), and the authoritative hash join runs its admitted keys with `null_equality::UNEQUAL` (`src/include/op/sirius_physical_hash_join.hpp`), so a NULL build key never matches any probe and a NULL probe key never matches any build key.
+
+- **Build side.** All three representations accept a nullable build column and `cudf::drop_nulls` it before building; `supports()` no longer requires `null_count() == 0`, so a fact-table foreign key with nulls (a TPC-DS `EXISTS`/`IN` semi-join whose build side is a fact table) gets an exact IN-list where it previously fell through to Bloom. The raw IN-list's 1–12 gate and the hash IN-list's size estimate count the valid rows; the publisher passes the valid row count to the selection policy.
+- **Probe side.** `compute_mask` reads the probe's validity bitmask in-kernel (`probe_validity` in `dynamic_filter_probe.cuh`) and writes `false` for a null row, so the returned BOOL8 mask is **never nullable**. Previously the probe's null mask was copied onto the output; `apply_boolean_mask` dropped those rows either way, so the post-decode consumer's behavior is unchanged, but the filtered (fused) decode requires a non-nullable mask (`simpatico_codegen.cpp` treats a null-masked probe result as a broken probe contract), and a nullable probe column no longer aborts it.
 
 ### Probe-side evaluation
 
@@ -167,7 +176,8 @@ The settings live under `sirius.operator_params`:
 
 - Hash-join builds are the only producers, and publication is a single immutable snapshot.
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
-- Membership filters currently support integer keys (`INT8`..`INT64`, `UINT8`..`UINT64`); temporal, decimal, floating-point, and string keys are declined (see "Key types" for where a family plugs in).
+- Membership filters currently support integer keys (`INT8`..`INT64`, `UINT8`..`UINT64`), nullable or not; temporal, decimal, floating-point, and string keys are declined (see "Key types" for where a family plugs in).
+- The fused (filtered) decode cannot yet carry a nullable *key chunk* to a membership probe: the compression planner fails closed on nullable input to the integer codecs and the filtered-decode assembly refuses null-masked columns, so nullable probe columns reach the membership filters only through the post-decode cascade today. The probe side is null-ready for when that lifts.
 - The join-edge (direct) route additionally requires identical build and probe storage types.
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
 - A genuinely hash-partitioned multi-batch build cannot publish because no delivery contains the complete key set.
