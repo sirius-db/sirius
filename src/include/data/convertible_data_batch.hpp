@@ -17,6 +17,7 @@
 #pragma once
 
 #include "data/convertible_data.hpp"
+#include "data/reclaim_ledger.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -156,19 +157,20 @@ class convertible_data_batch : public convertible_data {
   }
 
   /**
-   * @brief Get the size in bytes of this batch in the specified memory space.
+   * @brief Get the bytes actually freed in the specified memory space by converting this batch
+   * away.
    *
-   * Acquires a shared (read-only) lock to access the memory space pointer, then
-   * compares with the provided space. Returns the batch size in bytes if the batch
-   * resides in the given space, 0 otherwise.
+   * Acquires a shared (read-only) lock to access the memory space pointer, then compares with the
+   * provided space. Returns the batch's reclaimable size if it resides in the given space, 0
+   * otherwise.
    *
    * @param space The memory space to query.
-   * @return The batch size in bytes if the batch resides in the given space, 0 otherwise.
+   * @return The reclaimable bytes if the batch resides in the given space, 0 otherwise.
    */
-  std::size_t bytes_in_space(cucascade::memory::memory_space* space) const override
+  std::size_t reclaimable_bytes_in_space(cucascade::memory::memory_space* space) const override
   {
     auto ro = _batch->to_read_only();
-    if (ro.get_memory_space() == space) { return ro.get_data()->get_size_in_bytes(); }
+    if (ro.get_memory_space() == space) { return sirius::reclaimable_size_in_bytes(ro); }
     return 0;
   }
 
@@ -333,6 +335,8 @@ class convertible_data_batch_provider : public convertible_data_provider {
     auto ro = batch->try_to_read_only();
     if (!ro) { return nullptr; }
     if (ro->get_memory_space() == space) {
+      // A zero-reclaimable alias frees nothing; converting it only burns the target tier.
+      if (sirius::reclaimable_size_in_bytes(*ro) == 0) { return nullptr; }
       return std::make_unique<convertible_data_batch>(std::move(batch));
     }
 

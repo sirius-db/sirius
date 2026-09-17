@@ -106,16 +106,23 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   // Execution
   // -----------------------------
   /**
-   * @brief Produce a data batch for one split.
+   * @brief Produce a data batch for one scan split
    *
-   * The input is a @c scan_operator_input holding either scan metadata
-   * (fresh read) or a resident batch (pinned-cache hit). Both go through
-   * @c gpu_ingestible::materialize_table; @c post_filter_and_project runs
-   * afterwards unless materialize returned
-   * @c filter_state::ROW_FILTERED_AND_PROJECTED.
+   * The input is a @c scan_operator_input holding either scan metadata for a fresh read or a
+   * resident batch for a pinned-cache hit. Both go through @c gpu_ingestible::materialize_table;
+   * @c gpu_ingestible::post_filter_and_project runs unless materialization already produced the
+   * final output layout.
    *
-   * Throws on any other operator_data type (programmer error: the connector
-   * carries only @c scan_operator_input).
+   * When the result can surrender a copy-requiring view, the output batch retains its owner and
+   * forwards columns whose carriers already match the plan; raw unfiltered GPU pins use this path.
+   * Schema normalization replaces only mismatched columns with casts. Results that retain their
+   * materialization path are emitted as owned tables.
+   *
+   * @throw std::runtime_error if @p input_data is not a @c scan_operator_input
+   *
+   * @param input_data Split to materialize
+   * @param stream Stream used for materialization, filtering, and schema normalization
+   * @return Pipelineable data containing the emitted batch
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
                                              rmm::cuda_stream_view stream) override;

@@ -129,6 +129,10 @@ Candidates are fetched lazily via `convertible_data_provider` implementations:
 
 Candidates are converted individually via `convertible_data::convert()`, which handles state locking, memory reservation, tier conversion, and failure rollback atomically.
 
+### Reclaimable Bytes vs Attributed Size
+
+A batch's attributed size (`get_size_in_bytes()`, used for reservations and working-set estimates) is not always what converting it away frees: a view-backed batch's owner may keep the viewed storage alive (e.g. the scan's pinned-cache view forwards). Creators declare the honest amount through the `reclaim_ledger` (`src/include/data/reclaim_ledger.hpp`): `make_data_batch_from_view` records the declared `reclaimable_size` keyed by batch id and stores an erase-on-destroy token inside the representation's owner, so the entry retires exactly when that representation is destroyed (batch death or conversion away). Both candidate providers consult `reclaimable_bytes_in_space()`: undeclared batches default to their full size, declared-zero batches (pure pinned aliases) are excluded from candidacy in both tiers, and mixed forwards are credited only their cast-column bytes. Reservation and working-set sizing keep using the attributed size.
+
 ## Memory Consumption History
 
 **File:** `src/include/pipeline/pipeline_memory_history.hpp`
