@@ -1510,12 +1510,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       for (auto const& wanted : *data.args.cols) {
         auto const it = std::find(info->names.begin(), info->names.end(), wanted);
         if (it == info->names.end()) {
-          throw InvalidInputException("pin_table: '%s' has no column named '%s'",
-                                      data.args.path,
-                                      wanted);
+          throw InvalidInputException(
+            "pin_table: '%s' has no column named '%s'", data.args.path, wanted);
         }
-        pinned_columns.push_back(
-          static_cast<std::size_t>(std::distance(info->names.begin(), it)));
+        pinned_columns.push_back(static_cast<std::size_t>(std::distance(info->names.begin(), it)));
       }
       std::sort(pinned_columns.begin(), pinned_columns.end());
       pinned_columns.erase(std::unique(pinned_columns.begin(), pinned_columns.end()),
@@ -1548,21 +1546,20 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       pinned_names.push_back(info->names[col]);
       pinned_physical_types.push_back(info->physical_types[col]);
     }
-    auto pinned_bounds = info->group_bounds
-                           ? info->group_bounds->select_columns(pinned_columns)
-                           : sirius::scan_manager::group_bounds_arena{};
+    auto pinned_bounds = info->group_bounds ? info->group_bounds->select_columns(pinned_columns)
+                                            : sirius::scan_manager::group_bounds_arena{};
 
     std::vector<std::size_t> chunk_ids(info->chunk_rows.size());
     std::iota(chunk_ids.begin(), chunk_ids.end(), std::size_t{0});
     sirius::hpln_open_options open_options;
     open_options.io_ctx = std::move(io_ctx);
-    auto ingested = sirius::read_hpln_chunks_into_pinned(
+    auto ingested       = sirius::read_hpln_chunks_into_pinned(
       data.args.path,
       *host_space,
       chunk_ids,
       open_options,
       pinned_columns.size() == info->names.size() ? std::span<const std::size_t>{}
-                                                  : std::span<const std::size_t>{pinned_columns});
+                                                        : std::span<const std::size_t>{pinned_columns});
     if (ingested.size() != chunk_ids.size()) {
       // Silently serving fewer chunks than the file holds is missing rows, not a slow pin.
       throw InvalidInputException("pin_table: '" + data.args.path + "' staged " +
@@ -1612,13 +1609,12 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     // Copied, not moved: the bind's arena is shared with the metadata cache and with every other
     // scan of this file, while a pinned entry owns its own. A pin happens once, so the copy is
     // not on any hot path.
-    scan_mgr.insert_pinned_entry_host(
-      data.args.name,
-      std::move(cache_info),
-      std::move(host_chunks),
-      *host_space,
-      std::move(pinned_bounds),
-      std::move(column_storage));
+    scan_mgr.insert_pinned_entry_host(data.args.name,
+                                      std::move(cache_info),
+                                      std::move(host_chunks),
+                                      *host_space,
+                                      std::move(pinned_bounds),
+                                      std::move(column_storage));
     SIRIUS_LOG_INFO("[pin_table] '{}': ingested {} chunk(s) of '{}' into the host tier",
                     data.args.name,
                     ingested.size(),
@@ -1796,7 +1792,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (zone_map_group_rows == 0) {
       // A locally sorted chunk still spans the whole key range, so it prunes exactly nothing at
       // chunk granularity -- the clustering only pays through the per-group index
-      // (CHUNK_SKIPPING_PLAN.md 5.2 measures 72.7% of chunks pruned at G=8 against 0.0% here).
+      // (72.7% of chunks prune at G=8 against 0.0% here).
       SIRIUS_LOG_WARN(
         "[pin_table] '{}': cluster_by is set but pinned_zone_map_group_rows is 0; a per-chunk "
         "sort prunes nothing at chunk granularity, so this will cost the sort and save nothing",
@@ -2829,7 +2825,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   // parquet source).
   TableFunction read_simpatico(
     "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
-  read_simpatico.cardinality     = SiriusReadSimpaticoCardinality;
+  read_simpatico.cardinality         = SiriusReadSimpaticoCardinality;
   read_simpatico.filter_pushdown     = true;
   read_simpatico.projection_pushdown = true;
   // ... and this collects the one predicate filter_pushdown cannot deliver: a standalone IS NULL,

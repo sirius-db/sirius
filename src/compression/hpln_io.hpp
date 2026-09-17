@@ -20,7 +20,7 @@
 //
 // The format was built for a transport that charges per request: a fixed trailer locates a
 // postscript, which locates every segment, so ONE tail read tells a reader where the metadata and
-// each chunk live (CHUNK_SKIPPING_PLAN.md 7.5). What that buys is only realizable if the reads
+// each chunk live. What that buys is only realizable if the reads
 // actually go through an object store, which is what this file is for: one staging/parsing path
 // in simpatico_file_ingest.cpp, reading through a pluggable @ref hpln_source that is either the
 // local filesystem or a sirius io_context (uring for local paths, REST for `s3://`).
@@ -50,7 +50,7 @@ namespace sirius {
 //===----------------------------------------------------------------------===//
 
 /// How reads of a .hpln are turned into requests. Defaults measured on a g7e.2xlarge against
-/// in-region S3 (CHUNK_SKIPPING_PLAN.md 7.7); the per-request cost moved by 2.6x with instance
+/// in-region S3; the per-request cost moved by 2.6x with instance
 /// load alone, so treat them as a starting point that a caller may override.
 struct hpln_io_policy {
   /// Bridge a gap smaller than this rather than pay for a second request; the bridged bytes are
