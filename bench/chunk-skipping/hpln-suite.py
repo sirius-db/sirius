@@ -17,7 +17,9 @@ import os
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-EXTENSION_PATH = os.path.join(
+# SIRIUS_EXT_PATH points this harness at another worktree's build -- the only way to measure a
+# `dev` baseline, whose tree has no copy of this script, with the same queries and column unions.
+EXTENSION_PATH = os.environ.get("SIRIUS_EXT_PATH") or os.path.join(
     REPO, "build/release/extension/sirius/sirius.duckdb_extension"
 )
 QUERY_DIR = os.path.join(REPO, "test/tpch_performance/tpch_queries/orig")

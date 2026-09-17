@@ -2120,6 +2120,78 @@ plans that beat them all route through deflate, which is out of bounds here, so 
 high-cardinality text is structural until a non-LZ option exists. `l_orderkey` has a `delta -> ans`
 plan at 20.711x against the committed 12.393x, not taken: it costs decode 2072 → 639 GB/s.
 
+### 6.21 The `dev` baseline: what the project bought, measured post-merge (2026-09-17)
+
+Every number above predates the `upstream/dev` merge (`82003512`) and the cucascade bump it brought
+(`1b0e7b6c` → `e9929fff`). This section re-baselines on the merged build and adds the arm the
+document never had: **`dev` itself**, built in `../sirius-dev` at `c5a6454c` — the exact commit this
+branch merged — with `git submodule status cucascade` verified equal on both sides.
+`bench/chunk-skipping/run-dev-baseline.sh` runs it and refuses to start if the two SHAs differ.
+Both builds are driven by the SAME harness: `SIRIUS_EXT_PATH` points `hpln-pin-bench.py` at another
+worktree's `.so`, so the queries, the pinned column union and the compression plans cannot drift
+between arms (`tpch_pin_columns.py`'s `union_columns_by_table` and `detect_pin_glob` are
+byte-identical across the two trees; only the pin-SQL builder, which this harness does not use,
+differs).
+
+**SF1000 host-pinned, 8 GB batch, `ast_interpret`, best-of-3, all four arms result-identical:**
+
+| arm | pin | suite | vs `dev` |
+|---|---|---|---|
+| `dev` parquet | 18.69 s | 9.897 s | — |
+| ours, parquet, no clustering | 20.50 s | 9.905 s | +0.1% |
+| ours, parquet + `cluster_by` | 24.77 s | **8.788 s** | **−11.2%** |
+| ours, `.hpln` + `cluster_by` | **9.95 s** | **8.738 s** | **−11.7%** |
+
+Three things this settles.
+
+**The untouched path is untouched.** Our unclustered parquet arm lands within 0.1% of `dev` — the
+merge, the cucascade bump and the zone-map machinery cost nothing when clustering is off, which is
+what an unclustered zone map spanning the whole key range should do.
+
+**Most of the win is available to parquet, and needs no new format.** `cluster_by` at pin time is
+−11.2% on its own; `.hpln` adds a further 0.5% on the pinned suite, which is inside noise. What the
+format actually buys on a pin is the PIN: 9.95 s against `dev`'s 18.69 s, because it is an I/O copy
+rather than a decode-and-recompress. The pin-side cost of this branch is now separable too: +1.8 s
+is the zone-map capture (18.69 → 20.50, unclustered) and a further +4.3 s is the sort (→ 24.77).
+
+**The gain is concentrated, and it is the trade §6.13 predicts.** q6 −70%, q15 −56%, q14 −53%,
+q12 −53%, q20 −34%, q4 −24%, q7 −23% — every one a date predicate. Against that, clustered q8 +15.7%
+and q18 +10.9%, paying for the orderkey locality `cluster_by` gives away.
+
+**Cold, and a correction to how this document quotes cold numbers.** `dev` parquet 58.337 s /
+949.8 GB; ours parquet 59.149 s (+1.4%); ours `.hpln` + `cluster_by` 52.781 s / 795.4 GB on the
+first run — which is 2.9 s worse than §6.19's 49.873 s while reading byte-identical data, and was
+about to be written up as a cucascade regression. **It is not one. It is noise, and this document
+has been quoting single cold runs as if they were stable.** Five repetitions of the same arm:
+
+| | rep1 | rep2 | rep3 | rep4 | rep5 | parquet, same runs |
+|---|---|---|---|---|---|---|
+| `.hpln` cold suite | 52.781 | 46.754 | 46.660 | 49.973 | 46.418 | 58.5–59.1 |
+
+**13.7% spread on `.hpln`, 1.2% on parquet, in the same process, over byte-identical reads.** The
+spread concentrates in the byte-heavy queries (q6 ±1.77 s, q13 ±1.32 s, q1 ±1.10 s, q21 ±0.82 s,
+q9 ±0.77 s) and is nil where pruning leaves almost nothing to read (q14 ±0.005 s, q16 ±0.003 s).
+Median of five is **46.754 s, −19.9% vs `dev`** — better than the −15.2% on record, but the honest
+form of the claim is a median with its spread, not a single run.
+
+**The cache eviction is sound, so that is not the cause.** `hpln-suite.py` records
+`/proc/self/io:read_bytes`, which counts bytes off the BLOCK LAYER and excludes page-cache hits, and
+it is identical to two decimals on every query in all five runs. A partially-evicted run would have
+read fewer. `posix_fadvise(FADV_DONTNEED)` is advisory, but here it is measurably working.
+
+**Open:** what the 13.7% is. Same bytes, same pruning, same process, different time, and parquet —
+reading MORE bytes alongside it — is stable. O_DIRECT device-read variance on the RAID and the
+`std::ifstream` demotion of trap §6.20 are both still live; `transport()` exists on `hpln_source`
+but is surfaced in no log, so telling them apart needs instrumentation first. Until then, **cold
+`.hpln` numbers in this document should be read as ±7%**, which is wide enough to have swallowed
+several conclusions drawn from single runs.
+
+**q13 remains the whole cold deficit and is not merge fallout:** 5.371 s / 93.3 GB against `dev`'s
+1.947 s / 33.2 GB, matching the 5.549 s §6.13 records for the clustered arm. It is the `o_comment`
+LIKE over text stored raw. Excluding q13, the cold suite is 47.4 s against `dev`'s 56.4 s (−16%).
+And §6.20's qualifier still applies to every cold number here: parquet is being measured with its
+page-index pruning stage switched off, so a material part of the cold gap is a reader gap.
+
 ## 6.6 Skipping decode inside a GPU-resident compressed chunk
 
 **Scope: this section is about a chunk whose payload is already device-resident**, where the only
