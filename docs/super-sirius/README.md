@@ -42,6 +42,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
+| [`.hpln` Format](hpln-format.md) | Sirius's own columnar file format: the SQL surface (`read_simpatico`, `COPY ... FORMAT 'simpatico'`, pinning), the trailer/postscript layout and its segments, how reads are planned, and what the format trades away |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |
 | [Compressed Materialization](compressed-materialization.md) | Value-preserving narrow integer and DECIMAL carriers, restoration boundaries, and pin-cache invariants |
 | [Multi-GPU Architecture](multi-gpu-architecture.md) | How Sirius executes SQL across every GPU on a node — tiers, pin tables, ready-device scheduling, cross-GPU transfers, downgrade, concurrency invariants |

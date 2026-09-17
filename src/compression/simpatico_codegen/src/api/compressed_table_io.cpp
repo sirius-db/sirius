@@ -5,6 +5,7 @@
 
 #include "api/compressed_table_io.hpp"
 
+#include "codegen/plan/chunk_subset.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
@@ -14,6 +15,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -256,11 +258,16 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
   auto make_col = [&](std::size_t i) -> std::unique_ptr<cudf::column> {
     auto const& bd     = bufs[i];
     cudf::data_type dt = tag_to_dtype(bd.type_tag);
-    auto col           = cudf::make_numeric_column(dt,
-                                         static_cast<cudf::size_type>(bd.num_rows),
-                                         cudf::mask_state::UNALLOCATED,
-                                         stream,
-                                         leaf_mr);
+    // Fixed-width covers every leaf tag: numeric, timestamp, duration and fixed-point.
+    // make_numeric_column throws on the latter three, which an `identity` plan produces because
+    // its leaf carries the column's own type rather than a codec's integer storage. The tag
+    // carries no decimal scale (the column record does), but only the width has to be right here
+    // -- apply_stored_dtype re-tags the decoded column afterwards.
+    auto col = cudf::make_fixed_width_column(dt,
+                                             static_cast<cudf::size_type>(bd.num_rows),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             leaf_mr);
     if (bd.size_bytes > 0) {
       fill(i, col->mutable_view().head<void>(), static_cast<std::size_t>(bd.size_bytes), stream);
     }
@@ -323,7 +330,76 @@ static std::unique_ptr<compressed_representation> rep_from_leaf_desc(
 // 11: a Bitpack "packed" buffer counts its decode gather guard words in num_rows, so the
 //     stored word count is what the reader allocates and the guard needs no read-side
 //     reconstruction (see compact_bitpack_packed).
-static constexpr std::uint8_t kVersion = 11;
+// 12: each column carries a validity sidecar record after num_rows (see push_validity).
+//     Two independent lines both reached 11 with incompatible meanings, so the merged
+//     format takes the next number rather than aliasing either one — a v11 file written
+//     by either line parses as garbage here, and must be rejected, not guessed at.
+static constexpr std::uint8_t kVersion = 12;
+
+// Per-column validity record, written right after num_rows:
+//
+//   kind (uint8)                        [validity_kind]
+//   if kind != all_valid: null_count (int64 LE)
+//   if kind == mask:      size_bytes (uint64 LE) + payload_offset (uint64 LE)
+//
+// An all-valid column costs exactly one byte, and an all-null one costs nine
+// with no payload at all -- only a genuinely mixed column pays for a bitmask.
+// The mask is appended to the payload region like any leaf buffer, so callers
+// that stage the payload themselves need no special case for it.
+static void push_validity(std::vector<std::uint8_t>& hdr,
+                          validity_sidecar const& v,
+                          std::vector<payload_buffer_ref>& out_buffers,
+                          std::uint64_t& payload_offset,
+                          std::uint64_t payload_align)
+{
+  push_le(hdr, static_cast<std::uint8_t>(v.kind));
+  if (v.kind == validity_kind::all_valid) return;
+
+  push_le(hdr, v.null_count);
+  if (v.kind != validity_kind::mask) return;
+
+  auto const size_bytes = static_cast<std::uint64_t>(v.mask.size());
+  push_le(hdr, size_bytes);
+  payload_offset = align_up_to(payload_offset, payload_align);
+  push_le(hdr, payload_offset);
+  out_buffers.push_back(payload_buffer_ref{payload_offset, v.mask.data(), size_bytes, size_bytes});
+  payload_offset += size_bytes;
+}
+
+// Parsed form of the record above; the mask bytes are pulled from the payload
+// later (reconstruct_from_records), like every leaf buffer.
+struct ValidityRecord {
+  validity_kind kind           = validity_kind::all_valid;
+  std::int64_t null_count      = 0;
+  std::uint64_t size_bytes     = 0;
+  std::uint64_t payload_offset = 0;
+};
+
+// Inverse of push_validity. Returns false on a truncated or unknown record.
+//
+// When @p payload_offset_at is given it receives the position of the mask's
+// payload_offset field relative to @p header_base, so build_chunk_subset_header
+// can patch it: the mask is a payload buffer like any other and moves when the
+// payload is compacted, but it hangs off no leaf, so nothing else would record
+// where to re-point it.
+static bool read_validity(Reader& r,
+                          ValidityRecord& v,
+                          std::uint8_t const* header_base  = nullptr,
+                          std::uint64_t* payload_offset_at = nullptr)
+{
+  std::uint8_t k;
+  if (!r.read_le(k)) return false;
+  if (k > static_cast<std::uint8_t>(validity_kind::mask)) return false;
+  v.kind = static_cast<validity_kind>(k);
+  if (v.kind == validity_kind::all_valid) return true;
+
+  if (!r.read_le(v.null_count)) return false;
+  if (v.kind != validity_kind::mask) return true;
+
+  if (!r.read_le(v.size_bytes)) return false;
+  if (payload_offset_at) { *payload_offset_at = static_cast<std::uint64_t>(r.p - header_base); }
+  return r.read_le(v.payload_offset);
+}
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
 // Other ops carry their params in the op name, so only bitjoin needs attrs.
@@ -413,18 +489,57 @@ struct ColRecord {
   std::uint8_t dtype_tag = 0;
   std::int32_t scale     = 0;  // fixed-point scale for the column dtype (0 otherwise)
   std::int64_t num_rows  = 0;
+  ValidityRecord validity;
   PlanTree tree;
   std::vector<leaf_desc> leaf_descs;
   std::vector<std::vector<std::uint64_t>> buf_offsets;  // [leaf][buffer] -> payload offset
 };
 
+// Byte offsets, relative to where the Reader started, of the header fields that a chunk subset
+// has to restate. Recorded during parsing so build_chunk_subset_header can PATCH a copy of the
+// original header rather than re-emit one from the parsed records: a second writer would be free
+// to drift from build_compressed_table_header and the divergence would only show up as wrong
+// query results much later. Every field involved is fixed-width at a computable offset, so
+// patching keeps the output structurally identical to a written header by construction.
+struct HeaderFieldOffsets {
+  struct Buffer {
+    std::uint64_t size_bytes_at     = 0;  // uint64
+    std::uint64_t payload_offset_at = 0;  // uint64
+  };
+  struct Leaf {
+    std::uint64_t num_rows_at = 0;  // uint64
+    std::vector<Buffer> buffers;
+  };
+  struct Column {
+    // The column record's byte extent within the header. A COLUMN subset cannot patch offsets in
+    // place the way a row subset does -- it removes records, which moves everything after them --
+    // so it copies each kept column's bytes verbatim and patches those. Recorded here for the
+    // same reason the rest of this struct exists: a second header writer would be free to drift.
+    std::uint64_t begin_at    = 0;
+    std::uint64_t end_at      = 0;
+    std::uint64_t num_rows_at = 0;  // int64
+    // Where the validity mask's payload_offset sits; only meaningful when the
+    // column's record is validity_kind::mask.
+    std::uint64_t validity_payload_offset_at = 0;  // uint64
+    std::vector<Leaf> leaves;
+  };
+  std::vector<Column> columns;
+};
+
 // Parse the .hpln header from `r` into one ColRecord per column. On success
 // `r` is left pointing just past the header (i.e. at the payload region for the
 // concatenated file layout). Returns false and sets *err on any structural error.
-static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::string* err)
+static bool parse_hpln_header(Reader& r,
+                              std::vector<ColRecord>& out,
+                              std::string* err,
+                              HeaderFieldOffsets* field_offsets = nullptr)
 {
   nvtx_scoped_range nvtx_range{"simpatico::io::parse_header"};
-  auto bad = [&](std::string const& m) {
+  // Field offsets are recorded relative to where this Reader started, which is where the header
+  // begins in every caller, so they index straight into a copy of the header bytes.
+  std::uint8_t const* const header_base = r.p;
+  auto const field_at = [&] { return static_cast<std::uint64_t>(r.p - header_base); };
+  auto bad            = [&](std::string const& m) {
     if (err) *err = m;
     return false;
   };
@@ -443,13 +558,25 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
   if (!r.read_le(num_cols)) return bad("truncated header");
   out.clear();
   out.resize(num_cols);
+  if (field_offsets) {
+    field_offsets->columns.clear();
+    field_offsets->columns.resize(num_cols);
+  }
 
   for (std::uint16_t ci = 0; ci < num_cols; ++ci) {
     auto& cr = out[ci];
+    if (field_offsets) field_offsets->columns[ci].begin_at = field_at();
     if (!r.read_str16(cr.name)) return bad("truncated col name");
     if (!r.read_le(cr.dtype_tag)) return bad("truncated col dtype");
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
+    if (field_offsets) field_offsets->columns[ci].num_rows_at = field_at();
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
+    if (!read_validity(
+          r,
+          cr.validity,
+          header_base,
+          field_offsets ? &field_offsets->columns[ci].validity_payload_offset_at : nullptr))
+      return bad("truncated/unknown col validity");
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");
@@ -462,6 +589,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
     if (!r.read_le(nl)) return bad("truncated num_leaves");
     cr.leaf_descs.resize(nl);
     cr.buf_offsets.resize(nl);
+    if (field_offsets) field_offsets->columns[ci].leaves.resize(nl);
 
     for (std::uint16_t li = 0; li < nl; ++li) {
       auto& ld = cr.leaf_descs[li];
@@ -471,6 +599,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_le(k)) return bad("truncated leaf kind");
       ld.kind = static_cast<OpId>(k);
       if (!r.read_le(ld.type_tag)) return bad("truncated leaf type_tag");
+      if (field_offsets) field_offsets->columns[ci].leaves[li].num_rows_at = field_at();
       if (!r.read_le(ld.num_rows)) return bad("truncated leaf num_rows");
       if (!read_meta(r, ld.meta)) return bad("truncated/unknown leaf meta");
 
@@ -478,12 +607,19 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
       if (!r.read_le(nb)) return bad("truncated num_bufs");
       ld.buffers.resize(nb);
       cr.buf_offsets[li].resize(nb);
+      if (field_offsets) field_offsets->columns[ci].leaves[li].buffers.resize(nb);
 
       for (std::uint8_t bi = 0; bi < nb; ++bi) {
         auto& bd = ld.buffers[bi];
         if (!r.read_str16(bd.name)) return bad("truncated buf name");
         if (!r.read_le(bd.type_tag)) return bad("truncated buf type_tag");
+        if (field_offsets) {
+          field_offsets->columns[ci].leaves[li].buffers[bi].size_bytes_at = field_at();
+        }
         if (!r.read_le(bd.size_bytes)) return bad("truncated buf size_bytes");
+        if (field_offsets) {
+          field_offsets->columns[ci].leaves[li].buffers[bi].payload_offset_at = field_at();
+        }
         std::uint64_t poff;
         if (!r.read_le(poff)) return bad("truncated buf payload_offset");
         cr.buf_offsets[li][bi] = poff;
@@ -493,6 +629,7 @@ static bool parse_hpln_header(Reader& r, std::vector<ColRecord>& out, std::strin
             : 0;
       }
     }
+    if (field_offsets) field_offsets->columns[ci].end_at = field_at();
   }
   return true;
 }
@@ -534,6 +671,17 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
     *plan_tree     = std::move(cr.tree);
     auto& nodes    = plan_tree->nodes;
 
+    // Rebuild the validity sidecar. all_valid and all_null carry no payload, so
+    // only a mixed column costs a fetch here.
+    auto& validity      = plan_tree->validity;
+    validity.kind       = cr.validity.kind;
+    validity.null_count = cr.validity.null_count;
+    if (validity.kind == validity_kind::mask) {
+      auto const sz = static_cast<std::size_t>(cr.validity.size_bytes);
+      validity.mask = rmm::device_buffer(sz, stream, mr);
+      if (sz > 0) fetch(cr.validity.payload_offset, sz, validity.mask.data(), stream);
+    }
+
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       auto const& ld    = cr.leaf_descs[li];
       auto const& boffs = cr.buf_offsets[li];
@@ -572,19 +720,197 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
 // Public API
 // ---------------------------------------------------------------------------
 
-std::string write_compressed_table(compressed_table const& table,
-                                   std::string const& path,
-                                   rmm::cuda_stream_view stream)
+namespace {
+
+constexpr std::uint16_t kChunkDirectoryVersion = 1;
+
+}  // namespace
+
+std::vector<std::uint8_t> pack_hpln_chunk_directory(std::span<const hpln_chunk_ref> chunks)
 {
-  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
-  // Build the header + payload buffer list once (shared with the in-memory
-  // writer), then gather the payload into one contiguous blob for the file.
-  std::vector<std::uint8_t> hdr;
+  std::vector<std::uint8_t> out;
+  push_le(out, kChunkDirectoryVersion);
+  push_le(out, static_cast<std::uint32_t>(chunks.size()));
+  for (auto const& c : chunks) {
+    push_le(out, c.header_offset);
+    push_le(out, c.header_bytes);
+    push_le(out, c.payload_offset);
+    push_le(out, c.payload_bytes);
+    push_le(out, c.num_rows);
+  }
+  return out;
+}
+
+std::string unpack_hpln_chunk_directory(std::span<const std::uint8_t> bytes,
+                                        std::vector<hpln_chunk_ref>& out)
+{
+  out.clear();
+  constexpr std::size_t kEntryBytes = 5 * sizeof(std::uint64_t);
+  if (bytes.size() < 6) return "chunk directory: truncated preamble";
+  std::uint16_t version = 0;
+  std::uint32_t n       = 0;
+  std::memcpy(&version, bytes.data(), sizeof(version));
+  std::memcpy(&n, bytes.data() + 2, sizeof(n));
+  if (version != kChunkDirectoryVersion) {
+    return "chunk directory: unsupported version " + std::to_string(version);
+  }
+  if (bytes.size() < 6 + static_cast<std::size_t>(n) * kEntryBytes) {
+    return "chunk directory: truncated entry table";
+  }
+  out.resize(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto const* p = bytes.data() + 6 + static_cast<std::size_t>(i) * kEntryBytes;
+    std::memcpy(&out[i].header_offset, p, 8);
+    std::memcpy(&out[i].header_bytes, p + 8, 8);
+    std::memcpy(&out[i].payload_offset, p + 16, 8);
+    std::memcpy(&out[i].payload_bytes, p + 24, 8);
+    std::memcpy(&out[i].num_rows, p + 32, 8);
+  }
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// checksums
+//===----------------------------------------------------------------------===//
+namespace {
+
+/// Castagnoli polynomial, reflected. Built once; the hardware path below never touches it.
+std::array<std::uint32_t, 256> const& crc32c_table()
+{
+  static std::array<std::uint32_t, 256> const table = [] {
+    std::array<std::uint32_t, 256> t{};
+    for (std::uint32_t i = 0; i < 256; ++i) {
+      std::uint32_t c = i;
+      for (int k = 0; k < 8; ++k) {
+        c = (c & 1u) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+      }
+      t[i] = c;
+    }
+    return t;
+  }();
+  return table;
+}
+
+}  // namespace
+
+std::uint32_t hpln_crc32c(std::span<const std::uint8_t> bytes, std::uint32_t crc)
+{
+  // The usual reflected-CRC convention: invert going in and coming out, so a run of zero bytes
+  // does not hash to zero and a truncation is visible.
+  std::uint32_t c = ~crc;
+  auto const* p   = bytes.data();
+  std::size_t n   = bytes.size();
+#if defined(__ARM_FEATURE_CRC32) || defined(__SSE4_2__)
+  while (n >= 8) {
+    std::uint64_t word = 0;
+    std::memcpy(&word, p, 8);
+#if defined(__ARM_FEATURE_CRC32)
+    c = __builtin_aarch64_crc32cx(c, word);
+#else
+    c = static_cast<std::uint32_t>(__builtin_ia32_crc32di(c, word));
+#endif
+    p += 8;
+    n -= 8;
+  }
+#endif
+  auto const& table = crc32c_table();
+  for (std::size_t i = 0; i < n; ++i) {
+    c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+  }
+  return ~c;
+}
+
+std::vector<std::uint8_t> pack_hpln_checksums(std::span<const hpln_checksum_entry> entries)
+{
+  std::vector<std::uint8_t> out;
+  push_le(out, static_cast<std::uint16_t>(1));  // segment version
+  push_le(out, static_cast<std::uint16_t>(1));  // algorithm: 1 = CRC32C
+  push_le(out, static_cast<std::uint32_t>(entries.size()));
+  for (auto const& e : entries) {
+    push_le(out, static_cast<std::uint16_t>(e.kind));
+    push_le(out, static_cast<std::uint16_t>(0));  // reserved, keeps the entry 8-byte aligned
+    push_le(out, e.index);
+    push_le(out, e.offset);
+    push_le(out, e.bytes);
+    push_le(out, e.crc);
+    push_le(out, static_cast<std::uint32_t>(0));  // reserved
+  }
+  return out;
+}
+
+std::string unpack_hpln_checksums(std::span<const std::uint8_t> bytes,
+                                  std::vector<hpln_checksum_entry>& out)
+{
+  constexpr std::size_t kEntryBytes = 32;
+  out.clear();
+  if (bytes.size() < 8) { return "checksum table: truncated header"; }
+  std::uint16_t version = 0, algorithm = 0;
+  std::uint32_t n = 0;
+  std::memcpy(&version, bytes.data(), 2);
+  std::memcpy(&algorithm, bytes.data() + 2, 2);
+  std::memcpy(&n, bytes.data() + 4, 4);
+  if (version != 1) { return "checksum table: unsupported version " + std::to_string(version); }
+  if (algorithm != 1) {
+    return "checksum table: unsupported algorithm " + std::to_string(algorithm);
+  }
+  if (bytes.size() < 8 + static_cast<std::size_t>(n) * kEntryBytes) {
+    return "checksum table: truncated entry table";
+  }
+  out.resize(n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto const* p      = bytes.data() + 8 + static_cast<std::size_t>(i) * kEntryBytes;
+    std::uint16_t kind = 0;
+    std::memcpy(&kind, p, 2);
+    out[i].kind = static_cast<hpln_segment>(kind);
+    std::memcpy(&out[i].index, p + 4, 4);
+    std::memcpy(&out[i].offset, p + 8, 8);
+    std::memcpy(&out[i].bytes, p + 16, 8);
+    std::memcpy(&out[i].crc, p + 24, 4);
+  }
+  return {};
+}
+
+struct hpln_stream_writer::impl {
+  std::string path;
+  std::ofstream f;
+  // Every chunk's header, kept until finish(). Kilobytes per chunk: this is what makes the whole
+  // file's worth affordable when its payloads are not.
+  std::vector<std::vector<std::uint8_t>> headers;
+  std::vector<hpln_chunk_ref> dir;
+  std::vector<hpln_checksum_entry> sums;
+  std::uint64_t at = 0;
+  bool finished    = false;
+
+  explicit impl(std::string p) : path(std::move(p)), f(path, std::ios::binary | std::ios::trunc) {}
+};
+
+hpln_stream_writer::hpln_stream_writer(std::string path)
+  : _impl(std::make_unique<impl>(std::move(path)))
+{
+}
+
+hpln_stream_writer::~hpln_stream_writer() = default;
+
+std::size_t hpln_stream_writer::chunks_appended() const noexcept { return _impl->dir.size(); }
+
+std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_stream_view stream)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[append]"};
+  auto& st = *_impl;
+  if (st.finished) return "hpln_stream_writer: append after finish on '" + st.path + "'";
+  if (!st.f) return "failed to open '" + st.path + "' for writing";
+
+  std::vector<std::uint8_t> header;
   std::vector<payload_buffer_ref> buffers;
   std::uint64_t payload_bytes = 0;
-  std::string err = build_compressed_table_header(table, hdr, buffers, payload_bytes, stream);
-  if (!err.empty()) return err;
+  if (auto err =
+        build_compressed_table_header(table, header, buffers, payload_bytes, stream, kPayloadAlign);
+      !err.empty()) {
+    return err;
+  }
 
+  // Gather this chunk's payload out of device memory and write it. One chunk's worth of host
+  // staging is live at a time, and the caller may free the device table as soon as this returns.
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(payload_bytes));
   for (auto const& b : buffers) {
     if (b.size_bytes > 0 && b.device_ptr) {
@@ -597,12 +923,187 @@ std::string write_compressed_table(compressed_table const& table,
   }
   stream.synchronize();  // D→H copies must complete before the file write
 
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) return "failed to open '" + path + "' for writing";
-  f.write(reinterpret_cast<const char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-  f.write(reinterpret_cast<const char*>(payload.data()),
-          static_cast<std::streamsize>(payload.size()));
-  if (!f) return "write error on '" + path + "'";
+  // A chunk starts on a kPayloadAlign boundary, so its buffers' aligned offsets are aligned in
+  // the FILE too -- which is what the O_DIRECT test actually looks at. The gap is written rather
+  // than seeked over, so the file has no holes and every offset still means what it says.
+  if (auto const pad = align_payload(st.at) - st.at; pad > 0) {
+    static const std::vector<char> zeros(kPayloadAlign, 0);
+    st.f.write(zeros.data(), static_cast<std::streamsize>(pad));
+    st.at += pad;
+  }
+
+  auto const index = static_cast<std::uint32_t>(st.dir.size());
+  hpln_chunk_ref ref{};
+  ref.payload_offset = st.at;
+  ref.payload_bytes  = payload_bytes;
+  ref.num_rows       = table.num_rows();
+  st.f.write(reinterpret_cast<const char*>(payload.data()),
+             static_cast<std::streamsize>(payload.size()));
+  // Per chunk, not once for the whole region: a reader fetches a chunk at a time, and a checksum
+  // it cannot check without reading every other chunk is one it will never check.
+  st.sums.push_back({hpln_segment::payload, index, st.at, payload_bytes, hpln_crc32c(payload)});
+  st.at += payload_bytes;
+
+  st.dir.push_back(ref);
+  st.headers.push_back(std::move(header));
+  if (!st.f) return "write error on '" + st.path + "'";
+  return {};
+}
+
+std::string hpln_stream_writer::finish(std::span<const hpln_extra_segment> extra)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[finish]"};
+  auto& st = *_impl;
+  if (st.finished) return "hpln_stream_writer: finish called twice on '" + st.path + "'";
+  st.finished = true;
+  if (!st.f) return "failed to open '" + st.path + "' for writing";
+  if (st.dir.empty()) return "hpln_stream_writer: no chunks written to '" + st.path + "'";
+
+  auto const payload_region_bytes = st.at;
+
+  // The header region, contiguous, after the payloads. Contiguity is what 7.5 asked for; being
+  // first was never the requirement, and a reader locates it through the segment table.
+  auto const header_region_start = st.at;
+  for (std::size_t i = 0; i < st.headers.size(); ++i) {
+    st.dir[i].header_offset = st.at;
+    st.dir[i].header_bytes  = st.headers[i].size();
+    st.f.write(reinterpret_cast<const char*>(st.headers[i].data()),
+               static_cast<std::streamsize>(st.headers[i].size()));
+    st.sums.push_back({hpln_segment::header,
+                       static_cast<std::uint32_t>(i),
+                       st.at,
+                       st.headers[i].size(),
+                       hpln_crc32c(st.headers[i])});
+    st.at += st.headers[i].size();
+  }
+
+  std::vector<hpln_segment_ref> segs;
+  segs.push_back({hpln_segment::payload, 0, payload_region_bytes});
+  segs.push_back({hpln_segment::header, header_region_start, st.at - header_region_start});
+
+  auto const dir_bytes = pack_hpln_chunk_directory(st.dir);
+  st.f.write(reinterpret_cast<const char*>(dir_bytes.data()),
+             static_cast<std::streamsize>(dir_bytes.size()));
+  segs.push_back({hpln_segment::chunk_directory, st.at, dir_bytes.size()});
+  st.sums.push_back(
+    {hpln_segment::chunk_directory, 0, st.at, dir_bytes.size(), hpln_crc32c(dir_bytes)});
+  st.at += dir_bytes.size();
+
+  for (auto const& e : extra) {
+    if (e.bytes.empty()) continue;
+    st.f.write(reinterpret_cast<const char*>(e.bytes.data()),
+               static_cast<std::streamsize>(e.bytes.size()));
+    segs.push_back({e.kind, st.at, e.bytes.size()});
+    st.sums.push_back({e.kind, 0, st.at, e.bytes.size(), hpln_crc32c(e.bytes)});
+    st.at += e.bytes.size();
+  }
+
+  // Last of the segments, because it covers all of them and cannot cover itself. The postscript
+  // and the trailer are not covered either: they are read and validated structurally before
+  // anything else, and a reader that cannot parse them never gets as far as a checksum.
+  auto const sum_bytes = pack_hpln_checksums(st.sums);
+  st.f.write(reinterpret_cast<const char*>(sum_bytes.data()),
+             static_cast<std::streamsize>(sum_bytes.size()));
+  segs.push_back({hpln_segment::checksums, st.at, sum_bytes.size()});
+  st.at += sum_bytes.size();
+
+  std::vector<std::uint8_t> ps;
+  push_le(ps, static_cast<std::uint16_t>(segs.size()));
+  for (auto const& sg : segs) {
+    push_le(ps, static_cast<std::uint16_t>(sg.kind));
+    push_le(ps, sg.offset);
+    push_le(ps, sg.bytes);
+  }
+  st.f.write(reinterpret_cast<const char*>(ps.data()), static_cast<std::streamsize>(ps.size()));
+
+  // Fixed 16-byte trailer, magic LAST so a reader validates by reading the tail.
+  std::vector<std::uint8_t> tr;
+  push_le(tr, st.at);                                  // postscript offset (u64)
+  push_le(tr, static_cast<std::uint16_t>(ps.size()));  // postscript length (u16)
+  push_le(tr, kHplnFileVersion);                       // version (u16)
+  tr.push_back('H');
+  tr.push_back('P');
+  tr.push_back('L');
+  tr.push_back('N');
+  st.f.write(reinterpret_cast<const char*>(tr.data()), static_cast<std::streamsize>(tr.size()));
+  st.f.flush();
+  if (!st.f) return "write error on '" + st.path + "'";
+  return {};
+}
+
+std::string write_compressed_tables(std::span<compressed_table const* const> tables,
+                                    std::string const& path,
+                                    rmm::cuda_stream_view stream,
+                                    std::span<const hpln_extra_segment> extra)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
+  if (tables.empty()) return "write_compressed_tables: no chunks to write";
+
+  // The whole-file form is the streaming one with every chunk already in hand -- one writer, one
+  // layout. It differs only in that the caller cannot release a chunk between appends.
+  hpln_stream_writer writer(path);
+  for (std::size_t i = 0; i < tables.size(); ++i) {
+    if (tables[i] == nullptr)
+      return "write_compressed_tables: null chunk at index " + std::to_string(i);
+    if (auto err = writer.append(*tables[i], stream); !err.empty()) return err;
+  }
+  return writer.finish(extra);
+}
+
+std::string write_compressed_table(compressed_table const& table,
+                                   std::string const& path,
+                                   rmm::cuda_stream_view stream,
+                                   std::span<const hpln_extra_segment> extra)
+{
+  compressed_table const* one = &table;
+  return write_compressed_tables({&one, 1}, path, stream, extra);
+}
+
+std::string read_hpln_postscript(std::span<const std::uint8_t> tail,
+                                 std::uint64_t file_size,
+                                 std::vector<hpln_segment_ref>& out,
+                                 std::uint64_t* need_bytes)
+{
+  out.clear();
+  if (need_bytes) *need_bytes = kHplnTrailerBytes;
+  if (tail.size() < kHplnTrailerBytes || file_size < kHplnTrailerBytes) {
+    return "read_hpln_postscript: need at least the trailer";
+  }
+  auto const* t = tail.data() + tail.size() - kHplnTrailerBytes;
+  if (t[12] != 'H' || t[13] != 'P' || t[14] != 'L' || t[15] != 'N') {
+    return "read_hpln_postscript: no trailer magic (a pre-v7 file: parse the header from the "
+           "front)";
+  }
+  std::uint64_t ps_off = 0;
+  std::memcpy(&ps_off, t, sizeof(ps_off));
+  std::uint16_t ps_len = 0, version = 0;
+  std::memcpy(&ps_len, t + 8, sizeof(ps_len));
+  std::memcpy(&version, t + 10, sizeof(version));
+  if (version != kHplnFileVersion) {
+    return "read_hpln_postscript: unsupported file version " + std::to_string(version);
+  }
+  if (ps_off + ps_len + kHplnTrailerBytes > file_size) {
+    return "read_hpln_postscript: postscript runs past the file";
+  }
+  // Is the postscript inside the tail we were given? If not, say exactly how much would do.
+  auto const tail_start = file_size - tail.size();
+  if (ps_off < tail_start) {
+    if (need_bytes) *need_bytes = file_size - ps_off;
+    return "read_hpln_postscript: tail too short for the postscript";
+  }
+  Reader r{tail.data() + (ps_off - tail_start), ps_len};
+  std::uint16_t n = 0;
+  if (!r.read_le(n)) return "read_hpln_postscript: truncated postscript";
+  out.reserve(n);
+  for (std::uint16_t i = 0; i < n; ++i) {
+    std::uint16_t kind = 0;
+    std::uint64_t off = 0, len = 0;
+    if (!r.read_le(kind) || !r.read_le(off) || !r.read_le(len)) {
+      return "read_hpln_postscript: truncated segment table";
+    }
+    if (off + len > file_size) return "read_hpln_postscript: segment runs past the file";
+    out.push_back({static_cast<hpln_segment>(kind), off, len});
+  }
   return {};
 }
 
@@ -635,17 +1136,22 @@ compressed_table read_compressed_table(std::string const& path,
 
   // Bounds-check every buffer up front so a truncated file is reported here
   // rather than faulting mid-copy, then copy each buffer straight to device.
+  auto in_payload = [&](std::uint64_t off, std::size_t sz) {
+    // Subtraction form: `off + sz` could overflow for a corrupt/hostile file's
+    // huge declared offset and wrap below payload_total, passing the check and
+    // then faulting in fetch(). Compare against the remaining space instead so
+    // it can never overflow.
+    return sz == 0 || (off <= payload_total && sz <= payload_total - off);
+  };
   for (auto const& cr : col_records) {
+    if (cr.validity.kind == validity_kind::mask &&
+        !in_payload(cr.validity.payload_offset, static_cast<std::size_t>(cr.validity.size_bytes)))
+      return fail("payload out of bounds");
     for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
       for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
         std::size_t sz = static_cast<std::size_t>(cr.leaf_descs[li].buffers[bi].size_bytes);
         std::uint64_t const off = cr.buf_offsets[li][bi];
-        // Subtraction form: `off + sz` could overflow for a corrupt/hostile
-        // file's huge declared offset and wrap below payload_total, passing the
-        // check and then faulting in fetch(). Compare against the remaining space
-        // instead so it can never overflow.
-        if (sz > 0 && (off > payload_total || sz > payload_total - off))
-          return fail("payload out of bounds");
+        if (!in_payload(off, sz)) return fail("payload out of bounds");
       }
     }
   }
@@ -736,7 +1242,8 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           std::vector<std::uint8_t>& out_header,
                                           std::vector<payload_buffer_ref>& out_buffers,
                                           std::uint64_t& out_payload_bytes,
-                                          rmm::cuda_stream_view stream)
+                                          rmm::cuda_stream_view stream,
+                                          std::uint64_t payload_align)
 {
   nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
@@ -772,6 +1279,10 @@ std::string build_compressed_table_header(compressed_table const& table,
     // Structural plan tree (identical layout to the file header, so the same
     // parser reconstructs it): the node array is the source of truth on read.
     PlanTree const& tree = col.plan_tree ? *col.plan_tree : kEmptyTree;
+
+    // Validity rides beside the tree, not inside it: it is not a leaf and has no
+    // node, so it is written here rather than through describe().
+    push_validity(hdr, tree.validity, out_buffers, payload_offset, payload_align);
     push_le(hdr, static_cast<std::uint16_t>(tree.nodes.size()));
     for (auto const& node : tree.nodes)
       push_node(hdr, node);
@@ -798,6 +1309,10 @@ std::string build_compressed_table_header(compressed_table const& table,
         push_str16(hdr, bd.name);
         push_le(hdr, bd.type_tag);
         push_le(hdr, bd.size_bytes);
+        // Aligned start, exact size: see kPayloadAlign. The slack before the next buffer is
+        // written (the staging vector is zero-filled, so it checksums deterministically) and
+        // never read.
+        payload_offset = align_up_to(payload_offset, payload_align);
         push_le(hdr, payload_offset);
 
         // Record the buffer for the caller to stage out of device memory; no
@@ -812,7 +1327,7 @@ std::string build_compressed_table_header(compressed_table const& table,
     }
   }
 
-  out_payload_bytes = payload_offset;
+  out_payload_bytes = align_up_to(payload_offset, payload_align);
   return {};
 }
 
@@ -874,6 +1389,596 @@ compressed_table read_compressed_table_subset_from_memory(
     selected.push_back(std::move(duplicate_records[idx]));
   }
   return reconstruct_from_records(selected, fetch, stream, mr, /*leaf_mr=*/mr, error_out);
+}
+
+// ─── Chunk-subset header synthesis ──────────────────────────────────────────
+
+namespace {
+
+// Rows per decode chunk. Mirrors codegen::kChunkSize, which the decode grid is sized from
+// (leaf_desc::num_rows / kChunkSize); surviving chunk ids are in these units.
+constexpr std::uint64_t kSubsetRowsPerChunk = 1024;
+
+// Rows the surviving chunks of a @p total_rows sequence cover. Not simply
+// survivors * kSubsetRowsPerChunk: the last chunk of a column is short.
+std::uint64_t rows_over_chunks(std::uint64_t total_rows,
+                               std::span<const std::uint32_t> surviving_chunks)
+{
+  if (total_rows == 0) return 0;
+  auto const n_chunks = (total_rows + kSubsetRowsPerChunk - 1) / kSubsetRowsPerChunk;
+  std::uint64_t rows  = 0;
+  for (auto const chunk : surviving_chunks) {
+    if (chunk >= n_chunks) continue;  // a survivor past the end addresses nothing
+    auto const first = static_cast<std::uint64_t>(chunk) * kSubsetRowsPerChunk;
+    rows += std::min(kSubsetRowsPerChunk, total_rows - first);
+  }
+  return rows;
+}
+
+// Element width of a serialized buffer, or 0 when the tag is not a fixed-width type (which the
+// buffer layout arithmetic cannot address, so such a buffer is never subsetted).
+std::uint64_t buffer_elem_size(std::uint8_t type_tag)
+{
+  if (type_tag == 255) return 0;
+  auto const dt = tag_to_dtype(type_tag);
+  if (!cudf::is_fixed_width(dt)) return 0;
+  return static_cast<std::uint64_t>(cudf::size_of(dt));
+}
+
+}  // namespace
+
+std::string describe_compressed_table_header(std::span<const std::uint8_t> header, hpln_schema& out)
+{
+  out = {};
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  std::string err;
+  if (!parse_hpln_header(r, recs, &err)) {
+    return err.empty() ? std::string("describe_compressed_table_header: malformed header") : err;
+  }
+  out.header_bytes = header.size() - r.rem;
+  out.columns.reserve(recs.size());
+  for (auto const& cr : recs) {
+    hpln_column_desc d;
+    d.name       = cr.name;
+    d.dtype_tag  = cr.dtype_tag;
+    d.scale      = cr.scale;
+    d.num_rows   = cr.num_rows;
+    d.has_nulls  = cr.validity.kind != validity_kind::all_valid;
+    d.null_count = d.has_nulls ? cr.validity.null_count : 0;
+    // The mask is a payload buffer like any other, so it counts toward both the column's size and
+    // the payload's extent. It hangs off no leaf, so the loop below would otherwise miss it.
+    if (cr.validity.kind == validity_kind::mask) {
+      d.compressed_bytes += cr.validity.size_bytes;
+      out.payload_bytes =
+        std::max(out.payload_bytes, cr.validity.payload_offset + cr.validity.size_bytes);
+    }
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
+        auto const size = cr.leaf_descs[li].buffers[bi].size_bytes;
+        d.compressed_bytes += size;
+        out.payload_bytes = std::max(out.payload_bytes, cr.buf_offsets[li][bi] + size);
+      }
+    }
+    out.columns.push_back(std::move(d));
+  }
+  return {};
+}
+
+std::vector<gather_range> compose_gathers(std::span<const gather_range> outer,
+                                          std::span<const gather_range> inner)
+{
+  std::vector<gather_range> out;
+  if (outer.empty()) { return {inner.begin(), inner.end()}; }
+  out.reserve(inner.size());
+
+  // `outer` tiles its destination space contiguously from zero, so a binary search over the
+  // destination offsets finds the range holding any byte of it.
+  auto find = [&](std::uint64_t dst) -> std::size_t {
+    std::size_t lo = 0;
+    std::size_t hi = outer.size();
+    while (lo + 1 < hi) {
+      auto const mid = lo + (hi - lo) / 2;
+      if (outer[mid].dst_offset <= dst) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  };
+
+  for (auto const& in : inner) {
+    std::uint64_t remaining = in.size;
+    std::uint64_t src       = in.src_offset;
+    std::uint64_t dst       = in.dst_offset;
+    while (remaining > 0) {
+      auto const i  = find(src);
+      auto const& o = outer[i];
+      if (src < o.dst_offset || src >= o.dst_offset + o.size) {
+        return {};  // a byte no outer range produced: refuse rather than read something else
+      }
+      auto const within = src - o.dst_offset;
+      auto const take   = std::min<std::uint64_t>(o.size - within, remaining);
+      if (!out.empty() && out.back().src_offset + out.back().size == o.src_offset + within &&
+          out.back().dst_offset + out.back().size == dst) {
+        out.back().size += take;
+      } else {
+        out.push_back(gather_range{o.src_offset + within, take, dst});
+      }
+      src += take;
+      dst += take;
+      remaining -= take;
+    }
+  }
+  return out;
+}
+
+std::string build_column_subset_header(std::span<const std::uint8_t> header,
+                                       std::span<const std::size_t> selected_columns,
+                                       std::vector<std::uint8_t>& out_header,
+                                       std::vector<gather_range>& out_gather,
+                                       std::uint64_t* out_payload_bytes)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
+  out_header.clear();
+  out_gather.clear();
+  if (out_payload_bytes) *out_payload_bytes = 0;
+
+  if (selected_columns.empty()) { return "build_column_subset_header: no columns selected"; }
+  for (std::size_t i = 1; i < selected_columns.size(); ++i) {
+    if (selected_columns[i] <= selected_columns[i - 1]) {
+      return "build_column_subset_header: selected_columns must be strictly ascending";
+    }
+  }
+
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  HeaderFieldOffsets offsets;
+  std::string parse_err;
+  if (!parse_hpln_header(r, recs, &parse_err, &offsets)) {
+    return parse_err.empty() ? std::string("build_column_subset_header: malformed header")
+                             : parse_err;
+  }
+  if (selected_columns.back() >= recs.size()) {
+    return "build_column_subset_header: column index out of range";
+  }
+
+  // The fixed prefix -- magic, version, column count -- copied verbatim and then corrected to the
+  // number of columns actually emitted. Everything after it is per column, so the rest of the
+  // header is assembled by copying each kept column's record and patching the payload offsets
+  // inside it; nothing is re-serialized, which is what keeps this from drifting away from
+  // build_compressed_table_header.
+  auto const prefix_bytes = offsets.columns.empty()
+                              ? std::size_t{0}
+                              : static_cast<std::size_t>(offsets.columns.front().begin_at);
+  if (prefix_bytes == 0 || prefix_bytes > header.size()) {
+    return "build_column_subset_header: header has no column records";
+  }
+  out_header.assign(header.begin(), header.begin() + static_cast<std::ptrdiff_t>(prefix_bytes));
+  {
+    auto const n     = static_cast<std::uint16_t>(selected_columns.size());
+    auto const bytes = std::bit_cast<std::array<std::uint8_t, sizeof(n)>>(n);
+    // The count is the last field of the prefix.
+    std::memcpy(out_header.data() + prefix_bytes - sizeof(n), bytes.data(), bytes.size());
+  }
+
+  auto patch = [&](std::uint64_t at, std::uint64_t value) -> bool {
+    if (at + sizeof(value) > out_header.size()) return false;
+    auto const bytes = std::bit_cast<std::array<std::uint8_t, sizeof(value)>>(value);
+    std::memcpy(out_header.data() + at, bytes.data(), bytes.size());
+    return true;
+  };
+
+  // Contiguous-on-both-sides ranges merge. A selection of every column therefore collapses to one
+  // range over the whole payload, i.e. degrades exactly to the existing whole-chunk copy.
+  auto append_gather = [&](std::uint64_t src, std::uint64_t size, std::uint64_t dst) {
+    if (size == 0) return;
+    if (!out_gather.empty()) {
+      auto& last = out_gather.back();
+      if (src == last.src_offset + last.size && dst == last.dst_offset + last.size) {
+        last.size += size;
+        return;
+      }
+    }
+    out_gather.push_back(gather_range{src, size, dst});
+  };
+
+  // Can a buffer be gathered with its alignment padding, or was this file written tight?
+  //
+  // A file from before kPayloadAlign packs buffers end to end, so reading a padded extent out of
+  // one would overlap the next -- which the read planner rejects outright, and which past the last
+  // buffer would run off the chunk. So the layout is read from the file rather than assumed: pad
+  // only where every buffer starts aligned AND the next one starts far enough away to leave the
+  // slack. An old file fails the test on the first buffer and behaves exactly as it always did.
+  std::vector<std::uint64_t> starts;
+  for (auto const& cr : recs) {
+    if (cr.validity.kind == validity_kind::mask) { starts.push_back(cr.validity.payload_offset); }
+    for (auto const& leaf : cr.buf_offsets) {
+      starts.insert(starts.end(), leaf.begin(), leaf.end());
+    }
+  }
+  std::sort(starts.begin(), starts.end());
+  auto const padded_span = [&](std::uint64_t offset, std::uint64_t size) -> std::uint64_t {
+    if (offset % kPayloadAlign != 0) { return size; }
+    auto const want = align_payload(size);
+    auto const next = std::upper_bound(starts.begin(), starts.end(), offset);
+    // Past the last buffer the chunk's own padding is the slack, and the writer rounded the
+    // payload up to it (build_compressed_table_header), so the padded extent always fits.
+    if (next == starts.end()) { return want; }
+    return offset + want <= *next ? want : size;
+  };
+
+  std::uint64_t dst_offset = 0;
+  for (auto const ci : selected_columns) {
+    auto const& cr       = recs[ci];
+    auto const& col_offs = offsets.columns[ci];
+    if (col_offs.end_at <= col_offs.begin_at || col_offs.end_at > header.size()) {
+      return "build_column_subset_header: column record extent out of range";
+    }
+    // Where this column's record lands in the output, and hence how far every offset recorded
+    // inside it has moved.
+    auto const new_begin = static_cast<std::uint64_t>(out_header.size());
+    out_header.insert(out_header.end(),
+                      header.begin() + static_cast<std::ptrdiff_t>(col_offs.begin_at),
+                      header.begin() + static_cast<std::ptrdiff_t>(col_offs.end_at));
+    auto const shift = new_begin - col_offs.begin_at;
+
+    // Every buffer is kept WHOLE -- this narrows columns, not rows -- so each one is a single
+    // range and the compacted payload is their concatenation. No decode guard words are involved:
+    // those exist only where a row subset slices within a buffer.
+    //
+    // Ranges carry the buffer's PADDED extent (kPayloadAlign) while the header keeps declaring the
+    // exact size. That is what lets a subset stay O_DIRECT-eligible: the source offsets are
+    // aligned by the writer, so gathering the padding too keeps each destination aligned and each
+    // range contiguous with the next -- a whole-column selection still collapses to one range.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const span = padded_span(cr.validity.payload_offset, cr.validity.size_bytes);
+      if (!patch(col_offs.validity_payload_offset_at + shift, dst_offset)) {
+        return "build_column_subset_header: header field offset out of range";
+      }
+      append_gather(cr.validity.payload_offset, span, dst_offset);
+      dst_offset += span;
+    }
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      for (std::size_t bi = 0; bi < cr.leaf_descs[li].buffers.size(); ++bi) {
+        auto const span =
+          padded_span(cr.buf_offsets[li][bi], cr.leaf_descs[li].buffers[bi].size_bytes);
+        if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at + shift, dst_offset)) {
+          return "build_column_subset_header: header field offset out of range";
+        }
+        append_gather(cr.buf_offsets[li][bi], span, dst_offset);
+        dst_offset += span;
+      }
+    }
+  }
+
+  if (out_payload_bytes) *out_payload_bytes = dst_offset;
+  return {};
+}
+
+std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
+                                      std::span<const std::uint32_t> surviving_chunks,
+                                      payload_host_read_fn const& read_payload,
+                                      std::vector<std::uint8_t>& out_header,
+                                      std::vector<gather_range>& out_gather,
+                                      std::uint64_t max_gap_bytes,
+                                      std::uint64_t* out_payload_bytes,
+                                      std::vector<std::uint8_t>* out_column_subsetted)
+{
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_chunk_subset_header"};
+  out_header.clear();
+  out_gather.clear();
+  if (out_payload_bytes) *out_payload_bytes = 0;
+  if (out_column_subsetted) out_column_subsetted->clear();
+
+  for (std::size_t i = 1; i < surviving_chunks.size(); ++i) {
+    if (surviving_chunks[i] <= surviving_chunks[i - 1]) {
+      return "build_chunk_subset_header: surviving_chunks must be strictly ascending";
+    }
+  }
+  if (surviving_chunks.empty()) {
+    // A table with no rows at all is not something the reader can reconstruct, and a caller with
+    // nothing surviving has no reason to read the pin. Refuse rather than emit a degenerate table.
+    return "build_chunk_subset_header: no surviving chunks";
+  }
+
+  Reader r{header.data(), header.size()};
+  std::vector<ColRecord> recs;
+  HeaderFieldOffsets offsets;
+  std::string parse_err;
+  if (!parse_hpln_header(r, recs, &parse_err, &offsets)) {
+    return parse_err.empty() ? std::string("build_chunk_subset_header: malformed header")
+                             : parse_err;
+  }
+  if (out_column_subsetted) out_column_subsetted->assign(recs.size(), 0);
+
+  // Copy only the bytes the parse consumed: a caller may hand us a span covering the whole file,
+  // and the header the reader gets back must be exactly a header.
+  auto const header_bytes = header.size() - r.rem;
+  out_header.assign(header.begin(), header.begin() + static_cast<std::ptrdiff_t>(header_bytes));
+
+  auto patch = [&](std::uint64_t at, auto value) -> bool {
+    if (at + sizeof(value) > out_header.size()) return false;
+    auto const bytes = std::bit_cast<std::array<std::uint8_t, sizeof(value)>>(value);
+    std::memcpy(out_header.data() + at, bytes.data(), bytes.size());
+    return true;
+  };
+
+  // Merge a copy into the previous one when it is contiguous on BOTH sides. That is what makes an
+  // all-chunks-surviving subset collapse to a single range over the whole payload, i.e. degrade
+  // exactly to the existing whole-table fetch.
+  auto append_gather = [&](std::uint64_t src, std::uint64_t size, std::uint64_t dst) {
+    if (size == 0) return;
+    if (!out_gather.empty()) {
+      auto& last = out_gather.back();
+      if (src == last.src_offset + last.size && dst == last.dst_offset + last.size) {
+        last.size += size;
+        return;
+      }
+    }
+    out_gather.push_back(gather_range{src, size, dst});
+  };
+
+  std::uint64_t dst_offset = 0;
+
+  for (std::size_t ci = 0; ci < recs.size(); ++ci) {
+    auto const& cr       = recs[ci];
+    auto const& col_offs = offsets.columns[ci];
+    auto const col_rows =
+      cr.num_rows > 0 ? static_cast<std::uint64_t>(cr.num_rows) : std::uint64_t{0};
+
+    // Which nodes are COLUMN STATE rather than rows. A dictionary's keys are the case that
+    // matters: whatever compresses them produces buffers that look row-indexed on their own grid
+    // and have nothing to do with the column's rows, so the whole subtree hanging off such a
+    // channel is fetched whole and its length is not evidence that the column cannot be subsetted.
+    // Marked by walking the edges from the root; the mark is inherited, since a dictionary's keys
+    // stay column state however deeply they are then compressed.
+    std::vector<bool> node_is_column_state(cr.tree.nodes.size(), false);
+    {
+      std::vector<std::uint32_t> pending;
+      if (!cr.tree.nodes.empty()) { pending.push_back(0); }
+      while (!pending.empty()) {
+        auto const ni = pending.back();
+        pending.pop_back();
+        auto const& node = cr.tree.nodes[ni];
+        auto const kind  = op_id_from_name(node.op).value_or(OpId::Unknown);
+        for (auto const& edge : node.children) {
+          auto const child = static_cast<std::size_t>(edge.child);
+          if (child >= cr.tree.nodes.size() || child == ni) { continue; }
+          node_is_column_state[child] =
+            node_is_column_state[ni] || channel_is_column_state(kind, edge.channel);
+          pending.push_back(static_cast<std::uint32_t>(child));
+        }
+      }
+    }
+    // A leaf is column state when its node is, or when it IS a column-state output channel of a
+    // row-indexed node (a bare `input -> dictionary`, whose keys are stored as they are).
+    auto const leaf_is_column_state = [&](leaf_desc const& ld) {
+      auto const node = static_cast<std::size_t>(ld.node_index);
+      if (node >= cr.tree.nodes.size()) { return false; }
+      if (node_is_column_state[node]) { return true; }
+      if (ld.slot < 0) { return false; }
+      auto const& names = cr.tree.nodes[node].output_names;
+      auto const slot   = static_cast<std::size_t>(ld.slot);
+      if (slot >= names.size()) { return false; }
+      return channel_is_column_state(
+        op_id_from_name(cr.tree.nodes[node].op).value_or(OpId::Unknown), names[slot]);
+    };
+
+    // Plan every buffer of every leaf first. A column is served as a subset only if ALL of its
+    // ROW-INDEXED buffers can be, because the leaves of one column decode together: a compacted
+    // `packed` next to a full-length `chunk_count` is not a valid column, it is silently wrong
+    // data. Column-state leaves and buffers are emitted whole and constrain nothing.
+    std::vector<std::vector<buffer_subset>> plans(cr.leaf_descs.size());
+    std::vector<std::vector<bool>> buffer_whole(cr.leaf_descs.size());
+    std::vector<bool> leaf_whole(cr.leaf_descs.size(), false);
+    // A nullable column is never row-subsetted: the validity mask is one bit per
+    // row of the WHOLE column, so survivor chunk c does not name bit c's row in
+    // it, and no re-chunking of a bitmask is modelled here. It is still emitted
+    // (whole) below, so the column reads back correctly -- it just does not
+    // contribute to the fetch skip.
+    bool subsettable = col_rows > 0 && cr.validity.kind == validity_kind::all_valid;
+
+    for (std::size_t li = 0; subsettable && li < cr.leaf_descs.size(); ++li) {
+      auto const& ld = cr.leaf_descs[li];
+      if (leaf_is_column_state(ld)) {
+        leaf_whole[li] = true;
+        continue;
+      }
+      if (!supports_chunk_subset(ld.kind)) {
+        subsettable = false;  // whole_column or unclassified: fetch the column whole
+        break;
+      }
+      // Chunk ids are the COLUMN's 1024-row chunks. A node whose own output length differs (the
+      // values channel under an rle, say) chunks on a different grid, so survivor c does not name
+      // the same rows there and nothing about this column can be subsetted.
+      if (ld.num_rows != col_rows) {
+        subsettable = false;
+        break;
+      }
+
+      auto const n_chunks = (ld.num_rows + kSubsetRowsPerChunk - 1) / kSubsetRowsPerChunk;
+      std::vector<std::uint32_t> all_chunks(n_chunks);
+      for (std::uint64_t c = 0; c < n_chunks; ++c) {
+        all_chunks[c] = static_cast<std::uint32_t>(c);
+      }
+
+      // A bulk_variable buffer (only bitpack's `packed`) is sized by this leaf's own per-chunk
+      // metadata, whose VALUES live in the payload. Pull them host-side; without them
+      // plan_buffer_subset refuses and the column is emitted whole.
+      std::vector<std::int32_t> chunk_count;
+      std::vector<std::uint8_t> chunk_bits;
+      bool const needs_sizing =
+        std::any_of(ld.buffers.begin(), ld.buffers.end(), [&](auto const& bd) {
+          auto const layout = buffer_layout(ld.kind, bd.name);
+          return layout && *layout == ChannelLayout::bulk_variable;
+        });
+      if (needs_sizing && read_payload) {
+        auto load = [&](char const* name, void* dst, std::uint64_t want) {
+          for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+            if (ld.buffers[bi].name != name) continue;
+            if (ld.buffers[bi].size_bytes < want) return false;
+            return read_payload(cr.buf_offsets[li][bi], want, dst);
+          }
+          return false;
+        };
+        chunk_count.resize(n_chunks);
+        chunk_bits.resize(n_chunks);
+        if (!load("chunk_count", chunk_count.data(), n_chunks * sizeof(std::int32_t)) ||
+            !load("chunk_bits", chunk_bits.data(), n_chunks * sizeof(std::uint8_t))) {
+          chunk_count.clear();
+          chunk_bits.clear();
+        }
+      }
+      chunk_sizing_metadata const sizing{chunk_count, chunk_bits};
+
+      plans[li].resize(ld.buffers.size());
+      buffer_whole[li].assign(ld.buffers.size(), false);
+      for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+        auto const& bd = ld.buffers[bi];
+        // A column-state buffer of an otherwise row-indexed leaf — the keys of a bare
+        // `input -> dictionary`, which stores its keys and its per-row indices in one leaf. The
+        // keys are fetched whole and stay valid for whichever rows the indices name.
+        if (buffer_layout(ld.kind, bd.name) == ChannelLayout::column_state) {
+          buffer_whole[li][bi] = true;
+          continue;
+        }
+        auto const elem_size = buffer_elem_size(bd.type_tag);
+        auto const plan      = plan_buffer_subset(ld.kind,
+                                             bd.name,
+                                             static_cast<std::size_t>(elem_size),
+                                             ld.num_rows,
+                                             kSubsetRowsPerChunk,
+                                             surviving_chunks,
+                                             sizing,
+                                             max_gap_bytes);
+        if (!plan) {
+          subsettable = false;
+          break;
+        }
+        // Self-check: with EVERY chunk surviving the model must reproduce the size the writer
+        // declared. When it does not, our idea of this buffer's layout disagrees with what was
+        // actually written, and a subset built on it would be wrong without faulting -- the reader
+        // allocates whatever the header says and the decode reads whatever landed there. Emitting
+        // the column whole is always correct, so fall back to that.
+        auto const full = plan_buffer_subset(ld.kind,
+                                             bd.name,
+                                             static_cast<std::size_t>(elem_size),
+                                             ld.num_rows,
+                                             kSubsetRowsPerChunk,
+                                             all_chunks,
+                                             sizing,
+                                             /*max_gap_bytes=*/0);
+        if (!full || full->compacted_size != bd.size_bytes) {
+          subsettable = false;
+          break;
+        }
+        plans[li][bi] = *plan;
+      }
+    }
+
+    // The validity mask hangs off no leaf, so the loops below never see it. It is a
+    // payload buffer all the same and the compaction moves it, so copy it and re-point
+    // it here or the reader would parse whatever leaf bytes landed at its old offset as
+    // a null mask -- wrong rows marked null, with nothing to fault on.
+    if (cr.validity.kind == validity_kind::mask) {
+      auto const size = cr.validity.size_bytes;
+      if (!patch(col_offs.validity_payload_offset_at, dst_offset)) {
+        return "build_chunk_subset_header: header field offset out of range";
+      }
+      append_gather(cr.validity.payload_offset, size, dst_offset);
+      dst_offset += size;
+    }
+
+    if (!subsettable) {
+      // Emitted whole: sizes and row counts stay exactly as written; only the payload offsets move
+      // to keep the compacted payload dense.
+      for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+        auto const& ld = cr.leaf_descs[li];
+        for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+          auto const size = ld.buffers[bi].size_bytes;
+          if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at, dst_offset)) {
+            return "build_chunk_subset_header: header field offset out of range";
+          }
+          append_gather(cr.buf_offsets[li][bi], size, dst_offset);
+          dst_offset += size;
+        }
+      }
+      continue;
+    }
+
+    if (out_column_subsetted) (*out_column_subsetted)[ci] = 1;
+
+    // The column's row count over the survivors. Distinct from any leaf's, and not a multiple of
+    // the chunk size: the column's last chunk is short.
+    if (!patch(col_offs.num_rows_at,
+               static_cast<std::int64_t>(rows_over_chunks(col_rows, surviving_chunks)))) {
+      return "build_chunk_subset_header: header field offset out of range";
+    }
+
+    for (std::size_t li = 0; li < cr.leaf_descs.size(); ++li) {
+      auto const& ld = cr.leaf_descs[li];
+      // A column-state leaf is not indexed by rows at all, so neither its own length nor its
+      // buffers change; only where they sit in the compacted payload.
+      if (leaf_whole[li]) {
+        for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+          auto const size = ld.buffers[bi].size_bytes;
+          if (!patch(col_offs.leaves[li].buffers[bi].payload_offset_at, dst_offset)) {
+            return "build_chunk_subset_header: header field offset out of range";
+          }
+          append_gather(cr.buf_offsets[li][bi], size, dst_offset);
+          dst_offset += size;
+        }
+        continue;
+      }
+      // leaf_desc::num_rows is the NODE's own output length, not the column's (it drives the
+      // codegen decode grid), so it is recomputed over the survivors in its own right.
+      if (!patch(col_offs.leaves[li].num_rows_at,
+                 rows_over_chunks(ld.num_rows, surviving_chunks))) {
+        return "build_chunk_subset_header: header field offset out of range";
+      }
+
+      for (std::size_t bi = 0; bi < ld.buffers.size(); ++bi) {
+        auto const& bd  = ld.buffers[bi];
+        auto const& bof = col_offs.leaves[li].buffers[bi];
+        if (buffer_whole[li][bi]) {
+          if (!patch(bof.payload_offset_at, dst_offset)) {
+            return "build_chunk_subset_header: header field offset out of range";
+          }
+          append_gather(cr.buf_offsets[li][bi], bd.size_bytes, dst_offset);
+          dst_offset += bd.size_bytes;
+          continue;
+        }
+        auto const& sub = plans[li][bi];
+        if (!patch(bof.size_bytes_at, sub.compacted_size) ||
+            !patch(bof.payload_offset_at, dst_offset)) {
+          return "build_chunk_subset_header: header field offset out of range";
+        }
+
+        std::uint64_t written = 0;
+        for (auto const& range : sub.ranges) {
+          append_gather(cr.buf_offsets[li][bi] + range.offset, range.size, dst_offset + written);
+          written += range.size;
+        }
+        if (written < sub.compacted_size) {
+          // The declared size can exceed the bytes the plan moves: a bitpack `packed` buffer
+          // carries decode guard words past its last live word. Fill them from whatever follows in
+          // the source -- the decode never reads them as values, and it makes an all-surviving
+          // subset a byte-exact copy of the payload rather than one with holes in it.
+          auto const src_pos = sub.ranges.empty() ? std::uint64_t{0} : sub.ranges.back().end();
+          auto const avail   = bd.size_bytes > src_pos ? bd.size_bytes - src_pos : 0;
+          append_gather(cr.buf_offsets[li][bi] + src_pos,
+                        std::min(sub.compacted_size - written, avail),
+                        dst_offset + written);
+        }
+        dst_offset += sub.compacted_size;
+      }
+    }
+  }
+
+  if (out_payload_bytes) *out_payload_bytes = dst_offset;
+  return {};
 }
 
 }  // namespace simpatico

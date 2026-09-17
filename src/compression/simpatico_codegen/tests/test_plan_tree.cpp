@@ -199,7 +199,78 @@ void test_operator_registry()
     expect(op_id_from_name(std::string(op.name)) == op.id, "op name resolves to its op");
     for (simpatico::ChannelId i = 0; i < op.channels.size(); ++i)
       expect(channel_id(op.id, op.channels[i]) == i, "channel index matches position");
+    // Every fixed-arity op must classify every channel, or none: a partially-classified row
+    // would silently make the op ineligible for chunk-subset serving with no way to notice.
+    // Persisted buffers are keyed by name and independent of `channels`; a duplicate name would
+    // make buffer_layout's answer depend on table order.
+    for (std::size_t i = 0; i < op.persisted_buffers.size(); ++i)
+      for (std::size_t j = i + 1; j < op.persisted_buffers.size(); ++j)
+        expect(op.persisted_buffers[i].first != op.persisted_buffers[j].first,
+               "persisted buffer names are unique within an operator");
   }
+}
+
+// Which operators can serve a subset of their 1024-row chunks. This decides whether a column's
+// bytes can be fetched selectively, so a wrong answer is either a lost saving (too strict) or a
+// decode reading bytes it was never given (too loose).
+void test_channel_layout()
+{
+  using simpatico::buffer_layout;
+  using simpatico::ChannelLayout;
+  using simpatico::OpId;
+  using simpatico::supports_chunk_subset;
+
+  // Bitpack is the case the whole scheme rests on: three per-chunk metadata arrays plus one bulk
+  // stream, so keeping the surviving metadata entries and their packed bytes is a valid column.
+  expect(buffer_layout(OpId::Bitpack, "chunk_min") == ChannelLayout::per_chunk_metadata,
+         "bitpack.chunk_min is per-chunk metadata");
+  expect(buffer_layout(OpId::Bitpack, "chunk_bits") == ChannelLayout::per_chunk_metadata,
+         "bitpack.chunk_bits is per-chunk metadata");
+  // packed is the ONLY buffer whose per-chunk extent needs operator-specific arithmetic; every
+  // other subsettable buffer is derivable from the row count alone.
+  expect(buffer_layout(OpId::Bitpack, "packed") == ChannelLayout::bulk_variable,
+         "bitpack.packed is the variable-extent case");
+  expect(buffer_layout(OpId::Zigzag, "zigzag") == ChannelLayout::bulk_fixed_stride,
+         "zigzag is fixed stride per row");
+  expect(buffer_layout(OpId::Identity, "data") == ChannelLayout::bulk_fixed_stride,
+         "identity is fixed stride per row");
+  expect(supports_chunk_subset(OpId::Bitpack), "bitpack supports chunk subsets");
+
+  // Keyed on PERSISTED buffers, not output ports: delta's port is "differences" (the edge to its
+  // child) but what it actually persists is the per-chunk anchor "delta_first". Classifying the
+  // port would describe a buffer that is never written.
+  expect(!buffer_layout(OpId::Delta, "differences").has_value(),
+         "delta persists no buffer named after its output port");
+  expect(buffer_layout(OpId::Delta, "delta_first") == ChannelLayout::per_chunk_metadata,
+         "delta persists a per-chunk anchor");
+  expect(buffer_layout(OpId::For, "references") == ChannelLayout::per_chunk_metadata,
+         "for.references is per-chunk metadata");
+  expect(supports_chunk_subset(OpId::For), "for supports chunk subsets");
+  expect(supports_chunk_subset(OpId::Delta), "delta supports chunk subsets");
+  expect(supports_chunk_subset(OpId::Identity), "identity supports chunk subsets");
+
+  // Byte codecs chunk internally in ways we do not control, so a subset of rows is not a subset
+  // of their output.
+  expect(buffer_layout(OpId::Snappy, "output") == ChannelLayout::whole_column,
+         "snappy.output is whole-column");
+  expect(!supports_chunk_subset(OpId::Ans), "ans cannot serve chunk subsets");
+  expect(!supports_chunk_subset(OpId::Snappy), "snappy cannot serve chunk subsets");
+  expect(!supports_chunk_subset(OpId::Lz4), "lz4 cannot serve chunk subsets");
+  expect(!supports_chunk_subset(OpId::Bitcomp), "bitcomp cannot serve chunk subsets");
+
+  // str_split's chars are addressed through its offsets, not by chunk, so the column is not
+  // subsettable even though offsets alone would be.
+  expect(!supports_chunk_subset(OpId::StrSplit), "str_split cannot serve chunk subsets");
+  // rle's runs are variable-length per chunk with no per-chunk index.
+  expect(!supports_chunk_subset(OpId::Rle), "rle cannot serve chunk subsets");
+
+  // Variable-arity ops persist a set we have not described, so they must fetch whole.
+  expect(!supports_chunk_subset(OpId::Dictionary), "dictionary cannot serve chunk subsets");
+  expect(!supports_chunk_subset(OpId::Alp), "alp cannot serve chunk subsets");
+  expect(!buffer_layout(OpId::Bitpack, "bogus").has_value(), "unknown buffer -> nullopt");
+  // bp_offsets is synthesized at decode time and never persisted, so it must not be classified.
+  expect(!buffer_layout(OpId::Bitpack, "bp_offsets").has_value(),
+         "bp_offsets is a decode transient, not a persisted buffer");
 }
 
 // render_plan_tree is the inverse of the parser: parsing its output must yield
@@ -244,6 +315,7 @@ int main()
     test_channel_order_canonicalization();
     test_value_id_key_contract();
     test_operator_registry();
+    test_channel_layout();
     test_render_plan_tree();
     std::printf("test_plan_tree: PASS\n");
     return 0;

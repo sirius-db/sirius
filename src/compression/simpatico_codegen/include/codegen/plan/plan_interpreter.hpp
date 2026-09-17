@@ -191,8 +191,9 @@ struct column_decode_caps {
   ///                  in lockstep with the renderer's masked
   ///                  offsets-reconstruction coverage,
   ///   full         — everything else: decode full width, then gather.
-  /// Nullable plans (a `null_mask` output channel) take @c full throughout:
-  /// selection has no null model yet.
+  /// A nullable column takes @c full throughout and answers no predicate:
+  /// selection has no null model yet. Validity is a sidecar on the PlanTree,
+  /// not a routed channel, so probe_column reads it there.
   sirius::codegen::decode_route compact_route = sirius::codegen::decode_route::full;
 
   /// The plan resolves a set-membership predicate WITHOUT materialising the

@@ -296,9 +296,12 @@ endif()
 # cmake-format: off
 set(EXTENSION_SOURCES
     src/compression/compressed_representation.cpp
+    src/compression/hpln_io.cpp
+    src/compression/simpatico_file_ingest.cpp
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/compression/simpatico_copy_function.cpp
     src/late_mat/prepared_selection.cpp
     src/late_mat/materialize.cpp
     src/late_mat/defer_policy.cpp
@@ -309,6 +312,7 @@ set(EXTENSION_SOURCES
     src/scan_manager/late_mat_resolver.cpp
     src/late_mat/multi_source_gather.cu
     src/config.cpp
+    src/helper/duckdb_chunk_staging.cpp
     src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
@@ -396,6 +400,7 @@ set(EXTENSION_SOURCES
     src/op/scan/gpu_ingestible.cpp
     src/op/scan/parquet_gpu_ingestible.cpp
     src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/simpatico_gpu_ingestible.cpp
     src/op/scan/iceberg_metadata_reader.cpp
     src/op/scan/puffin_reader.cpp
     src/op/scan/positional_delete_filter.cpp
@@ -829,6 +834,10 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/test_hpln_ingest.cpp
+    test/cpp/compression/test_hpln_io.cpp
+    test/cpp/compression/test_simpatico_ingestible.cpp
+    test/cpp/compression/test_simpatico_pruning.cpp
     test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
@@ -890,6 +899,9 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
     test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
     test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_pin_simpatico_sql.cpp
+    test/cpp/integration/test_read_simpatico_sql.cpp
+    test/cpp/integration/test_simpatico_copy_sql.cpp
     test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
@@ -935,6 +947,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
+    test/cpp/scan_manager/test_pin_clustering.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
@@ -1081,6 +1094,13 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/integration/test_s3_sql_surface.cpp
     test/cpp/integration/test_s3_tpch.cpp)
 endif()
+
+# Appended after every other test source on purpose: these cases turn
+# SIRIUS_EXP_FUSED_SCAN_FILTER on, the knob is read once per process and cached,
+# and Catch2 runs cases in declaration order -- which is link order, which is
+# this list's order. Declared anywhere earlier, they would leave the
+# experimental decode-time filtering enabled for every case after them.
+list(APPEND TEST_SOURCES test/cpp/compression/test_simpatico_decode_filter.cpp)
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
 # caught by the check-orphan-tests pre-commit hook

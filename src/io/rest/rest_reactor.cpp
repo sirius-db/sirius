@@ -365,6 +365,22 @@ std::chrono::milliseconds compute_backoff(std::size_t attempt,
   return base + jitter;
 }
 
+/// Truncate @p s to its first @p bytes bytes, keeping its destination buffers.  The single-buffer
+/// shorthand constructor cannot express this: it would pair the truncated LENGTH with the first
+/// buffer's base, which is only correct when the segment has one buffer.
+io_object_segment clamp_segment(io_object_segment const& s, size_t bytes)
+{
+  io_object_segment out;
+  out.offset       = s.offset;
+  size_t remaining = bytes;
+  for (auto const& b : s.buffers) {
+    if (remaining == 0) { break; }
+    out.append(iovec{b.iov_base, std::min(remaining, b.iov_len)});
+    remaining -= std::min(remaining, b.iov_len);
+  }
+  return out;
+}
+
 /// Group destination segments into ranged-GET chunks.  Fuses runs of
 /// file-adjacent segments into one contiguous scatter GET capped at
 /// @p chunk_size bytes and @p max_n_chunks buffers.  When @p allow_split is
@@ -391,7 +407,10 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
       ++i;
       continue;
     }
-    if (allow_split && s.size > cs) {
+    // Only a single-buffer segment may be split: the pieces are addressed as `base + pos`, which
+    // is meaningless once the span is spread over several allocations.  A vectored segment stays
+    // whole (one scatter GET), which is correct if not maximally parallel.
+    if (allow_split && s.size > cs && s.n_chunks() == 1) {
       // Split an oversized contiguous segment into chunk_size pieces.  A null
       // buffer (bounce-staged) stays null per piece — never `nullptr + pos`
       // (UB): each piece is a standalone single-buffer chunk that submit() backs
@@ -411,8 +430,10 @@ std::vector<io_object_segment> chunk_host_segments(std::span<const io_object_seg
     // submit() can back it with one pinned bounce slot and its H2D copy resolves
     // to that slot — fusing it would either break the bounce (one slot per chunk)
     // or leave a stale null-derived copy source.
-    io_object_segment group{s.offset, s.size, s.data()};
-    size_t j = i + 1;
+    // Copy rather than reconstruct: `{s.offset, s.size, s.data()}` collapses a vectored segment
+    // onto its first buffer while keeping the full length.
+    io_object_segment group = s;
+    size_t j                = i + 1;
     while (j < segs.size() && group.n_chunks() < max_bufs && segs[j].size > 0 &&
            group.buffers.back().iov_base != nullptr && segs[j].data() != nullptr &&
            group.offset + group.size == segs[j].offset && group.size + segs[j].size <= cs) {
@@ -617,7 +638,11 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rxv_request(
   for (auto const& s : segments) {
     size_t const c = s.offset < fsize ? std::min(s.size, fsize - s.offset) : 0;
     if (c == 0) { continue; }
-    clamped.emplace_back(s.offset, c, s.data());
+    // Clamp along the buffer list rather than rebuilding the segment from its FIRST buffer: a
+    // caller-supplied vectored segment (one contiguous file range landing in several separate
+    // allocations) would otherwise become one buffer claiming the whole span, and the write
+    // callback would run off the end of the first allocation.
+    clamped.push_back(clamp_segment(s, c));
     bytes_requested += c;
   }
   if (clamped.empty()) { return rest_rx_request::create({}); }

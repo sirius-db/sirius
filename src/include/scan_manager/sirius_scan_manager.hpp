@@ -118,6 +118,10 @@ class cache_entry_info {
   std::string table_name;                          ///< duckdb identity: table
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
+  /// True when @c resolved_file_paths names .hpln files rather than parquet ones. Both formats
+  /// identify a table by its file set, so without this a parquet scan and a simpatico scan over
+  /// the same path would match each other's entries -- and the two decode incompatibly.
+  bool simpatico_files{false};
 
   /// Build the cache descriptor from a read-side ingestible_table_info (parquet
   /// or duckdb-native): captures the format's identity, the kept @c column_ids,
@@ -223,6 +227,13 @@ struct pinned_entry {
   /// capture was statless or degraded; see @ref pinned_zone_maps for the
   /// invariant and merge semantics.
   pinned_zone_maps zone_maps;
+  /// Finer-grained companion to @c zone_maps: min/max bounds over fixed-size groups of rows,
+  /// for every (cached column, chunk), in one contiguous column-major allocation.
+  ///
+  /// Empty when the pin captured none, which simply means no sub-chunk pruning — the coarse
+  /// zone_maps still apply. Kept separate from @c zone_maps rather than folded into it so the
+  /// existing sidecar's merge and degradation invariants are untouched.
+  group_bounds_arena group_bounds;
   /// Late-mat uniqueness proof, positional with @c cache_info.column_ids: true =
   /// the column's values were proven distinct across the whole pinned table at
   /// pin time (see @c late_mat::unique_probe). A false — or an empty vector —
@@ -354,10 +365,56 @@ void validate_recorded_column_storage(sirius::pinned_column_storage_matrix const
 /**
  * @brief Cache-serve-time survivor plan for one cached scan.
  */
+/// A contiguous half-open row range within one pinned chunk.
+struct chunk_row_range {
+  std::size_t chunk;      ///< index into the entry's chunks
+  std::size_t begin_row;  ///< first row, relative to the chunk
+  std::size_t end_row;    ///< one past the last row
+
+  [[nodiscard]] std::size_t rows() const noexcept { return end_row - begin_row; }
+  [[nodiscard]] bool operator==(chunk_row_range const&) const = default;
+};
+
 struct cached_scan_plan {
   std::vector<std::size_t> survivor_chunk_indices;  ///< indices of chunks that survived pruning
   std::size_t pruned{0};
+
+  /// Surviving row ranges within the surviving chunks, coalesced, in chunk then row order.
+  ///
+  /// Empty means "serve each surviving chunk whole" — the behaviour before group statistics
+  /// existed, and still the case whenever an entry carries no per-group bounds. When non-empty it
+  /// refines @c survivor_chunk_indices: every range's chunk appears in that list, and a chunk with
+  /// no range in this list is fully pruned. Adjacent surviving groups are merged, so a chunk whose
+  /// groups all survive yields exactly one range covering it.
+  ///
+  /// A consumer that cannot serve a partial chunk may ignore this entirely and serve whole chunks;
+  /// that is always sound, just less selective.
+  std::vector<chunk_row_range> survivor_row_ranges;
+  /// Rows the row ranges exclude within chunks that survived at chunk granularity. Zero when no
+  /// per-group bounds were available.
+  std::size_t rows_pruned_within_chunks{0};
 };
+
+/// The 1024-row simpatico decode chunks that @p ranges cover within one pinned chunk holding
+/// @p rows rows: batch-local ids, strictly ascending, as
+/// simpatico::build_chunk_subset_header expects them.
+///
+/// This is the translation between the two chunk sizes the system has — the pin chunk a zone map
+/// describes, and the decode chunk a compressed column can be addressed at. Group bounds are
+/// captured at a whole number of decode chunks per group, so a row range maps onto decode-chunk
+/// boundaries exactly and no partially covered chunk can arise; a range is nonetheless clamped to
+/// @p rows, since the final group of a chunk may be short.
+///
+/// Returns EMPTY when the ranges cover every decode chunk, when @p ranges is empty, or when the
+/// chunk has no rows — all of which mean "serve the chunk whole", the behaviour a caller that
+/// cannot subset falls back to anyway.
+[[nodiscard]] std::vector<std::uint32_t> surviving_decode_chunks(
+  std::span<chunk_row_range const> ranges, std::size_t rows);
+
+/// Rows the decode chunks @p chunks hold within a pinned chunk of @p rows rows — what a batch
+/// serving them contains. The last decode chunk of the pinned chunk is short.
+[[nodiscard]] std::size_t surviving_decode_chunk_rows(std::span<std::uint32_t const> chunks,
+                                                      std::size_t rows);
 
 /// Build the cached-serving databatch_provider for @p entry over
 /// @p selected_columns (positions into @c entry.cache_info.column_ids, in the
@@ -575,6 +632,8 @@ class sirius_scan_manager {
   ///                      with @p cache_info's column_ids; empty pins statless.
   /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
   ///                      compute_pinned_chunk_stats emits).
+  /// \param group_stats   Optional finer per-group capture, parallel to the chunks; empty skips
+  ///                      sub-chunk pruning and leaves the coarse stats in charge.
   /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
@@ -586,6 +645,28 @@ class sirius_scan_manager {
     cucascade::memory::memory_space& memory_space,
     duckdb::vector<duckdb::LogicalType> column_types,
     std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    std::vector<chunk_group_stats> group_stats,
+    sirius::pinned_column_storage_matrix column_storage);
+
+  /// \brief Pin a host-tier entry whose statistics arrive as a ready-made @ref group_bounds_arena.
+  ///
+  /// The overload above takes a capture — per-chunk and per-group @c BaseStatistics — because a
+  /// pin MEASURES its statistics off the GPU table it just materialized. A pin ingested from a
+  /// file does not: the bounds were computed by whoever wrote the file and travel in it, already
+  /// in the arena's packed form. Handing them over as @c BaseStatistics would mean unpacking
+  /// millions of cells into heap objects for the sole purpose of @ref group_bounds_arena::
+  /// from_capture packing them straight back, and the round trip is lossy where the arena's type
+  /// tags and the capture's allowlist disagree. So this overload takes the arena as it stands and
+  /// reduces the coarse sidecar from it (@ref chunk_zone_maps_from_group_bounds), which is the
+  /// only derived form the pruning path still needs.
+  ///
+  /// Otherwise identical to the capture overload, including "always REPLACES".
+  void insert_pinned_entry_host(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space,
+    group_bounds_arena group_bounds,
     sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Pin the entry for a table on the GPU tier from a compression-enabled pin.
@@ -602,15 +683,27 @@ class sirius_scan_manager {
   ///                      @c column_ids-aligned names.
   /// \param chunks        One @ref device_pin_chunk per batch (compressed or not).
   /// \param memory_space  Representative GPU memory space (metadata only).
+  /// \param column_types  Pin-time DuckDB type of each cached column, positional
+  ///                      with @p cache_info's column_ids; empty pins statless.
+  /// \param chunk_stats   Per-chunk zone-map stats (chunk_stats[c][i] = column i of chunk c, as
+  ///                      compute_pinned_chunk_stats emits). Captured off the uncompressed GPU
+  ///                      table before compression, so a compressed pin gets zone maps even
+  ///                      though its payload cannot be introspected here.
+  /// \param group_stats   Optional finer per-group capture, parallel to the chunks; empty skips
+  ///                      sub-chunk pruning and leaves the coarse stats in charge.
   /// \param column_storage Chunk-major stored-column metadata as the pin driver recorded it;
   ///                      must cover every chunk and cached column. A recorded carrier that
   ///                      contradicts an uncompressed chunk's stored type throws; a compressed
   ///                      chunk's types are unreadable here, so its cells are trusted.
-  void insert_pinned_entry_device(const std::string& name,
-                                  cache_entry_info cache_info,
-                                  std::vector<sirius::device_pin_chunk> chunks,
-                                  cucascade::memory::memory_space& memory_space,
-                                  sirius::pinned_column_storage_matrix column_storage);
+  void insert_pinned_entry_device(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<sirius::device_pin_chunk> chunks,
+    cucascade::memory::memory_space& memory_space,
+    duckdb::vector<duckdb::LogicalType> column_types,
+    std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
+    std::vector<chunk_group_stats> group_stats,
+    sirius::pinned_column_storage_matrix column_storage);
 
   /// \brief Attach MVCC snapshot metadata to the pinned entry for @p name.
   ///
@@ -723,6 +816,16 @@ class sirius_scan_manager {
   ///        with it. Throws a clear error for a non-object-store path.
   [[nodiscard]] std::size_t s3_list_max_matches(std::string const& s3_uri);
 
+  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
+  /// — including the scan resolver, which forwards raw ingestible paths — may pass a raw
+  /// `file://` / `s3://` URI), building it once per backend on first use.  Routes by path
+  /// through the registry so an `s3://` URI reaches the rest_ioctx even when the local default
+  /// `_io_ctx` is uring/kvikio.  Returns nullptr when no backend supports the path.
+  ///
+  /// Public because binding is a routing decision too: a `.hpln` bind reads the file's trailer
+  /// and metadata before any split exists, so it needs the same backend the scan will use.
+  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
+
  private:
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
@@ -753,13 +856,6 @@ class sirius_scan_manager {
   /// via the sirius.executor.scan_manager.memory_prefetcher config block (see
   /// memory_prefetcher.hpp). No-op otherwise.
   void maybe_start_memory_prefetcher();
-
-  /// Resolve the ioctx that should serve @p path (normalized internally, so callers
-  /// — including the scan resolver — may pass a raw `file://` / `s3://` URI),
-  /// building it once per backend on first use.  Routes by path through the registry
-  /// so an `s3://` URI reaches the rest_ioctx even when the local default `_io_ctx`
-  /// is uring/kvikio.  Returns nullptr when no backend supports the path.
-  std::shared_ptr<sirius::io::sirius_ioctx> ioctx_for_path(std::string_view path);
 
   scan_manager_config _config;
   cucascade::memory::memory_reservation_manager& _reservation_manager;
@@ -811,6 +907,19 @@ class sirius_scan_manager {
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
   std::atomic<late_mat::pin_generation_t> _next_pin_generation{1};
+
+  /// Shared tail of both @ref insert_pinned_entry_host overloads: validate the chunk and
+  /// column-storage shapes, then build and publish the entry. Only how the two sidecars are
+  /// OBTAINED differs between the overloads — measured from a capture, or carried by a file — so
+  /// everything downstream of them lives here once.
+  void install_pinned_entry_host(
+    const std::string& name,
+    cache_entry_info cache_info,
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks,
+    cucascade::memory::memory_space& memory_space,
+    pinned_zone_maps zone_maps,
+    group_bounds_arena group_bounds,
+    sirius::pinned_column_storage_matrix column_storage);
 
   /// Give the entry now living at @p name a fresh late-mat handle, and
   /// invalidate whatever handle it is replacing. Called after every insert;

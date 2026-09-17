@@ -34,10 +34,12 @@
 #include <codegen/util/stream_pool.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
 #include <op/scan/decoded_batch_representation.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <numeric>
@@ -51,32 +53,6 @@
 namespace sirius {
 
 namespace {
-
-// Rebind a column's buffers (recursively) to `s` for ordered teardown.
-// The decode's stream pool is long-lived (thread-local), but the caller's
-// pipeline stream `s` is what orders the rest of the work downstream —
-// re-pointing frees here ensures deallocation is not racing concurrent pipeline
-// operations on `s`.
-std::unique_ptr<cudf::column> rebind_column_stream(std::unique_ptr<cudf::column> col,
-                                                   rmm::cuda_stream_view s)
-{
-  if (!col) { return col; }
-  const auto type = col->type();
-  const auto size = col->size();
-  const auto nc   = col->null_count();
-  auto contents   = col->release();
-  if (contents.data) { contents.data->set_stream(s); }
-  rmm::device_buffer null_mask =
-    contents.null_mask ? std::move(*contents.null_mask) : rmm::device_buffer{};
-  null_mask.set_stream(s);
-  std::vector<std::unique_ptr<cudf::column>> children;
-  children.reserve(contents.children.size());
-  for (auto& ch : contents.children) {
-    children.push_back(rebind_column_stream(std::move(ch), s));
-  }
-  return std::make_unique<cudf::column>(
-    type, size, std::move(*contents.data), std::move(null_mask), nc, std::move(children));
-}
 
 // Reconstruct + project + decompress a compressed_table into a GPU table
 // representation. Shared by the host and device compression converters — only
@@ -125,10 +101,7 @@ std::unique_ptr<cucascade::idata_representation> reconstruct_and_decompress_to_g
   auto decompressed = std::move(decoded.table);
 
   // Re-point decoded buffers onto `stream` so pipeline teardown is ordered.
-  auto cols = decompressed->release();
-  for (auto& c : cols)
-    c = rebind_column_stream(std::move(c), stream);
-  decompressed = std::make_unique<cudf::table>(std::move(cols));
+  decompressed = rebind_table_stream(std::move(decompressed), stream);
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();
@@ -170,6 +143,147 @@ std::unique_ptr<cucascade::idata_representation> decompress_host_to_gpu(
     [&payload](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
       copy_pinned_blocks_to_device(payload, off, dst, sz, s);
     };
+
+  // Zone maps ruled some of this chunk's 1024-row decode chunks out. Synthesize a header that
+  // describes only the survivors and fetch only their bytes: the pruned rows then cost neither
+  // H2D transfer nor decode, which is where a host-tier pin spends its time. The reader and the
+  // decode see an ordinary, smaller table and need no knowledge that a subset is in play
+  // (simpatico::build_chunk_subset_header).
+  //
+  // Every failure here degrades to serving the chunk whole, which is correct — just less
+  // selective — so nothing below throws on a refusal.
+  auto const survivors = rep.surviving_chunks();
+  if (!survivors.empty()) {
+    // Narrow to the read columns FIRST. The row subset rewrites every record of every column in
+    // the header it is given, so over a wide pin it costs with the PIN's width while saving only
+    // with the QUERY's — enough to make pruning a net loss. allocate_chunk_narrowed does the same
+    // two-step for the .hpln file path.
+    //
+    // build_column_subset_header needs strictly ascending columns and emits them in that order, so
+    // the projection is remapped onto the narrowed positions: the scan's own order (outputs, then
+    // filter-only columns) is not ascending, and serving it reordered would hand the consumer a
+    // neighbouring column.
+    std::vector<std::uint8_t> column_header;
+    std::vector<simpatico::gather_range> gather_columns;
+    std::optional<std::vector<std::size_t>> projection = rep.selected_indices();
+    std::vector<std::size_t> ascending;
+    std::span<const std::uint8_t> working_header = rep.header();
+    if (projection.has_value()) {
+      ascending = *projection;
+      std::ranges::sort(ascending);
+      ascending.erase(std::ranges::unique(ascending).begin(), ascending.end());
+      if (simpatico::build_column_subset_header(
+            rep.header(), ascending, column_header, gather_columns)
+            .empty()) {
+        std::vector<std::size_t> remapped;
+        remapped.reserve(projection->size());
+        for (auto const col : *projection) {
+          remapped.push_back(
+            static_cast<std::size_t>(std::ranges::lower_bound(ascending, col) - ascending.begin()));
+        }
+        projection     = std::move(remapped);
+        working_header = column_header;
+      } else {
+        // A refusal is correct, just wider: the row subset then runs over the whole header as it
+        // always did, and the reader still projects.
+        gather_columns.clear();
+      }
+    }
+
+    std::vector<std::uint8_t> subset_header;
+    // The row subset's offsets live in the COLUMN subset's destination space, so they are mapped
+    // back before touching the payload; following them unmapped reads the wrong bytes silently.
+    simpatico::payload_host_read_fn read_metadata =
+      [&payload, &gather_columns](std::uint64_t off, std::uint64_t size, void* dst) {
+        if (size == 0) { return true; }
+        if (gather_columns.empty()) {
+          copy_pinned_blocks_to_host(payload, off, dst, size);
+          return true;
+        }
+        std::vector<simpatico::gather_range> const want{{off, size, 0}};
+        auto const ranges = simpatico::compose_gathers(gather_columns, want);
+        if (ranges.empty()) { return false; }
+        for (auto const& r : ranges) {
+          copy_pinned_blocks_to_host(
+            payload, r.src_offset, static_cast<std::uint8_t*>(dst) + r.dst_offset, r.size);
+        }
+        return true;
+      };
+    std::vector<simpatico::gather_range> gather;
+    std::vector<std::uint8_t> subsetted;
+    auto const error = simpatico::build_chunk_subset_header(working_header,
+                                                            survivors,
+                                                            read_metadata,
+                                                            subset_header,
+                                                            gather,
+                                                            /*max_gap_bytes=*/0,
+                                                            /*out_payload_bytes=*/nullptr,
+                                                            &subsetted);
+    // A column the format cannot address per chunk is emitted whole, and a whole column next to a
+    // compacted one has a different row count — the two cannot be one cudf::table. So the subset
+    // is usable only when every column this scan READS was compacted; one that was not sends the
+    // whole chunk down the ordinary path. After the narrowing above every column of
+    // `working_header` is read, so the check covers all of them; it walks the projection only when
+    // the narrowing was refused. Which column refused is worth naming — the answer is a property
+    // of the compression plan, not of the query.
+    auto const refusing_column = [&]() -> std::optional<std::size_t> {
+      auto const refused = [&](std::size_t col) {
+        return col >= subsetted.size() || subsetted[col] == 0;
+      };
+      if (gather_columns.empty() && projection.has_value()) {
+        auto const it = std::ranges::find_if(*projection, refused);
+        return it == projection->end() ? std::nullopt : std::optional{*it};
+      }
+      for (std::size_t col = 0; col < subsetted.size(); ++col) {
+        if (refused(col)) { return col; }
+      }
+      return subsetted.empty() ? std::optional<std::size_t>{0} : std::nullopt;
+    }();
+    if (error.empty() && !refusing_column.has_value()) {
+      // Both narrowings compose into one set of ranges against the ORIGINAL pinned payload.
+      auto composed = gather_columns.empty() ? std::move(gather)
+                                             : simpatico::compose_gathers(gather_columns, gather);
+      if (!composed.empty() || gather.empty()) {
+        SIRIUS_LOG_DEBUG(
+          "[compression_converters] chunk subset: {} decode chunks, {} of {} columns, {} gather "
+          "ranges, {} B moved",
+          survivors.size(),
+          subsetted.size(),
+          rep.column_names().size(),
+          composed.size(),
+          std::accumulate(
+            composed.begin(), composed.end(), std::uint64_t{0}, [](auto acc, auto const& g) {
+              return acc + g.size;
+            }));
+        return reconstruct_and_decompress_to_gpu(
+          subset_header,
+          gathered_payload_fetch{payload, std::move(composed)},
+          projection,
+          rep.pushdown_scan().get(),
+          rep.visibility_mask(),
+          source,
+          target_memory_space,
+          stream);
+      }
+      SIRIUS_LOG_WARN(
+        "[compression_converters] chunk subset ranges did not compose, serving the whole chunk");
+    } else if (error.empty()) {
+      auto const& names = rep.column_names();
+      // Report the FILE column, which is what a compression plan is written against.
+      auto const col =
+        gather_columns.empty()
+          ? *refusing_column
+          : (*refusing_column < ascending.size() ? ascending[*refusing_column] : *refusing_column);
+      SIRIUS_LOG_DEBUG(
+        "[compression_converters] chunk subset not used, serving the whole chunk: column {} ({}) "
+        "is not chunk-addressable",
+        col,
+        col < names.size() ? names[col] : "?");
+    } else {
+      SIRIUS_LOG_WARN("[compression_converters] chunk subset refused, serving the whole chunk: {}",
+                      error);
+    }
+  }
 
   return reconstruct_and_decompress_to_gpu(rep.header(),
                                            fetch,
@@ -213,10 +327,7 @@ std::unique_ptr<cucascade::idata_representation> decompress_device_to_gpu(
     decompress_chunk(ct, selected, rep.pushdown_scan().get(), rep.visibility_mask(), stream, mr);
   auto decompressed = std::move(decoded.table);
 
-  auto cols = decompressed->release();
-  for (auto& c : cols)
-    c = rebind_column_stream(std::move(c), stream);
-  decompressed = std::make_unique<cudf::table>(std::move(cols));
+  decompressed = rebind_table_stream(std::move(decompressed), stream);
 
   const cucascade::memory::memory_space* space =
     (target_memory_space != nullptr) ? target_memory_space : &source.get_memory_space();

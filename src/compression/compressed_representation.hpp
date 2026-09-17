@@ -22,6 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <api/compressed_table_io.hpp>
 #include <cuda/stream>
 
 #include <cucascade/data/common.hpp>
@@ -92,6 +93,47 @@ void copy_pinned_blocks_to_device(
   void* dst_device,
   std::size_t size,
   rmm::cuda_stream_view stream);
+
+/// Copy @p size bytes from the pinned payload at logical byte offset @p src_offset
+/// into host memory at @p dst_host (host→host, synchronous). Used to read the small
+/// per-chunk metadata buffers that size a chunk subset; see
+/// simpatico::build_chunk_subset_header.
+void copy_pinned_blocks_to_host(
+  const cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& src,
+  std::uint64_t src_offset,
+  void* dst_host,
+  std::size_t size);
+
+/// Serve a COMPACTED payload out of the original pinned one.
+///
+/// The reader asks for byte ranges of the payload a synthesized subset header describes; @p gather
+/// says where each of those bytes lives in the ORIGINAL payload. Ranges are ascending and
+/// non-overlapping in destination order, so answering a request is a walk from the first range
+/// that reaches into it.
+///
+/// Destination bytes no gather range covers are real and deliberate: a bitpack `packed` buffer
+/// declares decode guard words past its last live word (simpatico::kBitpackDecodeGuardWords), and
+/// the decode loads them unconditionally without their values reaching an output row. They are
+/// zeroed rather than left undefined so a decode never reads uninitialized device memory.
+///
+/// Shared by every path that serves a chunk subset -- a pinned entry's converter and the .hpln
+/// scan source -- because the zero-fill rule above is not obvious and a second copy of it would
+/// diverge silently: a missing memset is uninitialized device memory, not a fault.
+class gathered_payload_fetch {
+ public:
+  gathered_payload_fetch(
+    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation const& payload,
+    std::vector<simpatico::gather_range> gather)
+    : _payload(payload), _gather(std::move(gather))
+  {
+  }
+
+  void operator()(std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) const;
+
+ private:
+  cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation const& _payload;
+  std::vector<simpatico::gather_range> _gather;
+};
 
 /**
  * @brief HOST-tier idata_representation backed by a pinned Simpatico-compressed chunk.
@@ -210,6 +252,30 @@ class compressed_host_representation : public simpatico_compressed_representatio
     return _pushdown_scan;
   }
 
+  /// Restrict this projection to a subset of the chunk's 1024-row simpatico decode chunks.
+  ///
+  /// @p chunks are batch-local decode-chunk ids, strictly ascending — the chunks a zone-map pass
+  /// could not rule out. The converter then synthesizes a header describing only those chunks and
+  /// fetches only their compressed bytes, so the pruned rows cost neither transfer nor decode; see
+  /// simpatico::build_chunk_subset_header. A column the format cannot address that finely is
+  /// served whole, which is always correct.
+  ///
+  /// @p rows is how many rows those chunks hold — what the served batch will contain. The
+  /// representation's reported row count and byte footprints are scaled to it, so a reservation
+  /// sized off this representation matches what the decode actually produces.
+  ///
+  /// Call only on a freshly projected representation the caller owns outright (as
+  /// @ref select_columns returns): which chunks survive is a property of one query's filter,
+  /// never of the shared pinned chunk.
+  void set_surviving_chunks(std::vector<std::uint32_t> chunks, std::int64_t rows);
+
+  /// The surviving decode chunks, or empty when every chunk is served.
+  [[nodiscard]] std::span<const std::uint32_t> surviving_chunks() const noexcept
+  {
+    return _surviving_chunks ? std::span<const std::uint32_t>{*_surviving_chunks}
+                             : std::span<const std::uint32_t>{};
+  }
+
   /// Same freshly-projected-only ownership rule as the pushdown setter above.
   void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
 
@@ -238,6 +304,9 @@ class compressed_host_representation : public simpatico_compressed_representatio
   std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
   decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
+  /// Surviving 1024-row decode chunks; null when the whole chunk is served. Shared (never
+  /// mutated after being set) so a clone copies a pointer.
+  std::shared_ptr<const std::vector<std::uint32_t>> _surviving_chunks;
 };
 
 /// A Simpatico-compressed chunk resident in GPU (device) memory.

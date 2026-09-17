@@ -45,6 +45,8 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
+#include "compression/simpatico_copy_function.hpp"
+#include "compression/simpatico_file_ingest.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -67,9 +69,13 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
+#include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -104,6 +110,7 @@ extern "C" int cudaProfilerStop();
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -302,6 +309,114 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
     "read_parquet('s3://...') inside gpu_execution()");
 }
 
+// Bind callback for read_simpatico. read_hpln_schema parses the trailer, the header and the
+// logical_types segment and stops there: no payload is staged and no GPU is touched, so a bind
+// costs two small reads even for a file that decodes to gigabytes. The path is echoed into bind
+// data purely for the cardinality callback; the plan generator reads it back out of
+// parameters[0].
+unique_ptr<FunctionData> SiriusReadSimpaticoBind(ClientContext& context,
+                                                 TableFunctionBindInput& input,
+                                                 vector<LogicalType>& return_types,
+                                                 vector<string>& names)
+{
+  if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
+    throw std::runtime_error("read_simpatico expects a single non-null .hpln path");
+  }
+  auto const path = input.inputs[0].GetValue<std::string>();
+
+  // Read through the backend that serves the path, so `read_simpatico('s3://...')` binds at all.
+  // The Sirius state is absent when the extension is loaded but the runtime was never brought up;
+  // a local file still binds through the filesystem then, and a scheme path fails with a clear
+  // message from the transport rather than as "no such file".
+  sirius::hpln_open_options options;
+  if (auto state = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+    options.io_ctx = state->get_scan_manager().ioctx_for_path(path);
+  }
+  // Shared and cached, like the plan generator's bind: DuckDB re-binds a view on every query, and
+  // a query naming the table more than once binds it more than once, so this runs several times
+  // per query over a schema that cannot have changed.
+  auto schema  = sirius::read_hpln_schema_shared(path, options);
+  return_types = schema->types;
+  names.assign(schema->names.begin(), schema->names.end());
+  return make_uniq<SiriusReadSimpaticoBindData>(path, static_cast<std::size_t>(schema->num_rows));
+}
+
+// Harvest `x IS NULL` conjuncts for the .hpln scan's zone-map pruning.
+//
+// Worth stating why this hook exists at all, because it looks redundant next to filter_pushdown.
+// DuckDB's FilterCombiner lowers comparisons, IN lists and LIKE prefixes into a TableFilterSet,
+// but it builds an IsNullFilter only inside an OR of IS NOT DISTINCT FROM (filter_combiner.cpp)
+// -- a standalone `WHERE x IS NULL` is left as a LogicalFilter above the scan and the source
+// never sees it. The bounds evaluator has supported the op all along; the predicate simply never
+// arrived.
+//
+// The conjunct is deliberately NOT consumed: the expressions this leaves in @p filters are
+// rebuilt into the same LogicalFilter, which still applies the predicate. So this can only ever
+// skip data no query could have returned, and a mistake here cannot produce a wrong answer --
+// unlike a filter taken out of the plan, which the source then owes an exact application of.
+//
+// Writing into `get.table_filters` would be the more natural home, but it is a trap:
+// FilterPushdown::PushdownGet skips constant-filter generation entirely when table_filters is
+// already non-empty (pushdown_get.cpp), so populating it here would disable the range pruning
+// that pays for itself.
+void SiriusReadSimpaticoPushdownComplexFilter(ClientContext&,
+                                              LogicalGet& get,
+                                              FunctionData* bind_data_p,
+                                              vector<unique_ptr<Expression>>& filters)
+{
+  auto* bind = dynamic_cast<SiriusReadSimpaticoBindData*>(bind_data_p);
+  if (bind == nullptr) { return; }
+  auto const& column_ids = get.GetColumnIds();
+  // Recomputed, not accumulated: the optimizer may push filters into the same get more than once,
+  // and @p filters is the COMPLETE set of predicates still above the scan at each call. Appending
+  // would both duplicate entries and, worse, keep a column whose predicate a later pass dropped --
+  // which is the one way this could prune rows a query still wanted.
+  std::vector<std::size_t> harvested;
+  // Top-level conjuncts only. `a IS NULL OR b = 1` is satisfiable without a single NULL in a, so
+  // a nested IS NULL says nothing about what the file must contain.
+  for (auto const& filter : filters) {
+    if (!filter || filter->GetExpressionType() != ExpressionType::OPERATOR_IS_NULL) { continue; }
+    auto const& op = filter->Cast<BoundOperatorExpression>();
+    if (op.children.size() != 1 || !op.children[0] ||
+        op.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+      continue;
+    }
+    auto const& ref = op.children[0]->Cast<BoundColumnRefExpression>();
+    if (ref.binding.table_index != get.table_index ||
+        ref.binding.column_index >= column_ids.size()) {
+      continue;
+    }
+    auto const& column_id = column_ids[ref.binding.column_index];
+    if (!column_id.HasPrimaryIndex() || column_id.IsRowIdColumn() || column_id.IsVirtualColumn()) {
+      continue;
+    }
+    harvested.push_back(static_cast<std::size_t>(column_id.GetPrimaryIndex()));
+  }
+  bind->is_null_columns = std::move(harvested);
+}
+
+// Execute callback for read_simpatico -- the CPU path, which cannot exist.
+//
+// .hpln has no DuckDB reader: the payload is a cuDF-shaped compressed table that only the GPU
+// decode path understands. So this function is reached exactly when the query did NOT run on the
+// GPU, and the only useful thing it can do is say so. It deliberately does not attempt a
+// fallback: silently returning nothing, or erroring somewhere deeper, would read as a bug in the
+// file rather than as "this query never reached the GPU".
+//
+// The consequence for enable_duckdb_fallback is worth stating plainly: with it on (the default) a
+// GPU failure on a read_simpatico query is replayed on the CPU, lands here, and the error the
+// user sees is this one rather than the GPU error that actually caused it. Setting
+// enable_duckdb_fallback = false surfaces the underlying GPU error directly, which is what the
+// message points at.
+void SiriusReadSimpaticoFunction(ClientContext&, TableFunctionInput&, DataChunk&)
+{
+  throw std::runtime_error(
+    "read_simpatico requires GPU execution: the .hpln format has no DuckDB CPU reader, so this "
+    "query cannot run on the CPU. Either GPU execution is disabled (SET gpu_execution = true) or "
+    "the GPU plan failed and was replayed on the CPU -- run with SET enable_duckdb_fallback = "
+    "false to see the underlying GPU error");
+}
+
 }  // namespace
 
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
@@ -309,6 +424,15 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
 {
   if (bind_data_p == nullptr) { return nullptr; }
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
+
+unique_ptr<NodeStatistics> SiriusReadSimpaticoCardinality(ClientContext&,
+                                                          FunctionData const* bind_data_p)
+{
+  if (bind_data_p == nullptr) { return nullptr; }
+  auto const* typed = dynamic_cast<SiriusReadSimpaticoBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
   return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
 }
@@ -1211,6 +1335,15 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  auto cluster_it = input.named_parameters.find("cluster_by");
+  if (cluster_it != input.named_parameters.end() && !cluster_it->second.IsNull()) {
+    for (auto& val : ListValue::GetChildren(cluster_it->second)) {
+      if (val.IsNull()) {
+        throw BinderException("pin_table 'cluster_by' list cannot contain NULL entries");
+      }
+      result->args.cluster_by.push_back(val.ToString());
+    }
+  }
   auto compression_it = input.named_parameters.find("compression");
   if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
     result->args.compression = compression_it->second.GetValue<bool>();
@@ -1229,8 +1362,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
   auto format_it = input.named_parameters.find("format");
   if (format_it != input.named_parameters.end() && !format_it->second.IsNull()) {
     result->args.format = to_lower(format_it->second.ToString());
-    if (result->args.format != "parquet" && result->args.format != "duckdb") {
-      throw BinderException("pin_table 'format' must be 'parquet' or 'duckdb', got '" +
+    if (result->args.format != "parquet" && result->args.format != "duckdb" &&
+        result->args.format != "simpatico") {
+      throw BinderException("pin_table 'format' must be 'parquet', 'duckdb' or 'simpatico', got '" +
                             result->args.format + "'");
     }
   } else if (!result->args.path.empty()) {
@@ -1239,9 +1373,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
       result->args.format = "parquet";
     } else if (ends_with(lowered, ".db") || ends_with(lowered, ".duckdb")) {
       result->args.format = "duckdb";
+    } else if (ends_with(lowered, ".hpln")) {
+      result->args.format = "simpatico";
     } else {
       throw BinderException("pin_table: cannot infer format from path '" + result->args.path +
-                            "'; pass format => 'parquet' or 'duckdb'");
+                            "'; pass format => 'parquet', 'duckdb' or 'simpatico'");
     }
   } else {
     throw BinderException("pin_table: provide a positional path (parquet) or format => 'duckdb'");
@@ -1250,6 +1386,18 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
   if (result->args.format == "parquet") {
     if (result->args.path.empty()) {
       throw BinderException("pin_table: format 'parquet' requires a positional path argument");
+    }
+  } else if (result->args.format == "simpatico") {
+    if (result->args.path.empty()) {
+      throw BinderException("pin_table: format 'simpatico' requires a positional .hpln path");
+    }
+    if (!result->args.cluster_by.empty()) {
+      // Clustering is a property of how the file was WRITTEN (COPY ... TO ... (FORMAT simpatico)
+      // preserves the query's order); an ingest never reorders rows, because doing so would mean
+      // decoding and recompressing the very bytes it exists to copy untouched.
+      throw BinderException(
+        "pin_table: 'cluster_by' is not supported for format 'simpatico'; order the rows when the "
+        "file is written instead");
     }
   } else {
     // duckdb: 'name' is the (optionally qualified) table to pin, resolved from the
@@ -1333,6 +1481,152 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   std::size_t const batch_size =
     sirius_ctx->get_config().get_operator_params().scan_task_batch_size;
 
+  if (data.args.format == "simpatico") {
+    // A .hpln is ALREADY the pinned representation, so this pin is an I/O copy: the chunks are
+    // staged into pinned host memory byte for byte and become the entry's chunks as they are.
+    // Nothing is decoded, nothing is compressed, and the GPU is never touched -- which is the
+    // whole point, since re-compressing at pin time is what makes a parquet pin cost far more
+    // than the queries it serves.
+    if (data.args.tier != "host") {
+      throw InvalidInputException(
+        "pin_table: format 'simpatico' supports tier => 'host' only; the file's chunks are a host "
+        "representation");
+    }
+    int const first_gpu_id = gpu_spaces[0]->get_device_id();
+    auto* host_space       = host_space_by_gpu.at(first_gpu_id);
+
+    auto io_ctx = scan_mgr.ioctx_for_path(data.args.path);
+    // The same bind a read_simpatico() scan does, so the entry's identity and column layout are
+    // built from the same numbers the query side will present -- the reason a pinned .hpln is
+    // matched at all (cache_entry_info::can_serve_with_columns).
+    auto info = sirius::op::scan::bind_simpatico_file(data.args.path, *host_space, io_ctx);
+
+    // Which of the file's columns to pin. `cols` names them; without it the whole file is pinned.
+    // Ascending file order, not the order the caller listed: the header's column order is what
+    // every consumer indexes by, so a reordering subset would be a different table rather than a
+    // narrower one -- and the entry's positions line up with the chunk's only if both ascend.
+    std::vector<std::size_t> pinned_columns;
+    if (data.args.cols.has_value() && !data.args.cols->empty()) {
+      for (auto const& wanted : *data.args.cols) {
+        auto const it = std::find(info->names.begin(), info->names.end(), wanted);
+        if (it == info->names.end()) {
+          throw InvalidInputException(
+            "pin_table: '%s' has no column named '%s'", data.args.path, wanted);
+        }
+        pinned_columns.push_back(static_cast<std::size_t>(std::distance(info->names.begin(), it)));
+      }
+      std::sort(pinned_columns.begin(), pinned_columns.end());
+      pinned_columns.erase(std::unique(pinned_columns.begin(), pinned_columns.end()),
+                           pinned_columns.end());
+    } else {
+      pinned_columns.resize(info->names.size());
+      std::iota(pinned_columns.begin(), pinned_columns.end(), std::size_t{0});
+    }
+
+    // The entry's identity is FILE column indices over the file's full name list -- the same
+    // convention a parquet pin uses, and the one cache_entry_info::from expects: it aligns the
+    // full names BY these ids. A query binds the whole file, so it asks for file indices; an entry
+    // numbering its columns 0..n-1 would match nothing.
+    info->duckdb_column_ids.clear();
+    for (auto const col : pinned_columns) {
+      info->duckdb_column_ids.emplace_back(static_cast<duckdb::idx_t>(col));
+    }
+    auto cache_info = sirius::scan_manager::cache_entry_info::from(*info);
+
+    // Everything describing a CHUNK, on the other hand, is in entry order and covers only the
+    // pinned columns -- because that is what the chunks now physically hold. The zone maps are
+    // renumbered with them: the arena is keyed by column and the serve path indexes it by the
+    // entry's position, so leaving them file-keyed would evaluate a predicate against a
+    // neighbouring column's range and prune the wrong groups.
+    std::vector<std::string> pinned_names;
+    std::vector<cudf::data_type> pinned_physical_types;
+    pinned_names.reserve(pinned_columns.size());
+    pinned_physical_types.reserve(pinned_columns.size());
+    for (auto const col : pinned_columns) {
+      pinned_names.push_back(info->names[col]);
+      pinned_physical_types.push_back(info->physical_types[col]);
+    }
+    auto pinned_bounds = info->group_bounds ? info->group_bounds->select_columns(pinned_columns)
+                                            : sirius::scan_manager::group_bounds_arena{};
+
+    std::vector<std::size_t> chunk_ids(info->chunk_rows.size());
+    std::iota(chunk_ids.begin(), chunk_ids.end(), std::size_t{0});
+    sirius::hpln_open_options open_options;
+    open_options.io_ctx = std::move(io_ctx);
+    auto ingested       = sirius::read_hpln_chunks_into_pinned(
+      data.args.path,
+      *host_space,
+      chunk_ids,
+      open_options,
+      pinned_columns.size() == info->names.size() ? std::span<const std::size_t>{}
+                                                        : std::span<const std::size_t>{pinned_columns});
+    if (ingested.size() != chunk_ids.size()) {
+      // Silently serving fewer chunks than the file holds is missing rows, not a slow pin.
+      throw InvalidInputException("pin_table: '" + data.args.path + "' staged " +
+                                  std::to_string(ingested.size()) + " of " +
+                                  std::to_string(chunk_ids.size()) + " chunks");
+    }
+
+    // Decoded footprint of a chunk, which is what the serve path reserves device memory by. The
+    // file records the row count and the decoded type per column, so this is exact for
+    // fixed-width columns and a floor for variable-width ones.
+    auto const& physical_types  = pinned_physical_types;
+    auto const decoded_bytes_of = [&physical_types](std::int64_t rows) {
+      std::size_t total = 0;
+      for (auto const& dtype : physical_types) {
+        total += static_cast<std::size_t>(std::max<std::int64_t>(rows, 0)) *
+                 (cudf::is_fixed_width(dtype) ? cudf::size_of(dtype) : sizeof(std::int32_t));
+      }
+      return total;
+    };
+
+    std::vector<std::shared_ptr<cucascade::idata_representation>> host_chunks;
+    host_chunks.reserve(ingested.size());
+    sirius::pinned_column_storage_matrix column_storage;
+    column_storage.reserve(ingested.size());
+    for (auto& chunk : ingested) {
+      auto const payload_bytes = chunk.blob ? chunk.blob->payload_bytes : 0;
+      host_chunks.push_back(std::make_shared<sirius::compressed_host_representation>(
+        *host_space,
+        std::move(chunk.blob),
+        pinned_names,
+        static_cast<std::size_t>(payload_bytes),
+        decoded_bytes_of(chunk.num_rows),
+        chunk.num_rows));
+      // What the chunk DECODES to, per column: the recorded carrier is what the serve path sizes
+      // a carrier conversion by, and a compressed chunk cannot be introspected for it.
+      std::vector<sirius::pinned_column_storage_meta> row;
+      row.reserve(pinned_physical_types.size());
+      for (auto const& dtype : pinned_physical_types) {
+        row.push_back(
+          sirius::pinned_column_storage_meta{.carrier = dtype, .narrowed = false, .native = dtype});
+      }
+      column_storage.push_back(std::move(row));
+    }
+
+    // The bounds come out of the file's own `zone_maps` segment, already in the arena's packed
+    // form -- so they are handed over as they are rather than rebuilt through BaseStatistics.
+    // Copied, not moved: the bind's arena is shared with the metadata cache and with every other
+    // scan of this file, while a pinned entry owns its own. A pin happens once, so the copy is
+    // not on any hot path.
+    scan_mgr.insert_pinned_entry_host(data.args.name,
+                                      std::move(cache_info),
+                                      std::move(host_chunks),
+                                      *host_space,
+                                      std::move(pinned_bounds),
+                                      std::move(column_storage));
+    SIRIUS_LOG_INFO("[pin_table] '{}': ingested {} chunk(s) of '{}' into the host tier",
+                    data.args.name,
+                    ingested.size(),
+                    data.args.path);
+
+    output.SetCardinality(1);
+    output.SetValue(0, 0, Value::BOOLEAN(true));
+    data.finished = true;
+    window.finish();
+    return;
+  }
+
   // materialize_all_batches round-robins reads across these GPUs and reports the
   // per-batch placement; insert_pinned_entry wants non-const memory_space*.
   std::vector<cucascade::memory::memory_space*> gpu_spaces_mut;
@@ -1390,6 +1684,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
 
   auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;
+  // 0 disables the finer capture, leaving whole-chunk pruning as before.
+  std::size_t const zone_map_group_rows =
+    capture_chunk_stats ? pin_op_params.pinned_zone_map_group_rows : 0;
   // Read from the connection running the CALL, so a table pins with the carriers that
   // connection asked for rather than whatever another connection set last.
   bool const compressed_pin = duckdb::compressed_materialization_enabled(context);
@@ -1414,26 +1711,13 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
   const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
   if (compression_active) {
-    namespace fs     = std::filesystem;
-    const auto& name = data.args.name;
-    if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
-      std::error_code ec;
-      for (auto const& entry : fs::directory_iterator(comp_cfg.input_plan_dir, ec)) {
-        if (!entry.is_regular_file()) { continue; }
-        if (entry.path().stem() == name) {
-          std::ifstream f(entry.path());
-          std::string dsl((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-          if (!dsl.empty()) {
-            sirius::compression::plan_register::global().set_table_plan(name, std::move(dsl));
-          }
-          break;
-        }
-      }
-      if (ec) {
-        SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
-                        comp_cfg.input_plan_dir,
-                        ec.message());
-      }
+    std::string scan_error;
+    static_cast<void>(sirius::compression::resolve_table_plan_from_dir(
+      comp_cfg.input_plan_dir, data.args.name, &scan_error));
+    if (!scan_error.empty()) {
+      SIRIUS_LOG_WARN("[pin_table] cannot scan plan dir '{}': {}; skipping compression",
+                      comp_cfg.input_plan_dir,
+                      scan_error);
     }
   }
 
@@ -1481,6 +1765,40 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // names outlive cache_info, which every insert path moves from.
   auto const pinned_column_names = cache_info.column_names();
   auto probe_unique_columns = sirius::late_mat::pin_unique_probe_selection(pinned_column_names);
+
+  // cluster_by: sort each pin chunk on these columns so its zone maps describe a narrow range.
+  // Resolved here, where the pinned column list exists, so the materializer takes positions and
+  // never has to match names.
+  std::vector<std::size_t> cluster_key_columns;
+  if (!data.args.cluster_by.empty()) {
+    if (data.args.format == "duckdb") {
+      // A duckdb-native pin's rows stay addressable by DuckDB row id: the deleted-row keep-masks
+      // are positional against the pinned order (validate_duckdb_pin_chunk exists to keep each
+      // chunk a contiguous row-id range). Reordering rows would misapply those masks silently.
+      throw InvalidInputException(
+        "pin_table: 'cluster_by' is not supported for duckdb-native pins, whose rows must stay in "
+        "table order for deleted-row masks to apply");
+    }
+    for (auto const& key : data.args.cluster_by) {
+      auto const it = std::find(pinned_column_names.begin(), pinned_column_names.end(), key);
+      if (it == pinned_column_names.end()) {
+        throw InvalidInputException("pin_table: cluster_by column '" + key +
+                                    "' is not among the pinned columns of '" + data.args.name +
+                                    "'");
+      }
+      cluster_key_columns.push_back(
+        static_cast<std::size_t>(std::distance(pinned_column_names.begin(), it)));
+    }
+    if (zone_map_group_rows == 0) {
+      // A locally sorted chunk still spans the whole key range, so it prunes exactly nothing at
+      // chunk granularity -- the clustering only pays through the per-group index
+      // (72.7% of chunks prune at G=8 against 0.0% here).
+      SIRIUS_LOG_WARN(
+        "[pin_table] '{}': cluster_by is set but pinned_zone_map_group_rows is 0; a per-chunk "
+        "sort prunes nothing at chunk granularity, so this will cost the sort and save nothing",
+        data.args.name);
+    }
+  }
 
   // Record what the probe proved, by name (see attach_proven_unique_columns on
   // why not by position). A no-op when the probe was off.
@@ -1546,8 +1864,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       pinned_column_types,
                                       pin_comp,
                                       {.capture_chunk_stats               = capture_chunk_stats,
+                                       .group_rows                        = zone_map_group_rows,
                                        .enable_compressed_materialization = compressed_pin,
-                                       .probe_unique_columns              = probe_unique_columns});
+                                       .probe_unique_columns              = probe_unique_columns,
+                                       .cluster_key_columns               = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
@@ -1561,6 +1881,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       *representative_host_space,
                                       std::move(pinned_column_types),
                                       std::move(host_result.chunk_stats),
+                                      std::move(host_result.group_stats),
                                       std::move(host_result.column_storage));
     // The host path always REPLACES, so every pinned column holds this
     // materialization's values.
@@ -1577,9 +1898,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       *scan_mgr.io_ctx(),
       pinned_column_types,
       pin_comp,
-      {.capture_chunk_stats               = false,
+      {.capture_chunk_stats               = capture_chunk_stats,
+       .group_rows                        = zone_map_group_rows,
        .enable_compressed_materialization = compressed_pin,
-       .probe_unique_columns              = probe_unique_columns});
+       .probe_unique_columns              = probe_unique_columns,
+       .cluster_key_columns               = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(dev_result.column_storage));
 
@@ -1587,6 +1910,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                         std::move(cache_info),
                                         std::move(dev_result.chunks),
                                         *gpu_spaces_mut[0],
+                                        pinned_column_types,
+                                        std::move(dev_result.chunk_stats),
+                                        std::move(dev_result.group_stats),
                                         std::move(dev_result.column_storage));
     // The compressed device path always REPLACES, as above.
     attach_proven_unique(dev_result.unique_verdicts, pinned_column_names);
@@ -1600,7 +1926,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                                pinned_column_types,
                                                {.capture_chunk_stats = capture_chunk_stats,
                                                 .enable_compressed_materialization = compressed_pin,
-                                                .probe_unique_columns = probe_unique_columns});
+                                                .probe_unique_columns = probe_unique_columns,
+                                                .cluster_key_columns  = cluster_key_columns});
     sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
@@ -2481,6 +2808,40 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
+  // A .hpln file as a query source. Unlike sirius_read_parquet this IS a user-facing surface:
+  // there is no DuckDB function that reads the format, so nothing else can bind it.
+  //
+  // filter_pushdown is on because the format's own zone maps are the point of the source: they
+  // let a chunk that cannot match be skipped before it is read at all. DuckDB DELETES a
+  // pushed-down predicate from the plan, so this is also a promise to apply it exactly --
+  // simpatico_gpu_ingestible::post_filter_and_project does, after the bounds have narrowed what
+  // was decoded.
+  //
+  // projection_pushdown is on for the reason it is on everywhere else: without it the scan is
+  // typed by the file's FULL width and decodes every column, which measured 128.8 bytes/row on
+  // TPC-H lineitem where the query wanted 16 -- paid again by every operator above the scan. The
+  // filter's batch positions survive it because the decode still emits columns read only for the
+  // filter, and the projection that drops them runs AFTER the filter (scan_plan, shared with the
+  // parquet source).
+  TableFunction read_simpatico(
+    "read_simpatico", {LogicalType::VARCHAR}, SiriusReadSimpaticoFunction, SiriusReadSimpaticoBind);
+  read_simpatico.cardinality         = SiriusReadSimpaticoCardinality;
+  read_simpatico.filter_pushdown     = true;
+  read_simpatico.projection_pushdown = true;
+  // ... and this collects the one predicate filter_pushdown cannot deliver: a standalone IS NULL,
+  // which DuckDB never lowers into a TableFilter. It prunes only; it consumes nothing.
+  read_simpatico.pushdown_complex_filter = SiriusReadSimpaticoPushdownComplexFilter;
+  CreateTableFunctionInfo read_simpatico_info(read_simpatico);
+  catalog.CreateTableFunction(transaction, read_simpatico_info);
+
+  // The writer for the format read_simpatico reads: `COPY (SELECT ...) TO 'x.hpln'
+  // (FORMAT simpatico)`. Registered as a copy function rather than a table function because that
+  // is the surface a bulk writer has in SQL -- it gets the query's schema and its rows streamed
+  // in, which is exactly what the container needs and what a table function would have to
+  // re-derive.
+  CreateCopyFunctionInfo simpatico_copy_info(sirius::compression::make_simpatico_copy_function());
+  catalog.CreateCopyFunction(transaction, simpatico_copy_info);
+
   TableFunction set_query_label("sirius_set_query_label",
                                 {LogicalType::VARCHAR},
                                 SiriusSetQueryLabelFunction,
@@ -2518,6 +2879,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
+    pin_table.named_parameters["cluster_by"]  = LogicalType::LIST(LogicalType::VARCHAR);
     pin_table_set.AddFunction(std::move(pin_table));
   };
   add_pin_table_overload({LogicalType::VARCHAR});
