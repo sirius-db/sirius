@@ -2322,11 +2322,31 @@ fused-scan decision (`decode NOT applied, status=2` in both). Also ruled out: NU
 nodes 1–8 are GPU HBM with no CPUs), transparent huge pages (`madvise`, `AnonHugePages: 0`), CPU
 clock (pinned flat at 3.42 GHz across one slow and two fast runs), and driving-thread identity.
 
-**Still open:** which mechanism inside the ingest stalls. The remaining candidates are the reactor /
-prefetcher thread scheduling (`uring_n_reactors: 4`, `memory_prefetcher.num_threads: 3`,
-`scan_manager.num_threads: 18`), the queue depth (`max_bytes_in_flight`), and the coalescer's
-interaction with chunk arrival order — all in the path, none yet separated. The starvation being
-front-loaded suggests a ramp-up effect: whatever it is, it is worst while the pipeline is filling.
+**Tested and REJECTED: the per-batch barrier is not the mechanism.** `submit_vectored` awaits each
+batch of reads before building the next, and its own comment explains why (the reactor references a
+batch's iovecs until they are reaped). That reads like a drain at every batch boundary, so it was
+implemented as a ring of owned in-flight batches — lifetime solved by ownership rather than by
+blocking — with the per-batch cap cut to keep outstanding bytes unchanged. It BUILT, passed all 12
+`hpln_io` tests, returned matching results, and made things worse: the fast mode went 4.71 → 4.96 s
+and slow runs went from 2-of-6 to 5-of-8.
+
+A depth x batch-size sweep then killed the hypothesis outright. **Every configuration is bimodal,
+including `depth=1, batch=1GB`, which is the original code**: 4.720 / 4.708 / 5.341 s. The flip
+survives the control, so the barrier cannot be what causes it. Two lessons worth keeping: sweep the
+knob before changing the code it belongs to, and a bimodal distribution cannot be compared across
+configurations by the mean of three mixed-mode runs — classify the modes first.
+
+Plausible mechanism from a code reading plus a correlation (the starvation is front-loaded, which
+looked like a ramp-up effect) was not enough, and is not enough for the candidates below either.
+
+**Still open:** which mechanism inside the ingest stalls. Untouched so far is the uring reactor's
+own queue and bounce-slot handling, which is the largest unexamined component on the path;
+`memory_prefetcher.num_threads` and `scan_manager.num_threads` are also unswept. Next step is 15
+runs of one configuration with the modes classified, so two configurations can be told apart at
+all, then reactor-level instrumentation — NOT another code change.
+
+**Worth separating from the flip:** even the fast mode leaves ~23% of device bandwidth unused, and
+that gap does not depend on solving the bimodality. It is the larger number and the easier target.
 
 **The bigger prize is not the 12% flip.** Even the FAST mode reads at 18.6 GB/s against a device
 that delivers 24.25 — the ingest leaves **23% of available bandwidth unused on a good run, 32% on a
