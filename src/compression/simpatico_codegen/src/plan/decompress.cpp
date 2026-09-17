@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "decode/decode_session.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -23,6 +24,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <stdexcept>
 
@@ -100,61 +102,32 @@ std::vector<std::string> consumed_slots(std::string const& kind)
   return {};
 }
 
-// Decode memoises each reconstructed value by its structural identity — the
-// (node, port) it is produced on, packed into a key. A value is computed once
-// and shared by every consumer (and by the codegen tail binders). Consumer
-// counts let reconstruction move a value into its sole/last consumer while
-// preserving shared values. `kept` holds reconstructed reps alive for the
-// walk's duration.
-struct DecodeMemo {
-  std::unordered_map<std::uint64_t, std::unique_ptr<cudf::column>> values;
-  std::unordered_map<std::uint64_t, std::size_t> remaining_consumers;
-  std::vector<std::unique_ptr<compressed_representation>> kept;
-};
-
-// Reverse plan traversal. CompressWalk emits values forward into consumers;
-// DecodeWalk materializes producer inputs backward from stored representations.
-// The memo and all temporary reconstructed reps live for the full walk.
+// The frame owns the structural memo; this visitor never owns pending device dependencies.
 class DecodeWalk {
  public:
   DecodeWalk(PlanTree const& tree,
-             rmm::cuda_stream_view stream,
-             rmm::device_async_resource_ref const& mr,
+             decode_frame& frame,
              std::string* error_out,
              decode_predicate const* pred,
              decode_selection const* sel);
-
   cudf::column const* materialize(NodeId nid);
-  std::unique_ptr<cudf::column> run();
+  void run(decode_column_slot output);
 
  private:
-  std::unique_ptr<cudf::column> materialize_fused_node(NodeId nid,
-                                                       decode_selection const* node_sel);
-
-  /// True when @p nid produces the column's final value and a predicate is
-  /// pending — the one place a rep may answer the predicate instead of decoding.
+  void materialize_fused_node(NodeId nid,
+                              decode_selection const* node_sel,
+                              decode_column_slot output);
   [[nodiscard]] bool predicate_applies_to(NodeId nid) const;
-
-  /// True when @p nid is THE node whose fused decode consumes the pending
-  /// selection: the (0,0)-producing bitpack region, or — for the
-  /// dictionary-gather mode — the bitpack region producing the dictionary's `indices`
-  /// value. Inner fused subtrees (entropy tails, dictionary keys_offsets, ...)
-  /// hold metadata that is NOT row-aligned with the column and must decode
-  /// full; the precomputed @c sel_target pins the exact consumer.
   [[nodiscard]] bool selection_applies_to(NodeId nid) const;
 
   PlanTree const& tree;
+  decode_frame& frame;
   rmm::cuda_stream_view stream;
   rmm::device_async_resource_ref mr;
   std::string* error_out;
-  DecodeMemo memo;
-  /// Borrowed; null when the caller wants the column itself.
   decode_predicate const* pred = nullptr;
-  /// Borrowed decode-time row selection; null on the default path.
-  decode_selection const* sel = nullptr;
-  /// The one NodeId selection_applies_to accepts; tree.nodes.size() = none.
+  decode_selection const* sel  = nullptr;
   NodeId sel_target;
-  /// Set once a rep has answered `pred`, so run() knows not to compare again.
   bool predicate_resolved = false;
 };
 
@@ -167,41 +140,20 @@ std::string value_label(ValueId v)
 // last consumer; a sole/last consumer takes ownership. A null entry is deliberately retained after
 // a move so any accidental re-request is a deterministic runtime error rather than a silent
 // re-decode.
-std::unique_ptr<cudf::column> consume_memo_value(ValueId value,
-                                                 DecodeMemo& memo,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr,
-                                                 std::string* error_out)
+decode_column_slot consume_memo_value(ValueId value, decode_frame& frame)
 {
-  auto const key = value_id_key(value);
-  auto value_it  = memo.values.find(key);
-  if (value_it == memo.values.end()) {
-    if (error_out) *error_out = "decode: unresolved memo value " + value_label(value);
-    return nullptr;
+  auto const key     = value_id_key(value);
+  auto const* column = frame.find_memo(key);
+  if (!column)
+    throw std::runtime_error("decode: unresolved or consumed memo value " + value_label(value));
+  auto count_it = frame.remaining_consumers.find(key);
+  if (count_it == frame.remaining_consumers.end() || count_it->second == 0) {
+    throw std::runtime_error("decode: memo value has no remaining consumer " + value_label(value));
   }
-  if (!value_it->second) {
-    if (error_out) {
-      *error_out = "decode: memo value " + value_label(value) + " was already consumed";
-    }
-    return nullptr;
-  }
-
-  auto count_it = memo.remaining_consumers.find(key);
-  if (count_it == memo.remaining_consumers.end() || count_it->second == 0) {
-    if (error_out) {
-      *error_out = "decode: memo value " + value_label(value) + " has no remaining consumer";
-    }
-    return nullptr;
-  }
-
-  if (count_it->second == 1) {
-    count_it->second = 0;
-    return std::move(value_it->second);
-  }
-
-  auto copy = std::make_unique<cudf::column>(value_it->second->view(), stream, mr);
   --count_it->second;
-  return copy;
+  if (count_it->second == 0) return frame.memo_column(key);
+  return frame.keep_column(
+    std::make_unique<cudf::column>(column->view(), frame.stream(), frame.mr()));
 }
 
 // Returns the rep for node nid, or nullptr if the node has none.
@@ -361,7 +313,7 @@ bool bind_raw_passthrough_buffers(std::int32_t node_id,
 // another op (e.g. ``…packed -> snappy``, ``…packed -> bitcomp -> ans``, or a
 // codegen tail ``…chunk_min -> zigzag``), detected as a child edge — are
 // RESOLVED here via ``materialize`` (the downstream subtree), which returns a
-// view into the shared memo that owns it through the (synchronous) decode
+// view into the shared memo that owns it through completion of the decode
 // launch. An identity NO-OP terminal (``…chunk_min -> identity``) leaves the
 // bytes inside THIS rep and is bound directly.
 bool bind_real_node_buffers(std::int32_t node_id,
@@ -416,7 +368,7 @@ bool bind_real_node_buffers(std::int32_t node_id,
     } else if (has_edge) {
       // Tail-routed slot (a downstream codegen region OR non-codegen rep
       // consumes it): materialize the downstream's output — a view into the
-      // shared memo, which owns it through the synchronous launch. One path for
+      // shared memo, which owns it through completion of the launch. One path for
       // both, no empty-map special case (e.g. …bitpack -> chunk_min -> zigzag
       // resolves the nested codegen tail through the same memo).
       cudf::column const* col = materialize(eit->second);
@@ -510,7 +462,7 @@ struct bound_fused_region {
 // Build one codegen-fused subtree, resolve its metadata, and bind its device
 // buffers (keyed by DFS-preorder node_id) directly from the node-owned reps.
 // Entropy-tail-routed channels are materialized into the caller's shared memo,
-// which owns them through the (synchronous) launch that follows.
+// which owns them through completion of the launch that follows.
 //
 // Some intermediate fuse nodes store nothing and own no rep; their children
 // own the reps. In that case, the first non-null rep in the fused preorder
@@ -569,147 +521,66 @@ std::optional<bound_fused_region> bind_fused_region(PlanTree const& tree,
   return region;
 }
 
-// High-level decode bridge implementation: bind the fused region and launch
-// into a fresh output column. The launch is synchronous, so there is no
-// cross-call binding state to cache; the JIT compile itself is cached
-// process-wide in KernelCache.
-//
-// Returns nullptr + *error_out on failure.
-std::unique_ptr<cudf::column> decode_fused_subtree_impl(PlanTree const& tree,
-                                                        NodeId root_nid,
-                                                        decode_materialize_fn const& materialize,
-                                                        rmm::cuda_stream_view stream,
-                                                        rmm::device_async_resource_ref const& mr,
-                                                        std::string* error_out,
-                                                        decode_selection const* sel = nullptr)
+// Bind one region and submit into a preregistered owner. Every variant uses the same frame.
+void decode_fused_subtree_impl(PlanTree const& tree,
+                               NodeId root_nid,
+                               decode_materialize_fn const& materialize,
+                               decode_frame& frame,
+                               decode_column_slot output,
+                               std::string* error_out,
+                               decode_selection const* sel = nullptr)
 {
-  auto region = bind_fused_region(tree, root_nid, materialize, stream, mr, error_out);
-  if (!region) { return nullptr; }
-  cudf::data_type const root_type = region->root_type;
-  cudf::size_type const num_rows  = region->num_rows;
-  const char* dtype               = region->dtype;
-  auto& built                     = region->built;
-  auto& labeled                   = region->labeled;
-
-  // Compacted route: the combine + CNT wave already fixed the
-  // survivor count, so the compacted output is allocated count-first instead
-  // of full width (the whole point of the mask-consuming decode).
-  const bool masked = sel != nullptr && sel->active();
-  if (masked && (sel->survivor_count > static_cast<std::int64_t>(num_rows))) {
-    if (error_out) {
-      *error_out = "codegen decompress: selection survivor_count exceeds the column's row count";
-    }
-    return nullptr;
+  auto region =
+    bind_fused_region(tree, root_nid, materialize, frame.stream(), frame.mr(), error_out);
+  if (!region) throw std::runtime_error(error_out ? *error_out : "decode region binding failed");
+  auto const num_rows = region->num_rows;
+  bool const masked   = sel && sel->active();
+  if (masked && sel->survivor_count > num_rows) {
+    throw std::runtime_error("decode selection exceeds the column row count");
   }
-  cudf::size_type const out_rows =
-    masked ? static_cast<cudf::size_type>(sel->survivor_count) : num_rows;
-  auto out_col =
-    cudf::make_fixed_width_column(root_type, out_rows, cudf::mask_state::UNALLOCATED, stream, mr);
-  if (!out_col) {
-    if (error_out) *error_out = "codegen decompress: output column alloc failed";
-    return nullptr;
+  auto const out_rows = masked ? static_cast<cudf::size_type>(sel->survivor_count) : num_rows;
+  output.adopt(cudf::make_fixed_width_column(
+    region->root_type, out_rows, cudf::mask_state::UNALLOCATED, frame.stream(), frame.mr()));
+  if (out_rows == 0) return;
+  auto& built       = region->built;
+  auto& labeled     = region->labeled;
+  auto const* dtype = region->dtype;
+  if (!masked) {
+    launch_decode_fused_tree(
+      *built.tree, labeled, dtype, num_rows, output->mutable_view().head<void>(), frame);
+    return;
   }
-  // A zero-survivor chunk has nothing to decode, and a 0-row column's data
-  // pointer is null — launching against it would look like an allocation
-  // failure to the kernel and get refused, forcing a needless full-width
-  // fallback decode of a chunk that was already known to produce no rows.
-  if (masked && sel->survivor_count == 0) { return out_col; }
-
-  if (masked && sel->rows != nullptr) {
-    // Row-set walk: a selection that arrived after the scan, so there is no
-    // mask to walk and no chunk_offsets to have been counted. The row set
-    // carries its own grid — one block per touched chunk — and its own output
-    // bases, so only the touched chunks are launched at all.
-    if (sel->rows->num_survivors != sel->survivor_count) {
-      if (error_out) {
-        *error_out = "codegen decompress: decode_selection and row set disagree on survivor_count";
-      }
-      return nullptr;
+  if (sel->rows) {
+    if (!sel->rows->valid() || sel->rows->num_survivors != sel->survivor_count ||
+        sel->rows->num_rows != num_rows) {
+      throw std::runtime_error("decode row set does not match the selected column");
     }
-    if (sel->rows->num_rows != static_cast<std::int64_t>(num_rows)) {
-      if (error_out) {
-        *error_out = "codegen decompress: row set was built for a different row count";
-      }
-      return nullptr;
-    }
-    if (!sel->rows->valid()) {
-      if (error_out) { *error_out = "codegen decompress: row set fails its own contract"; }
-      return nullptr;
-    }
-    // The mask is not read on this path; the launcher takes the row set's
-    // geometry instead. A hollow one keeps the signature honest about that.
-    sirius::codegen::selection_mask const hollow{
-      nullptr, static_cast<std::int64_t>(num_rows), sel->survivor_count, nullptr};
-    if (!launch_decode_fused_tree_compacted(*built.tree,
-                                            labeled,
-                                            dtype,
-                                            static_cast<std::int64_t>(num_rows),
-                                            sel->mask != nullptr ? *sel->mask : hollow,
-                                            row_enumeration{nullptr, sel->rows},
-                                            out_col->mutable_view().head<void>(),
-                                            stream)) {
-      if (error_out) { *error_out = "codegen decompress: compacted (row-set walk) decode failed"; }
-      return nullptr;
-    }
-    return out_col;
+    sirius::codegen::selection_mask const hollow{nullptr, num_rows, sel->survivor_count, nullptr};
+    launch_decode_fused_tree_compacted(*built.tree,
+                                       labeled,
+                                       dtype,
+                                       num_rows,
+                                       hollow,
+                                       row_enumeration{nullptr, sel->rows},
+                                       output->mutable_view().head<void>(),
+                                       frame);
+    return;
   }
-  if (masked) {
-    // Mask walk: decode over all num_rows input rows with the mask
-    // words + chunk offsets as kernel arguments, writing only survivor rows
-    // compacted into out_col (chunk_offsets[c] is chunk c's output base).
-    if (sel->mask->chunk_offsets == nullptr) {
-      if (error_out)
-        *error_out =
-          "codegen decompress: selection mask has no chunk_offsets (CNT wave did not run)";
-      return nullptr;
-    }
-    if (sel->mask->survivor_count != sel->survivor_count) {
-      if (error_out)
-        *error_out = "codegen decompress: decode_selection and mask disagree on survivor_count";
-      return nullptr;
-    }
-    // Runtime pick: the index walk decodes only the listed survivor rows by
-    // random access into the packed bits — preferred by the orchestrator at low
-    // selectivity. Bitpack LEAF roots only: a delta root keeps the mask walk
-    // (the index walk rejects it at render), as does the dictionary codes
-    // region by contract. Any anomaly — indices absent, or a count that
-    // disagrees with the mask — silently keeps the mask walk, since the pick is
-    // an optimization and the mask walk is always renderable here.
-    bool const use_index_decode =
-      sel->enumerate_by_index && sel->route == sirius::codegen::decode_route::bitpack_mask &&
-      sel->survivor_count > 0 && root_nid < tree.nodes.size() &&
-      tree.nodes[root_nid].op == "bitpack" &&
-      static_cast<std::int64_t>(sel->survivor_indices.size()) == sel->survivor_count;
-    bool const masked_ok = launch_decode_fused_tree_compacted(
-      *built.tree,
-      labeled,
-      dtype,
-      static_cast<std::int64_t>(num_rows),
-      *sel->mask,
-      row_enumeration{use_index_decode ? sel->survivor_indices.data<std::int32_t>() : nullptr,
-                      nullptr},
-      out_col->mutable_view().head<void>(),
-      stream);
-    if (!masked_ok) {
-      if (error_out) {
-        *error_out = use_index_decode ? "codegen decompress: compacted (index walk) decode failed"
-                                      : "codegen decompress: compacted (mask walk) decode failed";
-      }
-      return nullptr;
-    }
-    return out_col;
+  if (!sel->mask->chunk_offsets || sel->mask->survivor_count != sel->survivor_count) {
+    throw std::runtime_error("decode selection mask has no matching count/offsets");
   }
-  bool ok = launch_decode_fused_tree(*built.tree,
-                                     labeled,
-                                     dtype,
-                                     static_cast<std::int64_t>(num_rows),
-                                     out_col->mutable_view().head<void>(),
-                                     stream);
-  if (!ok) {
-    if (error_out) *error_out = "codegen decompress: decode failed";
-    return nullptr;
-  }
-  return out_col;
+  bool const by_index =
+    sel->enumerate_by_index && sel->route == sirius::codegen::decode_route::bitpack_mask &&
+    tree.nodes[root_nid].op == "bitpack" && sel->survivor_indices.size() == sel->survivor_count;
+  launch_decode_fused_tree_compacted(
+    *built.tree,
+    labeled,
+    dtype,
+    num_rows,
+    *sel->mask,
+    row_enumeration{by_index ? sel->survivor_indices.data<std::int32_t>() : nullptr, nullptr},
+    output->mutable_view().head<void>(),
+    frame);
 }
 
 // Rep holding a bitjoin node's own (packed) output leaf: its node rep, or the
@@ -727,224 +598,163 @@ compressed_representation const* bitjoin_packed_rep(PlanNode const& node)
 // Split a bitjoin node's packed leaf back into its input field values, keyed in
 // `memo` by each input's structural ValueId. Fields sharing a source value are
 // OR-ed into one column (a source may receive several bit ranges).
-bool decode_bitjoin(NodeId nid,
-                    PlanTree const& tree,
-                    DecodeMemo& memo,
-                    rmm::cuda_stream_view stream,
-                    rmm::device_async_resource_ref mr,
-                    std::string* error_out)
+void decode_bitjoin(NodeId nid, PlanTree const& tree, decode_frame& frame)
 {
-  PlanNode const& node = tree.nodes[nid];
-  if (!node.attrs.bitjoin.has_value()) {
-    if (error_out) *error_out = "decode_bitjoin: missing bitjoin attrs";
-    return false;
-  }
-
-  compressed_representation const* repr = bitjoin_packed_rep(node);
-  if (!repr) {
-    if (error_out) *error_out = "bitjoin decode: missing packed rep at node " + std::to_string(nid);
-    return false;
-  }
-  auto packed = decompress_standalone_representation(repr, stream, mr, error_out);
-  if (!packed) {
-    if (error_out) *error_out = "bitjoin decode: failed to decompress packed leaf";
-    return false;
-  }
-  cudf::column_view packed_view = packed->view();
-  int64_t n_elements            = static_cast<int64_t>(packed_view.size());
-
+  auto const& node = tree.nodes[nid];
+  auto const* rep  = bitjoin_packed_rep(node);
+  if (!node.attrs.bitjoin || !rep)
+    throw std::runtime_error("bitjoin decode: missing layout or packed rep");
+  auto packed = frame.make_column();
+  decode_standalone(*rep, frame, packed);
+  auto const packed_view = packed.view();
   std::vector<std::optional<bit_range>> input_ranges;
-  input_ranges.reserve(node.attrs.bitjoin->inputs.size());
   for (auto const& ref : node.attrs.bitjoin->inputs)
     input_ranges.push_back(ref.range);
-
   bitjoin_layout layout;
-  if (!resolve_bitjoin_layout(
-        node.op, node.input_sources.size(), input_ranges, &layout, error_out)) {
-    return false;
+  std::string error;
+  if (!resolve_bitjoin_layout(node.op, node.input_sources.size(), input_ranges, &layout, &error)) {
+    throw std::runtime_error(error);
   }
-
-  // Group the fields by the source value each targets (a source may collect
-  // several bit ranges), keyed structurally by ValueId.
   struct field_ref {
-    uint32_t width, src_lo, dst_lo;
+    std::uint32_t width, src_lo, dst_lo;
   };
   std::unordered_map<std::uint64_t, std::vector<field_ref>> by_src;
-  std::vector<ValueId> order;
-  for (size_t fi = 0; fi < node.input_sources.size(); ++fi) {
-    std::uint64_t const k = value_id_key(node.input_sources[fi]);
-    auto& vec             = by_src[k];
-    if (vec.empty()) order.push_back(node.input_sources[fi]);
-    vec.push_back({layout.widths[fi], layout.src_los[fi], layout.dst_los[fi]});
+  for (std::size_t i = 0; i < node.input_sources.size(); ++i) {
+    by_src[value_id_key(node.input_sources[i])].push_back(
+      {layout.widths[i], layout.src_los[i], layout.dst_los[i]});
   }
-
-  for (auto const& src : order) {
-    auto const& refs     = by_src.at(value_id_key(src));
-    uint32_t max_src_top = 0;
-    for (auto const& r : refs) {
-      uint32_t top = r.src_lo + r.width;
-      if (top > max_src_top) max_src_top = top;
-    }
-    cudf::type_id field_type_id = (max_src_top <= 8)    ? cudf::type_id::UINT8
-                                  : (max_src_top <= 16) ? cudf::type_id::UINT16
-                                  : (max_src_top <= 32) ? cudf::type_id::UINT32
-                                                        : cudf::type_id::UINT64;
-    auto field_col              = cudf::make_fixed_width_column(cudf::data_type(field_type_id),
-                                                   static_cast<cudf::size_type>(n_elements),
-                                                   cudf::mask_state::UNALLOCATED,
-                                                   stream,
-                                                   mr);
-    cudaMemsetAsync(
-      field_col->mutable_view().head<void>(),
-      0,
-      static_cast<size_t>(n_elements) * static_cast<size_t>(cudf::size_of(field_col->type())),
-      stream.value());
-    for (auto const& r : refs) {
-      launch_bitjoin_field(field_col->mutable_view(),
+  for (auto const& [key, refs] : by_src) {
+    std::uint32_t top = 0;
+    for (auto const& ref : refs)
+      top = std::max(top, ref.src_lo + ref.width);
+    auto const type = top <= 8    ? cudf::type_id::UINT8
+                      : top <= 16 ? cudf::type_id::UINT16
+                      : top <= 32 ? cudf::type_id::UINT32
+                                  : cudf::type_id::UINT64;
+    auto output     = frame.memo_column(key);
+    output.adopt(cudf::make_fixed_width_column(cudf::data_type{type},
+                                               packed_view.size(),
+                                               cudf::mask_state::UNALLOCATED,
+                                               frame.stream(),
+                                               frame.mr()));
+    auto status =
+      cudaMemsetAsync(output->mutable_view().head<void>(),
+                      0,
+                      static_cast<std::size_t>(packed_view.size()) * cudf::size_of(output->type()),
+                      frame.stream().value());
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    for (auto const& ref : refs) {
+      launch_bitjoin_field(output->mutable_view(),
                            packed_view,
-                           static_cast<int>(r.dst_lo),
-                           static_cast<int>(r.src_lo),
-                           r.width,
-                           stream.value());
+                           static_cast<int>(ref.dst_lo),
+                           static_cast<int>(ref.src_lo),
+                           ref.width,
+                           frame.stream().value());
     }
-    memo.values[value_id_key(src)] = std::move(field_col);
   }
-  cudaStreamSynchronize(stream.value());
-  return true;
 }
 
-std::unique_ptr<cudf::column> DecodeWalk::materialize_fused_node(NodeId nid,
-                                                                 decode_selection const* node_sel)
+void DecodeWalk::materialize_fused_node(NodeId nid,
+                                        decode_selection const* node_sel,
+                                        decode_column_slot output)
 {
   decode_materialize_fn resolve = [this](NodeId dependency) { return materialize(dependency); };
-  return decode_fused_subtree_impl(tree, nid, resolve, stream, mr, error_out, node_sel);
+  decode_fused_subtree_impl(tree, nid, resolve, frame, output, error_out, node_sel);
 }
 
-// The single decode resolver. Reconstructs and memoises the value(s) node `nid`
-// produces on decode — its input_source(s) — and returns the primary one, keyed
-// by structural (node, port) identity so every consumer and the codegen tail
-// binders share one memo without matching path strings.
 cudf::column const* DecodeWalk::materialize(NodeId nid)
 {
-  PlanNode const& node  = tree.nodes[nid];
-  ValueId const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
-  std::uint64_t const pk = value_id_key(primary);
-  if (auto it = memo.values.find(pk); it != memo.values.end()) {
-    if (!it->second) {
-      if (error_out) {
-        *error_out = "decode: memo value " + value_label(primary) + " was already consumed";
-      }
-      return nullptr;
-    }
-    return it->second.get();
+  auto const& node   = tree.nodes.at(nid);
+  auto const primary = node.input_sources.empty() ? ValueId{nid, 0} : node.input_sources.front();
+  auto const key     = value_id_key(primary);
+  if (frame.contains_memo(key)) {
+    auto* value = frame.find_memo(key);
+    if (!value)
+      throw std::runtime_error("decode: memo value already consumed " + value_label(primary));
+    return value;
   }
-
-  // bitjoin recovers all its input values from one packed leaf.
-  if (node.attrs.bitjoin.has_value()) {
-    if (!decode_bitjoin(nid, tree, memo, stream, mr, error_out)) return nullptr;
-    auto it = memo.values.find(pk);
-    return it != memo.values.end() ? it->second.get() : nullptr;
+  if (node.attrs.bitjoin) {
+    decode_bitjoin(nid, tree, frame);
+    return frame.find_memo(key);
   }
-
-  std::unique_ptr<cudf::column> col;
+  auto output = frame.memo_column(key);
   if (is_codegen_compressor(node.op)) {
-    // Fused op (bitpack/delta/rle/for/zigzag): one JIT kernel inverts the whole
-    // region; tail slots resolve via materialize. Only the region producing
-    // the column's final value may consume the selection.
-    col = materialize_fused_node(nid, selection_applies_to(nid) ? sel : nullptr);
+    materialize_fused_node(nid, selection_applies_to(nid) ? sel : nullptr, output);
   } else if (node.rep) {
-    col = decompress_standalone_representation(node.rep.get(), stream, mr, error_out);
-  } else {
-    // Multi-output non-codegen op (alp/alp_rd/dictionary/bitextract): gather its
-    // outputs in port order (reconstruct matches by name). An output routed to a
-    // child edge is resolved and shared via the memo; a terminal output
-    // decompresses in place.
-    std::vector<std::string> names;
-    std::vector<std::unique_ptr<cudf::column>> outputs;
-    for (std::size_t i = 0; i < node.output_names.size(); ++i) {
-      std::string const& name = node.output_names[i];
-      auto child_it           = std::find_if(node.children.begin(),
-                                   node.children.end(),
-                                   [&](PlanEdge const& e) { return e.channel == name; });
-      if (child_it != node.children.end()) {
-        ValueId const output_value{nid, static_cast<ChannelId>(i)};
-        // Recurse only when the value isn't yet in the memo
-        if (!memo.values.count(value_id_key(output_value))) {
-          if (!materialize(child_it->child)) return nullptr;
-        }
-        auto output = consume_memo_value(output_value, memo, stream, mr, error_out);
-        if (!output) return nullptr;
-        names.push_back(name);
-        outputs.push_back(std::move(output));
-        continue;
-      }
-      auto ch_it = node.channels.find(node.output_paths[i]);
-      if (ch_it == node.channels.end()) continue;  // not produced here
-      if (!ch_it->second) return nullptr;
-      auto c = decompress_standalone_representation(ch_it->second.get(), stream, mr, error_out);
-      if (!c) return nullptr;
-      names.push_back(name);
-      outputs.push_back(std::move(c));
-    }
-    std::string err;
-    auto rep =
-      reconstruct_representation(node.op, names, std::move(outputs), stream, mr, &err, node.meta);
-    if (!rep) {
-      if (error_out) *error_out = err;
-      return nullptr;
-    }
-    // The dictionary rep is fully formed here — keys and indices both — and its
-    // decompress() is the gather we want to skip. Answer the predicate straight
-    // off the keys instead; a nullptr means the rep declined (unexpected index
-    // type, null keys) and we fall through to the ordinary decode + compare.
     if (predicate_applies_to(nid)) {
-      if (auto const* dict = dynamic_cast<dictionary_compressed_representation const*>(rep.get())) {
-        col = dict->decompress_predicate(*pred, stream, mr);
-        if (col) { predicate_resolved = true; }
+      if (auto const* dict =
+            dynamic_cast<dictionary_compressed_representation const*>(node.rep.get())) {
+        predicate_resolved = dict->decompress_predicate(*pred, frame, output);
       }
     }
-    if (!col) { col = decompress_standalone_representation(rep.get(), stream, mr, error_out); }
-    memo.kept.push_back(std::move(rep));
+    if (!output) decode_standalone(*node.rep, frame, output);
+  } else {
+    std::vector<std::string> names;
+    std::vector<decode_column_slot> outputs;
+    names.reserve(node.output_names.size());
+    outputs.reserve(node.output_names.size());
+    for (std::size_t i = 0; i < node.output_names.size(); ++i) {
+      auto const& name = node.output_names[i];
+      auto child       = std::find_if(node.children.begin(),
+                                node.children.end(),
+                                [&](PlanEdge const& edge) { return edge.channel == name; });
+      if (child != node.children.end()) {
+        ValueId const value{nid, static_cast<ChannelId>(i)};
+        if (!frame.contains_memo(value_id_key(value))) materialize(child->child);
+        names.push_back(name);
+        outputs.push_back(consume_memo_value(value, frame));
+      } else {
+        auto channel = node.channels.find(node.output_paths[i]);
+        if (channel == node.channels.end()) continue;
+        if (!channel->second) throw std::runtime_error("decode: missing terminal channel");
+        auto slot = frame.memo_column(value_id_key(ValueId{nid, static_cast<ChannelId>(i)}));
+        if (!slot) decode_standalone(*channel->second, frame, slot);
+        names.push_back(name);
+        outputs.push_back(slot);
+      }
+    }
+    auto& rep = reconstruct_decode_representation(node.op, names, outputs, node.meta, frame);
+    if (predicate_applies_to(nid)) {
+      if (auto const* dict = dynamic_cast<dictionary_compressed_representation const*>(&rep)) {
+        predicate_resolved = dict->decompress_predicate(*pred, frame, output);
+      }
+    }
+    if (!output) decode_standalone(rep, frame, output);
   }
-  if (!col) return nullptr;
-  auto [it, inserted] = memo.values.emplace(pk, std::move(col));
-  (void)inserted;
-  return it->second.get();
+  if (!output) throw std::runtime_error("decode: leaf returned no column");
+  return &output.get();
 }
 
 DecodeWalk::DecodeWalk(PlanTree const& tree,
-                       rmm::cuda_stream_view stream,
-                       rmm::device_async_resource_ref const& mr,
+                       decode_frame& frame,
                        std::string* error_out,
                        decode_predicate const* pred,
                        decode_selection const* sel)
   : tree(tree),
-    stream(stream),
-    mr(mr),
+    frame(frame),
+    stream(frame.stream()),
+    mr(frame.mr()),
     error_out(error_out),
-    pred(pred != nullptr && pred->active() ? pred : nullptr),
-    sel(sel != nullptr && sel->active() ? sel : nullptr),
+    pred(pred && pred->active() ? pred : nullptr),
+    sel(sel && sel->active() ? sel : nullptr),
     sel_target(static_cast<NodeId>(tree.nodes.size()))
 {
-  for (auto const& node : tree.nodes) {
-    for (auto const& src : node.input_sources) {
-      ++memo.remaining_consumers[value_id_key(src)];
-    }
+  for (auto const& node : tree.nodes)
+    for (auto const& source : node.input_sources)
+      ++frame.remaining_consumers[value_id_key(source)];
+  if (!this->pred && (!this->sel || this->sel->compacted())) {
+    frame.terminal_memo(value_id_key(ValueId{0, 0}));
   }
-  if (this->sel != nullptr && this->sel->compacted()) {
-    // Pin the one node whose fused decode consumes the mask. The producer of
-    // the column's final value is whichever node consumes (0,0).
+  if (this->sel && this->sel->compacted()) {
     for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
       auto const& sources = tree.nodes[nid].input_sources;
-      if (sources.empty() || !(sources.front() == ValueId{0, 0})) { continue; }
-      if (this->sel->route != sirius::codegen::decode_route::dict_codes) {
-        sel_target = nid;  // the root region itself.
-      } else {
-        // The dictionary route's consumer is the bitpack region producing the
-        // dictionary's `indices` value, never the dictionary node itself.
-        for (auto const& e : tree.nodes[nid].children) {
-          if (e.channel == "indices") {
-            sel_target = e.child;
+      if (sources.empty() || !(sources.front() == ValueId{0, 0})) continue;
+      if (this->sel->route != sirius::codegen::decode_route::dict_codes)
+        sel_target = nid;
+      else {
+        for (auto const& edge : tree.nodes[nid].children) {
+          if (edge.channel == "indices") {
+            sel_target = edge.child;
             break;
           }
         }
@@ -968,72 +778,90 @@ bool DecodeWalk::selection_applies_to(NodeId nid) const
   return sel != nullptr && nid == sel_target;
 }
 
-std::unique_ptr<cudf::column> DecodeWalk::run()
+void DecodeWalk::run(decode_column_slot output)
 {
-  // The result is the input value (node 0, port 0), produced by whichever op(s)
-  // consume it. Materialize those; fall back to a scan when the root carries no
-  // structural edges (a rep-only tree).
-  std::uint64_t const input_key = value_id_key(ValueId{0, 0});
-  for (auto const& e : tree.nodes[0].children) {
-    if (memo.values.count(input_key)) break;
-    if (!materialize(e.child)) return nullptr;
+  auto const key = value_id_key(ValueId{0, 0});
+  for (auto const& edge : tree.nodes[0].children) {
+    if (frame.find_memo(key)) break;
+    materialize(edge.child);
   }
-  if (!memo.values.count(input_key)) {
-    for (NodeId nid = 1; nid < tree.nodes.size() && !memo.values.count(input_key); ++nid) {
-      bool consumes_input = false;
-      for (auto const& src : tree.nodes[nid].input_sources)
-        if (src.node == 0 && src.channel == 0) consumes_input = true;
-      if (consumes_input && !materialize(nid)) return nullptr;
+  if (!frame.find_memo(key)) {
+    for (NodeId nid = 1; nid < tree.nodes.size() && !frame.find_memo(key); ++nid) {
+      for (auto const& source : tree.nodes[nid].input_sources) {
+        if (source == ValueId{0, 0}) {
+          materialize(nid);
+          break;
+        }
+      }
     }
   }
-
-  auto root_it = memo.values.find(input_key);
-  if (root_it == memo.values.end() || !root_it->second) {
-    if (error_out) *error_out = "decompression completed but 'input' column not reconstructed";
-    return nullptr;
-  }
-  cudaStreamSynchronize(stream.value());
-  auto result = std::move(root_it->second);
-
-  // Generic fallback: a predicate was requested but no rep could answer it off
-  // its compressed form, so the column was decoded in full. Compare here so the
-  // "directive ⇒ BOOL8 result" contract holds for every plan shape — callers
-  // rewrite their filter expression on the strength of it.
-  if (pred != nullptr && !predicate_resolved && result) {
-    auto const bool_t = cudf::data_type{cudf::type_id::BOOL8};
-    std::unique_ptr<cudf::column> mask;
-    for (auto const& value : pred->equals_any) {
-      cudf::string_scalar const needle(value, true, stream);
-      auto hit = cudf::binary_operation(
-        result->view(), needle, cudf::binary_operator::EQUAL, bool_t, stream, mr);
-      mask = mask
-               ? cudf::binary_operation(
-                   mask->view(), hit->view(), cudf::binary_operator::LOGICAL_OR, bool_t, stream, mr)
-               : std::move(hit);
+  auto const* value = frame.find_memo(key);
+  if (!value) throw std::runtime_error("decode: input column was not reconstructed");
+  if (pred && !predicate_resolved) {
+    auto mask            = frame.make_column();
+    auto const bool_type = cudf::data_type{cudf::type_id::BOOL8};
+    for (auto const& text : pred->equals_any) {
+      auto const& needle = frame.keep_scalar(
+        std::make_unique<cudf::string_scalar>(text, true, stream, mr), text.size() + 256);
+      auto hit = frame.make_column();
+      hit.adopt(cudf::binary_operation(
+        value->view(), needle, cudf::binary_operator::EQUAL, bool_type, stream, mr));
+      if (!mask)
+        mask.adopt(frame.release(hit));
+      else {
+        auto combined = frame.make_column();
+        combined.adopt(cudf::binary_operation(
+          mask.view(), hit.view(), cudf::binary_operator::LOGICAL_OR, bool_type, stream, mr));
+        mask = combined;
+      }
     }
-    if (!mask) {
-      if (error_out) *error_out = "decompress: predicate directive carried no values";
-      return nullptr;
-    }
-    cudaStreamSynchronize(stream.value());
-    result = std::move(mask);
+    if (!mask) throw std::runtime_error("decode: predicate has no values");
+    output.adopt(frame.release(mask));
+  } else {
+    output.adopt(frame.release_memo(key));
   }
-
   if (error_out) error_out->clear();
-  return result;
 }
 
 }  // namespace
 
-std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
-                                                   NodeId start_node,
-                                                   decode_materialize_fn const& materialize,
-                                                   rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref const& mr,
-                                                   std::string* error_out)
+namespace {
+
+void validate_plan(PlanTree const& tree)
 {
-  return decode_fused_subtree_impl(tree, start_node, materialize, stream, mr, error_out);
+  if (tree.nodes.empty() || tree.nodes.front().op != "input") {
+    throw std::invalid_argument("decode: tree missing input root");
+  }
+  for (auto const& node : tree.nodes) {
+    if (node.output_names.size() != node.output_paths.size()) {
+      throw std::invalid_argument("decode: output names and paths differ");
+    }
+    for (auto const& edge : node.children)
+      if (edge.child >= tree.nodes.size())
+        throw std::invalid_argument("decode: child out of range");
+    for (auto const& source : node.input_sources) {
+      if (source.node >= tree.nodes.size())
+        throw std::invalid_argument("decode: source out of range");
+      auto const channels =
+        source.node == 0 ? std::size_t{1} : tree.nodes[source.node].output_names.size();
+      if (source.channel >= channels)
+        throw std::invalid_argument("decode: source channel out of range");
+    }
+  }
+  std::vector<std::uint8_t> visited(tree.nodes.size());
+  std::function<void(NodeId)> visit = [&](NodeId nid) {
+    if (visited[nid] == 1) throw std::invalid_argument("decode: cyclic plan");
+    if (visited[nid] == 2) return;
+    visited[nid] = 1;
+    for (auto const& edge : tree.nodes[nid].children)
+      visit(edge.child);
+    visited[nid] = 2;
+  };
+  for (NodeId nid = 0; nid < tree.nodes.size(); ++nid)
+    visit(nid);
 }
+
+}  // namespace
 
 namespace {
 // Defined alongside probe_column below; used by decompress_column's route
@@ -1052,112 +880,93 @@ std::optional<str_split_shape> locate_str_split_shape(PlanTree const& tree);
 // or variable-width keys take the general route. The caller owns key-width
 // measurement, keys_chars extraction, the analytic offsets (j * width), and
 // the strings assembly — the kernel itself emits only the compacted chars.
-// Returns nullptr when the fast path does not apply or the launch declines;
-// nothing shared is mutated, so the caller falls through to the general route.
-std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
-                                                        decode_selection const& sel,
-                                                        rmm::cuda_stream_view stream,
-                                                        rmm::device_async_resource_ref mr)
+// Returns false only when this shape is unsupported. Execution failures throw;
+// nothing shared is mutated before a semantic decline.
+bool try_dict_gather_fast_path(PlanTree const& tree,
+                               decode_selection const& sel,
+                               DecodeWalk& walk,
+                               decode_frame& frame,
+                               decode_column_slot output)
 {
-  NodeId const dict_nid = root_value_producer(tree);
-  if (dict_nid >= tree.nodes.size()) { return nullptr; }
-  PlanNode const& dict_node = tree.nodes[dict_nid];
-
-  // Key channels must be terminal (identity-stored): a child edge on either
-  // means compressed keys — general route.
-  compressed_representation const* keys_offsets_rep = nullptr;
-  compressed_representation const* keys_chars_rep   = nullptr;
-  for (std::size_t i = 0; i < dict_node.output_names.size(); ++i) {
-    std::string const& name = dict_node.output_names[i];
-    if (name != "keys_offsets" && name != "keys_chars") { continue; }
-    for (auto const& e : dict_node.children) {
-      if (e.channel == name) { return nullptr; }
+  auto const dict_nid = root_value_producer(tree);
+  if (dict_nid >= tree.nodes.size()) return false;
+  auto const& node = tree.nodes[dict_nid];
+  std::optional<decode_column_slot> offsets;
+  std::optional<decode_column_slot> chars;
+  for (std::size_t i = 0; i < node.output_names.size(); ++i) {
+    auto const& name = node.output_names[i];
+    if (name != "keys_offsets" && name != "keys_chars") continue;
+    if (std::any_of(node.children.begin(), node.children.end(), [&](auto const& edge) {
+          return edge.channel == name;
+        }))
+      return false;
+    auto it = node.channels.find(node.output_paths[i]);
+    if (it == node.channels.end() || !it->second) return false;
+    auto slot = frame.memo_column(value_id_key(ValueId{dict_nid, static_cast<ChannelId>(i)}));
+    if (!slot) decode_standalone(*it->second, frame, slot);
+    (name == "keys_offsets" ? offsets : chars) = slot;
+  }
+  if (!offsets || !chars || (*offsets)->type().id() != cudf::type_id::INT32 ||
+      (*offsets)->size() < 2 || (*offsets)->null_count() != 0 ||
+      (*chars)->type().id() != cudf::type_id::UINT8 || (*chars)->null_count() != 0)
+    return false;
+  auto host = frame.host_array<std::int32_t>((*offsets)->size());
+  frame.read_bytes(host.data(), offsets->view().head<void>(), host.size_bytes());
+  auto const width = host[1] - host[0];
+  if (width <= 0) return false;
+  for (std::size_t i = 2; i < host.size(); ++i)
+    if (host[i] - host[i - 1] != width) return false;
+  auto codes_nid = static_cast<NodeId>(tree.nodes.size());
+  for (auto const& edge : node.children)
+    if (edge.channel == "indices") codes_nid = edge.child;
+  if (codes_nid >= tree.nodes.size()) return false;
+  std::string error;
+  decode_materialize_fn resolve = [&walk](NodeId nid) { return walk.materialize(nid); };
+  auto region = bind_fused_region(tree, codes_nid, resolve, frame.stream(), frame.mr(), &error);
+  if (!region) throw std::runtime_error(error);
+  auto const survivors = static_cast<cudf::size_type>(sel.survivor_count);
+  auto const& init     = frame.keep_scalar(
+    std::make_unique<cudf::numeric_scalar<std::int32_t>>(0, true, frame.stream(), frame.mr()), 512);
+  auto const& step = frame.keep_scalar(
+    std::make_unique<cudf::numeric_scalar<std::int32_t>>(width, true, frame.stream(), frame.mr()),
+    512);
+  auto out_offsets = frame.make_column();
+  out_offsets.adopt(cudf::sequence(survivors + 1, init, step, frame.stream(), frame.mr()));
+  auto& out_chars = frame.allocate_output_buffer(static_cast<std::size_t>(survivors) * width);
+  auto* char_data = out_chars.data();
+  struct assembly_owners {
+    std::vector<std::unique_ptr<cudf::column>> children{1};
+    rmm::device_buffer chars;
+  } owned;
+  struct failed_assembly_drain {
+    rmm::cuda_stream_view stream;
+    int exceptions = std::uncaught_exceptions();
+    ~failed_assembly_drain()
+    {
+      if (std::uncaught_exceptions() > exceptions) stream.synchronize_no_throw();
     }
-    auto it = dict_node.channels.find(dict_node.output_paths[i]);
-    if (it == dict_node.channels.end() || !it->second) { return nullptr; }
-    (name == "keys_offsets" ? keys_offsets_rep : keys_chars_rep) = it->second.get();
+  } drain{frame.stream()};
+  owned.children[0] = frame.release(out_offsets);
+  owned.chars       = std::move(out_chars);
+  output.adopt(std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
+                                              survivors,
+                                              std::move(owned.chars),
+                                              rmm::device_buffer{},
+                                              0,
+                                              std::move(owned.children)));
+  if (survivors != 0) {
+    launch_decode_fused_tree_dict_gather(*region->built.tree,
+                                         region->labeled,
+                                         region->dtype,
+                                         region->num_rows,
+                                         *sel.mask,
+                                         row_enumeration{},
+                                         chars->view().head<void>(),
+                                         width,
+                                         char_data,
+                                         frame);
   }
-  if (keys_offsets_rep == nullptr || keys_chars_rep == nullptr) { return nullptr; }
-
-  std::string err;
-  auto keys_offsets = decompress_standalone_representation(keys_offsets_rep, stream, mr, &err);
-  if (!keys_offsets || keys_offsets->type().id() != cudf::type_id::INT32 ||
-      keys_offsets->size() < 2 || keys_offsets->null_count() != 0) {
-    return nullptr;
-  }
-  auto keys_chars = decompress_standalone_representation(keys_chars_rep, stream, mr, &err);
-  if (!keys_chars || keys_chars->type().id() != cudf::type_id::UINT8 ||
-      keys_chars->null_count() != 0) {
-    return nullptr;
-  }
-
-  // Key-width measurement: D2H the K+1 offsets (small — a dictionary's key
-  // count) on the decode stream, then require a constant width. The
-  // unfiltered path pays an equivalent lazy probe inside dictionary decompress
-  // (constant_key_width), so this adds no new sync class; a plan-side cache is
-  // a follow-up (needs a mutable PlanNode slot).
-  auto const n_offsets = static_cast<std::size_t>(keys_offsets->size());
-  std::vector<std::int32_t> host_offsets(n_offsets);
-  if (cudaMemcpyAsync(host_offsets.data(),
-                      keys_offsets->view().head<void>(),
-                      n_offsets * sizeof(std::int32_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess ||
-      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    return nullptr;
-  }
-  std::int32_t const width = host_offsets[1] - host_offsets[0];
-  if (width < 1) { return nullptr; }
-  for (std::size_t i = 2; i < n_offsets; ++i) {
-    if (host_offsets[i] - host_offsets[i - 1] != width) { return nullptr; }
-  }
-
-  // Bind the codes (indices) region; entropy tails resolve through a local
-  // walk whose memo owns them across the synchronous launch.
-  NodeId codes_nid = static_cast<NodeId>(tree.nodes.size());
-  for (auto const& e : dict_node.children) {
-    if (e.channel == "indices") {
-      codes_nid = e.child;
-      break;
-    }
-  }
-  if (codes_nid >= tree.nodes.size()) { return nullptr; }
-  DecodeWalk tail_walk{tree, stream, mr, &err, nullptr, nullptr};
-  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
-    return tail_walk.materialize(dependency);
-  };
-  auto region = bind_fused_region(tree, codes_nid, resolve, stream, mr, &err);
-  if (!region) { return nullptr; }
-
-  auto const survivors = sel.survivor_count;
-  rmm::device_buffer out_chars(
-    static_cast<std::size_t>(survivors) * static_cast<std::size_t>(width), stream, mr);
-  if (!launch_decode_fused_tree_dict_gather(*region->built.tree,
-                                            region->labeled,
-                                            region->dtype,
-                                            static_cast<std::int64_t>(region->num_rows),
-                                            *sel.mask,
-                                            row_enumeration{},
-                                            keys_chars->view().head<void>(),
-                                            width,
-                                            out_chars.data(),
-                                            stream)) {
-    return nullptr;  // render/launch declined — general route still serves this batch
-  }
-
-  // Analytic offsets (j * width) + zero-copy chars wrap. The launcher synced;
-  // sync again after the sequence so the caller may free/rebind immediately.
-  cudf::numeric_scalar<std::int32_t> const init(0, true, stream);
-  cudf::numeric_scalar<std::int32_t> const step(width, true, stream);
-  auto offsets =
-    cudf::sequence(static_cast<cudf::size_type>(survivors + 1), init, step, stream, mr);
-  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
-                                       std::move(offsets),
-                                       std::move(out_chars),
-                                       0,
-                                       rmm::device_buffer(0, stream, mr));
-  cudaStreamSynchronize(stream.value());
-  return col;
+  return true;
 }
 
 // Masked str_split decode for `str_split -> {offsets: bitpack, chars: raw}`
@@ -1174,112 +983,191 @@ std::unique_ptr<cudf::column> try_dict_gather_fast_path(PlanTree const& tree,
 //     the RAW parked chars buffer into the compacted chars at the scan's
 //     destination offsets; the caller assembles via cudf::make_strings_column, with
 //     the scan output doubling as the strings offsets column.
-std::unique_ptr<cudf::column> try_str_split_path(PlanTree const& tree,
-                                                 decode_selection const& sel,
-                                                 rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr,
-                                                 std::string* error_out)
+void decode_str_split_selected(PlanTree const& tree,
+                               decode_selection const& sel,
+                               DecodeWalk& walk,
+                               decode_frame& frame,
+                               decode_column_slot output)
 {
   auto const shape = locate_str_split_shape(tree);
-  if (!shape) {
-    if (error_out) *error_out = "decompress: str_split plan shape not supported for masked decode";
-    return nullptr;
+  if (!shape) throw std::invalid_argument("decode: unsupported selected str_split shape");
+  auto const channels = shape->chars_rep->named_channels(frame.stream());
+  if (channels.empty() || channels.front().view.type().id() != cudf::type_id::UINT8) {
+    throw std::invalid_argument("decode: selected str_split requires raw UINT8 chars");
   }
-  compressed_representation const* chars_rep = shape->chars_rep;
-  NodeId const offsets_nid                   = shape->offsets_nid;
-  auto const chars_channels                  = chars_rep->named_channels(stream);
-  if (chars_channels.empty() || chars_channels.front().view.type().id() != cudf::type_id::UINT8) {
-    if (error_out) *error_out = "decompress: str_split chars channel is not raw UINT8";
-    return nullptr;
+  auto const chars = channels.front().view;
+  std::string error;
+  decode_materialize_fn resolve = [&walk](NodeId nid) { return walk.materialize(nid); };
+  auto region =
+    bind_fused_region(tree, shape->offsets_nid, resolve, frame.stream(), frame.mr(), &error);
+  if (!region) throw std::runtime_error(error);
+  if (region->num_rows != sel.mask->num_rows + 1) {
+    throw std::invalid_argument("decode: selected string mask does not match the row domain");
   }
-  cudf::column_view const chars_view = chars_channels.front().view;
-
-  // Bind the offsets subtree; entropy tails resolve through a local walk
-  // whose memo owns them across the synchronous launches.
-  std::string tail_err;
-  DecodeWalk tail_walk{tree, stream, mr, &tail_err, nullptr, nullptr};
-  decode_materialize_fn resolve = [&tail_walk](NodeId dependency) {
-    return tail_walk.materialize(dependency);
-  };
-  auto region = bind_fused_region(tree, offsets_nid, resolve, stream, mr, error_out);
-  if (!region) { return nullptr; }
-
-  auto const survivors       = sel.survivor_count;
-  auto const num_string_rows = sel.mask->num_rows;
-
-  auto lengths = cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
-                                               static_cast<cudf::size_type>(survivors + 1),
-                                               cudf::mask_state::UNALLOCATED,
-                                               stream,
-                                               mr);
-  rmm::device_buffer src_offsets(
-    static_cast<std::size_t>(survivors) * sizeof(std::int64_t), stream, mr);
+  auto const survivors = static_cast<cudf::size_type>(sel.survivor_count);
+  auto lengths         = frame.make_column();
+  lengths.adopt(cudf::make_fixed_width_column(cudf::data_type{cudf::type_id::INT32},
+                                              survivors + 1,
+                                              cudf::mask_state::UNALLOCATED,
+                                              frame.stream(),
+                                              frame.mr()));
+  auto& source_offsets =
+    frame.allocate_buffer(static_cast<std::size_t>(survivors) * sizeof(std::int64_t));
+  auto status = cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
+                                0,
+                                sizeof(std::int32_t),
+                                frame.stream().value());
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
   if (survivors > 0) {
-    // Phase 1 writes [0, survivors); the scan's tail slot must read as zero.
-    cudaMemsetAsync(lengths->mutable_view().data<std::int32_t>() + survivors,
-                    0,
-                    sizeof(std::int32_t),
-                    stream.value());
-    if (!launch_decode_fused_tree_str_split_meta(*region->built.tree,
-                                                 region->labeled,
-                                                 region->dtype,
-                                                 num_string_rows,
-                                                 *sel.mask,
-                                                 row_enumeration{},
-                                                 static_cast<std::int64_t*>(src_offsets.data()),
-                                                 lengths->mutable_view().data<std::int32_t>(),
-                                                 stream)) {
-      if (error_out)
-        *error_out = "decompress: masked str_split phase 1 (str_split_meta) launch failed";
-      return nullptr;
+    launch_decode_fused_tree_str_split_meta(*region->built.tree,
+                                            region->labeled,
+                                            region->dtype,
+                                            sel.mask->num_rows,
+                                            *sel.mask,
+                                            row_enumeration{},
+                                            static_cast<std::int64_t*>(source_offsets.data()),
+                                            lengths->mutable_view().data<std::int32_t>(),
+                                            frame);
+  }
+  auto offsets = frame.make_column();
+  offsets.adopt(cudf::scan(lengths.view(),
+                           *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
+                           cudf::scan_type::EXCLUSIVE,
+                           cudf::null_policy::EXCLUDE,
+                           frame.stream(),
+                           frame.mr()));
+  auto const total_chars = frame.read_scalar(offsets.view().data<std::int32_t>() + survivors);
+  if (total_chars < 0) throw std::runtime_error("decode: selected string size overflow");
+  auto const* offset_data = offsets.view().data<std::int32_t>();
+  auto& output_chars      = frame.allocate_output_buffer(static_cast<std::size_t>(total_chars));
+  auto* destination       = output_chars.data();
+  output.adopt(cudf::make_strings_column(
+    survivors, frame.release(offsets), std::move(output_chars), 0, rmm::device_buffer{}));
+  if (survivors > 0 && total_chars > 0) {
+    launch_masked_char_copy(chars.head<void>(),
+                            static_cast<std::int64_t const*>(source_offsets.data()),
+                            offset_data,
+                            survivors,
+                            destination,
+                            frame);
+  }
+}
+
+}  // namespace
+
+validated_selection::validated_selection(PlanTree const& plan, decode_selection const& selection)
+  : selection_(selection)
+{
+  validate_plan(plan);
+  namespace sc = sirius::codegen;
+  if (!selection.active() || (selection.mask != nullptr) == (selection.rows != nullptr)) {
+    throw std::invalid_argument("decode: selection requires exactly one active row source");
+  }
+  if (selection.route != sc::decode_route::full &&
+      selection.route != probe_column(plan).compact_route) {
+    throw std::invalid_argument("decode: requested route does not match the plan");
+  }
+  if (selection.rows) {
+    if (selection.route != sc::decode_route::bitpack_mask || selection.rows->num_rows < 0 ||
+        selection.rows->num_rows > std::numeric_limits<cudf::size_type>::max() ||
+        !selection.rows->valid() || selection.rows->num_survivors != selection.survivor_count) {
+      throw std::invalid_argument("decode: invalid compacted chunk row set");
     }
   } else {
-    cudaMemsetAsync(lengths->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
-  }
-
-  // Exclusive-sum scan -> destination offsets; doubles as the strings
-  // offsets column (cudf layout: survivors+1 entries, last = total chars).
-  auto out_offsets         = cudf::scan(lengths->view(),
-                                *cudf::make_sum_aggregation<cudf::scan_aggregation>(),
-                                cudf::scan_type::EXCLUSIVE,
-                                cudf::null_policy::EXCLUDE,
-                                stream,
-                                mr);
-  std::int32_t total_chars = 0;
-  if (cudaMemcpyAsync(&total_chars,
-                      out_offsets->view().data<std::int32_t>() + survivors,
-                      sizeof(std::int32_t),
-                      cudaMemcpyDeviceToHost,
-                      stream.value()) != cudaSuccess ||
-      cudaStreamSynchronize(stream.value()) != cudaSuccess) {
-    if (error_out) *error_out = "decompress: str_split offsets readback failed";
-    return nullptr;
-  }
-
-  rmm::device_buffer out_chars(static_cast<std::size_t>(total_chars), stream, mr);
-  if (survivors > 0 && total_chars > 0) {
-    if (!launch_masked_char_copy(chars_view.head<void>(),
-                                 static_cast<std::int64_t const*>(src_offsets.data()),
-                                 out_offsets->view().data<std::int32_t>(),
-                                 survivors,
-                                 out_chars.data(),
-                                 stream)) {
-      if (error_out) *error_out = "decompress: masked str_split phase 2 (char copy) launch failed";
-      return nullptr;
+    if (selection.mask->num_rows < 0 ||
+        selection.mask->num_rows > std::numeric_limits<cudf::size_type>::max() ||
+        (selection.mask->num_rows > 0 && !selection.mask->words) ||
+        selection.mask->survivor_count != selection.survivor_count ||
+        selection.survivor_count > selection.mask->num_rows ||
+        (selection.compacted() && !selection.mask->chunk_offsets)) {
+      throw std::invalid_argument("decode: inconsistent selection count or offsets");
+    }
+    auto const root = root_value_producer(plan);
+    bool const uses_indices =
+      !selection.compacted() ||
+      (selection.enumerate_by_index && selection.route == sc::decode_route::bitpack_mask &&
+       selection.survivor_count > 0 && root < plan.nodes.size() &&
+       plan.nodes[root].op == "bitpack" &&
+       selection.survivor_indices.size() == selection.survivor_count);
+    if (uses_indices &&
+        (selection.survivor_indices.type().id() != cudf::type_id::INT32 ||
+         selection.survivor_indices.size() != selection.survivor_count ||
+         selection.survivor_indices.null_count() != 0 ||
+         (selection.survivor_count > 0 && !selection.survivor_indices.data<std::int32_t>()))) {
+      throw std::invalid_argument("decode: survivor indices violate type/shape/null policy");
     }
   }
-  auto col = cudf::make_strings_column(static_cast<cudf::size_type>(survivors),
-                                       std::move(out_offsets),
-                                       std::move(out_chars),
-                                       0,
-                                       rmm::device_buffer(0, stream, mr));
-  // The phase-1 lengths column and src_offsets free on return; the launches
-  // synced above, and make_strings_column launched nothing — sync once more
-  // for the same caller-may-free discipline as the other compacted routes.
-  cudaStreamSynchronize(stream.value());
-  return col;
 }
-}  // namespace
+
+void decode_request(column_decode_request const& request, decode_frame& frame)
+{
+  auto const* predicate = std::get_if<predicate_result>(&request.result);
+  auto const* selection = request.selection ? &request.selection->get() : nullptr;
+  auto const* pred      = predicate ? &predicate->predicate : nullptr;
+  auto output           = frame.output();
+  if (auto const* standalone =
+        std::get_if<std::reference_wrapper<standalone_compressed_representation const>>(
+          &request.source)) {
+    if (predicate || selection)
+      throw std::invalid_argument("standalone request cannot substitute or select");
+    standalone->get().decompress(frame, output);
+    return;
+  }
+  auto const& tree = std::get<std::reference_wrapper<PlanTree const>>(request.source).get();
+  validate_plan(tree);
+  namespace sc = sirius::codegen;
+  if (predicate && !pred->active()) throw std::invalid_argument("decode: empty predicate request");
+  if (predicate && selection && selection->route != sc::decode_route::dict_codes &&
+      selection->route != sc::decode_route::full) {
+    throw std::invalid_argument("decode: predicate selection requires dict_codes or full route");
+  }
+  std::string error;
+  DecodeWalk walk{tree, frame, &error, pred, selection};
+  if (selection && selection->route == sc::decode_route::str_split) {
+    decode_str_split_selected(tree, *selection, walk, frame, output);
+  } else {
+    bool const emitted = selection && selection->route == sc::decode_route::dict_codes &&
+                         !predicate &&
+                         try_dict_gather_fast_path(tree, *selection, walk, frame, output);
+    if (!emitted) {
+      if (selection && !selection->compacted()) {
+        auto full = frame.make_column();
+        walk.run(full);
+        if (full->size() != selection->mask->num_rows)
+          throw std::invalid_argument("decode: full selection mask does not match the row domain");
+        if (full->null_count() != 0)
+          throw std::invalid_argument("decode: selected nullable values unsupported");
+        auto gathered = cudf::gather(cudf::table_view{{full.view()}},
+                                     selection->survivor_indices,
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     frame.stream(),
+                                     frame.mr());
+        auto columns  = gathered->release();
+        output.adopt(std::move(columns.front()));
+      } else {
+        walk.run(output);
+      }
+    }
+  }
+  if (selection && (output->size() != selection->survivor_count || output->null_count() != 0)) {
+    throw std::runtime_error("decode: selected output has wrong size or unsupported nulls");
+  }
+  if (predicate) {
+    if (output->type().id() != cudf::type_id::BOOL8)
+      throw std::runtime_error("decode: predicate is not BOOL8");
+    if (predicate->ballot) {
+      auto const& destination = *predicate->ballot;
+      if (output->size() != destination.num_rows || output->null_count() != 0 ||
+          (destination.num_rows > 0 && !destination.words)) {
+        throw std::invalid_argument("decode: predicate ballot shape/null policy mismatch");
+      }
+      sc::mask_from_bool8(output.view().data<std::uint8_t>(),
+                          destination.num_rows,
+                          destination.words,
+                          frame.stream());
+    }
+  }
+}
 
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 rmm::cuda_stream_view stream,
@@ -1288,151 +1176,30 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 decode_predicate const* pred,
                                                 decode_selection const* sel)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column"};
-
-  if (tree.nodes.empty() || tree.nodes[0].op != "input") {
-    if (error_out) *error_out = "decompress: tree missing input root";
+  nvtx3::scoped_range range{"simpatico::decompress_column"};
+  column_decode_request request{std::cref(tree)};
+  // Translate only documented host validation failures; submitted execution failures propagate.
+  try {
+    validate_plan(tree);
+    if (pred && pred->active()) request.result = predicate_result{*pred, std::nullopt};
+    if (sel && sel->active()) {
+      request.selection.emplace(tree, *sel);
+      if (pred && pred->active() && sel->route != sirius::codegen::decode_route::dict_codes &&
+          sel->route != sirius::codegen::decode_route::full) {
+        throw std::invalid_argument(
+          "decode: predicate selection requires dict_codes or full route");
+      }
+    }
+  } catch (std::invalid_argument const& e) {
+    if (error_out) *error_out = e.what();
     return nullptr;
   }
-
-  namespace sc = sirius::codegen;
-
-  bool const selecting    = sel != nullptr && sel->active();
-  bool const substituting = pred != nullptr && pred->active();
-  // The requested route must be the one this plan actually supports: a
-  // mismatch would silently decode full width where the caller sized the
-  // output from the survivor count.
-  if (selecting && sel->route != probe_column(tree).compact_route) {
-    if (error_out) {
-      *error_out = "decompress: requested decode route does not match the plan's shape";
-    }
-    return nullptr;
-  }
-  // A row set serves the compacted value decode and nothing else yet: the
-  // str_split reconstruct and the dictionary gather read mask words directly,
-  // and `full` compacts through the survivor index list, which a post-join
-  // selection does not carry. Refusing keeps the gap visible; decoding full
-  // width behind the caller's back would turn it into a silent cliff.
-  if (selecting && sel->rows != nullptr && sel->route != sc::decode_route::bitpack_mask) {
-    if (error_out) {
-      *error_out = "decompress: a chunk row set can only drive the bitpack compacted decode";
-    }
-    return nullptr;
-  }
-  if (selecting && substituting && sel->route != sc::decode_route::dict_codes &&
-      sel->route != sc::decode_route::full) {
-    // A predicate answer at a mask-source slot composes only where the
-    // predicate has a compacted meaning: the dictionary route answers it over
-    // the compacted codes, and `full` produces full-width BOOL8 that the
-    // survivor gather compacts. A write-skipping route never materializes the
-    // value to compare, so asking for both is a scheduling bug.
-    if (error_out) {
-      *error_out = "decompress: decode_predicate composes only with the dict_codes or full route";
-    }
-    return nullptr;
-  }
-  if (selecting && sel->route == sc::decode_route::str_split) {
-    // str_split has NO generic fallback: compacted offsets cannot feed the
-    // ordinary str_split reconstruct, so a declined dedicated route must error
-    // (the orchestrator re-runs the batch unfiltered) rather than fall through
-    // to a full-width walk the compacted() belt below would reject anyway.
-    auto col = try_str_split_path(tree, *sel, stream, mr, error_out);
-    if (!col) {
-      if (error_out && error_out->empty()) {
-        *error_out = "decompress: masked str_split decode declined";
-      }
-      return nullptr;
-    }
-    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count || col->null_count() != 0) {
-      if (error_out) {
-        *error_out =
-          "decompress: masked str_split decode returned a non-survivor-sized or null-masked column";
-      }
-      return nullptr;
-    }
-    return col;
-  }
-
-  std::unique_ptr<cudf::column> col;
-  if (selecting && sel->route == sc::decode_route::dict_codes && !substituting) {
-    // Constant-width fast path: the dictionary char-emit kernel replaces the
-    // compacted-codes intermediate + cudf key gather with one launch. A
-    // nullptr (not applicable / launch declined) falls through to the general
-    // dict route — nothing shared was mutated. Skipped under dual delivery:
-    // the caller wants a BOOL8 answer, not strings.
-    col = try_dict_gather_fast_path(tree, *sel, stream, mr);
-  }
-  if (!col) {
-    // A predicate answer composes here without special cases: the dictionary
-    // route reconstructs its rep over the compacted codes, so the existing
-    // answer (decompress_predicate — or run()'s generic decode-and-compare
-    // fallback) is already SURVIVOR-SIZED BOOL8; the `full` route produces
-    // full-width BOOL8 and the gather below compacts it.
-    DecodeWalk walk{tree, stream, mr, error_out, pred, sel};
-    col = walk.run();
-  }
-
-  if (col && selecting && substituting && col->type().id() != cudf::type_id::BOOL8) {
-    // Belt: a predicate directive promises "BOOL8 result" to the
-    // filter-expression rewrite; anything else must fail loudly here rather
-    // than let a strings column meet a bare boolean reference downstream.
-    if (error_out) {
-      *error_out = "decompress: predicate directive under selection returned a non-BOOL8 column";
-    }
-    return nullptr;
-  }
-
-  if (col && selecting && sel->compacted()) {
-    // Belt and braces for the same hazard: whatever comes back from a
-    // compacted-route request must already be survivor-sized (directly from
-    // the mask or index walk; the dictionary route via the key gather over the
-    // compacted codes) and — per the null policy — carry no null mask.
-    if (static_cast<std::int64_t>(col->size()) != sel->survivor_count) {
-      if (error_out) {
-        *error_out = "decompress: compacted decode returned a non-survivor-sized column";
-      }
-      return nullptr;
-    }
-    if (col->null_count() != 0) {
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
-      }
-      return nullptr;
-    }
-  }
-
-  // The `full` route: the walk decoded the column full width exactly as today;
-  // compact it to the batch's survivor rows with one gather over the shared
-  // mask→indices buffer. (Every other route came back survivor-sized from the
-  // masked decode and skips this.)
-  if (col && selecting && !sel->compacted()) {
-    if (col->null_count() != 0) {
-      // Selection targets NOT NULL columns only; refuse rather than risk a
-      // mask/null interaction the selection wave has not modeled.
-      if (error_out) {
-        *error_out = "decompress: selection on a null-masked column is not supported";
-      }
-      return nullptr;
-    }
-    if (static_cast<std::int64_t>(sel->survivor_indices.size()) != sel->survivor_count) {
-      if (error_out) {
-        *error_out = "decompress: survivor_indices size does not match survivor_count";
-      }
-      return nullptr;
-    }
-    // Indices come from the mask→indices kernel and are in-bounds by
-    // construction; skip the bounds pass.
-    auto gathered = cudf::gather(cudf::table_view{{col->view()}},
-                                 sel->survivor_indices,
-                                 cudf::out_of_bounds_policy::DONT_CHECK,
-                                 stream,
-                                 mr);
-    col           = std::move(gathered->release().front());
-    // Same discipline as run(): the caller may free inputs / rebind buffers as
-    // soon as we return, so the gather must have completed.
-    cudaStreamSynchronize(stream.value());
-  }
-  return col;
+  std::array const streams{stream};
+  decode_session session{streams, mr};
+  session.append(std::move(request));
+  auto columns = session.finish();
+  if (error_out) error_out->clear();
+  return std::move(columns.front());
 }
 
 namespace {
@@ -1588,6 +1355,72 @@ column_decode_caps probe_column(PlanTree const& tree)
   return caps;
 }
 
+mask_source_status decode_request(mask_decode_request const& request, decode_frame& frame)
+{
+  validate_plan(request.plan);
+  auto const destination = request.destination;
+  if (destination.num_rows < 0 || (destination.num_rows > 0 && !destination.words)) {
+    throw std::invalid_argument("decode: invalid mask destination");
+  }
+  std::string error;
+  DecodeWalk walk{request.plan, frame, &error, nullptr, nullptr};
+  if (auto const* range = std::get_if<sirius::codegen::range_predicate>(&request.source)) {
+    if (!probe_column(request.plan).can_produce_mask()) {
+      throw std::invalid_argument("decode: plan cannot produce a range ballot");
+    }
+    auto const root               = root_value_producer(request.plan);
+    decode_materialize_fn resolve = [&walk](NodeId dependency) {
+      return walk.materialize(dependency);
+    };
+    auto region =
+      bind_fused_region(request.plan, root, resolve, frame.stream(), frame.mr(), &error);
+    if (!region) throw std::runtime_error(error);
+    if (destination.num_rows != region->num_rows)
+      throw std::invalid_argument("decode: ballot row count mismatch");
+    sirius::codegen::selection_mask mask{destination.words, destination.num_rows, -1, nullptr};
+    if (destination.num_rows > 0) {
+      launch_decode_fused_tree_mask_out(
+        *region->built.tree, region->labeled, region->dtype, region->num_rows, *range, mask, frame);
+    }
+    return mask_source_status::accepted;
+  }
+  auto const& source = std::get<membership_source>(request.source);
+  if (!source.probe) throw std::invalid_argument("decode: empty membership probe");
+  auto keys = frame.make_column();
+  walk.run(keys);
+  if (keys->size() != destination.num_rows) {
+    throw std::invalid_argument("decode: membership key row count mismatch");
+  }
+  auto key_view = keys.view();
+  if (key_view.type() != source.stored_type && cudf::is_fixed_width(key_view.type()) &&
+      cudf::is_fixed_width(source.stored_type) &&
+      cudf::size_of(key_view.type()) == cudf::size_of(source.stored_type)) {
+    key_view = cudf::column_view{source.stored_type,
+                                 key_view.size(),
+                                 key_view.head<void>(),
+                                 key_view.null_mask(),
+                                 key_view.null_count(),
+                                 key_view.offset()};
+  }
+  auto flags = frame.make_column();
+  flags.adopt(source.probe(key_view, frame.stream(), frame.mr()));
+  if (!flags) {
+    auto const bytes = static_cast<std::size_t>(
+                         sirius::codegen::selection_mask::AllocWordsFor(destination.num_rows)) *
+                       sizeof(std::uint32_t);
+    auto status = cudaMemsetAsync(destination.words, 0xff, bytes, frame.stream().value());
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    return mask_source_status::declined;
+  }
+  if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != destination.num_rows ||
+      flags->null_count() != 0) {
+    throw std::invalid_argument("decode: membership flags violate shape/type/null policy");
+  }
+  sirius::codegen::mask_from_bool8(
+    flags.view().data<std::uint8_t>(), destination.num_rows, destination.words, frame.stream());
+  return mask_source_status::accepted;
+}
+
 bool decompress_column_selection_mask(PlanTree const& tree,
                                       sirius::codegen::range_predicate pred,
                                       std::uint32_t* mask_words,
@@ -1595,53 +1428,24 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column_selection_mask"};
-
-  if (tree.nodes.empty() || tree.nodes[0].op != "input") {
-    if (error_out) *error_out = "decompress: tree missing input root";
-    return false;
-  }
-  if (mask_words == nullptr) {
-    if (error_out) *error_out = "decompress: selection mask words buffer is null";
-    return false;
-  }
-  // Locate the root-value producer; only a bitpack-rooted region renders the ballot.
-  NodeId root = tree.nodes.size();
-  for (NodeId nid = 1; nid < tree.nodes.size(); ++nid) {
-    auto const& sources = tree.nodes[nid].input_sources;
-    if (!sources.empty() && sources.front() == ValueId{0, 0}) {
-      root = nid;
-      break;
+  try {
+    validate_plan(tree);
+    if (!mask_words || !probe_column(tree).can_produce_mask()) {
+      throw std::invalid_argument("decode: plan or destination cannot serve range ballot");
     }
-  }
-  if (root >= tree.nodes.size() || tree.nodes[root].op != "bitpack") {
-    if (error_out) {
-      *error_out = "decompress: plan is not bitpack-rooted; cannot decode a selection mask";
-    }
+  } catch (std::invalid_argument const& e) {
+    if (error_out) *error_out = e.what();
     return false;
   }
-
-  // The walk only resolves entropy-tail channels here (no column decode); its
-  // memo owns them through the synchronous mask launch below.
-  DecodeWalk walk{tree, stream, mr, error_out, nullptr, nullptr};
-  decode_materialize_fn resolve = [&walk](NodeId dependency) {
-    return walk.materialize(dependency);
-  };
-  auto region = bind_fused_region(tree, root, resolve, stream, mr, error_out);
-  if (!region) { return false; }
-
-  sirius::codegen::selection_mask mask{};
-  mask.words    = mask_words;
-  mask.num_rows = static_cast<std::int64_t>(region->num_rows);
-  bool const ok = launch_decode_fused_tree_mask_out(*region->built.tree,
-                                                    region->labeled,
-                                                    region->dtype,
-                                                    static_cast<std::int64_t>(region->num_rows),
-                                                    pred,
-                                                    mask,
-                                                    stream);
-  if (!ok && error_out) { *error_out = "decompress: masked (mask-out) decode failed"; }
-  return ok;
+  auto const root = root_value_producer(tree);
+  auto const* rep = node_rep(root, tree);
+  if (!rep) throw std::invalid_argument("decode: range ballot root has no representation");
+  std::array const streams{stream};
+  decode_session session{streams, mr};
+  session.append(mask_decode_request{tree, pred, {mask_words, rep->num_rows}});
+  session.finish();
+  if (error_out) error_out->clear();
+  return true;
 }
 
 std::unique_ptr<cudf::table> compact_scan_filter_output(
@@ -1726,15 +1530,21 @@ std::unique_ptr<cudf::table> compact_scan_filter_output(
         cudf::data_type{cudf::type_id::INT32}, survivors, result.row_indices.data(), nullptr, 0};
       // ONE gather compacts every full-width column of the batch; the indices come
       // from the mask→indices kernel and are in-bounds by construction.
-      auto gathered         = cudf::gather(cudf::table_view{full_views},
-                                   gather_map,
-                                   cudf::out_of_bounds_policy::DONT_CHECK,
-                                   stream,
-                                   mr);
-      auto gathered_columns = gathered->release();
-      // The full-width sources are replaced (freed) right below; their
-      // stream-ordered deallocation is only safe once the gather has read them.
-      cudaStreamSynchronize(stream.value());
+      std::unique_ptr<cudf::table> gathered;
+      std::vector<std::unique_ptr<cudf::column>> gathered_columns;
+      try {
+        gathered         = cudf::gather(cudf::table_view{full_views},
+                                gather_map,
+                                cudf::out_of_bounds_policy::DONT_CHECK,
+                                stream,
+                                mr);
+        gathered_columns = gathered->release();
+        // Complete this cross-column gather phase before replacing its source owners.
+        stream.synchronize();
+      } catch (...) {
+        stream.synchronize_no_throw();
+        throw;
+      }
       for (std::size_t k = 0; k < full_positions.size(); ++k) {
         columns[full_positions[k]] = std::move(gathered_columns[k]);
       }

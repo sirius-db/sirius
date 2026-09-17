@@ -82,11 +82,10 @@ detail::batched_codec_ops const& ans_ops()
 }
 }  // namespace
 
-std::unique_ptr<cudf::column> ans_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+void ans_compressed_representation::decompress(decode_frame& frame, decode_column_slot output) const
 {
-  return detail::nvcomp_decompress_impl(
-    ans_ops(), payload_data(), payload_size(), original_type, num_rows, stream, mr);
+  detail::nvcomp_decompress_impl(
+    ans_ops(), payload_data(), payload_size(), original_type, num_rows, frame, output);
 }
 
 std::unique_ptr<compressed_representation> ans_compressor::compress(

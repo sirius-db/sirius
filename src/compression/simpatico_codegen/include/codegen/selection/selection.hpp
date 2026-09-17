@@ -192,12 +192,12 @@ struct scan_filter_request {
 // per scan: chunks are unclustered, so one such batch predicts the rest and the caller
 // drops row selection from its remaining batches. The orchestrator stays stateless.
 enum class scan_filter_status : uint8_t {
-  refused = 0,               // gate off / nothing requested / a precondition failed
-                             // (no device work was done)
+  refused = 0,               // semantic refusal: gate/precondition, declined sources,
+                             // or unsupported null policy; preparatory work may have completed
   applied              = 1,  // the filtered decode produced the batch
   declined_unselective = 2,  // too many rows survived to pay for compacting; wave-1 cost paid,
                              // ordinary full-width output
-  failed = 3,                // mid-flight failure; full-width output (exceptional)
+  failed = 3,                // filtered execution failed; the call throws, no output is published
 };
 
 // Selection data surviving the converter call, owned by the batch (freed with

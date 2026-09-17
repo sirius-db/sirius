@@ -131,7 +131,7 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
   cje::EncodeKernelSpec spec = cje::render(tree, element_dtype, out.num_chunks);
   jit::CompileOptions opts;
   opts.arch_cc = arch_cc;
-  const jit::CompiledKernel* kernel =
+  const auto kernel =
     jit::KernelCache::instance().get_or_compile_plain(spec.source, spec.entry_symbol, opts);
 
   // Reserve so the per-spec emplace_backs never reallocate `owned` (keeps

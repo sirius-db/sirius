@@ -8,9 +8,8 @@
 
 namespace simpatico {
 
-/// A fixed set of CUDA streams for cross-column parallelism (one column per
-/// worker thread, each on its own stream). Per-column compress/decompress is
-/// single-stream and does not use this.
+/// A fixed set of CUDA streams for calling-thread column submission. Per-column compress/decompress
+/// is single-stream and does not use this.
 struct stream_pool {
   std::vector<cudaStream_t> streams;
 

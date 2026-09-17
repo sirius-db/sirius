@@ -1,17 +1,21 @@
 // Layer-1 decode-side cache smoke test (plain-CUDA renderer).
 //
-// Three properties to pin down:
+// Four properties to pin down:
 //   1. `source_digest` is deterministic and hex-encoded.
 //   2. Two structurally identical rendered sources hit the same cache slot.
 //   3. A different shape gets its own slot.
+//   4. Retained handles keep the CUDA library loaded across cache clear.
 
 #include "codegen/decode/jit/renderer.hpp"
 #include "codegen/jit/fused_tree.hpp"
 #include "codegen/jit/kernel_cache.hpp"
 #include "test_utils.hpp"
 
+#include <cuda.h>
+
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 namespace cdj = codegen::decode::jit;
@@ -68,8 +72,8 @@ int main()
   auto& cache = jit::KernelCache::instance();
   cache.clear();
 
-  const jit::CompiledKernel* k1 = nullptr;
-  double cold_ms                = 0;
+  std::shared_ptr<const jit::CompiledKernel> k1;
+  double cold_ms = 0;
   try {
     cold_ms =
       timed_ms([&] { k1 = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts); });
@@ -85,8 +89,8 @@ int main()
     return report_fail("rendered_source missing simpatico_bp_at decode primitive");
   }
 
-  const jit::CompiledKernel* k2 = nullptr;
-  double warm_ms                = 0;
+  std::shared_ptr<const jit::CompiledKernel> k2;
+  double warm_ms = 0;
   try {
     warm_ms =
       timed_ms([&] { k2 = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts); });
@@ -113,7 +117,7 @@ int main()
     return report_fail("render Delta>Bitpack failed", e.what());
   }
 
-  const jit::CompiledKernel* k3 = nullptr;
+  std::shared_ptr<const jit::CompiledKernel> k3;
   try {
     k3 = cache.get_or_compile_plain(spec_b.source, spec_b.entry_symbol, opts);
   } catch (const std::exception& e) {
@@ -128,7 +132,7 @@ int main()
   } catch (const std::exception& e) {
     return report_fail("render int64 failed", e.what());
   }
-  const jit::CompiledKernel* k4 = nullptr;
+  std::shared_ptr<const jit::CompiledKernel> k4;
   try {
     k4 = cache.get_or_compile_plain(spec_c.source, spec_c.entry_symbol, opts);
   } catch (const std::exception& e) {
@@ -137,9 +141,41 @@ int main()
   if (!k4 || k4 == k1) return report_fail("dtype change did not change cache slot");
   if (cache.size() != 3) return report_fail("cache size != 3 after dtype variant");
 
+  const std::size_t populated_size                  = cache.size();
+  std::weak_ptr<const jit::CompiledKernel> retained = k1;
+  cache.clear();
+  if (cache.size() != 0) return report_fail("cache not empty after clear with retained handles");
+  if (retained.expired()) return report_fail("clear destroyed a retained kernel");
+  CUkernel retained_kernel = nullptr;
+  if (cuLibraryGetKernel(&retained_kernel, k1->library, spec_a.entry_symbol.c_str()) !=
+        CUDA_SUCCESS ||
+      retained_kernel != k1->kern) {
+    return report_fail("retained CUDA library is invalid after clear");
+  }
+
+  std::shared_ptr<const jit::CompiledKernel> replacement;
+  try {
+    replacement = cache.get_or_compile_plain(spec_a.source, spec_a.entry_symbol, opts);
+  } catch (const std::exception& e) {
+    return report_fail(e.what());
+  }
+  if (!replacement || replacement == k1 || cache.size() != 1) {
+    return report_fail("lookup after clear did not create an independent cache entry");
+  }
+  k1.reset();
+  if (retained.expired()) return report_fail("kernel destroyed while second handle is retained");
+  k2.reset();
+  if (!retained.expired()) return report_fail("kernel survived release of its final handle");
+
+  std::weak_ptr<const jit::CompiledKernel> cached = replacement;
+  replacement.reset();
+  if (cached.expired()) return report_fail("cache failed to retain its kernel");
+  cache.clear();
+  if (!cached.expired()) return report_fail("clear retained a kernel without external owners");
+
   std::printf("test_jit_kernel_cache: OK (cold=%.1f ms, warm=%.3f ms, size=%zu)\n",
               cold_ms,
               warm_ms,
-              cache.size());
+              populated_size);
   return 0;
 }

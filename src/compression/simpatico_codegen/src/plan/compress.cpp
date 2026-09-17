@@ -715,6 +715,18 @@ struct single_op_representation : compressed_representation {
     }
     return total;
   }
+
+  std::size_t owned_device_bytes_estimate() const override
+  {
+    auto total = compressed_representation::owned_device_bytes_estimate();
+    if (!plan_tree) return total;
+    for (auto const& node : plan_tree->nodes) {
+      if (node.rep) total += node.rep->owned_device_bytes_estimate();
+      for (auto const& [path, rep] : node.channels)
+        if (rep) total += rep->owned_device_bytes_estimate();
+    }
+    return total;
+  }
 };
 
 }  // namespace

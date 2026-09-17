@@ -84,7 +84,7 @@ std::unique_ptr<compressed_representation> compress_single_op(std::string const&
 
 /// Per-column decode-time row selection
 /// (`SIRIUS_EXP_FUSED_SCAN_FILTER`). Built by the wave-2 orchestrator in
-/// ``decompress_columns_parallel`` AFTER the combine + CNT wave fixed the
+/// table decode orchestration AFTER the combine + CNT wave fixed the
 /// survivor count; never active on the default path (gate off ⇒ callers pass
 /// nullptr and behavior is byte-identical).
 struct decode_selection {
@@ -100,19 +100,20 @@ struct decode_selection {
   cudf::column_view survivor_indices{};
   /// How this column produces its compacted output. One value, so the modes
   /// cannot contradict each other and a plan that supports none of them simply
-  /// takes @c full. Must match @c probe_column(tree).compact_route — a mismatch
-  /// is refused, never silently decoded full width.
+  /// takes @c full. The @c full route is legal on any decodable plan; compacted
+  /// routes must match @c probe_column(tree).compact_route. A mismatch is
+  /// refused, never silently decoded full width.
   ///
   /// @c str_split has NO generic in-walk fallback (compacted offsets cannot
   /// feed the ordinary str_split reconstruct): if its dedicated route declines,
-  /// the call errors and the orchestrator re-runs the batch unfiltered.
+  /// the call reports an error without retrying partially submitted decoding.
   sirius::codegen::decode_route route = sirius::codegen::decode_route::full;
   /// Walk the survivor index list instead of the mask bits — the cheaper
   /// enumeration once few rows survive. Only meaningful for
   /// @c decode_route::bitpack_mask; delta roots IGNORE it (the index walk
   /// rejects them at render) and a dictionary codes region is unaffected. The
-  /// orchestrator populates @c survivor_indices whenever it sets this; any
-  /// anomaly silently keeps the mask walk (the pick is an optimization).
+  /// orchestrator supplies @c survivor_indices; absent/size-mismatched maps use
+  /// the mask walk. An index map that is used must be nonnullable INT32 data.
   bool enumerate_by_index = false;
   /// A selection that arrived AFTER the scan — post-join survivor rows, bucketed
   /// per chunk (codegen/selection/chunk_row_set.hpp). Mutually exclusive with

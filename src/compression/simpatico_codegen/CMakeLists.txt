@@ -123,6 +123,7 @@ add_custom_command(
 
 add_library(
   simpatico STATIC
+  src/decode/decode_session.cpp
   # Generated: CCCL header closure embedded for the runtime JIT.
   "${EMBED_CCCL_HEADERS_OUT}"
   # CUDA kernels: operators + offsets
@@ -220,6 +221,11 @@ function(add_codegen_host_test name)
 endfunction()
 
 add_codegen_host_test(test_compress_with_plan_roundtrip)
+add_codegen_host_test(test_async_decode)
+target_link_options(test_async_decode PRIVATE
+  "-Wl,--wrap=cudaStreamQuery"
+  "-Wl,--wrap=cudaStreamSynchronize")
+add_codegen_host_test(test_scan_filter_session)
 add_codegen_host_test(test_compressed_table_io)
 add_codegen_host_test(test_leaf_describe)
 add_codegen_host_test(test_plan_tree)
@@ -260,6 +266,8 @@ target_link_options(simpatico_cli PRIVATE "-Wl,-rpath,${_SIMPATICO_LIB_DIR}")
 enable_testing()
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
+add_test(NAME async_decode COMMAND test_async_decode)
+add_test(NAME scan_filter_session COMMAND test_scan_filter_session)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
 add_test(NAME leaf_describe COMMAND test_leaf_describe)
 add_test(NAME plan_tree COMMAND test_plan_tree)

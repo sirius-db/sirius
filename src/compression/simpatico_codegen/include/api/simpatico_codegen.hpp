@@ -1,4 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file
+ * @brief Completed compression/decompression APIs for owning Simpatico tables.
+ *
+ * Decompression returns only after the output is ready for use on other streams. Inputs must
+ * already be readable on the supplied stream(s) and remain alive until return. The supplied
+ * resource and streams must outlive allocations that retain them for deallocation. All codecs and
+ * predicate/row-selection routes use `decode_session` on the calling CPU thread. Submission may
+ * wait for required host observations or retained-temporary pressure; the session completes
+ * submitted work before publishing results.
+ */
 #pragma once
 
 #include "codegen/plan/plan_interpreter.hpp"
@@ -91,7 +102,7 @@ compressed_table compress_with_plan(
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
-/// Compress all columns in parallel using @p column_threads worker threads.
+/// Compress all columns using @p column_threads streams from the calling CPU thread.
 ///
 /// `max(1, column_threads)` streams are leased from a process-lifetime internal
 /// cache (never destroyed), so the returned table's buffers are safe to free on
@@ -99,7 +110,7 @@ compressed_table compress_with_plan(
 ///
 /// @param table          Source table.
 /// @param plan_dsl       Multi-column plan DSL string.
-/// @param column_threads Number of parallel CUDA streams / worker threads.
+/// @param column_threads Number of CUDA streams.
 /// @param mr             Device memory resource; nullptr selects the RMM default.
 /// @param column_names   Optional per-column names.
 /// @throws std::runtime_error  plan/table column count mismatch or GPU error.
@@ -110,7 +121,7 @@ compressed_table compress_with_plan(
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
-/// Compress all columns in parallel using a caller-owned stream pool.
+/// Compress all columns using a caller-owned stream pool from the calling CPU thread.
 ///
 /// The pool must remain valid for the duration of the call. Reusing the same
 /// pool across multiple calls is safe and avoids repeated stream allocation.
@@ -142,10 +153,10 @@ std::unique_ptr<cudf::table> decompress(
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress all columns in parallel using @p column_threads worker threads.
+/// Decompress all columns using @p column_threads streams from the calling CPU thread.
 ///
 /// @param table          Compressed table.
-/// @param column_threads Number of parallel CUDA streams / worker threads.
+/// @param column_threads Number of CUDA streams.
 /// @param mr             Device memory resource; nullptr selects the RMM default.
 /// @throws std::runtime_error on GPU error.
 std::unique_ptr<cudf::table> decompress(
@@ -153,7 +164,7 @@ std::unique_ptr<cudf::table> decompress(
   int column_threads,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress all columns in parallel using a caller-owned stream pool.
+/// Decompress all columns using a caller-owned stream pool from the calling CPU thread.
 ///
 /// @param table  Compressed table.
 /// @param pool   Caller-supplied stream pool.
@@ -178,14 +189,14 @@ std::unique_ptr<cudf::table> decompress(
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress a column subset in parallel using @p column_threads worker threads.
+/// Decompress a column subset using @p column_threads streams from the calling CPU thread.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
   int column_threads,
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
-/// Decompress a column subset in parallel using a caller-owned stream pool.
+/// Decompress a column subset using a caller-owned stream pool from the calling CPU thread.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
@@ -238,23 +249,22 @@ std::unique_ptr<cudf::table> decompress(
 /// (non-bitpack filter column, nulls, ...), this is EXACTLY the unfiltered
 /// decompress(table, selected_columns, pool, mr) — same kernels, same
 /// allocations — returned as released columns, and result.applied is false.
-/// result.status refines the applied=false cases: `refused` (no device work),
-/// `declined_unselective` (too many rows survived for compaction to pay off —
-/// the caller should remember this per scan and drop the row selection from its
-/// remaining batches), or `failed` (mid-flight fallback, exceptional).
+/// result.status refines the applied=false cases: `refused` (unsupported request or completed
+/// policy decline), `declined_unselective` (too many rows survived for compaction to pay off — the
+/// caller should remember this per scan and drop the row selection from its remaining batches).
+/// Execution failures set `failed` and propagate their original exception; they are not retried as
+/// ordinary decoding.
 ///
 /// Equality conjuncts answerable off a dictionary ride INSIDE the request
 /// (scan_filter_request::bool8_filters): wave 1 resolves them via the
 /// decode_predicate path, packs the BOOL8 result to mask words and ANDs it into
-/// the batch mask. On ANY non-applied outcome with bool8_filters present, the
-/// rerun is the PREDICATED decompress — those columns come back as BOOL8
+/// the batch mask. On any successful non-applied outcome with bool8_filters
+/// present, the rerun is the PREDICATED decompress — those columns come back as BOOL8
 /// substitution columns exactly like the ordinary pushdown, never a plain
 /// decode (the dictionary win survives every fallback). Callers must therefore
 /// be ready for BOOL8 at those columns whenever result.applied is false.
-/// Assembling the output can itself refuse (a null-masked column, an output
-/// that is neither full width nor survivor-sized): the call then falls back to
-/// the unfiltered decode, sets result.status = failed and writes @p error_out.
-/// A caller never sees a half-filtered batch.
+/// Unsupported nullable selection is an explicit completed policy decline. Malformed output shape
+/// or assembly failures throw; a caller never sees a half-filtered batch.
 ///
 /// Synchronizes @p stream before returning when the filtering applied, so the
 /// caller may free or rebind the inputs immediately.

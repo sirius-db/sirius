@@ -2,6 +2,7 @@
 // Implementation of the low-level (batched) nvcomp codec driver. See the header
 // for the frame format and rationale.
 
+#include "../decode/decode_session.hpp"
 #include "codegen/util/cuda_check.hpp"
 #include "nvcomp_batched_codec.hpp"
 
@@ -190,35 +191,28 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
                               std::size_t /*frame_size*/,
                               void* dst,
                               std::size_t out_bytes,
-                              rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr)
+                              decode_frame& owner)
 {
-  cudaStream_t const s = stream.value();
+  cudaStream_t const s = owner.stream().value();
   if (out_bytes == 0) return;
 
   auto const* fbase = static_cast<std::uint8_t const*>(frame);
 
-  std::uint64_t hdr[2] = {0, 0};
-  throw_if_cuda_error(cudaMemcpyAsync(hdr, fbase, sizeof(hdr), cudaMemcpyDeviceToHost, s),
-                      "D2H frame header");
-  throw_if_cuda_error(cudaStreamSynchronize(s), "sync frame header");
+  auto hdr = owner.host_array<std::uint64_t>(2);
+  owner.read_bytes(hdr.data(), fbase, hdr.size_bytes());
   std::size_t const num_chunks = static_cast<std::size_t>(hdr[0]);
   std::size_t const chunk      = static_cast<std::size_t>(hdr[1]);
   if (num_chunks == 0 || chunk == 0) {
     throw std::runtime_error("nvcomp batched: corrupt frame header");
   }
 
-  std::vector<std::size_t> h_comp_bytes(num_chunks);
-  throw_if_cuda_error(
-    cudaMemcpyAsync(
-      h_comp_bytes.data(), fbase + 16, num_chunks * sizeof(std::size_t), cudaMemcpyDeviceToHost, s),
-    "D2H comp sizes");
-  throw_if_cuda_error(cudaStreamSynchronize(s), "sync comp sizes");
+  auto h_comp_bytes = owner.host_array<std::size_t>(num_chunks);
+  owner.read_bytes(h_comp_bytes.data(), fbase + 16, h_comp_bytes.size_bytes());
 
   std::size_t const header = align_up(16 + num_chunks * sizeof(std::size_t), kFrameAlign);
-  std::vector<void const*> h_comp_ptrs(num_chunks);
-  std::vector<std::size_t> h_uncomp_bytes(num_chunks);
-  std::vector<void*> h_uncomp_ptrs(num_chunks);
+  auto h_comp_ptrs         = owner.host_array<void const*>(num_chunks);
+  auto h_uncomp_bytes      = owner.host_array<std::size_t>(num_chunks);
+  auto h_uncomp_ptrs       = owner.host_array<void*>(num_chunks);
   auto* d            = static_cast<std::uint8_t*>(dst);
   std::size_t cursor = header;
   for (std::size_t i = 0; i < num_chunks; ++i) {
@@ -241,7 +235,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   std::size_t const off_uncomp_ptrs  = off_uncomp_bytes + sz_size;
   std::size_t const off_actual       = off_uncomp_ptrs + sz_ptr;
   std::size_t const off_statuses     = off_actual + sz_size;
-  rmm::device_buffer meta(off_statuses + sz_stat, stream, mr);
+  auto& meta                         = owner.allocate_buffer(off_statuses + sz_stat);
   auto* const meta_base      = static_cast<std::uint8_t*>(meta.data());
   void* const d_comp_ptrs    = meta_base + off_comp_ptrs;
   void* const d_comp_bytes   = meta_base + off_comp_bytes;
@@ -276,7 +270,7 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
   std::size_t temp_bytes = 0;
   check(ops.decompress_get_temp_size(num_chunks, chunk, &temp_bytes, out_bytes),
         "decompress_get_temp_size");
-  rmm::device_buffer temp(temp_bytes, stream, mr);
+  auto& temp = owner.allocate_buffer(temp_bytes);
 
   check(ops.decompress_async(static_cast<void const* const*>(d_comp_ptrs),
                              static_cast<std::size_t const*>(d_comp_bytes),
@@ -289,7 +283,6 @@ void batched_decompress_bytes(batched_codec_ops const& ops,
                              static_cast<nvcompStatus_t*>(d_statuses),
                              s),
         "decompress_async");
-  throw_if_cuda_error(cudaStreamSynchronize(s), "sync after decompress");
 }
 
 }  // namespace detail

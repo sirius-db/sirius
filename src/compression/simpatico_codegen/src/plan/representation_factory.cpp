@@ -10,12 +10,14 @@
 // ``bitextract_<spec>`` prefix) to the matching subclass factory. Every place
 // that has raw stored channels and needs a typed rep funnels through here.
 
+#include "../decode/decode_session.hpp"
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/null_mask.hpp>
 
@@ -24,13 +26,53 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace simpatico {
+
+std::size_t compressed_representation::owned_device_bytes_estimate() const
+{
+  std::size_t bytes = 0;
+  for (auto const& column : channels_)
+    if (column) bytes += column->alloc_size();
+  return bytes;
+}
+
+std::size_t dictionary_compressed_representation::owned_device_bytes_estimate() const
+{
+  auto bytes = compressed_representation::owned_device_bytes_estimate();
+  for (auto const* column : {dict_column.get(),
+                             keys_chars_copy.get(),
+                             keys_offsets_synth.get(),
+                             indices_synth.get(),
+                             null_mask_copy.get()})
+    if (column) bytes += column->alloc_size();
+  return bytes;
+}
+
+std::size_t bitextract_compressed_representation::owned_device_bytes_estimate() const
+{
+  auto bytes = compressed_representation::owned_device_bytes_estimate();
+  for (auto const& column : fields)
+    if (column) bytes += column->alloc_size();
+  return bytes;
+}
+
+std::size_t codegen_fused_representation::owned_device_bytes_estimate() const
+{
+  auto bytes = compressed_representation::owned_device_bytes_estimate();
+  for (auto const& [name, column] : buffers)
+    if (column) bytes += column->alloc_size();
+  return bytes;
+}
+
 namespace {
 
 // Synchronous device->host read issued on `stream`. Use this instead of a plain
@@ -220,7 +262,7 @@ std::unique_ptr<compressed_representation> dictionary_compressed_representation:
       : cudf::make_dictionary_column(std::move(keys_strings), std::move(indices), stream, mr);
   // Indices, keys, and chars are then obtained as views from this column via
   // get_dictionary_child_view(dict_col->view(), ...) / dictionary_column_view.
-  return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
+  return from_encoded_column(std::move(dict_col), stream, mr);
 }
 
 // The four buffers are independent leaves that may each be further compressed
@@ -622,6 +664,347 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
     case OpId::Zigzag: return unsupported();
   }
   return unsupported();
+}
+
+namespace {
+
+void require_decode_channels(std::vector<std::string> const& names,
+                             std::span<decode_column_slot const> outputs,
+                             std::initializer_list<char const*> expected)
+{
+  if (names.size() != expected.size() || outputs.size() != expected.size() ||
+      !std::equal(names.begin(), names.end(), expected.begin())) {
+    throw std::invalid_argument("decode reconstruction: invalid output channels");
+  }
+}
+
+void adopt_decode_channels(compressed_representation& rep,
+                           std::span<decode_column_slot const> outputs,
+                           decode_frame& frame)
+{
+  rep.channels_.resize(outputs.size());
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    rep.channels_[i] = frame.release(outputs[i]);
+  }
+}
+
+template <typename Rep, typename Meta>
+compressed_representation& make_decode_payload(std::span<decode_column_slot const> outputs,
+                                               leaf_meta_v const& metadata,
+                                               decode_frame& frame)
+{
+  auto const* meta = std::get_if<Meta>(&metadata);
+  if (!meta) { throw std::invalid_argument("decode reconstruction: missing nvCOMP metadata"); }
+  auto const type  = cudf::data_type{static_cast<cudf::type_id>(meta->original_type_id)};
+  auto const bytes = meta->uncompressed_size;
+  auto const rows  = bytes > 0 && cudf::is_fixed_width(type)
+                       ? static_cast<cudf::size_type>(bytes / cudf::size_of(type))
+                       : 0;
+  std::unique_ptr<compressed_representation> owner;
+  if constexpr (std::is_same_v<Meta, leaf_meta::bitcomp>) {
+    owner = std::make_unique<Rep>(type, rows, nullptr, 0, bytes, meta->algorithm);
+  } else if constexpr (std::is_same_v<Meta, leaf_meta::nvcomp_cascaded>) {
+    owner = std::make_unique<Rep>(
+      type, rows, nullptr, 0, bytes, meta->num_deltas, meta->num_RLEs, meta->use_bp);
+  } else {
+    owner = std::make_unique<Rep>(type, rows, nullptr, 0, bytes);
+  }
+  auto& rep = frame.keep_representation(std::move(owner));
+  adopt_decode_channels(rep, outputs, frame);
+  return rep;
+}
+
+/** Drains on assembly failure before the preceding local owner bundle unwinds. */
+class failed_assembly_drain {
+ public:
+  explicit failed_assembly_drain(rmm::cuda_stream_view stream)
+    : stream_(stream), exceptions_(std::uncaught_exceptions())
+  {
+  }
+  ~failed_assembly_drain() noexcept
+  {
+    if (std::uncaught_exceptions() > exceptions_) { stream_.synchronize_no_throw(); }
+  }
+
+ private:
+  rmm::cuda_stream_view stream_;
+  int exceptions_;
+};
+
+void retain_remaining_contents(cudf::column::contents& contents, decode_frame& frame)
+{
+  if (contents.data) { frame.keep_buffer(std::move(*contents.data)); }
+  if (contents.null_mask) { frame.keep_buffer(std::move(*contents.null_mask)); }
+  for (auto& child : contents.children) {
+    if (child) { frame.keep_column(std::move(child)); }
+  }
+}
+
+compressed_representation& make_decode_dictionary(std::span<decode_column_slot const> outputs,
+                                                  bool has_mask,
+                                                  decode_frame& frame)
+{
+  auto const offsets_type = outputs[0]->type().id();
+  if ((offsets_type != cudf::type_id::INT32 && offsets_type != cudf::type_id::INT64) ||
+      outputs[1]->type().id() != cudf::type_id::UINT8) {
+    throw std::invalid_argument("dictionary: invalid key offsets/chars types");
+  }
+  auto const rows         = outputs[2]->size();
+  auto const offsets      = outputs[0]->size();
+  auto const keys         = offsets > 0 ? offsets - 1 : 0;
+  auto const indices_type = outputs[2]->type().id();
+  cudf::type_id signed_type;
+  switch (indices_type) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::UINT8: signed_type = cudf::type_id::INT8; break;
+    case cudf::type_id::INT16:
+    case cudf::type_id::UINT16: signed_type = cudf::type_id::INT16; break;
+    case cudf::type_id::INT32:
+    case cudf::type_id::UINT32: signed_type = cudf::type_id::INT32; break;
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT64: signed_type = cudf::type_id::INT64; break;
+    default: throw std::invalid_argument("dictionary: indices must have integer type");
+  }
+  cudf::size_type explicit_null_count = 0;
+  if (has_mask) {
+    if (outputs[3]->type().id() != cudf::type_id::UINT8 ||
+        static_cast<std::size_t>(outputs[3]->size()) < cudf::bitmask_allocation_size_bytes(rows)) {
+      throw std::invalid_argument("dictionary: invalid null mask channel");
+    }
+    // The host null count determines which mask belongs on the dictionary parent.
+    auto const* bits = reinterpret_cast<cudf::bitmask_type const*>(outputs[3].view().head<void>());
+    explicit_null_count = rows > 0 ? cudf::null_count(bits, 0, rows, frame.stream()) : 0;
+  }
+  if (explicit_null_count > 0 && (outputs[2]->null_count() > 0 || signed_type != indices_type)) {
+    throw std::invalid_argument("dictionary: masked indices must be null-free signed integers");
+  }
+  auto const null_count = explicit_null_count > 0 ? explicit_null_count : outputs[2]->null_count();
+  auto& rep             = static_cast<dictionary_compressed_representation&>(
+    frame.keep_representation(std::make_unique<dictionary_compressed_representation>(nullptr)));
+  rep.num_rows = rows;
+
+  struct assembly_owners {
+    cudf::column::contents chars;
+    cudf::column::contents indices;
+    cudf::column::contents mask;
+    std::vector<std::unique_ptr<cudf::column>> keys_children{1};
+    std::vector<std::unique_ptr<cudf::column>> dict_children{2};
+  } owned;
+  failed_assembly_drain const drain{frame.stream()};
+  // Shapes are validated before transfer. The direct column constructor only moves buffers and
+  // children; unlike the by-value factories, allocation failure leaves these owners in the guarded
+  // bundle.
+  owned.keys_children[0] = frame.release(outputs[0]);
+  owned.chars            = outputs[1]->release();
+  owned.dict_children[cudf::dictionary_column_view::keys_column_index] =
+    std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::STRING},
+                                   keys,
+                                   std::move(*owned.chars.data),
+                                   rmm::device_buffer{},
+                                   0,
+                                   std::move(owned.keys_children));
+  owned.indices = outputs[2]->release();
+  owned.dict_children[cudf::dictionary_column_view::indices_column_index] =
+    std::make_unique<cudf::column>(cudf::data_type{signed_type},
+                                   rows,
+                                   std::move(*owned.indices.data),
+                                   rmm::device_buffer{},
+                                   0,
+                                   std::move(owned.indices.children));
+  if (has_mask) { owned.mask = outputs[3]->release(); }
+  auto& parent_mask = explicit_null_count > 0 ? *owned.mask.data : *owned.indices.null_mask;
+  rep.dict_column   = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::DICTIONARY32},
+                                                   rows,
+                                                   rmm::device_buffer{},
+                                                   std::move(parent_mask),
+                                                   null_count,
+                                                   std::move(owned.dict_children));
+  retain_remaining_contents(owned.chars, frame);
+  retain_remaining_contents(owned.indices, frame);
+  retain_remaining_contents(owned.mask, frame);
+  return rep;
+}
+
+}  // namespace
+
+compressed_representation& reconstruct_decode_representation(
+  std::string const& compressor_name,
+  std::vector<std::string> const& output_names,
+  std::span<decode_column_slot const> outputs,
+  leaf_meta_v const& meta,
+  decode_frame& frame)
+{
+  if (output_names.size() != outputs.size() ||
+      std::any_of(outputs.begin(), outputs.end(), [](auto slot) { return !slot; })) {
+    throw std::invalid_argument("decode reconstruction: missing output channel");
+  }
+  auto const id = op_id_from_name(compressor_name);
+  if (!id) { throw std::invalid_argument("decode reconstruction: unknown compressor"); }
+  if (*id == OpId::Dictionary) {
+    bool const has_mask = !output_names.empty() && output_names.back() == "null_mask";
+    if (has_mask) {
+      require_decode_channels(
+        output_names, outputs, {"keys_offsets", "keys_chars", "indices", "null_mask"});
+    } else {
+      require_decode_channels(output_names, outputs, {"keys_offsets", "keys_chars", "indices"});
+    }
+    return make_decode_dictionary(outputs, has_mask, frame);
+  }
+  if (*id == OpId::Ans || *id == OpId::Snappy || *id == OpId::Lz4 || *id == OpId::Deflate ||
+      *id == OpId::Bitcomp || *id == OpId::NvcompCascaded) {
+    require_decode_channels(output_names, outputs, {"output"});
+    if (outputs[0]->type().id() != cudf::type_id::UINT8) {
+      throw std::invalid_argument("nvCOMP: payload must be UINT8");
+    }
+    switch (*id) {
+      case OpId::Ans:
+        return make_decode_payload<ans_compressed_representation, leaf_meta::ans>(
+          outputs, meta, frame);
+      case OpId::Snappy:
+        return make_decode_payload<snappy_compressed_representation, leaf_meta::snappy>(
+          outputs, meta, frame);
+      case OpId::Lz4:
+        return make_decode_payload<lz4_compressed_representation, leaf_meta::lz4>(
+          outputs, meta, frame);
+      case OpId::Deflate:
+        return make_decode_payload<deflate_compressed_representation, leaf_meta::deflate>(
+          outputs, meta, frame);
+      case OpId::Bitcomp:
+        return make_decode_payload<bitcomp_compressed_representation, leaf_meta::bitcomp>(
+          outputs, meta, frame);
+      case OpId::NvcompCascaded:
+        return make_decode_payload<cascaded_compressed_representation, leaf_meta::nvcomp_cascaded>(
+          outputs, meta, frame);
+      default: break;
+    }
+  }
+  std::unique_ptr<compressed_representation> owner;
+  switch (*id) {
+    case OpId::Identity:
+      if (outputs.size() != 1) { throw std::invalid_argument("identity: expected one channel"); }
+      owner                = std::make_unique<identity_compressed_representation>(nullptr);
+      owner->original_type = outputs[0]->type();
+      owner->num_rows      = outputs[0]->size();
+      break;
+    case OpId::Alp: {
+      require_decode_channels(
+        output_names, outputs, {"integers", "exceptions", "exception_positions", "metadata"});
+      auto const integers   = outputs[0]->type().id();
+      auto const exceptions = outputs[1]->type().id();
+      if (!((integers == cudf::type_id::INT32 && exceptions == cudf::type_id::FLOAT32) ||
+            (integers == cudf::type_id::INT64 && exceptions == cudf::type_id::FLOAT64)) ||
+          outputs[2]->type().id() != cudf::type_id::INT32 ||
+          outputs[3]->type().id() != cudf::type_id::UINT16 ||
+          outputs[1]->size() != outputs[2]->size()) {
+        throw std::invalid_argument("alp: invalid channel types or exception sizes");
+      }
+      owner = std::make_unique<alp_compressed_representation>(outputs[1]->type(),
+                                                              outputs[0]->size(),
+                                                              outputs[3]->size(),
+                                                              nullptr,
+                                                              nullptr,
+                                                              nullptr,
+                                                              nullptr);
+      break;
+    }
+    case OpId::AlpRd: {
+      require_decode_channels(
+        output_names,
+        outputs,
+        {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"});
+      auto const right = outputs[0]->type().id();
+      if ((right != cudf::type_id::UINT32 && right != cudf::type_id::UINT64) ||
+          outputs[1]->type().id() != cudf::type_id::UINT8 ||
+          outputs[2]->type().id() != cudf::type_id::UINT16 ||
+          outputs[3]->type().id() != cudf::type_id::UINT8 || outputs[3]->size() < 1 ||
+          outputs[4]->type().id() != cudf::type_id::UINT16 ||
+          outputs[5]->type().id() != cudf::type_id::INT32 ||
+          outputs[4]->size() != outputs[5]->size() || outputs[0]->size() != outputs[1]->size()) {
+        throw std::invalid_argument("alp_rd: invalid channel types or sizes");
+      }
+      auto const width = frame.read_scalar(outputs[3].view().data<std::uint8_t>());
+      auto const type  = cudf::data_type{right == cudf::type_id::UINT64 ? cudf::type_id::FLOAT64
+                                                                        : cudf::type_id::FLOAT32};
+      owner            = std::make_unique<alp_rd_compressed_representation>(
+        type, outputs[0]->size(), width, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+      break;
+    }
+    case OpId::StrSplit: {
+      bool const has_mask = outputs.size() == 3;
+      if (has_mask) {
+        require_decode_channels(output_names, outputs, {"offsets", "chars", "null_mask"});
+      } else {
+        require_decode_channels(output_names, outputs, {"offsets", "chars"});
+      }
+      auto const off   = outputs[0]->type().id();
+      auto const chars = outputs[1]->type().id();
+      if ((off != cudf::type_id::INT32 && off != cudf::type_id::INT64) ||
+          (chars != cudf::type_id::UINT8 && chars != cudf::type_id::UINT32 &&
+           chars != cudf::type_id::UINT64) ||
+          (has_mask && outputs[2]->type().id() != cudf::type_id::UINT8)) {
+        throw std::invalid_argument("str_split: invalid channel types");
+      }
+      owner = std::make_unique<str_split_compressed_representation>(
+        outputs[0]->size() > 0 ? outputs[0]->size() - 1 : 0, nullptr, nullptr, nullptr);
+      break;
+    }
+    case OpId::Bitextract: {
+      auto const suffix = strip_bitextract_prefix(compressor_name);
+      auto spec         = parse_bitextract_spec(suffix ? *suffix : std::string_view{});
+      if (spec.fields.empty() || spec.fields.size() != outputs.size()) {
+        throw std::invalid_argument("bitextract: invalid field count");
+      }
+      for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (spec.fields[i].name != output_names[i]) {
+          throw std::invalid_argument("bitextract: invalid output name");
+        }
+      }
+      auto& rep = static_cast<bitextract_compressed_representation&>(
+        frame.keep_representation(std::make_unique<bitextract_compressed_representation>(
+          std::move(spec), std::vector<std::unique_ptr<cudf::column>>{})));
+      rep.fields.resize(outputs.size());
+      rep.original_type = rep.spec.output_type;
+      rep.num_rows      = outputs[0]->size();
+      for (std::size_t i = 0; i < outputs.size(); ++i) {
+        rep.fields[i] = frame.release(outputs[i]);
+      }
+      return rep;
+    }
+    default: throw std::invalid_argument("decode reconstruction: unsupported compressor");
+  }
+  auto& rep = frame.keep_representation(std::move(owner));
+  adopt_decode_channels(rep, outputs, frame);
+  return rep;
+}
+
+std::unique_ptr<cudf::column> standalone_compressed_representation::decompress(
+  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+{
+  std::array const streams{stream};
+  decode_session session{streams, mr};
+  session.append(column_decode_request{std::cref(*this)});
+  auto results = session.finish();
+  return std::move(results.front());
+}
+
+void identity_compressed_representation::decompress(decode_frame& frame,
+                                                    decode_column_slot output) const
+{
+  if (channels_.size() != 1 || !channels_[0]) {
+    throw std::invalid_argument("identity decode: missing stored column");
+  }
+  output.adopt(std::make_unique<cudf::column>(*channels_[0], frame.stream(), frame.mr()));
+}
+
+void decode_standalone(compressed_representation const& rep,
+                       decode_frame& frame,
+                       decode_column_slot output)
+{
+  auto const* standalone = dynamic_cast<standalone_compressed_representation const*>(&rep);
+  if (!standalone) {
+    throw std::invalid_argument("decode standalone: representation requires the plan bridge");
+  }
+  standalone->decompress(frame, output);
 }
 
 std::unique_ptr<cudf::column> decompress_standalone_representation(
