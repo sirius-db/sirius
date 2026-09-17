@@ -2289,15 +2289,30 @@ busy only **16–18% of wall** — this is a storage-fed query. Raw `O_DIRECT` r
 from 16 threads measure **24.26 / 24.24 / 24.25 GB/s**, i.e. the disk is constant; Sirius extracts
 18.6 GB/s in the fast mode and 16.5 in the slow one.
 
-**Where the time goes: the pipeline stops feeding the device.** H2D volume is identical (132.7 GB)
-but the delivery rate is not — 27.4 GB/s against 24.4, with the loss concentrated in the first two
-seconds (14.5 vs **10.2 GB/s**) and extra 250 ms buckets with ZERO bytes delivered:
+**Where the time goes: the pipeline stops feeding the device.** Not the link — H2D runs at
+**332.0 GB/s (slow) against 328.8 (fast)** when active, D2H at ~350 and D2D at ~480, i.e. NVLink-C2C
+is healthy and identical in both modes. The H2D engine is busy **0.40 s of 4.84 s, an 8.3% duty
+cycle**; the other 92% it waits. The rates below are therefore PIPELINE delivery (bytes over wall
+clock), not link bandwidth: volume is identical (132.7 GB) and only the pacing differs — 27.4 GB/s
+against 24.4, with the loss concentrated in the first two seconds (14.5 vs **10.2 GB/s**) and extra
+250 ms buckets delivering ZERO bytes:
 
     GB per 250 ms, slow:  1.8  0.0  4.1  1.9  2.1  6.3  1.1  3.1  8.4  0.0  8.4 ...
     GB per 250 ms, fast:  1.8  2.1  3.9  0.0  4.2  4.2  5.8  6.9  6.3  4.2  7.6 ...
 
 GPU-busy bucketed over the query shows the same shape: identical total busy (1887 vs 1858 ms) with
 the low-utilisation ingest phase stretched by ~600 ms.
+
+**A third of the H2D traffic is spill repatriation, not input.** The query reads 89.4 GB from disk
+but moves 132.7 GB H2D, and D2H is 43.3 GB: 89.4 + 43.3 = 132.7, matching the downgrade record
+(`to_host: 3 batches / 42.9 GB`). At ~330 GB/s that costs only ~0.25 s of link time, but it is a
+third more traffic than the query's own input.
+
+**The ceiling is the disk, and the interconnect has ~40x the headroom.** 89.4 GB at the measured
+24.25 GB/s is a 3.69 s floor; the fast mode takes 4.81 s, so ~1.1 s is non-overlapped work and the
+slow mode adds ~0.6 s of starvation on top. This is why the H2D rate is identical across modes and
+says nothing about the flip: the defect is that the ingest cannot saturate a 24 GB/s device while
+sitting on a 330 GB/s link.
 
 **Ruled out inside the path, by log diff of a slow run against a fast one:** plan choice and batch
 structure (identical — 37 lineitem batches of `chunks=2 decoded rows=155281854`, `pruned 0/78`
