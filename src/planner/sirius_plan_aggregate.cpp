@@ -340,27 +340,56 @@ static std::optional<dense_count_join_detection> detect_dense_count_join(
                                                        sirius::operator_params const& op_params)
 {
   if (op_params.dense_count_join_max_bytes > 0) { return op_params.dense_count_join_max_bytes; }
-  auto const& manager    = sirius_ctx.get_memory_manager();
-  std::uint64_t capacity = 0;
+  auto const& manager = sirius_ctx.get_memory_manager();
+  // Smallest GPU: a task plans a full-width histogram on whichever device it lands on, so sizing
+  // off the largest admits a histogram the smallest cannot hold.
+  std::optional<std::uint64_t> capacity;
   for (auto const* space : manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
-    if (space != nullptr) { capacity = std::max<std::uint64_t>(capacity, space->get_max_memory()); }
+    if (space == nullptr) { continue; }
+    auto const space_bytes = space->get_max_memory();
+    capacity               = capacity.has_value() ? std::min(*capacity, space_bytes) : space_bytes;
   }
-  if (capacity == 0) { return sirius::config::DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES; }
-  return static_cast<std::uint64_t>(static_cast<double>(capacity) *
+  if (!capacity.has_value() || *capacity == 0) {
+    return sirius::config::DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES;
+  }
+  return static_cast<std::uint64_t>(static_cast<double>(*capacity) *
                                     op_params.dense_count_join_memory_fraction);
+}
+
+/// Slot width `dense_count_layout::plan` would choose; doubles once either side clears UINT32_MAX.
+[[nodiscard]] std::size_t histogram_slot_bytes(std::size_t preserved_rows, std::size_t counted_rows)
+{
+  auto const wide = preserved_rows >= std::numeric_limits<std::uint32_t>::max() ||
+                    counted_rows >= std::numeric_limits<std::uint32_t>::max();
+  return wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
 }
 
 /// Bytes the histogram would need, mirroring dense_count_layout::plan: presence plus counts
 /// over the key range, at a slot width that doubles once either side clears UINT32_MAX rows.
 /// The key range is unknown before execution, so the preserved cardinality stands in for it --
 /// sound for dense keys, and an underestimate for sparse ones that the runtime gate catches.
+/// Used by the planning gate; for what to reserve, see admitted_histogram_bytes.
 [[nodiscard]] std::uint64_t estimated_histogram_bytes(std::size_t preserved_rows,
                                                       std::size_t counted_rows)
 {
-  auto const wide = preserved_rows >= std::numeric_limits<std::uint32_t>::max() ||
-                    counted_rows >= std::numeric_limits<std::uint32_t>::max();
-  auto const slot_bytes = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
-  return sirius::memory::saturating_mul(2 * slot_bytes, preserved_rows);
+  return sirius::memory::saturating_mul(2 * histogram_slot_bytes(preserved_rows, counted_rows),
+                                        preserved_rows);
+}
+
+/// Largest histogram `dense_admits` would still accept, which is what the operator must reserve
+/// for: it allows up to 8 slots per preserved row (and 2 per input row), so the typical estimate
+/// is up to 8x short. Mirroring those caps keeps the reservation tied to the row counts, unlike
+/// the admission ceiling, which reports the whole budget once the input is large.
+[[nodiscard]] std::uint64_t admitted_histogram_bytes(std::size_t preserved_rows,
+                                                     std::size_t counted_rows,
+                                                     std::uint64_t budget)
+{
+  using sirius::memory::saturating_add;
+  using sirius::memory::saturating_mul;
+  auto const slots = std::min(saturating_mul(8, preserved_rows),
+                              saturating_mul(2, saturating_add(preserved_rows, counted_rows)));
+  auto const bytes = saturating_mul(2 * histogram_slot_bytes(preserved_rows, counted_rows), slots);
+  return std::min<std::uint64_t>(budget, bytes);
 }
 
 }  // namespace
@@ -433,8 +462,10 @@ sirius_physical_plan_generator::try_plan_dense_count_join(duckdb::LogicalAggrega
     detection->counted_key_idx,
     detection->counted_value_idx,
     budget,
-    histogram_bytes,
+    // The reservation gets the worst admissible sizing, not the typical one the gate above used.
+    admitted_histogram_bytes(preserved_cardinality, counted_cardinality, budget),
     preserved_cardinality,
+    counted_cardinality,
     op_params.hash_partition_bytes);
   fused->children.push_back(std::move(preserved));
   fused->children.push_back(std::move(counted));

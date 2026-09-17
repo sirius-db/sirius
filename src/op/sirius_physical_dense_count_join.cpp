@@ -218,6 +218,7 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   uint64_t max_bins_bytes,
   uint64_t planned_histogram_bytes,
   uint64_t planned_output_rows,
+  uint64_t planned_counted_rows,
   uint64_t hash_partition_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
@@ -226,7 +227,8 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
     _counted_value_idx(counted_value_idx),
     _max_bins_bytes(max_bins_bytes),
     _planned_histogram_bytes(planned_histogram_bytes),
-    _planned_output_rows(planned_output_rows)
+    _planned_output_rows(planned_output_rows),
+    _planned_counted_rows(planned_counted_rows)
 {
   _hash_partition_bytes = hash_partition_bytes;
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
@@ -467,10 +469,17 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   constexpr std::size_t kSparseGroupFactor = 8;
   auto const avg_batch_bytes =
     stats.num_batches > 0 ? stats.bytes / stats.num_batches : stats.bytes;
-  auto sparse_peak = saturating_add(allocation_floor, avg_batch_bytes);
-  sparse_peak      = saturating_add(
+  // Groups every distinct counted-side key, including unmatched ones that never reach the
+  // output, so output_rows does not bound the hash state.
+  auto const planned_groups =
+    _planned_counted_rows > 0
+      ? saturating_add(static_cast<std::size_t>(_planned_counted_rows), output_rows)
+      : cudf_row_limit;
+  auto const sparse_groups = std::min({planned_groups, stats.bytes / key_width, cudf_row_limit});
+  auto sparse_peak         = saturating_add(allocation_floor, avg_batch_bytes);
+  sparse_peak              = saturating_add(
     sparse_peak,
-    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), output_rows));
+    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), sparse_groups));
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 

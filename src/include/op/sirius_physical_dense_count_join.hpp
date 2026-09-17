@@ -107,11 +107,16 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    *        `std::nullopt` for COUNT(*)
    * @param max_bins_bytes Budget for one partition task's direct-address histograms; the runtime
    *        density and input-size gates may still select sparse aggregation below it
-   * @param planned_histogram_bytes Histogram size the planner computed; 0 leaves the memory
-   *        estimate on the admission ceiling, which is a gate rather than a size
+   * @param planned_histogram_bytes Largest histogram the runtime gate would admit for this plan;
+   *        0 leaves the memory estimate on the admission ceiling, which is a gate rather than a
+   *        size
    * @param planned_output_rows Rows this operator emits, i.e. the preserved child's cardinality,
    *        since a count-join emits one row per distinct preserved key. Not the same as the base
    *        `estimated_cardinality`, which duckdb sets to the join's output size
+   * @param planned_counted_rows The counted child's cardinality. Bounds the sparse path's hash
+   *        state, which groups every distinct counted-side key -- including keys that match
+   *        nothing on the preserved side and so never reach the output. 0 leaves that term on
+   *        the input-bytes ceiling
    * @param hash_partition_bytes Configured per-partition byte target; get_partition_strategy
    *        scales it up, because one task of this operator holds a partition of both inputs and
    *        this operator only ever sees narrow tables
@@ -125,6 +130,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
     uint64_t max_bins_bytes,
     uint64_t planned_histogram_bytes = 0,
     uint64_t planned_output_rows     = 0,
+    uint64_t planned_counted_rows    = 0,
     uint64_t hash_partition_bytes    = config::DEFAULT_HASH_PARTITION_BYTES);
 
   std::string params_to_string() const override;
@@ -266,9 +272,10 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   std::size_t _counted_key_idx;
   std::optional<std::size_t> _counted_value_idx;
   uint64_t _max_bins_bytes;
-  /// Planner's histogram sizing and emitted-row estimate; 0 when unknown.
+  /// Planner's histogram sizing and per-side row estimates; 0 when unknown.
   uint64_t _planned_histogram_bytes{0};
   uint64_t _planned_output_rows{0};
+  uint64_t _planned_counted_rows{0};
   /// Written by every task, read by nothing the operator decides on; see last_strategy().
   std::atomic<strategy> _last_strategy{strategy::NOT_RUN};
   /// Next partition to hand to a task; guarded by the base `lock`.
