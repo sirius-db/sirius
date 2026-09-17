@@ -7,12 +7,12 @@ edition.workspace = true
 collector = ["quent-instrumentation/io-collector"]
 
 [dependencies]
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260", features = ["serde"] }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23", features = ["serde"] }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [build-dependencies]
-quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }

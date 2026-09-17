@@ -13,7 +13,9 @@ use quent_query_engine_ui::{
     DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_ui::{
-    FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
+    FiniteStateMachine, Resource as UiResource, ResourceGroup as UiResourceGroup,
+    ResourceGroupNode, ResourceTree, convert_resource_tree,
+    fsm::FsmTypeDeclaration,
     quantity::{CapacityKind, QuantitySpec},
     timeline::{
         categorical::{
@@ -42,14 +44,11 @@ use tracing::debug;
 #[cfg(not(target_arch = "wasm32"))]
 use quent_analyzer::context::ContextInventory;
 use quent_analyzer::{
-    AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{
-        FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection,
-        events::AnalyzedTransition,
-    },
+    AnalyzerError, AnalyzerResult, Entity, Span,
+    fsm::{FsmUsages, Transition, collection::FsmCollection, native::AnalyzedTransition},
+    ref_tree::RefTreeCollection,
     resource::{
-        ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
-        tree::ResourceTreeNode,
+        ResourceTypeDecl, Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode,
     },
     timeline::binned::{
         categorical::{CategoricalKey, CategoricalTimelineBuilder},
@@ -64,18 +63,16 @@ use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
+pub use crate::boilerplate::{
+    BatchPlacement, BatchPlacementExt, DataBatch, DataBatchExt, Task, TaskExt,
+};
 use crate::{
-    batch_placement::{BatchPlacement, BatchPlacementExt},
-    data_batch::{DataBatch, DataBatchExt},
     model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
-    task::{Task, TaskExt},
     view::SiriusModelQueryView,
 };
 
-pub mod batch_placement;
-pub mod data_batch;
+mod boilerplate;
 pub mod model;
-pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod view;
@@ -415,17 +412,16 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             builder.try_build()?
         };
 
-        let qe = &model.query_engine;
         tracing::info!(
-            workers = qe.workers.len(),
-            query_groups = qe.query_groups.len(),
-            queries = qe.queries.len(),
-            plans = qe.plans.len(),
-            operators = qe.operators.len(),
-            ports = qe.ports.len(),
-            resources = model.sirius_resources.resources.len(),
-            resource_groups = model.sirius_resources.resource_groups.len(),
-            resource_types = model.sirius_resources.resource_types.len(),
+            workers = model.workers.len(),
+            query_groups = model.query_groups.len(),
+            queries = model.queries.len(),
+            plans = model.plans.len(),
+            operators = model.operators.len(),
+            ports = model.ports.len(),
+            resources = model.resources().count(),
+            resource_groups = model.gpu_devices.len() + model.thread_groups.len(),
+            resource_types = model.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
             data_batches = model.data_batches.len(),
@@ -497,14 +493,40 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let resources = view
             .sirius_resources()
-            .map(|resource| (resource.id(), resource.into()))
-            .collect();
+            .map(|resource| {
+                let parent_id = view
+                    .ref_tree_entity(resource.id())?
+                    .parent_id()
+                    .ok_or_else(|| {
+                        AnalyzerError::Validation(format!(
+                            "resource {} is the Reference Tree root",
+                            resource.id()
+                        ))
+                    })?;
+                Ok((
+                    resource.id(),
+                    UiResource::from_analyzed(
+                        resource,
+                        view.resource_instance_name(resource.id())
+                            .unwrap_or_default(),
+                        parent_id,
+                    ),
+                ))
+            })
+            .collect::<AnalyzerResult<_>>()?;
 
         let resource_groups = view
             .sirius_resource_groups()
             .map(|group| {
-                let group: &dyn ResourceGroup = group;
-                (group.id(), group.into())
+                (
+                    group.id(),
+                    UiResourceGroup::from_analyzed(
+                        group,
+                        view.resource_group_instance_name(group.id())
+                            .unwrap_or_default(),
+                        group.parent_id(),
+                    ),
+                )
             })
             .collect();
 
@@ -515,7 +537,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         let resource_group_types = view
             .sirius_resource_group_types()
-            .map(|(name, group_type)| (name.to_string(), group_type.into()))
+            .map(|(name, group_type)| (name.to_string(), group_type.clone()))
             .collect();
 
         let task_decl = Task::fsm_type_declaration();
@@ -549,8 +571,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         debug!("deriving resource tree");
         let engine = view.engine()?;
-        let resource_tree =
-            convert_resource_tree(view.resource_tree()?, &view)?.unwrap_or_else(|| {
+        let resource_tree = convert_resource_tree(ResourceTreeNode::try_new(&view)?, &view)?
+            .unwrap_or_else(|| {
                 ResourceTree::ResourceGroup(ResourceGroupNode {
                     id: EntityRef::Engine(engine.id()),
                     children: vec![],
@@ -634,6 +656,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .is_some_and(|op| query_operators.contains(&op))
                         && data_batch.matches_filter(&operator_filter)
                 },
+                DataBatchExt::try_to_ui_fsm,
                 query,
             ),
             Some(BATCH_PLACEMENT_TYPE_NAME) => entities::list_entities(
@@ -644,6 +667,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .is_some_and(|op| query_operators.contains(&op))
                         && batch.matches_filter(&operator_filter)
                 },
+                BatchPlacementExt::try_to_ui_fsm,
                 query,
             ),
             _ => entities::list_entities(
@@ -652,6 +676,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     task.pipeline_uuid()
                         .is_some_and(|op| query_operators.contains(&op))
                         && task.matches_filter(&operator_filter)
+                },
+                |task, epoch| {
+                    let pipeline_name = task
+                        .pipeline_uuid()
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
+                    task.try_to_ui_fsm(epoch, pipeline_name)
                 },
                 query,
             ),
@@ -797,11 +828,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
                 let fsm_filter = req.app_params;
 
-                // Build the resource tree for this group
-                let tree = ResourceTreeNode::try_new(&view, req.resource_group_id)?;
-                // Collect all leaf resource IDs of the requested type in the tree
+                let resource_tree = ResourceTreeNode::try_new(&view)?;
+                let tree = resource_tree
+                    .find(req.resource_group_id)
+                    .ok_or(AnalyzerError::InvalidId(req.resource_group_id))?;
+                // Collect all resource IDs of the requested type in the tree.
                 let resource_ids: HashSet<Uuid> = tree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -941,7 +974,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let view = self.model.query_view(request.app_params.query_id)?;
         // Prepare resource tree, we'll reuse this as it is potentially
         // expensive to build for every entry.
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         // Prepare builders, resource id filters, and operator filters, one for
         // each bulk entry. After populating this, we'll build a reverse index,
@@ -1153,7 +1186,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .query_engine_model()
             .query_epoch(request.app_params.query_id)?;
         let view = self.model.query_view(request.app_params.query_id)?;
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         let n_configs = request.configs.len();
 
@@ -1399,10 +1432,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // when recording; without them the view is unsupported (HTTP 501).
         let tier_names: HashMap<Uuid, &str> = self
             .model
-            .sirius_resources
             .resources()
             .filter(|r| r.type_name() == MEMORY_TIER_TYPE_NAME)
-            .map(|r| (r.id(), r.instance_name()))
+            .filter_map(|resource| {
+                self.model
+                    .resource_instance_name(resource.id())
+                    .map(|name| (resource.id(), name))
+            })
             .collect();
         if tier_names.is_empty() {
             return Err(AnalyzerError::Unsupported);
@@ -1592,7 +1628,7 @@ impl SiriusUiAnalyzer {
                     .find(rg.resource_group_id)
                     .ok_or(AnalyzerError::InvalidId(rg.resource_group_id))?;
                 let resource_ids: HashSet<Uuid> = subtree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -1647,8 +1683,8 @@ impl SiriusUiAnalyzer {
                 if let Some(task) = self.model.tasks.get(&id) {
                     let pipeline_name = task
                         .pipeline_uuid()
-                        .and_then(|id| self.model.query_engine.operator(id).ok())
-                        .map(|operator| operator.instance_name());
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
                     Some(task.try_to_ui_fsm(epoch, pipeline_name))
                 } else if let Some(db) = self.model.data_batches.get(&id) {
                     Some(db.try_to_ui_fsm(epoch))

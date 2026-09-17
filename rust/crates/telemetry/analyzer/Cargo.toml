@@ -5,15 +5,15 @@ edition.workspace = true
 
 [dependencies]
 sirius-telemetry-store = { path = "../store" }
-quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
-quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
-quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "53cb33a8eec9be623b60d236a01db4052f9bf260" }
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23", features = ["io-msgpack", "io-ndjson", "io-postcard"] }
+quent-time = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
+quent-ui = { git = "https://github.com/rapidsai/quent.git", rev = "fdf836950eab4df71189780b60ed1a5f34013c23" }
 rustc-hash = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }

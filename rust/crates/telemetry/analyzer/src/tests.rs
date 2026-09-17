@@ -3,12 +3,10 @@
 
 //! Tests for Batch ingestion and the data-flow distribution timeline.
 
-use quent_analyzer::{AnalyzerError, fsm::Fsm, resource::collection::ResourceCollection};
+use quent_analyzer::{AnalyzerError, Entity, fsm::Fsm};
 use quent_events::{EntityRef, Event};
 use quent_io::{ExporterOptions, FileSystemExporterOptions, FileSystemFormat};
-use quent_query_engine_analyzer::{
-    QueryEngineModel, model::QueryEvent as NormalizedQueryEvent, ui::UiAnalyzer,
-};
+use quent_query_engine_analyzer::{QueryEngineModel, ui::UiAnalyzer};
 use quent_query_engine_ui::{OperatorFilter, QueryFilter};
 use quent_store::event::{ModelEventStore, filesystem::Store};
 use quent_ui::entities::request::{
@@ -23,10 +21,11 @@ use quent_ui::timeline::{
     },
     response::ResourceTimeline as UiResourceTimeline,
 };
+use quent_ui::{ResourceGroupNode, ResourceTree};
 use sirius_telemetry_store::{self as schema, SiriusEvent};
 use uuid::Uuid;
 
-use crate::{SiriusUiAnalyzer, batch_placement::BatchPlacementExt, model::SiriusModelBuilder};
+use crate::{BatchPlacementExt, SiriusUiAnalyzer, model::SiriusModelBuilder};
 
 /// Nanoseconds; also the timestamp of the query's first transition, so the
 /// query epoch. All batch timestamps below are relative to this.
@@ -71,8 +70,8 @@ fn memory_tier_events(id: Uuid, parent: Uuid, name: &str, bytes: u64) -> Vec<Eve
     )]
 }
 
-/// A minimal engine with one query (two operators), the three memory tiers,
-/// and optionally batch placements:
+/// A minimal engine with one selected query (two operators), the three memory
+/// tiers, and optionally batch placements plus a foreign query pipeline:
 ///
 /// Batch A (pipeline op1, batch_id 7, 1000 bytes), timestamps relative to the
 /// query epoch:
@@ -191,6 +190,49 @@ fn fixture(with_batches: bool) -> Fixture {
 
     if with_batches {
         let port_id = Uuid::from_u128(0x0d);
+        let foreign_pipeline = Uuid::from_u128(0x0e);
+        let foreign_query = Uuid::from_u128(0x10);
+        let foreign_plan = Uuid::from_u128(0x12);
+        events.extend([
+            Event::new(
+                foreign_query,
+                EPOCH,
+                SiriusEvent::Query(schema::QueryEvent::Init {
+                    seq: 0,
+                    instance_name: "foreign query".to_owned(),
+                    query_group_id: EntityRef::new(query_group_id, ()),
+                }),
+            ),
+            Event::new(
+                foreign_query,
+                EPOCH + 50_000,
+                SiriusEvent::Query(schema::QueryEvent::Exit { seq: 1 }),
+            ),
+            Event::new(
+                foreign_plan,
+                EPOCH + 5,
+                SiriusEvent::Plan(schema::PlanEvent::Declaration {
+                    parent: schema::PlanParent {
+                        query_id: EntityRef::new(foreign_query, ()),
+                        plan_id: None,
+                    },
+                    instance_name: "foreign plan".to_owned(),
+                    edges: vec![],
+                    worker_id: Some(EntityRef::new(worker_id, ())),
+                }),
+            ),
+            Event::new(
+                foreign_pipeline,
+                EPOCH + 6,
+                SiriusEvent::Operator(schema::OperatorEvent::Declaration {
+                    plan_id: EntityRef::new(foreign_plan, ()),
+                    parent_operator_ids: vec![],
+                    instance_name: "foreign op".to_owned(),
+                    type_name: "scan".to_owned(),
+                    custom_attributes: Default::default(),
+                }),
+            ),
+        ]);
         events.extend([
             batch_event(
                 batch_a_id,
@@ -251,7 +293,6 @@ fn fixture(with_batches: bool) -> Fixture {
         ]);
 
         // A batch on a pipeline outside the query.
-        let foreign_pipeline = Uuid::from_u128(0x0e);
         events.extend([
             batch_event(
                 batch_b_id,
@@ -446,7 +487,6 @@ fn generated_ndjson_round_trips_through_store_and_analyzer() {
     assert!(analyzer.query_engine_model().engine().is_ok());
     let query = analyzer
         .model
-        .query_engine
         .query(query_id)
         .expect("round-trip query is present");
     let terminal_transition = query
@@ -454,7 +494,7 @@ fn generated_ndjson_round_trips_through_store_and_analyzer() {
         .expect("round-trip query has a terminal transition");
     assert!(matches!(
         &terminal_transition.data,
-        NormalizedQueryEvent::Done { seq: 3 }
+        schema::QueryEvent::Exit { seq: 3 }
     ));
 }
 
@@ -488,19 +528,112 @@ fn ingests_batches_and_memory_tiers() {
         (fixture.host_id, "HOST", 4 << 30),
         (fixture.disk_id, "DISK", 16 << 30),
     ] {
-        let resource = model.resource(id).expect("tier resource exists");
+        let resource = &model.memory_tiers[&id];
         assert_eq!(resource.type_name(), "memory_tier");
         assert_eq!(resource.instance_name(), name);
-        let bounds = &model.sirius_resources.resources[&id].bounds().0;
-        assert_eq!(bounds.len(), 1);
-        assert_eq!(bounds[0].name, "bytes");
-        assert_eq!(bounds[0].value, Some(bytes));
+        assert_eq!(resource.bounds().bytes, bytes);
     }
     assert!(
-        model.sirius_resources.resource_types["memory_tier"]
+        model.resource_types["memory_tier"]
             .used_by
             .contains("batch_placement")
     );
+}
+
+#[test]
+fn query_bundle_preserves_nested_sirius_resource_groups() {
+    fn find_group<'a>(
+        tree: &'a ResourceTree<quent_query_engine_ui::EntityRef>,
+        id: &quent_query_engine_ui::EntityRef,
+    ) -> Option<&'a ResourceGroupNode<quent_query_engine_ui::EntityRef>> {
+        match tree {
+            ResourceTree::ResourceGroup(group) if &group.id == id => Some(group),
+            ResourceTree::ResourceGroup(group) => group
+                .children
+                .iter()
+                .find_map(|child| find_group(child, id)),
+            ResourceTree::Resource(_) => None,
+        }
+    }
+
+    let mut fixture = fixture(false);
+    let gpu_id = Uuid::from_u128(0x20);
+    let thread_group_id = Uuid::from_u128(0x21);
+    let executor_id = Uuid::from_u128(0x22);
+    fixture.events.extend([
+        Event::new(
+            gpu_id,
+            EPOCH - 700,
+            SiriusEvent::GpuDevice(schema::GpuDeviceEvent::Declaration {
+                instance_name: "GPU 0".to_owned(),
+                parent_group_id: EntityRef::new(fixture.engine_id, ()),
+                ordinal: 0,
+            }),
+        ),
+        Event::new(
+            thread_group_id,
+            EPOCH - 600,
+            SiriusEvent::ThreadGroup(schema::ThreadGroupEvent::Declaration {
+                instance_name: "GPU 0 executors".to_owned(),
+                parent_group_id: EntityRef::new(gpu_id, ()),
+                engine_id: EntityRef::new(fixture.engine_id, ()),
+            }),
+        ),
+        Event::new(
+            executor_id,
+            EPOCH - 500,
+            SiriusEvent::ExecutorThread(schema::ExecutorThreadEvent::Declaration {
+                instance_name: "executor 0".to_owned(),
+                parent_group_id: EntityRef::new(thread_group_id, ()),
+                engine_id: EntityRef::new(fixture.engine_id, ()),
+            }),
+        ),
+    ]);
+
+    let query_id = fixture.query_id;
+    let analyzer = analyzer(&mut fixture);
+    let bundle = analyzer
+        .query_bundle(query_id)
+        .expect("query bundle is built");
+
+    let gpu = &bundle.entities.resource_groups[&gpu_id];
+    assert_eq!(gpu.instance_name, "GPU 0");
+    assert_eq!(gpu.parent_group_id, Some(fixture.engine_id));
+    let thread_group = &bundle.entities.resource_groups[&thread_group_id];
+    assert_eq!(thread_group.instance_name, "GPU 0 executors");
+    assert_eq!(thread_group.parent_group_id, Some(gpu_id));
+    let executor = &bundle.entities.resources[&executor_id];
+    assert_eq!(executor.instance_name, "executor 0");
+    assert_eq!(executor.parent_group_id, thread_group_id);
+
+    for group_type_name in ["Engine", "GpuDevice", "ThreadGroup"] {
+        assert!(
+            bundle.entities.resource_group_types[group_type_name]
+                .contains_resource_types
+                .contains(&"executor_thread".to_owned())
+        );
+    }
+
+    let gpu_node = find_group(
+        &bundle.resource_tree,
+        &quent_query_engine_ui::EntityRef::ResourceGroup(gpu_id),
+    )
+    .expect("GPU group is in the resource tree");
+    let thread_group_node = gpu_node
+        .children
+        .iter()
+        .find_map(|child| {
+            find_group(
+                child,
+                &quent_query_engine_ui::EntityRef::ResourceGroup(thread_group_id),
+            )
+        })
+        .expect("thread group is nested under the GPU group");
+    assert!(thread_group_node.children.iter().any(|child| matches!(
+        child,
+        ResourceTree::Resource(quent_query_engine_ui::EntityRef::Resource(id))
+            if *id == executor_id
+    )));
 }
 
 #[test]
@@ -574,6 +707,48 @@ fn nil_application_fsm_ids_return_errors() {
             .try_push(Event::new(Uuid::nil(), EPOCH, event))
             .expect_err("nil application FSM ids are rejected");
         assert!(matches!(error, AnalyzerError::Validation(_)));
+    }
+}
+
+#[test]
+fn duplicate_resource_declarations_return_errors() {
+    let engine_id = Uuid::from_u128(1);
+    let resource_id = Uuid::from_u128(2);
+    let declaration = |instance_name: &str| {
+        SiriusEvent::Memory(schema::MemoryEvent::Declaration {
+            instance_name: instance_name.to_owned(),
+            parent_group_id: EntityRef::new(engine_id, ()),
+            bounds: schema::MemoryBounds { bytes: 1024 },
+        })
+    };
+
+    let duplicates = [
+        declaration("second declaration"),
+        SiriusEvent::MemoryTier(schema::MemoryTierEvent::Declaration {
+            instance_name: "different resource type".to_owned(),
+            parent_group_id: EntityRef::new(engine_id, ()),
+            bounds: schema::MemoryTierBounds { bytes: 1024 },
+        }),
+    ];
+
+    for duplicate in duplicates {
+        let mut builder = SiriusModelBuilder::try_new(engine_id).expect("model builder is created");
+        builder
+            .try_push(Event::new(
+                resource_id,
+                EPOCH,
+                declaration("first declaration"),
+            ))
+            .expect("first resource declaration is accepted");
+        let error = builder
+            .try_push(Event::new(resource_id, EPOCH + 1, duplicate))
+            .expect_err("duplicate resource declarations are rejected");
+
+        assert!(matches!(
+            error,
+            AnalyzerError::Validation(message)
+                if message == format!("resource {resource_id} has multiple declarations")
+        ));
     }
 }
 

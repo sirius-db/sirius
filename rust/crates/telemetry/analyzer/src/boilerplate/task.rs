@@ -4,20 +4,82 @@
 //! Task FSM analysis types.
 
 use quent_analyzer::{
-    AnalyzerResult, Entity,
+    AnalyzerResult, Entity, RefTreeEntity,
     fsm::{
-        Fsm, FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration, FsmUsages,
-        Transition,
-        events::{AnalyzedTransition, FsmEvents, FsmEventsBuilder},
+        Fsm, FsmUsages, Transition,
+        native::{AnalyzedFsm, AnalyzedFsmBuilder, AnalyzedTransition},
     },
     resource::{Usage, Using},
 };
 use quent_dynamic_attributes::DynamicAttribute;
 use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
-use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
+use quent_ui::{
+    FiniteStateMachine, FsmTransition, FsmUsage,
+    fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
+};
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
+
+fn transition_attributes(event: &schema::TaskEvent) -> Vec<DynamicAttribute> {
+    match event {
+        schema::TaskEvent::Created { pipeline_uuid, .. } => vec![DynamicAttribute::string(
+            "pipeline_uuid",
+            pipeline_uuid.target.to_string(),
+        )],
+        schema::TaskEvent::Routing {
+            preferred_device_id,
+            ..
+        } => vec![DynamicAttribute::i64(
+            "preferred_device_id",
+            *preferred_device_id,
+        )],
+        schema::TaskEvent::Reserving {
+            requested_bytes,
+            input_basis,
+            peak_estimate,
+            bytes_to_materialize,
+            ..
+        } => vec![
+            DynamicAttribute::u64("requested_bytes", *requested_bytes),
+            DynamicAttribute::u64("input_basis", *input_basis),
+            DynamicAttribute::u64("peak_estimate", *peak_estimate),
+            DynamicAttribute::u64("bytes_to_materialize", *bytes_to_materialize),
+        ],
+        schema::TaskEvent::Downgrading {
+            shortfall_bytes,
+            partial_bytes,
+            ..
+        } => vec![
+            DynamicAttribute::u64("shortfall_bytes", *shortfall_bytes),
+            DynamicAttribute::u64("partial_bytes", *partial_bytes),
+        ],
+        schema::TaskEvent::Preparing {
+            origin_tier,
+            target_tier,
+            input_bytes,
+            ..
+        } => vec![
+            DynamicAttribute::string("origin_tier", origin_tier.clone()),
+            DynamicAttribute::string("target_tier", target_tier.clone()),
+            DynamicAttribute::u64("input_bytes", *input_bytes),
+        ],
+        schema::TaskEvent::Computing {
+            current_operator_id,
+            input_bytes,
+            peak_allocated_bytes,
+            ..
+        } => vec![
+            DynamicAttribute::u32("current_operator_id", *current_operator_id),
+            DynamicAttribute::u64("input_bytes", *input_bytes),
+            DynamicAttribute::u64("peak_allocated_bytes", *peak_allocated_bytes),
+        ],
+        schema::TaskEvent::Finalizing { success, .. } => {
+            vec![DynamicAttribute::u8("success", u8::from(*success))]
+        }
+        schema::TaskEvent::Queued { .. } => Vec::new(),
+    }
+}
 
 fn declaration() -> FsmTypeDecl {
     let state = |name: &str, usages: &[&str]| FsmStateTypeDecl {
@@ -62,7 +124,7 @@ fn declaration() -> FsmTypeDecl {
 
 /// The reconstructed task FSM.
 #[derive(Debug)]
-pub struct Task(FsmEvents<schema::TaskEvent>);
+pub struct Task(AnalyzedFsm<schema::TaskEvent>);
 
 impl Task {
     pub(crate) fn from_builder(builder: TaskBuilder) -> AnalyzerResult<Self> {
@@ -74,12 +136,21 @@ impl Task {
     }
 
     fn first_data(&self) -> Option<&schema::TaskEvent> {
-        self.0.first_data()
+        self.0.transition(0).map(|transition| &transition.data)
+    }
+
+    fn instance_name(&self) -> &str {
+        self.first_data()
+            .and_then(|event| match event {
+                schema::TaskEvent::Created { instance_name, .. } => Some(instance_name.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }
 
 /// Builder for task FSMs.
-pub type TaskBuilder = FsmEventsBuilder<schema::TaskEvent>;
+pub type TaskBuilder = AnalyzedFsmBuilder<schema::TaskEvent>;
 
 impl Entity for Task {
     fn id(&self) -> Uuid {
@@ -90,8 +161,18 @@ impl Entity for Task {
         "task"
     }
 
-    fn instance_name(&self) -> &str {
-        self.0.instance_name()
+    fn earliest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.earliest_timestamp()
+    }
+
+    fn latest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.latest_timestamp()
+    }
+}
+
+impl RefTreeEntity for Task {
+    fn parent_id(&self) -> Option<Uuid> {
+        self.pipeline_uuid()
     }
 }
 
@@ -216,7 +297,7 @@ impl TaskExt for Task {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    attributes: transition.attributes(),
+                    attributes: transition_attributes(&transition.data),
                     derived_attributes,
                 })
             })

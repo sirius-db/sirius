@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Print the resource-group tree of a Sirius telemetry session directory —
-//! the same tree the Quent viewer renders as collapsible rows.
+//! Print the resource hierarchy of a Sirius telemetry session directory.
 //!
 //! Usage:
 //!   cargo run -p sirius-telemetry-analyzer --example print_resource_tree -- \
 //!       <telemetry_output_dir>/<session_uuid>
 
-use quent_analyzer::resource::collection::ResourceCollection;
+use quent_analyzer::ref_tree::RefTreeCollection;
 use quent_analyzer::resource::tree::ResourceTreeNode;
-use quent_analyzer::{Entity, Model};
 use quent_query_engine_analyzer::ui::UiAnalyzer;
 use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use sirius_telemetry_analyzer::SiriusUiAnalyzer;
@@ -23,26 +21,16 @@ fn print_node(
     depth: usize,
 ) {
     let indent = "  ".repeat(depth);
-    match node {
-        ResourceTreeNode::ResourceGroup(id, children) => {
-            let group = model.resource_group(*id).expect("group in tree");
-            println!(
-                "{indent}[{}] {} ({id})",
-                group.type_name(),
-                group.instance_name()
-            );
-            for child in children {
-                print_node(model, child, depth + 1);
-            }
-        }
-        ResourceTreeNode::Resource(id) => {
-            let resource = model.resource(*id).expect("resource in tree");
-            println!(
-                "{indent}<{}> {} ({id})",
-                resource.type_name(),
-                resource.instance_name()
-            );
-        }
+    let entity = model
+        .ref_tree_entity(node.entity_id)
+        .expect("entity in tree");
+    if node.is_resource {
+        println!("{indent}<{}> ({})", entity.type_name(), node.entity_id);
+    } else {
+        println!("{indent}[{}] ({})", entity.type_name(), node.entity_id);
+    }
+    for child in &node.children {
+        print_node(model, child, depth + 1);
     }
 }
 
@@ -78,7 +66,6 @@ fn main() {
         SiriusUiAnalyzer::try_new(engine_id, events.into_iter()).expect("analyzable events");
     let model = &analyzer.model;
 
-    let root_id = model.root().expect("model has a root group").id();
-    let tree = ResourceTreeNode::try_new(model, root_id).expect("resource tree");
+    let tree = ResourceTreeNode::try_new(model).expect("resource tree");
     print_node(model, &tree, 0);
 }

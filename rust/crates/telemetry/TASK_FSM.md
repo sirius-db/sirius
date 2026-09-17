@@ -2,9 +2,9 @@
 
 Canonical schema: [`model.yaml`](model.yaml). Runtime emission is implemented
 by [`sirius_pipeline_itask.cpp`](../../../src/pipeline/sirius_pipeline_itask.cpp).
-Stored-event semantics and analyzer declarations are defined in
-[`store/src/lib.rs`](store/src/lib.rs) and
-[`analyzer/src/task.rs`](analyzer/src/task.rs), respectively.
+Stored-event transition semantics and analyzer declarations are defined in
+[`store/src/boilerplate/task.rs`](store/src/boilerplate/task.rs) and
+[`analyzer/src/boilerplate/task.rs`](analyzer/src/boilerplate/task.rs), respectively.
 
 ```mermaid
 flowchart LR

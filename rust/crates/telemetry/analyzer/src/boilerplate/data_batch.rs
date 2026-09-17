@@ -4,19 +4,39 @@
 //! Data-batch FSM analysis types.
 
 use quent_analyzer::{
-    AnalyzerResult, Entity,
+    AnalyzerResult, Entity, RefTreeEntity,
     fsm::{
-        Fsm, FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration, FsmUsages,
-        Transition,
-        events::{AnalyzedTransition, FsmEvents, FsmEventsBuilder},
+        Fsm, FsmUsages, Transition,
+        native::{AnalyzedFsm, AnalyzedFsmBuilder, AnalyzedTransition},
     },
     resource::{Usage, Using},
 };
+use quent_dynamic_attributes::DynamicAttribute;
 use quent_query_engine_ui::OperatorFilter;
 use quent_time::{TimeUnixNanoSec, Timestamp, span::SpanUnixNanoSec, to_secs_relative};
-use quent_ui::{FiniteStateMachine, FsmTransition, FsmUsage};
+use quent_ui::{
+    FiniteStateMachine, FsmTransition, FsmUsage,
+    fsm::{FsmStateTypeDecl, FsmTransitionDecl, FsmTypeDecl, FsmTypeDeclaration},
+};
 use sirius_telemetry_store as schema;
 use uuid::Uuid;
+
+fn transition_attributes(event: &schema::DataBatchEvent) -> Vec<DynamicAttribute> {
+    match event {
+        schema::DataBatchEvent::Constructed {
+            data_batch_id,
+            producer_pipeline_uuid,
+            ..
+        } => vec![
+            DynamicAttribute::u64("data_batch_id", *data_batch_id),
+            DynamicAttribute::string(
+                "producer_pipeline_uuid",
+                producer_pipeline_uuid.target.to_string(),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
 
 fn declaration() -> FsmTypeDecl {
     let state = |name: &str, usages: &[&str]| FsmStateTypeDecl {
@@ -45,7 +65,7 @@ fn declaration() -> FsmTypeDecl {
 
 /// The reconstructed data-batch FSM.
 #[derive(Debug)]
-pub struct DataBatch(FsmEvents<schema::DataBatchEvent>);
+pub struct DataBatch(AnalyzedFsm<schema::DataBatchEvent>);
 
 impl DataBatch {
     pub(crate) fn from_builder(builder: DataBatchBuilder) -> AnalyzerResult<Self> {
@@ -57,12 +77,23 @@ impl DataBatch {
     }
 
     fn first_data(&self) -> Option<&schema::DataBatchEvent> {
-        self.0.first_data()
+        self.0.transition(0).map(|transition| &transition.data)
+    }
+
+    fn instance_name(&self) -> &str {
+        self.first_data()
+            .and_then(|event| match event {
+                schema::DataBatchEvent::Constructed { instance_name, .. } => {
+                    Some(instance_name.as_str())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }
 
 /// Builder for data-batch FSMs.
-pub type DataBatchBuilder = FsmEventsBuilder<schema::DataBatchEvent>;
+pub type DataBatchBuilder = AnalyzedFsmBuilder<schema::DataBatchEvent>;
 
 impl Entity for DataBatch {
     fn id(&self) -> Uuid {
@@ -73,8 +104,18 @@ impl Entity for DataBatch {
         "data_batch"
     }
 
-    fn instance_name(&self) -> &str {
-        self.0.instance_name()
+    fn earliest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.earliest_timestamp()
+    }
+
+    fn latest_timestamp(&self) -> TimeUnixNanoSec {
+        self.0.latest_timestamp()
+    }
+}
+
+impl RefTreeEntity for DataBatch {
+    fn parent_id(&self) -> Option<Uuid> {
+        self.producer_pipeline_uuid()
     }
 }
 
@@ -160,7 +201,7 @@ impl DataBatchExt for DataBatch {
                         })
                         .collect(),
                     timestamp: to_secs_relative(transition.timestamp(), epoch),
-                    attributes: transition.attributes(),
+                    attributes: transition_attributes(&transition.data),
                     derived_attributes: Vec::new(),
                 })
             })
