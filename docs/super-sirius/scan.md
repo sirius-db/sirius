@@ -274,12 +274,14 @@ rebuilds a different table under the same qualified name, and neither the name, 
 nor the chunk shape tells the two apart — but DuckDB hands each catalog entry a fresh id from an
 instance-global monotonic counter and never reuses one, so requiring it to match pins each entry to
 exactly the table that was cached. A scan of a recreated table therefore misses the pin. Whether it
-may then fall through to a fresh disk-native read depends on the checkpoint generation: that path is
-MVCC-blind, so while the pin's checkpoint suppression still holds, the on-disk image is the dropped
-table's and the scan instead declines at plan time into the transparent CPU fallback. An explicit
-`CHECKPOINT` after the recreate rewrites that image to the live table, and the superseded pin
-becomes an ordinary clean miss served by a fresh read. Either way `CALL unpin_table(...)` then
-`pin_table` again to cache the new table.
+may then fall through to a fresh disk-native read depends on the recreated table itself: that path
+is MVCC-blind and reads only the checkpointed image, so while the new rows are still uncheckpointed
+(and the pin's checkpoint suppression keeps them that way) the image on disk is the dropped table's
+and the scan declines at plan time into the transparent CPU fallback instead. A `CHECKPOINT` after
+the recreate rewrites that image to the live table, and the superseded pin becomes an ordinary clean
+miss served by a fresh read. A checkpoint taken *before* the recreate does not count — only the
+recreated table's own rows being on disk does. Either way `CALL unpin_table(...)` then `pin_table`
+again to cache the new table.
 
 During `prepare_for_query`, `try_assign_cached_entries` matches each `GPU_SCAN` operator's `table_info` against the pinned entries. On a hit it builds a `cached_databatch_provider` over the matched entry, ordering columns by the ingestible's `materialized_column_order()` so a cached batch is laid out identically to a fresh disk read and `post_filter_and_project` resolves the same columns on both paths. The provider emits one cached chunk as one resident split and bypasses the fresh-read coalescer. Each split carries whether its selected columns are actually narrow, and `GPU_SCAN` normalizes that chunk to the query's planned physical schema (or the native logical schema when there is no override) before downstream operators can combine batches.
 

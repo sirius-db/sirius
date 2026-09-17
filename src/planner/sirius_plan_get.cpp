@@ -28,7 +28,6 @@
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
-#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -55,6 +54,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -557,6 +557,20 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
   }
 }
 
+// True when a scan of @p storage would read rows the last checkpoint did not write:
+// transaction-local appends, or transient segments. Every physical column is walked, so
+// a projection-free scan is covered too.
+[[nodiscard]] bool reads_uncheckpointed_rows(duckdb::ClientContext& context,
+                                             duckdb::DataTable& storage)
+{
+  if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+    return true;
+  }
+  std::vector<duckdb::storage_t> all_columns(storage.ColumnCount());
+  std::iota(all_columns.begin(), all_columns.end(), static_cast<duckdb::storage_t>(0));
+  return sirius::op::scan::any_uncheckpointed_appends(storage, all_columns);
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -667,24 +681,17 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       auto const& schema = table.ParentSchema().name;
       pinned             = scan_manager.find_pinned_entry_for_duckdb_table(
         catalog, schema, table.name, table.oid, &column_ids, &op.returned_types);
-      // A same-name pin for an older table cannot serve this scan. Until a
-      // checkpoint rewrites the on-disk image, the disk-native path is also unsafe,
-      // so decline here while transparent CPU fallback is still available.
+      // A same-name pin for an older table cannot serve this scan, and until the recreate
+      // is checkpointed the disk-native read still returns the dropped table's image.
       if (pinned == nullptr) {
-        auto const* checkpoint_block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
-          &table.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
-        // Unreachable while pin_table admits only single-file databases.
-        std::optional<std::uint64_t> current_iteration;
-        if (checkpoint_block_manager != nullptr) {
-          current_iteration = checkpoint_block_manager->GetCheckpointIteration();
-        }
         auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
-          catalog, schema, table.name, table.oid, current_iteration);
-        if (superseded) {
+          catalog, schema, table.name, table.oid);
+        if (superseded && reads_uncheckpointed_rows(context, table.GetStorage())) {
           throw duckdb::NotImplementedException(
             "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
-            "pin_table, so pinned entry '%s' holds a different table and cannot serve this scan. "
-            "Run CALL unpin_table('%s'), then pin_table again",
+            "pin_table, so pinned entry '%s' holds a different table, and its rows are not "
+            "checkpointed yet, so the on-disk image is still the dropped table's. Run CHECKPOINT, "
+            "or CALL unpin_table('%s') and pin_table again",
             table.name,
             *superseded,
             *superseded);
