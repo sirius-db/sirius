@@ -366,7 +366,7 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
 // direct_route_admissible
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality keys",
+TEST_CASE("join-edge route accepts only direct matching membership-supported equality keys",
           "[dynamic_filter][key_admission]")
 {
   auto const equal = sirius::comparison_type::equal;
@@ -375,6 +375,11 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
   {
     REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt32, kInt32));
     REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, kInt64, kInt64));
+    // Any membership-supported integer type qualifies, not just INT32/INT64.
+    auto const int16  = cudf::data_type{cudf::type_id::INT16};
+    auto const uint64 = cudf::data_type{cudf::type_id::UINT64};
+    REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, int16, int16));
+    REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, uint64, uint64));
   }
   SECTION("computed keys are rejected on either side, though the scan route admits them")
   {
@@ -412,11 +417,18 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
       direct_route_admissible(duckdb::JoinType::INNER, equal, cast_build, kInt32, kInt32));
     REQUIRE_FALSE(
       direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt32, kInt64));
+    // Same width, different signedness: the types are not identical.
     REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
                                           equal,
                                           kDirectDirect,
-                                          cudf::data_type{cudf::type_id::INT16},
-                                          cudf::data_type{cudf::type_id::INT16}));
+                                          cudf::data_type{cudf::type_id::UINT32},
+                                          kInt32));
+    // Identical but membership-unsupported types.
+    for (auto const id :
+         {cudf::type_id::FLOAT64, cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::STRING}) {
+      REQUIRE_FALSE(direct_route_admissible(
+        duckdb::JoinType::INNER, equal, kDirectDirect, cudf::data_type{id}, cudf::data_type{id}));
+    }
   }
 }
 

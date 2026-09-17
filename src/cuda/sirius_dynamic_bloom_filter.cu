@@ -73,8 +73,11 @@ using sirius_bloom = cuco::bloom_filter<KeyT,
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
 
-using bloom_storage =
-  std::variant<bloom_owner<sirius_bloom<std::int32_t>>, bloom_owner<sirius_bloom<std::int64_t>>>;
+// One alternative per membership_key_rep.
+using bloom_storage = std::variant<bloom_owner<sirius_bloom<std::int32_t>>,
+                                   bloom_owner<sirius_bloom<std::int64_t>>,
+                                   bloom_owner<sirius_bloom<std::uint32_t>>,
+                                   bloom_owner<sirius_bloom<std::uint64_t>>>;
 
 template <class Filter>
 bloom_owner<Filter> make_bloom(std::size_t num_blocks,
@@ -116,20 +119,26 @@ bloom_owner<Filter> build_bloom(cudf::column_view const& keys,
 {
   using key_type = typename Filter::key_type;
   auto result    = make_bloom<Filter>(num_blocks, mr, stream);
-  auto const* d  = keys.data<key_type>();
-  auto const n   = keys.size();
-  result->add_async(d, d + n, stream);
+  if (keys.size() > 0) {
+    // The build column may sit at a narrower same-family carrier than the rep; the iterator widens
+    // per element instead of materializing a widened copy.
+    bool const added = detail::with_build_key_iterator<key_type>(
+      keys, [&](auto first, auto last) { result->add_async(first, last, stream); });
+    if (!added) {
+      throw std::logic_error("[sirius_dynamic_bloom_filter] build carrier does not fit its rep.");
+    }
+  }
   return result;
 }
 
-/// @brief Per-row Bloom membership probe. Probe values convert into the key domain per element;
-/// an inserted key always fits that domain, so a non-representable value is a definite non-member
-/// and the conversion preserves the no-false-negative contract. Rows the prior keep-mask killed
-/// skip the block fetch.
-template <class ProbeT, class FilterRef>
+/// @brief Per-row Bloom membership probe. The adapter converts probe values into the key domain
+/// per element; an inserted key always fits that domain, so a non-representable value is a
+/// definite non-member and the conversion preserves the no-false-negative contract. Rows the prior
+/// keep-mask killed skip the block fetch.
+template <class Adapter, class FilterRef>
 struct bloom_contains {
   using key_type = typename FilterRef::key_type;
-  ProbeT const* __restrict__ probe;
+  Adapter adapt;
   bool* __restrict__ out;
   FilterRef ref;
   std::uint32_t const* __restrict__ prior_words;  // packed 1 bit/row, or null
@@ -141,7 +150,7 @@ struct bloom_contains {
       return;
     }
     key_type key;
-    if (!sirius::op::detail::probe_key_convert(probe[idx], key)) {
+    if (!adapt(idx, key)) {
       out[idx] = false;
       return;
     }
@@ -203,7 +212,7 @@ struct sirius_dynamic_bloom_filter::impl {
 
 bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
 {
-  return t.id() == cudf::type_id::INT32 || t.id() == cudf::type_id::INT64;
+  return membership_key_supported(t);
 }
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
@@ -215,10 +224,11 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
                                                          rmm::cuda_stream_view stream,
                                                          rmm::device_async_resource_ref mr)
 {
-  if (!supports(keys.type())) {
-    throw std::invalid_argument(
-      "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
+  auto const domain = classify_membership_key(keys.type());
+  if (!domain.has_value()) {
+    throw std::invalid_argument("[sirius_dynamic_bloom_filter] unsupported key type.");
   }
+  _domain = *domain;
   // Keep compacted storage alive until add_async is queued on stream.
   std::unique_ptr<cudf::table> compacted;
   cudf::column_view build_keys = keys;
@@ -234,20 +244,10 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::runtime_error("[sirius_dynamic_bloom_filter] failed to identify source device.");
   }
 
-  std::unique_ptr<bloom_replica> source;
-  switch (keys.type().id()) {
-    case cudf::type_id::INT32:
-      source =
-        build_bloom_replica<std::int32_t>(_impl->source_device, build_keys, num_blocks, mr, s);
-      break;
-    case cudf::type_id::INT64:
-      source =
-        build_bloom_replica<std::int64_t>(_impl->source_device, build_keys, num_blocks, mr, s);
-      break;
-    default:
-      throw std::logic_error(
-        "[sirius_dynamic_bloom_filter] supported key type changed during construction.");
-  }
+  auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
+    using key_type = decltype(key_tag);
+    return build_bloom_replica<key_type>(_impl->source_device, build_keys, num_blocks, mr, s);
+  });
   _impl->replicas.push_back(std::move(source));
 }
 
@@ -389,22 +389,22 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   // carrier; the kernel converts per element rather than materializing a widened copy.
   std::unique_ptr<cudf::column> out;
   auto const n          = probe.size();
-  auto const dispatched = detail::dispatch_signed_integer_probe(probe.type(), [&](auto probe_tag) {
-    using probe_type = decltype(probe_tag);
-    out              = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-    auto* const outp = out->mutable_view().data<bool>();
-    auto const* d    = probe.data<probe_type>();
-    std::visit(
-      [&](auto const& bloom) {
-        auto ref = bloom->ref();
+  auto const dispatched = std::visit(
+    [&](auto const& bloom) {
+      using owner_type = std::decay_t<decltype(bloom)>;
+      using key_type   = typename owner_type::element_type::key_type;
+      return detail::dispatch_probe_adapter<key_type>(_domain, probe, [&](auto adapter) {
+        out = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
+        auto* const outp = out->mutable_view().data<bool>();
+        auto ref         = bloom->ref();
         cub::DeviceFor::Bulk(
           n,
-          bloom_contains<probe_type, decltype(ref)>{d, outp, ref, prior_mask_words},
+          bloom_contains<decltype(adapter), decltype(ref)>{adapter, outp, ref, prior_mask_words},
           stream.value());
-      },
-      replica->bloom);
-  });
+      });
+    },
+    replica->bloom);
   if (!dispatched) { return nullptr; }
 
   if (probe.nullable() && probe.null_count() > 0) {

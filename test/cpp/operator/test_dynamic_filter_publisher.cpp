@@ -27,6 +27,8 @@
  *  - Type-coverage canary: Bloom support covers every hash-IN-list key type, so the policy's
  *    "keep a fitting IN-list when the type lacks Bloom support" clause is unreachable through the
  *    real publisher today.
+ *  - Narrowed build carriers: a build column arriving at a carrier restorable to the recorded
+ *    storage type publishes (filters built at the carrier); an unrelated type is still skipped.
  *  - Sparse fan-out and gating: each target receives only its bound keys, the domain-coverage
  *    gate consults each key's own domain, and unbound keys cost no construction.
  *  - Floating-point suppression: a FLOAT64 key whose build holds a NaN receives no zone map (the
@@ -46,6 +48,7 @@
  * `test_dynamic_filter_source_policy.cpp`.
  */
 
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
@@ -140,6 +143,15 @@ struct publisher_fixture {
                                      cudf::numeric_scalar<std::int64_t>(1, true, stream),
                                      stream,
                                      source_space.get_default_allocator()));
+  }
+
+  // Append the same sequence stored at a narrower carrier, as a pinned-narrow build would.
+  void add_key_column_as(std::size_t rows, cudf::data_type carrier, std::int64_t first = 0)
+  {
+    add_key_column(rows, first);
+    auto& source_space = replica_spaces.front().get_gpu_space();
+    columns.back() =
+      cudf::cast(columns.back()->view(), carrier, stream, source_space.get_default_allocator());
   }
 
   [[nodiscard]] cudf::table_view build_view() const
@@ -456,11 +468,114 @@ TEST_CASE("dynamic-filter Bloom support covers every hash-IN-list key type",
   // choose_membership_filter keeps an L2-fitting hash IN-list at any fraction when the key type
   // has no Bloom fallback; that clause is pinned GPU-free in test_dynamic_filter_source_policy.cpp.
   // This canary documents that the clause remains unreachable through the real publisher because
-  // the hash-IN-list and Bloom supported-type sets are identical (INT32/INT64). If either REQUIRE
-  // ever fails (the type sets diverge), add a publish-path test asserting the divergent type keeps
-  // the fitting IN-list at fraction 0.
-  REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT32}));
-  REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(cudf::data_type{cudf::type_id::INT64}));
+  // the hash-IN-list and Bloom supported-type sets are identical: both are exactly
+  // membership_key_supported. If this ever fails (the type sets diverge), add a publish-path test
+  // asserting the divergent type keeps the fitting IN-list at fraction 0.
+  using id = cudf::type_id;
+  for (auto const t : {id::INT8,
+                       id::INT16,
+                       id::INT32,
+                       id::INT64,
+                       id::UINT8,
+                       id::UINT16,
+                       id::UINT32,
+                       id::UINT64,
+                       id::BOOL8,
+                       id::FLOAT32,
+                       id::FLOAT64,
+                       id::TIMESTAMP_DAYS,
+                       id::TIMESTAMP_MICROSECONDS,
+                       id::DECIMAL32,
+                       id::DECIMAL64,
+                       id::DECIMAL128,
+                       id::STRING,
+                       id::LIST,
+                       id::STRUCT,
+                       id::EMPTY}) {
+    auto const type = cudf::data_type{t};
+    REQUIRE(sirius::op::sirius_dynamic_bloom_filter::supports(type) ==
+            sirius::op::membership_key_supported(type));
+    // The hash IN-list's gate takes a column; a null-free empty column isolates the type gate.
+    auto const empty = cudf::column_view{type, 0, nullptr, nullptr, 0};
+    REQUIRE(sirius::op::sirius_dynamic_in_list_filter::supports(empty) ==
+            sirius::op::membership_key_supported(type));
+  }
+}
+
+// Compressed materialization may hand the publisher a build key column at a narrower carrier
+// than the plan recorded (nation/region keys fit INT8, supplier keys INT16 at small scale). That
+// carrier restores losslessly to the recorded type, so the key must publish rather than count as a
+// type mismatch; the filters are built at the carrier and probes range-check into it.
+TEST_CASE(
+  "dynamic-filter publisher accepts a build column at a narrowed carrier of the recorded "
+  "type",
+  "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const publish = [&]() {
+    auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = true,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kInt64}}});
+    auto replica_spaces = fixture.replica_spaces;
+    dynamic_filter_publish_plan plan{
+      {make_int64_key(0, 0)}, std::move(targets), std::move(replica_spaces)};
+    auto const outcome =
+      sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+    REQUIRE(outcome.keys_considered == 1);
+    REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+    REQUIRE(outcome.membership_filters_built == 1);
+    REQUIRE(outcome.filters_pushed == 1);
+    auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+    REQUIRE(snapshot.size() == 1);
+    return snapshot.front();
+  };
+
+  SECTION("INT16 carrier, small IN-list tier")
+  {
+    fixture.add_key_column_as(3, cudf::data_type{cudf::type_id::INT16}, /*first=*/10);
+    REQUIRE(fixture.columns.front()->type().id() == cudf::type_id::INT16);
+    auto const filter = publish();
+    auto const* small =
+      dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get());
+    REQUIRE(small != nullptr);
+    CHECK(small->domain().rep == sirius::op::membership_key_rep::i32);
+    CHECK(small->domain().native.id() == cudf::type_id::INT16);
+
+    // The native INT64 probe (post-decode cascade) and the INT16 carrier (fused decode) agree.
+    auto const native = make_int64_values(fixture, {10, 11, 12, 13, 5'000'000'000LL});
+    std::vector<std::uint8_t> const expected{1, 1, 1, 0, 0};
+    REQUIRE(membership_mask(*filter, native->view(), fixture) == expected);
+    auto const narrowed = cudf::cast(make_int64_values(fixture, {10, 11, 12, 13})->view(),
+                                     cudf::data_type{cudf::type_id::INT16},
+                                     fixture.stream,
+                                     mr);
+    REQUIRE(membership_mask(*filter, narrowed->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 1, 1, 0});
+  }
+
+  SECTION("INT8 carrier, hash IN-list tier")
+  {
+    auto const rows = sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 1;
+    fixture.add_key_column_as(rows, cudf::data_type{cudf::type_id::INT8});
+    auto const filter = publish();
+    auto const* hashed =
+      dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(filter.get());
+    REQUIRE(hashed != nullptr);
+    REQUIRE(hashed->has_persistent_set());
+    CHECK(hashed->domain().rep == sirius::op::membership_key_rep::i32);
+    CHECK(hashed->domain().native.id() == cudf::type_id::INT8);
+    auto const native = make_int64_values(
+      fixture, {0, static_cast<std::int64_t>(rows) - 1, static_cast<std::int64_t>(rows), -1});
+    REQUIRE(membership_mask(*filter, native->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 1, 0, 0});
+  }
 }
 
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",
@@ -879,7 +994,25 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
       std::invalid_argument);
   }
 
-  SECTION("direct binding with a non-INT32/INT64 probe storage type")
+  SECTION("direct binding with a membership-unsupported probe storage type")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {
+         {.admitted_key_index = 0, .channel_push_ordinal = 0, .probe_storage_type = kFloat64}}});
+    // The admitted key is FLOAT64 as well, so probe/build equality holds and only the
+    // membership_key_supported arm rejects.
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kFloat64;
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
+      std::invalid_argument);
+  }
+
+  SECTION("direct binding over a supported narrow integer type is accepted")
   {
     std::vector<dynamic_filter_publish_plan::probe_target> targets;
     targets.push_back(
@@ -889,13 +1022,10 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
        .key_bindings             = {{.admitted_key_index   = 0,
                                      .channel_push_ordinal = 0,
                                      .probe_storage_type   = cudf::data_type{cudf::type_id::INT8}}}});
-    // The admitted key is INT8 as well, so probe/build equality holds and only the INT32/INT64
-    // whitelist arm rejects.
     auto key         = make_int64_key(0, 0);
     key.storage_type = cudf::data_type{cudf::type_id::INT8};
-    REQUIRE_THROWS_AS(
-      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
-      std::invalid_argument);
+    REQUIRE_NOTHROW(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)));
   }
 
   SECTION("direct binding whose probe storage type differs from the admitted key's build type")

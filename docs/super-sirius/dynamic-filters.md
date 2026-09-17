@@ -86,9 +86,9 @@ The publisher emits at most one membership representation per admitted key and m
 
 | Representation | Selection | Behavior |
 |---|---|---|
-| Raw IN-list | 1–12 null-free `INT32`/`INT64` build rows | Exact linear membership probe |
-| Hash IN-list | Null-free `INT32`/`INT64` keys whose estimated set fits the configured fraction of the smallest probe-GPU L2 | Exact for represented keys; reserved sentinel values conservatively pass |
-| Bloom | Supported `INT32`/`INT64` keys when the hash IN-list is not selected | Approximate membership with no false negatives; nullable builds are compacted first |
+| Raw IN-list | 1–12 null-free integer build rows | Exact linear membership probe |
+| Hash IN-list | Null-free integer keys whose estimated set fits the configured fraction of the smallest probe-GPU L2 | Exact for represented keys; the reserved sentinel value (`min` for signed, `max` for unsigned reps) conservatively passes |
+| Bloom | Integer keys when the hash IN-list is not selected | Approximate membership with no false negatives; nullable builds are compacted first |
 | Zone map | `enable_dynamic_zone_map_filter=true` and a supported non-floating-point key type | One global build-key `[min,max]` range |
 
 If no probe-GPU L2 size is available, the hash IN-list is not selected; the publisher uses Bloom when supported. Two additional gates avoid unproductive work:
@@ -96,9 +96,26 @@ If no probe-GPU L2 size is available, the hash IN-list is not selected; the publ
 - The domain-coverage gate skips the key before either filter is built when a proven-unique native build key covers at least `dynamic_filter_domain_coverage_threshold` of its known base-table domain.
 - The consumer keep-ratio gate disables ineffective post-decode filtering when a measured batch retains more than `dynamic_filter_keep_threshold` of its rows.
 
+### Key types
+
+Membership filters accept the integer key types below; every other build type (temporal, decimal, floating-point, string) is declined by all three and the key publishes nothing. The type gate is one predicate, `membership_key_supported` (`src/include/op/dynamic_filter/dynamic_filter_key_domain.hpp`), shared by the three filters' `supports()`, the publisher, the publish-plan validator, and the planner's join-edge gate.
+
+Each supported type is classified into a *key domain*: a **rep** (the device element type the set, Bloom, or needle buffer is instantiated over) and a **family** (which probe carriers are comparable to the stored keys):
+
+| Build key type | Rep | Family | Accepted probe carriers |
+|---|---|---|---|
+| `INT8`, `INT16`, `INT32` | `int32` | signed | `INT8`..`INT64` |
+| `INT64` | `int64` | signed | `INT8`..`INT64` |
+| `UINT8`, `UINT16`, `UINT32` | `uint32` | unsigned | `UINT8`..`UINT64` |
+| `UINT64` | `uint64` | unsigned | `UINT8`..`UINT64` |
+
+The rep is the narrowest listed type that holds the *build column as it arrives*. A build column that compressed materialization narrowed (an `INTEGER` key stored as `INT16`, say) therefore builds a 32-bit set at the carrier — the publisher accepts any build carrier that restores losslessly to the plan's recorded storage type instead of counting it as `keys_skipped_type_mismatch` — and each build value widens per element on insert, so no widened build copy is made either. `estimated_set_bytes` sizes slots at the rep, not the carrier.
+
+Adding a key family means one new value of `membership_key_family`, one arm in `classify_membership_key` / `membership_probe_compatible`, and one probe adapter plus its arm in `dispatch_probe_adapter` (`src/include/cuda/dynamic_filter_probe.cuh`); the three filters do not change.
+
 ### Probe-side evaluation
 
-`compute_mask` accepts any signed-integer probe carrier (`INT8`..`INT64`) regardless of the build-key width, converting each value in-kernel; a value the key domain cannot represent is a definite non-member. This matters where the probe column is decoded rather than stored natively: compressed materialization stores a bounded `BIGINT` join key in the narrowest fitting carrier, and probing that carrier directly avoids materializing a widened copy per chunk. Measured against materializing one (pooled allocator, 1M-key set, INT32 carrier vs INT64 keys): 0.74–0.81× the probe time for the hash IN-list and 0.66–0.82× for Bloom, the margin widening with the number of filters cascaded over one column. Non-integer carriers (decimals, dates, floats) still decline with `nullptr` — a semantic mismatch, not a width one.
+`compute_mask` accepts any integer probe carrier of the key's signedness (`INT8`..`INT64` for signed keys, `UINT8`..`UINT64` for unsigned) regardless of the build-key width, converting each value in-kernel through a per-carrier *probe adapter*; a value the key domain cannot represent is a definite non-member. This matters where the probe column is decoded rather than stored natively: compressed materialization stores a bounded `BIGINT` join key in the narrowest fitting carrier, and probing that carrier directly avoids materializing a widened copy per chunk. Measured against materializing one (pooled allocator, 1M-key set, INT32 carrier vs INT64 keys): 0.74–0.81× the probe time for the hash IN-list and 0.66–0.82× for Bloom, the margin widening with the number of filters cascaded over one column. Carriers outside the key's family (decimals, dates, floats, the other signedness) decline with `nullptr` — a semantic mismatch, not a width one; `membership_probe_compatible` is the host-side mirror of that decision. The (rep, carrier) pairs are an explicit list, so each filter kind compiles 16 probe kernels (2 signed reps × 4 signed carriers + 2 unsigned reps × 4 unsigned carriers) rather than a `cudf::type_dispatcher` cross product.
 
 `compute_mask` also has an overload taking an optional packed prior keep-mask (1 bit per row): rows the prior already killed skip the lookup. The filtered decode uses it — when a chunk has other mask sources, the membership probes run sequentially after those are AND-combined, each taking the combined mask as its prior and folding its result back in, so a second probe sees the first probe's survivors. Membership-only chunks keep the concurrent, prior-free submission. The prior is a hint only: ignoring it is sound because the caller ANDs the result with that same mask.
 
@@ -150,7 +167,8 @@ The settings live under `sirius.operator_params`:
 
 - Hash-join builds are the only producers, and publication is a single immutable snapshot.
 - Routing is deliberately allowlisted by join type, key shape, and lineage; unsupported shapes lose optimization rather than results.
-- Membership filters currently support `INT32` and `INT64` keys.
+- Membership filters currently support integer keys (`INT8`..`INT64`, `UINT8`..`UINT64`); temporal, decimal, floating-point, and string keys are declined (see "Key types" for where a family plugs in).
+- The join-edge (direct) route additionally requires identical build and probe storage types.
 - The publisher emits one global zone map per key; multi-zone publication is not implemented.
 - A genuinely hash-partitioned multi-batch build cannot publish because no delivery contains the complete key set.
 - Other producers and incremental refinement would require explicit producer identity, versioning, and completion semantics; they are not implemented.

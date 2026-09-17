@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 // libcudf's AST header uses std::variant without including <variant>.
@@ -168,9 +169,11 @@ class sirius_mask_applicable {
   /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
-   * The membership implementations accept any signed-integer carrier (INT8..INT64), converting
-   * per element in-kernel: a pinned chunk may store the key narrower than the type the filter
-   * was published with, and no consumer should have to materialize a widened copy to probe it.
+   * The membership implementations accept any integer carrier of the key's signedness
+   * (INT8..INT64 for signed keys, UINT8..UINT64 for unsigned), converting per element in-kernel:
+   * a pinned chunk may store the key narrower than the type the filter was published with, and no
+   * consumer should have to materialize a widened copy to probe it. `membership_probe_compatible`
+   * is the host-side mirror of what a filter accepts.
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
@@ -200,15 +203,18 @@ class sirius_mask_applicable {
 /**
  * @brief Exact hash membership filter
  *
- * The backing set cannot store `numeric_limits<KeyT>::min()`; probes with that value are kept to
- * avoid false negatives.
+ * The backing set reserves one sentinel value it cannot store (`numeric_limits::min()` for signed
+ * reps, `::max()` for unsigned); probes equal to it are kept to avoid false negatives.
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable,
                                             public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a persistent set from null-free INT32 or INT64 keys
+   * @brief Builds a persistent set from null-free integer keys (see `membership_key_supported`)
+   *
+   * The set is typed at the key's rep: a build column arriving at a narrowed carrier (INT8/INT16,
+   * UINT8/UINT16) widens per element into a 32-bit set.
    *
    * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
    * @throw std::invalid_argument if @p keys is unsupported
@@ -245,12 +251,14 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::size_t replica_count() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] bool has_persistent_set() const noexcept;
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
+  /// Baseline footprint of a set over @p num_keys keys of @p key_type, sized at the key's rep.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
 
  private:
-  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
   struct set_impl;
@@ -258,7 +266,9 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 };
 
 /**
- * @brief Exact linear membership over a small, null-free INT32 or INT64 set
+ * @brief Exact linear membership over a small, null-free integer set
+ *
+ * Needles are stored at the key's rep (see `membership_key_domain`).
  */
 class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
                                                   public sirius_mask_applicable,
@@ -308,10 +318,11 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
  private:
-  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
   struct needle_store;
@@ -328,7 +339,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a Bloom filter from INT32 or INT64 keys, excluding nulls
+   * @brief Builds a Bloom filter from integer keys (see `membership_key_supported`), excluding
+   * nulls
    *
    * @pre Key storage remains valid until work enqueued on @p stream completes.
    * @throw std::invalid_argument if @p keys is unsupported
@@ -365,10 +377,12 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  membership_key_domain _domain{};
   struct impl;
   std::unique_ptr<impl> _impl;
 };

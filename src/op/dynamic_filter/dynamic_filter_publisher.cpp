@@ -16,6 +16,7 @@
 
 #include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -158,17 +159,32 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
         "[publish_dynamic_filters] An admitted key's build ordinal lies outside the runtime build "
         "table");
     }
+    // The build column may arrive at a narrower carrier than the plan recorded: compressed
+    // materialization casts a pinned column to the narrowest carrier its values fit, and that
+    // carrier is restorable to the recorded type without changing any value. Filters are then
+    // built at the carrier (classification happens on the runtime column), which is sound because
+    // every probe range-checks into the carrier's domain. Any other disagreement is a
+    // type-derivation bug and skips the key; the join stays authoritative.
     auto const& col = build_view.column(admitted_key.build_key_ordinal);
     if (col.type() != admitted_key.storage_type) {
-      SIRIUS_LOG_WARN(
-        "[sirius_physical_hash_join] dynamic filter key {}: skipped (plan recorded type id {} but "
-        "build column {} carries type id {}).",
+      if (!sirius::can_restore_to(col.type(), admitted_key.storage_type)) {
+        SIRIUS_LOG_WARN(
+          "[sirius_physical_hash_join] dynamic filter key {}: skipped (plan recorded type id {} "
+          "but build column {} carries type id {}).",
+          admitted_key_index,
+          static_cast<int32_t>(admitted_key.storage_type.id()),
+          admitted_key.build_key_ordinal,
+          static_cast<int32_t>(col.type().id()));
+        ++outcome.keys_skipped_type_mismatch;
+        continue;
+      }
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] dynamic filter key {}: build column {} arrives at narrowed "
+        "carrier type id {} (plan recorded type id {}); building filters at the carrier.",
         admitted_key_index,
-        static_cast<int32_t>(admitted_key.storage_type.id()),
         admitted_key.build_key_ordinal,
-        static_cast<int32_t>(col.type().id()));
-      ++outcome.keys_skipped_type_mismatch;
-      continue;
+        static_cast<int32_t>(col.type().id()),
+        static_cast<int32_t>(admitted_key.storage_type.id()));
     }
     per_key_build_type[admitted_key_index] = col.type();
 

@@ -19,8 +19,8 @@
  * @brief Mask-aware membership probing in the filtered-decode wave: with another mask source
  *        present, the membership probes run AFTER the partial combine and receive it as a prior
  *        mask; without one they stay concurrent and prior-free. The probe key stays at its narrow
- *        decoded carrier (INT32) against an INT64-built set — the filtered decode must not require
- *        a materialized cast.
+ *        decoded carrier (INT32, or INT8 for a chunk stored that narrow) against an INT64-built
+ *        set — the filtered decode must not require a materialized cast.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -32,6 +32,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <cuda_runtime.h>
 
@@ -63,27 +64,37 @@ struct fused_gate_armer {
 
 constexpr cudf::size_type kRows = 4096;
 
-// col 0 ("v", range-filtered): i % 100. col 1 ("k", membership key): i % 50.
+template <typename T>
+std::unique_ptr<cudf::column> upload_column(std::vector<T> const& host,
+                                            rmm::cuda_stream_view stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto col      = cudf::make_numeric_column(cudf::data_type{cudf::type_to_id<T>()},
+                                       static_cast<cudf::size_type>(host.size()),
+                                       cudf::mask_state::UNALLOCATED,
+                                       stream,
+                                       mr);
+  REQUIRE(cudaMemcpyAsync(col->mutable_view().data<T>(),
+                          host.data(),
+                          host.size() * sizeof(T),
+                          cudaMemcpyHostToDevice,
+                          stream.value()) == cudaSuccess);
+  return col;
+}
+
+// col 0 ("v", range-filtered): i % 100. col 1 ("k", membership key): i % 50, stored at KeyT.
+template <typename KeyT = std::int32_t>
 std::unique_ptr<cudf::table> make_source_table(rmm::cuda_stream_view stream)
 {
   std::vector<std::int32_t> v(kRows);
-  std::vector<std::int32_t> k(kRows);
+  std::vector<KeyT> k(kRows);
   for (cudf::size_type i = 0; i < kRows; ++i) {
     v[static_cast<std::size_t>(i)] = i % 100;
-    k[static_cast<std::size_t>(i)] = i % 50;
+    k[static_cast<std::size_t>(i)] = static_cast<KeyT>(i % 50);
   }
-  auto const mr = cudf::get_current_device_resource_ref();
   std::vector<std::unique_ptr<cudf::column>> cols;
-  for (auto const* host : {&v, &k}) {
-    auto col = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32}, kRows, cudf::mask_state::UNALLOCATED, stream, mr);
-    REQUIRE(cudaMemcpyAsync(col->mutable_view().data<std::int32_t>(),
-                            host->data(),
-                            host->size() * sizeof(std::int32_t),
-                            cudaMemcpyHostToDevice,
-                            stream.value()) == cudaSuccess);
-    cols.push_back(std::move(col));
-  }
+  cols.push_back(upload_column(v, stream));
+  cols.push_back(upload_column(k, stream));
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(cols));
 }
@@ -132,14 +143,15 @@ sirius::codegen::membership_filter_directive make_probe_directive(
           }};
 }
 
-std::vector<std::int32_t> column_to_host(cudf::column_view const& col, rmm::cuda_stream_view stream)
+template <typename T = std::int32_t>
+std::vector<T> column_to_host(cudf::column_view const& col, rmm::cuda_stream_view stream)
 {
-  REQUIRE(col.type().id() == cudf::type_id::INT32);
-  std::vector<std::int32_t> host(static_cast<std::size_t>(col.size()));
+  REQUIRE(col.type().id() == cudf::type_to_id<T>());
+  std::vector<T> host(static_cast<std::size_t>(col.size()));
   if (!host.empty()) {
     REQUIRE(cudaMemcpyAsync(host.data(),
-                            col.data<std::int32_t>(),
-                            host.size() * sizeof(std::int32_t),
+                            col.data<T>(),
+                            host.size() * sizeof(T),
                             cudaMemcpyDeviceToHost,
                             stream.value()) == cudaSuccess);
   }
@@ -365,4 +377,51 @@ TEST_CASE("filtered-decode membership probe on an all-dead prior stays mask-awar
   } else {
     CHECK(out->view().column(0).size() == kRows);
   }
+}
+
+// A pinned chunk can store a BIGINT key as INT8 when its values fit; the fused decode re-tags the
+// decoded column with that stored carrier, so the membership probe sees INT8 against an
+// INT64-built set and must answer exactly what the native column would.
+TEST_CASE("filtered-decode membership probe reads an INT8-carrier key chunk",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto table        = make_source_table<std::int8_t>(stream);
+  REQUIRE(table->view().column(1).type().id() == cudf::type_id::INT8);
+  auto const ct = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  bool saw_prior = false;
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});
+  request.membership_filters.push_back(make_probe_directive(1, make_key_set(stream), &saw_prior));
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  REQUIRE(result.applied);
+  CHECK(saw_prior);
+
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int8_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19 && (i % 50) % 5 == 0) {
+      expect_v.push_back(i % 100);
+      expect_k.push_back(static_cast<std::int8_t>(i % 50));
+    }
+  }
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  CHECK(column_to_host<std::int8_t>(out->view().column(1), stream) == expect_k);
 }
