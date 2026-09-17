@@ -116,6 +116,36 @@ pixi run -e duckdb-python python example.py
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
 [Python benchmark script](../test/tpch_performance/performance_test.py).
 
+## The `.hpln` Format
+
+Sirius can also write tables in its own columnar format, `.hpln`, which stores a table in the
+representation a pinned entry already uses. Pinning one is a byte copy rather than a decode, so it
+is several times faster than pinning the same columns from parquet, and its per-group statistics let
+a scan skip parts of a file without reading them.
+
+```sql
+-- Write any query out as .hpln, ordering each chunk on the column queries filter on
+COPY (SELECT * FROM lineitem) TO '/data/lineitem.hpln'
+     (FORMAT 'simpatico', cluster_by 'l_shipdate');
+
+-- Read it back (also works for s3:// paths)
+SELECT sum(l_extendedprice) FROM read_simpatico('/data/lineitem.hpln')
+WHERE l_shipdate >= DATE '1995-01-01';
+
+-- Or pin it; .hpln pins are host-tier
+CALL pin_table('/data/lineitem.hpln', format => 'simpatico', tier => 'host', name => 'lineitem');
+```
+
+`cluster_by` at write time does for a `.hpln` what `pin_table`'s `cluster_by` does for a parquet pin
+— it is applied once by the writer, so every later pin and scan gets the ordering for free.
+
+Two caveats. The format is **GPU-only**: DuckDB has no CPU reader for it, so a query over
+`read_simpatico` that falls back to the CPU errors instead of returning rows. And a `.hpln` pin
+inherits the file's compression plans and row order rather than choosing its own, which is precisely
+why the pin is cheap.
+
+See [`.hpln` Format](super-sirius/hpln-format.md) for the on-disk layout and the full COPY options.
+
 ## Pinning Tables for Hot Runs
 
 Sirius reads table data from storage on every query. For the best hot-run performance, pin
