@@ -116,9 +116,9 @@ class cache_entry_info {
   std::string catalog_name;                      ///< duckdb identity: catalog (attach alias)
   std::string schema_name;                       ///< duckdb identity: schema
   std::string table_name;                        ///< duckdb identity: table
-  /// DuckDB catalog object id. This distinguishes tables that reuse the same
-  /// qualified name after a drop, recreate, or alter.
-  duckdb::idx_t table_oid{0};
+  duckdb::idx_t table_oid{0};  ///< DuckDB catalog object id. Distinguishes tables that
+                               ///< reuse the same qualified name after a drop,
+                               ///< recreate, or alter.
   duckdb::vector<duckdb::ColumnIndex> column_ids;  ///< cached columns, by primary index
   std::vector<std::string> names;                  ///< aligned with column_ids; gather keys
 
