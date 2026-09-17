@@ -22,8 +22,9 @@
 #include "downgrade/spill_policy.hpp"
 #include "log/logging.hpp"
 
-#include <absl/cleanup/cleanup.h>
 #include <nvtx3/nvtx3.hpp>
+
+#include <absl/cleanup/cleanup.h>
 
 #include <algorithm>
 #include <chrono>
@@ -558,7 +559,7 @@ void downgrade_executor::monitor_loop()
       // off cleanly; because this is re-checked every cycle the monitor resumes the instant host
       // frees or pressure drops -- there is no latched state to get wedged on.
       if (has_viable_downgrade_target()) {
-        backed_off = false;
+        backed_off    = false;
         size_t amount = _memory_space->get_amount_to_downgrade();
         if (amount > 0) {
           auto req                = std::make_unique<downgrade_request>();

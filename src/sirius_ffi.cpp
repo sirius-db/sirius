@@ -108,8 +108,7 @@ struct Context::Impl {
 
   void bring_up(sirius::sirius_config& config)
   {
-    sirius::converter_registry::initialize(
-      config.get_downgrade_executor_config().copy_chunk_bytes);
+    sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
 

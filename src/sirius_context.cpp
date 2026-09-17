@@ -1716,8 +1716,7 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
-  sirius::converter_registry::initialize(
-    config_.get_downgrade_executor_config().copy_chunk_bytes);
+  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
   context_ = std::move(context);

@@ -19,8 +19,6 @@
 #include "data/chunked_spill_copy.hpp"
 #include "log/logging.hpp"
 
-#include <absl/cleanup/cleanup.h>
-
 #include <cudf/column/column_view.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -33,6 +31,7 @@
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/cudf/host_table.hpp>
@@ -237,8 +236,8 @@ void submit_chunk(std::span<const copy_op> ops,
   RMM_CUDA_TRY(cudaMemcpyBatchAsync(
     dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, nullptr, stream.get()));
 #else
-  RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, stream.get()));
+  RMM_CUDA_TRY(
+    cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), attr, stream.get()));
 #endif
 #else
   // cudaMemcpyBatchAsync requires CUDA 12.8+.
@@ -280,8 +279,8 @@ std::unique_ptr<cucascade::idata_representation> convert_gpu_to_host_chunked(
   // Pass 2: allocate pinned host blocks (draws down the caller's reservation).
   auto mr = target_memory_space
               ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
-  auto allocation = mr->allocate_multiple_blocks(total_size, reservation);
-  bool copies_pending          = false;
+  auto allocation               = mr->allocate_multiple_blocks(total_size, reservation);
+  bool copies_pending           = false;
   absl::Cleanup sync_on_failure = [&]() noexcept {
     if (copies_pending) { CUCASCADE_ASSERT_CUDA_SUCCESS(cudaStreamSynchronize(stream.get())); }
   };
