@@ -6,6 +6,8 @@
 #include "decode_session_test_access.hpp"
 #include "test_utils.hpp"
 
+#include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -316,6 +318,91 @@ class current_resource_guard {
  private:
   cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
 };
+
+class pinned_resource_guard {
+ public:
+  explicit pinned_resource_guard(rmm::host_device_async_resource_ref resource)
+    : previous_(cudf::set_pinned_memory_resource(resource))
+  {
+  }
+  ~pinned_resource_guard() { cudf::set_pinned_memory_resource(previous_); }
+  pinned_resource_guard(pinned_resource_guard const&)            = delete;
+  pinned_resource_guard& operator=(pinned_resource_guard const&) = delete;
+
+ private:
+  rmm::host_device_async_resource_ref previous_;
+};
+
+// Reuse one pinned address without adding waits: publication must finish before returning it.
+class pinned_scalar_resource {
+ public:
+  struct state {
+    explicit state(rmm::cuda_stream_view stream)
+      : storage(sizeof(int64_t), stream, cudf::get_pinned_memory_resource())
+    {
+    }
+    rmm::device_buffer storage;
+    cudaStream_t allocated_stream = nullptr;
+    std::size_t attempts          = 0;
+    bool live                     = false;
+    bool fail_next                = false;
+    bool invalid_release          = false;
+  };
+
+  explicit pinned_scalar_resource(rmm::cuda_stream_view stream)
+    : observations(std::make_shared<state>(stream))
+  {
+  }
+
+  void* allocate(cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    ++observations->attempts;
+    expect(!observations->live && bytes == sizeof(int64_t) &&
+             alignment <= rmm::CUDA_ALLOCATION_ALIGNMENT,
+           "pinned scalar fixture received an invalid allocation");
+    if (observations->fail_next) {
+      observations->fail_next = false;
+      throw injected_out_of_memory(bytes);
+    }
+    observations->live             = true;
+    observations->allocated_stream = stream.get();
+    // Poison each recycled slot so reading it before the GPU result cannot look like valid metadata.
+    *static_cast<int64_t*>(observations->storage.data()) = std::numeric_limits<int64_t>::min();
+    return observations->storage.data();
+  }
+
+  void deallocate(cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    observations->invalid_release |=
+      !observations->live || ptr != observations->storage.data() || bytes != sizeof(int64_t) ||
+      alignment > rmm::CUDA_ALLOCATION_ALIGNMENT || stream.get() != observations->allocated_stream;
+    observations->live = false;
+  }
+
+  void* allocate_sync(std::size_t, std::size_t)
+  {
+    throw std::logic_error("pinned observation requested synchronous allocation");
+  }
+  void deallocate_sync(void*, std::size_t, std::size_t) noexcept
+  {
+    observations->invalid_release = true;
+  }
+  bool operator==(pinned_scalar_resource const& other) const noexcept
+  {
+    return observations == other.observations;
+  }
+  friend void get_property(pinned_scalar_resource const&, cuda::mr::host_accessible) noexcept {}
+  friend void get_property(pinned_scalar_resource const&, cuda::mr::device_accessible) noexcept {}
+
+  std::shared_ptr<state> observations;
+};
+
+static_assert(cuda::mr::resource_with<pinned_scalar_resource,
+                                      cuda::mr::host_accessible,
+                                      cuda::mr::device_accessible>);
 
 class release_observation {
  public:
@@ -717,8 +804,9 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
     std::vector<bool> valid;
     std::int64_t width;
   };
-  std::array<fixture, 7> const fixtures{{
+  std::array<fixture, 8> const fixtures{{
     {{"aa", "bb", "aa", "cc"}, {}, 2},
+    {{"only", "only", "only"}, {}, 4},
     {{"a", "bbb", "", "cc"}, {}, 0},
     {{"aa", "ignored", "bb", "aa"}, {true, false, true, true}, 2},
     {{"a", "ignored", "bbb", "a"}, {true, false, true, true}, 0},
@@ -740,6 +828,17 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
            "dictionary width fixture missing representation");
     expect(original->constant_key_width == fixture.width,
            "original dictionary did not publish eager key width");
+
+    auto copied = std::make_unique<cudf::column>(original->dict_column->view(), stream.view(), mr);
+    {
+      stream_gate gate(stream.view());
+      gate.release_after_delay.store(true);
+      auto published = simpatico::dictionary_compressed_representation::from_encoded_column(
+        std::move(copied), stream.view(), mr);
+      expect(gate.released.load() && published->constant_key_width == fixture.width,
+             "dictionary publication did not complete prior work and metadata");
+      expect(!gate.timed_out.load(), "dictionary publication watchdog expired");
+    }
 
     // The direct constructor also supports frame-local reconstruction with unknown metadata.
     // Decode must measure locally without turning that representation into a mutable cache.
@@ -810,6 +909,104 @@ void test_dictionary_width_metadata(rmm::device_async_resource_ref mr)
   }
 }
 
+void test_dictionary_width_sliced_input(rmm::device_async_resource_ref mr)
+{
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  auto input =
+    make_strings_column({"a", "long-prefix", "aa", "bb", "aa", "suffix"}, {}, stream.view());
+  auto const sliced = cudf::slice(input->view(), {2, 5}, stream.view()).front();
+  auto encoded      = simpatico::dictionary_compressor{}.compress(sliced, stream.view(), mr);
+  auto const* dictionary =
+    dynamic_cast<simpatico::dictionary_compressed_representation const*>(encoded.get());
+  expect(dictionary != nullptr && dictionary->constant_key_width == 2,
+         "dictionary width inspected the sliced input's prefix");
+  auto decoded = dictionary->decompress(stream.view(), mr);
+  expect(strings_equal_completed(sliced, decoded->view(), stream.view()),
+         "sliced dictionary roundtrip mismatch");
+}
+
+void test_dictionary_width_large_keys(rmm::device_async_resource_ref mr)
+{
+  enum class key_shape { fixed, last_wide, first_empty };
+  rmm::cuda_stream stream(rmm::cuda_stream::flags::non_blocking);
+  // Few output rows isolate the full key-set reduction from row-count/cardinality policy.
+  constexpr cudf::size_type key_count = 1 << 20;
+  std::array<int32_t, 3> const codes{0, key_count / 2, key_count - 1};
+  for (bool wide_offsets : {false, true}) {
+    for (auto shape : {key_shape::fixed, key_shape::last_wide, key_shape::first_empty}) {
+      std::vector<int64_t> offsets{0};
+      std::string chars;
+      std::vector<std::string> expected_values;
+      offsets.reserve(key_count + 1);
+      chars.reserve(static_cast<std::size_t>(key_count) * 7 + 1);
+      for (cudf::size_type key = 0; key < key_count; ++key) {
+        auto value = std::to_string(key);
+        value.insert(0, 7 - value.size(), '0');
+        if (shape == key_shape::first_empty && key == 0) value.clear();
+        if (shape == key_shape::last_wide && key == key_count - 1) value += 'x';
+        if (std::find(codes.begin(), codes.end(), key) != codes.end())
+          expected_values.push_back(value);
+        chars += value;
+        offsets.push_back(static_cast<int64_t>(chars.size()));
+      }
+      auto keys_offsets = cudf::make_numeric_column(
+        cudf::data_type{wide_offsets ? cudf::type_id::INT64 : cudf::type_id::INT32},
+        key_count + 1,
+        cudf::mask_state::UNALLOCATED,
+        stream.view(),
+        mr);
+      std::vector<int32_t> offsets32;
+      if (wide_offsets) {
+        cuda_check(cudaMemcpyAsync(keys_offsets->mutable_view().head<int64_t>(),
+                                   offsets.data(),
+                                   offsets.size() * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice,
+                                   stream.value()));
+      } else {
+        offsets32.assign(offsets.begin(), offsets.end());
+        cuda_check(cudaMemcpyAsync(keys_offsets->mutable_view().head<int32_t>(),
+                                   offsets32.data(),
+                                   offsets32.size() * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   stream.value()));
+      }
+      rmm::device_buffer keys_chars(chars.size(), stream.view(), mr);
+      cuda_check(cudaMemcpyAsync(
+        keys_chars.data(), chars.data(), chars.size(), cudaMemcpyHostToDevice, stream.value()));
+      auto keys = cudf::make_strings_column(
+        key_count, std::move(keys_offsets), std::move(keys_chars), 0, rmm::device_buffer{});
+      auto indices = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               codes.size(),
+                                               cudf::mask_state::UNALLOCATED,
+                                               stream.view(),
+                                               mr);
+      cuda_check(cudaMemcpyAsync(indices->mutable_view().head<int32_t>(),
+                                 codes.data(),
+                                 sizeof(codes),
+                                 cudaMemcpyHostToDevice,
+                                 stream.value()));
+      auto dictionary =
+        cudf::make_dictionary_column(std::move(keys), std::move(indices), rmm::device_buffer{}, 0);
+      auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
+        std::move(dictionary), stream.view(), mr);
+      auto const expected_width = shape == key_shape::fixed ? 7 : 0;
+      expect(prepared->constant_key_width == expected_width,
+             "dictionary width missed a key outside the first reduction block");
+      auto expected = make_strings_column(expected_values, {}, stream.view());
+      auto decoded  = prepared->decompress(stream.view(), mr);
+      expect(strings_equal_completed(expected->view(), decoded->view(), stream.view()),
+             "large-key dictionary roundtrip mismatch");
+
+      simpatico::dictionary_compressed_representation unknown(
+        std::make_unique<cudf::column>(prepared->dict_column->view(), stream.view(), mr));
+      auto fallback = unknown.decompress(stream.view(), mr);
+      expect(strings_equal_completed(expected->view(), fallback->view(), stream.view()),
+             "large-key unknown-width dictionary roundtrip mismatch");
+      expect(unknown.constant_key_width == -1, "large-key fallback mutated width metadata");
+    }
+  }
+}
+
 void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
 {
   simpatico::stream_pool pool;
@@ -830,14 +1027,14 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
     expect(observed->constant_key_width == 2, "explicit-resource dictionary width mismatch");
   }
   resource.check();
-  expect(resource.observations->attempts.size() > 1,
-         "dictionary observation did not expose first-width and reduction allocations");
+  auto const allocation_count = resource.observations->attempts.size();
+  expect(allocation_count == 1, "dictionary observation did not use one device scratch allocation");
   expect(default_resource.observations->attempts.empty(),
          "dictionary observation bypassed supplied resource");
-  for (std::size_t fail_at : {0U, 1U}) {
+  for (std::size_t fail_at = 0; fail_at < allocation_count; ++fail_at) {
     resource.reset();
     // Allocate the encoded-column copy upstream first, so injected failures target only the
-    // width observation (including reduction scratch after the first-width readback).
+    // width observation's device scratch allocation.
     auto copied = std::make_unique<cudf::column>(original->dict_column->view(), stream, upstream);
     resource.observations->fail_at = fail_at;
     event_markers markers(pool);
@@ -861,7 +1058,137 @@ void test_dictionary_width_failures(rmm::device_async_resource_ref upstream)
            "failed dictionary observation bypassed supplied resource");
     expect(!gate.timed_out.load(), "dictionary observation failure watchdog expired");
   }
+  // Unknown metadata uses the same reduction with frame-owned device result and scratch storage.
+  resource.reset();
+  {
+    simpatico::dictionary_compressed_representation unknown(
+      std::make_unique<cudf::column>(original->dict_column->view(), stream, upstream));
+    resource.observations->fail_at = 0;
+    event_markers markers(pool);
+    stream_gate gate(stream);
+    markers.record();
+    gate.release_after_delay.store(true);
+    bool injected = false;
+    try {
+      (void)unknown.decompress(stream, resource);
+    } catch (injected_out_of_memory const& error) {
+      injected = error.requested_bytes == resource.observations->failed_request_bytes &&
+                 error.requested_bytes >= sizeof(int64_t);
+    }
+    expect(injected, "unknown dictionary width lost its metadata allocation error");
+    expect(gate.released.load() && markers.complete(),
+           "unknown dictionary width failure escaped before prior stream work drained");
+    expect(unknown.constant_key_width == -1, "failed dictionary fallback mutated metadata");
+    resource.check();
+    expect(!gate.timed_out.load(), "unknown dictionary width failure watchdog expired");
+  }
+  expect(default_resource.observations->attempts.empty(),
+         "dictionary failure cleanup bypassed supplied resource");
   default_resource.check();
+}
+
+void test_dictionary_pinned_observation(rmm::device_async_resource_ref upstream)
+{
+  simpatico::stream_pool pool;
+  expect(pool.init(2), "dictionary pinned observation pool init");
+  rmm::cuda_stream_view const first{pool.streams.front()};
+  pinned_scalar_resource pinned(first);
+  checked_resource device(upstream);
+  std::array<std::vector<std::string>, 5> const values{
+    {{"aa", "bb"}, {"abcd", "efgh"}, {"a", "bbb"}, {}, {"ignored", "ignored"}}};
+  std::array<int64_t, 5> const widths{2, 4, 0, 0, 0};
+  std::vector<std::unique_ptr<simpatico::compressed_representation>> encoded;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    auto input = make_strings_column(
+      values[i], i == 4 ? std::vector<bool>{false, false} : std::vector<bool>{}, first);
+    encoded.push_back(simpatico::dictionary_compressor{}.compress(input->view(), first, upstream));
+  }
+  for (std::size_t repeat = 0; repeat < 3; ++repeat) {
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+      rmm::cuda_stream_view const stream{pool.streams[(repeat + i) % pool.streams.size()]};
+      auto const& original =
+        dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded[i]);
+      auto copied = std::make_unique<cudf::column>(original.dict_column->view(), stream, upstream);
+      auto const pinned_attempts = pinned.observations->attempts;
+      auto const device_attempts = device.observations->attempts.size();
+      stream_gate gate(stream);
+      gate.release_after_delay.store(true);
+      pinned_resource_guard override(pinned);
+      auto prepared = simpatico::dictionary_compressed_representation::from_encoded_column(
+        std::move(copied), stream, device);
+      expect(gate.released.load() && prepared->constant_key_width == widths[i],
+             "dictionary read an unfinished or recycled pinned scalar");
+      auto const expected_allocations = i < 3 ? 1U : 0U;
+      expect(pinned.observations->attempts - pinned_attempts == expected_allocations &&
+               device.observations->attempts.size() - device_attempts == expected_allocations,
+             "dictionary empty/nonempty observation allocation count mismatch");
+      expect(!pinned.observations->live && !pinned.observations->invalid_release,
+             "dictionary returned pinned staging with invalid ownership");
+      device.check();
+      expect(!gate.timed_out.load(), "dictionary pinned observation watchdog expired");
+    }
+  }
+
+  auto const& original =
+    dynamic_cast<simpatico::dictionary_compressed_representation const&>(*encoded.front());
+  {
+    auto copied = std::make_unique<cudf::column>(original.dict_column->view(), first, upstream);
+    auto const pinned_attempts   = pinned.observations->attempts;
+    device.observations->fail_at = device.observations->attempts.size();
+    event_markers markers(pool);
+    stream_gate gate(first);
+    markers.record();
+    gate.release_after_delay.store(true);
+    pinned_resource_guard override(pinned);
+    bool injected = false;
+    try {
+      (void)simpatico::dictionary_compressed_representation::from_encoded_column(
+        std::move(copied), first, device);
+    } catch (injected_out_of_memory const& error) {
+      injected = error.requested_bytes == device.observations->failed_request_bytes &&
+                 error.requested_bytes > 0;
+    }
+    device.observations->fail_at.reset();
+    expect(injected && pinned.observations->attempts == pinned_attempts,
+           "dictionary allocated pinned output before device scratch or lost device OOM details");
+    expect(gate.released.load() && markers.complete(),
+           "dictionary device OOM escaped before prior stream work drained");
+    expect(!pinned.observations->live && !pinned.observations->invalid_release,
+           "dictionary device OOM changed pinned ownership");
+    device.check();
+    expect(!gate.timed_out.load(), "dictionary device OOM watchdog expired");
+  }
+  auto copied = std::make_unique<cudf::column>(original.dict_column->view(), first, upstream);
+  auto const device_attempts     = device.observations->attempts.size();
+  auto const pinned_attempts     = pinned.observations->attempts;
+  pinned.observations->fail_next = true;
+  event_markers markers(pool);
+  stream_gate gate(first);
+  markers.record();
+  release_observation device_release(device, gate.released);
+  gate.release_after_delay.store(true);
+  {
+    pinned_resource_guard override(pinned);
+    bool injected = false;
+    try {
+      (void)simpatico::dictionary_compressed_representation::from_encoded_column(
+        std::move(copied), first, device);
+    } catch (injected_out_of_memory const& error) {
+      injected = error.requested_bytes == sizeof(int64_t);
+    }
+    expect(injected && !pinned.observations->fail_next,
+           "dictionary pinned OOM subtype/request size was lost");
+    expect(device.observations->attempts.size() == device_attempts + 1 &&
+             pinned.observations->attempts == pinned_attempts + 1,
+           "dictionary pinned OOM did not follow exactly one scratch allocation");
+    expect(gate.released.load() && markers.complete(),
+           "dictionary pinned OOM escaped before queued work drained");
+    expect(!pinned.observations->live && !pinned.observations->invalid_release,
+           "dictionary pinned OOM leaked staging");
+    device.check();
+  }
+  expect(!gate.timed_out.load(), "dictionary pinned OOM watchdog expired");
+  cuda_check(pool.sync_all());
 }
 
 void test_submission_and_kernel_lifetime(rmm::device_async_resource_ref upstream)
@@ -1925,7 +2252,10 @@ int main()
     test_completed_public_return(upstream);
     test_identity_owned_children(upstream);
     test_dictionary_width_metadata(upstream);
+    test_dictionary_width_sliced_input(upstream);
+    test_dictionary_width_large_keys(upstream);
     test_dictionary_width_failures(upstream);
+    test_dictionary_pinned_observation(upstream);
     test_submission_and_kernel_lifetime(upstream);
     test_abandoned_session(upstream);
     test_session_state_contracts(upstream);

@@ -23,20 +23,23 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cub/device/device_reduce.cuh>
+#include <cuda/functional>
 #include <cuda_runtime.h>
 #include <nvtx3/nvtx3.hpp>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/logical.h>
 #include <thrust/tabulate.h>
 #include <thrust/transform.h>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdio>
 #include <exception>
 #include <limits>
@@ -74,40 +77,69 @@ constexpr size_t MAX_INDICES = static_cast<size_t>(std::numeric_limits<cudf::siz
 constexpr size_t kDictCardCheckMinRows = 1 << 20;
 constexpr double kDictMaxCardFraction  = 0.5;
 
-void enqueue_first_key_width(cudf::strings_column_view const& keys,
-                             int64_t* width,
-                             rmm::cuda_stream_view stream,
-                             rmm::device_async_resource_ref mr)
-{
-  auto const off = cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets());
-  thrust::for_each_n(
-    rmm::exec_policy_nosync(stream, mr), thrust::counting_iterator<int>(0), 1, [=] __device__(int) {
-      width[0] = off[1] - off[0];
-    });
-}
+struct matching_key_width {
+  cudf::detail::input_offsetalator offsets;
 
-int64_t uniform_key_width(cudf::strings_column_view const& keys,
-                          int64_t width,
-                          rmm::cuda_stream_view stream,
-                          rmm::device_async_resource_ref mr)
+  __device__ int64_t operator()(cudf::size_type i) const
+  {
+    auto const width = offsets[1] - offsets[0];
+    return width > 0 && offsets[i + 1] - offsets[i] == width ? width : 0;
+  }
+};
+
+struct key_width_storage {
+  void* scratch;
+  int64_t* result;
+};
+
+/**
+ * Enqueue the positive uniform key width, or zero for variable/empty strings, for nonempty keys.
+ * The caller owns the storage and must retain it and the keys until the supplied stream completes.
+ */
+template <typename Allocate>
+  requires requires(Allocate allocate, std::size_t bytes) {
+    { allocate(bytes) } -> std::same_as<key_width_storage>;
+  }
+int64_t* enqueue_constant_key_width(cudf::strings_column_view const& keys,
+                                    rmm::cuda_stream_view stream,
+                                    Allocate allocate)
 {
-  if (width <= 0) return 0;
-  auto const off = cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets());
-  bool const all_equal =
-    thrust::all_of(rmm::exec_policy(stream, mr),
-                   thrust::counting_iterator<cudf::size_type>(0),
-                   thrust::counting_iterator<cudf::size_type>(keys.size()),
-                   [=] __device__(cudf::size_type i) { return off[i + 1] - off[i] == width; });
-  return all_equal ? width : 0;
+  matching_key_width const matching_width{
+    cudf::detail::offsetalator_factory::make_input_iterator(keys.offsets(), keys.offset())};
+  auto reduce = [&](void* scratch, std::size_t& scratch_bytes, int64_t* result) {
+    throw_if_cuda_error(
+      cub::DeviceReduce::TransformReduce(scratch,
+                                         scratch_bytes,
+                                         thrust::counting_iterator<cudf::size_type>(0),
+                                         result,
+                                         keys.size(),
+                                         cuda::minimum<int64_t>{},
+                                         matching_width,
+                                         std::numeric_limits<int64_t>::max(),
+                                         stream.value()),
+      "dictionary key width reduction");
+  };
+  std::size_t scratch_bytes = 0;
+  reduce(nullptr, scratch_bytes, nullptr);
+  auto const storage = allocate(scratch_bytes);
+  reduce(storage.scratch, scratch_bytes, storage.result);
+  return storage.result;
 }
 
 int64_t measure_constant_key_width(cudf::strings_column_view const& keys, decode_frame& frame)
 {
   if (keys.size() <= 0) return 0;
-  auto& first = frame.allocate_buffer(sizeof(int64_t));
-  auto* d     = static_cast<int64_t*>(first.data());
-  enqueue_first_key_width(keys, d, frame.stream(), frame.mr());
-  return uniform_key_width(keys, frame.read_scalar(d), frame.stream(), frame.mr());
+  auto const* width = enqueue_constant_key_width(
+    keys, frame.stream(), [&](std::size_t scratch_bytes) -> key_width_storage {
+      if (scratch_bytes > std::numeric_limits<std::size_t>::max() - sizeof(int64_t)) {
+        throw std::overflow_error("dictionary key width scratch size overflow");
+      }
+      auto& storage = frame.allocate_buffer(sizeof(int64_t) + scratch_bytes);
+      // CUB's queried size includes padding to align the scratch following the scalar.
+      return {static_cast<char*>(storage.data()) + sizeof(int64_t),
+              static_cast<int64_t*>(storage.data())};
+    });
+  return frame.read_scalar(width);
 }
 
 void drain_dictionary_observation(rmm::cuda_stream_view stream) noexcept
@@ -115,30 +147,6 @@ void drain_dictionary_observation(rmm::cuda_stream_view stream) noexcept
   auto const status = cudaStreamSynchronize(stream.value());
   if (status != cudaSuccess) {
     std::fprintf(stderr, "simpatico dictionary cleanup failed: %s\n", cudaGetErrorString(status));
-  }
-}
-
-int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
-                                   rmm::cuda_stream_view stream,
-                                   rmm::device_async_resource_ref mr)
-{
-  if (keys.size() <= 0) return 0;
-  // Keep both readback destinations alive until the observation completes, including failures after
-  // enqueue.
-  rmm::device_buffer first(0, stream, mr);
-  int64_t width = 0;
-  try {
-    first.resize(sizeof(int64_t), stream);
-    auto* d = static_cast<int64_t*>(first.data());
-    enqueue_first_key_width(keys, d, stream, mr);
-    throw_if_cuda_error(
-      cudaMemcpyAsync(&width, d, sizeof(width), cudaMemcpyDeviceToHost, stream.value()),
-      "dictionary key width readback");
-    stream.synchronize();
-    return uniform_key_width(keys, width, stream, mr);
-  } catch (...) {
-    drain_dictionary_observation(stream);
-    throw;
   }
 }
 
@@ -328,6 +336,9 @@ dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::
                                                           rmm::device_async_resource_ref mr)
 {
   std::unique_ptr<dictionary_compressed_representation> result;
+  std::optional<rmm::device_buffer> width_storage;
+  // The explicit pinned resource makes this buffer both host- and device-accessible.
+  std::optional<rmm::device_buffer> width_result;
   try {
     if (!dict_col) throw std::invalid_argument("dictionary construction: missing column");
     result = std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
@@ -335,14 +346,21 @@ dictionary_compressed_representation::from_encoded_column(std::unique_ptr<cudf::
     if (result->dict_column->size() > 0) {
       auto const keys = cudf::dictionary_column_view(result->dict_column->view()).keys();
       if (keys.size() > 0) {
-        result->constant_key_width =
-          measure_constant_key_width(cudf::strings_column_view(keys), stream, mr);
+        enqueue_constant_key_width(
+          cudf::strings_column_view(keys), stream, [&](std::size_t bytes) -> key_width_storage {
+            width_storage.emplace(bytes, stream, mr);
+            width_result.emplace(sizeof(int64_t), stream, cudf::get_pinned_memory_resource());
+            return {width_storage->data(), static_cast<int64_t*>(width_result->data())};
+          });
       }
     }
     stream.synchronize();
+    if (width_result) {
+      result->constant_key_width = *static_cast<int64_t const*>(width_result->data());
+    }
     return result;
   } catch (...) {
-    // Retain the encoded column until its pending construction and observation work have drained.
+    // Keep the column, scratch, and private result destination alive until pending work drains.
     drain_dictionary_observation(stream);
     throw;
   }
