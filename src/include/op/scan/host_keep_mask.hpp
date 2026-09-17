@@ -33,7 +33,7 @@ namespace sirius::op::scan {
  * @brief Filter @p view by a host-computed byte keep-mask.
  *
  * Uploads @p keep (one byte per row, 1 = keep) as a BOOL8 column and returns
- * @c cudf::apply_boolean_mask(view), so every host-computed keep-mask shares
+ * @c sirius::ApplyRetentionMask(view), so every host-computed keep-mask shares
  * one implementation.
  *
  * The upload is a @c cudaMemcpyAsync from pageable memory, which stages the
@@ -53,7 +53,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
  * @p keep_words is a cuDF-convention bitmask (bit `row % 32` of uint32 word
  * `row / 32`, 1 = keep; padding bits past @p row_count ignored). Uploads the
  * words, expands them with @c cudf::mask_to_bools, and returns
- * @c cudf::apply_boolean_mask(view). Used by the MVCC keep-mask path.
+ * @c sirius::ApplyRetentionMask(view). Used by the MVCC keep-mask path.
  *
  * ⚠ The upload from pinned host memory is a true-async DMA: @p keep_words
  * must stay alive until the work enqueued on @p stream completes.

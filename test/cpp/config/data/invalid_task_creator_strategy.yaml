@@ -1,0 +1,4 @@
+sirius:
+  executor:
+    task_creator:
+      strategy: lookahead

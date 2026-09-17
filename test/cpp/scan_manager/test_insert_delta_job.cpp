@@ -34,6 +34,7 @@
 #include <io/sirius_datasource.hpp>
 #include <memory/topology_index.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
+#include <op/scan/duckdb_native_metadata.hpp>
 #include <scan_manager/insert_delta_job.hpp>
 #include <unistd.h>
 
@@ -432,19 +433,24 @@ TEST_CASE("insert-delta job: blockless-only splits carry no datasource",
 TEST_CASE("insert-delta job: a delta spanning multiple capture ranges merges in order",
           "[insert_delta_job][scan_manager]")
 {
-  // One row group per capture range so the delta below spans several
-  // dispatcher tasks.
+  // The former environment override must not change the fixed internal
+  // scheduling granularity.
   setenv("SIRIUS_METADATA_PARSE_CHUNK", "1", 1);
   struct chunk_env_restore {
     ~chunk_env_restore() { unsetenv("SIRIUS_METADATA_PARSE_CHUNK"); }
   } restore;
+  REQUIRE(sirius::op::scan::metadata_parse_chunk() == 8);
 
+  // Use enough row groups to span multiple fixed internal capture ranges.
+  constexpr std::size_t delta_rows = 1'250'000;
   job_test_db tdb;
   exec_ok(*tdb.con, "SET threads TO 1");
   exec_ok(*tdb.con, "CREATE TABLE t AS SELECT range::INTEGER AS k FROM range(10000)");
   exec_ok(*tdb.con, "CHECKPOINT");
-  exec_ok(*tdb.con, "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(250000)");
-  exec_ok(*tdb.con, "INSERT INTO t VALUES (260000)");
+  exec_ok(
+    *tdb.con,
+    "INSERT INTO t SELECT (10000+range)::INTEGER FROM range(" + std::to_string(delta_rows) + ")");
+  exec_ok(*tdb.con, "INSERT INTO t VALUES (" + std::to_string(10000 + delta_rows) + ")");
 
   exec_ok(*tdb.con, "BEGIN TRANSACTION");
   auto& storage = resolve_storage(*tdb.con, "t");
@@ -454,7 +460,7 @@ TEST_CASE("insert-delta job: a delta spanning multiple capture ranges merges in 
   run(requests);
 
   auto const& request = requests[0];
-  REQUIRE(request.plan.row_groups.size() >= 3);
+  REQUIRE(request.plan.row_groups.size() > sirius::op::scan::metadata_parse_chunk());
 
   // Row-group order, contiguous boundaries, and filled columns survive the
   // parallel merge.
@@ -468,13 +474,13 @@ TEST_CASE("insert-delta job: a delta spanning multiple capture ranges merges in 
     expected_start += rg.row_count;
     plan_rows += rg.row_count;
   }
-  REQUIRE(plan_rows == 250001);
+  REQUIRE(plan_rows == delta_rows + 1);
 
   std::size_t bundle_rows = 0;
   for (auto const& b : request.bundles) {
     bundle_rows += b.total_rows;
   }
-  REQUIRE(bundle_rows == 250001);
+  REQUIRE(bundle_rows == delta_rows + 1);
   exec_ok(*tdb.con, "ROLLBACK");
 }
 

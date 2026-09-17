@@ -19,6 +19,7 @@
 #include "blockingconcurrentqueue.h"
 #include "cucascade/data/data_batch.hpp"
 #include "exec/try.hpp"
+#include "late_mat/column_origin.hpp"
 #include "op/scan/batch_coalescer.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
@@ -53,6 +54,11 @@ struct databatch_provider {
     std::size_t conversion_destination_bytes{0};
     std::unique_ptr<op::scan::scan_info> scan_info;
     int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
+    /// Where this batch's rows came from, for late materialization: the pinned
+    /// entry and the contiguous span of pin-order rows this chunk covers. Null
+    /// unless the late-mat gate is on and the scan is one whose batches are a
+    /// chunk each — the addressing means nothing otherwise.
+    std::shared_ptr<late_mat::scan_batch_origin const> origin;
   };
 
   virtual ~databatch_provider()  = default;

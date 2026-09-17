@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,7 +31,9 @@ namespace sirius::scan_manager {
  * One bit per row in cuDF's bitmask convention (bit `row % 32` of uint32 word
  * `row / 32`, 1 = keep), so the packed words upload and expand with
  * @c cudf::mask_to_bools without translation; padding bits past @ref
- * row_count are don't-care. @ref words aliases the mask job's pinned
+ * row_count are ZERO: the job zero-initializes every carve and only writes
+ * [0, row_count), which decode_visibility_mask requires. @ref words aliases
+ * the mask job's pinned
  * {reservation, blocks} bundle or its pageable fallback vector — the pointer
  * IS the owner, so copies are a refcount bump and a mask's words cannot
  * dangle. The mask job installs it at carve time and its fill tasks write
@@ -59,5 +62,17 @@ struct mvcc_chunk_mask {
 /// request fills it, then each cached provider takes its own copy (words are
 /// shared through the masks' owning pointers, never duplicated).
 using mvcc_chunk_mask_set = std::vector<mvcc_chunk_mask>;
+
+/// Whether any slot actually masks a row. A duckdb pin's set is sized to the chunk count at
+/// request creation and never resized (see mvcc_mask_job.hpp), so `masks.empty()` is false for
+/// every duckdb pin even when the table has no deletions — checking size alone would refuse late
+/// materialization for every duckdb-native scan unconditionally. This checks the slots
+/// themselves instead: an unmodified table's slots are all default-constructed (has_mask()
+/// false), so this reports false and the caller may treat the set as if it carried no mask.
+[[nodiscard]] inline bool has_any_mask(mvcc_chunk_mask_set const& masks)
+{
+  return std::any_of(
+    masks.begin(), masks.end(), [](mvcc_chunk_mask const& mask) { return mask.has_mask(); });
+}
 
 }  // namespace sirius::scan_manager

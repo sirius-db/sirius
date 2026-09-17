@@ -127,6 +127,13 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;
 
+  /// Exact whole-query input basis, known at plan time. This single-shot source yields at most
+  /// one ratio sample, so default estimation requires `assume_unit_ratio`.
+  [[nodiscard]] std::optional<std::size_t> total_source_input_bytes() const override
+  {
+    return estimated_source_bytes();
+  }
+
   /**
    * @brief Viability gate: throw for output types the host→device conversion
    *        cannot represent faithfully, triggering DuckDB CPU fallback.

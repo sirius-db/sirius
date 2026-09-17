@@ -4,6 +4,7 @@
  */
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -27,7 +28,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/logical.h>
@@ -45,7 +45,20 @@ namespace simpatico {
 
 namespace {
 
-constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
+// Structural row bound only: a cudf column cannot exceed size_type rows, and
+// the INT32 dictionary codes index the KEY SET (K distinct values), not rows,
+// so any representable column encodes. Audit notes (iteration 6): the decode
+// gathers do their addressing in int64 (key_base/nbytes below) and the
+// constant-width fast path self-guards on nbytes > size_type max; the historic
+// `1 << 28` "sanity bound" predated the HyperLogLog cardinality gate below,
+// which now handles the real hazard (dictionary::encode's illegal access on
+// huge HIGH-CARDINALITY inputs) by distinct FRACTION rather than row count —
+// the row cap only silently forced narrow pins (>= 2^28 rows/chunk, e.g. q12's
+// 5-col lineitem pin at ~276M and 2-3-col orders pins at ~600-900M) to raw.
+// Encode transients (cudf's hash set + INT32 indices) scale O(n); an
+// allocation failure throws and the pin falls back to an uncompressed chunk,
+// visibly (see the per-pin coverage line in pin_table.cpp).
+constexpr size_t MAX_INDICES = static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
 
 // cudf::dictionary::encode faults with a context-corrupting illegal access on
 // very large, very-high-cardinality strings — inputs a dictionary can't help
@@ -267,7 +280,7 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
   rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress"};
+  nvtx_scoped_range r{"dictionary_decompress"};
   // Decode from the stored dictionary column.
   if (dict_column == nullptr) { return nullptr; }
   if (dict_column->size() == 0) {
@@ -293,7 +306,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress_predicate"};
+  nvtx_scoped_range r{"dictionary_decompress_predicate"};
   if (dict_column == nullptr || !pred.active()) { return nullptr; }
 
   auto const n_rows = dict_column->size();

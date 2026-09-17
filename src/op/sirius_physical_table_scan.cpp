@@ -22,12 +22,11 @@
 #include "log/logging.hpp"
 #include "op/scan/scan_utils.hpp"
 #include "sirius_config.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/concatenate.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -107,7 +106,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::get_next_task_input_d
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   auto& input                  = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& ro_input_batches = input.get_read_only_batches();
 
@@ -172,8 +171,13 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (local_filter_expr != nullptr) {
-    sirius::expression_evaluator evaluator(
-      *local_filter_expr, cudf::get_current_device_resource_ref(), stream);
+    sirius::expression_evaluator evaluator(*local_filter_expr,
+                                           cudf::get_current_device_resource_ref(),
+                                           stream,
+                                           strategy_from_config(),
+                                           expression_evaluator::default_min_ast_size,
+                                           like_swar_fastpath_enabled(),
+                                           like_cache());
     auto filtered_table = evaluator.select(
       batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
     output_batch = sirius::make_data_batch(

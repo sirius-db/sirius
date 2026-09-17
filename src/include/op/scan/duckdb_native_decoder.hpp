@@ -52,15 +52,33 @@ std::vector<cudf::io::text::byte_range_info> row_group_file_ranges(
 //===----------------------------------------------------------------------===//
 // decode_duckdb_native_split
 //===----------------------------------------------------------------------===//
-/// @brief Decode a single split as provided by the split_provider into a cudf::table.
-/// Supported: fixed-width data (UNCOMPRESSED / RLE / BITPACKING / CONSTANT),
-///            varchar data (UNCOMPRESSED / DICTIONARY / FSST / DICT_FSST),
-///            validity (UNCOMPRESSED / EMPTY / CONSTANT / ROARING),
-///            rowid synthesis,
-///            host-backed segments (`host_ptr` set; insert-delta staging).
-/// @param datasource Read handle for the .db file; may be null only when
-///        no segment stages a file read (host-backed / blockless splits).
-/// @throws std::runtime_error on any codec the walker accepted but this decoder does not implement.
+/**
+ * @brief Decode one DuckDB-native split into a cuDF table.
+ *
+ * An empty row-group list returns a schema-correct zero-row table. Fixed-size
+ * ARRAY projections are represented as cuDF LIST columns with fixed-width
+ * children.
+ *
+ * Supported inputs:
+ * - fixed-width data: UNCOMPRESSED, RLE, BITPACKING, CONSTANT, ALP, and ALPRD;
+ * - varchar data: UNCOMPRESSED, DICTIONARY, FSST, and DICT_FSST;
+ * - fixed-size ARRAY data with supported fixed-width children;
+ * - validity: UNCOMPRESSED, EMPTY, CONSTANT, and ROARING; and
+ * - synthetic rowid and host-backed insert-delta segments.
+ *
+ * @throw std::runtime_error If the backing storage is not a single-file block
+ *                           manager, the split exceeds cuDF's row limit,
+ *                           staged file reads lack a datasource or Sirius
+ *                           context, or a segment uses a codec the decoder
+ *                           does not implement.
+ * @param row_groups Metadata for the row groups to decode; may be empty.
+ * @param table_info Table-level projection and storage metadata.
+ * @param datasource Read handle for the .db file; may be null when no segment
+ *                   stages a file read, including for an empty split.
+ * @param mem_space Destination GPU memory space.
+ * @param stream CUDA stream used for staging and decode.
+ * @return A table containing the decoded columns in projection order.
+ */
 std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   duckdb_native_ingestible_table_info const& table_info,

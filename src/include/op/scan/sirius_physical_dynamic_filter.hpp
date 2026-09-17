@@ -16,9 +16,9 @@
 
 #pragma once
 
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <op/sirius_physical_operator.hpp>
 
 #include <cstddef>
@@ -26,24 +26,9 @@
 
 namespace sirius::op::scan {
 
-//===----------------------------------------------------------------------===//
-// sirius_physical_dynamic_filter
-//===----------------------------------------------------------------------===//
-/// @brief Applies dynamic filters to a GPU scan's decoded output.
+/// @brief Applies visible dynamic filters at scan or direct-route endpoints.
 ///
-/// Sits directly above the scan in its pipeline: the scan reads, decodes, and assembles each
-/// batch, then this operator filters it. The apply mode matches the scan format's read-time
-/// capabilities: a parquet scan already ran AST-capable filters (zone maps) through the reader's
-/// @c set_filter, so its operator applies membership masks only; a duckdb-native scan has no
-/// read-time dynamic phase, so its operator also evaluates AST-capable filters row-wise
-/// (@c include_ast_row_masks).
-///
-/// Filters arrive on a @ref sirius_dynamic_filter_set the producing hash-join build publishes into.
-/// The @ref dynamic_filter_gate decides per scan whether filtering earns its cost, and a batch
-/// passes through unchanged when the publication attempt emitted no filter applicable under the
-/// mode, no device-local replica exists, or the gate declines. A producing join's immediate probe
-/// edge is ordered after build-port publication; this operator can run earlier when its scan is a
-/// transitive target below an intervening join, so each execution uses the filters then visible.
+/// Mode controls whether AST masks supplement membership masks; finalization closes the channel.
 class sirius_physical_dynamic_filter : public sirius_physical_operator {
  public:
   static constexpr SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DYNAMIC_FILTER;
@@ -60,21 +45,15 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 
   void on_finalize_operator() override;
 
-  /// Filtering only shrinks or passes through its input, never expands it — reserve at most the
-  /// input footprint rather than the base 2× expansion default.
+  /// Filtering never expands its input, so the peak estimate is the input footprint.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
   {
     return stats.bytes;
   }
 
  private:
-  /// The append-only publication channel; co-owned with the producing hash-join build.
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _filters;
-  /// Per-scan selectivity + per-filter marginal-keep gate, shared across this scan's split tasks.
   dynamic_filter_gate _gate;
-  /// Which filter capabilities apply post-decode: membership only when AST filters already ran at
-  /// read time (parquet), AST row masks too when the scan has no read-time dynamic phase
-  /// (duckdb-native).
   dynamic_filter_apply_mode _mode;
 };
 

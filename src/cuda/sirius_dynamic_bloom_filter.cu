@@ -16,25 +16,25 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 
-// cucascade
 #include <rmm/cuda_device.hpp>
 
 #include <cuco/bloom_filter.cuh>
 #include <cuco/bloom_filter_policies.cuh>
-#include <cuco/hash_functions.cuh>
 #include <cuda/sirius_rmm_cuco_allocator.cuh>
-#include <cuda/std/bit>
 #include <cuda/std/cstddef>
-#include <cuda/std/limits>
-#include <cuda/stream_ref>
+#include <cuda/stream>
+#include <cuda/utility>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <log/logging.hpp>
-#include <op/dynamic_filter_device.hpp>
-#include <op/dynamic_filter_replica_reservation.hpp>
-#include <op/dynamic_filter_replica_transfer.hpp>
-#include <op/sirius_dynamic_filter.hpp>
+#include <op/dynamic_filter/dynamic_filter_device.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_reservation.hpp>
+#include <op/dynamic_filter/dynamic_filter_replica_transfer.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -49,7 +49,6 @@
 namespace sirius::op {
 
 namespace {
-// ~16 bits/key → num_blocks ≈ keys/16
 constexpr std::size_t kBitsPerBlock     = 256;
 constexpr std::size_t kTargetBitsPerKey = 16;
 
@@ -62,82 +61,16 @@ std::size_t blocks_for(std::size_t num_keys)
 
 using bloom_alloc = sirius::rmm_cuco_allocator<cuda::std::byte>;
 
-/**
- * @brief Fingerprint policy for Sirius's dynamic Bloom filters.
- *
- * Identical to @c cuco::default_filter_policy<xxhash_64<KeyT>,uint32_t,8> in hash function,
- * block geometry and fingerprint layout; the @b only difference is @ref block_index. Neither
- * stock cuco policy fits here: @c arrow_filter_policy hard-caps the filter at 128 MiB (2^22
- * blocks), below the sizes the publisher emits at scale, and @c default_filter_policy computes
- * @c hash % num_blocks — an emulated 64-bit divide that dominates the probe kernel on GPUs.
- * This policy keeps the uncapped sizing and replaces the modulo with Lemire fast-range
- * (@c (hash*num_blocks)>>64, one @c mul.hi.u64).
- *
- * @note Correctness. Fast-range is deterministic and applied identically on @c add and
- *       @c contains, so the no-false-negative contract is preserved; only the false-positive
- *       set can differ (the join remains authoritative). Fast-range consumes the high hash
- *       bits while the fingerprint consumes the low 40, so the two draws stay disjoint until
- *       very large block counts; measured false-positive rates at the shapes that motivated
- *       this change were slightly better than the modulo's.
- */
-template <class KeyT>
-class sirius_bloom_policy {
- public:
-  using hasher             = cuco::xxhash_64<KeyT>;
-  using word_type          = std::uint32_t;
-  using hash_argument_type = typename hasher::argument_type;
-  using hash_result_type   = decltype(std::declval<hasher>()(std::declval<hash_argument_type>()));
-
-  static constexpr std::uint32_t words_per_block = 8;
-
- private:
-  static constexpr std::uint32_t word_bits = cuda::std::numeric_limits<word_type>::digits;
-  /// Bits of hash consumed per fingerprint bit (5 for a 32-bit word).
-  static constexpr std::uint32_t bit_index_width = cuda::std::bit_width(word_bits - 1);
-  static constexpr word_type bit_index_mask      = (word_type{1} << bit_index_width) - 1;
-
-  static_assert(words_per_block * bit_index_width <=
-                  cuda::std::numeric_limits<hash_result_type>::digits,
-                "hash is too narrow to supply one fingerprint bit per word");
-
- public:
-  __device__ constexpr hash_result_type hash(hash_argument_type const& key) const
-  {
-    return hash_(key);
-  }
-
-  /// Lemire fast-range in place of `hash % num_blocks`: one 64x64->high multiply.
-  template <class Extent>
-  [[nodiscard]] __device__ constexpr Extent block_index(hash_result_type hash,
-                                                        Extent num_blocks) const
-  {
-    auto const wide = static_cast<__uint128_t>(static_cast<std::uint64_t>(hash)) *
-                      static_cast<__uint128_t>(static_cast<std::uint64_t>(num_blocks));
-    return static_cast<Extent>(static_cast<std::uint64_t>(wide >> 64));
-  }
-
-  /// One fingerprint bit per word, drawn from a disjoint `bit_index_width`-wide hash field.
-  [[nodiscard]] __device__ constexpr word_type word_pattern(hash_result_type hash,
-                                                            std::uint32_t word_index) const
-  {
-    return word_type{1} << ((hash >> (word_index * bit_index_width)) & bit_index_mask);
-  }
-
- private:
-  hasher hash_{};
-};
-
 template <class KeyT>
 using sirius_bloom = cuco::bloom_filter<KeyT,
                                         cuco::extent<std::size_t>,
                                         cuda::thread_scope_device,
-                                        sirius_bloom_policy<KeyT>,
+                                        cuco::default_filter_policy<KeyT>,
                                         bloom_alloc>;
 
 template <class Filter>
 using bloom_owner = std::unique_ptr<Filter>;
 
-// The two legal key widths. A live replica owns exactly one alternative.
 using bloom_storage =
   std::variant<bloom_owner<sirius_bloom<std::int32_t>>, bloom_owner<sirius_bloom<std::int64_t>>>;
 
@@ -230,13 +163,11 @@ std::unique_ptr<bloom_replica> build_bloom_replica(int device_id,
                                                    rmm::device_async_resource_ref mr,
                                                    cuda::stream_ref stream)
 {
-  // The same policy serves every filter size, so replicas carry a single filter type.
   return std::make_unique<bloom_replica>(
     device_id, build_bloom<sirius_bloom<KeyT>>(keys, num_blocks, mr, stream));
 }
 }  // namespace
 
-// Owns the complete set of ready device-local Bloom replicas.
 struct sirius_dynamic_bloom_filter::impl {
   int source_device = -1;
   std::vector<std::unique_ptr<bloom_replica>> replicas;
@@ -258,7 +189,6 @@ bool sirius_dynamic_bloom_filter::supports(cudf::data_type t) noexcept
 
 std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) noexcept
 {
-  // Mirrors blocks_for(): each block is kBitsPerBlock bits = kBitsPerBlock/8 bytes.
   return blocks_for(num_keys) * (kBitsPerBlock / 8);
 }
 
@@ -270,7 +200,14 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     throw std::invalid_argument(
       "[sirius_dynamic_bloom_filter] unsupported key type (INT32 or INT64).");
   }
-  auto const n = keys.size();
+  // Keep compacted storage alive until add_async is queued on stream.
+  std::unique_ptr<cudf::table> compacted;
+  cudf::column_view build_keys = keys;
+  if (keys.null_count() > 0) {
+    compacted  = cudf::drop_nulls(cudf::table_view{{keys}}, {0}, stream, mr);
+    build_keys = compacted->view().column(0);
+  }
+  auto const n = build_keys.size();
   cuda::stream_ref const s{stream.value()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
@@ -281,10 +218,12 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
   std::unique_ptr<bloom_replica> source;
   switch (keys.type().id()) {
     case cudf::type_id::INT32:
-      source = build_bloom_replica<std::int32_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source =
+        build_bloom_replica<std::int32_t>(_impl->source_device, build_keys, num_blocks, mr, s);
       break;
     case cudf::type_id::INT64:
-      source = build_bloom_replica<std::int64_t>(_impl->source_device, keys, num_blocks, mr, s);
+      source =
+        build_bloom_replica<std::int64_t>(_impl->source_device, build_keys, num_blocks, mr, s);
       break;
     default:
       throw std::logic_error(
@@ -313,8 +252,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   }
   auto const& source_space = source_target->get_gpu_space();
 
-  // Retain all destination objects and streams until direct peer copies have been submitted to
-  // every target. The completion pass then waits on transfers already running in parallel.
+  // Keep copies and streams alive until all peer transfers are queued and synchronized.
   std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
@@ -342,9 +280,8 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
             target, detail::tracked_replica_allocation_bytes(bytes), stream);
           if (!reservation) { return std::unique_ptr<bloom_replica>{}; }
 
-          auto destination_bloom = make_bloom<filter_type>(source_bloom->block_extent(),
-                                                           reservation->allocator(),
-                                                           cuda::stream_ref{stream.value()});
+          auto destination_bloom = make_bloom<filter_type>(
+            source_bloom->block_extent(), reservation->allocator(), cuda::stream_ref{stream.get()});
           auto result = std::make_unique<bloom_replica>(device_id, std::move(destination_bloom));
           auto& destination = *std::get<bloom_owner<filter_type>>(result->bloom);
           copy_filter_storage(*source_bloom,
@@ -415,21 +352,26 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr) const
 {
-  if (!supports(probe.type())) { return nullptr; }
   auto const* replica =
     _impl ? _impl->find(detail::resolve_dynamic_filter_device_id(device_id)) : nullptr;
   if (!replica || !replica->has_bloom()) { return nullptr; }
 
-  auto const matching_key_type = std::visit(
-    [&](auto const& bloom) {
+  auto const want = std::visit(
+    [](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return probe.type().id() == key_type_id<key_type>();
+      return cudf::data_type{key_type_id<key_type>()};
     },
     replica->bloom);
-  if (!matching_key_type) { return nullptr; }
+  // A pinned chunk may store this key narrowed while the filter was published at
+  // the native carrier; restore rather than decline (see restore_probe_to). The
+  // equality below subsumes the old supports() guard: it admits exactly the two
+  // types the bloom is instantiated for.
+  auto const restored = detail::restore_probe_to(probe, want, stream, mr);
+  auto const keys     = restored ? restored->view() : probe;
+  if (keys.type() != want) { return nullptr; }
 
-  auto const n = probe.size();
+  auto const n = keys.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
   cuda::stream_ref const s{stream.value()};
@@ -439,7 +381,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
     [&](auto const& bloom) {
       using owner_type = std::decay_t<decltype(bloom)>;
       using key_type   = typename owner_type::element_type::key_type;
-      auto const* d    = probe.data<key_type>();
+      auto const* d    = keys.data<key_type>();
       bloom->contains_async(d, d + n, outp, s);
     },
     replica->bloom);

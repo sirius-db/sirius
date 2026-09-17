@@ -5,6 +5,7 @@
 #include "codegen/plan/plan_dsl.hpp"
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/selection.hpp"
 #include "codegen/util/stream_pool.hpp"
 
@@ -113,8 +114,22 @@ struct decode_selection {
   /// orchestrator populates @c survivor_indices whenever it sets this; any
   /// anomaly silently keeps the mask walk (the pick is an optimization).
   bool enumerate_by_index = false;
+  /// A selection that arrived AFTER the scan — post-join survivor rows, bucketed
+  /// per chunk (codegen/selection/chunk_row_set.hpp). Mutually exclusive with
+  /// @c mask in practice: a late selection has no mask to have been balloted
+  /// from, which is the whole reason this form exists, so @c survivor_count must
+  /// be set from the row set and the mask may be null.
+  ///
+  /// Only @c decode_route::bitpack_mask is served this way. The other routes
+  /// read the mask directly (str_split reconstruct, dictionary gather) or need
+  /// the survivor index list (@c full), and are refused rather than silently
+  /// decoded full width — the same footing the index walk was introduced on.
+  sirius::codegen::chunk_row_set const* rows = nullptr;
 
-  [[nodiscard]] bool active() const noexcept { return mask != nullptr && survivor_count >= 0; }
+  [[nodiscard]] bool active() const noexcept
+  {
+    return (mask != nullptr || rows != nullptr) && survivor_count >= 0;
+  }
   /// Any compacted route: the result column must be survivor-sized.
   [[nodiscard]] bool compacted() const noexcept
   {

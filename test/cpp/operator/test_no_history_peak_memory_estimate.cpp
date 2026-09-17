@@ -77,8 +77,7 @@ hash_join_fixture make_hash_join()
     duckdb::vector<duckdb::idx_t>{},
     duckdb::vector<duckdb::idx_t>{},
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{}),
-    0,
-    nullptr);
+    0);
   return f;
 }
 

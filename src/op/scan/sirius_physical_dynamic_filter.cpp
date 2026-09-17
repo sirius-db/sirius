@@ -18,9 +18,7 @@
 #include <data/data_batch_utils.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/sirius_physical_dynamic_filter.hpp>
-
-// nvtx
-#include <nvtx3/nvtx3.hpp>
+#include <telemetry/nvtx.hpp>
 
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -50,7 +48,7 @@ void sirius_physical_dynamic_filter::on_finalize_operator()
 std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_dynamic_filter::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_dynamic_filter::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
 
   // An immediate BUILD_PROBE target runs after publication, but a scan reached through an

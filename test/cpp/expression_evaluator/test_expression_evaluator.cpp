@@ -389,9 +389,11 @@ exec_result run_execute(memory_space& space,
 exec_result run_select(memory_space& space,
                        std::shared_ptr<data_batch> const& input_batch,
                        std::unique_ptr<ast_node> node,
-                       exp_strategy_enum strategy = MAT)
+                       exp_strategy_enum strategy = MAT,
+                       bool like_swar_fastpath    = true)
 {
-  exp_executor executor(*node, get_resource_ref(space), cudf::get_default_stream(), strategy);
+  exp_executor executor(
+    *node, get_resource_ref(space), cudf::get_default_stream(), strategy, 2, like_swar_fastpath);
   auto input_ro     = input_batch->to_read_only();
   auto& in_repr     = input_ro.get_data()->cast<gpu_table_representation>();
   auto output_table = executor.select(in_repr.get_table_view());
@@ -1117,6 +1119,59 @@ TEMPLATE_TEST_CASE("evaluate projects references, constants, and comparisons",
   }
 }
 
+TEMPLATE_TEST_CASE("evaluate casts scalar constants including HUGEINT and NULL",
+                   "[expression_evaluator][scalar_cast]",
+                   mat_strategy,
+                   ast_interpret_strategy,
+                   ast_jit_strategy)
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+  auto const hugeint = logical_type::make(type_id::HUGEINT);
+  auto const bigint  = logical_type::make(type_id::BIGINT);
+  auto const integer = logical_type::make(type_id::INTEGER);
+
+  for (auto const row_count : {0, 1, 7}) {
+    CAPTURE(row_count);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                row_count,
+                                                cudf::mask_state::UNALLOCATED,
+                                                cudf::get_default_stream(),
+                                                get_resource_ref(*space)));
+    auto input = std::make_unique<cudf::table>(std::move(columns));
+
+    std::vector<std::unique_ptr<ast_node>> nodes;
+    nodes.push_back(make_cast(make_int_const(-42), hugeint, false));
+    // The outer AST cast consumes the materialized HUGEINT cast as a temporary column.
+    nodes.push_back(make_cast(make_cast(make_int_const(1), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_null_const(integer), hugeint, false));
+    nodes.push_back(make_cast(make_cast(make_null_const(integer), hugeint, false), bigint, false));
+    nodes.push_back(make_cast(make_int_const(42), logical_type::make(type_id::DOUBLE), false));
+    std::vector<ast_node const*> expressions;
+    for (auto const& node : nodes) {
+      expressions.push_back(node.get());
+    }
+    exp_executor executor(
+      expressions, get_resource_ref(*space), cudf::get_default_stream(), TestType::value, 1);
+    auto output     = executor.evaluate(input->view());
+    auto const view = output->view();
+    REQUIRE(view.num_rows() == row_count);
+    REQUIRE(view.num_columns() == 5);
+    for (int i = 0; i < 4; ++i) {
+      REQUIRE(view.column(i).type() == cudf::data_type{cudf::type_id::INT64});
+    }
+    REQUIRE(copy_column_to_host<int64_t>(view.column(0)) == std::vector<int64_t>(row_count, -42));
+    REQUIRE(copy_column_to_host<int64_t>(view.column(1)) == std::vector<int64_t>(row_count, 1));
+    REQUIRE(view.column(0).null_count() == 0);
+    REQUIRE(view.column(1).null_count() == 0);
+    REQUIRE(view.column(2).null_count() == row_count);
+    REQUIRE(view.column(3).null_count() == row_count);
+    REQUIRE(view.column(4).type() == cudf::data_type{cudf::type_id::FLOAT64});
+    REQUIRE(copy_column_to_host<double>(view.column(4)) == std::vector<double>(row_count, 42.0));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // select() — basic filter + edge cases
 // ---------------------------------------------------------------------------
@@ -1655,6 +1710,120 @@ TEMPLATE_TEST_CASE("select LIKE and NOT LIKE",
       if (s != "str_1") { expected.push_back(s); }
     }
     REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("LIKE '%tr%1%' — multi-literal SWAR fast path")
+  {
+    // col0 LIKE '%tr%1%' — a `%lit1%lit2%` pattern, dispatched to the SWAR fast path.
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr%1%"));
+    auto expr = make_func(
+      sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto [in_batch, out_batch, iv, ov] = run_select(*space, input, std::move(expr), strategy);
+    auto in_strs                       = copy_string_column_to_host(iv.column(0));
+    std::vector<std::string> expected;
+    for (auto const& s : in_strs) {
+      auto const tr = s.find("tr");
+      if (tr != std::string::npos && s.find('1', tr + 2) != std::string::npos) {
+        expected.push_back(s);
+      }
+    }
+    REQUIRE(copy_string_column_to_host(ov.column(0)) == expected);
+  }
+
+  SECTION("LIKE fast-path classification is shared by pattern value across evaluators")
+  {
+    auto make_like_expression = [] {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      return make_func(
+        sirius::function_id::like, std::move(children), logical_type::make(type_id::BOOLEAN));
+    };
+    auto first_expr  = make_like_expression();
+    auto second_expr = make_like_expression();
+    REQUIRE(first_expr.get() != second_expr.get());
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor first_executor(*first_expr,
+                                get_resource_ref(*space),
+                                cudf::get_default_stream(),
+                                strategy,
+                                exp_executor::default_min_ast_size,
+                                /*like_swar_fastpath=*/true,
+                                like_cache);
+    exp_executor second_executor(*second_expr,
+                                 get_resource_ref(*space),
+                                 cudf::get_default_stream(),
+                                 strategy,
+                                 exp_executor::default_min_ast_size,
+                                 /*like_swar_fastpath=*/true,
+                                 like_cache);
+
+    auto first       = first_executor.select(repr.get_table_view());
+    auto first_again = first_executor.select(repr.get_table_view());
+    auto second      = second_executor.select(repr.get_table_view());
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(first_again->view().column(0)));
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) ==
+            copy_string_column_to_host(second->view().column(0)));
+    REQUIRE(first_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(second_executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
+  SECTION("NOT LIKE fallback classification is memoized across evaluator batches")
+  {
+    std::vector<std::unique_ptr<ast_node>> children;
+    children.push_back(make_ref(0));
+    children.push_back(make_str_const("%tr_1%"));
+    auto expr = make_func(
+      sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+
+    auto input_ro   = input->to_read_only();
+    auto& repr      = input_ro.get_data()->cast<gpu_table_representation>();
+    auto like_cache = std::make_shared<sirius::like_multiliteral_cache>();
+    exp_executor executor(*expr,
+                          get_resource_ref(*space),
+                          cudf::get_default_stream(),
+                          strategy,
+                          exp_executor::default_min_ast_size,
+                          /*like_swar_fastpath=*/true,
+                          like_cache);
+
+    auto first               = executor.select(repr.get_table_view());
+    auto second              = executor.select(repr.get_table_view());
+    auto const input_strings = copy_string_column_to_host(repr.get_table_view().column(0));
+    std::vector<std::string> expected;
+    for (auto const& value : input_strings) {
+      if (value != "str_1") { expected.push_back(value); }
+    }
+    REQUIRE(copy_string_column_to_host(first->view().column(0)) == expected);
+    REQUIRE(copy_string_column_to_host(second->view().column(0)) == expected);
+    REQUIRE(executor.like_shared_cache_lookup_count_for_testing() == 1);
+    REQUIRE(like_cache->classification_count_for_testing() == 1);
+  }
+
+  SECTION("NOT LIKE '%tr%1%' — fast path agrees with the cudf path (fast path disabled)")
+  {
+    auto run_not_like = [&](bool like_swar_fastpath) {
+      std::vector<std::unique_ptr<ast_node>> children;
+      children.push_back(make_ref(0));
+      children.push_back(make_str_const("%tr%1%"));
+      auto expr = make_func(
+        sirius::function_id::not_like, std::move(children), logical_type::make(type_id::BOOLEAN));
+      auto [in_batch, out_batch, iv, ov] =
+        run_select(*space, input, std::move(expr), strategy, like_swar_fastpath);
+      return copy_string_column_to_host(ov.column(0));
+    };
+
+    auto const with_fast_path = run_not_like(true);
+    auto const with_cudf      = run_not_like(false);
+    REQUIRE(with_fast_path == with_cudf);
   }
 }
 

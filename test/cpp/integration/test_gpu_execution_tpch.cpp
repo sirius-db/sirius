@@ -24,6 +24,7 @@
 #include <duckdb.hpp>
 #include <duckdb/common/enums/optimizer_type.hpp>
 #include <duckdb/main/config.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
 #include <utils/log_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/tpch_queries.hpp>
@@ -231,7 +232,8 @@ class GPUExecutionFixtureBase {
   {
     // Enable transparent GPU execution
     con->Query("SET gpu_execution = true;");
-    auto before_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
+    auto before_gpu_stats    = sirius::test::get_transparent_execution_stats(*con);
+    auto before_filter_stats = sirius::test::get_dynamic_filter_stats_snapshot(*con);
 
     // Run on GPU (transparent — plain SQL goes through Sirius optimizer hook)
     auto gpu_result = con->Query(query);
@@ -242,6 +244,11 @@ class GPUExecutionFixtureBase {
     REQUIRE_FALSE(gpu_result->HasError());
     auto after_gpu_stats = sirius::test::get_transparent_execution_stats(*con);
     sirius::test::require_transparent_execution_delta(before_gpu_stats, after_gpu_stats, 1, 0, 1);
+
+    // Domain evidence must remain an upper bound for every build shape exercised by this suite.
+    auto after_filter_stats = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+    REQUIRE(after_filter_stats.keys_build_exceeded_domain ==
+            before_filter_stats.keys_build_exceeded_domain);
 
     // Run on CPU (disable transparent execution)
     con->Query("SET gpu_execution = false;");

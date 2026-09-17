@@ -107,6 +107,16 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   /// prefetch threads grabbing exclusive locks would serialize them.
   [[nodiscard]] bool is_draining(std::size_t quiet_ms) const;
 
+  /// \brief True after close(); unlike @ref is_closed, does not require the queue to be drained.
+  [[nodiscard]] bool is_discovery_complete() const;
+
+  /// \brief Monotonic sum of `get_estimated_size_in_bytes()` for all pushed splits.
+  /// Complete after discovery only if @ref has_unsized_splits is false.
+  [[nodiscard]] std::size_t discovered_bytes() const;
+
+  /// \brief Whether any split lacked an a-priori size estimate and contributed zero.
+  [[nodiscard]] bool has_unsized_splits() const;
+
  private:
   friend class load_balancing_scan_batch_coalescer;
 
@@ -122,6 +132,10 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   std::exception_ptr _exception;
   /// steady_clock ms timestamp of the last get_next_split() pop (0 = never).
   std::atomic<std::int64_t> _last_pop_ms{0};
+  /// Monotonic total; consumers never decrement it.
+  std::size_t _discovered_bytes{0};
+  /// Latched when a split reports no size estimate.
+  bool _has_unsized_splits{false};
 };
 
 }  // namespace sirius::scan_manager

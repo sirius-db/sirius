@@ -17,6 +17,7 @@
 #include "compressed_representation.hpp"
 
 #include "device_compressed_blob.hpp"
+#include "memory/size_arithmetic.hpp"
 
 #include <cuda_runtime.h>
 
@@ -95,7 +96,7 @@ compressed_host_representation::compressed_host_representation(
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -116,7 +117,7 @@ compressed_host_representation::compressed_host_representation(
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -130,7 +131,7 @@ compressed_host_representation::compressed_host_representation(
 // ── idata_representation interface ───────────────────────────────────────────
 
 std::unique_ptr<cucascade::idata_representation> compressed_host_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same backing blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_host_representation>(
@@ -165,8 +166,8 @@ std::pair<std::size_t, std::size_t> projected_bytes(
     std::size_t compressed   = 0;
     std::size_t uncompressed = 0;
     for (auto idx : absolute) {
-      compressed += sizes->compressed[idx];
-      uncompressed += sizes->uncompressed[idx];
+      compressed   = memory::saturating_add(compressed, sizes->compressed[idx]);
+      uncompressed = memory::saturating_add(uncompressed, sizes->uncompressed[idx]);
     }
     return {compressed, uncompressed};
   }
@@ -259,7 +260,7 @@ compressed_device_representation::compressed_device_representation(
   std::size_t uncompressed_bytes,
   std::int64_t num_rows,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -278,7 +279,7 @@ compressed_device_representation::compressed_device_representation(
   std::int64_t num_rows,
   std::optional<std::vector<std::size_t>> selected_indices,
   std::shared_ptr<const per_column_byte_sizes> column_sizes)
-  : cucascade::idata_representation(memory_space),
+  : simpatico_compressed_representation(memory_space),
     _blob(std::move(blob)),
     _column_names(std::move(column_names)),
     _compressed_bytes(compressed_bytes),
@@ -289,13 +290,15 @@ compressed_device_representation::compressed_device_representation(
 {
 }
 
+bool compressed_device_representation::has_table() const noexcept { return _blob != nullptr; }
+
 const simpatico::compressed_table& compressed_device_representation::table() const noexcept
 {
   return _blob->table;
 }
 
 std::unique_ptr<cucascade::idata_representation> compressed_device_representation::clone(
-  rmm::cuda_stream_view /*stream*/)
+  ::cuda::stream_ref /*stream*/)
 {
   // Share the same cached blob — no byte copy needed.
   auto copy = std::unique_ptr<compressed_device_representation>(

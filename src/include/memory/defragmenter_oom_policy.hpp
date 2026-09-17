@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cuda/stream>
+
 #include <cucascade/memory/oom_handling_policy.hpp>
 
 namespace sirius {
@@ -36,7 +38,7 @@ struct defragmenter_oom_policy final : public cucascade::memory::oom_handling_po
 
  protected:
   void* do_handle_oom(std::size_t bytes,
-                      rmm::cuda_stream_view stream,
+                      ::cuda::stream_ref stream,
                       std::exception_ptr eptr,
                       RetryFunc retry_function) override;
 };

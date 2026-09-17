@@ -40,8 +40,11 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
 }
 
 sirius_interface::sirius_interface(duckdb::ClientContext& client_context,
-                                   std::optional<std::string> query_label)
-  : client_context(client_context), query_label(std::move(query_label)) {};
+                                   std::optional<std::string> query_label,
+                                   std::optional<std::string> session_label)
+  : client_context(client_context),
+    query_label(std::move(query_label)),
+    session_label(std::move(session_label)) {};
 
 void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
                                             const duckdb::string& query) const

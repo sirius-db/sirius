@@ -11,6 +11,8 @@
   },
   "dependencies": [
     "cudf",
+    "cuvs",
+    "raft",
     "cuco",
     "nvrtc",
     "yaml-cpp",
@@ -18,7 +20,13 @@
     "numactl",
     "liburing",
     "openssl",
-    "curl"
+    "roaring",
+    {
+      "features": [
+        "http2"
+      ],
+      "name": "curl"
+    }
   ],
   "overrides": [
     {

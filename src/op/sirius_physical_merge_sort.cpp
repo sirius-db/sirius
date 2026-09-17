@@ -22,8 +22,7 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -80,7 +79,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 

@@ -35,6 +35,9 @@ query::query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipel
 void query::build_indices()
 {
   for (const auto& pipeline : _pipelines) {
+    // Stamp the query id so the task queues can derive their per-query index key from a
+    // pipeline without recovering it from the (31-bit-masked) scheduling priority.
+    pipeline->set_query_id(_query_id);
     for (auto& op : pipeline->get_operators()) {
       op.get().set_pipeline(pipeline);
     }

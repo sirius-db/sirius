@@ -207,6 +207,8 @@ class downgrade_executor {
   cucascade::memory::memory_space* _memory_space;
   std::string _source_label;
   sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
+  // Non-owning pointer into task_scheduler. SiriusContext stops this executor before destroying
+  // the scheduler and its queue.
   sirius::exec::multi_index_priority_queue<sirius::parallel::itask>* _pipeline_task_queue{nullptr};
 };
 

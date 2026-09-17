@@ -17,9 +17,12 @@
 #pragma once
 
 #include "compressed_scan.hpp"
+#include "compression/simpatico_compressed_representation.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
@@ -103,7 +106,7 @@ void copy_pinned_blocks_to_device(
  * Multiple compressed_host_representation objects may share the same underlying
  * blob (e.g. after select_columns() or clone()).
  */
-class compressed_host_representation : public cucascade::idata_representation {
+class compressed_host_representation : public simpatico_compressed_representation {
  public:
   /**
    * @brief Construct a compressed_host_representation owning a share of @p blob.
@@ -149,7 +152,7 @@ class compressed_host_representation : public cucascade::idata_representation {
 
   /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 
@@ -207,6 +210,14 @@ class compressed_host_representation : public cucascade::idata_representation {
     return _pushdown_scan;
   }
 
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -225,6 +236,7 @@ class compressed_host_representation : public cucascade::idata_representation {
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 
@@ -247,7 +259,7 @@ class compressed_host_representation : public cucascade::idata_representation {
  * simpatico::decompress() directly on the cached table, decompressing only the selected
  * columns when a projection is set.
  */
-class compressed_device_representation : public cucascade::idata_representation {
+class compressed_device_representation : public simpatico_compressed_representation {
  public:
   compressed_device_representation(
     cucascade::memory::memory_space& memory_space,
@@ -274,12 +286,16 @@ class compressed_device_representation : public cucascade::idata_representation 
 
   /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   /// Projection sharing the same cached blob; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
     std::span<const std::size_t> indices) const;
 
+  /// Whether @ref table is readable. A chunk may legitimately carry no blob —
+  /// serving paths that need only the row count or a column projection never
+  /// touch one — so anything that DOES read the table must ask first.
+  [[nodiscard]] bool has_table() const noexcept;
   /// The cached compressed_table (defined in device_compressed_blob.hpp).
   [[nodiscard]] const simpatico::compressed_table& table() const noexcept;
 
@@ -312,6 +328,14 @@ class compressed_device_representation : public cucascade::idata_representation 
     return _pushdown_scan;
   }
 
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
+  }
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -329,6 +353,7 @@ class compressed_device_representation : public cucascade::idata_representation 
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

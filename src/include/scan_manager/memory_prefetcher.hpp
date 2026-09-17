@@ -102,7 +102,7 @@ class memory_prefetcher {
   }
 
  private:
-  void worker_loop();
+  void worker_loop(std::size_t worker_index);
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
   std::size_t sweep(rmm::cuda_stream_view stream);
@@ -115,6 +115,10 @@ class memory_prefetcher {
   /// short scan-bound queries). Quiet connectors allow full parallelism.
   std::unique_ptr<std::atomic<bool>[]> _drain_claims;
   cucascade::memory::memory_space* _gpu_space;
+
+  /// One stream per worker, borrowed (NOT owned): converted batches are
+  /// dealloc-bound to it and outlive the worker that made them.
+  std::vector<rmm::cuda_stream_view> _worker_streams;
 
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};

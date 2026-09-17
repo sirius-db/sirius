@@ -16,7 +16,6 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
-#include "planner/duckdb_join_filter_candidate_adapter.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
@@ -239,9 +238,7 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(duckdb::LogicalOperator const& plan,
                                                               duckdb::ClientContext& context)
 {
-  auto copy = plan.Copy(context);
-  planner::duckdb_join_filter_candidate_adapter::preserve_dynamic_filter_metadata(plan, *copy);
-  return copy;
+  return plan.Copy(context);
 }
 
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
@@ -268,6 +265,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // hooks must not throw, so log a readable message and decline the plan.
   try {
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
+  } catch (duckdb::NotImplementedException& e) {
+    // Plan not serializable — skip GPU. Logged because a silent skip here is
+    // indistinguishable from "GPU ran and was slow": the query still returns correct
+    // CPU results, so an unserializable table function looks like a perf mystery.
+    SIRIUS_LOG_DEBUG("Transparent execution: plan not serializable, skipping GPU: {}", e.what());
   } catch (std::exception& e) {
     SIRIUS_LOG_DEBUG("Transparent execution: failed to copy logical plan: {}",
                      sirius::sanitized_message(e));

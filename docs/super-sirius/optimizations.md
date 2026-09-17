@@ -64,19 +64,35 @@ num_partitions = max(1, ceil(total_bytes / hash_partition_bytes))
 - `src/op/sirius_physical_grouped_aggregate_merge.cpp`, `src/op/sirius_physical_top_n.cpp` — `build_pipelines()` overrides
 - `src/sirius_engine.cpp` — invokes marking after parent pointers are refreshed
 
-**Config:** `fuse_merge_pipelines` (default: true). See [physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape details.
+**Policy:** Sirius applies eligible merge fusion automatically. See
+[physical-plan-generation.md](physical-plan-generation.md) → Merge fusion for pipeline-shape
+details.
 
 ### Task Creator Look-Ahead (PR #1174)
 
 **Motivation:** With demand-driven (`active`) task creation, a drained task queue leaves GPU workers idle even when not-yet-activated scans could already be producing work.
 
-**Mechanism:** The task creator keeps a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When the task scheduler finds its task queue empty, it calls `schedule_lookahead(device_hint)`, which — only under `strategy: lookahead` — emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
+**Mechanism:** The task creator retains a `_lookahead_queue` of candidate operators (built at query start from the plan's scan operators after the first, cleared on drain/restart). When an engine-controlled policy selects the internal `request_type::lookahead` primitive and the task scheduler finds its task queue empty, `schedule_lookahead(device_hint)` emits one speculative request for the next not-yet-activated operator, warming scans up one task at a time. The manager loop creates a single task per look-ahead request rather than draining the source. See [task-creator.md](task-creator.md).
 
 **Code path:** `src/creator/task_creator.cpp` — `schedule_lookahead()`; `src/pipeline/task_scheduler.cpp` — empty-queue trigger; `src/include/creator/config.hpp` — `request_type`
 
-**Config:** `executor.task_creator.strategy` (`active` default, `lookahead` opt-in) — see [configuration.md](configuration.md).
+**Policy:** internal. The current shipped policy is active and demand-driven;
+look-ahead is not a user-selectable YAML setting.
 
 ## Operator-Level Optimizations
+
+### Multi-Literal LIKE SWAR Fast Path (PR #1610)
+
+**Motivation:** cuDF's thread-per-row, byte-at-a-time LIKE matcher is load-instruction-bound on wide text columns. The TPC-H q13 predicate `%special%requests%` measured about 6x faster in the specialized kernel, reducing the query's LIKE work without changing SQL semantics.
+
+**Mechanism:** Constant patterns of the form `%lit1%lit2%...%litN%` are classified and compiled once per query and pattern value, then shared immutably across task-local evaluators. The CUDA kernel scans aligned 64-bit words, uses SWAR digram masks to find candidates, and verifies complete literals in order. Unsupported pattern shapes and ineligible column layouts fall back to `cudf::strings::like`; NOT LIKE is fused into the output write.
+
+**Code path:**
+- `src/expression_evaluator/specializations/function.cpp` — query-cache lookup and dispatch
+- `src/cuda/sirius_like_multiliteral.cu` — classifier, query-cache implementation, compiled descriptors, and SWAR kernel
+- `src/include/expression_evaluator/like_multiliteral.hpp` — launcher and input contracts
+
+**Config:** `like_swar_fastpath` (default: `true`, connection-local). The query snapshots this setting at engine initialization. Supported Sirius ingestion must supply valid UTF-8 for DuckDB VARCHAR/cuDF STRING input; the hot path treats that as a precondition and does not add a redundant validation scan.
 
 ### Adaptive Join BUILD_PROBE Mode (PR #423)
 
@@ -108,11 +124,32 @@ In BUILD_PROBE mode, each partition's first task builds a `cudf::hash_join` hash
 
 **Motivation:** cuDF's sorted groupby finds group boundaries via `stable_sorted_order(keys)`, which takes the radix fast path only for a single key column. A multi-column group key falls to lexicographic merge sort — on TPC-H q16 at SF1000, 308.7 ms for 118.8M rows, 92% of the aggregate. The pre-existing dictionary-encode path narrows the comparators but leaves multiple key columns, so the single-column gate is never reached.
 
-**Mechanism:** `cudf::encode` collapses the key table into one dense INT32 label; the groupby sorts on that label, and original keys are recovered with a gather at group cardinality. `cudf::encode` returns distinct key rows in sorted order, so label ordering equals lexicographic key ordering; NULL key tuples get their own label (`null_policy::INCLUDE`). Gated on: a COLLECT_SET aggregation being present, ≥ 1M input rows, a multi-column non-nested key, and an HLL estimate putting group cardinality below 1% of rows (otherwise `cudf::encode`'s internal distinct+sort costs as much as the sort it replaces). Falls back silently to the plain multi-column sort if encoding throws; short-circuits the STRING dictionary-encode path when active.
+**Mechanism:** the key table collapses into one dense INT32 label; the groupby sorts on that label, and representative keys are recovered with a gather at group cardinality. Sirius first computes distinct keys with equal nulls and all NaNs equal, then sorts those keys lexicographically with nulls last. The sorted distinct table is the unique build side of a `cudf::distinct_hash_join`; probing the original rows returns one build-row index per input row, which is already the required dense label. Gated on: a COLLECT_SET aggregation, at least 1,048,576 input rows, a non-nested key that is not already a single null-free fixed-width column, and an HLL estimate below 1% of rows. A single nullable or variable-width key can qualify. Non-fatal label construction failures fall back to the original key columns; an active label path bypasses STRING dictionary encoding.
 
-**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` — `local_grouped_agg()`, label path (`use_label_keys`)
+**Code path:** `src/op/aggregate/gpu_aggregate_impl.cpp` -- `gpu_aggregate_impl::local_grouped_aggregate()`, label path (`use_label_keys`)
 
-**Config:** none (thresholds hard-coded). TPC-H SF1000 GB300: q16 0.490 s → 0.298 s.
+**Config:** none (thresholds are internal). TPC-H SF1000 GB300 measured workload: q16 0.490 s -> 0.298 s.
+
+### Fused Dense Count Join (PR #1606)
+
+**Motivation:** A `COUNT(col | *) GROUP BY key` over a preserved-side outer equi-join on the same key materializes the whole join result only to collapse it again. The count is a pure cardinality product, so the joined rows never have to exist.
+
+**Mechanism:** `sirius_physical_dense_count_join` replaces the join-plus-aggregate fragment with two direct-address histograms over the preserved key domain: one holding each key's preserved-side multiplicity `P`, one holding its counted-side match count `M`. For a key with `V` matches whose COUNT argument is non-NULL, the emitted value is `P * max(M, 1)` for COUNT(*) and `P * V` for COUNT(col) — the rule `sirius::op::dense_count_semantics` states once for both strategies. Preserved-side NULL keys form a single group carrying the same formula at `M == 0`.
+
+The dense path is taken only when `dense_count_layout::plan` succeeds — the domain must be non-empty and not the full 64-bit range, `2 * slots * slot_bytes` must fit `size_t`, and `slots` must fit `int64_t` — and the domain is then dense enough to be worth direct addressing: `total_bytes() <= min(max_bins_bytes, 4 x input bytes)`, `slots <= 8 x non-NULL preserved rows`, and `slots <= 2 x total input rows`. Every term is measured over the one partition a task holds, and the budget is not divided by the partition count: hash partitioning gives every task the full key domain, so tasks replicate a full-width histogram rather than splitting one — a domain worth direct addressing over the whole input is rejected once it would have to be replicated per partition. Otherwise the operator falls back to exact sparse aggregation (per-batch groupby, balanced partial merge, left join, multiply).
+
+Slots are 32-bit unless either side has at least `UINT32_MAX` rows, in which case they widen to 64-bit. Narrow slots halve the per-key footprint and so double the key range admitted under the same `max_bins_bytes` budget.
+
+**Why this is not a group-by strategy:** direct addressing needs the key domain of everything a task will accumulate before the first row lands, which is why both inputs take FULL barriers. Both inputs are also hash-partitioned on the join key, so equal keys — NULL keys included — land in one partition: each task sizes its histogram from its own partition's preserved min/max, and the per-task outputs concatenate with no merge step. `sirius_physical_dense_count_join::execute` asserts that co-location at runtime, rejecting a second partition that arrives carrying NULL preserved keys. `gpu_aggregate_impl::local_grouped_aggregate` sees one batch of one table and has no min/max at all to size a histogram against.
+
+Two fast paths live inside the dense path. When every slot in the domain is occupied, the selected-group list is the identity permutation, so no gather map is built and the histogram reads stream instead of gathering; otherwise the map is sized from the exact group count, which a duplicate-heavy preserved side keeps far below both the domain and the row count. Below a 48 KiB shared-memory budget, and with at least eight rows per slot, accumulation privatizes the histogram per block to keep a low-cardinality domain off a handful of global atomic addresses.
+
+**Code path:**
+- `src/op/sirius_physical_dense_count_join.cpp` — strategy gate (`dense_admits`, `max_admitted_histogram_bytes`), sparse fallback
+- `src/cuda/dense_count_join_impl.cu` — histogram accumulation and emit kernels
+- `src/include/op/aggregate/dense_count_join_impl.hpp` — `dense_count_layout`, `dense_count_semantics`, `dense_count_bounds`, `dense_count_state`
+
+**Config:** `enable_dense_count_join` (default: `true`, see [Configuration](configuration.md)); the histogram byte budget is engine-internal and not user-tunable. Operator entry: [Operators](operators.md).
 
 ### Distinct Hash Join (PR #558)
 
@@ -278,6 +315,43 @@ result materialization restore native carriers.
 `sirius.operator_params` and the DuckDB SET option. See
 [Compressed Materialization](compressed-materialization.md).
 
+### Late Materialization (unreleased, experimental)
+
+**Motivation:** A query that selects wide columns carries them from the scan to whatever finally
+reads them — through joins that copy them beside their keys, partitions that write them to a
+repository and read them back, and aggregates that group on them. Nothing in that stretch reads
+what is IN them. On TPC-H q10 at SF1000 the five wide `customer` columns are 158 B/row and cross
+eleven port boundaries before anything needs their values.
+
+**Mechanism:** For a PINNED table, the scan emits a pin-order rowid (UINT32 where the table's rows
+fit 32 bits, UINT64 otherwise) in place of the deferred columns plus 1-byte placeholders, so arity
+and positions are unchanged and every operator in between is unaffected. A directive on the
+consuming operator gathers the values back out of the pinned chunks, matching its batch by whole
+schema. Both halves install together or not at all. A plan pass reports how far each column travels
+and how many port crossings it survives; a policy with measured floors decides whether the ride
+repays the rowid. Where the deferred columns are GROUP BY keys, the ride can continue past the
+aggregate to materialize one row per group instead of one per join match, subject to a pin-time
+distinctness proof.
+
+**Code path:**
+- `src/planner/late_mat_plan_pass.cpp` — column lifetimes, group-by/top-n/join modelling
+- `src/include/late_mat/defer_directive.hpp` — the pair, the substituted schemas, rowid widths
+- `src/include/late_mat/defer_policy.hpp` — value/boundary floors and their measurements
+- `src/late_mat/pin_uniqueness.cpp` — the pin-time distinctness proof
+- `src/scan_manager/sirius_scan_manager.cpp` — admission, the port hop, riders
+- `src/late_mat/port_materialize.cpp`, `materialize.cpp` — putting the values back
+- `src/op/scan/sirius_gpu_scan_operator.cpp` — rowid emission, including for filtered scans
+
+**Config:** `SIRIUS_EXP_LATE_MAT=1` gates the feature (off by default, inert when off);
+`SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS` selects the columns the uniqueness probe observes, without
+which no group-by-rowid ride is admissible. Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the
+floors and the dark count-on-deferred path. Composes with `enable_compressed_materialization`
+(default on) — a deferred column riding through a carrier-restore cast is carried past it rather
+than suppressing the deferral.
+
+**Measured:** GB300 SF1000, default `enable_compressed_materialization`. See
+[Late Materialization](late-materialization.md) for the full results table.
+
 ### Row Group Pruning with Filter Pushdown (PR #363)
 
 **Motivation:** Scanning all row groups wastes I/O bandwidth when filter predicates can eliminate entire groups.
@@ -363,13 +437,11 @@ If translation fails, filtering falls back to `expression_evaluator` on the deco
 **Mechanism:** The walk is structured for minimal, parallel, typed metadata access with statistics pruning:
 1. **Projected-column-only, typed walk (#868, #936):** `walk_duckdb_native_row_group_range()` walks the DuckDB segment trees directly for only the projected columns, reading typed `block_id` / compression / row counts / validity-child / max-string-length per segment instead of calling `GetColumnSegmentInfo` and re-parsing strings.
 2. **Stats pruning (#900):** `prepare_duckdb_native_walk()` evaluates DuckDB's own `TableFilter::CheckStatistics` against each row group's per-column statistics and drops any row group a pushed-down filter proves `FILTER_ALWAYS_FALSE` before it is staged, copied to the GPU, or decoded; an all-pruned table routes to DuckDB CPU up front.
-3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into ranges of `SIRIUS_METADATA_PARSE_CHUNK` groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
+3. **Parallel range walk + early decode (#895):** `prepare_duckdb_native_walk()` runs as a cheap serial pre-step (partition stats, type-viability gate, row-group count) with no per-segment I/O; the row groups are sliced into fixed internal ranges of eight groups, and the scan-manager pool walks the ranges in parallel so cold segment reads for different ranges overlap. The batch coalescer packs parsed ranges into cap-sized batches that decode while later ranges are still being parsed.
 
 **Code path:**
 - `src/op/scan/duckdb_native_metadata.cpp` — `prepare_duckdb_native_walk()`, `walk_duckdb_native_row_group_range()`, `mark_row_groups_pruned_by_filter_stats()`
 - `src/op/scan/duckdb_native_gpu_ingestible.cpp` — parse-range slicing, per-range walk thunks, and the `duckdb_native_batch_coalescer`
-
-**Config:** `SIRIUS_METADATA_PARSE_CHUNK` (row groups per parallel parse range, default 8)
 
 ### DuckDB-Native Async Coalesced Reads (PR #849)
 

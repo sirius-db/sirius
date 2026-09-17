@@ -19,8 +19,8 @@
 // GPUs. Before replica support, the corresponding cross-device dereference is the
 // cudaErrorIllegalAddress reported by TPC-H Q2.
 
-#include "op/dynamic_filter_replica_transfer.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/dynamic_filter_replica_transfer.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "operator_test_utils.hpp"
 
 #include <cudf/ast/expressions.hpp>
@@ -34,6 +34,7 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
@@ -178,7 +179,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     filter    = std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     keys.reset();  // replication must not depend on the constructor's borrowed column_view
 
     REQUIRE(filter->replica_count() == 1);
@@ -189,7 +190,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
     // explicit replication, a GPU 1 caller skips the optional filter and never touches GPU 0's set.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      auto const probe_stream = cudf::get_default_stream();
+      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -206,7 +207,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(
@@ -257,7 +258,7 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     sirius::op::sirius_dynamic_in_list_filter filter(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     require_omitted(filter);
   }
 
@@ -266,7 +267,7 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     sirius::op::sirius_dynamic_small_in_list_filter filter(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     require_omitted(filter);
   }
 
@@ -279,7 +280,7 @@ TEST_CASE("dynamic-filter replicas require destination reservation admission",
                                build_space.get_default_allocator());
     sirius::op::sirius_dynamic_bloom_filter filter(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     require_omitted(filter);
   }
 }
@@ -308,7 +309,7 @@ TEST_CASE("IN-list peer copies fan out to three GPUs before publication",
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     filter    = std::make_unique<sirius::op::sirius_dynamic_in_list_filter>(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
 
     filter->replicate_to_devices(replica_spaces);
     REQUIRE(filter->replica_count() == device_count);
@@ -364,9 +365,9 @@ TEST_CASE("dynamic-filter replica transfer borrows fixed blocks from a Sirius HO
     source =
       std::make_unique<rmm::device_buffer>(bytes, stream, source_space.get_default_allocator());
     REQUIRE(cudaMemcpyAsync(
-              source->data(), expected.data(), bytes, cudaMemcpyHostToDevice, stream.value()) ==
+              source->data(), expected.data(), bytes, cudaMemcpyHostToDevice, stream.get()) ==
             cudaSuccess);
-    stream.synchronize();
+    stream.sync();
   }
 
   {
@@ -393,9 +394,9 @@ TEST_CASE("dynamic-filter replica transfer borrows fixed blocks from a Sirius HO
 
     std::vector<std::byte> actual(bytes);
     auto const err = cudaMemcpyAsync(
-      actual.data(), destination.data(), bytes, cudaMemcpyDeviceToHost, stream.value());
+      actual.data(), destination.data(), bytes, cudaMemcpyDeviceToHost, stream.get());
     REQUIRE(err == cudaSuccess);
-    stream.synchronize();
+    stream.sync();
     REQUIRE(actual == expected);
   }
 
@@ -422,7 +423,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
                                build_space.get_default_allocator());
     filter                  = std::make_unique<sirius::op::sirius_dynamic_bloom_filter>(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     keys.reset();  // replication must use filter-owned source material
 
     REQUIRE(filter->replica_count() == 1);
@@ -434,7 +435,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     // Positions 0, 2, and 4 are build keys. Misses may be Bloom false positives, so only the
     // no-false-negative contract is asserted for them.
     auto probe = make_values<std::int64_t>(
@@ -473,7 +474,7 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
     filter = std::make_unique<sirius::op::sirius_dynamic_zone_map_filter>(std::move(zones),
                                                                           /*inclusive_min=*/true,
                                                                           /*inclusive_max=*/true);
-    stream.synchronize();
+    stream.sync();
 
     REQUIRE(filter->is_available_on_device(kBuildDevice));
     REQUIRE_FALSE(filter->is_available_on_device(kProbeDevice));
@@ -482,8 +483,8 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
-    auto probe        = cudf::sequence(10,
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
+    auto probe                         = cudf::sequence(10,
                                 cudf::numeric_scalar<std::int64_t>(0, true, stream),
                                 cudf::numeric_scalar<std::int64_t>(1, true, stream),
                                 stream,
@@ -526,7 +527,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
     auto keys = make_values<std::int64_t>({2, 4, 6}, cudf::data_type{cudf::type_id::INT64}, stream);
     filter    = std::make_unique<sirius::op::sirius_dynamic_small_in_list_filter>(
       keys->view(), stream, build_space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     keys.reset();  // replication must use the filter-owned needle snapshot
 
     REQUIRE(filter->replica_count() == 1);
@@ -537,7 +538,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
     // published; it must never dereference the source GPU's buffer.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      auto const probe_stream = cudf::get_default_stream();
+      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -554,7 +555,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    auto const stream = cudf::get_default_stream();
+    rmm::cuda_stream_view const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(

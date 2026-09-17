@@ -96,21 +96,6 @@ struct scan_plan {
   /// (either a hive partition, a virtual column, or not projected).
   std::vector<std::optional<std::size_t>> batch_position_by_column_id;
 
-  /// Sentinel for @ref output_position_by_column_id: the column_ids entry produces no output
-  /// column (pure-filter, virtual, or duplicate).
-  static constexpr std::size_t no_output_position = static_cast<std::size_t>(-1);
-
-  /// C → output-position map: column_ids index → its position in @c output_layout (and thus in
-  /// the assembled output table), or @ref no_output_position when that column is not emitted.
-  ///
-  /// DuckDB hands Sirius dynamic-filter column references in column_ids space (a
-  /// @c LogicalGet binding's @c column_index — see @c JoinFilterPushdownColumn). Whenever
-  /// @c projection_ids reorders or prunes the output (or a virtual/duplicate column is skipped),
-  /// that index differs from the output-column position the post-decode filter and AST merge
-  /// operate on. This map translates the former to the latter; @c sirius_dynamic_filter_set
-  /// applies it on push so every consumer keys filters by output position.
-  std::vector<std::size_t> output_position_by_column_id;
-
   /// Primary indices of hive-partition columns. Supplied to
   /// @c convert_table_filters_to_expression so those filters are dropped
   /// from pushdown (they aren't in the parquet file).
@@ -126,6 +111,10 @@ struct scan_plan {
   /// expects, and the scan can skip @c set_column_names and per-file name-based
   /// leaf resolution.
   bool needs_reader_projection = false;
+  /// D index of the row-count carrier a column-less scan reads instead of its
+  /// natural batch (see build_scan_plan). Unset when the scan reads real
+  /// columns or when no fixed-width column was available.
+  std::optional<std::size_t> carrier_batch_index;
 
   //===--------------------------------------------------------------------===//
   // Convenience views
@@ -145,9 +134,8 @@ struct scan_plan {
   /// translator's name resolver.
   [[nodiscard]] std::string batch_column_name(duckdb::idx_t batch_position) const;
 
-  /// Batch positions of data columns that are read for filter evaluation but
-  /// not part of the logical output layout. The metadata scan accounts for
-  /// these separately from projected data columns when estimating decode memory.
+  /// D positions absent from output_layout, including pure-filter columns
+  /// and the row-count carrier.
   [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
 };
 
@@ -226,9 +214,10 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
 /// honor by name even when @c projection_ids is empty (the case for
 /// @c sirius_read_parquet, which DuckDB plans without projection pushdown, so the
 /// reader would otherwise return the full file width and the plan would assemble
-/// the wrong columns by compacted position). False for an empty @p column_ids
-/// (e.g. @c count(*), which must keep the reader's natural batch so the row count
-/// survives) and for a full-identity @c SELECT * read. @c build_scan_plan (to set
+/// the wrong columns by compacted position). False for an empty or virtual-only
+/// @p column_ids (@c count(*) — no real column to project by; @c build_scan_plan
+/// gives such scans a row-count carrier) and for a full-identity @c SELECT * read.
+/// @c build_scan_plan (to set
 /// @c needs_reader_projection) and the parquet ingestible (to enforce the
 /// column-names invariant) share this so their contracts agree.
 [[nodiscard]] bool column_ids_need_reader_projection(

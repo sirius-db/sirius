@@ -34,8 +34,9 @@
 #include "expression/join_condition.hpp"
 #include "expression/value.hpp"
 #include "helper/logical_type.hpp"
-#include "op/sirius_dynamic_filter.hpp"
+#include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/sirius_physical_delim_join.hpp"
+#include "op/sirius_physical_dense_count_join.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -49,11 +50,13 @@
 
 #include <catch.hpp>
 #include <duckdb/planner/operator/logical_dummy_scan.hpp>
+#include <utils/dense_count_join_test_builder.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -62,6 +65,7 @@ using sirius::op::sirius_physical_operator;
 using sirius::op::SiriusPhysicalOperatorType;
 
 namespace {
+using sirius::test::make_dense_count_join;
 
 constexpr cudf::data_type k_int8{cudf::type_id::INT8};
 constexpr cudf::data_type k_int16{cudf::type_id::INT16};
@@ -180,12 +184,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_hash_join> make_hash_join(
   condition.left  = make_reference(0);
   condition.right = make_reference(0);
   conditions.push_back(std::move(condition));
-  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(stub,
-                                                                  std::move(left),
-                                                                  std::move(right),
-                                                                  std::move(conditions),
-                                                                  join_type,
-                                                                  /*estimated_cardinality=*/1);
+  return duckdb::make_uniq<sirius::op::sirius_physical_hash_join>(
+    stub,
+    std::move(left),
+    std::move(right),
+    std::move(conditions),
+    join_type,
+    /*left_projection_map=*/duckdb::vector<std::size_t>{},
+    /*right_projection_map=*/duckdb::vector<std::size_t>{},
+    /*delim_types=*/duckdb::vector<sirius::logical_type>{},
+    /*estimated_cardinality=*/1);
 }
 
 duckdb::vector<duckdb::LogicalType> duckdb_integer_types(std::size_t count)
@@ -242,18 +250,27 @@ duckdb::unique_ptr<sirius::op::sirius_physical_grouped_aggregate> make_grouped_a
   return aggregate;
 }
 
-// Assert @p slot is a restore projection over the key column: a cast at output 0, bare
-// references elsewhere, and @p expected as its sidecar.
-void require_key_restore_projection(sirius_physical_operator const& op,
-                                    std::vector<cudf::data_type> const& expected)
+void require_restore_projection_at(sirius_physical_operator const& op,
+                                   std::size_t restored_idx,
+                                   std::vector<cudf::data_type> const& expected)
 {
   REQUIRE(op.type == SiriusPhysicalOperatorType::PROJECTION);
   auto const& projection = op.Cast<sirius::op::sirius_physical_projection>();
-  REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
-  for (std::size_t output_idx = 1; output_idx < projection.select_list.size(); ++output_idx) {
-    REQUIRE(projection.select_list[output_idx]->holds<sirius::ast::reference>());
+  REQUIRE(projection.select_list.size() == expected.size());
+  for (std::size_t output_idx = 0; output_idx < projection.select_list.size(); ++output_idx) {
+    if (output_idx == restored_idx) {
+      REQUIRE(projection.select_list[output_idx]->holds<sirius::ast::cast>());
+    } else {
+      REQUIRE(projection.select_list[output_idx]->holds<sirius::ast::reference>());
+    }
   }
   REQUIRE(op.get_physical_types() == expected);
+}
+
+void require_key_restore_projection(sirius_physical_operator const& op,
+                                    std::vector<cudf::data_type> const& expected)
+{
+  require_restore_projection_at(op, 0, expected);
 }
 
 }  // namespace
@@ -360,6 +377,23 @@ TEST_CASE("compressed_schema_propagation - hash join restores keys and maps payl
     REQUIRE(plan->get_physical_types() ==
             std::vector<cudf::data_type>{k_int32, k_int8, k_int32, k_int16});
   }
+}
+
+TEST_CASE("compressed_schema_propagation - dense count restores only keys and emits native",
+          "[compressed_schema_propagation]")
+{
+  duckdb::unique_ptr<sirius_physical_operator> plan = make_dense_count_join(
+    /*preserved_key_idx=*/1,
+    /*counted_key_idx=*/0,
+    /*counted_value_idx=*/1,
+    make_scan(3, {k_int8, k_int16, k_int8}),
+    make_scan(3, {k_int8, k_int16, k_int8}));
+
+  sirius::planner::propagate_compressed_schema(plan);
+
+  REQUIRE(!plan->has_physical_overrides());
+  require_restore_projection_at(*plan->children[0], 1, {k_int8, k_int32, k_int8});
+  require_restore_projection_at(*plan->children[1], 0, {k_int32, k_int16, k_int8});
 }
 
 TEST_CASE("compressed_schema_propagation - native boundaries restore children fully",
@@ -537,14 +571,14 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only the
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int8, k_int8});
   }
 
-  SECTION("projection_ids indirection maps targets to output positions")
+  SECTION("targets are output positions even when projection_ids indirect the scan")
   {
-    // Output 0 reads column_ids position 2 and output 1 reads position 0; the target is given in
-    // column_ids space, so targeting position 2 must flip OUTPUT 0 native and leave output 1
-    // narrow.
+    // Planned targets arrive in the scan's output space -- the channel's push, store, and lookup
+    // coordinate -- so the pass must not translate through projection_ids: targeting output 0
+    // flips it native even though that output reads column_ids position 2.
     auto scan = make_scan(2, {k_int8, k_int8}, duckdb::vector<std::size_t>{2, 0});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer({2});
+    scan->sirius_dynamic_filters->register_producer({0});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);

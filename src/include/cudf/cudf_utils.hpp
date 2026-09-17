@@ -19,36 +19,31 @@
 #include <cudf/version_config.hpp>
 #define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
 
-#include <cudf/table/table.hpp>
-#if CUDF_VERSION_NUM > 2504
-#include <cudf/detail/aggregation/aggregation.hpp>
-#include <cudf/detail/stream_compaction.hpp>
-#include <cudf/join/conditional_join.hpp>
-#include <cudf/join/distinct_hash_join.hpp>
-#include <cudf/join/hash_join.hpp>
-#include <cudf/join/join.hpp>
-#include <cudf/join/mixed_join.hpp>
-#else
-#include <cudf/join.hpp>
-#endif
+#include "helper/logical_type.hpp"
+#include "sirius/exception.hpp"
+
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/aggregation/aggregation.hpp>
+#include <cudf/detail/stream_compaction.hpp>
 #include <cudf/groupby.hpp>
-#include <cudf/reduction.hpp>
-#if CUDF_VERSION_NUM >= 2604
-#include <cudf/reduction/distinct_count.hpp>
-#endif
-#include "helper/logical_type.hpp"
-#include "sirius/exception.hpp"
-
+#include <cudf/join/conditional_join.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/join/hash_join.hpp>
+#include <cudf/join/join.hpp>
+#include <cudf/join/mixed_join.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
+#include <cudf/reduction/distinct_count.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -63,13 +58,30 @@
 #include <duckdb/common/types/value.hpp>
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius {
+
+/**
+ * @brief Apply a boolean retention mask using the cuDF 26.08 API.
+ */
+inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
+                                                       cudf::column_view const& retention_mask,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+#if CUDF_VERSION_NUM >= 2610
+  return cudf::apply_retention_mask(input, retention_mask, stream, mr);
+#else
+  return cudf::apply_boolean_mask(input, retention_mask, stream, mr);
+#endif
+}
 
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
 {
@@ -306,19 +318,34 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
   }
 }
 
+/** @brief Assemble an owned table from column pointers; `cudf::table` has no variadic constructor.
+ */
+template <typename... Columns>
+  requires(sizeof...(Columns) > 0 &&
+           (std::convertible_to<Columns &&, std::unique_ptr<cudf::column>> && ...))
+[[nodiscard]] inline std::unique_ptr<cudf::table> make_table(Columns&&... columns)
+{
+  std::vector<std::unique_ptr<cudf::column>> owned;
+  owned.reserve(sizeof...(Columns));
+  (owned.push_back(std::forward<Columns>(columns)), ...);
+  return std::make_unique<cudf::table>(std::move(owned));
+}
+
 /**
  * @brief Build a 0-row cudf table with one column per logical type.
  *
- * Column order and types mirror @p types (each via get_cudf_type). Used wherever an empty but
- * schema-bearing table is needed — e.g. an all-pruned GPU-values source, or the synthesized missing
- * side of a join against an empty table.
+ * Column order and types mirror @p types (each via get_cudf_type). An ARRAY entry becomes an empty
+ * cuDF LIST column of its fixed-width element type (`cudf::make_empty_column` rejects nested
+ * types). Used wherever an empty but schema-bearing table is needed — e.g. an all-pruned GPU-values
+ * source, or the synthesized missing side of a join against an empty table.
  */
 inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logical_type>& types)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   for (auto const& t : types) {
-    columns.push_back(cudf::make_empty_column(get_cudf_type(t)));
+    columns.push_back(t.is_array() ? cudf::make_empty_lists_column(get_cudf_type(t.array_child()))
+                                   : cudf::make_empty_column(get_cudf_type(t)));
   }
   return std::make_unique<cudf::table>(std::move(columns));
 }
@@ -328,10 +355,22 @@ inline std::unique_ptr<cudf::table> make_empty_table(const duckdb::vector<logica
  *
  * The carrier-exact counterpart of the logical-type overload, for callers holding an operator's
  * `physical_types` sidecar: the result reproduces those carriers instead of re-deriving native
- * ones.
+ * ones. Every entry must be non-nested: an id-only `cudf::data_type` carries no child type, so a
+ * nested carrier cannot be synthesized here.
+ *
+ * @throws duckdb::InvalidInputException on a nested entry — use the logical-type overload, which
+ *         carries element types.
  */
 inline std::unique_ptr<cudf::table> make_empty_table(const std::vector<cudf::data_type>& types)
 {
+  for (auto const& t : types) {
+    if (cudf::is_nested(t)) {
+      throw duckdb::InvalidInputException(
+        "sirius::make_empty_table: carrier-exact make_empty_table cannot synthesize nested type "
+        "%s; use the logical-type overload, which carries element types",
+        cudf::type_to_name(t));
+    }
+  }
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.reserve(types.size());
   for (auto const& t : types) {
@@ -470,14 +509,15 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
   }
 }
 
+/**
+ * @brief Build a zero-row cuDF table with the same per-column types as @p input.
+ *
+ * Nested-safe via `cudf::empty_like`: nested columns (LIST/STRUCT) reproduce their full child
+ * hierarchy, not just the top-level type id.
+ */
 inline std::unique_ptr<cudf::table> make_empty_like(cudf::table_view input)
 {
-  std::vector<std::unique_ptr<cudf::column>> empty_cols;
-  empty_cols.reserve(input.num_columns());
-  for (cudf::size_type col_idx = 0; col_idx < input.num_columns(); ++col_idx) {
-    empty_cols.push_back(cudf::make_empty_column(input.column(col_idx).type()));
-  }
-  return std::make_unique<cudf::table>(std::move(empty_cols));
+  return cudf::empty_like(input);
 }
 
 }  // namespace duckdb

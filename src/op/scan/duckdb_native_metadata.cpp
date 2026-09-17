@@ -17,8 +17,7 @@
 #include "op/scan/duckdb_native_metadata.hpp"
 
 #include "log/logging.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <duckdb/common/column_index.hpp>
 #include <duckdb/common/enums/compression_type.hpp>
@@ -44,7 +43,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -55,14 +53,9 @@ namespace sirius::op::scan {
 
 std::size_t metadata_parse_chunk()
 {
-  constexpr std::size_t kDefaultParseChunk = 8;
-  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
-    try {
-      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
-    } catch (...) { /* fall through to default */
-    }
-  }
-  return kDefaultParseChunk;
+  // This is an internal scheduling granularity, not a user tuning surface.
+  constexpr std::size_t kParseChunk = 8;
+  return kParseChunk;
 }
 
 namespace {
@@ -450,12 +443,9 @@ bool row_group_pruned_by_filter_stats(duckdb::PartitionRowGroup& prg,
   return false;
 }
 
-/// @brief Mark row groups a pushed-down filter proves can hold no matching rows.
-///
-/// Runs during prepare, before worker-thread segment walks, because statistics
-/// are available from PartitionRowGroup handles and do not require segment
-/// metadata. This avoids parsing metadata for row groups that will be skipped
-/// and lets the all-pruned case route to DuckDB CPU before the async scan starts.
+// Mark row groups a pushed-down filter proves can hold no matching rows. This
+// runs before concurrent segment walks so pruned groups need no segment
+// metadata. An all-pruned plan remains viable and reaches the empty-split path.
 void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 {
   if (plan.table_filters == nullptr || plan.table_filters->filters.empty() ||
@@ -483,6 +473,25 @@ void mark_row_groups_pruned_by_filter_stats(duckdb_native_walk_plan& plan)
 }
 
 }  // namespace
+
+std::optional<std::string> unsupported_projected_type_reason(
+  const std::vector<projected_column>& projected_cols,
+  const std::vector<sirius::logical_type>& projected_types)
+{
+  if (projected_cols.empty()) { return "no projected columns"; }
+  if (projected_cols.size() != projected_types.size()) {
+    return "projected_cols and projected_types size mismatch";
+  }
+  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
+    if (projected_cols[ci].is_rowid) { continue; }
+    std::string reason;
+    if (!is_supported_logical_type(projected_types[ci], reason)) {
+      return "column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
+             reason;
+    }
+  }
+  return std::nullopt;
+}
 
 bool is_supported_data_compression(duckdb::CompressionType c)
 {
@@ -524,7 +533,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   const duckdb::TableFilterSet* table_filters,
   const duckdb::vector<duckdb::ColumnIndex>* column_ids)
 {
-  nvtx3::scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
+  nvtx_scoped_range nvtx_prep{"sirius::native_metadata_prepare"};
 
   duckdb_native_walk_plan plan;
   plan.viable          = false;
@@ -541,24 +550,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
                      plan.viability_failure_reason);
   };
 
-  if (projected_cols.empty()) {
-    refuse("no projected columns");
+  if (auto reason = unsupported_projected_type_reason(projected_cols, projected_types)) {
+    refuse(std::move(*reason));
     return plan;
-  }
-  if (projected_cols.size() != projected_types.size()) {
-    refuse("projected_cols and projected_types size mismatch");
-    return plan;
-  }
-
-  // Type gate
-  for (std::size_t ci = 0; ci < projected_types.size(); ++ci) {
-    if (projected_cols[ci].is_rowid) { continue; }
-    std::string reason;
-    if (!is_supported_logical_type(projected_types[ci], reason)) {
-      refuse("column " + std::to_string(projected_cols[ci].storage_idx.GetPrimaryIndex()) + ": " +
-             reason);
-      return plan;
-    }
   }
 
   // GetPartitionStats touches LocalStorage/ClientContext. Runs before the
@@ -566,7 +560,7 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   duckdb::vector<duckdb::PartitionStatistics> partition_stats;
   {
     /// @note Synchronous pread()s happen here when cold.
-    nvtx3::scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
+    nvtx_scoped_range nvtx_ps{"sirius::native_metadata_partition_stats"};
     partition_stats = storage.GetPartitionStats(context);
   }
 
@@ -711,7 +705,7 @@ duckdb_native_row_group_range walk_duckdb_native_row_group_range(
   // Walk segment metadata for surviving row groups only — reading the typed
   // segment trees directly
   {
-    nvtx3::scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
+    nvtx_scoped_range nvtx_si{"sirius::native_metadata_segment_info"};
     auto& row_groups = *plan.storage->GetRowGroupCollection();
     for (std::size_t rg = rg_begin; rg < rg_end; ++rg) {
       auto const local_rgi = local_index_by_rg[rg - rg_begin];

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -36,6 +37,32 @@ struct task_memory_record {
   std::size_t estimated_bytes;              ///< Pre-history estimation basis
   std::size_t peak_memory_bytes;            ///< Actual peak allocated bytes during execution
   std::optional<std::size_t> output_bytes;  ///< Total output data size (nullopt if task OOM'd)
+  /// Whether @ref estimated_bytes is in pipeline-input units. False for mid-pipeline resumes;
+  /// they remain valid for per-task @ref estimate_peak_memory.
+  bool ratio_eligible = true;
+};
+
+/**
+ * @brief Non-evicting totals over successful pipeline tasks.
+ *
+ * Ratio terms require matching usable input and output; output terms include every successful
+ * task. Keeping them separate prevents unsized inputs from reducing the emitted total.
+ */
+struct history_totals {
+  /// Tasks with nonzero, ratio-eligible input and recorded output.
+  std::size_t ratio_input_bytes  = 0;
+  std::size_t ratio_output_bytes = 0;
+  std::size_t ratio_records      = 0;
+  /// Every task with recorded output, including zero-basis and resumed tasks.
+  std::size_t output_bytes   = 0;
+  std::size_t output_records = 0;
+
+  /// Aggregate ratio over eligible tasks, or nullopt without usable input.
+  [[nodiscard]] std::optional<double> ratio() const
+  {
+    if (ratio_records == 0 || ratio_input_bytes == 0) { return std::nullopt; }
+    return static_cast<double>(ratio_output_bytes) / static_cast<double>(ratio_input_bytes);
+  }
 };
 
 /**
@@ -44,6 +71,7 @@ struct task_memory_record {
  * Stores a bounded ring buffer of recent task_memory_records and provides
  * an estimation function that uses historical ratios to predict peak memory
  * consumption for a new task given its estimation basis.
+ * Also maintains @ref history_totals beyond ring-buffer eviction.
  */
 class pipeline_memory_history {
  public:
@@ -58,8 +86,21 @@ class pipeline_memory_history {
    */
   void record(task_memory_record rec)
   {
-    if (rec.estimated_bytes == 0) { return; }
     std::lock_guard<std::mutex> lock(_mutex);
+    // OOM'd tasks have no output and contribute to neither total.
+    if (rec.output_bytes.has_value()) {
+      // Output totals include every successful task.
+      _totals.output_bytes += *rec.output_bytes;
+      _totals.output_records++;
+      // Ratio totals additionally require a usable pipeline-input basis.
+      if (rec.estimated_bytes > 0 && rec.ratio_eligible) {
+        _totals.ratio_input_bytes += rec.estimated_bytes;
+        _totals.ratio_output_bytes += *rec.output_bytes;
+        _totals.ratio_records++;
+      }
+    }
+    // estimate_peak_memory divides by the basis, so zero-basis records skip the ring.
+    if (rec.estimated_bytes == 0) { return; }
     if (_records.size() < kMaxRecords) {
       _records.push_back(rec);
     } else {
@@ -139,9 +180,18 @@ class pipeline_memory_history {
       weight_sum += weight;
     }
 
-    double avg_ratio = weighted_ratio_sum / weight_sum;
+    double const avg_ratio = weighted_ratio_sum / weight_sum;
 
-    return static_cast<std::size_t>(static_cast<double>(estimated_bytes) * avg_ratio);
+    double const scaled_estimate = static_cast<double>(estimated_bytes) * avg_ratio;
+    // Floating-to-integer conversion is only defined for values representable by the target.
+    if (!(scaled_estimate > 0.0)) { return 0; }
+
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (!std::isfinite(scaled_estimate) || scaled_estimate >= static_cast<double>(max_size)) {
+      return max_size;
+    }
+
+    return static_cast<std::size_t>(scaled_estimate);
   }
 
   /**
@@ -153,12 +203,20 @@ class pipeline_memory_history {
     return _records.size();
   }
 
+  /// Non-evicting totals over successful tasks.
+  [[nodiscard]] history_totals totals() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _totals;
+  }
+
  private:
   static constexpr std::size_t kMaxRecords = 64;
 
   mutable std::mutex _mutex;
   std::vector<task_memory_record> _records;
   std::size_t _write_pos = 0;
+  history_totals _totals;
 };
 
 }  // namespace sirius::pipeline

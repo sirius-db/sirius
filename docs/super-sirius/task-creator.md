@@ -8,6 +8,11 @@ This document covers the task creation subsystem: how the system decides when an
 
 The `task_creator` is a multi-threaded component that converts operator scheduling requests into concrete scan or GPU pipeline tasks. It maintains global state maps for each operator type and uses a hint-chain recursion to find the deepest ready operator.
 
+Task creation policy is internal and currently demand-driven, with source-side
+pipelines prioritized first within each branch. The engine retains its
+lookahead and reverse-priority primitives for policy-controlled use, but users
+do not select either through YAML.
+
 ## Core Flow
 
 ```
@@ -214,7 +219,7 @@ The `mark_task_created()` call before data popping prevents a race condition whe
 
 **Files:** `src/include/creator/config.hpp`, `src/creator/task_creator.cpp`
 
-The task creator is constructed with a `task_creator_config` whose `strategy` is `request_type::active` (default, purely demand-driven) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds a `_lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the queue from `_index_of_next_lookahead`, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. The knob is `executor.task_creator.strategy` — see [configuration.md](configuration.md).
+The task creator is constructed with a `task_creator_config` whose internal `strategy` is `request_type::active` (the current shipped, purely demand-driven policy) or `request_type::lookahead`. Under `lookahead`, `prepare_for_query` seeds a `_lookahead_queue` with the plan's scan operators after the first. When the task scheduler's management loop finds its task queue empty, it calls `schedule_lookahead(device_hint)`: the creator walks the queue from `_index_of_next_lookahead`, skips finished pipelines, and pushes one request tagged `request_type::lookahead` for the next not-yet-activated operator. A look-ahead request creates a **single** task (the manager loop breaks instead of draining the source), so speculation warms a scan up without committing its full memory footprint. Look-ahead state is cleared by `drain_pending_tasks()` and `reset()` so no dangling operator pointers survive `QueryEnd`. This primitive is retained for engine-controlled policy; it is not exposed through YAML.
 
 ## Device Assignment for GPU Tasks
 

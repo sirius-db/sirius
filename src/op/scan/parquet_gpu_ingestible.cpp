@@ -24,13 +24,13 @@
 #include <io/io_context.hpp>
 #include <io/sirius_datasource.hpp>
 #include <log/logging.hpp>
+#include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
-#include <op/sirius_dynamic_filter.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
@@ -71,6 +71,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -265,15 +266,18 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->datasource ? std::shared_ptr<io::sirius_datasource>(file->datasource->duplicate())
                          : std::shared_ptr<io::sirius_datasource>{},
         file->partition_values,
-        file->disable_filter_pushdown};
+        file->disable_filter_pushdown,
+        file->reader_options};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
-                             _disable_pushdown != file->disable_filter_pushdown)) {
+                             _disable_pushdown != file->disable_filter_pushdown ||
+                             _run_reader_options != file->reader_options)) {
       emitted.push_back(emit_current());
     }
-    _partition_values = file->partition_values;
-    _disable_pushdown = file->disable_filter_pushdown;
+    _run_reader_options = file->reader_options;
+    _partition_values   = file->partition_values;
+    _disable_pushdown   = file->disable_filter_pushdown;
 
     std::vector<cudf::size_type> cur_rgs;
     std::size_t cur_output  = 0;
@@ -346,9 +350,10 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
                            _empty_split_fallback->datasource);
-      _partition_values = _empty_split_fallback->partition_values;
-      _disable_pushdown = _empty_split_fallback->disable_filter_pushdown;
-      _produced_any     = true;
+      _partition_values   = _empty_split_fallback->partition_values;
+      _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
+      _run_reader_options = _empty_split_fallback->reader_options;
+      _produced_any       = true;
       out.push_back(emit_current());
     }
     return out;
@@ -359,7 +364,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   {
     auto split                     = std::make_unique<parquet_split_info>();
     split->rg_slices               = std::move(_slices);
-    split->reader_options          = _reader_options;
+    split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
@@ -381,6 +386,9 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::size_t _emit_count        = 0;  // [coalesce-debug] running count of emitted batches
   std::vector<std::string> _partition_values;
   bool _disable_pushdown = false;
+  /// Reader options of the current run. Projected and natural reads cannot share
+  /// a split.
+  std::shared_ptr<cudf::io::parquet_reader_options> _run_reader_options;
 
   /// First fully-pruned file, kept as the source for flush()'s empty-split
   /// fallback when the whole scan produced no slice.
@@ -390,6 +398,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::shared_ptr<io::sirius_datasource> datasource;
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
+    std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -586,8 +595,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   // Shared reader options — column projection only. set_filter is never applied
   // here: it is a per-split decision (FLBA files disable it) made in
   // materialize_table on a copy of these options.
-  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(
+  _natural_reader_options = std::make_shared<cudf::io::parquet_reader_options>(
     cudf::io::parquet_reader_options::builder().build());
+  _reader_options = std::make_shared<cudf::io::parquet_reader_options>(*_natural_reader_options);
   // Never hand cuDF an empty column list — a zero-column read over live row groups
   // hangs. is_projected() already excludes it; this pins the invariant here.
   if (_plan->is_projected() && !_plan->data_columns.empty()) {
@@ -595,13 +605,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _sirius_dynamic_filters = bind.sirius_dynamic_filters;
-
-  // Producers reference probe columns in DuckDB's column_ids space; the AST merge and the
-  // post-decode apply both key by output-column position. Install the translation so push_filter
-  // remaps before storing. Wiring-time setup, before the producing build publishes.
-  if (_sirius_dynamic_filters) {
-    _sirius_dynamic_filters->set_consumer_column_remap(_plan->output_position_by_column_id);
-  }
 
   // Hive-partition columns are path-derived constants, not decoded parquet columns, so they must
   // not receive post-decode dynamic filters.
@@ -693,8 +696,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   if (!file_metadata) {
     auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
     auto const footer_len = footer->size();
+    // The carrier projection is only known to match this file after the footer
+    // is parsed, so the parse itself runs without a column selection.
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
-                                     opts);
+                                     _plan->carrier_batch_index ? *_natural_reader_options : opts);
     file_metadata =
       std::make_shared<cudf::io::parquet::FileMetaData const>(footer_reader.parquet_metadata());
     // Park the parse in the ioctx metadata store so a later scan of the same
@@ -705,11 +710,21 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
   auto const& metadata = *file_metadata;
 
+  // The carrier is chosen from the bind schema; a file that lacks it (schema
+  // evolution) or has no row groups to resolve it against reads its natural
+  // batch.
+  bool const carrier_unavailable =
+    _plan->carrier_batch_index.has_value() &&
+    detail::leaf_indices_for_column(metadata, _plan->data_columns[*_plan->carrier_batch_index].name)
+      .empty();
+  if (carrier_unavailable) { opts = *_natural_reader_options; }
+  bool const file_projected = _plan->is_projected() && !carrier_unavailable;
+
   // FLBA-decimal pushdown probe: cudf's row-group stats filter cannot compare a
   // fixed_point_scalar AST literal against FLBA / BYTE_ARRAY decimal stats, so
   // reader-side pushdown is disabled when such a decimal is among the columns
   // this scan reads (the filter still applies post-decode).
-  bool const restrict_to_scanned = _plan->is_projected();
+  bool const restrict_to_scanned = file_projected;
   std::unordered_set<std::string> scanned_column_names;
   if (restrict_to_scanned) {
     auto const names = _plan->data_column_names();
@@ -755,13 +770,24 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // column when partitioning row groups into batches — see rg_contribution.
   auto const& returned_types   = _info->returned_types;
   auto const data_column_names = _plan->data_column_names();
+  // A file read without its carrier keeps every file column. rg_contribution
+  // uses bind-type widths for known, non-partition top-level columns and
+  // metadata estimates for the rest; a partition name's bind type is the
+  // partition's, not the file column's.
+  std::unordered_map<std::string, std::size_t> primary_by_name;
+  if (carrier_unavailable) {
+    for (std::size_t p = 0; p < _info->names.size() && p < returned_types.size(); ++p) {
+      if (_plan->partition_primary_indices.count(p) > 0) { continue; }
+      primary_by_name.emplace(_info->names[p], p);
+    }
+  }
   std::vector<std::size_t> selected_chunk_indices;
   // Parallel to selected_chunk_indices: the decoded (GPU) byte width of each
   // selected leaf chunk's column, or 0 for VARCHAR / nested / unknown types
   // (which fall back to the parquet encoded-uncompressed size in rg_contribution).
   std::vector<std::size_t> selected_chunk_decoded_width;
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
-  if (_plan->is_projected()) {
+  if (file_projected) {
     auto const pure_filter_positions = _plan->pure_filter_batch_positions();
     bool has_data_output             = false;
     for (auto const& output : _plan->output_layout) {
@@ -895,6 +921,25 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     }
   }
 
+  // Hive partition values for this file, in scan_plan::partition_columns order.
+  // Each split synthesizes one scalar-backed column per entry, so every row of
+  // the file also pays their width on top of the decoded batch.
+  std::vector<std::string> partition_values;
+  std::size_t partition_row_bytes = 0;
+  if (!_plan->partition_columns.empty()) {
+    partition_values.reserve(_plan->partition_columns.size());
+    auto parsed = duckdb::HivePartitioning::Parse(file_path);
+    for (auto const& pc : _plan->partition_columns) {
+      auto it = parsed.find(pc.name);
+      partition_values.push_back(it != parsed.end() ? it->second : std::string{});
+      partition_row_bytes +=
+        pc.type.is_fixed_width()
+          ? pc.type.fixed_width_byte_size()
+          : duckdb::HivePartitioning::Unescape(partition_values.back()).size() +
+              sizeof(cudf::size_type);
+    }
+  }
+
   struct row_group_size_estimate {
     std::size_t output_bytes         = 0;
     std::size_t decode_working_bytes = 0;
@@ -932,12 +977,28 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
       if (!is_pure_filter) { estimate.output_bytes += decoded_bytes; }
       estimate.compressed_bytes += static_cast<std::size_t>(column_metadata.total_compressed_size);
     };
-    if (_plan->is_projected()) {
+    if (file_projected) {
       for (std::size_t i = 0; i < selected_chunk_indices.size(); ++i) {
         auto const chunk_idx = selected_chunk_indices[i];
         add_chunk(row_group.columns[chunk_idx],
                   pure_filter_chunk_indices.contains(chunk_idx),
                   selected_chunk_decoded_width[i]);
+      }
+    } else if (carrier_unavailable) {
+      for (auto const& chunk : row_group.columns) {
+        std::size_t decoded_width = 0;
+        auto const& path          = chunk.meta_data.path_in_schema;
+        if (path.size() == 1) {
+          auto const it = primary_by_name.find(path.front());
+          if (it != primary_by_name.end()) {
+            try {
+              decoded_width = returned_types[it->second].fixed_width_byte_size();
+            } catch (...) {
+              decoded_width = 0;
+            }
+          }
+        }
+        add_chunk(chunk, /*is_pure_filter=*/false, decoded_width);
       }
     } else if (returned_types.size() == row_group.columns.size()) {
       // Unprojected (identity) scan: the reader materializes every file column
@@ -964,6 +1025,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
           static_cast<std::size_t>(chunk.meta_data.total_compressed_size);
       }
     }
+    auto const partition_bytes = row_count * partition_row_bytes;
+    estimate.output_bytes += partition_bytes;
+    estimate.decode_working_bytes += partition_bytes;
     return estimate;
   };
 
@@ -971,7 +1035,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   out->file_metadata           = file_metadata;
   out->file_path               = file_path;
   out->datasource              = std::move(sirius_ds);
-  out->reader_options          = _reader_options;
+  out->reader_options          = carrier_unavailable ? _natural_reader_options : _reader_options;
+  out->carrier_unavailable     = carrier_unavailable;
   out->disable_filter_pushdown = disable_filter_pushdown;
   out->row_groups.reserve(row_group_indices.size());
   for (auto const rg_idx : row_group_indices) {
@@ -983,15 +1048,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
                                metadata.row_groups[rg_idx].num_rows});
   }
 
-  // Hive partition values for this file, in scan_plan::partition_columns order.
-  if (!_plan->partition_columns.empty()) {
-    out->partition_values.reserve(_plan->partition_columns.size());
-    auto parsed = duckdb::HivePartitioning::Parse(file_path);
-    for (auto const& pc : _plan->partition_columns) {
-      auto it = parsed.find(pc.name);
-      out->partition_values.push_back(it != parsed.end() ? it->second : std::string{});
-    }
-  }
+  out->partition_values = std::move(partition_values);
 
   return out;
 }
@@ -1002,7 +1059,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto const& split = static_cast<parquet_split_info const&>(info);
 
@@ -1109,7 +1168,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     owning_table_view view{std::move(table)};
     if (!reader_applied_full_filter && _duckdb_filter_expression) {
       auto sirius_filter_ast = sirius::ast::from_duckdb(*_duckdb_filter_expression);
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        like_cache);
       auto const data_positions = output_data_positions(*_plan);
       view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
                                     : owning_table_view{exec.select(view.view(), data_positions)};
@@ -1131,10 +1196,32 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
 // per-split partition values) and return ROW_FILTERED_AND_PROJECTED, so they
 // never reach here. This path therefore only applies a pending row filter and a
 // non-partition projection; partition injection is unreachable.
+
+namespace {
+
+/// Positions of `width` minus `elided`, ascending. Empty when nothing would be
+/// left: a zero-column table carries no row count, and the rowid needs one.
+std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t const> elided)
+{
+  if (elided.empty() || elided.size() >= width) { return {}; }
+  std::vector<std::size_t> kept;
+  kept.reserve(width - elided.size());
+  for (std::size_t pos = 0; pos < width; ++pos) {
+    if (std::find(elided.begin(), elided.end(), pos) == elided.end()) { kept.push_back(pos); }
+  }
+  return kept;
+}
+
+}  // namespace
+
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream)
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache,
+  std::unique_ptr<cudf::column>* survivors,
+  std::span<std::size_t const> elided)
 {
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
 
@@ -1153,10 +1240,24 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     // `exec`, which only borrows the AST.
     auto sirius_filter_ast = _residual.against(input.predicate_columns, input.predicates_enforced);
     if (sirius_filter_ast) {
-      sirius::expression_evaluator exec(sirius_filter_ast.get(), mr_ref, stream);
+      sirius::expression_evaluator exec(sirius_filter_ast.get(),
+                                        mr_ref,
+                                        stream,
+                                        strategy_from_config(),
+                                        sirius::expression_evaluator::default_min_ast_size,
+                                        like_swar_fastpath,
+                                        std::move(like_cache));
       auto const data_positions = output_data_positions(*_plan);
-      auto filtered             = data_positions.empty() ? exec.select(input.table.view())
-                                                         : exec.select(input.table.view(), data_positions);
+      std::unique_ptr<cudf::table> filtered;
+      if (survivors != nullptr && !data_positions.empty()) {
+        // A deferral rides on this batch: it needs to know WHICH rows survived,
+        // because its rowid addresses the pinned chunk and the batch no longer
+        // holds that chunk's rows in order.
+        filtered = exec.select_with_survivors(input.table.view(), data_positions, *survivors);
+      } else {
+        filtered = data_positions.empty() ? exec.select(input.table.view())
+                                          : exec.select(input.table.view(), data_positions);
+      }
       // The select only enqueued its reads; record before the reassignment drops the read lock.
       input.table.record_reader_event(stream);
       input = filtered_table{owning_table_view{std::move(filtered)}, filter_state::ROW_FILTERED};
@@ -1182,7 +1283,21 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
     assemble_scan_output(*_plan, std::move(input.table), /*partition_values=*/{}, stream);
   SIRIUS_LOG_DEBUG(
     "[parquet_gpu_ingestible::post_filter_and_project] Assembled scan output to plan layout.");
+  if (auto const kept =
+        kept_positions(static_cast<std::size_t>(assembled.view().num_columns()), elided);
+      !kept.empty()) {
+    assembled.select_columns(kept);
+  }
   return assembled.release(stream, mr_ref);
+}
+
+bool parquet_gpu_ingestible::output_assembly_is_leading_identity() const noexcept
+{
+  // !needs_output_assembly means assemble_scan_output is a pass-through: no
+  // partition columns to synthesize and output_layout reads data columns
+  // 0..N-1 in order. (Its other false case, the empty count(*) layout, can
+  // never reach the transactional steal: such scans have no carrier targets.)
+  return !needs_output_assembly(*_plan);
 }
 
 //===----------------------------------------------------------------------===//

@@ -97,10 +97,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   duckdb::vector<duckdb::Value> parameters;
   //! Named parameters of the table function
   duckdb::named_parameter_map_t named_parameters;
-  /// The duckdb::DynamicTableFilterSet pointer planted by plan-gen for this scan, if any. Used as
-  /// the route key identity for Sirius-side dynamic filters @ref sirius_dynamic_filters. Read by
-  /// the scan consumer to merge into the parquet reader's AST filter.
-  duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   //! Virtual columns
   duckdb::virtual_column_map_t virtual_columns;
@@ -140,6 +136,9 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! planner's `apply_tier_narrowing_policy`) additionally check `has_physical_overrides()`.
   //! Host-tier-backed and never-sidecared scans leave it false.
   bool sidecar_from_gpu_tier_pin = false;
+
+  //! A pinned entry serves this scan, so the ingestible's metadata walk can be deferred.
+  bool mvcc_pin_serves_scan = false;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 

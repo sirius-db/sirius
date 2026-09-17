@@ -8,8 +8,9 @@ use starrocks_thrift::descriptors::{
     TDescriptorTable, TSlotDescriptor, TTableDescriptor, TTupleDescriptor,
 };
 use starrocks_thrift::exprs::{
-    TBoolLiteral, TCaseExpr, TDateLiteral, TDecimalLiteral, TExpr, TExprNode, TExprNodeType,
-    TFloatLiteral, TInPredicate, TIntLiteral, TIsNullPredicate, TSlotRef, TStringLiteral,
+    TAggregateExpr, TBoolLiteral, TCaseExpr, TDateLiteral, TDecimalLiteral, TExpr, TExprNode,
+    TExprNodeType, TFloatLiteral, TInPredicate, TIntLiteral, TIsNullPredicate, TSlotRef,
+    TStringLiteral,
 };
 use starrocks_thrift::internal_service::{
     InternalServiceVersion, TExecPlanFragmentParams, TPlanFragmentExecParams, TScanRangeParams,
@@ -17,8 +18,9 @@ use starrocks_thrift::internal_service::{
 use starrocks_thrift::opcodes::TExprOpcode;
 use starrocks_thrift::partitions::{TDataPartition, TPartitionType};
 use starrocks_thrift::plan_nodes::{
-    TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TFileFormatType, TFileScanNode,
-    TFileScanType, TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode,
+    TAggregationNode, TBrokerRangeDesc, TBrokerScanRange, TBrokerScanRangeParams, TEqJoinCondition,
+    TFileFormatType, TFileScanNode, TFileScanType, THashJoinNode, TJoinOp, TNestLoopJoinNode,
+    TPlan, TPlanNode, TPlanNodeType, TProjectNode, TScanRange, TSelectNode, TSortInfo, TSortNode,
 };
 use starrocks_thrift::planner::TPlanFragment;
 use starrocks_thrift::types::{
@@ -53,12 +55,15 @@ fn complex_type(kind: TTypeNodeType) -> TTypeDesc {
 }
 
 /// Builds a materialized slot descriptor owned by a test tuple.
-fn slot(id: i32, tuple_id: i32, column_pos: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
+///
+/// `column_pos` is always -1: the FE sets it unconditionally and the IDL marks it deprecated, so
+/// a fixture carrying a real position would be a shape the translator never sees.
+fn slot(id: i32, tuple_id: i32, name: &str, ty: TTypeDesc) -> TSlotDescriptor {
     TSlotDescriptor::new(
         Some(id),
         Some(tuple_id),
         Some(ty),
-        Some(column_pos),
+        Some(-1),
         None,
         None,
         None,
@@ -209,6 +214,20 @@ fn bool_literal(value: bool) -> TExpr {
     TExpr::new(vec![node])
 }
 
+/// Builds an arithmetic expression and appends child nodes in preorder.
+fn arithmetic(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::ARITHMETIC_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        2,
+    );
+    node.opcode = Some(opcode);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
 /// Builds a binary predicate expression and appends child nodes in preorder.
 fn binary_pred(opcode: TExprOpcode, left: TExpr, right: TExpr) -> TExpr {
     let mut node = base_expr_node(
@@ -352,8 +371,8 @@ fn base_desc() -> TDescriptorTable {
     desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
         ],
     )
 }
@@ -663,6 +682,393 @@ fn split_broker_range_is_unsupported() {
     }
 }
 
+/// Verifies incremental scan-range delivery is refused: this CN never receives the rest, so
+/// accepting the prefix would silently read a subset of the data.
+#[test]
+fn has_more_scan_ranges_are_refused() {
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            "file:///data/users.parquet",
+            TFileFormatType::FORMAT_PARQUET,
+            0,
+            -1,
+            Some(1024),
+        ),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()[0]
+        .has_more = Some(true);
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    assert_eq!(
+        reason,
+        "incremental scan-range delivery (has_more) is not supported"
+    );
+}
+
+/// The FE ends a connector scan's assignment with a placeholder `TScanRangeParams` that carries
+/// an empty `scan_range`, `empty = true` and `has_more` telling whether more ranges follow. The
+/// placeholder itself is skipped; only `has_more = true` refuses the fragment, so the order of the
+/// two checks matters and is pinned here.
+#[test]
+fn empty_placeholder_scan_ranges_are_skipped() {
+    let path = "file:///data/users.parquet";
+    let placeholder = |has_more: bool| {
+        TScanRangeParams::new(TScanRange::default(), None, Some(true), Some(has_more))
+    };
+    let with_placeholder = |has_more: bool| {
+        let mut fragment = params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, -1, Some(1024)),
+        );
+        fragment
+            .params
+            .as_mut()
+            .unwrap()
+            .per_node_scan_ranges
+            .get_mut(&0)
+            .unwrap()
+            .push(placeholder(has_more));
+        fragment
+    };
+
+    let translated = PlanTranslator::new()
+        .translate_fragment(&with_placeholder(false))
+        .expect("an empty placeholder without has_more is skipped");
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+
+    let err = PlanTranslator::new()
+        .translate_fragment(&with_placeholder(true))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "incremental scan-range delivery (has_more) is not supported"
+    );
+}
+
+/// Verifies complete byte-range splits are collapsed to one whole-file local read.
+#[test]
+fn complete_split_broker_ranges_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+            None,
+            None,
+            None,
+        ));
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
+/// Builds fragment params whose node-0 scan carries every `(start, size)` split of `path`, all
+/// declaring `file_size`, in the order given.
+fn params_with_splits(
+    path: &str,
+    file_size: i64,
+    splits: &[(i64, i64)],
+) -> TExecPlanFragmentParams {
+    let (first, rest) = splits.split_first().expect("at least one split");
+    let mut fragment = params_with_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(
+            path,
+            TFileFormatType::FORMAT_PARQUET,
+            first.0,
+            first.1,
+            Some(file_size),
+        ),
+    );
+    let ranges = fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap();
+    for &(start, size) in rest {
+        ranges.push(TScanRangeParams::new(
+            broker_scan_range(
+                path,
+                TFileFormatType::FORMAT_PARQUET,
+                start,
+                size,
+                Some(file_size),
+            ),
+            None,
+            None,
+            None,
+        ));
+    }
+    fragment
+}
+
+/// Translates `splits` and returns the `UnsupportedScanRange` reason they were refused with.
+fn splits_rejected_because(file_size: i64, splits: &[(i64, i64)]) -> &'static str {
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            file_size,
+            splits,
+        ))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { node_id, reason } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(node_id, 0);
+    reason
+}
+
+/// Splits that leave a hole are refused: collapsing them to a whole-file read would scan the
+/// hole, which a sibling instance is already scanning.
+#[test]
+fn split_broker_ranges_with_a_gap_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 256), (512, 512)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Splits that tile a prefix but stop short of the file are refused: the tail would be dropped.
+#[test]
+fn split_broker_ranges_covering_only_a_prefix_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 256), (256, 256)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// A split that runs past the end of the file is malformed metadata, not a whole-file read. The
+/// sweep only asked whether EOF had been reached, so `(512, 1024)` over a 1024-byte file collapsed
+/// to a whole-file read instead of being refused.
+#[test]
+fn split_broker_ranges_extending_past_eof_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 512), (512, 1024)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 2048)]),
+        "byte-range split extends past the end of the parquet file"
+    );
+}
+
+/// A zero-length split covers nothing, so it can never be part of a tiling: `(0, 0)` is refused
+/// outright, and a zero-length tail `(1024, -1)` after a whole-file split trips the same rule.
+#[test]
+fn zero_size_split_is_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 0)]),
+        "byte-range splits do not tile the parquet file"
+    );
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 1024), (1024, -1)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Two splits that both cover the head of the file are refused. They "cover" every byte, so a
+/// sweep that only rejects gaps collapses them into one whole-file read — Sirius would scan the
+/// shared row groups once where StarRocks scans them on both instances, and `count(*)` would
+/// disagree with no error.
+#[test]
+fn overlapping_split_broker_ranges_are_unsupported() {
+    assert_eq!(
+        splits_rejected_because(1024, &[(0, 1024), (0, 512)]),
+        "byte-range splits do not tile the parquet file"
+    );
+}
+
+/// Splits of one file that disagree on how big that file is are refused — the coverage check
+/// would otherwise be measured against an arbitrary one of them.
+#[test]
+fn split_broker_ranges_disagreeing_on_file_size_are_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_splits(path, 1024, &[(0, 512)]);
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(2048)),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(reason, "scan ranges disagree on the parquet file size");
+}
+
+/// A split missing its `file_size` reports as missing wherever it lands in the list, not
+/// only when it happens to be inserted first. Checking agreement before presence made the
+/// message depend on arrival order: the same fragment reported "missing" or "disagree"
+/// depending on which range the FE sent first.
+#[test]
+fn split_broker_range_missing_file_size_after_the_first_is_unsupported() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_splits(path, 1024, &[(0, 512)]);
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .per_node_scan_ranges
+        .get_mut(&0)
+        .unwrap()
+        .push(TScanRangeParams::new(
+            broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, None),
+            None,
+            None,
+            None,
+        ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&fragment)
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(reason, "scan range is missing the parquet file size");
+}
+
+/// Splits arriving out of order still tile the file: the sweep sorts before checking, and the FE
+/// does not promise an order. Without the sort this case would be refused.
+#[test]
+fn split_broker_ranges_in_descending_order_are_accepted() {
+    let translated = PlanTranslator::new()
+        .translate_fragment(&params_with_splits(
+            "file:///data/users.parquet",
+            1024,
+            &[(512, 512), (0, 512)],
+        ))
+        .unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
+/// The motivating shape: with pipeline dop the FE hands one instance several splits of the same
+/// file under different driver sequences. They must be combined across sequences into one
+/// whole-file read, not validated per sequence.
+#[test]
+fn per_driver_split_ranges_across_sequences_produce_one_local_file() {
+    let path = "file:///data/users.parquet";
+    let mut fragment = params_with_per_driver_scan_range(
+        TPlan::new(vec![scan_node(0, 0)]),
+        base_desc(),
+        0,
+        broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 0, 512, Some(1024)),
+    );
+    fragment
+        .params
+        .as_mut()
+        .unwrap()
+        .node_to_per_driver_seq_scan_ranges
+        .as_mut()
+        .unwrap()
+        .get_mut(&0)
+        .unwrap()
+        .insert(
+            1,
+            vec![TScanRangeParams::new(
+                broker_scan_range(path, TFileFormatType::FORMAT_PARQUET, 512, 512, Some(1024)),
+                None,
+                None,
+                None,
+            )],
+        );
+    let translated = PlanTranslator::new().translate_fragment(&fragment).unwrap();
+    let rel::RelType::Read(read) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected local read");
+    };
+    let Some(read_rel::ReadType::LocalFiles(files)) = read.read_type.as_ref() else {
+        panic!("expected local files");
+    };
+    assert_eq!(files.items.len(), 1);
+}
+
 /// Verifies a scan range delivered via the pipeline per-driver-sequence map is
 /// collected too (not just `per_node_scan_ranges`).
 #[test]
@@ -834,16 +1240,32 @@ fn bounded_split_with_unknown_file_size_is_unsupported() {
 }
 
 /// Verifies an empty (zero-byte) file range is rejected: it is not a readable
-/// parquet file, so it must not be passed to `parquet_scan`.
+/// parquet file, so it must not be passed to `parquet_scan`. Pins the reason too —
+/// an empty file used to be reported as a file-size disagreement, which sent the
+/// reader hunting for a second, differing range that does not exist.
 #[test]
 fn empty_file_scan_range_is_unsupported() {
-    assert_scan_range_unsupported(broker_scan_range(
-        "file:///data/users.parquet",
-        TFileFormatType::FORMAT_PARQUET,
-        0,
-        0,
-        Some(0),
-    ));
+    let err = PlanTranslator::new()
+        .translate_fragment(&params_with_scan_range(
+            TPlan::new(vec![scan_node(0, 0)]),
+            base_desc(),
+            0,
+            broker_scan_range(
+                "file:///data/users.parquet",
+                TFileFormatType::FORMAT_PARQUET,
+                0,
+                0,
+                Some(0),
+            ),
+        ))
+        .unwrap_err();
+    let TranslateError::UnsupportedScanRange { reason, .. } = err else {
+        panic!("expected an unsupported scan range, got {err:?}");
+    };
+    assert_eq!(
+        reason,
+        "parquet scan range reports an empty or negative file size"
+    );
 }
 
 /// Verifies a renamed column mapping is rejected: destination slot 1 ("id") fed
@@ -941,9 +1363,9 @@ fn duplicate_output_names_are_unique_and_match_root() {
     let desc = desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name_1", scalar_type(TPrimitiveType::BIGINT)),
-            slot(3, 0, 2, "name", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name_1", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 0, "name", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1027,7 +1449,7 @@ fn integer_literal_preserves_expr_width() {
 
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "id", scalar_type(TPrimitiveType::INT))],
+        vec![slot(1, 0, "id", scalar_type(TPrimitiveType::INT))],
     );
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![select, scan_node(0, 0)])),
@@ -1079,10 +1501,10 @@ fn scan_project_preserves_descriptor_output_order() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(3, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(4, 1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(4, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1104,6 +1526,199 @@ fn scan_project_preserves_descriptor_output_order() {
     {
         rel::RelType::Project(project) => assert_eq!(project.expressions.len(), 2),
         other => panic!("expected project rel, got {other:?}"),
+    }
+}
+
+/// Verifies hidden project expressions are appended in key order and can be
+/// referenced by visible expressions without descriptor-table slots.
+#[test]
+fn project_common_slots_are_materialized_before_visible_expressions() {
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(5, 1, scalar_type(TPrimitiveType::BIGINT)));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Project(visible) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected visible project");
+    };
+    let expression::RexType::Selection(selection) =
+        visible.expressions[0].rex_type.as_ref().unwrap()
+    else {
+        panic!("expected common-slot selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    assert_eq!(field.field, 2);
+
+    // The hidden project must pass its two input columns through and append the common slot,
+    // and the visible project must then read past all three. Asserting only that a project
+    // exists leaves the emit mappings -- the single line this lowering rests on -- unobserved.
+    let rel::RelType::Project(hidden) = visible.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the hidden project under the visible one");
+    };
+    assert_eq!(hidden.expressions.len(), 1);
+    assert_eq!(emit_mapping(hidden.common.as_ref()), vec![0, 1, 2]);
+    assert_eq!(emit_mapping(visible.common.as_ref()), vec![3]);
+}
+
+/// A later hidden slot may name an earlier one. The translator appends one
+/// project per entry in ascending slot id, so the second expression already
+/// sees the first column. Putting every hidden expression in one `ProjectRel`
+/// would evaluate them all against the scan and this case would break.
+#[test]
+fn nested_common_slots_are_appended_in_slot_id_order() {
+    let bigint = scalar_type(TPrimitiveType::BIGINT);
+    let mut common_slot_map = BTreeMap::new();
+    common_slot_map.insert(4, slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)));
+    common_slot_map.insert(5, slot_ref(1, 0, bigint.clone()));
+    common_slot_map.insert(
+        6,
+        arithmetic(
+            TExprOpcode::ADD,
+            slot_ref(5, 1, bigint.clone()),
+            int_literal(1),
+        ),
+    );
+    let mut slot_map = BTreeMap::new();
+    slot_map.insert(3, slot_ref(6, 1, bigint));
+
+    let mut project = base_plan_node(1, TPlanNodeType::PROJECT_NODE, 1, vec![1]);
+    project.project_node = Some(TProjectNode::new(Some(slot_map), Some(common_slot_map)));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![project, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let visible = as_project(root(&translated.plan).input.as_ref().unwrap());
+    assert_eq!(struct_field(&visible.expressions[0]), 4);
+    assert_eq!(emit_mapping(visible.common.as_ref()), vec![5]);
+
+    let cse2 = as_project(visible.input.as_ref().unwrap());
+    assert_eq!(struct_field(scalar_arg(&cse2.expressions[0], 0)), 3);
+    assert_eq!(emit_mapping(cse2.common.as_ref()), vec![0, 1, 2, 3, 4]);
+
+    let cse1 = as_project(cse2.input.as_ref().unwrap());
+    assert_eq!(struct_field(&cse1.expressions[0]), 0);
+    assert_eq!(emit_mapping(cse1.common.as_ref()), vec![0, 1, 2, 3]);
+
+    let first = as_project(cse1.input.as_ref().unwrap());
+    assert_eq!(struct_field(&first.expressions[0]), 1);
+    assert_eq!(emit_mapping(first.common.as_ref()), vec![0, 1, 2]);
+}
+
+/// Unwraps a Substrait project relation.
+fn as_project(rel: &substrait::proto::Rel) -> &substrait::proto::ProjectRel {
+    match rel.rel_type.as_ref().unwrap() {
+        rel::RelType::Project(project) => project,
+        other => panic!("expected project rel, got {other:?}"),
+    }
+}
+
+/// Reads the zero-based field index from a Substrait struct-field selection.
+fn struct_field(expr: &substrait::proto::Expression) -> i32 {
+    let expression::RexType::Selection(selection) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected field selection");
+    };
+    let expression::field_reference::ReferenceType::DirectReference(segment) =
+        selection.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected direct field reference");
+    };
+    let expression::reference_segment::ReferenceType::StructField(field) =
+        segment.reference_type.as_ref().unwrap()
+    else {
+        panic!("expected struct field");
+    };
+    field.field
+}
+
+/// Only `PROJECT_NODE` materializes its common slots. A `SELECT_NODE`, hash join or nested-loop
+/// join carrying the same field is refused up front with a clear reason, instead of failing later
+/// with an opaque descriptor error when a conjunct references one of the shared sub-expressions.
+#[test]
+fn common_slots_outside_a_project_are_rejected() {
+    let common = || {
+        let mut map = BTreeMap::new();
+        map.insert(5, slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)));
+        Some(map)
+    };
+
+    let mut select = base_plan_node(1, TPlanNodeType::SELECT_NODE, 1, vec![0]);
+    select.select_node = Some(TSelectNode::new(common()));
+    let select_plan = TPlan::new(vec![select, scan_node(0, 0)]);
+
+    let mut hash_join = hash_join_node(TJoinOp::INNER_JOIN);
+    hash_join.hash_join_node.as_mut().unwrap().common_slot_map = common();
+    let hash_plan = TPlan::new(vec![hash_join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let mut nestloop = nestloop_join_node(
+        TJoinOp::INNER_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    nestloop
+        .nestloop_join_node
+        .as_mut()
+        .unwrap()
+        .common_slot_map = common();
+    let nestloop_plan = TPlan::new(vec![nestloop, scan_node(0, 0), scan_node(1, 1)]);
+
+    for (label, plan, desc) in [
+        ("SELECT_NODE", select_plan, base_desc()),
+        ("HASH_JOIN_NODE", hash_plan, join_desc()),
+        ("NESTLOOP_JOIN_NODE", nestloop_plan, join_desc()),
+    ] {
+        let err = translate_fragment(&params(Some(plan), Some(desc), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(reason, "common slots are only materialized on PROJECT_NODE");
     }
 }
 
@@ -1134,10 +1749,10 @@ fn fragment_output_exprs_add_root_projection() {
     }
 }
 
-/// Verifies unsupported joins return a structured unsupported-plan-node error.
+/// Verifies unsupported plan nodes return a structured unsupported-plan-node error.
 #[test]
-fn unsupported_hash_join_is_structured_error() {
-    let join = base_plan_node(9, TPlanNodeType::HASH_JOIN_NODE, 0, vec![0]);
+fn unsupported_merge_join_is_structured_error() {
+    let join = base_plan_node(9, TPlanNodeType::MERGE_JOIN_NODE, 0, vec![0]);
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![join])),
         Some(base_desc()),
@@ -1150,7 +1765,7 @@ fn unsupported_hash_join_is_structured_error() {
             node_id: 9,
             node_type,
             ..
-        } if node_type == TPlanNodeType::HASH_JOIN_NODE
+        } if node_type == TPlanNodeType::MERGE_JOIN_NODE
     ));
 }
 
@@ -1185,7 +1800,7 @@ fn unsupported_expression_is_structured_error() {
 fn unsupported_complex_type_is_structured_error() {
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "items", complex_type(TTypeNodeType::ARRAY))],
+        vec![slot(1, 0, "items", complex_type(TTypeNodeType::ARRAY))],
     );
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -1205,13 +1820,13 @@ fn unsupported_complex_type_is_structured_error() {
 /// Verifies unsupported types on non-materialized slots do not block visible output.
 #[test]
 fn non_materialized_unsupported_slot_type_is_ignored() {
-    let mut hidden_slot = slot(2, 0, 1, "hidden", complex_type(TTypeNodeType::ARRAY));
+    let mut hidden_slot = slot(2, 0, "hidden", complex_type(TTypeNodeType::ARRAY));
     hidden_slot.is_materialized = Some(false);
 
     let desc = desc_table(
         vec![(0, Some(100))],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
             hidden_slot,
         ],
     );
@@ -1230,7 +1845,7 @@ fn non_materialized_unsupported_slot_type_is_ignored() {
 fn unsupported_largeint_is_structured_error() {
     let desc = desc_table(
         vec![(0, Some(100))],
-        vec![slot(1, 0, 0, "big", scalar_type(TPrimitiveType::LARGEINT))],
+        vec![slot(1, 0, "big", scalar_type(TPrimitiveType::LARGEINT))],
     );
     let err = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -1254,7 +1869,6 @@ fn unsupported_decimal256_is_structured_error() {
         vec![(0, Some(100))],
         vec![slot(
             1,
-            0,
             0,
             "huge_decimal",
             scalar_type_with(TPrimitiveType::DECIMAL256, None, Some(76), Some(0)),
@@ -1292,8 +1906,8 @@ fn project_node_conjuncts_are_unsupported() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(3, 1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1483,13 +2097,7 @@ fn hdfs_scan_node(node_id: i32, tuple_id: i32) -> TPlanNode {
 /// Builds a single-column descriptor whose table carries `db` (empty for fallback tests).
 fn desc_with_db(db: &str) -> TDescriptorTable {
     TDescriptorTable::new(
-        Some(vec![slot(
-            1,
-            0,
-            0,
-            "id",
-            scalar_type(TPrimitiveType::BIGINT),
-        )]),
+        Some(vec![slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT))]),
         vec![TTupleDescriptor::new(Some(0), None, None, Some(7), None)],
         Some(vec![table_descriptor(7, db, "t", 1)]),
         None,
@@ -1781,6 +2389,20 @@ fn decimal_literal_encodes_little_endian_unscaled_value() {
     }
 }
 
+/// A decimal literal wider than 18 digits follows the slot rule and is emitted as FP64.
+#[test]
+fn wide_decimal_literal_is_lowered_to_fp64() {
+    let plan = filter_with_conjunct(binary_pred(
+        TExprOpcode::EQ,
+        slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        decimal_literal("1.5", 19, 2),
+    ));
+    match literal_type(scalar_arg(filter_condition(&plan), 1)) {
+        expression::literal::LiteralType::Fp64(value) => assert_eq!(*value, 1.5),
+        other => panic!("expected fp64 literal, got {other:?}"),
+    }
+}
+
 /// Verifies an integer literal that overflows its declared width is a malformed plan.
 #[test]
 fn integer_literal_overflowing_declared_width_is_error() {
@@ -1851,10 +2473,10 @@ fn project_emit_mapping_starts_after_input_columns() {
     let desc = desc_table(
         vec![(0, Some(100)), (1, None)],
         vec![
-            slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
-            slot(2, 0, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(3, 1, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
-            slot(4, 1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(3, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(4, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
         ],
     );
 
@@ -1891,7 +2513,7 @@ fn project_emit_mapping_starts_after_input_columns() {
 fn scan_table_name_falls_back_when_table_missing() {
     let desc = desc_table(
         vec![(0, None)],
-        vec![slot(1, 0, 0, "id", scalar_type(TPrimitiveType::BIGINT))],
+        vec![slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT))],
     );
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
@@ -1999,6 +2621,587 @@ fn builtin_function(name: &str, ret_type: TTypeDesc) -> TFunction {
     )
 }
 
+/// Builds an aggregate-function expression (`fn(child)`) in flat preorder form.
+fn aggregate_expr(name: &str, ret_type: TTypeDesc, child: Option<TExpr>) -> TExpr {
+    let num_children = child.as_ref().map(|_| 1).unwrap_or(0);
+    let mut node = base_expr_node(TExprNodeType::AGG_EXPR, ret_type.clone(), num_children);
+    node.agg_expr = Some(TAggregateExpr::new(false));
+    node.fn_ = Some(builtin_function(name, ret_type));
+    let mut nodes = vec![node];
+    if let Some(child) = child {
+        nodes.extend(child.nodes);
+    }
+    TExpr::new(nodes)
+}
+
+/// Builds a one-phase aggregation node over `output_tuple` with the given keys and aggregates.
+fn aggregation_node(
+    node_id: i32,
+    output_tuple: i32,
+    grouping: Vec<TExpr>,
+    aggregates: Vec<TExpr>,
+) -> TPlanNode {
+    let mut node = base_plan_node(
+        node_id,
+        TPlanNodeType::AGGREGATION_NODE,
+        1,
+        vec![output_tuple],
+    );
+    node.agg_node = Some(TAggregationNode::new(
+        Some(grouping),
+        aggregates,
+        output_tuple,
+        output_tuple,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    node
+}
+
+/// Descriptor with a scan tuple 0 (`id` BIGINT, `name` VARCHAR) and an aggregation output
+/// tuple 1 (`name` key, `total` BIGINT).
+fn agg_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Verifies one-phase group-by aggregation becomes an `AggregateRel` with the grouping key and
+/// a `sum` measure, and that the output row layout switches to the aggregation output tuple.
+#[test]
+fn aggregation_translates_to_aggregate_rel() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(aggregate.groupings.len(), 1);
+    assert_eq!(aggregate.groupings[0].expression_references, vec![0]);
+    assert_eq!(aggregate.measures.len(), 1);
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(measure.arguments.len(), 1);
+    assert_eq!(
+        measure.invocation,
+        substrait::proto::aggregate_function::AggregationInvocation::All as i32
+    );
+    let names: Vec<_> = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+}
+
+/// Verifies a distinct aggregate (StarRocks `multi_distinct_count`) becomes a distinct `count`.
+#[test]
+fn multi_distinct_count_translates_to_distinct_count() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    let measure = aggregate.measures[0].measure.as_ref().unwrap();
+    assert_eq!(
+        measure.invocation,
+        substrait::proto::aggregate_function::AggregationInvocation::Distinct as i32
+    );
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+}
+
+/// Verifies a merge-phase aggregate (two-phase aggregation) is rejected.
+#[test]
+fn merge_aggregation_is_rejected() {
+    let mut aggregate = aggregate_expr(
+        "sum",
+        scalar_type(TPrimitiveType::BIGINT),
+        Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+    );
+    aggregate.nodes[0].agg_expr = Some(TAggregateExpr::new(true));
+    let agg = aggregation_node(1, 1, Vec::new(), vec![aggregate]);
+    // Output tuple 1 has two slots but no grouping keys, so use a dedicated descriptor with a
+    // single aggregate output slot.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(matches!(err, TranslateError::UnsupportedExpression { .. }));
+}
+
+/// Verifies a top-N sort becomes project (sort tuple) + sort + fetch with the node limit.
+#[test]
+fn sort_with_limit_becomes_project_sort_fetch() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.limit = 5;
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    // Sort tuple 1 materializes only the ordering column.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected fetch relation");
+    };
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            fetch.count_mode,
+            Some(substrait::proto::fetch_rel::CountMode::Count(5))
+        );
+        assert_eq!(fetch.offset_mode, None);
+    }
+    let rel::RelType::Sort(sort) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort under fetch");
+    };
+    assert_eq!(sort.sorts.len(), 1);
+    assert_eq!(
+        sort.sorts[0].sort_kind,
+        Some(substrait::proto::sort_field::SortKind::Direction(
+            substrait::proto::sort_field::SortDirection::AscNullsLast as i32
+        ))
+    );
+    let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort-tuple projection under sort");
+    };
+}
+
+/// Two-table descriptor for join tests: tuple 0 = users(`a`), tuple 1 = orders(`b`).
+fn join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Two-table descriptor whose sides differ in width: tuple 0 = users(`a`, `b`), tuple 1 =
+/// orders(`c`). A build-side slot lands at field 2, so an index into the concatenated
+/// probe-then-build row cannot be confused with a literal `1`.
+fn wide_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "b", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "c", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Builds a hash-join plan node with one `left = right` equality conjunct.
+fn hash_join_node(join_op: TJoinOp) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::HASH_JOIN_NODE, 2, vec![0, 1]);
+    join.hash_join_node = Some(THashJoinNode::new(
+        join_op,
+        vec![TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Field indices referenced by a scalar function's arguments, in order.
+fn argument_field_indices(scalar: &expression::ScalarFunction) -> Vec<i32> {
+    scalar
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => field_index(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect()
+}
+
+/// Verifies an inner hash join becomes a Substrait join whose equality condition references the
+/// concatenated left-then-right row (right side offset by the left width).
+#[test]
+fn inner_hash_join_translates_to_join_rel() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::INNER_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    let expression::RexType::ScalarFunction(equal) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected scalar function join condition");
+    };
+    assert_eq!(argument_field_indices(equal), vec![0, 1]);
+}
+
+/// Verifies an ON-clause predicate beyond the equality is ANDed into the join condition, and that
+/// both operands resolve against the concatenated probe-then-build row.
+///
+/// Run over the asymmetric descriptor: with a two-column probe side a build-side reference lands
+/// at field 2, which a wrong offset (a literal 1, or the build width) cannot reproduce.
+#[test]
+fn other_join_conjuncts_are_anded_into_the_join_condition() {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.hash_join_node.as_mut().unwrap().other_join_conjuncts = Some(vec![binary_pred(
+        TExprOpcode::LT,
+        slot_ref(2, 0, bigint()),
+        slot_ref(1, 1, bigint()),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(wide_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b", "c"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    let conjunction = scalar_fn(join.expression.as_ref().unwrap());
+    let (urn, name) = resolved_function(&translated.plan, conjunction.function_reference);
+    assert_eq!((urn.as_str(), name.as_str()), (URN_BOOLEAN, "and"));
+
+    let operands: Vec<_> = conjunction
+        .arguments
+        .iter()
+        .map(|argument| match argument.arg_type.as_ref().unwrap() {
+            substrait::proto::function_argument::ArgType::Value(value) => scalar_fn(value),
+            other => panic!("unexpected argument {other:?}"),
+        })
+        .collect();
+    let names: Vec<_> = operands
+        .iter()
+        .map(|operand| resolved_function(&translated.plan, operand.function_reference).1)
+        .collect();
+    assert_eq!(names, vec!["equal", "lt"]);
+    // `a = c` then `b < c`: fields 0 and 1 are the probe side, field 2 is the build side.
+    assert_eq!(argument_field_indices(operands[0]), vec![0, 2]);
+    assert_eq!(argument_field_indices(operands[1]), vec![1, 2]);
+}
+
+/// Verifies a join's own conjuncts become a filter over the join, resolved against the
+/// concatenated row rather than the probe side alone.
+#[test]
+fn join_node_conjuncts_become_a_post_join_filter() {
+    let mut join = hash_join_node(TJoinOp::INNER_JOIN);
+    join.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(wide_join_desc()), None)).unwrap();
+
+    let rel::RelType::Filter(filter) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a filter over the join");
+    };
+    let rel::RelType::Join(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the join under the filter");
+    };
+    let greater = scalar_fn(filter.condition.as_deref().unwrap());
+    let substrait::proto::function_argument::ArgType::Value(probed) =
+        greater.arguments[0].arg_type.as_ref().unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    assert_eq!(field_index(probed), 2);
+}
+
+/// Verifies a left semi join keeps only the probe-side row layout.
+#[test]
+fn left_semi_join_keeps_probe_layout() {
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::LEFT_SEMI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a"]);
+    let rel::RelType::Join(join) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected join relation");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::LeftSemi as i32
+    );
+}
+
+/// Builds a nested-loop join plan node carrying `conjuncts` as its join predicate.
+fn nestloop_join_node(join_op: TJoinOp, conjuncts: Vec<TExpr>) -> TPlanNode {
+    let mut join = base_plan_node(2, TPlanNodeType::NESTLOOP_JOIN_NODE, 2, vec![0, 1]);
+    join.nestloop_join_node = Some(TNestLoopJoinNode::new(
+        Some(join_op),
+        None,
+        Some(conjuncts),
+        None,
+        None,
+        None,
+    ));
+    join
+}
+
+/// Builds `left OR right`.
+fn or_pred(left: TExpr, right: TExpr) -> TExpr {
+    let mut node = base_expr_node(
+        TExprNodeType::COMPOUND_PRED,
+        scalar_type(TPrimitiveType::BOOLEAN),
+        2,
+    );
+    node.opcode = Some(TExprOpcode::COMPOUND_OR);
+    let mut nodes = vec![node];
+    nodes.extend(left.nodes);
+    nodes.extend(right.nodes);
+    TExpr::new(nodes)
+}
+
+/// Verifies a cross nested-loop join becomes a filtered constant-key equality join.
+#[test]
+fn nestloop_join_translates_to_filtered_cross_rel() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over constant-key join");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
+    };
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+}
+
+/// Verifies a nested-loop join that is not inner or cross is rejected: the translation emits a
+/// cross product, which keeps no unmatched rows.
+#[test]
+fn non_inner_nestloop_join_is_rejected() {
+    for join_op in [TJoinOp::LEFT_OUTER_JOIN, TJoinOp::LEFT_SEMI_JOIN] {
+        let plan = TPlan::new(vec![
+            nestloop_join_node(
+                join_op,
+                vec![binary_pred(
+                    TExprOpcode::LT,
+                    slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+                    slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+                )],
+            ),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{join_op:?}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(reason, "only inner/cross nested-loop joins are supported");
+    }
+}
+
+/// Verifies a nested-loop join still translates when the conjunct would not lift into a
+/// comparison join: the synthetic constant key is the join condition, and the original
+/// predicate stays a filter.
+#[test]
+fn nestloop_join_without_a_liftable_comparison_still_translates() {
+    let bigint = || scalar_type(TPrimitiveType::BIGINT);
+    let probe_side_only = binary_pred(TExprOpcode::LT, slot_ref(1, 0, bigint()), int_literal(10));
+    let disjunction = or_pred(
+        binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+        binary_pred(
+            TExprOpcode::GT,
+            slot_ref(1, 0, bigint()),
+            slot_ref(1, 1, bigint()),
+        ),
+    );
+
+    for conjunct in [probe_side_only, disjunction] {
+        let plan = TPlan::new(vec![
+            nestloop_join_node(TJoinOp::CROSS_JOIN, vec![conjunct]),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap();
+        let root = root(&translated.plan);
+        let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected filter over constant-key join");
+        };
+        let rel::RelType::Project(project) =
+            filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected output projection under filter");
+        };
+        let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("expected constant-key join under projection");
+        };
+        assert_eq!(
+            join.r#type,
+            substrait::proto::join_rel::JoinType::Inner as i32
+        );
+    }
+}
+
 /// Verifies an exchange node is still rejected: fragments are translated in isolation and
 /// multi-fragment plans are a later milestone.
 #[test]
@@ -2097,7 +3300,7 @@ fn date_literal_translates_to_epoch_days() {
         Some(filtered_scan(TExpr::new(nodes))),
         Some(desc_table(
             vec![(0, Some(100))],
-            vec![slot(1, 0, 0, "d", scalar_type(TPrimitiveType::DATE))],
+            vec![slot(1, 0, "d", scalar_type(TPrimitiveType::DATE))],
         )),
         None,
     ))
@@ -2203,27 +3406,485 @@ fn case_expression_translates_to_if_then() {
     );
 }
 
-/// Verifies decimal-typed arithmetic is rejected (it crashes the engine's GPU projection).
+/// Verifies aggregation-node conjuncts (HAVING) become a filter over the aggregate output.
 #[test]
-fn decimal_arithmetic_is_rejected() {
-    let decimal = scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4));
-    let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
-    arith.opcode = Some(TExprOpcode::MULTIPLY);
-    let mut nodes = vec![arith];
-    nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
-    nodes.extend(slot_ref(1, 0, decimal).nodes);
+fn aggregation_conjuncts_become_having_filter() {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    // HAVING total > 10, referencing the aggregation output tuple.
+    agg.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
 
+    let root = root(&translated.plan);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected HAVING filter over the aggregate");
+    };
+    let rel::RelType::Aggregate(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate under the HAVING filter");
+    };
+}
+
+/// Names the extension function a scalar-function expression invokes.
+fn scalar_function_name(
+    plan: &substrait::proto::Plan,
+    expr: &substrait::proto::Expression,
+) -> String {
+    let expression::RexType::ScalarFunction(call) = expr.rex_type.as_ref().unwrap() else {
+        panic!("expected a scalar function, got {expr:?}");
+    };
+    plan.extensions
+        .iter()
+        .find_map(|ext| {
+            match ext.mapping_type.as_ref().unwrap() {
+            substrait::proto::extensions::simple_extension_declaration::MappingType
+                ::ExtensionFunction(f) if f.function_anchor == call.function_reference =>
+            {
+                Some(f.name.clone())
+            }
+            _ => None,
+        }
+        })
+        .unwrap_or_else(|| panic!("no extension for anchor {}", call.function_reference))
+}
+
+/// Verifies each anti join is lowered through the specific supported form it needs, not merely
+/// that it translates: a left anti becomes a LEFT join filtered on the build key being NULL, a
+/// right anti mirrors that, and a null-aware left anti becomes a MARK join filtered on NOT of the
+/// marker column the join appends. Asserting only the output arity cannot tell these apart, and
+/// every one of them is a different answer.
+#[test]
+fn anti_hash_joins_are_lowered() {
+    for (join_op, want_type, want_filter, want_filter_field, want_emit) in [
+        (
+            TJoinOp::LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Left,
+            "is_null",
+            vec![1],
+            vec![0],
+        ),
+        (
+            TJoinOp::RIGHT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::Right,
+            "is_null",
+            vec![0],
+            vec![1],
+        ),
+        (
+            TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN,
+            substrait::proto::join_rel::JoinType::LeftMark,
+            "not",
+            vec![1],
+            vec![0],
+        ),
+    ] {
+        let plan = TPlan::new(vec![
+            hash_join_node(join_op),
+            scan_node(0, 0),
+            scan_node(1, 1),
+        ]);
+        let translated = translate_fragment(&params(Some(plan), Some(join_desc()), None))
+            .unwrap_or_else(|err| panic!("{join_op:?}: {err:?}"));
+
+        let root = root(&translated.plan);
+        assert_eq!(root.names.len(), 1, "{join_op:?}");
+        let rel::RelType::Project(project) =
+            root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the output projection under the root");
+        };
+        assert_eq!(
+            emit_mapping(project.common.as_ref()),
+            want_emit,
+            "{join_op:?}"
+        );
+
+        let rel::RelType::Filter(filter) =
+            project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the anti-join filter under the projection");
+        };
+        assert_eq!(
+            scalar_function_name(&translated.plan, filter.condition.as_ref().unwrap()),
+            want_filter,
+            "{join_op:?}"
+        );
+        let expression::RexType::ScalarFunction(scalar) = filter
+            .condition
+            .as_ref()
+            .unwrap()
+            .rex_type
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("{join_op:?}: expected a scalar-function filter");
+        };
+        assert_eq!(
+            argument_field_indices(scalar),
+            want_filter_field,
+            "{join_op:?}: the filter must test the build key (left anti), the probe key (right \
+             anti) or the appended marker (null-aware)"
+        );
+
+        let rel::RelType::Join(join) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+        else {
+            panic!("{join_op:?}: expected the join under the filter");
+        };
+        assert_eq!(join.r#type, want_type as i32, "{join_op:?}");
+    }
+}
+
+/// The outer-join + `is_null(key)` lowering tells an unmatched row by the NULL the join pads the
+/// other side with, so the null-tested key must propagate NULL. A column reference does, and so
+/// does a cast of one; an arithmetic (or `if`/`case`) expression over the key is refused rather
+/// than risk dropping unmatched rows.
+#[test]
+fn anti_join_with_non_column_key_is_rejected() {
+    let times_two = |slot_id: i32, tuple_id: i32| {
+        let mut arith = base_expr_node(
+            TExprNodeType::ARITHMETIC_EXPR,
+            scalar_type(TPrimitiveType::BIGINT),
+            2,
+        );
+        arith.opcode = Some(TExprOpcode::MULTIPLY);
+        let mut nodes = vec![arith];
+        nodes.extend(slot_ref(slot_id, tuple_id, scalar_type(TPrimitiveType::BIGINT)).nodes);
+        nodes.extend(int_literal(2).nodes);
+        TExpr::new(nodes)
+    };
+
+    // LEFT ANTI null-tests the build (right) key; RIGHT ANTI null-tests the probe (left) key.
+    let mut left_anti = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    left_anti.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = times_two(1, 1);
+    let mut right_anti = hash_join_node(TJoinOp::RIGHT_ANTI_JOIN);
+    right_anti
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts[0]
+        .left = times_two(1, 0);
+    for (label, join) in [("LEFT_ANTI", left_anti), ("RIGHT_ANTI", right_anti)] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "anti join key is not a plain column reference",
+            "{label}"
+        );
+    }
+
+    // A cast over the column keeps NULL as NULL and stays supported.
+    let mut cast_key = hash_join_node(TJoinOp::LEFT_ANTI_JOIN);
+    cast_key.hash_join_node.as_mut().unwrap().eq_join_conjuncts[0].right = cast_expr(
+        scalar_type(TPrimitiveType::BIGINT),
+        slot_ref(1, 1, scalar_type(TPrimitiveType::INT)),
+    );
+    let plan = TPlan::new(vec![cast_key, scan_node(0, 0), scan_node(1, 1)]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("a cast of a column reference is still a column key");
+}
+
+/// A null-aware anti join is only equivalent to `LeftMark + NOT(marker)` when one equality key
+/// decides the match. Both executors null out *every* unmatched marker as soon as any build row
+/// has a NULL in any key, so a row made definitely non-matching by a second predicate is reported
+/// UNKNOWN and dropped. Correlated `NOT IN` (correlation predicate in `other_join_conjuncts`) and
+/// tuple `NOT IN` (several eq conjuncts) are therefore refused rather than silently returning too
+/// few rows.
+#[test]
+fn null_aware_anti_join_with_extra_predicates_is_rejected() {
+    let extra_eq = || {
+        TEqJoinCondition::new(
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+            Some(TExprOpcode::EQ),
+        )
+    };
+    let correlation = || {
+        binary_pred(
+            TExprOpcode::EQ,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )
+    };
+
+    // Tuple NOT IN: two equality keys.
+    let mut multi_key = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    multi_key
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .eq_join_conjuncts
+        .push(extra_eq());
+
+    // Correlated NOT IN: the correlation predicate rides in other_join_conjuncts.
+    let mut correlated = hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN);
+    correlated
+        .hash_join_node
+        .as_mut()
+        .unwrap()
+        .other_join_conjuncts = Some(vec![correlation()]);
+
+    for (label, join) in [
+        ("tuple NOT IN", multi_key),
+        ("correlated NOT IN", correlated),
+    ] {
+        let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+        let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+        let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+            panic!("{label}: expected an unsupported plan node, got {err:?}");
+        };
+        assert_eq!(
+            reason, "null-aware left anti join with correlated or multi-column keys",
+            "{label}"
+        );
+    }
+
+    // The single-key, no-extra-conjunct form stays supported: there, "unmatched with a NULL on
+    // the build side" really is UNKNOWN, so the global rule is exact.
+    let plan = TPlan::new(vec![
+        hash_join_node(TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN),
+        scan_node(0, 0),
+        scan_node(1, 1),
+    ]);
+    translate_fragment(&params(Some(plan), Some(join_desc()), None))
+        .expect("plain single-key null-aware anti join is still supported");
+}
+
+/// Verifies an unsupported join op is named as the reason even when the plan also carries no join
+/// conjuncts, which is the shape some join types arrive in once the FE has folded predicates away.
+#[test]
+fn unsupported_join_type_is_reported_before_missing_conjuncts() {
+    let mut join = hash_join_node(TJoinOp::CROSS_JOIN);
+    join.hash_join_node.as_mut().unwrap().eq_join_conjuncts = vec![];
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+
+    let err = translate_fragment(&params(Some(plan), Some(join_desc()), None)).unwrap_err();
+    let TranslateError::UnsupportedPlanNode { reason, .. } = err else {
+        panic!("expected an unsupported plan node, got {err:?}");
+    };
+    assert_eq!(reason, "hash join type is unsupported");
+}
+
+/// Asserts an expression is a throwing cast to FP64, the lowering every decimal operand and
+/// decimal aggregate argument goes through.
+fn assert_fp64_cast(expr: &substrait::proto::Expression) {
+    let Some(expression::RexType::Cast(cast)) = expr.rex_type.as_ref() else {
+        panic!("expected a cast, got {expr:?}");
+    };
+    assert!(
+        matches!(
+            cast.r#type.as_ref().unwrap().kind,
+            Some(substrait::proto::r#type::Kind::Fp64(_))
+        ),
+        "cast target {:?}",
+        cast.r#type
+    );
+    assert_eq!(
+        cast.failure_behavior,
+        expression::cast::FailureBehavior::ThrowException as i32
+    );
+}
+
+/// Verifies decimal arithmetic is lowered to throwing FP64 casts for the GPU expression
+/// evaluator, and that the result type is FP64 even when the FE result slot stays DECIMAL
+/// (precision <= 18, where `map_type_desc` alone would keep it decimal).
+#[test]
+fn decimal_arithmetic_is_lowered_to_fp64() {
+    for decimal in [
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(31), Some(4)),
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
+    ] {
+        let mut arith = base_expr_node(TExprNodeType::ARITHMETIC_EXPR, decimal.clone(), 2);
+        arith.opcode = Some(TExprOpcode::MULTIPLY);
+        let mut nodes = vec![arith];
+        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+        nodes.extend(slot_ref(1, 0, decimal.clone()).nodes);
+
+        let translated = translate_fragment(&params(
+            Some(TPlan::new(vec![scan_node(0, 0)])),
+            Some(base_desc()),
+            Some(vec![TExpr::new(nodes)]),
+        ))
+        .unwrap();
+        let rel::RelType::Project(project) = root(&translated.plan)
+            .input
+            .as_ref()
+            .unwrap()
+            .rel_type
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected output project");
+        };
+        let expression::RexType::ScalarFunction(function) =
+            project.expressions[0].rex_type.as_ref().unwrap()
+        else {
+            panic!("expected arithmetic function");
+        };
+        assert_eq!(function.arguments.len(), 2, "{decimal:?}");
+        for argument in &function.arguments {
+            let substrait::proto::function_argument::ArgType::Value(value) =
+                argument.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            assert_fp64_cast(value);
+        }
+        assert!(
+            matches!(
+                function.output_type.as_ref().unwrap().kind,
+                Some(substrait::proto::r#type::Kind::Fp64(_))
+            ),
+            "{decimal:?}"
+        );
+    }
+}
+
+/// Translates a one-phase aggregation with one measure over a BIGINT slot and returns that
+/// measure's (possibly lowered) argument.
+fn single_measure_argument(name: &str, ret_type: TTypeDesc) -> substrait::proto::Expression {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            name,
+            ret_type,
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+    let rel::RelType::Aggregate(aggregate) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected aggregate");
+    };
+    let substrait::proto::function_argument::ArgType::Value(value) =
+        aggregate.measures[0].measure.as_ref().unwrap().arguments[0]
+            .arg_type
+            .as_ref()
+            .unwrap()
+    else {
+        panic!("expected a value argument");
+    };
+    value.clone()
+}
+
+/// Verifies a decimal AVG argument is lowered to a throwing FP64 cast for GPU execution.
+#[test]
+fn decimal_avg_is_lowered_to_fp64() {
+    assert_fp64_cast(&single_measure_argument(
+        "avg",
+        scalar_type_with(TPrimitiveType::DECIMAL128, None, Some(38), Some(8)),
+    ));
+}
+
+/// Verifies a decimal SUM argument is lowered the same way, including when the FE result slot
+/// stays DECIMAL (precision <= 18).
+#[test]
+fn decimal_sum_is_lowered_to_fp64() {
+    assert_fp64_cast(&single_measure_argument(
+        "sum",
+        scalar_type_with(TPrimitiveType::DECIMAL64, None, Some(18), Some(2)),
+    ));
+}
+
+/// Verifies an avg that lowers to neither the DOUBLE nor the decimal path (temporal avg, with
+/// StarRocks-specific rounding) is refused with a reason that names what is supported.
+#[test]
+fn temporal_avg_is_rejected() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "avg",
+            scalar_type(TPrimitiveType::DATE),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
     let err = translate_fragment(&params(
-        Some(TPlan::new(vec![scan_node(0, 0)])),
-        Some(base_desc()),
-        Some(vec![TExpr::new(nodes)]),
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap_err();
+    let TranslateError::UnsupportedExpression { node_type, reason } = err else {
+        panic!("expected an unsupported expression, got {err:?}");
+    };
+    assert_eq!(node_type, TExprNodeType::AGG_EXPR);
+    assert_eq!(
+        reason,
+        "avg is only supported where it lowers to the GPU's FP64 avg (DOUBLE and DECIMAL inputs)"
+    );
+}
+
+/// Verifies partitioned top-N sorts are rejected rather than run as a global sort.
+#[test]
+fn partitioned_topn_sort_is_rejected() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    let mut sort_node = TSortNode::new(
+        sort_info, true, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    );
+    sort_node.partition_exprs = Some(vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))]);
+    sort_node.partition_limit = Some(3);
+    sort.sort_node = Some(sort_node);
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
     ))
     .unwrap_err();
     assert!(
         matches!(
             err,
-            TranslateError::UnsupportedExpression {
-                node_type: TExprNodeType::ARITHMETIC_EXPR,
+            TranslateError::UnsupportedPlanNode {
+                node_type: TPlanNodeType::SORT_NODE,
                 ..
             }
         ),
@@ -2231,8 +3892,46 @@ fn decimal_arithmetic_is_rejected() {
     );
 }
 
-/// Verifies GPU-executor guards: non-constant LIKE patterns and non-constant substring
-/// bounds are rejected.
+/// Verifies the sort-tuple materialization is read from `TSortInfo` (the resolved field), not
+/// only from the deprecated node-level duplicate.
+#[test]
+fn sort_tuple_exprs_come_from_sort_info() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info, false, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
+    ));
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    let rel::RelType::Sort(sort) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    let rel::RelType::Project(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort-tuple projection from TSortInfo exprs");
+    };
+}
+
+/// Verifies GPU-executor guards: non-constant LIKE patterns, non-constant substring bounds,
+/// and ungrouped DISTINCT aggregates are rejected.
 #[test]
 fn gpu_unsupported_shapes_are_rejected() {
     // LIKE with a column pattern (not a literal).
@@ -2283,4 +3982,624 @@ fn gpu_unsupported_shapes_are_rejected() {
         matches!(err, TranslateError::UnsupportedExpression { .. }),
         "{err:?}"
     );
+
+    // DISTINCT aggregate without grouping keys.
+    let agg = aggregation_node(
+        1,
+        1,
+        Vec::new(),
+        vec![aggregate_expr(
+            "multi_distinct_count",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "cnt", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+}
+
+/// Extracts the struct-field index from a Substrait direct field reference.
+fn field_index(expr: &substrait::proto::Expression) -> i32 {
+    let Some(expression::RexType::Selection(selection)) = expr.rex_type.as_ref() else {
+        panic!("expected a field reference, got {expr:?}");
+    };
+    let Some(expression::field_reference::ReferenceType::DirectReference(segment)) =
+        selection.reference_type.as_ref()
+    else {
+        panic!("expected a direct reference");
+    };
+    let Some(expression::reference_segment::ReferenceType::StructField(field)) =
+        segment.reference_type.as_ref()
+    else {
+        panic!("expected a struct field reference");
+    };
+    field.field
+}
+
+/// StarRocks orders an aggregation's output tuple by `groupBys` clause order, which is not
+/// sorted by slot id: TPC-H Q18 emits `group by: 2: c_name, 1: c_custkey`. Pins that the
+/// translated column order follows the descriptor's wire order rather than ascending slot id.
+#[test]
+fn aggregation_output_tuple_follows_wire_order_not_slot_id() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    // Output tuple 1 lists `name` (slot 2) before `id` (slot 1), matching the grouping order.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(3, 1, "total", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "id", "total"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    // Scan tuple 0 is `id` then `name`, so the keys resolve to fields 1 and 0 in that order.
+    assert_eq!(
+        aggregate
+            .grouping_expressions
+            .iter()
+            .map(field_index)
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+}
+
+/// StarRocks builds a sort tuple ordering-slots-first, so its wire order is not sorted by slot
+/// id. Pins that the sort key resolves against the projection the translator emits.
+#[test]
+fn sort_tuple_follows_wire_order_not_slot_id() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(2, 1, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        Some(0),
+        None,
+        None,
+        None,
+        None,
+        // Sort-tuple expressions in wire order: the ordering column first, then the payload.
+        Some(vec![
+            slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR)),
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+        ]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    // Sort tuple 1 lists `name` (slot 2) before `id` (slot 1).
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "id"]);
+    let rel::RelType::Sort(sorted) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected sort relation");
+    };
+    // The projection below emits `name` first, so the ordering key is field 0.
+    assert_eq!(field_index(sorted.sorts[0].expr.as_ref().unwrap()), 0);
+}
+
+/// Name of a Substrait type's kind, for asserting which descriptor slot a measure was paired with.
+fn type_kind_name(ty: &substrait::proto::Type) -> &'static str {
+    use substrait::proto::r#type::Kind;
+    match ty.kind.as_ref().expect("measure output type") {
+        Kind::I64(_) => "i64",
+        Kind::Fp64(_) => "fp64",
+        Kind::String(_) => "string",
+        other => panic!("unexpected measure output type {other:?}"),
+    }
+}
+
+/// StarRocks appends one output-tuple slot per aggregate after the grouping keys, so measure `i`
+/// takes its declared output type from slot `keys + i`. The two measures are given different
+/// types so that both an off-by-one into the grouping keys and a swap between the measures are
+/// visible; with one measure, every wrong slice lands on the same slot.
+#[test]
+fn each_aggregate_takes_its_own_output_slot() {
+    let agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![
+            aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::DOUBLE),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            ),
+            aggregate_expr(
+                "count",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))),
+            ),
+        ],
+    );
+    // Output tuple 1: grouping key `name` (VARCHAR), then one slot per aggregate in aggregate
+    // order — `total` DOUBLE, `n` BIGINT.
+    let desc = desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(2, 1, "total", scalar_type(TPrimitiveType::DOUBLE)),
+            slot(3, 1, "n", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    );
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(desc),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["name", "total", "n"]);
+    let rel::RelType::Aggregate(aggregate) =
+        root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected aggregate relation");
+    };
+    assert_eq!(aggregate.grouping_expressions.len(), 1);
+    assert_eq!(aggregate.measures.len(), 2);
+
+    let calls: Vec<_> = aggregate
+        .measures
+        .iter()
+        .map(|m| m.measure.as_ref().unwrap())
+        .collect();
+    // Each measure keeps its own argument: `sum(id)` reads field 0, `count(name)` field 1.
+    let arg_fields: Vec<_> = calls
+        .iter()
+        .map(|call| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                call.arguments[0].arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(arg_fields, vec![0, 1]);
+    // And its own output slot: slice past the grouping keys, in aggregate order.
+    let out_kinds: Vec<_> = calls
+        .iter()
+        .map(|call| type_kind_name(call.output_type.as_ref().unwrap()))
+        .collect();
+    assert_eq!(out_kinds, vec!["fp64", "i64"]);
+
+    let names = extension_function_names(&translated.plan);
+    assert!(names.contains(&"sum".to_string()), "{names:?}");
+    assert!(names.contains(&"count".to_string()), "{names:?}");
+}
+
+/// Builds a SORT_NODE over sort tuple 1 carrying `limit` and `offset`, sorting on the single
+/// BIGINT column the `sort_fetch_desc` fixture materializes.
+fn sort_node_with(limit: i64, offset: Option<i64>) -> TPlanNode {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut sort = base_plan_node(1, TPlanNodeType::SORT_NODE, 1, vec![1]);
+    sort.limit = limit;
+    sort.sort_node = Some(TSortNode::new(
+        sort_info,
+        true,
+        offset,
+        None,
+        None,
+        None,
+        None,
+        Some(vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    sort
+}
+
+/// Scan tuple 0 (`id`, `name`) plus a sort tuple 1 materializing only `id`.
+fn sort_fetch_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, None)],
+        vec![
+            slot(1, 0, "id", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "name", scalar_type(TPrimitiveType::VARCHAR)),
+            slot(1, 1, "id", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Translates a fragment whose only node is a sort with `limit`/`offset`, returning its fetch.
+#[allow(deprecated)]
+fn fetch_modes(
+    limit: i64,
+    offset: Option<i64>,
+) -> (
+    Option<substrait::proto::fetch_rel::CountMode>,
+    Option<substrait::proto::fetch_rel::OffsetMode>,
+) {
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![
+            sort_node_with(limit, offset),
+            scan_node(0, 0),
+        ])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap();
+    let root = root(&translated.plan);
+    match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+        rel::RelType::Fetch(fetch) => (fetch.count_mode.clone(), fetch.offset_mode.clone()),
+        other => panic!("expected a fetch relation, got {other:?}"),
+    }
+}
+
+/// An offset with no limit must still emit an explicit unlimited count: DuckDB's consumer reads
+/// the plain `count` field without checking the oneof, so an unset count decodes as `LIMIT 0` and
+/// the query silently returns no rows.
+#[test]
+#[allow(deprecated)]
+fn offset_without_limit_emits_an_unlimited_count() {
+    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+    assert_eq!(
+        fetch_modes(-1, Some(5)),
+        (Some(CountMode::Count(-1)), Some(OffsetMode::Offset(5)))
+    );
+}
+
+/// `LIMIT n OFFSET m` carries both modes.
+#[test]
+#[allow(deprecated)]
+fn limit_and_offset_emit_both_modes() {
+    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+    assert_eq!(
+        fetch_modes(10, Some(5)),
+        (Some(CountMode::Count(10)), Some(OffsetMode::Offset(5)))
+    );
+}
+
+/// `LIMIT 0` is a real limit, not the "unset" sentinel: it must reach the plan as `Count(0)`
+/// rather than being folded away into an unlimited fetch.
+#[test]
+#[allow(deprecated)]
+fn zero_limit_is_not_treated_as_unlimited() {
+    use substrait::proto::fetch_rel::CountMode;
+    assert_eq!(fetch_modes(0, Some(0)), (Some(CountMode::Count(0)), None));
+}
+
+/// A limit on a non-sort node still becomes a fetch, and it sits *above* that node's conjunct
+/// filter — StarRocks applies a scan or aggregation's limit to the rows that passed its
+/// predicates, so `Filter(Fetch(..))` would truncate before filtering and return too few rows.
+#[test]
+#[allow(deprecated)]
+fn a_limit_on_an_aggregation_fetches_above_its_having_filter() {
+    let mut agg = aggregation_node(
+        1,
+        1,
+        vec![slot_ref(2, 0, scalar_type(TPrimitiveType::VARCHAR))],
+        vec![aggregate_expr(
+            "sum",
+            scalar_type(TPrimitiveType::BIGINT),
+            Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+        )],
+    );
+    agg.limit = 3;
+    agg.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(2, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![agg, scan_node(0, 0)])),
+        Some(agg_desc()),
+        None,
+    ))
+    .unwrap();
+
+    let root = root(&translated.plan);
+    let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the limit to become a fetch above the aggregation");
+    };
+    assert_eq!(
+        fetch.count_mode,
+        Some(substrait::proto::fetch_rel::CountMode::Count(3))
+    );
+    let rel::RelType::Filter(filter) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the HAVING filter under the fetch");
+    };
+    let rel::RelType::Aggregate(_) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the aggregate under the HAVING filter");
+    };
+}
+
+/// A sorter carrying a payload tuple beyond the sort tuple is refused: only the first row tuple
+/// is translated, so the rest would vanish from the output row.
+#[test]
+fn sort_with_a_second_row_tuple_is_rejected() {
+    let mut sort = sort_node_with(-1, Some(0));
+    sort.row_tuples = vec![1, 2];
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+}
+
+/// StarRocks can fold a partial aggregation into the sorter; a Substrait sort has nowhere to put
+/// it, so the node is refused rather than translated as a plain sort over unaggregated rows.
+#[test]
+fn sort_with_a_pre_aggregation_payload_is_rejected() {
+    for with_slots in [false, true] {
+        let mut sort = sort_node_with(-1, Some(0));
+        let node = sort.sort_node.as_mut().unwrap();
+        if with_slots {
+            node.pre_agg_output_slot_id = Some(vec![1]);
+        } else {
+            node.pre_agg_exprs = Some(vec![aggregate_expr(
+                "sum",
+                scalar_type(TPrimitiveType::BIGINT),
+                Some(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))),
+            )]);
+        }
+        let err = translate_fragment(&params(
+            Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+            Some(sort_fetch_desc()),
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+            "with_slots={with_slots}: {err:?}"
+        );
+    }
+}
+
+/// A sort carrying its own predicates is refused. StarRocks' sorter applies the limit internally
+/// and never evaluates conjuncts — its backend asserts they are absent — so there is no reference
+/// answer for whether the predicate runs before or after the truncation, and either choice
+/// silently returns a different row set.
+#[test]
+fn sort_with_conjuncts_is_rejected() {
+    let mut sort = sort_node_with(5, Some(0));
+    sort.conjuncts = Some(vec![binary_pred(
+        TExprOpcode::GT,
+        slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        int_literal(10),
+    )]);
+    let err = translate_fragment(&params(
+        Some(TPlan::new(vec![sort, scan_node(0, 0)])),
+        Some(sort_fetch_desc()),
+        None,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(err, TranslateError::UnsupportedPlanNode { .. }),
+        "{err:?}"
+    );
+}
+
+/// Reads a relation's `RelCommon` emit mapping — what a consumer actually projects by.
+fn emit_mapping(common: Option<&substrait::proto::RelCommon>) -> Vec<i32> {
+    let Some(substrait::proto::rel_common::EmitKind::Emit(emit)) =
+        common.and_then(|common| common.emit_kind.as_ref())
+    else {
+        panic!("expected an explicit emit mapping");
+    };
+    emit.output_mapping.clone()
+}
+
+/// A two-column left side and a one-column right side, so the synthetic-key arithmetic cannot be
+/// satisfied by more than one formula.
+fn asymmetric_join_desc() -> TDescriptorTable {
+    desc_table(
+        vec![(0, Some(100)), (1, Some(100))],
+        vec![
+            slot(1, 0, "a", scalar_type(TPrimitiveType::BIGINT)),
+            slot(2, 0, "a2", scalar_type(TPrimitiveType::BIGINT)),
+            slot(1, 1, "b", scalar_type(TPrimitiveType::BIGINT)),
+        ],
+    )
+}
+
+/// Pins the synthetic-key index arithmetic, which is the only thing in this lowering that can be
+/// wrong. With one column per side every off-by-one formula produces the same numbers; with a
+/// 2x1 descriptor the join row is `[a, a2, key_l, b, key_r]`, so the condition must compare
+/// fields 2 and 4 and the projection must emit `[0, 1, 3]` — dropping both synthetic keys.
+#[test]
+fn constant_key_join_indexes_past_the_synthetic_keys() {
+    let join = nestloop_join_node(
+        TJoinOp::CROSS_JOIN,
+        vec![binary_pred(
+            TExprOpcode::LT,
+            slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)),
+            slot_ref(1, 1, scalar_type(TPrimitiveType::BIGINT)),
+        )],
+    );
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "a2", "b"]);
+    let rel::RelType::Filter(filter) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected filter over constant-key join");
+    };
+    let rel::RelType::Project(project) = filter.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected output projection under filter");
+    };
+    // The projection only drops columns; it must not compute anything.
+    assert!(project.expressions.is_empty());
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
+
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    let expression::RexType::ScalarFunction(condition) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected a scalar-function join condition");
+    };
+    let operands: Vec<_> = condition
+        .arguments
+        .iter()
+        .map(|arg| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                arg.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(operands, vec![2, 4]);
+}
+
+/// `SELECT * FROM a, b` — a nested-loop join with no conjuncts at all. This is the shape the PR
+/// exists to accept, and it takes the one branch the conjunct-carrying tests never reach: no
+/// filter is emitted, so the projection is the root's direct input.
+#[test]
+fn bare_cross_join_translates_to_constant_key_join() {
+    let join = nestloop_join_node(TJoinOp::CROSS_JOIN, Vec::new());
+    let plan = TPlan::new(vec![join, scan_node(0, 0), scan_node(1, 1)]);
+    let translated =
+        translate_fragment(&params(Some(plan), Some(asymmetric_join_desc()), None)).unwrap();
+
+    let root = root(&translated.plan);
+    assert_eq!(root.names, vec!["a", "a2", "b"]);
+    let rel::RelType::Project(project) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected the output projection directly under the root, with no filter");
+    };
+    assert!(project.expressions.is_empty());
+    assert_eq!(emit_mapping(project.common.as_ref()), vec![0, 1, 3]);
+
+    let rel::RelType::Join(join) = project.input.as_ref().unwrap().rel_type.as_ref().unwrap()
+    else {
+        panic!("expected constant-key join under projection");
+    };
+    assert_eq!(
+        join.r#type,
+        substrait::proto::join_rel::JoinType::Inner as i32
+    );
+    // Both operands are the appended literal keys, so the join is a Cartesian product expressed
+    // as an equality the GPU planner accepts.
+    let expression::RexType::ScalarFunction(condition) =
+        join.expression.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected a scalar-function join condition");
+    };
+    let operands: Vec<_> = condition
+        .arguments
+        .iter()
+        .map(|arg| {
+            let substrait::proto::function_argument::ArgType::Value(expr) =
+                arg.arg_type.as_ref().unwrap()
+            else {
+                panic!("expected a value argument");
+            };
+            field_index(expr)
+        })
+        .collect();
+    assert_eq!(operands, vec![2, 4]);
 }

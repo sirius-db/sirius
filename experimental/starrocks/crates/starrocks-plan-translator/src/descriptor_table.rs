@@ -12,8 +12,6 @@ use crate::type_mapper;
 pub struct SlotInfo {
     /// StarRocks slot identifier from `TSlotDescriptor.id`.
     pub slot_id: i32,
-    /// Descriptor-table column position, used to preserve StarRocks output order.
-    pub column_pos: i32,
     /// Stable output name for the slot, falling back to `col_<slot_id>`.
     pub col_name: String,
     /// Substrait type mapped from the StarRocks slot type and nullability.
@@ -157,7 +155,6 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 SlotKey::new(parent_tuple_id, slot_id),
                 SlotInfo {
                     slot_id,
-                    column_pos: slot.column_pos.unwrap_or(slot_id),
                     col_name: slot
                         .col_name
                         .clone()
@@ -167,6 +164,11 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 },
             );
 
+            // Wire order is the column order: the FE appends materialized slots in the same
+            // order as the positional expression lists that reference them (grouping keys in
+            // GROUP BY order, sort tuples ordering-slots-first). It is not sorted by slot id,
+            // and `TSlotDescriptor.column_pos` cannot be used instead -- the FE always sends
+            // -1 and the field is deprecated in the IDL.
             tuples
                 .get_mut(&parent_tuple_id)
                 .ok_or_else(|| {
@@ -176,15 +178,6 @@ impl TryFrom<&TDescriptorTable> for DescriptorTable {
                 })?
                 .slot_ids
                 .push(slot_id);
-        }
-
-        for (tuple_id, tuple) in tuples.iter_mut() {
-            tuple.slot_ids.sort_by_key(|slot_id| {
-                let slot = slots
-                    .get(&SlotKey::new(*tuple_id, *slot_id))
-                    .expect("slot id stored in tuple exists");
-                (slot.column_pos < 0, slot.column_pos, slot.slot_id)
-            });
         }
 
         Ok(Self {

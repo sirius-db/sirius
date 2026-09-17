@@ -21,7 +21,6 @@
 #include "log/logging.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream.hpp>
 #include <rmm/error.hpp>
 
 #include <absl/cleanup/cleanup.h>
@@ -48,9 +47,14 @@ memory_prefetcher::memory_prefetcher(memory_prefetcher_config cfg,
   for (std::size_t i = 0; i < _connectors.size(); ++i) {
     _drain_claims[i].store(false, std::memory_order_relaxed);
   }
+  // Acquired before the workers start, so round-robin gives each a distinct stream.
+  _worker_streams.reserve(_config.num_threads);
+  for (std::size_t i = 0; i < _config.num_threads; ++i) {
+    _worker_streams.push_back(_gpu_space->acquire_stream());
+  }
   _workers.reserve(_config.num_threads);
   for (std::size_t i = 0; i < _config.num_threads; ++i) {
-    _workers.emplace_back([this] { worker_loop(); });
+    _workers.emplace_back([this, i] { worker_loop(i); });
   }
   SIRIUS_LOG_INFO(
     "[memory_prefetcher] started: {} threads, {} connectors, min_free_fraction={:.2f}",
@@ -82,17 +86,17 @@ void memory_prefetcher::stop()
   _workers.clear();
 }
 
-void memory_prefetcher::worker_loop()
+void memory_prefetcher::worker_loop(std::size_t worker_index)
 {
   // Bind this worker to the space's device: a fresh thread's current device is
   // 0, and the compression converters allocate from the CURRENT device's
   // resource rather than the target space's.
   rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{_gpu_space->get_device_id()}};
-  rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
+  const rmm::cuda_stream_view stream = _worker_streams[worker_index];
   while (_running.load(std::memory_order_relaxed)) {
     std::size_t converted = 0;
     try {
-      converted = sweep(stream.view());
+      converted = sweep(stream);
     } catch (const std::exception& e) {
       SIRIUS_LOG_WARN("[memory_prefetcher] sweep error (backing off): {}", e.what());
     }

@@ -24,6 +24,7 @@
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -74,6 +75,17 @@ constexpr double DEFAULT_MAX_SORT_PARTITION_MEMORY_FRACTION = 0.33;
 /// disable (always use filtered_join).
 constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 
+struct valid_domain_coverage_threshold {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return std::isfinite(value) && value > 0.0;
+  }
+  [[nodiscard]] static constexpr char const* description() noexcept
+  {
+    return "must be finite and greater than 0.0";
+  }
+};
+
 /// Test build-key uniqueness at runtime when the planner could not prove it statically.
 ///
 /// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
@@ -86,12 +98,20 @@ constexpr double DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO = 8.0;
 /// (NVIDIA/cuCollections#834) on some key distributions. Re-enable once the fix ships in libcudf.
 constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
+constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
+
+constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+
 }  // namespace config
 
 /// Parameters controlling operator-level resource sizing.
-/// These can be set via the .yaml file under the sirius.operator_params section
-/// or overridden at runtime using DuckDB SET commands.
+/// Fields are YAML-configurable unless documented as engine-owned; runtime test hooks require
+/// `SIRIUS_ENABLE_TEST_OPTIONS=1`.
 struct operator_params {
+  /// Engine-owned query policy. The user-facing setting defaults to enabled, but an unwired
+  /// execution context stays fail-closed until the engine snapshots the connection value.
+  bool like_swar_fastpath = false;
+
   /// Target batch size (bytes) for DuckDB scan tasks.
   uint64_t scan_task_batch_size = config::derived_default_batch_size();
 
@@ -128,45 +148,30 @@ struct operator_params {
   /// disable (always use filtered_join).
   double mark_join_build_switch_ratio = config::DEFAULT_MARK_JOIN_BUILD_SWITCH_RATIO;
 
-  /// When the planner could not prove build-key uniqueness, test it at runtime (one
-  /// cudf::distinct_count pass over the build keys) and take the single-pass
-  /// cudf::distinct_hash_join instead of the two-pass general path when the keys are in fact
-  /// distinct. BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. See
+  /// Engine-owned policy: when enabled and the planner could not prove build-key uniqueness, test
+  /// it at runtime (one cudf::distinct_count pass over the build keys) and take the single-pass
+  /// cudf::distinct_hash_join when the keys are distinct. Temporarily disabled pending issue #1600.
+  /// BUILD_PROBE mode only, INNER/LEFT equality joins with null-unequal semantics. Tests retain
+  /// direct programmatic control of this field to exercise both implementations. See
   /// DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE.
   bool enable_runtime_distinct_build_probe = config::DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE;
 
-  /// Wire dynamic table-filter pushdown: an eligible BUILD_PROBE hash-join build publishes a raw
-  /// exact IN-list for 1..12 supported build rows, otherwise a hash IN-list if it fits the smallest
-  /// probe-GPU L2, or a Bloom, into the probe-side scan. The scan applies membership post-decode to
-  /// drop non-matching rows before the join. On by default; the master switch for the feature.
-  bool enable_dynamic_filter_pushdown = true;
+  /// Enable dynamic filters for eligible hash joins.
+  bool enable_dynamic_filter = true;
 
-  /// Additionally emit a runtime zone-map (build-key [min,max]) alongside the membership filter,
-  /// for READ-time row-group pruning on parquet scans; duckdb-native scans apply it row-wise
-  /// post-decode instead. Off by default and requires enable_dynamic_filter_pushdown: on
-  /// TPC-H-shaped joins DuckDB's static transitive-predicate pushdown already prunes
-  /// range-derivable builds, and scattered keys prune nothing, so the zone-map only pays off on
-  /// clustered-keyset joins whose narrow key range is runtime-determined.
+  /// Emit build-key min/max filters in addition to membership filters.
   bool enable_dynamic_zone_map_filter = false;
 
-  /// Skip publishing a key's dynamic filters when the build covers at least this fraction of the
-  /// key's domain (rows gate and zone-map range gate). Values >= 1.0 effectively disable the gate.
+  /// Skip a proven-unique key when its complete build meets this known-domain coverage. Values
+  /// above 1 disable the gate.
   double dynamic_filter_domain_coverage_threshold = 0.9;
 
-  /// Maximum estimated cuco-set size for the exact hash IN-list membership filter, as a fraction of
-  /// the smallest queried probe-GPU L2 cache (cudaDevAttrL2CacheSize), in [0, 1]. Larger sets
-  /// publish a Bloom filter instead: a streaming probe evicts a near-L2-sized set every pass, where
-  /// the smaller Bloom bit array stays cache-resident. A GB300 residency sweep measured the
-  /// IN-list's probe cost flat below ~0.28 of L2 and steadily degrading beyond, with the (inexact)
-  /// Bloom probing >= 2.2x faster at every swept size; the default 0.125 sits inside that flat
-  /// region, keeping the exact filter only where exactness costs the least. 0 always publishes the
-  /// Bloom when the key type supports it; 1.0 reproduces the legacy L2-fit rule. Ignored when no
-  /// device L2 size is available (the legacy fit rule then applies unchanged).
+  /// Hash-IN-list size limit as a fraction of the smallest known probe-GPU L2, in [0, 1]. Larger
+  /// sets use Bloom; unknown L2 makes the hash IN-list ineligible.
   double dynamic_filter_inlist_max_l2_fraction = 0.125;
 
-  /// Consumer-side scan gate: disable a scan's post-decode dynamic filtering once a measured split
-  /// keeps more than this fraction of its rows (too unselective to repay the mask kernel). In
-  /// [0, 1]; 1.0 keeps filtering always on.
+  /// Disable post-decode filtering above this measured keep ratio. Values are in [0, 1]; 1 keeps
+  /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
@@ -180,6 +185,12 @@ struct operator_params {
   /// metadata; other scans use native carriers. Logical types remain unchanged, and type-sensitive
   /// boundaries restore native carriers.
   bool enable_compressed_materialization = true;
+
+  /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
+  bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
+
+  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
+  uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's
@@ -201,6 +212,10 @@ struct telemetry_config {
   std::string exporter{"ndjson"};
   std::string output_directory{"telemetry_data"};
   std::string engine_name{"siriusDB"};
+  /// Optional override naming an NVTX injection library. Normally Sirius uses
+  /// its loadable DSO or the initializer embedded in a static DuckDB host. An
+  /// NVTX_INJECTION64_PATH already in the environment takes precedence.
+  std::string nvtx_injection_lib{};
 };
 
 /// Parameters controlling Simpatico compression for pin_table(tier=>'host').

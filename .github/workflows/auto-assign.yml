@@ -3,7 +3,7 @@ name: Auto Assign PR
 
 on:
   pull_request_target:
-    types: [ opened, reopened, synchronize ]
+    types: [ opened, reopened, synchronize, ready_for_review ]
 
 permissions:
   pull-requests: write
@@ -11,6 +11,7 @@ permissions:
 jobs:
   assign-author:
     runs-on: ubuntu-slim
+    if: ${{ !github.event.pull_request.draft }}
     steps:
       - uses: toshimaru/auto-author-assign@a78a94b219445cece8ccf0d45fec60af449f212a #v3.0.3
         with:

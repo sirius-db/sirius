@@ -405,7 +405,7 @@ input with neither a conversion nor a sidecar uses the larger of its stored and 
 
 ## Simpatico interplay
 
-Pin-table compression (Simpatico, `pin_table_compression`) and compressed materialization stack:
+Pin-table compression (Simpatico, `CALL pin_table(..., compression => true)`) and compressed materialization stack:
 a pinned chunk is narrowed first, then compressed, and at serve time decompression reproduces the
 narrow carrier directly from the blob. The two features shrink different things — compression
 shrinks resident bytes and the host-to-GPU transfer (the converter uploads compressed leaves and

@@ -55,15 +55,11 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
 /// \brief Copy a logical plan for Sirius's transparent execution path.
 ///
-/// Wraps \c duckdb::LogicalOperator::Copy and additionally preserves the dynamic-filter metadata
-/// from the source plan onto the copy: \c LogicalComparisonJoin::filter_pushdown and \c
-/// LogicalGet::dynamic_filters. Neither field is in DuckDB's serialization schema, so a plain \c
-/// Copy (serialize → deserialize) strips them, and the downstream Sirius wiring would never see the
-/// optimizer's pushdown work. Use this at every site that copies a captured logical plan for GPU
-/// execution.
+/// Wraps \c duckdb::LogicalOperator::Copy. Serialization omits DuckDB join-filter metadata, but
+/// Sirius discovers targets from plan structure and does not consume that metadata. The original
+/// plan remains unchanged for CPU fallback.
 ///
-/// \param plan     The plan to copy. Not consumed; \c filter_pushdown / \c dynamic_filters are left
-///                 on the original so DuckDB's CPU fallback path can still see them.
+/// \param plan     The plan to copy. Not consumed.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.
 [[nodiscard]] duckdb::unique_ptr<duckdb::LogicalOperator> copy_logical_plan(
   duckdb::LogicalOperator const& plan, duckdb::ClientContext& context);

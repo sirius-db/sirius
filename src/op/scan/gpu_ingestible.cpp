@@ -27,13 +27,17 @@
 
 namespace sirius::op::scan {
 
-filtered_table gpu_ingestible::materialize_table(const op::scan::scan_operator_input& split,
-                                                 rmm::cuda_stream_view stream)
+filtered_table gpu_ingestible::materialize_table(
+  const op::scan::scan_operator_input& split,
+  rmm::cuda_stream_view stream,
+  bool like_swar_fastpath,
+  std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.prefetch(io::cache::prefetching_stage::disposable);
-    auto materialized = materialize_metadata_to_table(split.get_scan_info(), *mem_space, stream);
+    auto materialized = materialize_metadata_to_table(
+      split.get_scan_info(), *mem_space, stream, like_swar_fastpath, std::move(like_cache));
     if (split.mvcc_keep_mask.has_mask()) {
       // Only insert-delta splits carry a visibility mask here; disk-walk
       // splits never do. Sync before returning for the same reason as the

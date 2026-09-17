@@ -34,15 +34,13 @@ namespace sirius {
  * whenever the decode has something to report; the plain type is still used
  * when it does not, so nothing changes on the ordinary path and the feature
  * gate being off is byte-identical to before. @c sirius::pushdown_outcome is
- * declared with the decoder that fills it (compression/compressed_scan.hpp).
+ * declared with the decoder that fills it (compression/compressed_scan.hpp);
+ * scan_operator_input::prepare_for_processing reads it right after convert_to.
  *
- * scan_operator_input::prepare_for_processing reads @ref outcome right after
- * convert_to and stamps the split from it.
- *
- * The outcome is a property of THIS decode, so a copy that shares the decoded
- * columns legitimately shares it too — unlike the dynamic-type encoding this
- * replaced, where clone() had to decide what the copy "is" and settled for
- * dropping the information.
+ * Carrying it as a VALUE is the point: the outcome is a property of this decode,
+ * so a copy sharing the decoded columns shares it too — where the dynamic-type
+ * encoding this replaced had clone() decide what the copy "is", and drop the
+ * information.
  */
 class decompression_pushdown_batch_representation final
   : public ::cucascade::gpu_table_representation {

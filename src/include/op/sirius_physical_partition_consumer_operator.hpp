@@ -33,6 +33,10 @@ struct partition_sizing_input {
   bool is_build_side;    ///< The sizing partition drives the build side (only the build side can
                          ///< drive broadcast / build-probe).
   bool build_foldable;   ///< A downstream build-side CONCAT can concat_all to a single batch.
+  /// Bytes waiting on both sibling partitions' input ports (equal to `total_bytes` when the
+  /// partition has no sibling). A consumer whose task holds both join inputs at once sizes from
+  /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
+  uint64_t combined_total_bytes;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

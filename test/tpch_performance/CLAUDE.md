@@ -95,7 +95,7 @@ equivalent — which is sound precisely because the base data is byte-identical 
 
 ### Rewriting parquet with GPU-optimized settings
 
-The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only). Requires the pixi environment in this directory (`pixi install`).
+The `rewrite_parquet.py` script reads existing parquet files and rewrites them with larger row groups, snappy compression, V2 page headers, dictionary encoding, and configurable max file size (large tables are split into numbered files). Uses cudf (GPU) if available, otherwise falls back to pyarrow (CPU-only, via the root `pixi install`).
 
 ```bash
 cd test/tpch_performance
@@ -317,8 +317,11 @@ query creates a view and nothing is shared between concurrent streams.
 `--pin-compression` pins the tables Simpatico-compressed (either tier): the runner sets
 `pin_table_compression` and points `pin_table_input_compression_plan_dir` at
 `--compression-plan-dir`, which defaults to the explore-generated TPC-H plans shipped under
-`src/compression/simpatico_codegen/plans/tpch_sf1000` (6 of 8 tables; `nation`/`region` have no
-plans and pin uncompressed). Compression happens at pin time, so the flag requires a pinned tier.
+`src/compression/simpatico_codegen/plans/tpch_sf1000` (2 of 8 tables active — `lineitem`, `orders`;
+`part`, `partsupp`, `supplier`, `customer` are present but named `*_disabled.txt` pending
+performance/correctness validation of a whole-table plan against the SF1000 repro, and `nation`/
+`region` have no plans at all — all six pin uncompressed). Compression happens at pin time, so the
+flag requires a pinned tier.
 A table whose plan is missing or does not cover the pinned columns degrades to uncompressed with
 a `[pin_table]` WARN in the log; the runner counts the `compressing with plan` INFO markers after
 pinning and aborts if nothing compressed, so a misconfigured run cannot silently measure
@@ -351,6 +354,26 @@ sqrt(Power · Throughput)`.
   following queries from `pinned base + insert delta − delete mask`, with no CHECKPOINT between a
   refresh and the queries that observe it. The delta is re-decoded and the mask re-applied per
   query, so the post-refresh passes measure a stable recurring cost.
+- `--staged-refresh` (default on; `--no-staged-refresh` restores the legacy path) takes the CSV
+  parse off the timed refresh path. In untimed prep (right after the pins), every needed update
+  set is loaded into native staging tables in the scratch DB — `staging_orders_u<n>` /
+  `staging_lineitem_u<n>` via a LIMIT-0 CTAS off the base table plus the *same* COPY statement the
+  legacy RF1 uses (parse semantics identical by construction), and `staging_delete_u<n>` holding
+  the delete keys as BIGINT from one read_csv. The timed RF1 becomes two
+  `INSERT INTO ... SELECT * FROM staging_*` and RF2 two
+  `DELETE ... WHERE key IN (SELECT orderkey FROM staging_delete_u<n>)`, which DuckDB plans as a
+  hash semi-join (verified with EXPLAIN on CPU) — the delete key CSV is no longer parsed twice
+  per pair. Staging tables are dropped in untimed teardown. **Spec legality**: TPC-H v3.0.1
+  clause 2.5.3.1 explicitly permits providing the SUT with the RF1 data / RF2 keys before the
+  benchmark in any implementation language — only *pre-executing* the refresh functions is
+  banned; RF timing remains submission-to-commit (clause 5.3.7.3) and the refresh stream's pairs
+  stay sequential (clause 5.1.2.4). The mode also applies `enable_optimistic_write=true` and
+  `preserve_insertion_order=false` on the refresh cursors (`--refresh-write-config`, best-effort
+  on engines without the settings; pass it alone for the config-only A/B, or
+  `--staged-refresh --no-refresh-write-config` to isolate staging). Both knobs are recorded in
+  `run_info.txt` / `metrics.json`, and validation + count verification run unchanged in either
+  mode (the deferred CPU child always replays the legacy CSV form — final table state is
+  identical).
 - The summary reports per-query `clean`, `post-RF1`, and `post-RF2` times, plus `delta overhead`
   (post-RF1 − clean) and `mask overhead` (post-RF2 − post-RF1). Power@Size itself uses only the
   post-RF1 stream.
@@ -440,8 +463,12 @@ to start without an explicit config; there is no default path), `--mode power|th
 tables — debug only), `--pin-compression/--no-pin-compression` (Simpatico-compressed pins; needs
 a pinned tier), `--compression-plan-dir <dir>`, `--vary-predicates/--no-vary-predicates`
 (per-stream qgen parameters; rejects `--validation`), `--query-dir <dir>`,
-`--validation/--no-validation` (fixed predicates only), `--baseline-pass/--no-baseline-pass`,
+`--validation/--no-validation` (fixed predicates only), `--staged-refresh/--no-staged-refresh`
+(pre-stage update sets as native tables, untimed; see above — spec-legal per clause 2.5.3.1),
+`--refresh-write-config/--no-refresh-write-config` (write-path settings on the refresh cursors;
+defaults to following `--staged-refresh`), `--baseline-pass/--no-baseline-pass`,
 `--query-timeout <s>`, `--keep-scratch-db`, `--output`.
+
 
 Output (under `test/tpch_performance/output/tpch_power_<ts>_sf<SF>_s<N>/`): `metrics.json`
 (all metrics + per-query/per-stream times + validation verdicts), `timings.csv`

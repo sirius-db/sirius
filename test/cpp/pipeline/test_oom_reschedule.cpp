@@ -79,7 +79,10 @@ struct oom_test_fixture {
   cucascade::memory::memory_space* mem_space = nullptr;
   sirius::exec::channel<std::unique_ptr<sirius::pipeline::task_request>> request_channel;
   std::unique_ptr<sirius::pipeline::gpu_pipeline_executor> executor;
-  sirius::pipeline::completion_handler completion;
+  // The query's completion signal now travels on the task's global state rather than on
+  // the executor, so it is shared with whatever global state the test builds.
+  std::shared_ptr<sirius::pipeline::completion_handler> completion =
+    std::make_shared<sirius::pipeline::completion_handler>();
 
   // Returns false if setup failed (no GPU available) — caller should WARN and return.
   bool setup(int num_threads, const std::string& thread_name_prefix)
@@ -115,7 +118,6 @@ struct oom_test_fixture {
       std::move(request_publisher),
       nullptr,
       sirius::test::make_test_telemetry_context());
-    executor->set_completion_handler(&completion);
     return true;
   }
 };
@@ -364,6 +366,7 @@ TEST_CASE("GPU pipeline executor reschedules tasks on OOM", "[gpu_pipeline_execu
   }
 
   auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
 
   const int num_tasks = 3;
   std::atomic<int> dispatched{0};
@@ -453,6 +456,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   }
 
   auto global_state = std::make_shared<oom_test_global_state>();
+  global_state->set_completion_handler(f.completion);
 
   const int num_small = 5;
   const int num_xl    = 3;
@@ -487,7 +491,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   //--------------------------------------------------------------------------
   auto start_time = std::chrono::steady_clock::now();
   auto timeout    = std::chrono::seconds(60);
-  while (!f.completion.has_error()) {
+  while (!f.completion->has_error()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       f.executor->stop();
@@ -522,7 +526,7 @@ TEST_CASE("GPU pipeline executor fails after max OOM retries",
   REQUIRE(global_state->completed_count.load(std::memory_order_relaxed) == num_small);
 
   // The completion handler should be in an error state from exceeding max retries.
-  REQUIRE(f.completion.has_error());
+  REQUIRE(f.completion->has_error());
 
   // XL tasks should have OOM'd many times (at least 10 for the one that hit the limit).
   REQUIRE(global_state->oom_count.load(std::memory_order_relaxed) >= 10);

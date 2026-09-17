@@ -1,0 +1,972 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "planner/late_mat_plan_pass.hpp"
+
+#include "expression/ast/node.hpp"
+#include "expression/ast/utils.hpp"
+#include "op/sirius_physical_concat.hpp"
+#include "op/sirius_physical_filter.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_projection.hpp"
+#include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
+
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <variant>
+
+namespace sirius::planner {
+
+namespace {
+
+using op::sirius_physical_operator;
+using op::SiriusPhysicalOperatorType;
+
+/// Whether `expr` reads the column at `pos`.
+bool reads_column(ast::node const& expr, std::size_t pos)
+{
+  bool found = false;
+  ast::visit_references(expr, [&](ast::reference const& ref) {
+    if (ref.column_index == pos) { found = true; }
+  });
+  return found;
+}
+
+/// Whether @p condition is a plain `lhs_column = rhs_column`.
+///
+/// The rider proof turns "these two scans meet in this condition" into "at most
+/// one rider row per primary row", and only this shape supports that step. An
+/// inequality matches many rows on a distinct side; a computed side is a
+/// different value than the one proven distinct.
+bool is_bare_column_equality(sirius::join_condition const& condition)
+{
+  return condition.comparison == sirius::comparison_type::equal && condition.left &&
+         condition.right && condition.left->holds<ast::reference>() &&
+         condition.right->holds<ast::reference>();
+}
+
+/// What one operator does to a column arriving from `from` at input position
+/// `in_pos`.
+struct step {
+  /// Where the column moves to in this operator's OUTPUT, or nullopt when it is
+  /// not passed on. Independent of whether it was read: an operator commonly
+  /// reads a column and emits it anyway (a filter's predicate, a join's key),
+  /// and the walk keeps following such a column — not to extend its own ride,
+  /// which ended at the read, but because a column that rides REAL is exactly
+  /// the one whose uniqueness can admit somebody else's.
+  std::optional<std::size_t> moved_to;
+  /// This operator needs the column's VALUES. The ride ends here.
+  bool read_content = false;
+  /// ...and the read is a key comparison (a join, or the partition below it).
+  /// See column_lifetime::read_as_join_key: such a column leaves candidacy
+  /// entirely, which is stronger than stopping here.
+  bool as_join_key = false;
+  /// This operator uses the column as a GROUP KEY. Also a stopping point for a
+  /// plain ride — but the one stop that the pin-uniqueness bijection can move
+  /// further up. Set together with read_content when the same column is also an
+  /// aggregate input, which is a real read and not extendable.
+  bool as_group_key = false;
+
+  /// The join conditions that compared this column, when the reader is a join.
+  /// Empty at a partition, which hashes a key the join above it will compare —
+  /// the walk records the role where the comparison actually is.
+  struct compared_condition {
+    std::size_t index  = 0;
+    bool bare_equality = false;
+  };
+  std::vector<compared_condition> compared_in;
+  /// Which side of the join the column arrived on; only meaningful with
+  /// compared_in. Two scans meeting on opposite sides of ONE condition is what
+  /// determines a rider's row from the ride's.
+  bool from_lhs = false;
+
+  /// Every read of this column here is a COUNT: the reader needs the row, not
+  /// what is in it, so a rowid standing in counts identically. See
+  /// column_lifetime::consumed_as_count_only.
+  bool count_only = false;
+
+  /// Output position of a carrier-restore cast this column passed through. Not
+  /// a read — the ride continues — but a site the installer must neutralize.
+  std::optional<std::size_t> carrier_restore_at;
+
+  // Designated rather than positional: these have grown a member at a time, and
+  // a positional initializer silently sets the wrong flag when one lands in the
+  // middle.
+  static step reads() { return step{.read_content = true}; }
+  static step reads_and_moves(std::optional<std::size_t> position)
+  {
+    return step{.moved_to = position, .read_content = true};
+  }
+  static step counts() { return step{.read_content = true, .count_only = true}; }
+  static step key(std::optional<std::size_t> position)
+  {
+    return step{.moved_to = position, .read_content = true, .as_join_key = true};
+  }
+  static step to(std::optional<std::size_t> position) { return step{.moved_to = position}; }
+  static step group_key(std::optional<std::size_t> position, bool also_read = false)
+  {
+    return step{.moved_to = position, .read_content = also_read, .as_group_key = true};
+  }
+};
+
+/// Whether `node` is one of the two group-by shapes.
+bool is_group_by(sirius_physical_operator const& node)
+{
+  return node.type == SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+         node.type == SiriusPhysicalOperatorType::MERGE_GROUP_BY;
+}
+
+/// Whether `node` can emit MORE rows than one side handed it. A port above one
+/// gathers the fan-out rather than the rows the scan produced.
+bool multiplies_rows(sirius_physical_operator const& node)
+{
+  switch (node.type) {
+    case SiriusPhysicalOperatorType::HASH_JOIN:
+    case SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
+    case SiriusPhysicalOperatorType::BLOCKWISE_NL_JOIN:
+    case SiriusPhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+    case SiriusPhysicalOperatorType::IE_JOIN:
+    case SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:
+    case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
+    case SiriusPhysicalOperatorType::ASOF_JOIN: return true;
+    default: return false;
+  }
+}
+
+/// Whether `node` collapses rows: a group-by emits one per group, a top-n cuts
+/// to N. Either undoes a fan-out below it.
+bool reduces_rows(sirius_physical_operator const& node)
+{
+  return is_group_by(node) || node.type == SiriusPhysicalOperatorType::TOP_N ||
+         node.type == SiriusPhysicalOperatorType::MERGE_TOP_N;
+}
+
+/// The grouping/aggregate metadata both group-by shapes carry, or nullopt for a
+/// node that claims a group-by type but is not one of the two modelled classes
+/// (which must read everything, like any unmodelled shape).
+struct group_by_shape {
+  std::vector<int> const* group_idx                         = nullptr;
+  std::vector<int> const* aggregate_idx                     = nullptr;
+  std::vector<std::vector<int>> const* aggregate_struct_idx = nullptr;
+  /// Parallel to aggregate_idx: what each aggregate DOES with its input. A
+  /// COUNT needs the row, not the value.
+  std::vector<cudf::aggregation::Kind> const* aggregate_kinds = nullptr;
+};
+
+std::optional<group_by_shape> read_group_by(sirius_physical_operator const& node)
+{
+  if (auto const* agg = dynamic_cast<op::sirius_physical_grouped_aggregate const*>(&node)) {
+    return group_by_shape{&agg->group_idx,
+                          &agg->cudf_aggregate_idx,
+                          &agg->cudf_aggregate_struct_col_indices,
+                          &agg->cudf_aggregates};
+  }
+  if (auto const* merge = dynamic_cast<op::sirius_physical_grouped_aggregate_merge const*>(&node)) {
+    return group_by_shape{&merge->group_idx,
+                          &merge->cudf_aggregate_idx,
+                          &merge->cudf_aggregate_struct_col_indices,
+                          &merge->cudf_aggregates};
+  }
+  return std::nullopt;
+}
+
+step trace_through(sirius_physical_operator const& node,
+                   sirius_physical_operator const& from,
+                   std::size_t in_pos,
+                   bool& nullified,
+                   bool rode_group_key)
+{
+  switch (node.type) {
+    // Positionally transparent plumbing. A partition rewrites which rows sit in
+    // which batch and a wrap concat glues those batches back together; neither
+    // touches the column layout.
+    case SiriusPhysicalOperatorType::PARTITION: {
+      auto const& partition = static_cast<op::sirius_physical_partition const&>(node);
+      // Except that a partition READS the columns it hashes to place a row —
+      // and it resolved those positions from its consumer at plan time, so they
+      // are known here rather than one hop up at the join. A rowid hashes
+      // differently from the value it stands for, so a key riding as one would
+      // scatter equal values across partitions and the join would simply miss
+      // matches. This is the walk's one silent-wrong-answer shape, and it is
+      // why a partition is not transparent by fiat.
+      auto const& keys = partition.partition_keys();
+      if (std::find(keys.begin(), keys.end(), static_cast<int>(in_pos)) != keys.end()) {
+        // One exception, and only one: a partition that feeds a GROUP-BY, for a
+        // column already riding as a group key. The bijection that admits such
+        // a ride makes every row of a group carry one and the same rowid, so
+        // hashing the rowid places the group exactly where hashing its values
+        // would. The two-stage shape puts this partition ABOVE the local
+        // aggregate, so `rode_group_key` is already set by the time we get here
+        // — a partition below a join never sees it and is refused as before.
+        auto const* consumer = node.get_parent_op();
+        if (rode_group_key && consumer != nullptr && is_group_by(*consumer)) {
+          return step::group_key(in_pos);
+        }
+        return step::key(in_pos);
+      }
+      return step::to(in_pos);
+    }
+
+    case SiriusPhysicalOperatorType::CONCAT: {
+      // The generator builds a CONCAT at exactly one site — wrapping one child
+      // of one join — so every concat gathers the partitions of ONE flow and a
+      // payload crossing it still comes from where the scan said it did.
+      //
+      // That matters because fan-in at a concat is expressed through PORTS, not
+      // tree children: a concat merging two different producers into one
+      // repository could not be recognised from here, and if both producers had
+      // deferred with type-identical schemas the port's whole-schema match
+      // could not tell them apart either. No such concat exists today; the
+      // arity check is what would notice if one appeared.
+      if (node.children.size() != 1) { return step::reads(); }
+      return step::to(in_pos);
+    }
+
+    case SiriusPhysicalOperatorType::HASH_JOIN: {
+      auto const& join = static_cast<op::sirius_physical_hash_join const&>(node);
+      // The types that pass a payload through at all. Semi, anti and mark
+      // joins collect a single side's columns, so a payload riding the other
+      // is not in the output to be deferred.
+      auto const type    = join.join_type;
+      bool const carries = type == duckdb::JoinType::INNER || type == duckdb::JoinType::LEFT ||
+                           type == duckdb::JoinType::RIGHT || type == duckdb::JoinType::OUTER;
+      if (!carries) { return step::reads(); }
+      if (node.children.size() != 2) { return step::reads(); }
+
+      bool const from_lhs = node.children[0].get() == &from;
+      if (!from_lhs && node.children[1].get() != &from) { return step::reads(); }
+
+      // A key is read: the join compares its values. The conditions' left
+      // nodes address the lhs and their right nodes the rhs, so only this
+      // side's half is consulted.
+      std::vector<step::compared_condition> compared_in;
+      for (std::size_t c = 0; c < join.conditions.size(); ++c) {
+        auto const& side = from_lhs ? join.conditions[c].left : join.conditions[c].right;
+        if (side && reads_column(*side, in_pos)) {
+          compared_in.push_back({c, is_bare_column_equality(join.conditions[c])});
+        }
+      }
+
+      std::vector<int> const lhs(join.lhs_output_columns.col_idxs.begin(),
+                                 join.lhs_output_columns.col_idxs.end());
+      std::vector<int> const rhs(join.rhs_output_columns.col_idxs.begin(),
+                                 join.rhs_output_columns.col_idxs.end());
+      auto const moved = join_output_position(from_lhs, lhs, rhs, in_pos);
+      // A key is read: the join compares its values. It is usually projected
+      // out as well, and the walk follows it there — its own ride is over, but
+      // its key and group-key roles further up are what admit another column's.
+      if (!compared_in.empty()) {
+        auto keyed        = step::key(moved);
+        keyed.compared_in = std::move(compared_in);
+        keyed.from_lhs    = from_lhs;
+        return keyed;
+      }
+
+      // An outer join can emit a row this side never matched. The rowid is
+      // null there and the column materializes null, which is sound — so the
+      // ride continues and the fact is recorded rather than refused.
+      //
+      // Recorded only for a column that actually RIDES. A column read here as a
+      // key, or not projected out, arrives with its own values and stops; the
+      // join nullifies its OUTPUT, which that column never reaches. Marking it
+      // anyway would cost the key substitution a deferral it is entitled to.
+      if (moved.has_value()) {
+        nullified = nullified || type == duckdb::JoinType::OUTER ||
+                    (from_lhs && type == duckdb::JoinType::RIGHT) ||
+                    (!from_lhs && type == duckdb::JoinType::LEFT);
+      }
+      return step::to(moved);
+    }
+
+    // A dynamic filter drops rows a join build has already excluded. It reads
+    // only the key columns it probes, and rewrites no column layout, so a
+    // payload riding past it is positionally unchanged. Treating it as a reader
+    // instead ends the ride at the operator that sits directly above a pinned
+    // scan, which is where q10's customer payload was stopping: the bundle
+    // materialized one hop from the scan and paid the rowid for nothing.
+    //
+    // The probed columns are not enumerated here: the filter set is published
+    // mid-query and a column this walk decided was payload must not become a
+    // probe key afterwards. Deferring a probed key would hand the probe a rowid
+    // in place of the value it compares, so it is refused at the source instead
+    // -- the scan withholds any column a partition hashes, which is the same
+    // column set this operator probes.
+    case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return step::to(in_pos);
+
+    case SiriusPhysicalOperatorType::HASH_GROUP_BY:
+    case SiriusPhysicalOperatorType::MERGE_GROUP_BY: {
+      auto const shape = read_group_by(node);
+      // A group-by type this pass cannot introspect reads everything, like any
+      // other unmodelled shape.
+      if (!shape.has_value()) { return step::reads(); }
+
+      // Aggregate inputs are read for their VALUES — SUM of a rowid is not the
+      // SUM the query asked for. A column can be BOTH (GROUP BY x, SUM(x)); it
+      // is then a group key for the purpose of proving somebody else's ride and
+      // a genuine read for the purpose of its own.
+      auto const in        = static_cast<int>(in_pos);
+      bool aggregate_input = false;
+      bool counted_only    = false;
+      if (shape->aggregate_idx != nullptr) {
+        bool any        = false;
+        bool all_counts = true;
+        for (std::size_t a = 0; a < shape->aggregate_idx->size(); ++a) {
+          if ((*shape->aggregate_idx)[a] != in) { continue; }
+          any               = true;
+          auto const counts = shape->aggregate_kinds != nullptr &&
+                              a < shape->aggregate_kinds->size() &&
+                              (*shape->aggregate_kinds)[a] == cudf::aggregation::Kind::COUNT_VALID;
+          all_counts = all_counts && counts;
+        }
+        aggregate_input = any;
+        counted_only    = any && all_counts;
+      }
+      if (!aggregate_input && shape->aggregate_struct_idx != nullptr) {
+        for (auto const& columns : *shape->aggregate_struct_idx) {
+          if (std::find(columns.begin(), columns.end(), in) != columns.end()) {
+            aggregate_input = true;
+            break;
+          }
+        }
+      }
+
+      // A group key lands at its index in group_idx: the output is
+      // groups-then-aggregates, so group key k is output column k.
+      auto const key = std::find(shape->group_idx->begin(), shape->group_idx->end(), in);
+      if (key == shape->group_idx->end()) {
+        // Not a key: read if an aggregate consumes it, and either way the
+        // aggregate's output carries no such column, so the ride ends here.
+        // A read that only COUNTS says so — the values are not needed, which is
+        // what count-on-deferred trades on.
+        if (counted_only) { return step::counts(); }
+        return step::reads();
+      }
+      return step::group_key(
+        static_cast<std::size_t>(std::distance(shape->group_idx->begin(), key)), aggregate_input);
+    }
+
+    case SiriusPhysicalOperatorType::TOP_N:
+    case SiriusPhysicalOperatorType::MERGE_TOP_N: {
+      // A top-n reads its SORT KEYS and gathers whole rows by them, so a
+      // payload rides through with its position unchanged — and lands on the
+      // far side already cut to the top N. That is the difference between
+      // materializing 150k grouped rows and materializing the handful the
+      // query actually returns.
+      //
+      // Both shapes carry the same `orders` vector; a node that claims the type
+      // but is neither class reads everything, like any unmodelled shape.
+      duckdb::vector<duckdb::BoundOrderByNode> const* orders = nullptr;
+      if (auto const* top_n = dynamic_cast<op::sirius_physical_top_n const*>(&node)) {
+        orders = &top_n->orders;
+      } else if (auto const* merge = dynamic_cast<op::sirius_physical_top_n_merge const*>(&node)) {
+        orders = &merge->orders;
+      }
+      if (orders == nullptr) { return step::reads(); }
+
+      for (auto const& order : *orders) {
+        // Only a bare column reference can be checked against a position; an
+        // expression over columns is not modelled, so it reads everything.
+        if (!order.expression) { return step::reads(); }
+        if (order.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+          return step::reads();
+        }
+        auto const index = order.expression->Cast<duckdb::BoundReferenceExpression>().index;
+        if (static_cast<std::size_t>(index) == in_pos) { return step::reads_and_moves(in_pos); }
+      }
+      return step::to(in_pos);
+    }
+
+    case SiriusPhysicalOperatorType::FILTER: {
+      auto const& filter = static_cast<op::sirius_physical_filter const&>(node);
+      // The predicate is the only thing a filter reads; it decides which ROWS
+      // survive, never what is in the columns it passes on.
+      bool const in_predicate = filter.expression && reads_column(*filter.expression, in_pos);
+      // The output mask is an explicit positional map, so a filter that folds a
+      // projection into its gather is still transparent to everything it keeps.
+      auto const moved = std::visit(
+        [&](auto const& mask) -> std::optional<std::size_t> {
+          using T = std::decay_t<decltype(mask)>;
+          if constexpr (std::is_same_v<T, op::passthrough>) {
+            return in_pos;
+          } else {
+            for (std::size_t out = 0; out < mask.size(); ++out) {
+              if (static_cast<std::size_t>(mask[out]) == in_pos) { return out; }
+            }
+            return std::nullopt;  // dropped here; nothing downstream can want it
+          }
+        },
+        filter.output_columns);
+      return in_predicate ? step::reads_and_moves(moved) : step::to(moved);
+    }
+
+    case SiriusPhysicalOperatorType::PROJECTION: {
+      auto const& projection = static_cast<op::sirius_physical_projection const&>(node);
+      // A bare column reference MOVES the column. Anything else computes with
+      // it, which is a read.
+      std::optional<std::size_t> moved_to;
+      std::optional<std::size_t> restore_at;
+      bool computed_with = false;
+      for (std::size_t out = 0; out < projection.select_list.size(); ++out) {
+        auto const& expr = projection.select_list[out];
+        if (!expr) { continue; }
+        if (auto const* ref = std::get_if<ast::reference>(&expr->v)) {
+          if (ref->column_index == in_pos) {
+            if (!moved_to.has_value()) {
+              moved_to = out;
+            } else {
+              // Fan-out: a second output position also wants this column (`SELECT x AS a, x AS
+              // b`). moved_to only tracks one destination, so the second copy would silently end
+              // up carrying whatever the first destination got — a rowid where it should have a
+              // real value. Fail closed like every other unmodelled shape here: treat this as a
+              // read, which ends the ride at this projection instead of installing a deferral
+              // that would materialize the wrong thing at one of the two outputs.
+              computed_with = true;
+            }
+          }
+          continue;
+        }
+        // A carrier restore changes a column's bit width, not its value, so the
+        // ride MOVES through one — but it is recorded: it would convert a rowid.
+        if (auto const* cast_expr = std::get_if<ast::cast>(&expr->v)) {
+          if (cast_expr->kind == ast::cast_kind::carrier_restore) {
+            if (auto const* inner = std::get_if<ast::reference>(&cast_expr->child->v)) {
+              if (inner->column_index == in_pos && !moved_to.has_value()) {
+                moved_to   = out;
+                restore_at = out;
+              }
+              continue;
+            }
+          }
+        }
+        if (reads_column(*expr, in_pos)) { computed_with = true; }
+      }
+      // moved_to is nullopt when the projection simply drops the column.
+      auto moved = computed_with ? step::reads_and_moves(moved_to) : step::to(moved_to);
+      moved.carrier_restore_at = restore_at;
+      return moved;
+    }
+
+    default:
+      // Fail closed: an unmodelled shape is assumed to read everything. This
+      // can only shorten a lifetime, so an operator missing from this switch
+      // costs a deferral rather than permitting a wrong one.
+      return step::reads();
+  }
+}
+
+}  // namespace
+
+std::optional<std::size_t> join_output_position(bool from_lhs,
+                                                std::vector<int> const& lhs_projection,
+                                                std::vector<int> const& rhs_projection,
+                                                std::size_t in_position)
+{
+  auto const& own = from_lhs ? lhs_projection : rhs_projection;
+  for (std::size_t i = 0; i < own.size(); ++i) {
+    if (static_cast<std::size_t>(own[i]) == in_position) {
+      // The output is lhs-then-rhs, so an rhs column carries the lhs's emitted
+      // width as an offset — not the lhs's INPUT width, which is larger
+      // whenever the join projects only part of its left side.
+      return from_lhs ? i : lhs_projection.size() + i;
+    }
+  }
+  return std::nullopt;
+}
+
+std::int64_t estimated_value_bytes(sirius::logical_type const& type)
+{
+  if (type.is_fixed_width()) { return static_cast<std::int64_t>(type.fixed_width_byte_size()); }
+  // A variable-width column carries its bytes plus an offset. TPC-H's deferred
+  // string columns run 15-72 bytes; 24 sits below most of them, so a bundle
+  // that qualifies on this estimate would have qualified on the real widths.
+  return 24;
+}
+
+std::vector<late_mat::defer_candidate> build_defer_candidates(
+  sirius_physical_operator const& scan,
+  std::vector<column_lifetime> const& lifetimes,
+  std::vector<op::sirius_physical_operator const*>* out_readers)
+{
+  std::vector<late_mat::defer_candidate> candidates;
+  // Slots are labelled by the order their reader is first seen, so a label is
+  // stable within one analysis and readable in the census — the identity that
+  // matters is "the same operator", not the operator's name.
+  std::vector<op::sirius_physical_operator const*> readers;
+
+  for (auto const& life : lifetimes) {
+    if (life.first_reader == nullptr) { continue; }
+    if (life.scan_output_position >= scan.types.size()) { continue; }
+    // A join emits one scan row once per match, so materializing on its OUTPUT
+    // gathers a row set larger than the scan produced -- by the join's fan-out,
+    // which the per-row value model does not see. q20 rode 2 columns (40 B/row
+    // over 6 crossings, comfortably past both floors) into a hash join and cost
+    // 0.18 -> 3.33 s. A ride that ends where rows can multiply is refused until
+    // the policy can price that fan-out; ports that only ever reduce rows (an
+    // aggregate, a top-n) are unaffected, which is where q10's ride lands.
+    if (multiplies_rows(*life.first_reader)) { continue; }
+
+    auto slot = std::find(readers.begin(), readers.end(), life.first_reader);
+    if (slot == readers.end()) {
+      readers.push_back(life.first_reader);
+      slot = std::prev(readers.end());
+      late_mat::defer_candidate fresh;
+      fresh.slot       = "slot" + std::to_string(readers.size() - 1);
+      fresh.boundaries = life.port_crossings;
+      candidates.push_back(std::move(fresh));
+    }
+    auto& candidate = candidates[static_cast<std::size_t>(slot - readers.begin())];
+    candidate.columns.push_back(
+      late_mat::defer_column{static_cast<std::uint32_t>(life.scan_output_position),
+                             estimated_value_bytes(scan.types[life.scan_output_position])});
+  }
+  if (out_readers != nullptr) { *out_readers = std::move(readers); }
+  return candidates;
+}
+
+std::vector<column_lifetime> analyze_column_lifetimes(sirius_physical_operator const& scan)
+{
+  std::vector<column_lifetime> lifetimes(scan.types.size());
+  for (std::size_t col = 0; col < lifetimes.size(); ++col) {
+    lifetimes[col].scan_output_position = col;
+    lifetimes[col].position_at_reader   = col;
+  }
+
+  /// A column still travelling: where it sits now, and what the ride has done
+  /// to it. Carrying the set through one walk — rather than walking the chain
+  /// once per column — is what gives per-column state somewhere to live.
+  struct live_column {
+    std::size_t index;
+    std::size_t position;
+    bool nullified = false;
+    /// Something has read this column's content: its own ride is over and the
+    /// lifetime is recorded. It keeps travelling anyway, because a column that
+    /// rides REAL is the one whose uniqueness can admit another column's ride,
+    /// and that role only shows up further along.
+    bool stopped = false;
+    /// The stop was a group-key read, and every read since has been one too —
+    /// so the longer ride is still open and still being measured.
+    bool extending = false;
+    /// A join below the column's current position multiplied the rows, and no
+    /// reduction has undone it. A port here gathers the fan-out.
+    bool fanned_out = false;
+  };
+  std::vector<live_column> live;
+  live.reserve(lifetimes.size());
+  for (std::size_t col = 0; col < lifetimes.size(); ++col) {
+    live.push_back(live_column{col, col, false});
+  }
+
+  int crossings    = 0;
+  auto const* from = static_cast<sirius_physical_operator const*>(&scan);
+  for (auto const* node = scan.get_parent_op(); node != nullptr && !live.empty();
+       from = node, node = node->get_parent_op()) {
+    // Count what carrying actually COSTS. A pipeline sink writes its output to
+    // a repository for the next pipeline to read, so leaving one is where the
+    // deferred bytes would have been paid for; a filter or projection hands its
+    // columns straight on within the pipeline and a wide column rides past it
+    // for free. Counting operators instead would let a chain of projections
+    // look like a ride worth deferring.
+    if (from->is_sink()) { ++crossings; }
+    std::vector<live_column> still_travelling;
+    still_travelling.reserve(live.size());
+    for (auto& col : live) {
+      auto const moved = trace_through(*node, *from, col.position, col.nullified, col.extending);
+      auto& life       = lifetimes[col.index];
+      // Every group-by this column is a key of, whatever else reads it: this is
+      // what makes it usable as somebody else's proof. The partition above a
+      // local aggregate hashes the same keys, but it is plumbing on the ride,
+      // not an aggregate a proof has to cover.
+      if (moved.as_group_key && is_group_by(*node)) { life.group_key_at.push_back(node); }
+      // For the whole ride, not just up to the first reader: the group-key
+      // extension's port sits further up.
+      if (moved.carrier_restore_at.has_value()) {
+        life.carrier_restores.push_back(carrier_restore_site{node, *moved.carrier_restore_at});
+      }
+      for (auto const& condition : moved.compared_in) {
+        life.join_key_at.push_back(
+          join_key_role{node, condition.index, moved.from_lhs, condition.bare_equality});
+      }
+
+      // A group-by reads its keys, so a key read stops a plain ride exactly
+      // like any other read — it is only the ONE stop the pin-uniqueness
+      // bijection can move further up, which is what `extending` measures.
+      bool const stops_here = moved.read_content || moved.as_group_key;
+      if (stops_here && !col.stopped) {
+        life.first_reader           = node;
+        life.port_crossings         = crossings;
+        life.position_at_reader     = col.position;
+        life.reader_input           = from;
+        life.nullified_on_ride      = col.nullified;
+        life.read_as_join_key       = moved.as_join_key;
+        life.consumed_as_count_only = moved.count_only;
+        life.fanned_out_at_reader   = col.fanned_out;
+        col.stopped                 = true;
+        // Extendable only if the stop was a key role and nothing else about the
+        // column's values was needed here.
+        if (moved.as_group_key && !moved.read_content) {
+          life.group_ride.emplace();
+          col.extending = true;
+        }
+      } else if (col.extending && moved.read_content) {
+        // The longer ride ends where something wants the values back.
+        life.group_ride->reader               = node;
+        life.group_ride->port_crossings       = crossings;
+        life.group_ride->position_at_reader   = col.position;
+        life.group_ride->reader_input         = from;
+        life.group_ride->nullified_on_ride    = col.nullified;
+        life.group_ride->read_as_join_key     = moved.as_join_key;
+        life.group_ride->fanned_out_at_reader = col.fanned_out;
+        col.extending                         = false;
+      }
+      if (col.extending && moved.as_group_key && is_group_by(*node)) {
+        life.group_ride->group_bys.push_back(node);
+      }
+
+      if (!moved.moved_to.has_value()) {
+        // Not passed on: nothing above can read it, and nothing above can use
+        // it as a proof either. Being DROPPED here ends the ride exactly like
+        // being read here — there is nowhere downstream to materialize into.
+        if (!col.stopped) {
+          life.first_reader           = node;
+          life.port_crossings         = crossings;
+          life.position_at_reader     = col.position;
+          life.reader_input           = from;
+          life.nullified_on_ride      = col.nullified;
+          life.read_as_join_key       = moved.as_join_key;
+          life.consumed_as_count_only = moved.count_only;
+          life.fanned_out_at_reader   = col.fanned_out;
+          col.stopped                 = true;
+        }
+        if (col.extending) {
+          life.group_ride->reader               = node;
+          life.group_ride->port_crossings       = crossings;
+          life.group_ride->position_at_reader   = col.position;
+          life.group_ride->reader_input         = from;
+          life.group_ride->nullified_on_ride    = col.nullified;
+          life.group_ride->fanned_out_at_reader = col.fanned_out;
+          col.extending                         = false;
+        }
+        continue;
+      }
+      // For the NEXT node up. After the stop snapshots, because a port
+      // materializes at its INPUT: what counts is strictly what is below it.
+      if (multiplies_rows(*node)) { col.fanned_out = true; }
+      if (reduces_rows(*node)) { col.fanned_out = false; }
+      col.position = *moved.moved_to;
+      still_travelling.push_back(col);
+    }
+    live = std::move(still_travelling);
+  }
+
+  // Whatever is still live reached the top of the plan. A column that was never
+  // read there is one the query only projects; one still extending rode past
+  // the aggregates with nothing beyond them wanting its values back.
+  for (auto const& col : live) {
+    auto& life = lifetimes[col.index];
+    if (col.extending) {
+      life.group_ride->port_crossings       = crossings;
+      life.group_ride->position_at_reader   = col.position;
+      life.group_ride->reader_input         = from;
+      life.group_ride->nullified_on_ride    = col.nullified;
+      life.group_ride->fanned_out_at_reader = col.fanned_out;
+      continue;  // reader stays nullptr: nothing past the aggregates reads it
+    }
+    if (col.stopped) { continue; }  // its lifetime was recorded where it stopped
+    life.port_crossings       = crossings;
+    life.position_at_reader   = col.position;
+    life.reader_input         = from;
+    life.nullified_on_ride    = col.nullified;
+    life.fanned_out_at_reader = col.fanned_out;
+  }
+  return lifetimes;
+}
+
+namespace {
+
+/// The group-by-rowid extension of the bundle at @p bundle_positions, or
+/// nullopt when the bundle does not have one.
+///
+/// Every condition here is a refusal to guess. The columns must ride ONE chain
+/// of aggregates to ONE reader, because a bundle materializes as a unit and
+/// half a bundle at the far end restores nothing. None may be nullified (a null
+/// rowid has no group to belong to) or read as a join key (the partition below
+/// the join has already hashed it). And the reader must exist: with nothing
+/// reading them past the aggregates there is no port to install, and the sound
+/// stop is the only stop.
+std::optional<group_key_extension> plan_group_key_extension(
+  std::vector<column_lifetime> const& lifetimes, std::vector<std::size_t> const& bundle_positions)
+{
+  if (bundle_positions.empty()) { return std::nullopt; }
+
+  group_key_extension extension;
+  op::sirius_physical_operator const* reader = nullptr;
+  for (std::size_t i = 0; i < bundle_positions.size(); ++i) {
+    auto const& life = lifetimes[bundle_positions[i]];
+    if (!life.group_ride.has_value()) { return std::nullopt; }
+    auto const& ride = *life.group_ride;
+    if (ride.reader == nullptr || ride.read_as_join_key || ride.nullified_on_ride) {
+      return std::nullopt;
+    }
+    if (ride.group_bys.empty()) { return std::nullopt; }
+    if (i == 0) {
+      reader               = ride.reader;
+      extension.group_bys  = ride.group_bys;
+      extension.port_input = ride.reader_input;
+      extension.boundaries = ride.port_crossings;
+    } else if (ride.reader != reader || ride.group_bys != extension.group_bys) {
+      return std::nullopt;
+    }
+    extension.port_positions.push_back(ride.position_at_reader);
+    extension.fanned_out_at_port = extension.fanned_out_at_port || ride.fanned_out_at_reader;
+  }
+
+  // Which columns could carry the proof: one that RIDES REAL (the bundle
+  // substitutes the others, and a rowid cannot prove anything about itself) and
+  // is a group key at every aggregate the bundle rode. Whether it is read
+  // elsewhere does not matter — q10's c_custkey is a join key long before it is
+  // a group key, and it is exactly the column that admits the ride.
+  for (std::size_t pos = 0; pos < lifetimes.size(); ++pos) {
+    if (std::find(bundle_positions.begin(), bundle_positions.end(), pos) !=
+        bundle_positions.end()) {
+      continue;
+    }
+    auto const& life = lifetimes[pos];
+    // A key an outer join could null is no proof: several unmatched rows share
+    // the null key and would be one group, while their rowids differ — the
+    // bijection the whole transform rests on is exactly what breaks.
+    if (life.nullified_on_ride) { continue; }
+    bool covers_chain = true;
+    for (auto const* aggregate : extension.group_bys) {
+      if (std::find(life.group_key_at.begin(), life.group_key_at.end(), aggregate) ==
+          life.group_key_at.end()) {
+        covers_chain = false;
+        break;
+      }
+    }
+    if (covers_chain) { extension.unique_key_candidates.push_back(pos); }
+  }
+  // An empty candidate list is not a refusal here. The bundle's OWN columns can
+  // carry the proof (a deferred column that is unique over its pinned table
+  // makes the rowid a bijective relabelling of it), and a rider joining somebody
+  // else's ride is admitted on that basis alone. Who may prove what is the
+  // admission's business; this reports the shape.
+
+  extension.port = const_cast<op::sirius_physical_operator*>(reader);
+  return extension;
+}
+
+}  // namespace
+
+planned_deferral plan_deferral(sirius_physical_operator& scan, late_mat::defer_policy const& policy)
+{
+  // No env gate here: like the rest of the pass this only reports, and the one
+  // caller that acts on it is gated. Keeping the analysis ungated is also what
+  // lets it be tested without the gate set in the test binary's environment.
+  planned_deferral planned;
+  auto const lifetimes = analyze_column_lifetimes(scan);
+
+  // Withdraw the columns an outer join could null BEFORE anything weighs them.
+  // Deferring one is sound — a null rowid must materialize a null — but the
+  // materializer produces no nulls yet, so the refusal belongs here, where it
+  // costs a deferral, rather than at the far end where it would already be an
+  // answer.
+  std::vector<column_lifetime> weighable;
+  weighable.reserve(lifetimes.size());
+  for (auto const& life : lifetimes) {
+    if (life.nullified_on_ride) {
+      ++planned.nullable_columns_skipped;
+      continue;
+    }
+    // A join key leaves candidacy outright — see column_lifetime's note: the
+    // partition below the join has already hashed it by the time the port could
+    // put its value back.
+    if (life.read_as_join_key) {
+      ++planned.join_keys_skipped;
+      continue;
+    }
+    weighable.push_back(life);
+  }
+
+  std::vector<sirius_physical_operator const*> readers;
+  auto const candidates = build_defer_candidates(scan, weighable, &readers);
+  planned.census        = late_mat::choose_deferrals(candidates, policy);
+
+  // One rowid rides, so one bundle installs. Widest wins, same rule the policy
+  // arbitrates a shared slot by, and the losers are recorded rather than
+  // dropped.
+  std::optional<std::size_t> best;
+  for (std::size_t i = 0; i < planned.census.size(); ++i) {
+    if (!planned.census[i].installed()) { continue; }
+    if (!best) {
+      best = i;
+      continue;
+    }
+    auto const loser = planned.census[i].net_value_bytes > planned.census[*best].net_value_bytes
+                         ? std::exchange(*best, i)
+                         : i;
+    planned.census[loser].refusal = late_mat::defer_refusal::second_bundle;
+  }
+  if (!best || *best >= readers.size() || readers[*best] == nullptr) { return planned; }
+
+  // The walk reads the plan, which is why it holds const pointers; installing
+  // writes to it, and the caller handed us the mutable tree those pointers
+  // address.
+  planned.port            = const_cast<sirius_physical_operator*>(readers[*best]);
+  planned.net_value_bytes = planned.census[*best].net_value_bytes;
+  planned.boundaries      = planned.census[*best].boundaries;
+  for (auto const& column : candidates[*best].columns) {
+    auto const position = static_cast<std::size_t>(column.column_pos);
+    planned.positions.push_back(position);
+    planned.restored_types.push_back(scan.types[position]);
+    planned.port_positions.push_back(lifetimes[position].position_at_reader);
+    auto const& sites = lifetimes[position].carrier_restores;
+    planned.carrier_restores.insert(planned.carrier_restores.end(), sites.begin(), sites.end());
+  }
+  planned.port_input         = lifetimes[planned.positions.front()].reader_input;
+  planned.fanned_out_at_port = lifetimes[planned.positions.front()].fanned_out_at_reader;
+  planned.group_extension    = plan_group_key_extension(lifetimes, planned.positions);
+  // The one-half install needs EVERY column of the bundle to be count-only: a
+  // single column whose values are read has a far end to restore at, and the
+  // bundle installs as a pair like any other.
+  planned.count_only_bundle =
+    std::all_of(planned.positions.begin(), planned.positions.end(), [&](std::size_t position) {
+      return lifetimes[position].consumed_as_count_only;
+    });
+  return planned;
+}
+
+std::size_t neutralize_carrier_restores(std::vector<carrier_restore_site> const& sites,
+                                        sirius_physical_operator const& port)
+{
+  // A fact about the plan chain, not about the order the walk recorded them in
+  // — riders put several columns' sites in one unordered list.
+  auto const below_port = [&port](sirius_physical_operator const& site) {
+    for (auto const* node = site.get_parent_op(); node != nullptr; node = node->get_parent_op()) {
+      if (node == &port) { return true; }
+    }
+    return false;
+  };
+
+  std::size_t rewritten = 0;
+  for (auto const& site : sites) {
+    if (site.projection == nullptr || !below_port(*site.projection)) { continue; }
+    if (site.projection->type != SiriusPhysicalOperatorType::PROJECTION) { continue; }
+    // The walk only reads, so it holds const pointers; the caller handed us the
+    // mutable tree they address, exactly as install_deferral does.
+    auto& projection = const_cast<op::sirius_physical_projection&>(
+      static_cast<op::sirius_physical_projection const&>(*site.projection));
+    if (site.output_position >= projection.select_list.size()) { continue; }
+    auto& expr = projection.select_list[site.output_position];
+    if (!expr) { continue; }
+    // Re-checked rather than trusted: rewriting the wrong expression is a wrong
+    // answer, not a missed deferral.
+    auto* cast_expr = std::get_if<ast::cast>(&expr->v);
+    if (cast_expr == nullptr || cast_expr->kind != ast::cast_kind::carrier_restore) { continue; }
+    if (cast_expr->try_cast || !cast_expr->child) { continue; }
+    auto const* inner = std::get_if<ast::reference>(&cast_expr->child->v);
+    if (inner == nullptr) { continue; }
+    // The reference declares the type the cast targeted — that is what makes
+    // the two equivalent for every input the cast was inserted for.
+    expr->v = ast::reference{inner->column_index, cast_expr->target_type};
+    ++rewritten;
+  }
+  return rewritten;
+}
+
+bool install_deferral(sirius_physical_operator& scan,
+                      sirius_physical_operator& port,
+                      late_mat::defer_pair pair)
+{
+  if (!pair.valid()) { return false; }
+  // A scan materializing its own deferral would defer nothing across nothing.
+  if (&scan == &port) { return false; }
+  // Neither half may be overwritten: the second install would substitute
+  // against a schema the first one already rewrote.
+  if (!scan._deferred_output.empty() || !port._port_directive.empty()) { return false; }
+  scan._deferred_output = std::move(pair.scan);
+  port._port_directive  = std::move(pair.port);
+  late_mat::note_deferral_installed();
+  return true;
+}
+
+bool install_count_deferral(sirius_physical_operator& scan, late_mat::deferred_scan_output output)
+{
+  if (output.empty()) { return false; }
+  if (!scan._deferred_output.empty()) { return false; }
+  // NO PORT, and that is the point: nothing downstream restores these columns
+  // because nothing downstream reads their values. The caller owes the proof —
+  // every read is a COUNT and the pinned values carry no nulls — because from
+  // here it is indistinguishable from throwing data away.
+  scan._deferred_output = std::move(output);
+  late_mat::note_deferral_installed();
+  return true;
+}
+
+bool install_rider(sirius_physical_operator& scan,
+                   sirius_physical_operator& port,
+                   late_mat::defer_pair pair)
+{
+  if (!pair.valid()) { return false; }
+  if (&scan == &port) { return false; }
+  // A rider joins an existing ride; with no primary at the port there is
+  // nothing to join, and the rider's own admission was never argued.
+  if (port._port_directive.empty()) { return false; }
+  // The rider's scan may not already be deferring: one bundle per scan, because
+  // one rowid rides.
+  if (!scan._deferred_output.empty()) { return false; }
+  late_mat::rider_bundle rider;
+  rider.output_positions = std::move(pair.port.output_positions);
+  rider.rowid_at         = pair.port.rowid_at;
+  rider.origins          = std::move(pair.port.origins);
+  rider.restored_types   = std::move(pair.port.restored_types);
+  rider.rowid_type       = pair.port.rowid_type;
+
+  auto merged = port._port_directive;
+  // The rider's half was built against the port schema AS IT ALREADY STANDS, so
+  // its expected_schema is the installed one plus its own substitutions. It may
+  // therefore differ at the rider's positions and NOWHERE else — anywhere else
+  // means the two halves were built against different batches, and a port whose
+  // schema matches neither materializes nothing.
+  if (pair.port.expected_schema.size() != merged.expected_schema.size()) { return false; }
+  for (std::size_t i = 0; i < merged.expected_schema.size(); ++i) {
+    auto const& positions = rider.output_positions;
+    if (std::find(positions.begin(), positions.end(), i) != positions.end()) { continue; }
+    if (pair.port.expected_schema[i] != merged.expected_schema[i]) { return false; }
+  }
+  merged.expected_schema = pair.port.expected_schema;
+
+  // Accept the merged directive only if it validates — position collisions
+  // between bundles are caught there, and a port that restores one column twice
+  // would take the values from whichever pinned table wrote last.
+  merged.riders.push_back(std::move(rider));
+  if (!merged.valid()) { return false; }
+
+  port._port_directive  = std::move(merged);
+  scan._deferred_output = std::move(pair.scan);
+  late_mat::note_deferral_installed();
+  return true;
+}
+
+}  // namespace sirius::planner
