@@ -185,11 +185,9 @@ int compute_bp_offsets(const void* cc_p,
 // Render-side kernel compile: optionally dump the source (``dump_env`` names an
 // env var holding a path), then compile-or-warm-cache the rendered source.
 // Returns the cached kernel, or nullptr on any failure (logged with ``ctx`` as
-// the message prefix). ``default_device`` is nvrtc's -default-device (decode
-// needs it for rle_block.cuh's unannotated constexpr accessors).
+// the message prefix).
 const jit::CompiledKernel* compile_rendered(const std::string& source,
                                             const std::string& entry_symbol,
-                                            bool default_device,
                                             const char* dump_env,
                                             const char* ctx)
 {
@@ -200,8 +198,7 @@ const jit::CompiledKernel* compile_rendered(const std::string& source,
     }
   }
   jit::CompileOptions opts;
-  opts.arch_cc        = jit::arch_cc_for_current_device();
-  opts.default_device = default_device;
+  opts.arch_cc = jit::arch_cc_for_current_device();
   try {
     const jit::CompiledKernel* kernel =
       jit::KernelCache::instance().get_or_compile_plain(source, entry_symbol, opts);
@@ -787,13 +784,8 @@ int run_rendered_decode(const jit::FusedTree& tree,
     return -1;
   }
   lap("render");
-  // The rendered decode source includes rle_block.cuh (→ tree.hpp), whose
-  // unannotated constexpr accessors require nvrtc's -default-device.
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/true,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "rendered decode");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "rendered decode");
   if (kernel == nullptr) { return -1; }
   lap("compile");
 
@@ -1142,11 +1134,8 @@ bool launch_masked_char_copy(void const* chars,
     return false;
   }
   const cdj::DecodeKernelSpec spec  = cdj::render_masked_char_copy();
-  const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                       spec.entry_symbol,
-                                                       /*default_device=*/false,
-                                                       "CODEGEN_JIT_DUMP_DECODE_SOURCE",
-                                                       "masked char copy");
+  const jit::CompiledKernel* kernel = compile_rendered(
+    spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_DECODE_SOURCE", "masked char copy");
   if (kernel == nullptr) { return false; }
 
   CUdeviceptr d_chars  = reinterpret_cast<CUdeviceptr>(chars);
@@ -1317,11 +1306,8 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
     // same fused-tree shape and dtype hits the cached compile —
     // including different files / different num_rows.  Cache owns the
     // CompiledKernel; we hold a non-owning pointer for the launch.
-    const jit::CompiledKernel* kernel = compile_rendered(spec.source,
-                                                         spec.entry_symbol,
-                                                         /*default_device=*/false,
-                                                         "CODEGEN_JIT_DUMP_ENCODE_SOURCE",
-                                                         "cpp encode");
+    const jit::CompiledKernel* kernel = compile_rendered(
+      spec.source, spec.entry_symbol, "CODEGEN_JIT_DUMP_ENCODE_SOURCE", "cpp encode");
     if (kernel == nullptr) { return -1; }
 
     // Allocate one rmm::device_buffer per EncodeBufferSpec.  Buffers are moved

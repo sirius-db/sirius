@@ -24,8 +24,7 @@ struct CompileError : std::runtime_error {
 };
 
 struct CompileOptions {
-  int arch_cc         = 0;  // must be set by caller via arch_cc_for_current_device()
-  bool default_device = false;
+  int arch_cc = 0;  // must be set by caller via arch_cc_for_current_device()
 };
 
 // Returns major*10+minor for the current CUDA device (e.g. 90 for H100).
