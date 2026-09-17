@@ -172,8 +172,9 @@ class sirius_mask_applicable {
    * The membership implementations accept any integer carrier of the key's signedness
    * (INT8..INT64 for signed keys, UINT8..UINT64 for unsigned), converting per element in-kernel:
    * a pinned chunk may store the key narrower than the type the filter was published with, and no
-   * consumer should have to materialize a widened copy to probe it. `membership_probe_compatible`
-   * is the host-side mirror of what a filter accepts.
+   * consumer should have to materialize a widened copy to probe it. A DATE key accepts
+   * TIMESTAMP_DAYS or its INT8/INT16/INT32 storage carriers; a sub-day timestamp key accepts only
+   * its own unit. `membership_probe_compatible` is the host-side mirror of what a filter accepts.
    *
    * The result is never nullable. A null probe row is written as `false`: admission never routes
    * a null-safe comparison to a dynamic filter and the authoritative join runs with
@@ -216,11 +217,12 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a persistent set from integer keys (see `membership_key_supported`), excluding
-   * nulls
+   * @brief Builds a persistent set from integer or temporal keys (see
+   * `membership_key_supported`), excluding nulls
    *
    * The set is typed at the key's rep: a build column arriving at a narrowed carrier (INT8/INT16,
-   * UINT8/UINT16) widens per element into a 32-bit set. `size()` reports the valid keys stored.
+   * UINT8/UINT16) widens per element into a 32-bit set; a temporal column is read through its
+   * integer storage (int32 epoch days, int64 ticks). `size()` reports the valid keys stored.
    *
    * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
    * @throw std::invalid_argument if @p keys is unsupported
@@ -272,7 +274,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 };
 
 /**
- * @brief Exact linear membership over a small integer set
+ * @brief Exact linear membership over a small integer or temporal set
  *
  * Needles are stored at the key's rep (see `membership_key_domain`). Null build keys are compacted
  * out; `supports()` and `size()` count the valid keys.
@@ -346,8 +348,8 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a Bloom filter from integer keys (see `membership_key_supported`), excluding
-   * nulls
+   * @brief Builds a Bloom filter from integer or temporal keys (see `membership_key_supported`),
+   * excluding nulls
    *
    * @pre Key storage remains valid until work enqueued on @p stream completes.
    * @throw std::invalid_argument if @p keys is unsupported

@@ -44,7 +44,16 @@ enum class membership_key_rep : std::uint8_t { i32, i64, u32, u64 };
 /// Probe-adapter selector. Each value names one device adapter (cuda/dynamic_filter_probe.cuh)
 /// and one arm each of `classify_membership_key` and `membership_probe_compatible`; a new key
 /// family adds a value here and those three arms.
-enum class membership_key_family : std::uint8_t { signed_int, unsigned_int };
+///
+/// Temporal keys are integers underneath (cudf stores `TIMESTAMP_DAYS` as int32 epoch days and
+/// the other timestamp units as int64 ticks), so they share the signed integral adapter over the
+/// column's storage type; the family only decides which probe types are comparable:
+///   * `date_days`: a `DATE` key. Probes are `TIMESTAMP_DAYS` or the `INT8`/`INT16`/`INT32`
+///     carriers compressed materialization stores a `DATE` in;
+///   * `timestamp`: a sub-day timestamp key. Probes must carry the same unit; a different unit
+///     is a planner cast and never reaches a membership probe, so it declines rather than
+///     converting.
+enum class membership_key_family : std::uint8_t { signed_int, unsigned_int, date_days, timestamp };
 
 struct membership_key_domain {
   membership_key_rep rep{membership_key_rep::i32};
@@ -88,5 +97,15 @@ struct membership_key_domain {
 
 /// Byte width of a rep's device element.
 [[nodiscard]] std::size_t membership_rep_bytes(membership_key_rep rep) noexcept;
+
+/**
+ * @brief cudf type whose buffer layout @p t shares
+ *
+ * Temporal columns store plain integers: `TIMESTAMP_DAYS` maps to `INT32`, every other timestamp
+ * unit to `INT64`. Any other type is its own storage type. The probe adapters and build-side
+ * iterators read a column through this type, so a temporal key is bit-identical to an integer
+ * one on the device and adds no kernel instantiations.
+ */
+[[nodiscard]] cudf::data_type membership_storage_type(cudf::data_type t) noexcept;
 
 }  // namespace sirius::op

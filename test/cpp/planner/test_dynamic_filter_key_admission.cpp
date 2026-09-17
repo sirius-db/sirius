@@ -380,6 +380,11 @@ TEST_CASE("join-edge route accepts only direct matching membership-supported equ
     auto const uint64 = cudf::data_type{cudf::type_id::UINT64};
     REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, int16, int16));
     REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, uint64, uint64));
+    // DATE and same-unit TIMESTAMP keys are membership-supported as well.
+    auto const days   = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+    auto const micros = cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
+    REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, days, days));
+    REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, micros, micros));
   }
   SECTION("computed keys are rejected on either side, though the scan route admits them")
   {
@@ -423,9 +428,20 @@ TEST_CASE("join-edge route accepts only direct matching membership-supported equ
                                           kDirectDirect,
                                           cudf::data_type{cudf::type_id::UINT32},
                                           kInt32));
+    // Mixed temporal units are different types (the planner would have cast one side).
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}));
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS},
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}));
     // Identical but membership-unsupported types.
     for (auto const id :
-         {cudf::type_id::FLOAT64, cudf::type_id::TIMESTAMP_DAYS, cudf::type_id::STRING}) {
+         {cudf::type_id::FLOAT64, cudf::type_id::DURATION_DAYS, cudf::type_id::STRING}) {
       REQUIRE_FALSE(direct_route_admissible(
         duckdb::JoinType::INNER, equal, kDirectDirect, cudf::data_type{id}, cudf::data_type{id}));
     }

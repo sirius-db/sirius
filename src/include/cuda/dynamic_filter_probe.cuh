@@ -25,7 +25,9 @@
 // cudf::type_dispatcher is deliberately not used for the (key rep, probe carrier) pair: the
 // allowed pairs are a short explicit list and are the correctness surface, so they are spelled
 // out here, and the instantiation count stays bounded (per filter kind: 2 signed reps x 4 signed
-// carriers + 2 unsigned reps x 4 unsigned carriers = 16 probe kernels).
+// carriers + 2 unsigned reps x 4 unsigned carriers = 16 probe kernels). Temporal keys and probes
+// are read through their integer storage type (membership_storage_type) and reuse the signed
+// integral adapters, so they add no instantiations.
 
 // sirius
 #include <op/dynamic_filter/dynamic_filter_key_domain.hpp>
@@ -202,18 +204,29 @@ bool dispatch_probe_adapter(membership_key_domain const& domain,
                             cudf::column_view const& probe,
                             Fn&& fn)
 {
-  auto const integral_arm = [&]() {
-    return dispatch_family_carrier<KeyT>(probe.type(), [&](auto probe_tag) {
+  // Reads the probe through @p storage (its own type, or the integer type a temporal column
+  // stores) and hands fn the matching integral adapter.
+  auto const integral_arm = [&](cudf::data_type storage) {
+    return dispatch_family_carrier<KeyT>(storage, [&](auto probe_tag) {
       using probe_type = decltype(probe_tag);
       fn(integral_probe_adapter<probe_type, KeyT>{probe.data<probe_type>()});
     });
   };
   switch (domain.family) {
     case membership_key_family::signed_int:
-      if constexpr (cuda::std::is_signed_v<KeyT>) { return integral_arm(); }
+      if constexpr (cuda::std::is_signed_v<KeyT>) { return integral_arm(probe.type()); }
       return false;
     case membership_key_family::unsigned_int:
-      if constexpr (cuda::std::is_unsigned_v<KeyT>) { return integral_arm(); }
+      if constexpr (cuda::std::is_unsigned_v<KeyT>) { return integral_arm(probe.type()); }
+      return false;
+    // Temporal keys: the host mirror decides which probe types are comparable (same unit, or a
+    // DATE storage carrier); a comparable probe is then bit-identical to an integer one.
+    case membership_key_family::date_days:
+    case membership_key_family::timestamp:
+      if constexpr (cuda::std::is_signed_v<KeyT>) {
+        if (!membership_probe_compatible(domain, probe.type())) { return false; }
+        return integral_arm(membership_storage_type(probe.type()));
+      }
       return false;
   }
   return false;
@@ -234,13 +247,14 @@ struct widen_to {
 
 /// Invokes @p fn(first, last) with a device iterator range yielding the build keys as KeyT,
 /// widening a narrower same-family carrier per element so no widened build copy is needed.
-/// Returns false without invoking @p fn when @p keys is not a carrier KeyT can hold; classify
-/// always picks a rep at least as wide as the build carrier, so that is unreachable in practice.
+/// Temporal build columns are read through their integer storage type. Returns false without
+/// invoking @p fn when @p keys is not a carrier KeyT can hold; classify always picks a rep at
+/// least as wide as the build carrier, so that is unreachable in practice.
 template <class KeyT, class Fn>
 bool with_build_key_iterator(cudf::column_view const& keys, Fn&& fn)
 {
   bool invoked = false;
-  dispatch_family_carrier<KeyT>(keys.type(), [&](auto carrier_tag) {
+  dispatch_family_carrier<KeyT>(membership_storage_type(keys.type()), [&](auto carrier_tag) {
     using carrier_type = decltype(carrier_tag);
     if constexpr (sizeof(carrier_type) <= sizeof(KeyT)) {
       auto const first =

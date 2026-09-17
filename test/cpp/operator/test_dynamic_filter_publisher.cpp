@@ -29,6 +29,9 @@
  *    real publisher today.
  *  - Narrowed build carriers: a build column arriving at a carrier restorable to the recorded
  *    storage type publishes (filters built at the carrier); an unrelated type is still skipped.
+ *  - DATE keys: a TIMESTAMP_DAYS key publishes a membership filter and a zone map, is probed by
+ *    the native column and by an INT16 carrier alike, and a build column arriving at an INT16
+ *    carrier is restored to TIMESTAMP_DAYS so it stays in the DATE family.
  *  - Sparse fan-out and gating: each target receives only its bound keys, the domain-coverage
  *    gate consults each key's own domain, and unbound keys cost no construction.
  *  - Floating-point suppression: a FLOAT64 key whose build holds a NaN receives no zone map (the
@@ -90,6 +93,7 @@ using sirius::op::dynamic_filter_route_class;
 
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
 constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
+constexpr auto kDays    = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
@@ -168,6 +172,28 @@ struct publisher_fixture {
     stream.synchronize();
   }
 
+  // Append a DATE (TIMESTAMP_DAYS) column of consecutive epoch days starting at `first_day`.
+  void add_date_key_column(std::size_t rows, std::int32_t first_day)
+  {
+    std::vector<std::int32_t> days(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+      days[i] = first_day + static_cast<std::int32_t>(i);
+    }
+    auto& source_space = replica_spaces.front().get_gpu_space();
+    auto column        = cudf::make_timestamp_column(kDays,
+                                              static_cast<cudf::size_type>(rows),
+                                              cudf::mask_state::UNALLOCATED,
+                                              stream,
+                                              source_space.get_default_allocator());
+    REQUIRE(cudaMemcpyAsync(column->mutable_view().head<std::int32_t>(),
+                            days.data(),
+                            days.size() * sizeof(std::int32_t),
+                            cudaMemcpyHostToDevice,
+                            stream.value()) == cudaSuccess);
+    stream.synchronize();
+    columns.push_back(std::move(column));
+  }
+
   [[nodiscard]] cudf::table_view build_view() const
   {
     std::vector<cudf::column_view> views;
@@ -208,6 +234,42 @@ std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixtu
   auto const err = cudaMemcpyAsync(column->mutable_view().data<double>(),
                                    values.data(),
                                    values.size() * sizeof(double),
+                                   cudaMemcpyHostToDevice,
+                                   fixture.stream.value());
+  REQUIRE(err == cudaSuccess);
+  fixture.stream.synchronize();
+  return column;
+}
+
+std::unique_ptr<cudf::column> make_day_values(publisher_fixture const& fixture,
+                                              std::vector<std::int32_t> const& days)
+{
+  auto column    = cudf::make_timestamp_column(kDays,
+                                            static_cast<cudf::size_type>(days.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            fixture.stream,
+                                            cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(column->mutable_view().head<std::int32_t>(),
+                                   days.data(),
+                                   days.size() * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   fixture.stream.value());
+  REQUIRE(err == cudaSuccess);
+  fixture.stream.synchronize();
+  return column;
+}
+
+std::unique_ptr<cudf::column> make_int16_values(publisher_fixture const& fixture,
+                                                std::vector<std::int16_t> const& values)
+{
+  auto column    = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT16},
+                                          static_cast<cudf::size_type>(values.size()),
+                                          cudf::mask_state::UNALLOCATED,
+                                          fixture.stream,
+                                          cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(column->mutable_view().data<std::int16_t>(),
+                                   values.data(),
+                                   values.size() * sizeof(std::int16_t),
                                    cudaMemcpyHostToDevice,
                                    fixture.stream.value());
   REQUIRE(err == cudaSuccess);
@@ -676,6 +738,119 @@ TEST_CASE(
   }
 }
 
+// TPC-DS d_date semi-joins (q58/q83, q38/q87) publish a DATE key. The build column is
+// TIMESTAMP_DAYS, so both a membership filter and a zone map are built and pushed to a binding
+// probing at the native type; the membership filter answers the native probe and the INT16
+// carrier a pinned chunk would serve identically, and declines INT64 (not a DATE carrier).
+TEST_CASE("dynamic-filter publisher publishes membership and zone-map filters for a DATE key",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  fixture.add_date_key_column(3, /*first_day=*/10957);  // 2000-01-01 .. 2000-01-03
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kDays}}});
+  auto key         = make_int64_key(0, 0);
+  key.storage_type = kDays;
+  dynamic_filter_publish_plan plan{
+    {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.zone_map_filters_built == 1);
+  REQUIRE(outcome.filters_pushed == 2);
+
+  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(snapshot) == 1);
+  auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get()) !=
+           nullptr;
+  });
+  REQUIRE(membership != snapshot.end());
+  auto const* small =
+    dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(membership->get());
+  CHECK(small->domain().family == sirius::op::membership_key_family::date_days);
+  CHECK(small->domain().rep == sirius::op::membership_key_rep::i32);
+  CHECK(small->domain().native == kDays);
+
+  // Native probe (post-decode cascade) and INT16 carrier (fused decode) agree on the same days.
+  std::vector<std::uint8_t> const expected{1, 0, 1, 1, 0};
+  auto const native = make_day_values(fixture, {10957, 10956, 10958, 10959, 20000});
+  REQUIRE(membership_mask(**membership, native->view(), fixture) == expected);
+  auto const narrowed = make_int16_values(fixture, {10957, 10956, 10958, 10959, 20000});
+  REQUIRE(membership_mask(**membership, narrowed->view(), fixture) == expected);
+
+  // INT64 is not a DATE carrier: decline, as the host mirror says.
+  auto const wide        = make_int64_values(fixture, {10957, 10956});
+  auto const* applicable = dynamic_cast<sirius::op::sirius_mask_applicable const*>(small);
+  REQUIRE(applicable != nullptr);
+  REQUIRE(applicable->compute_mask(
+            wide->view(), kDeviceId, fixture.stream, cudf::get_current_device_resource_ref()) ==
+          nullptr);
+}
+
+// A DATE build column that compressed materialization stored as INT16 arrives at that carrier
+// while the plan recorded TIMESTAMP_DAYS. The publisher must not build a signed-integer set (it
+// would decline the native TIMESTAMP_DAYS probe): it restores the column, so the key publishes in
+// the DATE family with its zone map, and the native probe and the carrier both work.
+TEST_CASE("dynamic-filter publisher restores a DATE build column arriving at an INT16 carrier",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  fixture.add_key_column_as(3, cudf::data_type{cudf::type_id::INT16}, /*first=*/10957);
+  REQUIRE(fixture.columns.front()->type().id() == cudf::type_id::INT16);
+
+  auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kDays}}});
+  auto key         = make_int64_key(0, 0);
+  key.storage_type = kDays;
+  dynamic_filter_publish_plan plan{
+    {key}, std::move(targets), std::move(fixture.replica_spaces), {.emit_zone_map_filters = true}};
+
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.zone_map_filters_built == 1);
+  // The restored build type equals the native probe type, so the zone map is pushed as well.
+  REQUIRE(outcome.filters_pushed == 2);
+
+  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+  auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& filter) {
+    return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(filter.get()) !=
+           nullptr;
+  });
+  REQUIRE(membership != snapshot.end());
+  auto const* small =
+    dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(membership->get());
+  CHECK(small->domain().family == sirius::op::membership_key_family::date_days);
+  CHECK(small->domain().native == kDays);
+
+  std::vector<std::uint8_t> const expected{1, 0, 1, 1, 0};
+  auto const native = make_day_values(fixture, {10957, 10956, 10958, 10959, 20000});
+  REQUIRE(membership_mask(**membership, native->view(), fixture) == expected);
+  auto const narrowed = make_int16_values(fixture, {10957, 10956, 10958, 10959, 20000});
+  REQUIRE(membership_mask(**membership, narrowed->view(), fixture) == expected);
+}
+
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",
           "[dynamic_filter][publisher]")
 {
@@ -1105,6 +1280,38 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
     // membership_key_supported arm rejects.
     auto key         = make_int64_key(0, 0);
     key.storage_type = kFloat64;
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
+      std::invalid_argument);
+  }
+
+  SECTION("direct binding over a DATE key is accepted")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {
+         {.admitted_key_index = 0, .channel_push_ordinal = 0, .probe_storage_type = kDays}}});
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kDays;
+    REQUIRE_NOTHROW(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)));
+  }
+
+  SECTION("direct binding mixing timestamp units is rejected")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::direct,
+                       .accepts_zone_map_filters = false,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = 0,
+                                                     .probe_storage_type   = cudf::data_type{
+                                           cudf::type_id::TIMESTAMP_MICROSECONDS}}}});
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS};
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);

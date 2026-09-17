@@ -127,6 +127,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   std::vector<std::shared_ptr<sirius_dynamic_filter>> per_key_membership(admitted_keys.size());
   std::vector<cudf::data_type> per_key_build_type(admitted_keys.size(),
                                                   cudf::data_type{cudf::type_id::EMPTY});
+  // Build columns restored from a narrowed carrier; filters copy from them asynchronously on
+  // `stream`, so they must outlive the synchronize below.
+  std::vector<std::unique_ptr<cudf::column>> restored_build_columns;
 
   for (std::size_t admitted_key_index = 0; admitted_key_index < admitted_keys.size();
        ++admitted_key_index) {
@@ -165,26 +168,45 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     // built at the carrier (classification happens on the runtime column), which is sound because
     // every probe range-checks into the carrier's domain. Any other disagreement is a
     // type-derivation bug and skips the key; the join stays authoritative.
-    auto const& col = build_view.column(admitted_key.build_key_ordinal);
-    if (col.type() != admitted_key.storage_type) {
-      if (!sirius::can_restore_to(col.type(), admitted_key.storage_type)) {
+    cudf::column_view col   = build_view.column(admitted_key.build_key_ordinal);
+    auto const arrived_type = col.type();
+    if (arrived_type != admitted_key.storage_type) {
+      if (!sirius::can_restore_to(arrived_type, admitted_key.storage_type)) {
         SIRIUS_LOG_WARN(
           "[sirius_physical_hash_join] dynamic filter key {}: skipped (plan recorded type id {} "
           "but build column {} carries type id {}).",
           admitted_key_index,
           static_cast<int32_t>(admitted_key.storage_type.id()),
           admitted_key.build_key_ordinal,
-          static_cast<int32_t>(col.type().id()));
+          static_cast<int32_t>(arrived_type.id()));
         ++outcome.keys_skipped_type_mismatch;
         continue;
       }
-      SIRIUS_LOG_DEBUG(
-        "[sirius_physical_hash_join] dynamic filter key {}: build column {} arrives at narrowed "
-        "carrier type id {} (plan recorded type id {}); building filters at the carrier.",
-        admitted_key_index,
-        admitted_key.build_key_ordinal,
-        static_cast<int32_t>(col.type().id()),
-        static_cast<int32_t>(admitted_key.storage_type.id()));
+      if (admitted_key.storage_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+        // A DATE stored in an INT8/INT16 carrier is indistinguishable from a narrowed integer
+        // once the plan's type is out of sight, and the filters classify on the column alone; a
+        // carrier-typed set would take a `date_days` probe for a signed-integer one and decline
+        // it. Restoring the (small) build column keeps the key in its own family, and costs no
+        // set width: DATE's rep is int32 whether it arrives narrowed or native.
+        restored_build_columns.push_back(
+          sirius::cast_through_rep(col, admitted_key.storage_type, stream, allocator_ref));
+        col = restored_build_columns.back()->view();
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic filter key {}: DATE build column {} arrives at "
+          "narrowed carrier type id {}; restored to TIMESTAMP_DAYS for publication.",
+          admitted_key_index,
+          admitted_key.build_key_ordinal,
+          static_cast<int32_t>(arrived_type.id()));
+      } else {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_physical_hash_join] dynamic filter key {}: build column {} arrives at "
+          "narrowed carrier type id {} (plan recorded type id {}); building filters at the "
+          "carrier.",
+          admitted_key_index,
+          admitted_key.build_key_ordinal,
+          static_cast<int32_t>(arrived_type.id()),
+          static_cast<int32_t>(admitted_key.storage_type.id()));
+      }
     }
     per_key_build_type[admitted_key_index] = col.type();
 

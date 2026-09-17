@@ -40,7 +40,16 @@ std::optional<membership_key_domain> classify_membership_key(cudf::data_type bui
       return membership_key_domain{rep::u32, family::unsigned_int, build_type};
     case cudf::type_id::UINT64:
       return membership_key_domain{rep::u64, family::unsigned_int, build_type};
-    // Every other type (temporal, decimal, floating-point, string, nested) declines.
+    // Temporal keys sit on integer storage (int32 epoch days, int64 ticks) and use the signed
+    // integral adapter over it; the family restricts which probe types are comparable.
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return membership_key_domain{rep::i32, family::date_days, build_type};
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return membership_key_domain{rep::i64, family::timestamp, build_type};
+    // Every other type (duration, decimal, floating-point, string, nested) declines.
     default: return std::nullopt;
   }
 }
@@ -71,6 +80,20 @@ bool membership_probe_compatible(membership_key_domain const& domain,
         case cudf::type_id::UINT64: return true;
         default: return false;
       }
+    // A DATE probe arrives native from the post-decode cascade, or at the INT8/INT16 carrier a
+    // pinned chunk stored it in (fused decode re-tags the decoded column with the stored type).
+    // INT32 is the storage width itself, so it is accepted as well.
+    case membership_key_family::date_days:
+      switch (probe.id()) {
+        case cudf::type_id::TIMESTAMP_DAYS:
+        case cudf::type_id::INT8:
+        case cudf::type_id::INT16:
+        case cudf::type_id::INT32: return true;
+        default: return false;
+      }
+    // Sub-day timestamps are never narrowed, and a unit change is a planner cast that blocks the
+    // key upstream, so only the identical unit is comparable.
+    case membership_key_family::timestamp: return probe.id() == domain.native.id();
   }
   return false;
 }
@@ -95,6 +118,18 @@ std::size_t membership_rep_bytes(membership_key_rep rep) noexcept
     case membership_key_rep::u64: return sizeof(std::int64_t);
   }
   return sizeof(std::int64_t);
+}
+
+cudf::data_type membership_storage_type(cudf::data_type t) noexcept
+{
+  switch (t.id()) {
+    case cudf::type_id::TIMESTAMP_DAYS: return cudf::data_type{cudf::type_id::INT32};
+    case cudf::type_id::TIMESTAMP_SECONDS:
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+    case cudf::type_id::TIMESTAMP_NANOSECONDS: return cudf::data_type{cudf::type_id::INT64};
+    default: return t;
+  }
 }
 
 }  // namespace sirius::op

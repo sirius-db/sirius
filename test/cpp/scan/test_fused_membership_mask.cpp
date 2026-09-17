@@ -20,8 +20,9 @@
  *        present, the membership probes run AFTER the partial combine and receive it as a prior
  *        mask; without one they stay concurrent and prior-free. The probe key stays at its narrow
  *        decoded carrier (INT32, or INT8 for a chunk stored that narrow) against an INT64-built
- *        set — the filtered decode must not require a materialized cast — and a nullable probe
- *        column yields a non-nullable mask that the filtered decode consumes.
+ *        set, and a DATE stored as INT16 against a TIMESTAMP_DAYS-built set — the filtered decode
+ *        must not require a materialized cast — and a nullable probe column yields a non-nullable
+ *        mask that the filtered decode consumes.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -124,6 +125,30 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_key_set(
   REQUIRE(cudaMemcpyAsync(col->mutable_view().data<std::int64_t>(),
                           keys.data(),
                           keys.size() * sizeof(std::int64_t),
+                          cudaMemcpyHostToDevice,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+}
+
+// TIMESTAMP_DAYS-built exact membership set over the multiples of @p step in [0, 50) epoch days
+// — the DATE key as the post-decode cascade publishes it, while the chunk stores it as INT16.
+std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_date_key_set(
+  rmm::cuda_stream_view stream, std::int32_t step = 5)
+{
+  std::vector<std::int32_t> days;
+  for (std::int32_t k = 0; k < 50; k += step) {
+    days.push_back(k);
+  }
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto col      = cudf::make_timestamp_column(cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                         static_cast<cudf::size_type>(days.size()),
+                                         cudf::mask_state::UNALLOCATED,
+                                         stream,
+                                         mr);
+  REQUIRE(cudaMemcpyAsync(col->mutable_view().head<std::int32_t>(),
+                          days.data(),
+                          days.size() * sizeof(std::int32_t),
                           cudaMemcpyHostToDevice,
                           stream.value()) == cudaSuccess);
   stream.synchronize();
@@ -519,4 +544,54 @@ TEST_CASE("filtered-decode membership probe consumes a nullable probe column",
   REQUIRE(out->num_columns() == 2);
   CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   CHECK(column_to_host(out->view().column(1), stream) == expect_k);
+}
+// Compressed materialization stores a DATE in the narrowest INT8/INT16 carrier its epoch days
+// fit, while the hash join publishes the key at TIMESTAMP_DAYS. The fused decode re-tags the
+// decoded column with the stored carrier, so the probe sees INT16 against a TIMESTAMP_DAYS-built
+// set and must answer exactly what the native column would, mask-aware.
+TEST_CASE("filtered-decode membership probe reads a DATE stored as an INT16 carrier",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto table        = make_source_table<std::int16_t>(stream);
+  REQUIRE(table->view().column(1).type().id() == cudf::type_id::INT16);
+  auto const ct = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  auto const filter = make_date_key_set(stream);
+  REQUIRE(filter->domain().family == sirius::op::membership_key_family::date_days);
+
+  bool saw_prior = false;
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});
+  request.membership_filters.push_back(make_probe_directive(1, filter, &saw_prior));
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  REQUIRE(result.applied);
+  CHECK(saw_prior);
+
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int16_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19 && (i % 50) % 5 == 0) {
+      expect_v.push_back(i % 100);
+      expect_k.push_back(static_cast<std::int16_t>(i % 50));
+    }
+  }
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  CHECK(column_to_host<std::int16_t>(out->view().column(1), stream) == expect_k);
 }

@@ -20,17 +20,24 @@
  *        small IN-list, Bloom): heterogeneous integer probe carriers (no materialized cast),
  *        the optional prior keep-mask (dead rows skip the lookup), sentinel conservation, the
  *        refusal of non-integer probe types, INT8/INT16 and unsigned keys, carrier-typed build
- *        sets, cross-carrier mask identity, and nulls on both sides (null build keys are dropped,
- *        null probe rows are definite non-members, the mask is never nullable).
+ *        sets, cross-carrier mask identity, nulls on both sides (null build keys are dropped,
+ *        null probe rows are definite non-members, the mask is never nullable), and DATE /
+ *        TIMESTAMP keys (native and narrow-carrier DATE probes, same-unit-only timestamps, zone
+ *        map as a containment oracle).
  */
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/table/table_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
+#include <cudf/wrappers/timestamps.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -56,6 +63,7 @@ using sirius::op::membership_probe_compatible;
 using sirius::op::sirius_dynamic_bloom_filter;
 using sirius::op::sirius_dynamic_in_list_filter;
 using sirius::op::sirius_dynamic_small_in_list_filter;
+using sirius::op::sirius_dynamic_zone_map_filter;
 
 namespace {
 
@@ -518,14 +526,22 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
   expect(id::UINT16, membership_key_rep::u32, membership_key_family::unsigned_int);
   expect(id::UINT32, membership_key_rep::u32, membership_key_family::unsigned_int);
   expect(id::UINT64, membership_key_rep::u64, membership_key_family::unsigned_int);
+  // Temporal keys ride their integer storage: int32 epoch days, int64 ticks.
+  expect(id::TIMESTAMP_DAYS, membership_key_rep::i32, membership_key_family::date_days);
+  for (auto const t : {id::TIMESTAMP_SECONDS,
+                       id::TIMESTAMP_MILLISECONDS,
+                       id::TIMESTAMP_MICROSECONDS,
+                       id::TIMESTAMP_NANOSECONDS}) {
+    expect(t, membership_key_rep::i64, membership_key_family::timestamp);
+  }
 
   for (auto const t : {id::EMPTY,
                        id::BOOL8,
                        id::FLOAT32,
                        id::FLOAT64,
-                       id::TIMESTAMP_DAYS,
-                       id::TIMESTAMP_MICROSECONDS,
+                       id::DURATION_DAYS,
                        id::DURATION_SECONDS,
+                       id::DURATION_MICROSECONDS,
                        id::DECIMAL32,
                        id::DECIMAL64,
                        id::DECIMAL128,
@@ -548,13 +564,69 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
     CHECK(membership_probe_compatible(unsigned_domain, cudf::data_type{t}));
     CHECK_FALSE(membership_probe_compatible(signed_domain, cudf::data_type{t}));
   }
-  for (auto const t : {id::FLOAT64, id::TIMESTAMP_DAYS, id::DECIMAL64, id::STRING, id::BOOL8}) {
+  for (auto const t : {id::FLOAT64,
+                       id::TIMESTAMP_DAYS,
+                       id::TIMESTAMP_MICROSECONDS,
+                       id::DECIMAL64,
+                       id::STRING,
+                       id::BOOL8}) {
     CHECK_FALSE(membership_probe_compatible(signed_domain, cudf::data_type{t}));
     CHECK_FALSE(membership_probe_compatible(unsigned_domain, cudf::data_type{t}));
   }
 
+  // A DATE key takes its native type or the storage carriers a pinned chunk narrows it to; a
+  // sub-day timestamp key takes exactly its own unit. Neither takes the other, INT64, or the
+  // unsigned carriers.
+  auto const date_domain = *classify_membership_key(cudf::data_type{id::TIMESTAMP_DAYS});
+  auto const us_domain   = *classify_membership_key(cudf::data_type{id::TIMESTAMP_MICROSECONDS});
+  for (auto const t : {id::TIMESTAMP_DAYS, id::INT8, id::INT16, id::INT32}) {
+    CHECK(membership_probe_compatible(date_domain, cudf::data_type{t}));
+    CHECK_FALSE(membership_probe_compatible(us_domain, cudf::data_type{t}));
+  }
+  for (auto const t : {id::INT64,
+                       id::UINT8,
+                       id::UINT32,
+                       id::TIMESTAMP_SECONDS,
+                       id::TIMESTAMP_MILLISECONDS,
+                       id::TIMESTAMP_MICROSECONDS,
+                       id::TIMESTAMP_NANOSECONDS,
+                       id::DURATION_DAYS,
+                       id::FLOAT64,
+                       id::STRING}) {
+    CHECK_FALSE(membership_probe_compatible(date_domain, cudf::data_type{t}));
+  }
+  CHECK(membership_probe_compatible(us_domain, cudf::data_type{id::TIMESTAMP_MICROSECONDS}));
+  for (auto const t : {id::INT64,
+                       id::UINT64,
+                       id::TIMESTAMP_SECONDS,
+                       id::TIMESTAMP_MILLISECONDS,
+                       id::TIMESTAMP_NANOSECONDS,
+                       id::DURATION_MICROSECONDS,
+                       id::FLOAT64}) {
+    CHECK_FALSE(membership_probe_compatible(us_domain, cudf::data_type{t}));
+  }
+
+  // The device reads every temporal type through its integer storage.
+  CHECK(sirius::op::membership_storage_type(cudf::data_type{id::TIMESTAMP_DAYS}) ==
+        cudf::data_type{id::INT32});
+  for (auto const t : {id::TIMESTAMP_SECONDS,
+                       id::TIMESTAMP_MILLISECONDS,
+                       id::TIMESTAMP_MICROSECONDS,
+                       id::TIMESTAMP_NANOSECONDS}) {
+    CHECK(sirius::op::membership_storage_type(cudf::data_type{t}) == cudf::data_type{id::INT64});
+  }
+  CHECK(sirius::op::membership_storage_type(cudf::data_type{id::INT16}) ==
+        cudf::data_type{id::INT16});
+
   // The three filters' type gates are the same predicate.
-  for (auto const t : {id::INT8, id::INT64, id::UINT16, id::UINT64, id::FLOAT64, id::STRING}) {
+  for (auto const t : {id::INT8,
+                       id::INT64,
+                       id::UINT16,
+                       id::UINT64,
+                       id::TIMESTAMP_DAYS,
+                       id::TIMESTAMP_NANOSECONDS,
+                       id::FLOAT64,
+                       id::STRING}) {
     CHECK(sirius_dynamic_bloom_filter::supports(cudf::data_type{t}) ==
           membership_key_supported(cudf::data_type{t}));
   }
@@ -573,6 +645,8 @@ TEST_CASE("hash IN-list set bytes are sized at the key rep, not the build carrie
   CHECK(bytes_of(id::UINT32) == bytes_of(id::INT32));
   CHECK(bytes_of(id::UINT64) == bytes_of(id::INT64));
   CHECK(bytes_of(id::INT64) == 2 * bytes_of(id::INT32));
+  CHECK(bytes_of(id::TIMESTAMP_DAYS) == bytes_of(id::INT32));
+  CHECK(bytes_of(id::TIMESTAMP_MICROSECONDS) == bytes_of(id::INT64));
 }
 
 // The three filters must answer identically whatever carrier the probe arrives at, with or
@@ -977,5 +1051,303 @@ TEST_CASE("membership filters handle all-null probes and all-null builds",
     std::vector<std::uint8_t> const expected{0, 0, 0, 0};
     CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
     CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == expected);
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// DATE / TIMESTAMP keys
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Upload @p values as a temporal column of @p type whose storage element is T (int32_t for
+/// TIMESTAMP_DAYS, int64_t for the other units).
+template <typename T>
+std::unique_ptr<cudf::column> make_temporal(std::vector<T> const& values,
+                                            cudf::data_type type,
+                                            rmm::cuda_stream_view stream)
+{
+  auto col       = cudf::make_timestamp_column(type,
+                                         static_cast<cudf::size_type>(values.size()),
+                                         cudf::mask_state::UNALLOCATED,
+                                         stream,
+                                         cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(col->mutable_view().head<T>(),
+                                   values.data(),
+                                   values.size() * sizeof(T),
+                                   cudaMemcpyHostToDevice,
+                                   stream.value());
+  REQUIRE(err == cudaSuccess);
+  stream.synchronize();
+  return col;
+}
+
+std::unique_ptr<cudf::column> make_days(std::vector<std::int32_t> const& days,
+                                        rmm::cuda_stream_view stream)
+{
+  return make_temporal(days, cudf::data_type{cudf::type_id::TIMESTAMP_DAYS}, stream);
+}
+
+std::unique_ptr<cudf::column> make_micros(std::vector<std::int64_t> const& ticks,
+                                          rmm::cuda_stream_view stream)
+{
+  return make_temporal(ticks, cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}, stream);
+}
+
+std::unique_ptr<cudf::scalar> make_day_scalar(std::int32_t day, rmm::cuda_stream_view stream)
+{
+  return std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
+    cudf::timestamp_D{cudf::duration_D{day}}, true, stream);
+}
+
+/// Lowers a zone map over the probe column and evaluates it, yielding the BOOL8 keep mask.
+std::vector<std::uint8_t> zone_map_mask(sirius_dynamic_zone_map_filter const& zone_map,
+                                        cudf::column_view const& probe,
+                                        rmm::cuda_stream_view stream)
+{
+  cudf::table_view const input{{probe}};
+  cudf::ast::tree tree;
+  auto const& col_ref = tree.emplace<cudf::ast::column_reference>(0);
+  auto const& root    = zone_map.to_ast(tree, col_ref, kDevice);
+  auto mask = cudf::compute_column(input, root, stream, cudf::get_current_device_resource_ref());
+  return mask_to_host(mask->view(), stream);
+}
+
+template <class Filter>
+std::unique_ptr<cudf::column> raw_mask(Filter const& filter,
+                                       cudf::column_view const& probe,
+                                       rmm::cuda_stream_view stream)
+{
+  return filter.compute_mask(
+    probe, nullptr, kDevice, stream, cudf::get_current_device_resource_ref());
+}
+
+}  // namespace
+
+// A DATE key set (TIMESTAMP_DAYS, int32 epoch days) is probed by the native column the
+// post-decode cascade emits and by the INT8/INT16 carriers a pinned chunk stores a DATE in (plus
+// INT32, the storage width itself). All three filters must answer the host oracle identically on
+// every carrier, with and without a prior keep-mask; the zone map over the same keys must contain
+// every membership hit.
+TEST_CASE("DATE keys probe native TIMESTAMP_DAYS and narrow-carrier columns identically",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // Epoch days around 2000-01-01 (10957) plus a pre-epoch date and the epoch itself; all fit
+  // INT16, so INT16/INT32/TIMESTAMP_DAYS see the same logical probe and INT8 sees the subset
+  // that fits it.
+  std::vector<std::int64_t> const key_values{10957, 10958, 11000, 0, -100, 127, -128};
+  std::vector<std::int64_t> probe_values;
+  for (std::int64_t v = -130; v <= 130; ++v) {  // 261 rows: crosses prior-mask word boundaries
+    probe_values.push_back(v);
+  }
+  for (std::int64_t const v : {10956, 10957, 10958, 10959, 11000, 20000, -20000}) {
+    probe_values.push_back(v);
+  }
+  auto const is_key = [&](std::int64_t v) {
+    return std::find(key_values.begin(), key_values.end(), v) != key_values.end();
+  };
+
+  std::vector<std::int32_t> key_days(key_values.begin(), key_values.end());
+  auto const keys = make_days(key_days, stream);
+  REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+  REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));
+  REQUIRE(sirius_dynamic_bloom_filter::supports(keys->type()));
+
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  for (auto const* domain : {&in_list.domain(), &small_list.domain(), &bloom.domain()}) {
+    CHECK(domain->rep == membership_key_rep::i32);
+    CHECK(domain->family == membership_key_family::date_days);
+    CHECK(domain->native == keys->type());
+  }
+  REQUIRE(in_list.has_persistent_set());
+
+  // Zone map over the same build keys, as the publisher would emit beside the membership filter.
+  std::vector<sirius::op::zone_map_entry> zones;
+  zones.push_back({make_day_scalar(-128, stream), make_day_scalar(11000, stream)});
+  sirius_dynamic_zone_map_filter const zone_map{std::move(zones)};
+
+  // Reference: the native TIMESTAMP_DAYS probe with no prior, checked against the host oracle,
+  // then each Bloom answer is compared against the native Bloom answer.
+  std::vector<std::int32_t> native_days(probe_values.begin(), probe_values.end());
+  auto const native = make_days(native_days, stream);
+  std::vector<std::uint8_t> expected;
+  std::vector<bool> keep;
+  for (std::size_t i = 0; i < probe_values.size(); ++i) {
+    expected.push_back(is_key(probe_values[i]) ? 1 : 0);
+    keep.push_back((i % 3) == 0);
+  }
+  auto prior                 = upload_prior_mask(keep, stream);
+  auto const* prior_words    = static_cast<std::uint32_t const*>(prior.data());
+  auto const expected_masked = and_with(expected, keep);
+
+  CHECK(probe_mask(in_list, native->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(in_list, native->view(), prior_words, stream) == expected_masked);
+  CHECK(probe_mask(small_list, native->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(small_list, native->view(), prior_words, stream) == expected_masked);
+  auto const bloom_reference = probe_mask(bloom, native->view(), nullptr, stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != 0) { REQUIRE(bloom_reference[i] == 1); }  // no false negatives
+  }
+  CHECK(probe_mask(bloom, native->view(), prior_words, stream) == and_with(bloom_reference, keep));
+
+  // Zone map as oracle: every exact hit lies inside [min, max], and the bounds themselves hit
+  // both representations.
+  auto const zone_hits = zone_map_mask(zone_map, native->view(), stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    INFO("day=" << probe_values[i]);
+    if (expected[i] != 0) { CHECK(zone_hits[i] == 1); }
+    if (zone_hits[i] == 0) { CHECK(bloom_reference[i] == 0); }
+    if (probe_values[i] == -128 || probe_values[i] == 11000) {
+      CHECK(zone_hits[i] == 1);
+      CHECK(expected[i] == 1);
+    }
+  }
+
+  // The DATE storage carriers: each sees the subset of the probe that fits it.
+  auto const run_carrier = [&](auto carrier_tag) {
+    using carrier_type = decltype(carrier_tag);
+    std::vector<std::int64_t> values;
+    std::vector<std::uint8_t> carrier_expected;
+    std::vector<std::uint8_t> carrier_bloom_reference;
+    std::vector<bool> carrier_keep;
+    for (std::size_t i = 0; i < probe_values.size(); ++i) {
+      auto const v = probe_values[i];
+      if (v < std::numeric_limits<carrier_type>::min() ||
+          v > std::numeric_limits<carrier_type>::max()) {
+        continue;
+      }
+      values.push_back(v);
+      carrier_expected.push_back(expected[i]);
+      carrier_bloom_reference.push_back(bloom_reference[i]);
+      carrier_keep.push_back(keep[i]);
+    }
+    auto carrier_prior              = upload_prior_mask(carrier_keep, stream);
+    auto const* carrier_prior_words = static_cast<std::uint32_t const*>(carrier_prior.data());
+    auto const probe                = make_typed<carrier_type>(values, stream);
+    INFO("carrier=" << static_cast<int>(probe->type().id()));
+    CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == carrier_expected);
+    CHECK(probe_mask(in_list, probe->view(), carrier_prior_words, stream) ==
+          and_with(carrier_expected, carrier_keep));
+    CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == carrier_expected);
+    CHECK(probe_mask(small_list, probe->view(), carrier_prior_words, stream) ==
+          and_with(carrier_expected, carrier_keep));
+    CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == carrier_bloom_reference);
+    CHECK(probe_mask(bloom, probe->view(), carrier_prior_words, stream) ==
+          and_with(carrier_bloom_reference, carrier_keep));
+  };
+  run_carrier(std::int8_t{});
+  run_carrier(std::int16_t{});
+  run_carrier(std::int32_t{});
+
+  // INT64 is not a DATE carrier, and a sub-day timestamp is another unit: both decline.
+  auto const wide  = make_typed<std::int64_t>(probe_values, stream);
+  auto const micro = make_micros(probe_values, stream);
+  for (auto const* probe : {&wide, &micro}) {
+    CHECK(raw_mask(in_list, (*probe)->view(), stream) == nullptr);
+    CHECK(raw_mask(small_list, (*probe)->view(), stream) == nullptr);
+    CHECK(raw_mask(bloom, (*probe)->view(), stream) == nullptr);
+  }
+}
+
+TEST_CASE("DATE probes write null rows as false and keep the sentinel conservative",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const keys = make_days({10957, 10958}, stream);
+  sirius_dynamic_in_list_filter filter{keys->view(), stream, mr};
+
+  // Row 1 is null: a definite non-member written as `false`, and the mask stays non-nullable, as
+  // for integer probes.
+  auto probe     = make_days({10957, 10958, 5, 10958}, stream);
+  auto null_mask = cudf::create_null_mask(4, cudf::mask_state::ALL_VALID, stream, mr);
+  cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
+  probe->set_null_mask(std::move(null_mask), 1);
+  auto mask = filter.compute_mask(probe->view(), kDevice, stream, mr);
+  REQUIRE(mask != nullptr);
+  CHECK_FALSE(mask->nullable());
+  CHECK(mask->null_count() == 0);
+  auto const host = mask_to_host(mask->view(), stream);
+  CHECK(host == std::vector<std::uint8_t>{1, 0, 0, 1});
+
+  // The int32 rep's empty sentinel (INT32_MIN epoch days) cannot be stored, so a probe equal to
+  // it is kept conservatively, exactly as for an INT32 set.
+  auto const sentinel = make_days({std::numeric_limits<std::int32_t>::min(), 10957, 6}, stream);
+  CHECK(probe_mask(filter, sentinel->view(), nullptr, stream) ==
+        std::vector<std::uint8_t>{1, 1, 0});
+}
+
+// Sub-day timestamps sit on int64 ticks. The set is built at that rep and probed by the same
+// unit only: another unit (or a bare INT64, or a DATE) is a semantic mismatch even though the
+// bytes are the same width, and the planner's casts make such a pair unreachable anyway.
+TEST_CASE("TIMESTAMP keys probe their own unit and decline every other type",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // 2000-01-01T00:00:00 in microseconds plus offsets, a pre-epoch tick, and a value beyond
+  // int32 either way.
+  constexpr std::int64_t y2k = 946'684'800'000'000LL;
+  std::vector<std::int64_t> const key_values{y2k, y2k + 1, y2k + 3'600'000'000LL, -1, 0, 7};
+  std::vector<std::int64_t> probe_values;
+  for (std::int64_t v = -40; v <= 40; ++v) {  // 81 rows: crosses a prior-mask word boundary
+    probe_values.push_back(v);
+  }
+  for (std::int64_t const v :
+       std::vector<std::int64_t>{y2k - 1, y2k, y2k + 1, y2k + 2, y2k + 3'600'000'000LL}) {
+    probe_values.push_back(v);
+  }
+  std::vector<std::uint8_t> expected;
+  std::vector<bool> keep;
+  for (std::size_t i = 0; i < probe_values.size(); ++i) {
+    expected.push_back(
+      std::find(key_values.begin(), key_values.end(), probe_values[i]) != key_values.end() ? 1 : 0);
+    keep.push_back((i % 2) == 0);
+  }
+  auto prior                 = upload_prior_mask(keep, stream);
+  auto const* prior_words    = static_cast<std::uint32_t const*>(prior.data());
+  auto const expected_masked = and_with(expected, keep);
+
+  auto const keys = make_micros(key_values, stream);
+  REQUIRE(membership_key_supported(keys->type()));
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  for (auto const* domain : {&in_list.domain(), &small_list.domain(), &bloom.domain()}) {
+    CHECK(domain->rep == membership_key_rep::i64);
+    CHECK(domain->family == membership_key_family::timestamp);
+    CHECK(domain->native == keys->type());
+  }
+
+  auto const probe = make_micros(probe_values, stream);
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(in_list, probe->view(), prior_words, stream) == expected_masked);
+  CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(small_list, probe->view(), prior_words, stream) == expected_masked);
+  auto const bloom_mask = probe_mask(bloom, probe->view(), nullptr, stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != 0) { CHECK(bloom_mask[i] == 1); }
+  }
+  CHECK(probe_mask(bloom, probe->view(), prior_words, stream) == and_with(bloom_mask, keep));
+
+  // Mixed units and bare integers decline; the same ticks in another unit mean other instants.
+  auto const millis =
+    make_temporal(probe_values, cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS}, stream);
+  auto const nanos =
+    make_temporal(probe_values, cudf::data_type{cudf::type_id::TIMESTAMP_NANOSECONDS}, stream);
+  auto const plain = make_typed<std::int64_t>(probe_values, stream);
+  auto const days  = make_days({0, 7}, stream);
+  for (auto const* other : {&millis, &nanos, &plain, &days}) {
+    INFO("probe type=" << static_cast<int>((*other)->type().id()));
+    CHECK(raw_mask(in_list, (*other)->view(), stream) == nullptr);
+    CHECK(raw_mask(small_list, (*other)->view(), stream) == nullptr);
+    CHECK(raw_mask(bloom, (*other)->view(), stream) == nullptr);
   }
 }
