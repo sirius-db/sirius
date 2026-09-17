@@ -32,6 +32,9 @@
  *  - DATE keys: a TIMESTAMP_DAYS key publishes a membership filter and a zone map, is probed by
  *    the native column and by an INT16 carrier alike, and a build column arriving at an INT16
  *    carrier is restored to TIMESTAMP_DAYS so it stays in the DATE family.
+ *  - Decimal keys: a DECIMAL64 key arriving as a same-scale DECIMAL32 carrier publishes a 32-bit
+ *    set; a DECIMAL128 key publishes membership only when its unscaled build values fit int64
+ *    (otherwise only the zone map), and the join-edge validator requires an identical scale.
  *  - Sparse fan-out and gating: each target receives only its bound keys, the domain-coverage
  *    gate consults each key's own domain, and unbound keys cost no construction.
  *  - Floating-point suppression: a FLOAT64 key whose build holds a NaN receives no zone map (the
@@ -94,6 +97,9 @@ using sirius::op::dynamic_filter_route_class;
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
 constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
 constexpr auto kDays    = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+auto const kDecimal32   = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+auto const kDecimal64   = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+auto const kDecimal128  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
@@ -270,6 +276,32 @@ std::unique_ptr<cudf::column> make_int16_values(publisher_fixture const& fixture
   auto const err = cudaMemcpyAsync(column->mutable_view().data<std::int16_t>(),
                                    values.data(),
                                    values.size() * sizeof(std::int16_t),
+                                   cudaMemcpyHostToDevice,
+                                   fixture.stream.value());
+  REQUIRE(err == cudaSuccess);
+  fixture.stream.synchronize();
+  return column;
+}
+
+// Fixed-point column at @p type whose unscaled storage holds @p values narrowed to Rep.
+template <typename Rep>
+std::unique_ptr<cudf::column> make_decimal_values(publisher_fixture const& fixture,
+                                                  cudf::data_type type,
+                                                  std::vector<__int128_t> const& values)
+{
+  std::vector<Rep> typed;
+  typed.reserve(values.size());
+  for (auto const v : values) {
+    typed.push_back(static_cast<Rep>(v));
+  }
+  auto column    = cudf::make_fixed_point_column(type,
+                                              static_cast<cudf::size_type>(typed.size()),
+                                              cudf::mask_state::UNALLOCATED,
+                                              fixture.stream,
+                                              cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(column->mutable_view().data<Rep>(),
+                                   typed.data(),
+                                   typed.size() * sizeof(Rep),
                                    cudaMemcpyHostToDevice,
                                    fixture.stream.value());
   REQUIRE(err == cudaSuccess);
@@ -851,6 +883,134 @@ TEST_CASE("dynamic-filter publisher restores a DATE build column arriving at an 
   REQUIRE(membership_mask(**membership, narrowed->view(), fixture) == expected);
 }
 
+// A DECIMAL(15,2) key (TPC-H q2's ps_supplycost) is DECIMAL64 in the plan, but a pinned build
+// column may arrive as DECIMAL32 at the same scale. That carrier restores losslessly, so the key
+// publishes a 32-bit set at the carrier and both the native DECIMAL64 probe and the DECIMAL32
+// carrier probe answer identically.
+TEST_CASE("dynamic-filter publisher accepts a DECIMAL32-carrier build column for a DECIMAL64 key",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const native_keys =
+    make_decimal_values<std::int64_t>(fixture, kDecimal64, {1000, 2000, 3000});
+  fixture.columns.push_back(cudf::cast(native_keys->view(), kDecimal32, fixture.stream, mr));
+  REQUIRE(fixture.columns.front()->type() == kDecimal32);
+
+  auto key         = make_int64_key(0, 0);
+  key.storage_type = kDecimal64;
+  auto channel     = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+  std::vector<dynamic_filter_publish_plan::probe_target> targets;
+  targets.push_back({.filter_set               = channel,
+                     .route_class              = dynamic_filter_route_class::scan,
+                     .accepts_zone_map_filters = true,
+                     .key_bindings             = {{.admitted_key_index   = 0,
+                                                   .channel_push_ordinal = kProbeColumnIndex,
+                                                   .probe_storage_type   = kDecimal64}}});
+  dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(fixture.replica_spaces)};
+  auto const outcome =
+    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  REQUIRE(outcome.keys_considered == 1);
+  REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+  REQUIRE(outcome.membership_filters_built == 1);
+  REQUIRE(outcome.filters_pushed == 1);
+
+  auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
+  REQUIRE(snapshot.size() == 1);
+  auto const* small =
+    dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(snapshot.front().get());
+  REQUIRE(small != nullptr);
+  CHECK(small->domain().rep == sirius::op::membership_key_rep::i32);
+  CHECK(small->domain().family == sirius::op::membership_key_family::decimal);
+  CHECK(small->domain().native == kDecimal32);
+  CHECK(small->domain().scale == -2);
+
+  auto const native = make_decimal_values<std::int64_t>(
+    fixture, kDecimal64, {1000, 1500, 2000, 3000, 6'000'000'000LL});
+  REQUIRE(membership_mask(*small, native->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 0, 1, 1, 0});
+  auto const carrier =
+    make_decimal_values<std::int32_t>(fixture, kDecimal32, {1000, 1500, 2000, 3000});
+  REQUIRE(membership_mask(*small, carrier->view(), fixture) ==
+          std::vector<std::uint8_t>{1, 0, 1, 1});
+  // Another scale never reaches a filter (the planner casts), and is declined if it did.
+  auto const rescaled = make_decimal_values<std::int64_t>(
+    fixture, cudf::data_type{cudf::type_id::DECIMAL64, -3}, {10000, 20000});
+  REQUIRE(small->compute_mask(rescaled->view(), kDeviceId, fixture.stream, mr) == nullptr);
+}
+
+// A DECIMAL128 key (TPC-H q15's total_revenue, join-edge route) sits on the int64 rep. The
+// publisher decides per build whether the unscaled values fit: when they do, membership publishes;
+// when they do not, membership is declined for the key -- not counted as a type mismatch -- while
+// the zone map, exact at DECIMAL128, still publishes.
+TEST_CASE("dynamic-filter publisher publishes DECIMAL128 membership only when the build fits int64",
+          "[dynamic_filter][publisher]")
+{
+  publisher_fixture fixture;
+  auto const mr = cudf::get_current_device_resource_ref();
+
+  auto const publish = [&](std::vector<__int128_t> const& build_values) {
+    fixture.columns.push_back(make_decimal_values<__int128_t>(fixture, kDecimal128, build_values));
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kDecimal128;
+    auto channel     = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = true,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kDecimal128}}});
+    auto replica_spaces = fixture.replica_spaces;
+    dynamic_filter_publish_plan plan{
+      {key}, std::move(targets), std::move(replica_spaces), {.emit_zone_map_filters = true}};
+    auto const outcome =
+      sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+    return std::pair{outcome, channel->filters_for_column(kProbeColumnIndex)};
+  };
+
+  SECTION("values within int64: membership and zone map both publish")
+  {
+    auto const [outcome, snapshot] = publish({100, std::numeric_limits<std::int64_t>::max(), 300});
+    REQUIRE(outcome.keys_considered == 1);
+    REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+    REQUIRE(outcome.zone_map_filters_built == 1);
+    REQUIRE(outcome.membership_filters_built == 1);
+    REQUIRE(outcome.filters_pushed == 2);
+    REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+    REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_small_in_list_filter>(snapshot) == 1);
+    auto const membership = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& f) {
+      return dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(f.get()) !=
+             nullptr;
+    });
+    auto const* small =
+      static_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(membership->get());
+    CHECK(small->domain().rep == sirius::op::membership_key_rep::i64);
+    CHECK(small->domain().native == kDecimal128);
+
+    auto const wide = make_decimal_values<__int128_t>(
+      fixture,
+      kDecimal128,
+      {100, 200, 300, static_cast<__int128_t>(std::numeric_limits<std::int64_t>::max()) + 1});
+    REQUIRE(membership_mask(*small, wide->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 0, 1, 0});
+    auto const narrow = make_decimal_values<std::int64_t>(fixture, kDecimal64, {300, 301});
+    REQUIRE(membership_mask(*small, narrow->view(), fixture) == std::vector<std::uint8_t>{1, 0});
+  }
+
+  SECTION("a value beyond int64: membership declined, zone map kept")
+  {
+    auto const [outcome, snapshot] = publish({100, static_cast<__int128_t>(1) << 70, 300});
+    REQUIRE(outcome.keys_considered == 1);
+    REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+    REQUIRE(outcome.zone_map_filters_built == 1);
+    REQUIRE(outcome.membership_filters_built == 0);
+    REQUIRE(outcome.filters_pushed == 1);
+    REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+  }
+}
+
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",
           "[dynamic_filter][publisher]")
 {
@@ -1331,6 +1491,38 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
     key.storage_type = cudf::data_type{cudf::type_id::INT8};
     REQUIRE_NOTHROW(
       dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)));
+  }
+
+  SECTION("direct binding over a same-scale decimal key is accepted")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {
+         {.admitted_key_index = 0, .channel_push_ordinal = 0, .probe_storage_type = kDecimal128}}});
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kDecimal128;
+    REQUIRE_NOTHROW(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)));
+  }
+
+  SECTION("direct binding whose decimal scale differs from the admitted key's is rejected")
+  {
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {{.admitted_key_index   = 0,
+                                     .channel_push_ordinal = 0,
+                                     .probe_storage_type   = cudf::data_type{cudf::type_id::DECIMAL64, -3}}}});
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kDecimal64;
+    REQUIRE_THROWS_AS(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
+      std::invalid_argument);
   }
 
   SECTION("direct binding whose probe storage type differs from the admitted key's build type")

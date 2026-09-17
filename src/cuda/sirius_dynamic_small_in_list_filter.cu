@@ -165,8 +165,14 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   auto const domain = classify_membership_key(keys.type());
   if (!domain.has_value() || !supports(keys)) {
     throw std::invalid_argument(
-      "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys valid integer "
-      "keys required).");
+      "[sirius_dynamic_small_in_list_filter] unsupported key column (1..k_max_keys valid keys of "
+      "a membership_key_supported type required).");
+  }
+  // A DECIMAL128 build whose unscaled values exceed the int64 rep cannot be stored exactly.
+  if (!membership_build_fits_rep(keys, stream, mr)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_small_in_list_filter] build keys do not fit the key rep (DECIMAL128 values "
+      "outside int64).");
   }
   _domain = *domain;
 
@@ -188,12 +194,13 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   }
 
   // Needles are stored at the rep so one kernel per (adapter, rep) serves every build carrier;
-  // a narrower build carrier widens per element on the way in.
+  // a build carrier other than the rep converts per element on the way in.
   auto const bytes = _num_keys * membership_rep_bytes(_domain.rep);
   rmm::device_buffer needles{bytes, stream, mr};
   bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
-    return detail::with_build_key_iterator<key_type>(build_keys, [&](auto first, auto last) {
+    return detail::with_build_key_iterator<key_type>(
+      _domain, build_keys, stream, mr, [&](auto first, auto last) {
       thrust::copy(
         rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
     });
@@ -236,7 +243,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   auto const dispatched = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type      = decltype(key_tag);
     auto const* needles = static_cast<key_type const*>(replica->needles.data());
-    return detail::dispatch_probe_adapter<key_type>(_domain, probe, [&](auto adapter) {
+    return detail::dispatch_probe_adapter<key_type>(_domain, probe, stream, [&](auto adapter) {
       out = cudf::make_numeric_column(
         cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
       auto* const outp = out->mutable_view().data<bool>();

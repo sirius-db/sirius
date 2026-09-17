@@ -134,17 +134,20 @@ set_owner<KeyT> make_set(std::size_t capacity,
 }
 
 template <class KeyT>
-set_owner<KeyT> build_set(cudf::column_view const& keys,
+set_owner<KeyT> build_set(membership_key_domain const& domain,
+                          cudf::column_view const& keys,
                           std::size_t capacity,
                           rmm::device_async_resource_ref mr,
                           cuda::stream_ref stream)
 {
   auto set = make_set<KeyT>(capacity, mr, stream);
   if (keys.size() > 0) {
-    // The build column may sit at a narrower same-family carrier than the rep; the iterator widens
-    // per element instead of materializing a widened copy.
+    // The build column may sit at a same-family carrier other than the rep; the iterator converts
+    // per element instead of materializing a rep-typed copy.
     bool const inserted = detail::with_build_key_iterator<KeyT>(
-      keys, [&](auto first, auto last) { set->insert_async(first, last, stream); });
+      domain, keys, stream, mr, [&](auto first, auto last) {
+        set->insert_async(first, last, stream);
+      });
     if (!inserted) {
       throw std::logic_error("[sirius_dynamic_in_list_filter] build carrier does not fit its rep.");
     }
@@ -225,7 +228,13 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   auto const domain = classify_membership_key(keys.type());
   if (!domain.has_value() || !supports(keys)) {
     throw std::invalid_argument(
-      "[sirius_dynamic_in_list_filter] unsupported key column (integer keys required).");
+      "[sirius_dynamic_in_list_filter] unsupported key column (see membership_key_supported).");
+  }
+  // A DECIMAL128 build whose unscaled values exceed the int64 rep cannot be stored exactly.
+  if (!membership_build_fits_rep(keys, stream, mr)) {
+    throw std::invalid_argument(
+      "[sirius_dynamic_in_list_filter] build keys do not fit the key rep (DECIMAL128 values "
+      "outside int64).");
   }
   _domain = *domain;
 
@@ -251,7 +260,7 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
   auto source = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
     return std::make_unique<set_replica>(_set->source_device,
-                                         build_set<key_type>(build_keys, capacity, mr, s));
+                                         build_set<key_type>(_domain, build_keys, capacity, mr, s));
   });
   SIRIUS_LOG_DEBUG(
     "[sirius_dynamic_in_list_filter] built set: {} keys, bucket_size={}, capacity_factor={}, "
@@ -426,7 +435,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
     [&](auto const& set) {
       using owner_type = std::decay_t<decltype(set)>;
       using key_type   = typename owner_type::element_type::key_type;
-      return detail::dispatch_probe_adapter<key_type>(_domain, probe, [&](auto adapter) {
+      return detail::dispatch_probe_adapter<key_type>(_domain, probe, stream, [&](auto adapter) {
         out = cudf::make_numeric_column(
           cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
         auto* const outp = out->mutable_view().data<bool>();

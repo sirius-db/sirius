@@ -170,8 +170,9 @@ class sirius_mask_applicable {
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
    * The membership implementations accept any integer carrier of the key's signedness
-   * (INT8..INT64 for signed keys, UINT8..UINT64 for unsigned), converting per element in-kernel:
-   * a pinned chunk may store the key narrower than the type the filter was published with, and no
+   * (INT8..INT64 for signed keys, UINT8..UINT64 for unsigned) and, for decimal keys, any
+   * fixed-point width at the key's scale (DECIMAL32/64/128), converting per element in-kernel: a
+   * pinned chunk may store the key narrower than the type the filter was published with, and no
    * consumer should have to materialize a widened copy to probe it. A DATE key accepts
    * TIMESTAMP_DAYS or its INT8/INT16/INT32 storage carriers; a sub-day timestamp key accepts only
    * its own unit. `membership_probe_compatible` is the host-side mirror of what a filter accepts.
@@ -217,15 +218,17 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a persistent set from integer or temporal keys (see
+   * @brief Builds a persistent set from keys of a supported type (see
    * `membership_key_supported`), excluding nulls
    *
    * The set is typed at the key's rep: a build column arriving at a narrowed carrier (INT8/INT16,
-   * UINT8/UINT16) widens per element into a 32-bit set; a temporal column is read through its
-   * integer storage (int32 epoch days, int64 ticks). `size()` reports the valid keys stored.
+   * UINT8/UINT16, DECIMAL32 for a DECIMAL64 key) widens per element into a 32-bit set; a temporal
+   * column is read through its integer storage (int32 epoch days, int64 ticks); a DECIMAL128
+   * column narrows into the int64 set once `membership_build_fits_rep` has verified it. `size()`
+   * reports the valid keys stored.
    *
    * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    */
@@ -274,7 +277,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 };
 
 /**
- * @brief Exact linear membership over a small integer or temporal set
+ * @brief Exact linear membership over a small key set of a supported type
  *
  * Needles are stored at the key's rep (see `membership_key_domain`). Null build keys are compacted
  * out; `supports()` and `size()` count the valid keys.
@@ -289,7 +292,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
    * @brief Copies a small build-key set into device-local storage
    *
    * @pre The backing storage for @p keys remains valid until the copy on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
   sirius_dynamic_small_in_list_filter(cudf::column_view const& keys,
@@ -348,11 +351,11 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a Bloom filter from integer or temporal keys (see `membership_key_supported`),
+   * @brief Builds a Bloom filter from keys of a supported type (see `membership_key_supported`),
    * excluding nulls
    *
    * @pre Key storage remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    */

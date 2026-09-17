@@ -16,6 +16,10 @@
 
 #include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 
+#include "helper/numeric_narrowing.hpp"
+
+#include <limits>
+
 namespace sirius::op {
 
 // Each key family owns one arm here and a matching adapter arm in
@@ -49,7 +53,20 @@ std::optional<membership_key_domain> classify_membership_key(cudf::data_type bui
     case cudf::type_id::TIMESTAMP_MICROSECONDS:
     case cudf::type_id::TIMESTAMP_NANOSECONDS:
       return membership_key_domain{rep::i64, family::timestamp, build_type};
-    // Every other type (duration, decimal, floating-point, string, nested) declines.
+    // Fixed-point keys are their unscaled integer storage at one scale. A DECIMAL64 key pinned
+    // narrow arrives as DECIMAL32 at the same scale and builds a 32-bit set, exactly like an
+    // INT16 carrier of an INTEGER key. DECIMAL128 has no 16-byte rep (cuco's static_set caps keys
+    // at 8 bytes); it classifies onto i64 provisionally and membership_build_fits_rep decides.
+    case cudf::type_id::DECIMAL32:
+      return membership_key_domain{rep::i32, family::decimal, build_type, build_type.scale()};
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128:
+      return membership_key_domain{rep::i64, family::decimal, build_type, build_type.scale()};
+    // Strings have no bitwise-comparable fixed-width form a set could hold; the set stores a
+    // 64-bit XXHash_64 fingerprint per key instead (no false negatives, see the header).
+    case cudf::type_id::STRING:
+      return membership_key_domain{rep::u64, family::string_hash, build_type};
+    // Every other type (duration, floating-point, nested) declines.
     default: return std::nullopt;
   }
 }
@@ -57,6 +74,26 @@ std::optional<membership_key_domain> classify_membership_key(cudf::data_type bui
 bool membership_key_supported(cudf::data_type t) noexcept
 {
   return classify_membership_key(t).has_value();
+}
+
+bool membership_build_fits_rep(cudf::column_view const& keys,
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
+{
+  auto const domain = classify_membership_key(keys.type());
+  if (!domain.has_value()) { return false; }
+  if (keys.type().id() != cudf::type_id::DECIMAL128) { return true; }
+  // No non-null value: nothing can be truncated (every filter compacts null build keys out).
+  if (keys.size() == 0 || keys.null_count() == keys.size()) { return true; }
+  // Exact unscaled bounds over the valid rows; nullopt only for a scale outside the SQL range,
+  // which DuckDB never produces, and is treated as not fitting so nothing is built on an
+  // unverified column.
+  auto const range = sirius::compute_exact_numeric_range(keys, stream, mr);
+  if (!range.has_value() || range->domain != sirius::numeric_range_domain::DECIMAL) {
+    return false;
+  }
+  return range->minimum >= static_cast<__int128_t>(std::numeric_limits<std::int64_t>::min()) &&
+         range->maximum <= static_cast<__int128_t>(std::numeric_limits<std::int64_t>::max());
 }
 
 // Mirrors dispatch_probe_adapter: the probe carriers each family's adapter accepts.
@@ -94,6 +131,16 @@ bool membership_probe_compatible(membership_key_domain const& domain,
     // Sub-day timestamps are never narrowed, and a unit change is a planner cast that blocks the
     // key upstream, so only the identical unit is comparable.
     case membership_key_family::timestamp: return probe.id() == domain.native.id();
+    case membership_key_family::decimal:
+      switch (probe.id()) {
+        case cudf::type_id::DECIMAL32:
+        case cudf::type_id::DECIMAL64:
+        case cudf::type_id::DECIMAL128: return probe.scale() == domain.scale;
+        default: return false;
+      }
+    // The in-kernel hash reads cudf::string_view elements, so the probe must be a materialized
+    // STRING column; a dictionary-encoded carrier declines rather than hashing its codes.
+    case membership_key_family::string_hash: return probe.id() == cudf::type_id::STRING;
   }
   return false;
 }

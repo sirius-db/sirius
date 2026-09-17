@@ -18,6 +18,7 @@
 
 #include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "telemetry/nvtx.hpp"
@@ -239,14 +240,31 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       sirius::op::sirius_dynamic_in_list_filter::estimated_set_bytes(valid_rows, col.type());
     auto const bloom_bytes = sirius::op::sirius_dynamic_bloom_filter::estimated_bytes(valid_rows);
 
+    // The type gates below are necessary, not sufficient: a DECIMAL128 key sits on the int64 rep
+    // only when its unscaled build values fit, which is a property of this build, not the type.
+    // One min/max reduction here spares every filter's supports() from re-deriving it; an
+    // unfitting build declines membership for the key while the zone map (exact at DECIMAL128)
+    // still publishes.
+    bool const fits_rep =
+      membership_key_supported(col.type()) && membership_build_fits_rep(col, stream, allocator_ref);
+    if (membership_key_supported(col.type()) && !fits_rep) {
+      SIRIUS_LOG_DEBUG(
+        "[sirius_physical_hash_join] dynamic filter key {}: build values exceed the membership "
+        "key rep (DECIMAL128 outside int64); membership filters declined.",
+        admitted_key_index);
+    }
+
     auto const chosen = choose_membership_filter(
       {.build_rows               = valid_rows,
        .l2_cache_bytes           = l2_bytes,
        .estimated_hash_set_bytes = set_bytes,
        .inlist_max_l2_fraction   = plan.inlist_max_l2_fraction(),
-       .supports_small_in_list   = sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
-       .supports_hash_in_list    = sirius::op::sirius_dynamic_in_list_filter::supports(col),
-       .supports_bloom           = sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
+       .supports_small_in_list =
+         fits_rep && sirius::op::sirius_dynamic_small_in_list_filter::supports(col),
+       .supports_hash_in_list =
+         fits_rep && sirius::op::sirius_dynamic_in_list_filter::supports(col),
+       .supports_bloom =
+         fits_rep && sirius::op::sirius_dynamic_bloom_filter::supports(col.type())});
 
     char const* choice = "none";
     switch (chosen) {

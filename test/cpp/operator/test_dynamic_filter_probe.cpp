@@ -19,17 +19,20 @@
  * @brief Single-GPU probe-kernel semantics of the membership dynamic filters (IN-list,
  *        small IN-list, Bloom): heterogeneous integer probe carriers (no materialized cast),
  *        the optional prior keep-mask (dead rows skip the lookup), sentinel conservation, the
- *        refusal of non-integer probe types, INT8/INT16 and unsigned keys, carrier-typed build
- *        sets, cross-carrier mask identity, nulls on both sides (null build keys are dropped,
- *        null probe rows are definite non-members, the mask is never nullable), and DATE /
- *        TIMESTAMP keys (native and narrow-carrier DATE probes, same-unit-only timestamps, zone
- *        map as a containment oracle).
+ *        refusal of non-integer probe types against integer sets, INT8/INT16 and unsigned keys,
+ *        carrier-typed build sets, cross-carrier mask identity, nulls on both sides (null build
+ *        keys are dropped, null probe rows are definite non-members, the mask is never nullable),
+ *        DATE / TIMESTAMP keys (native and narrow-carrier DATE probes, same-unit-only timestamps,
+ *        zone map as a containment oracle), and fixed-point keys (DECIMAL32/64/128 at one scale,
+ *        checked against the zone map that already lowers those types).
  */
 
+#include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
@@ -51,10 +54,12 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
 using sirius::op::classify_membership_key;
+using sirius::op::membership_build_fits_rep;
 using sirius::op::membership_key_domain;
 using sirius::op::membership_key_family;
 using sirius::op::membership_key_rep;
@@ -282,7 +287,11 @@ TEST_CASE("Bloom filter has no false negatives across probe carriers", "[dynamic
   }
 }
 
-TEST_CASE("membership filters refuse non-integer probe carriers", "[dynamic_filter][probe]")
+// A decimal probe against an *integer* set is a semantic mismatch even though its unscaled
+// storage is an int64: the family boundary, not the width, decides. Decimal sets accept decimal
+// probes below ("Decimal keys").
+TEST_CASE("integer-keyed membership filters refuse non-integer probe carriers",
+          "[dynamic_filter][probe]")
 {
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
@@ -542,9 +551,6 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
                        id::DURATION_DAYS,
                        id::DURATION_SECONDS,
                        id::DURATION_MICROSECONDS,
-                       id::DECIMAL32,
-                       id::DECIMAL64,
-                       id::DECIMAL128,
                        id::STRING,
                        id::DICTIONARY32,
                        id::LIST,
@@ -630,6 +636,49 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
     CHECK(sirius_dynamic_bloom_filter::supports(cudf::data_type{t}) ==
           membership_key_supported(cudf::data_type{t}));
   }
+}
+
+TEST_CASE("membership key domain classifies decimal types by width and keeps their scale",
+          "[dynamic_filter][key_domain]")
+{
+  using id            = cudf::type_id;
+  auto const dec      = [](id t, std::int32_t scale) { return cudf::data_type{t, scale}; };
+  auto const classify = [&](id t, std::int32_t scale, membership_key_rep rep) {
+    auto const domain = classify_membership_key(dec(t, scale));
+    REQUIRE(domain.has_value());
+    CHECK(domain->rep == rep);
+    CHECK(domain->family == membership_key_family::decimal);
+    CHECK(domain->native == dec(t, scale));
+    CHECK(domain->scale == scale);
+    CHECK(membership_key_supported(dec(t, scale)));
+    CHECK(sirius_dynamic_bloom_filter::supports(dec(t, scale)));
+    return *domain;
+  };
+  classify(id::DECIMAL32, -2, membership_key_rep::i32);
+  auto const dec64 = classify(id::DECIMAL64, -2, membership_key_rep::i64);
+  // DECIMAL128 has no 16-byte rep; it classifies onto int64 provisionally (see fits_rep below).
+  classify(id::DECIMAL128, -3, membership_key_rep::i64);
+  classify(id::DECIMAL64, 0, membership_key_rep::i64);
+
+  // Probe compatibility: any fixed-point width at the key's scale; nothing else.
+  for (auto const t : {id::DECIMAL32, id::DECIMAL64, id::DECIMAL128}) {
+    CHECK(membership_probe_compatible(dec64, dec(t, -2)));
+    CHECK_FALSE(membership_probe_compatible(dec64, dec(t, -3)));
+    CHECK_FALSE(membership_probe_compatible(dec64, dec(t, 0)));
+  }
+  for (auto const t : {id::INT32, id::INT64, id::UINT64, id::FLOAT64, id::TIMESTAMP_DAYS}) {
+    CHECK_FALSE(membership_probe_compatible(dec64, cudf::data_type{t}));
+  }
+  auto const int64_domain = *classify_membership_key(cudf::data_type{id::INT64});
+  CHECK_FALSE(membership_probe_compatible(int64_domain, dec(id::DECIMAL64, 0)));
+
+  // Set slots are the rep: a DECIMAL128 key costs int64 slots, a DECIMAL32 key int32 slots.
+  auto const bytes_of = [](cudf::data_type t) {
+    return sirius_dynamic_in_list_filter::estimated_set_bytes(1000, t);
+  };
+  CHECK(bytes_of(dec(id::DECIMAL32, -2)) == bytes_of(cudf::data_type{id::INT32}));
+  CHECK(bytes_of(dec(id::DECIMAL64, -2)) == bytes_of(cudf::data_type{id::INT64}));
+  CHECK(bytes_of(dec(id::DECIMAL128, -2)) == bytes_of(cudf::data_type{id::INT64}));
 }
 
 TEST_CASE("hash IN-list set bytes are sized at the key rep, not the build carrier",
@@ -1349,5 +1398,366 @@ TEST_CASE("TIMESTAMP keys probe their own unit and decline every other type",
     CHECK(raw_mask(in_list, (*other)->view(), stream) == nullptr);
     CHECK(raw_mask(small_list, (*other)->view(), stream) == nullptr);
     CHECK(raw_mask(bloom, (*other)->view(), stream) == nullptr);
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Decimal keys
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+constexpr std::int32_t kScale = -2;  // DECIMAL(p, 2) in cudf's negative-scale convention
+
+template <typename Rep>
+constexpr cudf::type_id decimal_id_for()
+{
+  if constexpr (std::is_same_v<Rep, std::int32_t>) {
+    return cudf::type_id::DECIMAL32;
+  } else if constexpr (std::is_same_v<Rep, std::int64_t>) {
+    return cudf::type_id::DECIMAL64;
+  } else {
+    static_assert(std::is_same_v<Rep, __int128_t>);
+    return cudf::type_id::DECIMAL128;
+  }
+}
+
+/// Fixed-point column at @p scale whose unscaled storage holds @p values narrowed to Rep.
+template <typename Rep>
+std::unique_ptr<cudf::column> make_decimal(std::vector<__int128_t> const& values,
+                                           rmm::cuda_stream_view stream,
+                                           std::int32_t scale = kScale)
+{
+  std::vector<Rep> typed;
+  typed.reserve(values.size());
+  for (auto const v : values) {
+    typed.push_back(static_cast<Rep>(v));
+  }
+  auto col       = cudf::make_fixed_point_column(cudf::data_type{decimal_id_for<Rep>(), scale},
+                                           static_cast<cudf::size_type>(typed.size()),
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           cudf::get_current_device_resource_ref());
+  auto const err = cudaMemcpyAsync(col->mutable_view().data<Rep>(),
+                                   typed.data(),
+                                   typed.size() * sizeof(Rep),
+                                   cudaMemcpyHostToDevice,
+                                   stream.value());
+  REQUIRE(err == cudaSuccess);
+  stream.synchronize();
+  return col;
+}
+
+/// Calls fn(Rep{}) for each fixed-point storage width.
+template <class Fn>
+void for_each_decimal_carrier(Fn&& fn)
+{
+  fn(std::int32_t{});
+  fn(std::int64_t{});
+  fn(__int128_t{});
+}
+
+/// Host oracle for an exact IN-list: 1 where the probe value is one of the keys.
+std::vector<std::uint8_t> expected_hits(std::vector<__int128_t> const& probe_values,
+                                        std::vector<__int128_t> const& key_values)
+{
+  std::vector<std::uint8_t> out;
+  out.reserve(probe_values.size());
+  for (auto const v : probe_values) {
+    out.push_back(std::find(key_values.begin(), key_values.end(), v) != key_values.end() ? 1 : 0);
+  }
+  return out;
+}
+
+/// Zone map over the build keys exactly as the publisher builds it (min/max reduce, inclusive),
+/// lowered to AST and evaluated on @p probe (same type as the keys; cudf AST compares like types).
+std::vector<std::uint8_t> zone_map_mask(cudf::column_view const& keys,
+                                        cudf::column_view const& probe,
+                                        rmm::cuda_stream_view stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto min_s    = cudf::reduce(
+    keys, *cudf::make_min_aggregation<cudf::reduce_aggregation>(), keys.type(), stream, mr);
+  auto max_s = cudf::reduce(
+    keys, *cudf::make_max_aggregation<cudf::reduce_aggregation>(), keys.type(), stream, mr);
+  REQUIRE(min_s->is_valid(stream));
+  REQUIRE(max_s->is_valid(stream));
+  std::vector<sirius::op::zone_map_entry> zones;
+  zones.push_back({std::move(min_s), std::move(max_s)});
+  sirius_dynamic_zone_map_filter const zone_map{std::move(zones), true, true};
+
+  cudf::ast::tree tree;
+  auto const& col_ref = tree.emplace<cudf::ast::column_reference>(0);
+  auto const& root    = zone_map.to_ast(tree, col_ref, kDevice);
+  std::vector<cudf::column_view> columns{probe};
+  auto mask = cudf::compute_column(cudf::table_view{columns}, root, stream, mr);
+  REQUIRE(mask->null_count() == 0);
+  return mask_to_host(mask->view(), stream);
+}
+
+}  // namespace
+
+// Fixed-point keys compare by their unscaled storage, so DECIMAL32/64/128 build keys behave like
+// INT32/INT64 keys: every same-scale fixed-point probe carrier answers identically, with and
+// without a prior keep-mask, against a host oracle. The zone map the publisher already emits for
+// decimal keys is the independent check: an exact hit must lie inside [min, max].
+TEST_CASE("decimal keys probe every same-scale fixed-point carrier identically",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // Every unscaled value fits int32 so each carrier sees the same logical probe.
+  std::vector<__int128_t> const key_values{150, 2500, -99, 0, 1, 12345678, -2147483648LL, 77};
+  std::vector<__int128_t> probe_values;
+  std::vector<bool> keep;
+  for (__int128_t v = -130; v <= 130; ++v) {  // 261 rows: crosses prior-mask word boundaries
+    probe_values.push_back(v);
+    keep.push_back((v % 3) == 0);
+  }
+  for (__int128_t const v :
+       std::vector<__int128_t>{150, 2500, 12345678, -2147483648LL, 2147483647LL}) {
+    probe_values.push_back(v);
+    keep.push_back(true);
+  }
+  auto const expected        = expected_hits(probe_values, key_values);
+  auto prior                 = upload_prior_mask(keep, stream);
+  auto const* prior_words    = static_cast<std::uint32_t const*>(prior.data());
+  auto const expected_masked = and_with(expected, keep);
+
+  auto const run = [&](auto key_tag, membership_key_rep rep) {
+    using key_type  = decltype(key_tag);
+    auto const keys = make_decimal<key_type>(key_values, stream);
+    REQUIRE(membership_key_supported(keys->type()));
+    REQUIRE(membership_build_fits_rep(keys->view(), stream, mr));
+    REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));
+
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    for (auto const* domain : {&in_list.domain(), &small_list.domain(), &bloom.domain()}) {
+      CHECK(domain->rep == rep);
+      CHECK(domain->family == membership_key_family::decimal);
+      CHECK(domain->native == keys->type());
+      CHECK(domain->scale == kScale);
+    }
+    CHECK(in_list.has_persistent_set());
+
+    // Reference: the widest carrier with no prior.
+    auto const native          = make_decimal<__int128_t>(probe_values, stream);
+    auto const bloom_reference = probe_mask(bloom, native->view(), nullptr, stream);
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      if (expected[i] != 0) { REQUIRE(bloom_reference[i] == 1); }  // no false negatives
+    }
+    auto const bloom_reference_masked = and_with(bloom_reference, keep);
+
+    for_each_decimal_carrier([&](auto carrier_tag) {
+      using carrier_type = decltype(carrier_tag);
+      auto const probe   = make_decimal<carrier_type>(probe_values, stream);
+      INFO("key=" << static_cast<int>(keys->type().id())
+                  << " carrier=" << static_cast<int>(probe->type().id()));
+      CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+      CHECK(probe_mask(in_list, probe->view(), prior_words, stream) == expected_masked);
+      CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+      CHECK(probe_mask(small_list, probe->view(), prior_words, stream) == expected_masked);
+      CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == bloom_reference);
+      CHECK(probe_mask(bloom, probe->view(), prior_words, stream) == bloom_reference_masked);
+    });
+
+    // Zone-map oracle at the key's own type: every exact hit is inside the published range, and
+    // the range itself matches the host min/max of the keys.
+    auto const same_type_probe = make_decimal<key_type>(probe_values, stream);
+    auto const zone            = zone_map_mask(keys->view(), same_type_probe->view(), stream);
+    auto const [lo, hi]        = std::minmax_element(key_values.begin(), key_values.end());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      if (expected[i] != 0) { CHECK(zone[i] == 1); }
+      CHECK(zone[i] == ((probe_values[i] >= *lo && probe_values[i] <= *hi) ? 1 : 0));
+    }
+  };
+  run(std::int32_t{}, membership_key_rep::i32);
+  run(std::int64_t{}, membership_key_rep::i64);
+  run(__int128_t{}, membership_key_rep::i64);
+}
+
+TEST_CASE("wide decimal probes range-check into a narrower decimal set",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream               = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  constexpr __int128_t two_pow_70 = static_cast<__int128_t>(1) << 70;
+  constexpr auto int64_max        = std::numeric_limits<std::int64_t>::max();
+  constexpr auto int32_max        = std::numeric_limits<std::int32_t>::max();
+
+  auto const check_all = [&](cudf::column_view const& keys,
+                             cudf::column_view const& probe,
+                             std::vector<std::uint8_t> const& expected) {
+    sirius_dynamic_in_list_filter in_list{keys, stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys, stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys, stream, mr};
+    CHECK(probe_mask(in_list, probe, nullptr, stream) == expected);
+    CHECK(probe_mask(small_list, probe, nullptr, stream) == expected);
+    // A value outside the rep is a definite non-member for Bloom too; hits must pass.
+    auto const bloom_mask = probe_mask(bloom, probe, nullptr, stream);
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      if (expected[i] != 0) { CHECK(bloom_mask[i] == 1); }
+    }
+    return bloom_mask;
+  };
+
+  SECTION("DECIMAL32 set, DECIMAL64 and DECIMAL128 probes")
+  {
+    auto const keys = make_decimal<std::int32_t>({5, 6, -7}, stream);
+    auto const wide = make_decimal<std::int64_t>(
+      {5, static_cast<__int128_t>(int32_max) + 1, 6, -7, 6'000'000'000LL}, stream);
+    auto const bloom = check_all(keys->view(), wide->view(), {1, 0, 1, 1, 0});
+    CHECK(bloom[1] == 0);
+    CHECK(bloom[4] == 0);
+    auto const wider       = make_decimal<__int128_t>({5, two_pow_70, -two_pow_70, 6}, stream);
+    auto const bloom_wider = check_all(keys->view(), wider->view(), {1, 0, 0, 1});
+    CHECK(bloom_wider[1] == 0);
+    CHECK(bloom_wider[2] == 0);
+  }
+
+  SECTION("DECIMAL64 set, DECIMAL128 probe beyond int64")
+  {
+    auto const keys  = make_decimal<std::int64_t>({7, int64_max}, stream);
+    auto const probe = make_decimal<__int128_t>(
+      {7, static_cast<__int128_t>(int64_max) + 1, int64_max, two_pow_70}, stream);
+    auto const bloom = check_all(keys->view(), probe->view(), {1, 0, 1, 0});
+    CHECK(bloom[1] == 0);
+    CHECK(bloom[3] == 0);
+  }
+
+  SECTION("a DECIMAL128 probe equal to the int64 set's sentinel is kept conservatively")
+  {
+    auto const keys = make_decimal<std::int64_t>({7}, stream);
+    sirius_dynamic_in_list_filter filter{keys->view(), stream, mr};
+    auto const probe = make_decimal<__int128_t>(
+      {std::numeric_limits<std::int64_t>::min(), 7, 8, two_pow_70}, stream);
+    CHECK(probe_mask(filter, probe->view(), nullptr, stream) ==
+          std::vector<std::uint8_t>{1, 1, 0, 0});
+  }
+}
+
+TEST_CASE("decimal sets decline probes at another scale or of another family",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const keys = make_decimal<std::int64_t>({100, 200, 300}, stream);
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+
+  // Same values, other scales: the unscaled storage is not comparable (a rescale is a planner
+  // cast that never reaches a filter).
+  auto const rescaled_64  = make_decimal<std::int64_t>({100, 200, 300}, stream, /*scale=*/-3);
+  auto const rescaled_32  = make_decimal<std::int32_t>({100, 200, 300}, stream, /*scale=*/0);
+  auto const rescaled_128 = make_decimal<__int128_t>({100, 200, 300}, stream, /*scale=*/-1);
+  // Same bits at an integer type: a different family.
+  auto const as_int64 = make_int64({100, 200, 300}, stream);
+  auto const as_int32 = make_int32({100, 200, 300}, stream);
+  for (auto const* probe : {&rescaled_64, &rescaled_32, &rescaled_128, &as_int64, &as_int32}) {
+    INFO("probe type=" << static_cast<int>((*probe)->type().id())
+                       << " scale=" << (*probe)->type().scale());
+    CHECK_FALSE(membership_probe_compatible(in_list.domain(), (*probe)->type()));
+    CHECK(in_list.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+    CHECK(small_list.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+    CHECK(bloom.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+  }
+
+  // The same scale at any width is accepted.
+  auto const same_scale = make_decimal<std::int32_t>({100, 150, 300}, stream);
+  CHECK(probe_mask(in_list, same_scale->view(), nullptr, stream) ==
+        std::vector<std::uint8_t>{1, 0, 1});
+}
+
+// DECIMAL128 sits on the int64 rep, so the build column's unscaled values must fit int64. cuco's
+// static_set cannot hold 16-byte keys, so an unfitting build is refused by every filter rather
+// than truncated; the publisher checks the same predicate once and declines membership for the
+// key.
+TEST_CASE("DECIMAL128 keys build an int64 set when their values fit and are refused otherwise",
+          "[dynamic_filter][probe][key_domain]")
+{
+  auto const stream               = cudf::get_default_stream();
+  auto const mr                   = cudf::get_current_device_resource_ref();
+  constexpr auto int64_max        = std::numeric_limits<std::int64_t>::max();
+  constexpr auto int64_min        = std::numeric_limits<std::int64_t>::min();
+  constexpr __int128_t two_pow_64 = static_cast<__int128_t>(1) << 64;
+
+  SECTION("values spanning int64 fit and probe exactly across carriers")
+  {
+    // int64_min + 1 rather than int64_min: the minimum is the hash set's reserved sentinel.
+    auto const keys =
+      make_decimal<__int128_t>({int64_max, static_cast<__int128_t>(int64_min) + 1, 42}, stream);
+    REQUIRE(membership_build_fits_rep(keys->view(), stream, mr));
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    for (auto const* domain : {&in_list.domain(), &small_list.domain(), &bloom.domain()}) {
+      CHECK(domain->rep == membership_key_rep::i64);
+      CHECK(domain->native.id() == cudf::type_id::DECIMAL128);
+    }
+
+    auto const wide = make_decimal<__int128_t>(
+      {int64_max, 42, 43, static_cast<__int128_t>(int64_max) + 1, two_pow_64}, stream);
+    std::vector<std::uint8_t> const expected_wide{1, 1, 0, 0, 0};
+    CHECK(probe_mask(in_list, wide->view(), nullptr, stream) == expected_wide);
+    CHECK(probe_mask(small_list, wide->view(), nullptr, stream) == expected_wide);
+    auto const bloom_wide = probe_mask(bloom, wide->view(), nullptr, stream);
+    CHECK(bloom_wide[0] == 1);
+    CHECK(bloom_wide[1] == 1);
+    CHECK(bloom_wide[3] == 0);
+    CHECK(bloom_wide[4] == 0);
+
+    auto const narrow64 = make_decimal<std::int64_t>({int64_max, 42, 43}, stream);
+    CHECK(probe_mask(in_list, narrow64->view(), nullptr, stream) ==
+          std::vector<std::uint8_t>{1, 1, 0});
+    CHECK(probe_mask(small_list, narrow64->view(), nullptr, stream) ==
+          std::vector<std::uint8_t>{1, 1, 0});
+    auto const narrow32 = make_decimal<std::int32_t>({42, 43}, stream);
+    CHECK(probe_mask(in_list, narrow32->view(), nullptr, stream) ==
+          std::vector<std::uint8_t>{1, 0});
+    CHECK(probe_mask(bloom, narrow32->view(), nullptr, stream)[0] == 1);
+  }
+
+  SECTION("a value beyond int64 in either direction refuses every filter")
+  {
+    for (auto const overflow : {two_pow_64, -two_pow_64, static_cast<__int128_t>(int64_max) + 1}) {
+      auto const keys = make_decimal<__int128_t>({1, overflow, 3}, stream);
+      CHECK(membership_key_supported(keys->type()));  // the type is admissible ...
+      CHECK_FALSE(membership_build_fits_rep(keys->view(), stream, mr));  // ... this build is not
+      CHECK_THROWS_AS((sirius_dynamic_in_list_filter{keys->view(), stream, mr}),
+                      std::invalid_argument);
+      CHECK_THROWS_AS((sirius_dynamic_small_in_list_filter{keys->view(), stream, mr}),
+                      std::invalid_argument);
+      CHECK_THROWS_AS((sirius_dynamic_bloom_filter{keys->view(), stream, mr}),
+                      std::invalid_argument);
+    }
+  }
+
+  SECTION("nulls are ignored by the range check and compacted by Bloom")
+  {
+    auto keys      = make_decimal<__int128_t>({5, 0, 7}, stream);
+    auto null_mask = cudf::create_null_mask(3, cudf::mask_state::ALL_VALID, stream, mr);
+    cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
+    keys->set_null_mask(std::move(null_mask), 1);
+    REQUIRE(membership_build_fits_rep(keys->view(), stream, mr));
+    // The IN-lists still require null-free keys; Bloom drops the null before inserting.
+    CHECK_FALSE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+    auto const probe = make_decimal<std::int64_t>({5, 7}, stream);
+    CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{1, 1});
+  }
+
+  SECTION("a non-decimal supported type always fits; an unsupported type never does")
+  {
+    auto const ints = make_int64({1, std::numeric_limits<std::int64_t>::max()}, stream);
+    CHECK(membership_build_fits_rep(ints->view(), stream, mr));
+    auto const fp = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::FLOAT64}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
+    CHECK_FALSE(membership_build_fits_rep(fp->view(), stream, mr));
   }
 }

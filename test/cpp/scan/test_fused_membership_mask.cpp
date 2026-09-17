@@ -19,10 +19,11 @@
  * @brief Mask-aware membership probing in the filtered-decode wave: with another mask source
  *        present, the membership probes run AFTER the partial combine and receive it as a prior
  *        mask; without one they stay concurrent and prior-free. The probe key stays at its narrow
- *        decoded carrier (INT32, or INT8 for a chunk stored that narrow) against an INT64-built
- *        set, and a DATE stored as INT16 against a TIMESTAMP_DAYS-built set — the filtered decode
- *        must not require a materialized cast — and a nullable probe column yields a non-nullable
- *        mask that the filtered decode consumes.
+ *        decoded carrier (INT32, or INT8 for a chunk stored that narrow, or DECIMAL32 for a
+ *        narrowed decimal key) against an INT64- or DECIMAL64-built set, and a DATE stored as
+ *        INT16 against a TIMESTAMP_DAYS-built set — the filtered decode must not require a
+ *        materialized cast — and a nullable probe column yields a non-nullable mask that the
+ *        filtered decode consumes.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -85,9 +86,12 @@ std::unique_ptr<cudf::column> upload_column(std::vector<T> const& host,
   return col;
 }
 
-// col 0 ("v", range-filtered): i % 100. col 1 ("k", membership key): i % 50, stored at KeyT.
+// col 0 ("v", range-filtered): i % 100. col 1 ("k", membership key): i % 50, stored at KeyT, or
+// as the unscaled storage of @p key_type when one is given (a fixed-point chunk).
 template <typename KeyT = std::int32_t>
-std::unique_ptr<cudf::table> make_source_table(rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::table> make_source_table(rmm::cuda_stream_view stream,
+                                               cudf::data_type key_type = cudf::data_type{
+                                                 cudf::type_to_id<KeyT>()})
 {
   std::vector<std::int32_t> v(kRows);
   std::vector<KeyT> k(kRows);
@@ -97,7 +101,15 @@ std::unique_ptr<cudf::table> make_source_table(rmm::cuda_stream_view stream)
   }
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(upload_column(v, stream));
-  cols.push_back(upload_column(k, stream));
+  auto key = upload_column(k, stream);
+  if (key_type != key->type()) {
+    // Re-tag the storage as the fixed-point type (same width, identical bits).
+    REQUIRE(cudf::size_of(key_type) == sizeof(KeyT));
+    auto contents = key->release();
+    key           = std::make_unique<cudf::column>(
+      key_type, kRows, std::move(*contents.data), rmm::device_buffer{}, 0);
+  }
+  cols.push_back(std::move(key));
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(cols));
 }
@@ -155,6 +167,30 @@ std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_date_key_set(
   return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
 }
 
+// DECIMAL64-built exact membership set (cudf scale -2) over the multiples of @p step in [0, 50) as
+// unscaled values -- the fixed-point counterpart of make_key_set.
+std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_decimal_key_set(
+  rmm::cuda_stream_view stream, std::int64_t step = 5)
+{
+  std::vector<std::int64_t> keys;
+  for (std::int64_t k = 0; k < 50; k += step) {
+    keys.push_back(k);
+  }
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto col      = cudf::make_fixed_point_column(cudf::data_type{cudf::type_id::DECIMAL64, -2},
+                                           static_cast<cudf::size_type>(keys.size()),
+                                           cudf::mask_state::UNALLOCATED,
+                                           stream,
+                                           mr);
+  REQUIRE(cudaMemcpyAsync(col->mutable_view().data<std::int64_t>(),
+                          keys.data(),
+                          keys.size() * sizeof(std::int64_t),
+                          cudaMemcpyHostToDevice,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col->view(), stream, mr);
+}
+
 sirius::codegen::membership_filter_directive make_probe_directive(
   std::size_t column,
   std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> filter,
@@ -171,9 +207,12 @@ sirius::codegen::membership_filter_directive make_probe_directive(
 }
 
 template <typename T = std::int32_t>
-std::vector<T> column_to_host(cudf::column_view const& col, rmm::cuda_stream_view stream)
+std::vector<T> column_to_host(cudf::column_view const& col,
+                              rmm::cuda_stream_view stream,
+                              cudf::data_type expected_type = cudf::data_type{
+                                cudf::type_to_id<T>()})
 {
-  REQUIRE(col.type().id() == cudf::type_to_id<T>());
+  REQUIRE(col.type() == expected_type);
   std::vector<T> host(static_cast<std::size_t>(col.size()));
   if (!host.empty()) {
     REQUIRE(cudaMemcpyAsync(host.data(),
@@ -545,6 +584,7 @@ TEST_CASE("filtered-decode membership probe consumes a nullable probe column",
   CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   CHECK(column_to_host(out->view().column(1), stream) == expect_k);
 }
+
 // Compressed materialization stores a DATE in the narrowest INT8/INT16 carrier its epoch days
 // fit, while the hash join publishes the key at TIMESTAMP_DAYS. The fused decode re-tags the
 // decoded column with the stored carrier, so the probe sees INT16 against a TIMESTAMP_DAYS-built
@@ -594,4 +634,55 @@ TEST_CASE("filtered-decode membership probe reads a DATE stored as an INT16 carr
   REQUIRE(out->num_columns() == 2);
   CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   CHECK(column_to_host<std::int16_t>(out->view().column(1), stream) == expect_k);
+}
+
+// A pinned chunk can store a DECIMAL(15,2) key as DECIMAL32 at the same scale when its unscaled
+// values fit; the fused decode runs the codec on the int32 storage and re-tags the decoded column
+// DECIMAL32(-2), so the membership probe sees a narrow fixed-point carrier against a
+// DECIMAL64-built set and must answer exactly what the native column would.
+TEST_CASE("filtered-decode membership probe reads a DECIMAL32-carrier key chunk",
+          "[fused_scan_filter][dynamic_filter]")
+{
+  auto const stream     = cudf::get_default_stream();
+  auto const mr         = cudf::get_current_device_resource_ref();
+  auto const kDecimal32 = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+  auto table            = make_source_table<std::int32_t>(stream, kDecimal32);
+  REQUIRE(table->view().column(1).type() == kDecimal32);
+  auto const ct = simpatico::compress_with_plan(table->view(), kBitpackPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  bool saw_prior = false;
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});
+  request.membership_filters.push_back(
+    make_probe_directive(1, make_decimal_key_set(stream), &saw_prior));
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::bitpack_mask};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  REQUIRE(result.applied);
+  CHECK(saw_prior);
+
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::int32_t> expect_k;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19 && (i % 50) % 5 == 0) {
+      expect_v.push_back(i % 100);
+      expect_k.push_back(i % 50);
+    }
+  }
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  // The survivors keep the chunk's stored fixed-point type, not the set's.
+  CHECK(column_to_host<std::int32_t>(out->view().column(1), stream, kDecimal32) == expect_k);
 }

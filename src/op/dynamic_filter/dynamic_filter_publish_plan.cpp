@@ -104,7 +104,8 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
       }
       if (target.route_class == dynamic_filter_route_class::direct) {
         // A join-edge probe is an operator output at the key's native type, so the binding must
-        // name a membership-supported build type and an identical, adaptable probe type.
+        // name a membership-supported build type and an identical, adaptable probe type (for a
+        // decimal key, identical includes the scale).
         auto const& key   = _admitted_keys[binding.admitted_key_index];
         auto const domain = classify_membership_key(key.storage_type);
         if (!domain.has_value() || binding.probe_storage_type != key.storage_type ||
