@@ -222,10 +222,12 @@ headers (`nvrtcCreateProgram`):
   `#include` set reachable from the kernel preludes, scanned at build time and embedded by
   `cmake/embed_cccl_headers.cmake`.
 
-At configure time, Simpatico resolves that closure from libcudf's exported `CUB::CUB` target,
-not from the CUDA toolkit, and consumes `CCCL::CCCL` so its public headers inherit the same
-CCCL namespace and feature definitions. `-DSIMPATICO_CCCL_INCLUDE_DIR=<path>` is available as
-an explicit build-time override for unusual package layouts.
+Simpatico links to `cudf::cudf`, inheriting libcudf's CCCL headers and namespace/feature
+definitions through its exported CMake targets. CMake also supplies the embedding script
+with the evaluated include directories from `CCCL::CCCL`. This supports both installed
+packages and source checkouts with separate CUB, Thrust, and libcudacxx include directories.
+For nonstandard installations, use the usual CMake package discovery settings such as
+`CMAKE_PREFIX_PATH` or `cudf_DIR`.
 
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).

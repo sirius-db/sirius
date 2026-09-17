@@ -5,9 +5,9 @@
 # -I into a CCCL tree, so a binary distribution needs only the driver + the
 # nvrtc runtime it already links. Invoked via `cmake -P`.
 #
-# Required -D inputs: CCCL_DIR is the build-time CCCL include root containing
-# cuda/, cub/, and thrust/; OUT is the path of the .cpp to generate. DEPFILE is
-# optional and names a Make/Ninja depfile for the transitively scanned headers.
+# Required -D inputs: INCLUDE_DIRS_FILE contains CMake's evaluated CCCL include
+# directories, one per line; OUT is the path of the .cpp to generate. DEPFILE
+# optionally names a Make/Ninja depfile for the transitively scanned headers.
 #
 # The scan follows every literal `#include` line (both #ifdef branches) from the
 # fixed kernel-prelude roots below. Dependencies reached through macro-expanded
@@ -16,15 +16,32 @@
 
 cmake_minimum_required(VERSION 3.24)
 
-if(NOT IS_DIRECTORY "${CCCL_DIR}")
-  message(
-    FATAL_ERROR "embed_cccl_headers: CCCL_DIR '${CCCL_DIR}' is not a directory")
-endif()
+file(STRINGS "${INCLUDE_DIRS_FILE}" cccl_include_dirs)
+
+# Installed packages share one include root; source packages use separate
+# component roots. Search the directories in the order supplied by CMake.
+function(find_cccl_header name output)
+  foreach(include_dir IN LISTS cccl_include_dirs)
+    cmake_path(SET candidate NORMALIZE "${include_dir}/${name}")
+    if(EXISTS "${candidate}" AND NOT IS_DIRECTORY "${candidate}")
+      set(${output}
+          "${candidate}"
+          PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${output}
+      ""
+      PARENT_SCOPE)
+endfunction()
+
 foreach(marker cub/version.cuh cuda/std/cstdint thrust/version.h)
-  if(NOT EXISTS "${CCCL_DIR}/${marker}")
+  find_cccl_header("${marker}" header)
+  if(NOT header)
     message(
       FATAL_ERROR
-        "embed_cccl_headers: CCCL_DIR '${CCCL_DIR}' is missing '${marker}'")
+        "embed_cccl_headers: '${marker}' is missing from CCCL include directories: ${cccl_include_dirs}"
+    )
   endif()
 endforeach()
 
@@ -50,8 +67,8 @@ while(worklist)
   if(rel IN_LIST found)
     continue()
   endif()
-  set(abs "${CCCL_DIR}/${rel}")
-  if(NOT EXISTS "${abs}" OR IS_DIRECTORY "${abs}")
+  find_cccl_header("${rel}" abs)
+  if(NOT abs)
     continue()
   endif()
   list(APPEND found "${rel}")
@@ -67,20 +84,18 @@ while(worklist)
   foreach(inc IN LISTS incs)
     string(REGEX REPLACE ".*[<\"]([^>\"]+)[>\"].*" "\\1" name "${inc}")
     set(resolved "")
-    # 1) resolve relative to the CCCL root (covers <cuda/...>, <cub/...>)
-    cmake_path(SET cand NORMALIZE "${CCCL_DIR}/${name}")
-    if(EXISTS "${cand}" AND NOT IS_DIRECTORY "${cand}")
-      cmake_path(RELATIVE_PATH cand BASE_DIRECTORY "${CCCL_DIR}"
-                 OUTPUT_VARIABLE resolved)
+    # 1) resolve through CCCL's include directories (<cuda/...>, <cub/...>)
+    find_cccl_header("${name}" header)
+    if(header)
+      set(resolved "${name}")
     elseif(curdir)
       # 2) resolve relative to the including file's directory (quoted includes)
-      cmake_path(SET cand2 NORMALIZE "${CCCL_DIR}/${curdir}/${name}")
-      string(FIND "${cand2}" "${CCCL_DIR}/" pos)
-      if(pos EQUAL 0
-         AND EXISTS "${cand2}"
-         AND NOT IS_DIRECTORY "${cand2}")
-        cmake_path(RELATIVE_PATH cand2 BASE_DIRECTORY "${CCCL_DIR}"
-                   OUTPUT_VARIABLE resolved)
+      cmake_path(SET relative_name NORMALIZE "${curdir}/${name}")
+      if(NOT relative_name MATCHES "^\\.\\./")
+        find_cccl_header("${relative_name}" header)
+        if(header)
+          set(resolved "${relative_name}")
+        endif()
       endif()
     endif()
     # Names that don't resolve under CCCL are nvrtc built-ins or host headers
@@ -109,8 +124,11 @@ string(APPEND body "namespace codegen::jit {\n")
 
 set(idx 0)
 set(_fingerprint_manifest "")
+set(header_dependencies "")
 foreach(rel IN LISTS found)
-  file(READ "${CCCL_DIR}/${rel}" hsrc)
+  find_cccl_header("${rel}" header)
+  list(APPEND header_dependencies "${header}")
+  file(READ "${header}" hsrc)
   # Hash each source independently, then hash an unambiguous ordered manifest.
   # This avoids retaining a second full copy of the (large) closure while still
   # binding the final fingerprint to every relative name and byte of content.
@@ -163,8 +181,8 @@ if(DEFINED DEPFILE AND NOT DEPFILE STREQUAL "")
   file(MAKE_DIRECTORY "${depfile_dir}")
   escape_depfile_path("${OUT}" depfile_out)
   set(_depfile_body "${depfile_out}:")
-  foreach(rel IN LISTS found)
-    escape_depfile_path("${CCCL_DIR}/${rel}" depfile_header)
+  foreach(header IN LISTS header_dependencies)
+    escape_depfile_path("${header}" depfile_header)
     string(APPEND _depfile_body " \\\n  ${depfile_header}")
   endforeach()
   string(APPEND _depfile_body "\n")
