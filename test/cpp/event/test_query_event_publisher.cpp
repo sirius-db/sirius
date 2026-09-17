@@ -110,11 +110,6 @@ class recording_subscriber : public query_event_subscriber {
     return _seen.size();
   }
 
-  [[nodiscard]] bool stop_seen() const noexcept { return _stop_seen.load(); }
-
- protected:
-  void on_stop_requested() noexcept override { _stop_seen.store(true); }
-
  private:
   void record(std::string what)
   {
@@ -124,7 +119,6 @@ class recording_subscriber : public query_event_subscriber {
 
   mutable std::mutex _mtx;
   std::vector<std::string> _seen;
-  std::atomic<bool> _stop_seen{false};
 };
 
 /// Delivery is asynchronous, so every assertion about what arrived has to be a
@@ -523,8 +517,6 @@ TEST_CASE("stopping the publisher takes every subscriber down with it",
   CHECK_FALSE(second.is_subscribed());
   first.stop();
   second.stop();
-  CHECK(first.stop_seen());
-  CHECK(second.stop_seen());
 }
 
 namespace {

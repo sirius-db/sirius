@@ -202,16 +202,6 @@ class query_event_subscriber {
                                            int gpu_id,
                                            std::size_t bytes_needed) noexcept;
 
- protected:
-  /// Invoked when a started subscriber observes a publisher stop request, on
-  /// the worker and after the last event hook --- so it is serialised against
-  /// them and is the last thing the worker does.  The hook for tearing down
-  /// whatever the subscriber was driving; the worker's own exit needs no help.
-  ///
-  /// Not invoked when the subscriber's own @ref stop is what took it down: the
-  /// caller of @ref stop already knows.
-  virtual void on_stop_requested() noexcept;
-
  private:
   /// Drain until the mailbox closes, replaying each event into its hook.
   ///
@@ -238,8 +228,8 @@ class query_event_subscriber {
   /// deregister from the destructor.
   std::weak_ptr<query_event_publisher> _publisher;
   std::shared_ptr<event_queue> _queue;
-  /// Distinguishes "the publisher stopped us" from "our owner stopped us",
-  /// which is the only thing @ref on_stop_requested keys off.
+  /// Lets @ref start refuse to spin up a worker once the publisher has
+  /// already stopped.
   std::stop_token _stop_token;
 
   /// Guards the whole of @ref start and @ref stop.  A flag per transition was

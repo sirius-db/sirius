@@ -103,6 +103,13 @@ void query_event_subscriber::stop() noexcept
     _queue->interrupt();
   } catch (...) {  // NOLINT(bugprone-empty-catch)
   }
+
+  // A hook that stops its own subscriber would be joining itself, which throws
+  // -- and throwing out of a noexcept function terminates.  Leave instead: the
+  // mailbox is closed, so the worker exits as soon as the hook returns, and
+  // the destructor's @c ~jthread joins it.
+  if (!was_running || _worker.get_id() == std::this_thread::get_id()) { return; }
+  _worker.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +154,6 @@ void query_event_subscriber::on_wait_for_memory_for_task(
 {
 }
 
-void query_event_subscriber::on_stop_requested() noexcept {}
-
 // ---------------------------------------------------------------------------
 // worker
 // ---------------------------------------------------------------------------
@@ -160,10 +165,6 @@ void query_event_subscriber::run() noexcept
   while (auto event = _queue->pop()) {
     dispatch(*event);
   }
-  // Reported here, after the last hook, so a subscriber sees its events and its
-  // shutdown in one order on one thread.  Only when the publisher is what
-  // stopped us: a caller of @ref stop does not need telling.
-  if (_stop_token.stop_requested()) { on_stop_requested(); }
   _worker_live.store(false, std::memory_order_release);
 }
 
