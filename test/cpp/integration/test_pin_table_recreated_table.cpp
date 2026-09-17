@@ -23,9 +23,15 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/storage/single_file_block_manager.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <cstdint>
 #include <set>
 #include <string>
 
@@ -72,6 +78,31 @@ std::set<std::string> cached_column_names(duckdb::Connection& con, const std::st
       return false;  // stop
     });
   return names;
+}
+
+/// Checkpoint generation of the database holding @p table_name, read inside a
+/// transaction (catalog lookups require one).
+std::uint64_t checkpoint_iteration(duckdb::Connection& con,
+                                   const std::string& attach_alias,
+                                   const std::string& table_name)
+{
+  std::uint64_t iteration = 0;
+  con.BeginTransaction();
+  try {
+    auto& table_entry =
+      duckdb::Catalog::GetEntry(
+        *con.context, duckdb::CatalogType::TABLE_ENTRY, attach_alias, "main", table_name)
+        .Cast<duckdb::DuckTableEntry>();
+    auto const* block_manager = dynamic_cast<duckdb::SingleFileBlockManager const*>(
+      &table_entry.GetStorage().GetAttached().GetStorageManager().GetBlockManager());
+    REQUIRE(block_manager != nullptr);
+    iteration = block_manager->GetCheckpointIteration();
+    con.Rollback();
+  } catch (...) {
+    con.Rollback();
+    throw;
+  }
+  return iteration;
 }
 
 bool entry_exists(duckdb::Connection& con, const std::string& name)
@@ -144,6 +175,36 @@ TEST_CASE_METHOD(PinRecreateFixture,
   compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM ckpt_recreate_t;");
 
   run_ok("CALL unpin_table('ckpt_recreate_t');");
+}
+
+TEST_CASE_METHOD(PinRecreateFixture,
+                 "pin_table - a checkpoint before the recreate leaves the disk image stale",
+                 "[integration][gpu_execution][pin_table][pin_table_mvcc]")
+{
+  run_ok("CREATE TABLE bumped_recreate_t AS SELECT range AS a, range * 2 AS b FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='bumped_recreate_t', tier='gpu');");
+  compare_gpu_vs_cpu("SELECT sum(a), sum(b) FROM bumped_recreate_t;");
+
+  // Move the database past the pin's checkpoint generation. A checkpoint only writes a
+  // new header when the WAL holds something, hence the unrelated write.
+  auto const before = checkpoint_iteration(*con, attach_alias, "bumped_recreate_t");
+  run_ok("CREATE TABLE bump_t AS SELECT range AS x FROM range(16);");
+  run_ok("CHECKPOINT;");
+  REQUIRE(checkpoint_iteration(*con, attach_alias, "bumped_recreate_t") > before);
+
+  // The recreate is itself uncheckpointed, so the on-disk image is still the dropped
+  // table's: a newer generation than the pin's does not make the fresh read safe.
+  run_ok("DROP TABLE bumped_recreate_t;");
+  run_ok(
+    "CREATE TABLE bumped_recreate_t AS SELECT range + 1000000 AS a, range * 3 AS b FROM "
+    "range(50000);");
+
+  REQUIRE(entry_exists(*con, "bumped_recreate_t"));
+
+  expect_fallback_matches_cpu(*this, "SELECT sum(a), sum(b) FROM bumped_recreate_t;");
+
+  run_ok("CALL unpin_table('bumped_recreate_t');");
 }
 
 TEST_CASE_METHOD(PinRecreateFixture,
