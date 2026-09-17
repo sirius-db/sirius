@@ -2352,6 +2352,74 @@ that gap does not depend on solving the bimodality. It is the larger number and 
 that delivers 24.25 — the ingest leaves **23% of available bandwidth unused on a good run, 32% on a
 bad one**. The cold `.hpln` numbers throughout this document are therefore a floor, not a ceiling.
 
+### 6.24 The bimodality is I/O queue depth, and `uring_n_reactors: 4` is the wrong default (2026-09-17)
+
+§6.23 found the flip and mis-diagnosed its mechanism twice. A thread-pool sweep found it, and the
+answer is a config default rather than a code defect.
+
+**Only the reactor count matters, and it wants to go DOWN, not up** (q9 cold, four runs each):
+
+| `uring_n_reactors` | fast-mode value | slow draws |
+|---|---|---|
+| **1** | **4.427–4.490 s** | **0 of 4** |
+| 2 | 4.464–4.547 | 1 of 4 |
+| 3 | 4.666–4.696 | 2 of 4 |
+| 4 (the config's default) | 4.711–4.717 | 2 of 4 |
+| 8 | — | 4 of 4 |
+| 16 | — | 4 of 4, and slower still |
+
+Every step up costs speed AND raises the odds of the slow mode. The other pools only bias the coin:
+`task_creator` 8/16 and `pipeline` 12/16 push toward slow, `scan_manager` 6/10 stays bimodal, and
+pinning the process to 16 cores (either range) forces slow every time. **The two modes sit at the
+same two values in every one of those configurations** — a fixed penalty that is either paid or
+not, which is why thread tuning could never fix it and the reactor count could.
+
+**It is the reactor COUNT, not queue depth.** Each reactor allows `NUM_CHUNKS = 64` concurrent
+reads, so depth is `reactors x 64` and the obvious story is device over-saturation. It is wrong,
+twice over. Matched-total sweeps: `1 x 64` gives 4.473–4.486 s and `1 x 16` gives 4.527–4.621, both
+tight, while `2 x 32` and `4 x 16` — same totals — stay bimodal. And a single-ring io_uring
+microbenchmark shows depth barely matters and never degrades (8 → 13.0 GB/s, 32 → 17.3,
+64 → 16.9, 256 → 17.4).
+
+What is left is `splits` (`io_request.hpp`): one caller request is divided across ALL reactors and
+its future completes only when every split does, so each read finishes at its **slowest** reactor.
+One reactor has no such barrier. That also explains the rest of the grid — more `task_creator` or
+`pipeline` threads, or pinning to 16 cores, all make it likelier that one reactor lags, which is
+exactly when the slow mode appears.
+
+**Confirmed on the full cold suite, six runs:**
+
+| | baseline (15 runs) | `uring_n_reactors: 1` (6 runs) |
+|---|---|---|
+| `.hpln` cold suite | 46.418–52.781 s, bimodal | **44.829–45.492 s, spread 1.5%** |
+| mean | 48.45 s | **45.04 s** |
+| parquet | 58.14–59.25 s | 56.67–59.21 s |
+| bytes read | 949.8 / 795.4 GB | identical |
+
+The bimodality is gone and the format's cold result improves against `dev` parquet from −19.9% to
+**−22.8%**. Parquet gains in four of six runs but spreads wider than its own baseline, so it may
+carry a smaller version of the same effect — unconfirmed.
+
+**What this cost, and the lesson:** two mechanisms were proposed from code reading plus a
+correlation, and both were wrong — the `std::ifstream` demotion (the logs said every read was
+uring + O_DIRECT) and the per-batch read barrier (pipelining it made things WORSE, and the
+unmodified control was itself bimodal). The sweep that found the answer costs ~20 runs and should
+have come first. Sweep the knob before changing the code it belongs to.
+
+**The engine's default is already 1** (`scan_manager/config.hpp`); it is THIS project's benchmark
+configs that set 4. The regression was self-inflicted by our own tuning, and the fix is to the
+yaml, not the engine. Changed for the cold-run configs; the pin configs still say 4 and should be
+returned deliberately, since every recorded pin time was taken at 4.
+
+**Request size does NOT transfer, though the microbenchmark says it should.** On one ring at depth
+32, 16 MB → 128 MB takes 17.2 → 23.7 GB/s, i.e. 97% of the device's 24.4 — and the 16 MB default is
+documented as measured against in-region S3, never returned for NVMe. In situ it changes nothing:
+requests per lineitem batch drop from 131 to 19 (the knob demonstrably works) and the query stays at
+4.45–4.53 s. The reason is that the benchmark reads ONE sequential stream while the scan already
+issues several files' reads concurrently into the ring, so it reaches ~20 GB/s at 16 MB — above the
+benchmark's single-stream rate. Roughly 18% of device bandwidth is still unclaimed, and request
+shaping is not the lever.
+
 ## 6.6 Skipping decode inside a GPU-resident compressed chunk
 
 **Scope: this section is about a chunk whose payload is already device-resident**, where the only
