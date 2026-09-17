@@ -31,6 +31,7 @@
 #include "catch.hpp"
 #include "compression/decompression_pushdown_policy.hpp"
 #include "compression/simpatico_file_ingest.hpp"
+#include "compression/simpatico_test_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/scan/simpatico_gpu_ingestible.hpp"
 #include "operator/operator_test_utils.hpp"
@@ -108,28 +109,6 @@ void require_pushdown_gate()
 {
   ::setenv("SIRIUS_EXP_FUSED_SCAN_FILTER", "1", /*overwrite=*/1);
   REQUIRE(sirius::decompression_pushdown_enabled());
-}
-
-std::unique_ptr<cudf::column> int32_column(std::vector<std::int32_t> const& values)
-{
-  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                       static_cast<cudf::size_type>(values.size()),
-                                       cudf::mask_state::UNALLOCATED);
-  REQUIRE(cudaMemcpy(col->mutable_view().head<std::int32_t>(),
-                     values.data(),
-                     values.size() * sizeof(std::int32_t),
-                     cudaMemcpyHostToDevice) == cudaSuccess);
-  return col;
-}
-
-std::vector<std::int32_t> read_back(cudf::column_view const& v)
-{
-  std::vector<std::int32_t> host(static_cast<std::size_t>(v.size()));
-  REQUIRE(cudaMemcpy(host.data(),
-                     v.head<std::int32_t>(),
-                     host.size() * sizeof(std::int32_t),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
-  return host;
 }
 
 constexpr int kChunks       = 4;
