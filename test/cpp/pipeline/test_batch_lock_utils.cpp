@@ -36,8 +36,8 @@
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -158,21 +158,21 @@ struct batch_lock_utils_fixture {
   /// Single INT64 column of random data, resident on `space`.
   std::shared_ptr<cucascade::data_batch> make_gpu_batch(std::size_t num_rows,
                                                         cucascade::memory::memory_space& space,
-                                                        rmm::cuda_stream_view stream)
+                                                        ::cuda::stream_ref stream)
   {
     auto table = sirius::create_cudf_table_with_random_data(num_rows,
                                                             {cudf::data_type{cudf::type_id::INT64}},
                                                             {std::make_pair(0, 1000000)},
                                                             stream,
                                                             space.get_default_allocator());
-    stream.synchronize();
+    stream.sync();
     return sirius::make_data_batch(
       std::move(table), space, stream, sirius::telemetry::batch_telemetry_info{});
   }
 
   /// GPU batch converted in place to the host representation (spilled-batch shape).
   std::shared_ptr<cucascade::data_batch> make_host_batch(std::size_t num_rows,
-                                                         rmm::cuda_stream_view stream)
+                                                         ::cuda::stream_ref stream)
   {
     auto batch     = make_gpu_batch(num_rows, *gpu0, stream);
     auto& registry = sirius::converter_registry::get();
@@ -180,7 +180,7 @@ struct batch_lock_utils_fixture {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::host_data_representation>(registry, host0, stream);
     }
-    stream.synchronize();
+    stream.sync();
     return batch;
   }
 };
@@ -190,11 +190,11 @@ struct batch_lock_utils_fixture {
 /// pool memory fails with cudaErrorInvalidValue, and an unchecked failure would silently
 /// return the zero-initialized vector.
 template <typename T>
-std::vector<T> column_values_to_host(const cudf::column_view& col, rmm::cuda_stream_view stream)
+std::vector<T> column_values_to_host(const cudf::column_view& col, ::cuda::stream_ref stream)
 {
   std::vector<T> out(static_cast<std::size_t>(col.size()));
   if (out.empty()) { return out; }
-  stream.synchronize();
+  stream.sync();
   cudaPointerAttributes attrs{};
   REQUIRE(cudaPointerGetAttributes(&attrs, col.data<T>()) == cudaSuccess);
   int prev = -1;
@@ -211,7 +211,7 @@ std::vector<T> column_values_to_host(const cudf::column_view& col, rmm::cuda_str
 /// One LIST<INT32> column with `num_lists` two-element lists [2i, 2i+1], on `space`.
 std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                                              cucascade::memory::memory_space& space,
-                                             rmm::cuda_stream_view stream)
+                                             ::cuda::stream_ref stream)
 {
   auto mr = space.get_default_allocator();
 
@@ -231,7 +231,7 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                   offsets_host.data(),
                   offsets_host.size() * sizeof(int32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                           static_cast<cudf::size_type>(values_host.size()),
                                           cudf::mask_state::UNALLOCATED,
@@ -241,8 +241,8 @@ std::unique_ptr<cudf::table> make_list_table(std::size_t num_lists,
                   values_host.data(),
                   values_host.size() * sizeof(int32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  stream.synchronize();
+                  stream.get());
+  stream.sync();
 
   auto list_col = cudf::make_lists_column(static_cast<cudf::size_type>(num_lists),
                                           std::move(offsets),
@@ -266,7 +266,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
   REQUIRE(batch != nullptr);
   const auto source_id = batch->get_batch_id();
   std::size_t source_bytes;
@@ -275,10 +275,10 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
     auto ro      = batch->to_read_only();
     source_bytes = ro.get_data()->get_size_in_bytes();
     source_values =
-      column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream.view());
+      column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream);
   }
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
   REQUIRE(prepared.has_value());
 
   // The returned accessor references a NEW batch in the target space.
@@ -287,7 +287,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
   REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
   REQUIRE(prepared->get_data()->get_size_in_bytes() == source_bytes);
   auto clone_values =
-    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream.view());
+    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream);
   REQUIRE(clone_values == source_values);
 
   // The source was never moved or mutated: still on gpu0, and back to idle (readable /
@@ -308,7 +308,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
 
   // Hold a shared lock on the source for the entire duration of the cross-GPU prepare —
   // modelling a probe task on another GPU sharing a build batch. The in-place convert_to
@@ -317,7 +317,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
   auto reader = std::make_optional(batch->to_read_only());
 
   auto fut                               = std::async(std::launch::async, [&]() {
-    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
   });
   const auto status                      = fut.wait_for(std::chrono::seconds(120));
   const bool completed_while_reader_held = (status == std::future_status::ready);
@@ -339,22 +339,22 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
   REQUIRE(f.setup(1));
 
   rmm::cuda_stream stream;
-  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch           = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
   const auto source_id = batch->get_batch_id();
   std::vector<int64_t> source_values;
   {
     auto ro = batch->to_read_only();
     source_values =
-      column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream.view());
+      column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream);
   }
   auto& registry = sirius::converter_registry::get();
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::host_data_representation>(registry, f.host0, stream.view());
+    mut.convert_to<cucascade::host_data_representation>(registry, f.host0, stream);
   }
   stream.synchronize();
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream.view());
+  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream);
   REQUIRE(prepared.has_value());
 
   // Same batch object, converted in place: identical id, source object now GPU-resident and
@@ -366,7 +366,7 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
 
   // Data integrity across the spill + upgrade round trip.
   auto upgraded_values =
-    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream.view());
+    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream);
   REQUIRE(upgraded_values == source_values);
 }
 
@@ -378,16 +378,18 @@ TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
 
   rmm::cuda_stream stream1;
   rmm::cuda_stream stream2;
-  auto batch = f.make_host_batch(kNumRows, stream1.view());
+  auto batch = f.make_host_batch(kNumRows, stream1);
 
   // Two consumers of the same spilled batch racing to the same GPU space exercise the
   // post-readonly_to_mutable re-dispatch: the exclusive-lock winner converts in place, the
   // loser observes the batch already in the target space and skips the redundant copy.
-  auto worker = [&](rmm::cuda_stream_view sv) {
+  auto worker = [&](::cuda::stream_ref sv) {
     return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, sv);
   };
-  auto fut1 = std::async(std::launch::async, worker, stream1.view());
-  auto fut2 = std::async(std::launch::async, worker, stream2.view());
+  ::cuda::stream_ref const stream1_ref = stream1;
+  ::cuda::stream_ref const stream2_ref = stream2;
+  auto fut1                            = std::async(std::launch::async, worker, stream1_ref);
+  auto fut2                            = std::async(std::launch::async, worker, stream2_ref);
 
   auto consume = [&](std::future<std::optional<cucascade::read_only_data_batch>>& fut) {
     auto prepared = fut.get();
@@ -448,7 +450,7 @@ std::vector<int32_t> expected_list_values(std::size_t num_lists)
 /// normalize_gpu_list_offsets fixup. Returned idle.
 std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock_utils_fixture& f,
                                                                       std::size_t num_lists,
-                                                                      rmm::cuda_stream_view stream)
+                                                                      ::cuda::stream_ref stream)
 {
   auto table = make_list_table(num_lists, *f.gpu0, stream);
   auto batch = sirius::make_data_batch(
@@ -458,7 +460,7 @@ std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::host_data_representation>(registry, f.host0, stream);
   }
-  stream.synchronize();
+  stream.sync();
   {
     auto upgraded = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream);
     REQUIRE(upgraded.has_value());
@@ -476,15 +478,14 @@ TEST_CASE("host to GPU upgrade normalizes LIST offsets to INT32", "[batch_lock_u
   rmm::cuda_stream stream;
   constexpr std::size_t kNumLists = 512;
 
-  auto batch = make_normalized_gpu_list_batch(f, kNumLists, stream.view());
+  auto batch = make_normalized_gpu_list_batch(f, kNumLists, stream);
 
   auto ro = batch->to_read_only();
   cudf::lists_column_view lcv(sirius::get_cudf_table_view(ro).column(0));
   REQUIRE(lcv.offsets().type().id() == cudf::type_id::INT32);
-  REQUIRE(column_values_to_host<int32_t>(lcv.offsets(), stream.view()) ==
+  REQUIRE(column_values_to_host<int32_t>(lcv.offsets(), stream) ==
           expected_list_offsets(kNumLists));
-  REQUIRE(column_values_to_host<int32_t>(lcv.child(), stream.view()) ==
-          expected_list_values(kNumLists));
+  REQUIRE(column_values_to_host<int32_t>(lcv.child(), stream) == expected_list_values(kNumLists));
 }
 
 TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_lock_utils][mgpu]")
@@ -496,19 +497,19 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
   rmm::cuda_stream stream;
   constexpr std::size_t kNumLists = 512;
 
-  auto batch = make_normalized_gpu_list_batch(f, kNumLists, stream.view());
+  auto batch = make_normalized_gpu_list_batch(f, kNumLists, stream);
 
   // Cross-GPU clone of the (normalized) GPU-resident source: the peer copy preserves the
   // source's column types exactly, so the clone's LIST offsets stay INT32 with no fixup on
   // the clone path.
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream.view());
+  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
   REQUIRE(prepared.has_value());
   REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
   cudf::lists_column_view clone_lcv(sirius::get_cudf_table_view(*prepared).column(0));
   REQUIRE(clone_lcv.offsets().type().id() == cudf::type_id::INT32);
-  REQUIRE(column_values_to_host<int32_t>(clone_lcv.offsets(), stream.view()) ==
+  REQUIRE(column_values_to_host<int32_t>(clone_lcv.offsets(), stream) ==
           expected_list_offsets(kNumLists));
-  REQUIRE(column_values_to_host<int32_t>(clone_lcv.child(), stream.view()) ==
+  REQUIRE(column_values_to_host<int32_t>(clone_lcv.child(), stream) ==
           expected_list_values(kNumLists));
 }
 
@@ -520,11 +521,11 @@ TEST_CASE("prepare_for_processing rebinds idle batches to the prepared clones",
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
 
   sirius::op::pipelineable_operator_data op_data(
     std::vector<std::shared_ptr<cucascade::data_batch>>{batch});
-  op_data.prepare_for_processing(f.gpu1, stream.view());
+  op_data.prepare_for_processing(f.gpu1, stream);
 
   // get_data_batches() must return the clone underlying the read-only accessor, not the
   // stale original — downstream forwarding (dynamic_filter, sink) relies on this.
@@ -557,7 +558,7 @@ TEST_CASE("bytes_to_materialize_input counts cross-GPU inputs for the target spa
   REQUIRE(f.setup(2));
 
   rmm::cuda_stream stream;
-  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+  auto batch = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
   std::size_t uncompressed_bytes;
   {
     auto ro            = batch->to_read_only();
@@ -586,14 +587,14 @@ TEST_CASE("single-consumer source is freed promptly after a cross-GPU prepare",
   rmm::cuda_stream stream;
   std::weak_ptr<cucascade::data_batch> source_weak;
   auto op_data = [&]() {
-    auto batch  = f.make_gpu_batch(kNumRows, *f.gpu0, stream.view());
+    auto batch  = f.make_gpu_batch(kNumRows, *f.gpu0, stream);
     source_weak = batch;
     return std::make_unique<sirius::op::pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(batch)});
   }();
   REQUIRE(!source_weak.expired());
 
-  op_data->prepare_for_processing(f.gpu1, stream.view());
+  op_data->prepare_for_processing(f.gpu1, stream);
 
   // Ownership-driven lifetime: with no other owners, the original loses its last reference
   // during prepare (the idle vector is rebound to the clone) and its gpu0 memory is freed —

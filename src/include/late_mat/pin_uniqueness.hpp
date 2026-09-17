@@ -66,7 +66,7 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -134,7 +134,7 @@ enum class unique_verdict : std::uint8_t {
 /// column would exceed a cudf column) — undecidable stays UNKNOWN and must not
 /// be confused with a column shown to repeat.
 [[nodiscard]] std::optional<bool> exact_distinct_over_chunks(
-  std::span<cudf::column_view const> chunks, rmm::cuda_stream_view stream);
+  std::span<cudf::column_view const> chunks, ::cuda::stream_ref stream);
 
 /**
  * @brief Accumulates the per-chunk evidence behind a whole-table distinctness proof.
@@ -156,7 +156,7 @@ class unique_probe {
   /// the selection; a mismatch abandons the whole proof (fails closed) rather
   /// than risking a positional misread. Runs on @p stream and synchronizes it
   /// via the scalar reads it performs.
-  void observe(cudf::table_view const& chunk, rmm::cuda_stream_view stream);
+  void observe(cudf::table_view const& chunk, ::cuda::stream_ref stream);
 
   /// Per-column verdicts, positional with the selection.
   [[nodiscard]] std::vector<unique_verdict> verdicts() const;

@@ -179,7 +179,7 @@ struct scan_plan {
   scan_plan const& plan,
   owning_table_view&& table,
   std::vector<std::string> const& partition_values,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 /// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
 /// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in

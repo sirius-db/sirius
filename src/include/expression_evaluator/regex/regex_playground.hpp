@@ -20,8 +20,9 @@
 #include <cudf/copying.hpp>
 #include <cudf/transform.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 namespace sirius {
 namespace regex {
@@ -29,9 +30,7 @@ namespace regex {
 class regex_playground {
  public:
   static std::unique_ptr<cudf::column> jit_transform_clickbench_q28_regex(
-    const cudf::column_view& input,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+    const cudf::column_view& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 };
 
 }  // namespace regex

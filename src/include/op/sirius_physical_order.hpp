@@ -59,7 +59,7 @@ class sirius_physical_order : public sirius_physical_operator {
   }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 };
 
 }  // namespace op

@@ -382,7 +382,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::optional<task_creation_hint> get_next_task_hint() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// Nominates the streaming probe port for INNER/LEFT/SEMI/ANTI/MARK joins. Returns nullopt for
   /// RIGHT-family and OUTER joins, which would require build-byte accounting. See
@@ -515,7 +515,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   // Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
   // propagate.
-  void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
+  void publish_dynamic_filters(cudf::table_view const& build_view, ::cuda::stream_ref stream);
 
   enum class dynamic_filter_publication_state : std::uint8_t {
     OPEN,

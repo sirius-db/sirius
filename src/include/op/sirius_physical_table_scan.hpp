@@ -143,7 +143,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
  public:
   bool is_source() const override { return true; }

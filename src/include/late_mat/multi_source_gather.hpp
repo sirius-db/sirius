@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +52,6 @@ void multi_source_gather_fixed(void const* const* bases_dev,
                                void* out,
                                std::uint32_t const* const* masks_dev,
                                std::uint32_t* out_mask,
-                               rmm::cuda_stream_view stream);
+                               ::cuda::stream_ref stream);
 
 }  // namespace sirius::late_mat

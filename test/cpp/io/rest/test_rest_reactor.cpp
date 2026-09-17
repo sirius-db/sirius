@@ -16,8 +16,7 @@
 
 #include <cudf/io/text/byte_range_info.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
@@ -330,8 +329,14 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
                                         io_object_segment{100, 100, fake_ptr(kB1)},
                                         io_object_segment{200, 100, fake_ptr(kB2)}};
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/0, /*size=*/300, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_host_to_device_rx_request(cfg,
+                                                            file,
+                                                            segs,
+                                                            fake_ptr(kDst),
+                                                            /*offset=*/0,
+                                                            /*size=*/300,
+                                                            ::cuda::stream_ref{cudaStream_t{}},
+                                                            0);
     REQUIRE(req->size() == 1);
     auto chunks = req->get_all_chunks();
     REQUIRE(chunks.size() == 1);
@@ -358,8 +363,14 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
                                         io_object_segment{100, 100, fake_ptr(kB1)},
                                         io_object_segment{200, 100, fake_ptr(kB2)}};
     // Device window [50, 250): clips the first and last buffers.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/50, /*size=*/200, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_host_to_device_rx_request(cfg,
+                                                            file,
+                                                            segs,
+                                                            fake_ptr(kDst),
+                                                            /*offset=*/50,
+                                                            /*size=*/200,
+                                                            ::cuda::stream_ref{cudaStream_t{}},
+                                                            0);
     REQUIRE(req->size() == 1);
     auto chunks   = req->get_all_chunks();
     auto const& c = *chunks[0];
@@ -388,7 +399,7 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
                                         io_object_segment{100, 100, fake_ptr(kB1)},
                                         io_object_segment{200, 100, fake_ptr(kB2)}};
     auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), 0, 300, rmm::cuda_stream_view{}, 0);
+      cfg, file, segs, fake_ptr(kDst), 0, 300, ::cuda::stream_ref{cudaStream_t{}}, 0);
     REQUIRE(req->size() == 2);  // [0,200) over 2 buffers, then [200,300)
   }
 
@@ -397,7 +408,7 @@ TEST_CASE("prep_host_to_device fuses contiguous segments into a multi-copy chunk
     std::vector<io_object_segment> segs{io_object_segment{0, 100, fake_ptr(kB0)},
                                         io_object_segment{500, 100, fake_ptr(kB1)}};
     auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), 0, 600, rmm::cuda_stream_view{}, 0);
+      cfg, file, segs, fake_ptr(kDst), 0, 600, ::cuda::stream_ref{cudaStream_t{}}, 0);
     REQUIRE(req->size() == 2);
     auto chunks = req->get_all_chunks();
     for (auto const& cp : chunks) {
@@ -422,8 +433,14 @@ TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-s
                                         io_object_segment{300, 100, fake_ptr(kB1)}};
     // Device window [150, 380): clips the first and last real buffers while the
     // null-buffer gap is staged later through a reactor-owned bounce slot.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/150, /*size=*/230, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_host_to_device_rx_request(cfg,
+                                                            file,
+                                                            segs,
+                                                            fake_ptr(kDst),
+                                                            /*offset=*/150,
+                                                            /*size=*/230,
+                                                            ::cuda::stream_ref{cudaStream_t{}},
+                                                            0);
 
     auto chunks = req->get_all_chunks();
     REQUIRE(chunks.size() == 3);
@@ -467,8 +484,14 @@ TEST_CASE("prep_host_to_device keeps null-buffer segments as standalone bounce-s
     // Device window [125, 275): the first null-buffer chunk starts 25 bytes into
     // its future bounce slot, proving the copy carries a src_off instead of a
     // near-null absolute pointer.
-    auto req = rest_reactor::prep_host_to_device_rx_request(
-      cfg, file, segs, fake_ptr(kDst), /*offset=*/125, /*size=*/150, rmm::cuda_stream_view{}, 0);
+    auto req = rest_reactor::prep_host_to_device_rx_request(cfg,
+                                                            file,
+                                                            segs,
+                                                            fake_ptr(kDst),
+                                                            /*offset=*/125,
+                                                            /*size=*/150,
+                                                            ::cuda::stream_ref{cudaStream_t{}},
+                                                            0);
 
     auto chunks = req->get_all_chunks();
     REQUIRE(chunks.size() == 2);
@@ -504,7 +527,7 @@ TEST_CASE("device_cpy_request rejects null-derived host sources before cuda memc
   }
 
   device_cpy_request invalid;
-  invalid.stream    = rmm::cuda_stream_view{};
+  invalid.stream    = ::cuda::stream_ref{cudaStream_t{}};
   invalid.device_id = 0;
   invalid.copies.push_back(device_cpy_request::copy{
     /*dst=*/fake_ptr(0x100000), /*src=*/nullptr, /*src_off=*/4, /*size=*/4});
@@ -515,7 +538,7 @@ TEST_CASE("device_cpy_request rejects null-derived host sources before cuda memc
   REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device_dst), host.size()) == cudaSuccess);
 
   device_cpy_request valid;
-  valid.stream    = rmm::cuda_stream_view{};
+  valid.stream    = ::cuda::stream_ref{cudaStream_t{}};
   valid.device_id = 0;
   valid.copies.push_back(device_cpy_request::copy{
     /*dst=*/device_dst, /*src=*/nullptr, /*src_off=*/0, /*size=*/host.size()});

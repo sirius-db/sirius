@@ -16,7 +16,7 @@
 
 #include "stream_check.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <absl/debugging/stacktrace.h>
 #include <absl/debugging/symbolize.h>
@@ -144,12 +144,12 @@ namespace cudf {
  * this will log a stack trace to the configured file. Otherwise, it returns
  * the RMM default stream without logging.
  */
-rmm::cuda_stream_view get_default_stream()
+::cuda::stream_ref get_default_stream()
 {
   if (g_log_on_default_stream.load(std::memory_order_relaxed)) { log_default_stream_access(); }
 
   // Always return the RMM default stream
-  return rmm::cuda_stream_view{};
+  return ::cuda::stream_ref{cudaStream_t{}};
 }
 
 }  // namespace cudf

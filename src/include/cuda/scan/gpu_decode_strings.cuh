@@ -25,8 +25,9 @@
 
 #include <cudf/column/column.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <duckdb/common/enums/compression_type.hpp>
 
@@ -69,7 +70,7 @@ struct gpu_string_column_decode_input {
 /// the per-segment length upper bound is unknown or pathological). Throws
 /// on malformed segment metadata or unsupported codecs.
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::cuda::scan

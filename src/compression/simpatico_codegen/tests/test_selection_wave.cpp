@@ -23,9 +23,9 @@
 
 #include "codegen/selection/selection.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -112,7 +112,7 @@ std::vector<std::uint32_t> pack_reference(std::vector<std::uint8_t> const& flags
   return words;
 }
 
-rmm::cuda_stream_view test_stream() { return rmm::cuda_stream_view{}; }
+::cuda::stream_ref test_stream() { return ::cuda::stream_ref{cudaStream_t{}}; }
 
 //===----------------------------------------------------------------------===//
 

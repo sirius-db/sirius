@@ -52,7 +52,7 @@ class sirius_physical_cte : public sirius_physical_operator {
   std::string ctename;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
  public:
   // Sink interface

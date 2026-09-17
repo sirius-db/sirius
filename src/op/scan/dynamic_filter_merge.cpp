@@ -64,7 +64,7 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
   int device_id)
@@ -226,7 +226,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
   dynamic_filter_gate& gate,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   int device_id)
 {

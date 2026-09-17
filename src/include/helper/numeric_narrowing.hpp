@@ -23,8 +23,9 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
@@ -171,7 +172,7 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
 [[nodiscard]] std::unique_ptr<cudf::column> cast_through_rep(
   cudf::column_view const& column,
   cudf::data_type target,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
@@ -245,7 +246,7 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
 [[nodiscard]] std::optional<numeric_range> compute_exact_numeric_range(
   cudf::column_view const& column,
   logical_type const& logical,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 /**
@@ -262,6 +263,6 @@ enum class narrow_domain : uint8_t { NONE, SIGNED_INTEGER, UNSIGNED_INTEGER, DEC
  * or has an unsupported fixed-point scale
  */
 [[nodiscard]] std::optional<numeric_range> compute_exact_numeric_range(
-  cudf::column_view const& column, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
+  cudf::column_view const& column, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 
 }  // namespace sirius

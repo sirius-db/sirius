@@ -23,7 +23,7 @@
 // clang-format on
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_gate.hpp>
@@ -60,7 +60,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
   dynamic_filter_gate* gate      = nullptr,
   int device_id                  = -1);
@@ -74,7 +74,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
   cudf::table_view const& input,
   sirius::op::sirius_dynamic_filter_set const& filters,
   dynamic_filter_gate& gate,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   int device_id = -1);
 

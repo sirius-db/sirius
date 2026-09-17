@@ -1999,25 +1999,21 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   rmm::cuda_stream build_stream;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (allocator == nullptr ||
-      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+      !allocator->attach_reservation_to_tracker(build_stream, std::move(reservation))) {
     throw InvalidInputException(
       "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
   }
   // Release the reservation whether the build succeeds or throws. On release the
   // arena hands back its unused slack and keeps the resident index accounted.
   absl::Cleanup reset_reservation = [allocator, &build_stream] {
-    allocator->reset_stream_reservation(build_stream.view());
+    allocator->reset_stream_reservation(build_stream);
   };
 
   // Build IVF-Flat on the build stream
   std::unique_ptr<sirius::vss::any_cuvs_index> handle;
   try {
-    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
-                                                            dim,
-                                                            n_lists,
-                                                            metric,
-                                                            target_space->get_default_allocator(),
-                                                            build_stream.view());
+    handle = sirius::vss::build_ivf_flat_index_from_batches(
+      chunk_views, dim, n_lists, metric, target_space->get_default_allocator(), build_stream);
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
@@ -2041,9 +2037,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists      = static_cast<int64_t>(n_lists);
   meta.metric       = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
-  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
-    allocator->get_peak_allocated_bytes(build_stream.view());
+    allocator->get_peak_allocated_bytes(build_stream);
 
   // Release the reservation before the build stream moves into the cache.
   std::move(reset_reservation).Invoke();

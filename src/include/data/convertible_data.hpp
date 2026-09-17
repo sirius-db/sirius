@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <memory>
@@ -73,7 +73,7 @@ class convertible_data {
    */
   virtual std::optional<std::vector<std::size_t>> convert(
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
     bool blocking) = 0;
 

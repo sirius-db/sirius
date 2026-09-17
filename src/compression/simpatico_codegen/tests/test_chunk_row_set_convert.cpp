@@ -23,10 +23,10 @@
 #include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/selection.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -65,7 +65,7 @@ void check_round_trip(char const* what,
                       std::int64_t num_rows,
                       std::vector<std::int64_t> const& survivors)
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
 
   auto const num_words  = selection_mask::WordsFor(num_rows);
@@ -84,7 +84,7 @@ void check_round_trip(char const* what,
                   host_words.data(),
                   host_words.size() * sizeof(std::uint32_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
   rmm::device_buffer offsets(
     (static_cast<std::size_t>(num_chunks) + 1) * sizeof(std::uint32_t), stream, mr);
 
@@ -104,7 +104,7 @@ void check_round_trip(char const* what,
     static_cast<std::size_t>(counted == 0 ? 1 : counted) * sizeof(std::int32_t), stream, mr);
   sirius::codegen::mask_to_row_indices(
     mask, static_cast<std::int32_t*>(wave_indices.data()), stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   auto built = build_chunk_row_set(
     static_cast<std::int32_t const*>(wave_indices.data()), counted, num_rows, stream, mr);
@@ -115,14 +115,14 @@ void check_round_trip(char const* what,
   rmm::device_buffer derived_words(host_words.size() * sizeof(std::uint32_t), stream, mr);
   rmm::device_buffer derived_offsets(
     (static_cast<std::size_t>(num_chunks) + 1) * sizeof(std::uint32_t), stream, mr);
-  cudaMemsetAsync(derived_words.data(), 0xAB, derived_words.size(), stream.value());
-  cudaMemsetAsync(derived_offsets.data(), 0xAB, derived_offsets.size(), stream.value());
+  cudaMemsetAsync(derived_words.data(), 0xAB, derived_words.size(), stream.get());
+  cudaMemsetAsync(derived_offsets.data(), 0xAB, derived_offsets.size(), stream.get());
   row_set_to_mask(rows,
                   static_cast<std::uint32_t*>(derived_words.data()),
                   static_cast<std::uint32_t*>(derived_offsets.data()),
                   stream,
                   mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   auto const got_words = download<std::uint32_t>(derived_words.data(), host_words.size());
   REQUIRE_MSG(got_words == host_words, "[%s] derived mask != the mask the wave counted", what);

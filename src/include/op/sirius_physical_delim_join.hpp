@@ -97,7 +97,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -119,7 +119,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 };
 
 }  // namespace op

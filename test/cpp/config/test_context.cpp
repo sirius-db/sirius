@@ -94,20 +94,20 @@ bool enable_p2p_for_test(int num_gpus)
 // Phase 18 / DB-03: const dropped from data_batch& parameter (mirrors
 // debug_utils.hpp pattern from plan 18-04). cucascade #117's to_read_only is
 // non-const because it acquires the shared lock.
-uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
+uint64_t compute_batch_checksum_fnv1a64(cucascade::data_batch& batch, ::cuda::stream_ref stream)
 {
   // Phase 18 / DB-03 Recipe R1: scoped read-only accessor for the lifetime
   // of gpu_rep, packed, and host_buf — released at function exit.
   auto ro             = batch.to_read_only();
   auto const& gpu_rep = ro.get_data()->cast<cucascade::gpu_table_representation>();
   auto packed         = cudf::pack(gpu_rep.get_table_view(), stream);
-  stream.synchronize();
+  stream.sync();
 
   auto const bytes = packed.gpu_data->size();
   std::vector<uint8_t> host_buf(bytes);
   cudaMemcpyAsync(
-    host_buf.data(), packed.gpu_data->data(), bytes, cudaMemcpyDeviceToHost, stream.value());
-  stream.synchronize();
+    host_buf.data(), packed.gpu_data->data(), bytes, cudaMemcpyDeviceToHost, stream.get());
+  stream.sync();
 
   uint64_t h = 0xcbf29ce484222325ULL;
   for (auto b : host_buf) {
@@ -2131,13 +2131,13 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // MGPU-06 Pitfall 2 data integrity guard — Ada Lovelace + Sapphire Rapids
   // silent PCIe P2P write-ordering corruption. Capture the FNV-1a checksum
   // over the batch payload BEFORE any cross-GPU transfer.
-  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream.view());
+  auto checksum_pre = compute_batch_checksum_fnv1a64(*batch, stream);
 
   // GPU0 -> GPU1 forward leg.
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream.view());
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu1, stream);
   }
 
   {
@@ -2153,7 +2153,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // Phase 18 / DB-03 Recipe R8 + R3: scoped mutable accessor.
   {
     auto mut = batch->to_mutable();
-    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream.view());
+    mut.convert_to<cucascade::gpu_table_representation>(registry, gpu0, stream);
   }
 
   {
@@ -2168,7 +2168,7 @@ TEST_CASE("gpu_to_gpu round-trip preserves bytes on N>=2 hosts (MGPU-04 + MGPU-0
   // Sapphire Rapids (or later) host = silent data corruption; see Pitfall 2
   // in .planning/phases/07-*/07-RESEARCH.md for the NVIDIA-documented
   // mitigation (disable P2P on affected platforms, or use Hopper/Blackwell).
-  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream.view());
+  auto checksum_post = compute_batch_checksum_fnv1a64(*batch, stream);
   INFO("MGPU-04 + MGPU-06 round-trip checksum: pre=" << checksum_pre << " post=" << checksum_post);
   REQUIRE(checksum_post == checksum_pre);
 

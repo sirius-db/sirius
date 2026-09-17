@@ -86,7 +86,7 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
 
   /// Pass-through: batches are already materialized.
   std::unique_ptr<operator_data> execute(const operator_data& input,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// Pass-through: return input bytes so the default 2× heuristic does not over-reserve.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(

@@ -71,7 +71,7 @@ __global__ void offsets_tail_kernel(std::uint32_t const* __restrict__ counts,
 void row_set_to_mask(chunk_row_set const& rows,
                      std::uint32_t* mask_words,
                      std::uint32_t* all_chunk_offsets,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (mask_words == nullptr || all_chunk_offsets == nullptr || rows.num_rows <= 0) {
@@ -85,22 +85,21 @@ void row_set_to_mask(chunk_row_set const& rows,
   // read as a survivor that does not exist.
   throw_on_cuda(
     cudaMemsetAsync(
-      mask_words, 0, static_cast<std::size_t>(num_words) * sizeof(std::uint32_t), stream.value()),
+      mask_words, 0, static_cast<std::size_t>(num_words) * sizeof(std::uint32_t), stream.get()),
     "mask clear");
 
   rmm::device_buffer counts(
     static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t), stream, mr);
-  throw_on_cuda(cudaMemsetAsync(counts.data(),
-                                0,
-                                static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t),
-                                stream.value()),
-                "counts clear");
+  throw_on_cuda(
+    cudaMemsetAsync(
+      counts.data(), 0, static_cast<std::size_t>(num_chunks) * sizeof(std::uint32_t), stream.get()),
+    "counts clear");
 
   if (rows.num_survivors > 0) {
     if (!rows.valid()) {
       throw std::runtime_error("chunk_row_set_convert: mask expansion from an invalid row set");
     }
-    to_mask_kernel<<<static_cast<unsigned>(rows.num_touched), kBlock, 0, stream.value()>>>(
+    to_mask_kernel<<<static_cast<unsigned>(rows.num_touched), kBlock, 0, stream.get()>>>(
       rows.chunk_ids,
       rows.block_offsets,
       rows.in_chunk_rows,
@@ -115,7 +114,7 @@ void row_set_to_mask(chunk_row_set const& rows,
                                               static_cast<std::uint32_t const*>(counts.data()),
                                               all_chunk_offsets,
                                               static_cast<int>(num_chunks),
-                                              stream.value()),
+                                              stream.get()),
                 "chunk offsets scan probe");
   rmm::device_buffer tmp(tmp_bytes, stream, mr);
   throw_on_cuda(cub::DeviceScan::ExclusiveSum(tmp.data(),
@@ -123,9 +122,9 @@ void row_set_to_mask(chunk_row_set const& rows,
                                               static_cast<std::uint32_t const*>(counts.data()),
                                               all_chunk_offsets,
                                               static_cast<int>(num_chunks),
-                                              stream.value()),
+                                              stream.get()),
                 "chunk offsets scan");
-  offsets_tail_kernel<<<1, 1, 0, stream.value()>>>(
+  offsets_tail_kernel<<<1, 1, 0, stream.get()>>>(
     static_cast<std::uint32_t const*>(counts.data()), num_chunks, all_chunk_offsets);
   throw_on_cuda(cudaPeekAtLastError(), "chunk offsets tail launch");
 }

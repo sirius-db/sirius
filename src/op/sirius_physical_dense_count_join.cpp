@@ -97,7 +97,7 @@ namespace {
 std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
                                                   cudf::column_view const& values,
                                                   cudf::null_policy value_policy,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   cudf::groupby::groupby gb(cudf::table_view({keys}), cudf::null_policy::EXCLUDE, cudf::sorted::NO);
@@ -115,7 +115,7 @@ std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
 
 std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
                                                std::unique_ptr<cudf::table> rhs,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   std::vector<cudf::table_view> views{lhs->view(), rhs->view()};
@@ -141,7 +141,7 @@ std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
 std::unique_ptr<cudf::table> sparse_merge_partials(
   std::vector<std::unique_ptr<cudf::table>> partials,
   cudf::data_type key_type,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (partials.empty()) {
@@ -445,7 +445,7 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
 }
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
-  operator_data const& input_data, rmm::cuda_stream_view stream)
+  operator_data const& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
   auto const& input          = dynamic_cast<dense_count_join_input const&>(input_data);

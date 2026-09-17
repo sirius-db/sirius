@@ -153,7 +153,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    * @return Pipelineable data containing one output batch
    */
   std::unique_ptr<operator_data> execute(operator_data const& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }

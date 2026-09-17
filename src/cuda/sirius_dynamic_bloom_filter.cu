@@ -88,7 +88,7 @@ void copy_filter_storage(Filter const& source,
                          cucascade::memory::memory_space const& source_space,
                          Filter& destination,
                          rmm::cuda_device_id destination_device,
-                         rmm::cuda_stream_view stream,
+                         ::cuda::stream_ref stream,
                          cucascade::memory::memory_space const& host_staging_space,
                          std::size_t& bytes)
 {
@@ -193,7 +193,7 @@ std::size_t sirius_dynamic_bloom_filter::estimated_bytes(std::size_t num_keys) n
 }
 
 sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const& keys,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   if (!supports(keys.type())) {
@@ -208,7 +208,7 @@ sirius_dynamic_bloom_filter::sirius_dynamic_bloom_filter(cudf::column_view const
     build_keys = compacted->view().column(0);
   }
   auto const n = build_keys.size();
-  cuda::stream_ref const s{stream.value()};
+  cuda::stream_ref const s{stream.get()};
   auto const num_blocks = blocks_for(n);
   _impl                 = std::make_unique<impl>();
   if (cudaGetDevice(&_impl->source_device) != cudaSuccess) {
@@ -253,7 +253,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
   auto const& source_space = source_target->get_gpu_space();
 
   // Keep copies and streams alive until all peer transfers are queued and synchronized.
-  std::vector<std::pair<std::unique_ptr<bloom_replica>, rmm::cuda_stream_view>> pending;
+  std::vector<std::pair<std::unique_ptr<bloom_replica>, ::cuda::stream_ref>> pending;
   pending.reserve(spaces.size());
   _impl->replicas.reserve(_impl->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -323,7 +323,7 @@ void sirius_dynamic_bloom_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      stream.sync();
       _impl->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
@@ -349,7 +349,7 @@ std::size_t sirius_dynamic_bloom_filter::replica_count() const noexcept
 std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   cudf::column_view const& probe,
   int device_id,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   auto const* replica =
@@ -374,7 +374,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_bloom_filter::compute_mask(
   auto const n = keys.size();
   auto out     = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::BOOL8}, n, cudf::mask_state::UNALLOCATED, stream, mr);
-  cuda::stream_ref const s{stream.value()};
+  cuda::stream_ref const s{stream.get()};
   auto* const outp = out->mutable_view().data<bool>();
 
   std::visit(

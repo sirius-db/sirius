@@ -262,7 +262,7 @@ void downgrade_executor::processing_loop()
              &disk_target_stats]() mutable {
               try {
                 auto result =
-                  cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
+                  cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
                 if (result) {
                   req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                   req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);
@@ -326,7 +326,7 @@ void downgrade_executor::processing_loop()
            &disk_target_stats]() mutable {
             try {
               auto result =
-                cand->convert(targets, rmm::cuda_stream_view{exc_stream.get()}, res_mgr, false);
+                cand->convert(targets, ::cuda::stream_ref{exc_stream.get()}, res_mgr, false);
               if (result) {
                 req_ptr->bytes_freed.fetch_add(candidate_bytes, std::memory_order_relaxed);
                 req_ptr->batches_downgraded.fetch_add(1, std::memory_order_relaxed);

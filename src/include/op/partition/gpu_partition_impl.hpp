@@ -63,7 +63,7 @@ class gpu_partition_impl {
     const std::vector<int>& partition_key_idx,
     const std::vector<cudf::data_type>& partition_key_cast_types,
     int num_partitions,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
@@ -72,7 +72,7 @@ class gpu_partition_impl {
     const cucascade::read_only_data_batch& input,
     const std::vector<int>& partition_key_idx,
     int num_partitions,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {})
   {
@@ -93,7 +93,7 @@ class gpu_partition_impl {
   static std::vector<std::shared_ptr<cucascade::data_batch>> evenly_partition(
     const cucascade::read_only_data_batch& input,
     int num_partitions,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 };

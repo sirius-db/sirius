@@ -175,7 +175,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute(rmm::cuda_stream_view stream) override;
+  void execute(::cuda::stream_ref stream) override;
 
   /**
    * @brief Get the preferred GPU device ID for this task.
@@ -243,7 +243,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<op::operator_data> compute_task(::cuda::stream_ref stream) override;
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -252,7 +252,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
+  void publish_output(op::operator_data& output_batches, ::cuda::stream_ref stream) override;
 
   /// Restore the sink's deferred input, if it carries a port directive.
   ///
@@ -260,12 +260,12 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// restoration alone: a sink publishes incrementally, so an OOM inside sink() has already
   /// committed batches and replaying its input would duplicate them.
   std::unique_ptr<op::operator_data> materialize_sink_input(op::operator_data& output_data,
-                                                            rmm::cuda_stream_view stream);
+                                                            ::cuda::stream_ref stream);
 
   /// Publish @p materialized (or @p output_batches when there was nothing to restore) to the sink.
   void publish_output(op::operator_data& output_batches,
                       op::operator_data* materialized,
-                      rmm::cuda_stream_view stream);
+                      ::cuda::stream_ref stream);
 
   /**
    * @brief Get the input size for this task

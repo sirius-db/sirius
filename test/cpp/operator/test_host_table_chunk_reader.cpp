@@ -37,7 +37,8 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <algorithm>
@@ -159,7 +160,7 @@ std::vector<cudf::size_type> build_null_indices(size_t num_rows,
 
 void apply_null_mask(cudf::column& column,
                      std::vector<cudf::size_type> const& null_rows,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (null_rows.empty() || column.size() == 0) { return; }
@@ -217,7 +218,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 host_data_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<data_batch> const& batch,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   // Verify batch has data (use read-only accessor to check).
   {
@@ -251,7 +252,7 @@ host_data_representation const& convert_to_host_table(
 std::unique_ptr<cudf::table> make_timestamp_table(std::vector<int64_t> const& ticks,
                                                   cudf::type_id ts_type_id,
                                                   std::vector<cudf::size_type> const& null_rows,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   auto col = cudf::make_timestamp_column(cudf::data_type{ts_type_id},
@@ -273,7 +274,7 @@ std::unique_ptr<cudf::table> make_timestamp_table(std::vector<int64_t> const& ti
 
 std::shared_ptr<data_batch> make_test_batch(std::unique_ptr<cudf::table> table,
                                             cucascade::memory::memory_space& gpu_space,
-                                            rmm::cuda_stream_view stream)
+                                            ::cuda::stream_ref stream)
 {
   return sirius::make_data_batch(
     std::move(table), gpu_space, stream, sirius::telemetry::batch_telemetry_info{});
@@ -284,7 +285,7 @@ std::vector<duckdb::timestamp_t> read_timestamp_chunks(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<data_batch> const& batch,
   duckdb::LogicalType const& output_type,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto const& host_table = convert_to_host_table(sirius_ctx, batch, stream);
   duckdb::vector<duckdb::LogicalType> types{output_type};

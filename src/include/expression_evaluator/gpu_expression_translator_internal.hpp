@@ -34,7 +34,8 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <functional>
@@ -108,8 +109,7 @@ class gpu_expression_translator {
    * constructing literals).
    * @param resource_ref The RMM resource reference to use for any operations performed
    */
-  gpu_expression_translator(rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref resource_ref)
+  gpu_expression_translator(::cuda::stream_ref stream, rmm::device_async_resource_ref resource_ref)
     : _stream(stream), _resource_ref(resource_ref)
   {
   }
@@ -271,9 +271,10 @@ class gpu_expression_translator {
   cudf::ast::tree _ast_tree{};  ///< The cuDF AST being constructed by the translator. The final
                                 ///< expression will be the back of the tree.
   std::vector<std::unique_ptr<cudf::scalar>>
-    _literal_scalars{};           ///< Owning storage for scalar literals referenced by AST nodes.
-  rmm::cuda_stream_view _stream;  ///< The CUDA stream to use for any operations performed by the
-                                  ///< translator (e.g. in constructing literals).
+    _literal_scalars{};  ///< Owning storage for scalar literals referenced by AST nodes.
+  ::cuda::stream_ref _stream{
+    cudaStream_t{}};  ///< The CUDA stream to use for any operations performed by the
+                      ///< translator (e.g. in constructing literals).
   rmm::device_async_resource_ref
     _resource_ref;  ///< The RMM resource reference to use for any operations performed by the
                     ///< translator (e.g. in constructing literals).

@@ -104,7 +104,7 @@ std::vector<int32_t> expected_survivors(std::vector<std::uint8_t> const& keep)
 void require_survivors(std::unique_ptr<cudf::table> const& result,
                        std::vector<std::uint8_t> const& keep)
 {
-  sirius::test::operator_utils::default_stream().synchronize();
+  sirius::test::operator_utils::default_stream().sync();
   auto const expected = expected_survivors(keep);
   REQUIRE(result->num_columns() == 1);
   REQUIRE(static_cast<std::size_t>(result->num_rows()) == expected.size());

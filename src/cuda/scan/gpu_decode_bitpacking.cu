@@ -356,7 +356,7 @@ template <typename T>
 void launch_typed(detail::cta_block_desc const* h_descs,
                   size_t num_groups,
                   T* d_output,
-                  rmm::cuda_stream_view stream,
+                  ::cuda::stream_ref stream,
                   rmm::device_async_resource_ref mr)
 {
   // The +1 guard word satisfies `unpack_value`'s 3-word read contract for
@@ -373,10 +373,10 @@ void launch_typed(detail::cta_block_desc const* h_descs,
                                h_descs,
                                num_groups * sizeof(detail::cta_block_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   kernel_decode_bitpacking<T, SHMEM_BYTES>
-    <<<static_cast<uint32_t>(num_groups), BITPACK_BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_groups), BITPACK_BLOCK_DIM, 0, stream.get()>>>(
       d_descs.data(), d_output, static_cast<uint32_t>(num_groups));
 }
 
@@ -395,7 +395,7 @@ void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
                             cudf::data_type /*type*/,
                             uint32_t type_size,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   auto descs = detail::build_block_descs<BP_META_GROUP_SIZE>(run);

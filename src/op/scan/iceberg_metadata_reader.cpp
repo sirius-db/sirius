@@ -381,7 +381,7 @@ struct equality_delete_read_result {
 equality_delete_read_result read_equality_delete_file(std::string const& delete_file_path,
                                                       sirius::io::sirius_ioctx& ioctx)
 {
-  auto stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
 
   // One datasource for both passes: its io_object opens 2 fds, so reusing avoids a reopen.
   auto datasource = ioctx.open_datasource(delete_file_path);
@@ -421,7 +421,7 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
     field_ids.clear();
   }
 
-  stream.synchronize();
+  stream.sync();
   SIRIUS_LOG_INFO("[iceberg] read equality-delete: path={} rows={} cols={}",
                   delete_file_path,
                   result.tbl->num_rows(),
@@ -579,7 +579,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
                                          std::vector<std::optional<int32_t>> key_field_ids,
                                          std::vector<cudf::table_view> const& views)
 {
-  auto stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
 
   auto all_rows = (views.size() == 1) ? std::make_unique<cudf::table>(views[0], stream)
                                       : cudf::concatenate(views, stream);
@@ -606,7 +606,7 @@ EqualityDeleteGroup build_equality_group(std::vector<std::string> key_names,
 
   auto hash_join = std::make_unique<cudf::distinct_hash_join>(
     deduped->view(), cudf::null_equality::EQUAL, 0.5, stream);
-  stream.synchronize();
+  stream.sync();
 
   EqualityDeleteGroup group;
   group.delete_table  = std::move(deduped);

@@ -20,7 +20,7 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -97,7 +97,7 @@ class itask {
   itask& operator=(itask&&)      = delete;
 
   // Execution function.
-  virtual void execute(rmm::cuda_stream_view stream) = 0;
+  virtual void execute(::cuda::stream_ref stream) = 0;
 
   template <typename T>
   T* as() noexcept

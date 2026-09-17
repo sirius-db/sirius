@@ -53,6 +53,8 @@
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 
+#include <cuda/stream>
+
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/types/value.hpp>
@@ -73,7 +75,7 @@ namespace sirius {
  */
 inline std::unique_ptr<cudf::table> ApplyRetentionMask(cudf::table_view const& input,
                                                        cudf::column_view const& retention_mask,
-                                                       rmm::cuda_stream_view stream,
+                                                       ::cuda::stream_ref stream,
                                                        rmm::device_async_resource_ref mr)
 {
 #if CUDF_VERSION_NUM >= 2610
@@ -261,7 +263,7 @@ inline cudf::data_type get_cudf_type(const logical_type& t)
  */
 inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& val,
                                                           logical_type const& t,
-                                                          rmm::cuda_stream_view stream)
+                                                          ::cuda::stream_ref stream)
 {
   auto cudf_type = get_cudf_type(t);
 
@@ -452,7 +454,7 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
  */
 inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
                                                              LogicalType const& logical_type,
-                                                             rmm::cuda_stream_view stream)
+                                                             ::cuda::stream_ref stream)
 {
   auto cudf_type = GetCudfType(logical_type);
 

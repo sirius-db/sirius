@@ -28,7 +28,7 @@
 // rmm
 #include "io/io_context.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 // standard library
 #include <concepts>
@@ -102,7 +102,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
    */
   filtered_table materialize_table(
     const op::scan::scan_operator_input& split,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr);
 
@@ -152,7 +152,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   virtual filtered_table materialize_metadata_to_table(
     const scan_info& info,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr) = 0;
 
@@ -193,7 +193,7 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   virtual std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath                                           = false,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache = nullptr,
     std::unique_ptr<cudf::column>* survivors                          = nullptr,

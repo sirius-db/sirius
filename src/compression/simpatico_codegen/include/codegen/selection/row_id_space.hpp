@@ -26,9 +26,10 @@
 
 #pragma once
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <vector>
@@ -66,7 +67,7 @@ struct sorted_unique_ids {
 /// that is the sync this avoids.
 sorted_unique_ids sort_unique_global_ids(std::uint64_t const* ids,
                                          std::int64_t count,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr);
 
 /// Where each batch's slice of a SORTED global id list begins.
@@ -89,7 +90,7 @@ std::vector<std::int64_t> split_sorted_ids_by_batch(
   std::int32_t const* count_dev,
   std::vector<std::int64_t> const& batch_row_start,
   std::int64_t* count_out,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 /// One batch's slice of global ids to batch-local ids: ``out[i] = ids[i] -
@@ -103,6 +104,6 @@ void global_slice_to_local(std::uint64_t const* ids,
                            std::int64_t count,
                            std::int64_t batch_row_start,
                            std::int32_t* out_local,
-                           rmm::cuda_stream_view stream);
+                           ::cuda::stream_ref stream);
 
 }  // namespace sirius::codegen

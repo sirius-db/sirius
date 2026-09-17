@@ -25,8 +25,9 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -42,7 +43,7 @@ enum : uint8_t {
 //! @brief Build per-segment DICT_FSST predecode state on device: import symbol tables, unpack +
 //! scan the dictionary byte/decoded offsets, and aggregate the per-segment predecode prefix.
 prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr);
 
 //! @brief Pass 1: write each row's decoded length (from the per-dict decoded offsets) into
@@ -51,7 +52,7 @@ void launch_dict_fsst_lengths(dict_fsst_desc const* d_chunks,
                               uint32_t* d_lengths,
                               uint32_t const* d_decoded_offsets,
                               uint32_t n_chunks,
-                              rmm::cuda_stream_view stream);
+                              ::cuda::stream_ref stream);
 
 //! @brief Mode-1 predecode: decompress each dictionary entry once into @p d_predecode. No-op when
 //! @p n_segments is 0 or @p total_predecode_bytes is 0.
@@ -62,7 +63,7 @@ void launch_dict_fsst_predecode(dict_fsst_desc const* d_descs,
                                 uint8_t* d_predecode,
                                 uint32_t n_segments,
                                 uint32_t total_predecode_bytes,
-                                rmm::cuda_stream_view stream);
+                                ::cuda::stream_ref stream);
 
 //! @brief Pass 2: per-row gather + emit into @p d_chars at the prefix-summed @p d_offsets. No-op
 //! when @p n_chunks is 0.
@@ -74,12 +75,12 @@ void launch_dict_fsst_gather(dict_fsst_desc const* d_chunks,
                              uint8_t const* d_predecode,
                              fsst_decoder_compact const* d_decoders,
                              uint32_t n_chunks,
-                             rmm::cuda_stream_view stream);
+                             ::cuda::stream_ref stream);
 
 //! @brief Fold inline NULLs (dict idx 0) into @p d_null_mask. No-op when @p n_segments is 0.
 void launch_dict_fsst_mark_nulls(dict_fsst_desc const* d_descs,
                                  uint8_t* d_null_mask,
                                  uint32_t n_segments,
-                                 rmm::cuda_stream_view stream);
+                                 ::cuda::stream_ref stream);
 
 }  // namespace sirius::cuda::scan

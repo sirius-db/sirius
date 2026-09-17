@@ -168,7 +168,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
-                                                               rmm::cuda_stream_view stream)
+                                                               ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
@@ -205,7 +205,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
-void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);

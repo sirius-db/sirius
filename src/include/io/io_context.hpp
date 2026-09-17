@@ -22,7 +22,7 @@
 #include "io/cache/types.hpp"
 #include "io/types.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -224,7 +224,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
                                                          size_t offset,
                                                          size_t size,
                                                          uint8_t* dst,
-                                                         rmm::cuda_stream_view stream) noexcept = 0;
+                                                         ::cuda::stream_ref stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_to_device_read_async_io(
     const sirius_io_object& obj,
@@ -232,7 +232,7 @@ class sirius_ioctx : public std::enable_shared_from_this<sirius_ioctx> {
     size_t offset,
     size_t size,
     uint8_t* device_dst,
-    rmm::cuda_stream_view stream) noexcept = 0;
+    ::cuda::stream_ref stream) noexcept = 0;
 
   virtual exec::semi_future<size_t> host_read_ranges_async_io(
     const sirius_io_object& obj, std::span<io_object_segment> segments) noexcept = 0;
