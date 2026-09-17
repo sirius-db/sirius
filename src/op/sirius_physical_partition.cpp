@@ -79,33 +79,17 @@ const char* sirius_physical_partition::sizing_basis_name(sizing_basis basis)
   return "unknown";
 }
 
-void sirius_physical_partition::record_sizing_basis() const
-{
-  if (_context_observer == nullptr) { return; }
-  switch (_sizing_basis) {
-    case sizing_basis::measured: _context_observer->record_partition_sized_from_measured(); return;
-    case sizing_basis::upstream_complete:
-      _context_observer->record_partition_sized_from_upstream_complete();
-      return;
-    case sizing_basis::projected:
-      _context_observer->record_partition_sized_from_projection();
-      return;
-  }
-}
-
 sirius_physical_partition::sirius_physical_partition(
   duckdb::vector<sirius::logical_type> types,
   std::size_t estimated_cardinality,
   sirius_physical_operator* key_source,
   bool is_build,
   duckdb::SiriusContext* compressed_materialization_observer,
-  bool enable_size_estimation,
-  double size_estimate_safety_factor)
+  bool enable_size_estimation)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality),
-    _context_observer(compressed_materialization_observer),
-    _enable_size_estimation(enable_size_estimation),
-    _size_estimate_safety_factor(size_estimate_safety_factor)
+    _compressed_materialization_observer(compressed_materialization_observer),
+    _enable_size_estimation(enable_size_estimation)
 {
   _is_build = is_build;
   // Capture partition keys/types from `key_source` and, for joins, the downstream sizing consumer.
@@ -282,7 +266,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       // Narrow-passthrough observability: count input columns whose actual carrier is narrower
       // than the native mapping of this operator's logical schema. The counter reads actual batch
       // types, so a regression anywhere in the narrow-carrier chain drops it to zero.
-      if (has_physical_overrides() && _context_observer != nullptr) {
+      if (has_physical_overrides() && _compressed_materialization_observer != nullptr) {
         auto const view = get_cudf_table_view(input_batch_ro);
         auto const width =
           std::min<std::size_t>(static_cast<std::size_t>(view.num_columns()), types.size());
@@ -294,8 +278,8 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
           }
         }
         if (narrow_columns > 0) {
-          _context_observer->record_compressed_materialization_partition_narrow_columns(
-            narrow_columns);
+          _compressed_materialization_observer
+            ->record_compressed_materialization_partition_narrow_columns(narrow_columns);
         }
       }
       partitioned_results = gpu_partition_impl::hash_partition(input_batch_ro,
@@ -418,11 +402,8 @@ std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
       _size_estimate->ratio_samples);
   }
 
-  auto const scaled = _size_estimate->exact
-                        ? static_cast<double>(_size_estimate->bytes)
-                        : static_cast<double>(_size_estimate->bytes) * _size_estimate_safety_factor;
   // An estimate cannot invalidate bytes already received.
-  return std::max(static_cast<uint64_t>(scaled), compute_total_bytes());
+  return std::max(static_cast<uint64_t>(_size_estimate->bytes), compute_total_bytes());
 }
 
 void sirius_physical_partition::set_num_partitions(int num_partitions)
@@ -662,7 +643,6 @@ std::unique_ptr<operator_data> sirius_physical_partition::get_next_task_input_da
       } else {
         _sizing_basis = sizing_basis::measured;
       }
-      record_sizing_basis();
       SIRIUS_LOG_DEBUG("sirius_physical_partition id {} sized {} partitions from {} bytes ({})",
                        this->get_operator_id(),
                        strategy.num_partitions,

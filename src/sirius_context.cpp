@@ -1258,33 +1258,6 @@ void SiriusContext::record_compressed_materialization_scan_narrow_targets_retrac
     count, std::memory_order_relaxed);
 }
 
-SiriusContext::size_estimation_stats SiriusContext::get_size_estimation_stats() const noexcept
-{
-  return size_estimation_stats{
-    .partitions_sized_from_measured =
-      partitions_sized_from_measured_count_.load(std::memory_order_relaxed),
-    .partitions_sized_from_projection =
-      partitions_sized_from_projection_count_.load(std::memory_order_relaxed),
-    .partitions_sized_from_upstream_complete =
-      partitions_sized_from_upstream_complete_count_.load(std::memory_order_relaxed),
-  };
-}
-
-void SiriusContext::record_partition_sized_from_measured() noexcept
-{
-  partitions_sized_from_measured_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void SiriusContext::record_partition_sized_from_projection() noexcept
-{
-  partitions_sized_from_projection_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void SiriusContext::record_partition_sized_from_upstream_complete() noexcept
-{
-  partitions_sized_from_upstream_complete_count_.fetch_add(1, std::memory_order_relaxed);
-}
-
 namespace {
 
 bool logical_plan_reads_s3(duckdb::LogicalOperator const& op)

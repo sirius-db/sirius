@@ -341,27 +341,25 @@ When `enable_runtime_size_estimation` is on, the partition ingress uses a `PARTI
 sizes from an estimated total. It still waits if no estimate is available.
 `PARTITION → MERGE_GROUP_BY` remains `FULL`.
 
-Projected totals are multiplied by `size_estimate_safety_factor` and floored at the bytes already
-received. Exact totals are not scaled. The feature is enabled only on the grouped-aggregation
-partition, so delim-join partitions retain their existing barrier.
+Estimated totals are floored at the bytes already received. The feature is enabled only on the
+grouped-aggregation partition, so delim-join partitions retain their existing barrier.
 
 ## Observability
 
-Each partition records whether its count came from measured input, a projection, or an already
-finished upstream pipeline. `SiriusContext::get_size_estimation_stats()` exposes those counters,
-and the partition logs estimated-versus-actual bytes when it finalizes.
+Each partition logs whether its count came from measured input, a projection, or an already
+finished upstream pipeline, along with estimated-versus-actual bytes when it finalizes.
 
-Integration tests verify that the enabled path uses an estimator result and produces the same rows
-as the disabled and CPU paths.
+Focused operator tests verify the sizing decision and waiting behavior. Integration tests verify
+that enabling estimation produces the same rows as the disabled and CPU paths.
 
 ## Configuration
 
-Both settings are DuckDB `SET` variables and YAML options under `sirius.operator_params`.
+The feature toggle is available as a DuckDB `SET` variable and a YAML option under
+`sirius.operator_params`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_runtime_size_estimation` | `false` | Enable projected sizing for grouped-aggregation partitions. |
-| `size_estimate_safety_factor` | `1.0` | Multiplier for projected totals; must be finite and in `(0, 1000]`. |
 
 The feature is off by default because tests confirmed that projections arrive before sizing with
 about 0.5% error, but the tested TPC-H workloads showed no measurable wall-clock improvement.

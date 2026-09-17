@@ -30,8 +30,6 @@
 
 namespace {
 
-using sirius::test::get_size_estimation_stats;
-
 // Use enough distinct, wide rows to exercise partition sizing.
 class SizeEstimationFixture : public sirius::test::GpuExecutionFixture {
  public:
@@ -68,12 +66,6 @@ class SizeEstimationFixture : public sirius::test::GpuExecutionFixture {
     sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
     return collect_rows(result->Cast<duckdb::MaterializedQueryResult>(), /*sort=*/true);
   }
-
-  /// Count partitions driven by either estimator result; the exact basis is timing-dependent.
-  static uint64_t estimator_driven(const duckdb::SiriusContext::size_estimation_stats& s)
-  {
-    return s.partitions_sized_from_projection + s.partitions_sized_from_upstream_complete;
-  }
 };
 
 constexpr const char* kGroupByQuery =
@@ -88,31 +80,6 @@ constexpr const char* kDistinctAggregateQuery =
   "SELECT g, COUNT(DISTINCT k) AS ks, SUM(v) AS total FROM facts GROUP BY g";
 
 }  // namespace
-
-TEST_CASE_METHOD(SizeEstimationFixture,
-                 "gpu_execution grouped aggregation sizes from an estimate when enabled",
-                 "[integration][gpu_execution][size_estimation]")
-{
-  set_estimation(false);
-  auto const before_off = get_size_estimation_stats(*con);
-  auto off_result       = con->Query(kGroupByQuery);
-  REQUIRE(off_result);
-  REQUIRE_FALSE(off_result->HasError());
-  auto const after_off = get_size_estimation_stats(*con);
-
-  CHECK(after_off.partitions_sized_from_measured > before_off.partitions_sized_from_measured);
-  CHECK(estimator_driven(after_off) == estimator_driven(before_off));
-
-  set_estimation(true);
-  auto const before_on = get_size_estimation_stats(*con);
-  auto on_result       = con->Query(kGroupByQuery);
-  REQUIRE(on_result);
-  REQUIRE_FALSE(on_result->HasError());
-  auto const after_on = get_size_estimation_stats(*con);
-
-  CHECK(estimator_driven(after_on) > estimator_driven(before_on));
-  CHECK(after_on.partitions_sized_from_measured == before_on.partitions_sized_from_measured);
-}
 
 TEST_CASE_METHOD(SizeEstimationFixture,
                  "gpu_execution grouped aggregation is correct with size estimation on",
