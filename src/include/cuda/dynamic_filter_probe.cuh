@@ -38,17 +38,20 @@
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_view.hpp>
 #include <cudf/hashing.hpp>
-#include <cudf/hashing/detail/xxhash_64.cuh>
 #include <cudf/strings/string_view.cuh>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
+
+// cuco
+#include <cuco/hash_functions.cuh>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 // cccl
+#include <cuda/std/cstddef>
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
 #include <thrust/iterator/transform_iterator.h>
@@ -180,11 +183,23 @@ struct integral_probe_adapter {
 };
 
 /// Hash used for the string family on both sides: `cudf::hashing::xxhash_64` over the build
-/// column (a one-column table hashes each row as XXHash_64<string_view>{seed}(row)) and this
-/// functor over each probe string. The seed and byte view (the string's UTF-8 bytes, no length
-/// prefix, no terminator) must stay identical or the filter silently drops matches.
-using string_fingerprint_hasher = cudf::hashing::detail::XXHash_64<cudf::string_view>;
+/// column (a one-column table hashes each row as XXH64(seed) over the string's UTF-8 bytes) and
+/// this functor over each probe string. cudf's own device functor for that lives in a detail
+/// header (`cudf/hashing/detail/xxhash_64.cuh`) that clang-cuda rejects (constexpr mismatch on
+/// its specializations), so this goes straight to the `cuco::xxhash_64` it wraps and feeds it the
+/// same byte view: the string's bytes, no length prefix, no terminator. The seed and byte view
+/// must stay identical to the build side or the filter silently drops matches; a unit test pins
+/// both against a host XXH64 reference.
 constexpr std::uint64_t string_fingerprint_seed = cudf::DEFAULT_HASH_SEED;
+struct string_fingerprint_hasher {
+  cuco::xxhash_64<cudf::string_view> impl;
+  __host__ __device__ explicit string_fingerprint_hasher(std::uint64_t seed) : impl{seed} {}
+  __device__ std::uint64_t operator()(cudf::string_view const& s) const noexcept
+  {
+    return impl.compute_hash(reinterpret_cast<cuda::std::byte const*>(s.data()),
+                             static_cast<cuda::std::size_t>(s.size_bytes()));
+  }
+};
 
 /// STRING probes against a fingerprint set: hashes each probe string in-kernel, so no hashed copy
 /// of the probe column is materialized. A null probe string is a definite non-member; the kernel
