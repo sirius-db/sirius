@@ -51,13 +51,17 @@ enum class index_kind : std::uint8_t {
 /// (type-erased) index payload so the cache can be inspected, logged, and
 /// matched without instantiating any cuVS index type.
 ///
-/// The (@c catalog_name, @c schema_name, @c table_name, @c column_name, @c metric) tuple is
-/// the index's auto-routing identity.
+/// The (@c catalog_name, @c schema_name, @c table_name, @c table_oid, @c column_name,
+/// @c metric) tuple is the index's auto-routing identity.
 struct index_metadata {
   index_kind kind{index_kind::ivf_flat};
   std::string catalog_name;  ///< Resolved catalog the table lives in
   std::string schema_name;   ///< Resolved schema the table lives in
   std::string table_name;    ///< Base table the index was built on
+  /// Catalog object id of the indexed table — its *incarnation*. The index holds the
+  /// pin's vectors and row positions, so one built before a DROP/CREATE must not route
+  /// to the new table (cf. @c cache_entry_info::table_oid).
+  std::uint64_t table_oid{0};
   std::string column_name;   ///< Vector column the index was built on
   std::int64_t dim{0};       ///< Vector dimensionality
   std::int64_t num_rows{0};  ///< Number of indexed vectors
@@ -204,17 +208,27 @@ class cuvs_index_cache {
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find(std::string_view name) const;
 
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
-  /// metadata matches (@p catalog, @p schema, @p table, @p column, @p metric).
-  /// Returns nullptr if no pinned index covers that column under that metric.
-  /// Metrics are compared up to canonicalization.
+  /// metadata matches (@p catalog, @p schema, @p table, @p table_oid, @p column,
+  /// @p metric). Returns nullptr if no pinned index covers that column under that
+  /// metric. Metrics are compared up to canonicalization.
   [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
     std::string_view catalog,
     std::string_view schema,
     std::string_view table,
+    std::uint64_t table_oid,
     std::string_view column,
     cuvs::distance::DistanceType metric) const;
 
-  /// List all pinned indexes (across metrics) on this column.
+  /// Whether this column carries an index built on a superseded incarnation. Only for
+  /// telling a stale index apart from no index at all.
+  [[nodiscard]] bool has_superseded_index_for_column(std::string_view catalog,
+                                                     std::string_view schema,
+                                                     std::string_view table,
+                                                     std::uint64_t table_oid,
+                                                     std::string_view column,
+                                                     cuvs::distance::DistanceType metric) const;
+
+  /// List all pinned indexes (across metrics and table incarnations) on this column.
   [[nodiscard]] std::vector<index_metadata> indexes_on_column(std::string_view catalog,
                                                               std::string_view schema,
                                                               std::string_view table,
@@ -230,7 +244,8 @@ class cuvs_index_cache {
   /// Remove entries on (@p catalog, @p schema, @p table, @p column). With a
   /// @p metric, only the entry for that metric is removed (compared up to
   /// canonicalization); with no metric, every index on the column is removed
-  /// regardless of metric. Returns the number of entries removed.
+  /// regardless of metric. Incarnation-blind, so a rebuild reclaims a superseded
+  /// index's memory. Returns the number of entries removed.
   std::size_t erase_by_column(std::string_view catalog,
                               std::string_view schema,
                               std::string_view table,

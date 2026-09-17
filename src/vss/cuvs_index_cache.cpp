@@ -91,6 +91,7 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   std::string_view catalog,
   std::string_view schema,
   std::string_view table,
+  std::uint64_t table_oid,
   std::string_view column,
   cuvs::distance::DistanceType metric) const
 {
@@ -99,12 +100,32 @@ std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
     if (entry->meta.catalog_name == catalog && entry->meta.schema_name == schema &&
-        entry->meta.table_name == table && entry->meta.column_name == column &&
-        canonical_metric(entry->meta.metric) == wanted) {
+        entry->meta.table_name == table && entry->meta.table_oid == table_oid &&
+        entry->meta.column_name == column && canonical_metric(entry->meta.metric) == wanted) {
       return entry;
     }
   }
   return nullptr;
+}
+
+bool cuvs_index_cache::has_superseded_index_for_column(std::string_view catalog,
+                                                       std::string_view schema,
+                                                       std::string_view table,
+                                                       std::uint64_t table_oid,
+                                                       std::string_view column,
+                                                       cuvs::distance::DistanceType metric) const
+{
+  std::scoped_lock lock(_mutex);
+  auto const wanted = canonical_metric(metric);
+  for (auto const& kv : _entries) {
+    auto const& meta = kv.second->meta;
+    if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
+        meta.table_oid != table_oid && meta.column_name == column &&
+        canonical_metric(meta.metric) == wanted) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<index_metadata> cuvs_index_cache::indexes_on_column(std::string_view catalog,
