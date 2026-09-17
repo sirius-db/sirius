@@ -108,11 +108,9 @@ struct Context::Impl {
 
   void bring_up(sirius::sirius_config& config)
   {
+    sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
-    // Register the builtin + parquet representation converters the GPU scan/result
-    // path needs. Idempotent; the transparent path does this at extension load.
-    sirius::converter_registry::initialize();
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
