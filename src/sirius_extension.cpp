@@ -2035,6 +2035,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.catalog_name = entry_catalog;
   meta.schema_name  = entry_schema;
   meta.table_name   = entry.name;
+  meta.table_oid    = entry.oid;
   meta.column_name  = data.column_name;
   meta.dim          = dim;
   meta.num_rows     = n_rows;
