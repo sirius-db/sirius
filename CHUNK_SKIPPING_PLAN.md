@@ -2168,29 +2168,98 @@ has been quoting single cold runs as if they were stable.** Five repetitions of 
 |---|---|---|---|---|---|---|
 | `.hpln` cold suite | 52.781 | 46.754 | 46.660 | 49.973 | 46.418 | 58.5–59.1 |
 
-**13.7% spread on `.hpln`, 1.2% on parquet, in the same process, over byte-identical reads.** The
-spread concentrates in the byte-heavy queries (q6 ±1.77 s, q13 ±1.32 s, q1 ±1.10 s, q21 ±0.82 s,
-q9 ±0.77 s) and is nil where pruning leaves almost nothing to read (q14 ±0.005 s, q16 ±0.003 s).
-Median of five is **46.754 s, −19.9% vs `dev`** — better than the −15.2% on record, but the honest
-form of the claim is a median with its spread, not a single run.
+**13.7% spread on `.hpln`, 1.9% on parquet, in the same process, over byte-identical reads.**
 
-**The cache eviction is sound, so that is not the cause.** `hpln-suite.py` records
+**Fifteen repetitions say it is BIMODAL, not noisy** — which is a different and more interesting
+fact, because noise averages out and a bistable condition does not:
+
+| | n | mean | sd | range |
+|---|---|---|---|---|
+| low mode | 8 | **46.678 s** | 0.213 | 46.418–46.979 |
+| high mode | 7 | 50.466 s | 1.049 | 49.810–52.781 |
+
+A 2.83 s gap with NOTHING in between, each mode tighter than parquet's own spread, and no ordering
+pattern (`H L L H L H L L H H H L L L H`). Parquet in the same processes moves 58.45 → 59.01.
+
+**The per-query shape says it is a strategy flip, not a slower device.** In the high mode a large,
+coherent set slows by a remarkably uniform **+15%** (q5 +15.8, q8 +15.0, q9 +15.3, q11 +15.3,
+q17 +17.8, q18 +15.3, q19 +16.9, q21 +15.4, q4 +15.0, q6 +13.5, q10 +11.6) while another set gets
+FASTER (q3 −31%, q1 −24%, q7 −22%, q20 −17%, q12 −11%) and the heavily-pruned queries do not move
+at all (q14, q15, q16, q22, all within ±0.2%). A slower device or a colder cache cannot make five
+queries faster; the untouched four are exactly the ones that decode almost nothing, so whatever
+flips lives in the decode/execution path rather than in I/O.
+
+**The cache eviction is sound, so that is not it.** `hpln-suite.py` records
 `/proc/self/io:read_bytes`, which counts bytes off the BLOCK LAYER and excludes page-cache hits, and
-it is identical to two decimals on every query in all five runs. A partially-evicted run would have
-read fewer. `posix_fadvise(FADV_DONTNEED)` is advisory, but here it is measurably working.
+it is identical to two decimals on every query in all fifteen runs. A partially-evicted run would
+have read fewer. `posix_fadvise(FADV_DONTNEED)` is advisory, but here it is measurably working.
 
-**Open:** what the 13.7% is. Same bytes, same pruning, same process, different time, and parquet —
-reading MORE bytes alongside it — is stable. O_DIRECT device-read variance on the RAID and the
-`std::ifstream` demotion of trap §6.20 are both still live; `transport()` exists on `hpln_source`
-but is surfaced in no log, so telling them apart needs instrumentation first. Until then, **cold
-`.hpln` numbers in this document should be read as ±7%**, which is wide enough to have swallowed
-several conclusions drawn from single runs.
+**Ruled out so far:** cache residency (identical block-layer bytes); pruning nondeterminism
+(identical bytes per query); run order and thermal drift (no pattern in the sequence); and the
+fused-scan tier-B fallback count, which correlates weakly (15.0 in high runs vs 12.6 in low) but
+overlaps at 14 and so is not the switch.
+
+**Open, and worth a ticket:** what the binary condition is. The next step is instrumentation rather
+than more repetitions — per-query `hpln_source::stats().transport` (trap §6.20's `std::ifstream`
+demotion is still live and would plausibly produce exactly two modes) and per-operator timing with
+telemetry on, comparing one run from each mode.
+
+**What to quote:** the low mode is **−20.0%** against `dev` parquet and the median of 15 is
+**−19.5%**; the high mode is −13.5%. Any single cold run in this document is one draw from this
+distribution, which is wide enough to have swallowed conclusions drawn from single runs — §6.19's
+49.873 s, for instance, is a high-mode draw.
 
 **q13 remains the whole cold deficit and is not merge fallout:** 5.371 s / 93.3 GB against `dev`'s
 1.947 s / 33.2 GB, matching the 5.549 s §6.13 records for the clustered arm. It is the `o_comment`
 LIKE over text stored raw. Excluding q13, the cold suite is 47.4 s against `dev`'s 56.4 s (−16%).
 And §6.20's qualifier still applies to every cold number here: parquet is being measured with its
 page-index pruning stage switched off, so a material part of the cold gap is a reader gap.
+
+### 6.22 Clustering and sub-chunk zone maps are worth nothing apart and −11.2% together (2026-09-17)
+
+§6.21 left open how the −11.2% splits between pin-time `cluster_by` and this branch's fine
+(8192-row) zone maps, since `dev` already has the coarse per-chunk capture. Switching
+`pinned_zone_map_group_rows` off on a CLUSTERED parquet pin answers it, and the answer is that
+neither half is worth anything without the other:
+
+| SF1000 host pin, parquet | pin | suite | vs `dev` |
+|---|---|---|---|
+| `dev` (coarse chunk stats, no clustering) | 18.69 s | 9.897 s | — |
+| group stats only, unclustered | 20.50 s | 9.905 s | +0.1% |
+| `cluster_by` only (`group_rows=0`) | 23.32 s | **10.009 s** | **+1.1%** |
+| both | 24.66 s | **8.712 s** | **−11.2%** |
+
+**Clustering with only coarse statistics is a net LOSS**, and §6.13 already explains why without
+anyone having connected it: `cluster_by` is a local sort WITHIN each chunk, so which rows land in
+which chunk never changes — **chunk-level min/max are bit-identical whether you cluster or not.**
+The coarse pruning `dev` has therefore cannot benefit from clustering by construction, while the
+orderkey locality clustering trades away still costs (q8, q18, q9 all regress). Only a sub-chunk
+index can see the order clustering creates.
+
+So the branch's value is strictly joint: clustering manufactures locality, the group maps are the
+only thing that can read it.
+
+**What the group capture costs, and where.** `group_rows` 0 / 8192 / 65536 on an unclustered pin
+measured 18.91 / 20.32 / 19.44 s. `group_rows=0` reproduces `dev`'s 18.69 s, which attributes the
+whole pin regression to `compute_pinned_group_stats` and nothing else in the branch. Eight times
+fewer groups cuts the overhead 2.7x rather than 8x or 1x, which separates it:
+
+- **~0.40 s fixed** — the `segmented_reduce` min/max pair, which reads the whole column however it
+  is segmented;
+- **~1.00 s per-group (≈70%)** — `reduction_column_to_values` boxing each bound into a
+  `duckdb::Value`, then `NumericStats::CreateUnknown` + `ToUnique()` heap-allocating a
+  `BaseStatistics` per (group, column): ~10.25M allocations for SF1000 lineitem.
+
+The data starts as device `int64` and ends as `int64` spans in a `group_bounds_arena`, so the
+boxing is a round trip through DuckDB objects that the stored form does not use. The `.hpln` path
+already avoids it — `insert_pinned_entry_host` takes a ready-made arena precisely so an ingested
+file does not unpack millions of cells just to pack them back (`sirius_scan_manager.hpp:651`).
+
+**Two cheap follow-ups, in order:** (1) pack device `int64` straight into the arena and derive the
+coarse per-chunk `BaseStatistics` by reduction, recovering ~70% of the pin cost at unchanged
+resolution; (2) skip the group capture when it cannot pay — no `cluster_by` and no group narrower
+than its chunk — which is decidable at capture time and would remove the +1.8 s an unclustered pin
+currently pays for nothing.
 
 ## 6.6 Skipping decode inside a GPU-resident compressed chunk
 
