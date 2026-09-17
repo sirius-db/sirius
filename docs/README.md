@@ -131,6 +131,11 @@ CALL pin_table('/path/to/lineitem.parquet', name = 'lineitem', tier = 'gpu',
 -- Pin a DuckDB base table
 CALL pin_table(format = 'duckdb', name = 'my_table', tier = 'gpu');
 
+-- Cluster each pinned chunk on a filter column, so range filters can skip most of it
+CALL pin_table('/path/to/lineitem.parquet', name = 'lineitem', tier = 'gpu',
+               cols = ['l_orderkey', 'l_quantity', 'l_extendedprice', 'l_shipdate'],
+               cluster_by = ['l_shipdate']);
+
 -- Served from the pinned copy — no file I/O
 SELECT sum(l_extendedprice * l_quantity)
 FROM read_parquet('/path/to/lineitem.parquet')
@@ -142,6 +147,18 @@ CALL unpin_table('lineitem');
 
 `tier = 'gpu'` pins columns in GPU memory for the fastest scans; `tier = 'host'` pins them in
 pinned host memory instead, for tables larger than GPU memory.
+
+`cluster_by` sorts the rows of each pinned chunk on the given columns. Pinning captures min/max
+statistics per chunk and per group of rows within it, and a query whose filter falls outside those
+bounds skips the data without reading it — but only if the rows are ordered on the filtered column,
+which is what clustering arranges. Pick the column your range filters use (a date, a timestamp, a
+sort key); it costs some pin time and trades away whatever order the source had, so it pays when
+queries filter on that column and not otherwise. It applies per pinned table, so clustering a fact
+table on its date column while leaving the others alone is the common case.
+
+`cluster_by` is accepted for parquet pins only. DuckDB-native pins keep table order, and a pin is
+rejected if you ask to cluster one; for file formats written in sorted order the ordering belongs
+at write time instead.
 
 Deletes and committed inserts on pinned DuckDB tables are reconciled per query. `UPDATE`,
 `MERGE ... UPDATE`, and `INSERT ... ON CONFLICT DO UPDATE` are rejected while the target table is
