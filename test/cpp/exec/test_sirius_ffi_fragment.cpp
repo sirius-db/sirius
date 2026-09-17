@@ -25,7 +25,7 @@
 // through the public API: that end_lifecycle() leaves the connection able to start and fail a
 // second, independent Fragment cleanly.
 
-#include "sirius_ffi.hpp"
+#include "sirius/ffi.hpp"
 
 #include <catch.hpp>
 #include <duckdb/common/exception/transaction_exception.hpp>

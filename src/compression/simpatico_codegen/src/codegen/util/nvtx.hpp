@@ -11,9 +11,9 @@ namespace simpatico {
 /// `libcucascade`, ...).
 ///
 /// Sirius declares a second tag type for the same domain in
-/// src/include/telemetry/nvtx.hpp, because neither include tree can reach the
-/// other: simpatico also builds standalone, without src/include on the include
-/// path, and the parquet_benchmark target is given src/include but not
+/// src/telemetry/nvtx.hpp, because neither include tree can reach the other:
+/// simpatico also builds standalone, without src on the include
+/// path, and the parquet_benchmark target is given src but not
 /// simpatico's include root. The name cannot drift between the two, though — it
 /// arrives from the single SIRIUS_NVTX_DOMAIN_NAME compile definition set in
 /// this directory's CMakeLists.txt. NVTX keys domains by name, so both tag types
