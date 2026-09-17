@@ -93,7 +93,7 @@ class query_index {
    * unit tests that construct pipeline DAGs without a full query.
    */
   static std::shared_ptr<const query_index> build_index(
-    const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
+    const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
     build_index_options options = {});
 
   /**

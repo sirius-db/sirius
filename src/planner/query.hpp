@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "duckdb/common/unordered_map.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "query_id.hpp"
@@ -25,6 +24,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 
 namespace sirius {
 class sirius_engine;
@@ -48,7 +50,7 @@ class query {
    * @param query_id The engine-wide query identity.
    * @param telemetry_info Info useful for emitting identifiable telemetry.
    */
-  query(duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> pipelines,
+  query(std::vector<std::shared_ptr<pipeline::sirius_pipeline>> pipelines,
         const quent::Context& context,
         sirius::query_id_t query_id,
         telemetry::query_telemetry_info telemetry_info);
@@ -77,14 +79,14 @@ class query {
    * @return Shared pointer to the pipeline containing the operator,
    *         or nullptr if not found.
    */
-  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline(op::sirius_physical_operator* op);
+  std::shared_ptr<pipeline::sirius_pipeline> get_pipeline(op::sirius_physical_operator* op);
 
   /**
    * @brief Get all pipelines in execution order.
    *
    * @return Reference to the vector of pipelines in execution order.
    */
-  [[nodiscard]] const duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& get_pipelines()
+  [[nodiscard]] const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& get_pipelines()
     const;
 
   /**
@@ -108,12 +110,11 @@ class query {
   uuid::UUID _plan_id;
   //! Pipelines and the order in which they must be executed in order to successfully complete the
   // query.
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> _pipelines;
   //! Cached scan operators in pipeline execution order
   duckdb::vector<op::sirius_physical_operator*> _scan_operators;
   //! Map from operator pointer to its containing pipeline
-  duckdb::unordered_map<op::sirius_physical_operator*,
-                        duckdb::shared_ptr<pipeline::sirius_pipeline>>
+  std::unordered_map<op::sirius_physical_operator*, std::shared_ptr<pipeline::sirius_pipeline>>
     _operator_to_pipeline;
 };
 

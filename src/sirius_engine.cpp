@@ -291,8 +291,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
-  auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+  auto root_pipeline = std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
   root_pipeline->build(*sirius_physical_plan);
   root_pipeline->ready();
   root_pipeline->get_pipelines(sirius_root_pipelines, false);
