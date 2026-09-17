@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <ranges>
-#include <tuple>
 #include <utility>
 
 namespace sirius::event {
@@ -36,7 +35,9 @@ subscriber_registration query_event_publisher::register_subscriber(
     if (!_stopped) {
       _queues.push_back(queue);
       for (auto e : events) {
-        auto& bucket = _by_event[static_cast<std::size_t>(e)];
+        auto const index = static_cast<std::size_t>(e);
+        if (index >= n_query_events) { continue; }
+        auto& bucket = _by_event[index];
         // A repeated event would double-deliver, and a caller assembling the
         // list from overlapping sets should not have to care.
         if (std::ranges::find(bucket, queue.get()) == bucket.end()) {
@@ -75,10 +76,14 @@ void query_event_publisher::stop() noexcept
     }
   }
   for (auto const& q : queues) {
-    // try_ so this stays genuinely noexcept: the allocating enqueue could
-    // throw, and a subscriber that misses the sentinel still comes out on the
-    // stop token within a poll interval.  The sentinel only buys promptness.
-    std::ignore = q->try_enqueue(nullptr);
+    // interrupt() closes the queue before it enqueues its wake-up sentinels, so
+    // a throw from the allocating enqueue still leaves the mailbox closed and
+    // the worker comes out on the queue's own poll backstop instead.  Catching
+    // here is what keeps this genuinely noexcept.
+    try {
+      q->interrupt();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
   }
 }
 

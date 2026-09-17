@@ -20,9 +20,9 @@
 #include "event/query_event_publisher.hpp"
 
 #include <atomic>
-#include <functional>
+#include <cstdint>
 #include <memory>
-#include <optional>
+#include <mutex>
 #include <span>
 #include <stop_token>
 #include <string_view>
@@ -36,10 +36,10 @@ namespace sirius::event {
  *
  * The subscriber registers a mailbox in its constructor and drops it in its
  * destructor.  In between, @ref start puts a worker on that mailbox and @ref
- * stop takes it off; both are just gates on the worker.  Events published
- * while the worker is off ACCUMULATE in the mailbox and are drained the next
- * time it comes on --- there is one subscription per subscriber, and its
- * lifetime is the subscriber's own.
+ * stop closes it.  Events published before @ref start ACCUMULATE in the mailbox
+ * and are replayed when the worker comes on; events published after @ref stop
+ * are dropped at the publisher, because the mailbox is closed.  There is one
+ * subscription per subscriber, and its lifetime is the subscriber's own.
  *
  * The hooks below run on the subscriber's worker, not on the creator,
  * scheduler or executor thread that raised the event, so an implementation is
@@ -49,9 +49,9 @@ namespace sirius::event {
  * the arguments as a snapshot rather than as live state.
  *
  * Thread safety: hooks are called from the subscriber's worker and nowhere
- * else, so they are serialised against each other and see events in publication
- * order.  They still race against the implementation's own public API, which
- * is called from elsewhere.
+ * else, so they are serialised against each other.  They still race against the
+ * implementation's own public API, which is called from elsewhere.  @ref start
+ * and @ref stop may be called concurrently from any thread.
  *
  * Subclassing: the worker dispatches into virtual hooks, so it must be stopped
  * before the derived part of the object is destroyed.  A derived class whose
@@ -91,15 +91,26 @@ class query_event_subscriber {
   /// mailbox and gets replayed in order.
   void start();
 
-  /// Stop the worker and join it.  Terminal: subsequent @ref start calls are
-  /// no-ops.  Does NOT drop the registration --- that happens once, at
-  /// destruction.  Safe to call when not started, and safe to call twice.
-  /// Does not stop the publisher.
+  /// Close the mailbox and join the worker.  Terminal: subsequent @ref start
+  /// calls are no-ops, and the publisher stops feeding the mailbox from here
+  /// on, so a stopped subscriber accumulates nothing.  Does NOT drop the
+  /// registration --- that happens once, at destruction.  Safe to call when
+  /// not started, and safe to call twice.  Does not stop the publisher.
+  ///
+  /// Callable from a hook, where it cannot join (that would be a self-join) and
+  /// so returns with the worker still on its way out: it exits as soon as the
+  /// hook returns.  A caller that needs the worker down before it tears
+  /// anything else apart must therefore stop from somewhere other than a hook.
   void stop() noexcept;
 
-  /// Whether the worker is up.  Named apart from any @c is_running a subclass
-  /// has for its own work, which is a different question.
-  [[nodiscard]] bool is_subscribed() const noexcept { return _worker.joinable(); }
+  /// Whether the worker is up.  False once it has exited, including when the
+  /// publisher --- rather than @ref stop --- is what took it down.  Named apart
+  /// from any @c is_running a subclass has for its own work, which is a
+  /// different question.
+  [[nodiscard]] bool is_subscribed() const noexcept
+  {
+    return _worker_live.load(std::memory_order_acquire);
+  }
 
   /// Name for logs and for the worker's thread name, which is
   /// @c "subscriber-<name>" truncated to what pthread accepts.
@@ -192,19 +203,21 @@ class query_event_subscriber {
                                            std::size_t bytes_needed) noexcept;
 
  protected:
-  /// Invoked once when the publisher requests stop, on the thread that called
-  /// @ref query_event_publisher::stop --- not on the worker, which may still
-  /// be finishing an event.  The hook for tearing down whatever the subscriber
-  /// was driving; the worker's own exit needs no help.
+  /// Invoked when a started subscriber observes a publisher stop request, on
+  /// the worker and after the last event hook --- so it is serialised against
+  /// them and is the last thing the worker does.  The hook for tearing down
+  /// whatever the subscriber was driving; the worker's own exit needs no help.
+  ///
+  /// Not invoked when the subscriber's own @ref stop is what took it down: the
+  /// caller of @ref stop already knows.
   virtual void on_stop_requested() noexcept;
 
  private:
-  /// Drain until stopped, replaying each event into its hook.
+  /// Drain until the mailbox closes, replaying each event into its hook.
   ///
-  /// The timed wait rather than a plain blocking one is what makes the token a
-  /// real stop signal: a publisher that goes away without pushing the sentinel
-  /// still gets the worker out within the poll interval, instead of leaving a
-  /// thread parked forever on a queue nobody will write to again.
+  /// Every teardown path --- @ref stop, the publisher's, and the destructor's
+  /// --- closes the mailbox, which is what gets the worker out of its blocking
+  /// wait.  Nothing else needs to poke it.
   void run() noexcept;
 
   /// Replay one event into the hook that matches its tag.  Kept out of line:
@@ -217,17 +230,29 @@ class query_event_subscriber {
   /// helper and its 15-byte truncation.
   void set_thread_name() noexcept;
 
+  /// A subscriber goes idle -> running -> stopped and never back: @c stopped is
+  /// terminal, which is what makes @ref start after @ref stop a no-op.
+  enum class worker_state : std::uint8_t { idle, running, stopped };
+
   /// Weak so a subscriber never keeps the publisher alive; used only to
   /// deregister from the destructor.
   std::weak_ptr<query_event_publisher> _publisher;
   std::shared_ptr<event_queue> _queue;
+  /// Distinguishes "the publisher stopped us" from "our owner stopped us",
+  /// which is the only thing @ref on_stop_requested keys off.
   std::stop_token _stop_token;
-  std::optional<std::stop_callback<std::function<void()>>> _stop_cb;
-  /// Cleared by @ref stop so the worker leaves without draining the backlog.
-  std::atomic<bool> _draining{true};
-  /// Latched by @ref stop; makes the subscriber's lifecycle one-shot so
-  /// @ref start after it is a no-op instead of a restart.
-  std::atomic<bool> _stopped{false};
+
+  /// Guards the whole of @ref start and @ref stop.  A flag per transition was
+  /// not enough: the checks and the mutations to @c _worker have to happen
+  /// together, or a @ref start racing a @ref stop leaves behind a worker the
+  /// stopper already decided was not there.  No hook runs under it.
+  mutable std::mutex _mtx;
+  worker_state _state{worker_state::idle};  ///< guarded by @c _mtx
+
+  /// Whether the worker is still in @ref run.  Separate from @c _state because
+  /// the worker clears it on its own way out and must not touch @c _mtx to do
+  /// so --- @ref stop holds that while joining it.
+  std::atomic<bool> _worker_live{false};
   std::jthread _worker;
 };
 

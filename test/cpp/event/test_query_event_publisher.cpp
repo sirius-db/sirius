@@ -450,8 +450,8 @@ TEST_CASE("stop is terminal and start after it is a no-op", "[event][query_event
 {
   // Subscribers are one-shot: once torn down they stay that way, so @ref start
   // after @ref stop is a no-op rather than a restart.  Anything published
-  // between is still received into the mailbox but stays there --- the worker
-  // that would have drained it does not come back.
+  // between is dropped at the publisher --- @ref stop closes the mailbox, so
+  // there is nothing queued for a worker that is not coming back either.
   auto publisher = std::make_shared<query_event_publisher>();
   recording_subscriber subscriber{*publisher};
   subscriber.start();
@@ -510,16 +510,91 @@ TEST_CASE("stopping the publisher takes every subscriber down with it",
 
   publisher->stop();
 
-  // The sentinel is what makes this prompt; the stop token alone would take up
-  // to a poll interval.
+  // Closing each mailbox is what makes this prompt; the queue's own poll
+  // backstop alone would take longer.
   auto const deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < deadline && first.is_subscribed()) {
+  while (std::chrono::steady_clock::now() < deadline &&
+         (first.is_subscribed() || second.is_subscribed())) {
     std::this_thread::sleep_for(1ms);
   }
+  // is_subscribed() tracks the worker, not merely whether one was ever spawned,
+  // so it reports the publisher's teardown without anyone calling stop().
+  CHECK_FALSE(first.is_subscribed());
+  CHECK_FALSE(second.is_subscribed());
   first.stop();
   second.stop();
   CHECK(first.stop_seen());
   CHECK(second.stop_seen());
+}
+
+namespace {
+
+/// Stops itself from inside a hook, which is the one call of @ref stop that
+/// cannot join --- it would be joining the thread it is running on.
+class self_stopping_subscriber : public query_event_subscriber {
+ public:
+  explicit self_stopping_subscriber(query_event_publisher& publisher)
+    : query_event_subscriber(publisher, {event_type::task_queue_empty})
+  {
+  }
+
+  ~self_stopping_subscriber() override { stop(); }
+
+  [[nodiscard]] std::string_view name() const noexcept override { return "self-stop"; }
+
+  void on_task_queue_empty(event_id_t, timestamp_t) noexcept override
+  {
+    _count.fetch_add(1, std::memory_order_relaxed);
+    stop();
+  }
+
+  [[nodiscard]] std::size_t count() const noexcept
+  {
+    return _count.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<std::size_t> _count{0};
+};
+
+}  // namespace
+
+TEST_CASE("a subscriber can stop itself from a hook", "[event][query_event_publisher]")
+{
+  // The failure mode is a crash, not a wrong value: stop() joins, and a join
+  // from the joined thread throws out of a noexcept function, which terminates.
+  auto publisher = std::make_shared<query_event_publisher>();
+  self_stopping_subscriber subscriber{*publisher};
+  subscriber.start();
+
+  publisher->publish_task_queue_empty();
+  REQUIRE(wait_for(subscriber, 1));
+
+  // The mailbox is closed, so the second one never reaches the hook -- and the
+  // worker is on its way out rather than joined, so give it room to get there.
+  publisher->publish_task_queue_empty();
+  std::this_thread::sleep_for(50ms);
+  CHECK(subscriber.count() == 1);
+}
+
+TEST_CASE("concurrent start and stop leave no worker behind", "[event][query_event_publisher]")
+{
+  // start() reads its own state and then writes the worker; a stop() landing
+  // between the two used to conclude there was nothing to join and return,
+  // leaving a live worker no one would ever take down.
+  constexpr int n_rounds = 200;
+  for (int round = 0; round < n_rounds; ++round) {
+    auto publisher = std::make_shared<query_event_publisher>();
+    recording_subscriber subscriber{*publisher};
+
+    std::thread starter{[&subscriber] { subscriber.start(); }};
+    std::thread stopper{[&subscriber] { subscriber.stop(); }};
+    starter.join();
+    stopper.join();
+
+    // stop() is terminal however the race fell out, so the worker is down.
+    CHECK_FALSE(subscriber.is_subscribed());
+  }
 }
 
 TEST_CASE("a stopped publisher publishes nothing further", "[event][query_event_publisher]")

@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include "blockingconcurrentqueue.h"
 #include "event/event.hpp"
+#include "exec/interruptible_mpmc.hpp"
 
 #include <array>
 #include <atomic>
@@ -36,11 +36,15 @@ namespace sirius::event {
 
 class query_event_subscriber;
 
-using event_queue = duckdb_moodycamel::BlockingConcurrentQueue<std::shared_ptr<query_events>>;
+/// A subscriber's mailbox.  @c interruptible_mpmc already is what this needs:
+/// a closable queue whose @c interrupt wakes a parked consumer at once and
+/// whose @c push becomes a no-op once closed --- so closing a mailbox both
+/// releases its worker and stops the publisher feeding a queue nobody drains.
+using event_queue = exec::interruptible_mpmc<std::shared_ptr<query_events>>;
 
 /// One subscriber's mailbox plus the publisher-wide stop token.  The queue is
-/// what the publisher pushes into; the token is what the subscriber parks
-/// against while waiting.
+/// what the publisher pushes into; the token is what tells a subscriber the
+/// publisher --- rather than its own owner --- is what took it down.
 struct subscriber_registration {
   std::shared_ptr<event_queue> queue;
   std::stop_token stop_token;
@@ -62,6 +66,13 @@ struct subscriber_registration {
  * what a subscriber does with the event, which matters because these are raised
  * from the creator, scheduler and executor hot paths.  Nothing here is virtual:
  * the publisher is the fixed relay and the subscriber is the extension point.
+ *
+ * Ordering: events published by one reporter reach a subscriber in the order
+ * that reporter raised them.  Across reporters the order is UNSPECIFIED --- two
+ * threads can take their event IDs and then enqueue in either order, and the
+ * underlying queue does not order across producers either.  @c event_id is the
+ * ordering key; a subscriber that needs a global sequence must sort by it
+ * rather than trust arrival order.
  *
  * Registration is not a public entry point of this class.  A @ref
  * query_event_subscriber registers itself in its own constructor and drops
@@ -87,11 +98,9 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   query_event_publisher(query_event_publisher const&)            = delete;
   query_event_publisher& operator=(query_event_publisher const&) = delete;
 
-  /// Stop every subscriber and close the publisher to further publishing.
-  /// Requests stop on the shared token and pushes the null sentinel to each
-  /// queue, which is what wakes a subscriber parked on an empty mailbox;
-  /// subsequent @c publish_* calls are no-ops.  Does not join the subscribers:
-  /// a subscriber owns its own thread and joins it in its own destructor.
+  /// Request every subscriber to stop and ignore subsequent @c publish_* calls.
+  /// Does not join subscriber threads; each subscriber owns and joins its own
+  /// worker.
   void stop() noexcept;
 
   // -- reporting -------------------------------------------------------------
@@ -145,24 +154,24 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// rounding error; it is worth having because the cost grows with
   /// subscribers x events while the useful work does not.
   ///
-  /// Registering after events have started flowing is safe; the subscriber
-  /// simply misses what was published before it arrived.  Registering after
-  /// @ref stop yields an already-stopped token and a queue nothing will ever
-  /// be pushed to, so the subscriber never gets past a no-op @c start.
+  /// Registers a mailbox for @p events without replaying earlier publications.
+  /// If the publisher is already stopped, returns an unregistered mailbox and
+  /// an already-requested stop token.
   [[nodiscard]] subscriber_registration register_subscriber(std::span<event_type const> events);
 
-  /// Drop @p queue's registration.  Blocks until any in-flight publish has
-  /// finished, so no further event reaches @p queue once this returns.  Called
-  /// by the subscriber base in its destructor.
+  /// Remove @p queue from routing, synchronising with in-flight publications.
+  /// After this returns, the publisher will not enqueue another event to it.
+  /// Called by the subscriber base in its destructor.
   void unregister_subscriber(std::shared_ptr<event_queue> const& queue) noexcept;
 
   /// Build the event once and fan a reference to it out to every mailbox.
   ///
-  /// The empty check ahead of the allocation is not just an optimisation: with
-  /// nobody listening these entry points sit on hot paths and should cost a
-  /// lock and a branch, not a heap allocation.  Publishing is @c noexcept, so a
-  /// failed allocation drops the event rather than propagating out into a
-  /// reporter that has no way to handle it.
+  /// Everything is behind the empty check, including the event ID and the
+  /// timestamp: with nobody listening these entry points sit on hot paths and
+  /// should cost a lock and a branch, not a contended RMW and a clock read.
+  /// The ID therefore skips over events nobody was there to see.  Publishing is
+  /// @c noexcept, so a failed allocation drops the event rather than
+  /// propagating out into a reporter that has no way to handle it.
   ///
   /// The template body stays in the header even though nothing else does: the
   /// @c publish_* wrappers in the .cpp instantiate it, and moving it out would
@@ -170,16 +179,16 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   template <typename Event, typename... Args>
   void publish(Args&&... args) noexcept
   {
-    auto const event_id  = _next_event_id.fetch_add(1, std::memory_order_relaxed);
-    auto const timestamp = std::chrono::system_clock::now();
     try {
       std::shared_lock g{_queues_mtx};
       auto const& subscribers = _by_event[event_index_v<Event>];
       if (subscribers.empty()) { return; }
-      auto payload = std::make_shared<query_events>(
+      auto const event_id  = _next_event_id.fetch_add(1, std::memory_order_relaxed);
+      auto const timestamp = std::chrono::system_clock::now();
+      auto payload         = std::make_shared<query_events>(
         Event{event_id, timestamp, typename Event::param_type{std::forward<Args>(args)...}});
       for (auto* q : subscribers) {
-        q->enqueue(payload);
+        std::ignore = q->push(payload);
       }
     } catch (...) {  // NOLINT(bugprone-empty-catch)
       // Telemetry is not worth failing execution over.

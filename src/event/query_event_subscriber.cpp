@@ -18,9 +18,10 @@
 
 #include "exec/thread_util.hpp"
 
-#include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -78,37 +79,43 @@ query_event_subscriber::~query_event_subscriber()
 
 void query_event_subscriber::start()
 {
-  if (_worker.joinable()) { return; }
-  if (_stopped.load(std::memory_order_relaxed)) { return; }  // torn down for good
-  if (_stop_token.stop_requested()) { return; }              // publisher already stopped
-  _draining.store(true, std::memory_order_relaxed);
-  // Armed here rather than in the constructor so a subscriber that is never
-  // started never gets the callback -- and so @ref on_stop_requested cannot
-  // fire before the derived object is fully built.
-  _stop_cb.emplace(_stop_token, [this] { on_stop_requested(); });
+  // One lock over the whole transition rather than a flag per step: the checks
+  // and the assignment to @c _worker have to be indivisible, or a @ref stop
+  // running between them decides there is no worker and leaves one behind.
+  std::lock_guard g{_mtx};
+  if (_state != worker_state::idle) { return; }  // already running, or torn down for good
+  if (_stop_token.stop_requested()) { return; }  // publisher already stopped
+  _state = worker_state::running;
+  _worker_live.store(true, std::memory_order_release);
   _worker = std::jthread([this] { run(); });
   set_thread_name();
 }
 
 void query_event_subscriber::stop() noexcept
 {
-  // Latch first so a concurrent @ref start (racing with our teardown from a
-  // different thread) turns into a no-op rather than resurrecting the worker
-  // we are about to join.
-  _stopped.store(true, std::memory_order_relaxed);
-  if (!_worker.joinable()) {
-    _stop_cb.reset();
-    return;
+  std::lock_guard g{_mtx};
+  if (_state == worker_state::stopped) { return; }
+  auto const was_running = _state == worker_state::running;
+  _state                 = worker_state::stopped;  // terminal: @ref start is a no-op from here
+  if (!was_running) { return; }
+
+  // Closing the mailbox is the whole teardown: it wakes the worker at once, and
+  // it turns every later publish into a drop, so a stopped subscriber cannot
+  // accumulate events nobody will drain.  interrupt() closes before it enqueues
+  // its wake-up sentinels, so a throw from that allocation still leaves the
+  // mailbox closed and the worker comes out on the queue's poll backstop --
+  // which is what lets this stay noexcept.
+  try {
+    _queue->interrupt();
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
   }
-  // The sentinel wakes a worker parked on an empty mailbox; the flag stops
-  // it from working through whatever is queued behind the sentinel.
-  // A stale sentinel left in the queue would kill a restart, but subscribers
-  // are one-shot: once stopped, @ref start is a no-op, so there is no next
-  // worker to be tripped by it.
-  _draining.store(false, std::memory_order_relaxed);
-  std::ignore = _queue->try_enqueue(nullptr);  // see query_event_publisher::stop
+
+  // A hook that stops its own subscriber would be joining itself, which throws
+  // -- and throwing out of a noexcept function terminates.  Leave instead: the
+  // mailbox is closed, so the worker exits as soon as the hook returns, and
+  // @c ~jthread joins it.
+  if (_worker.get_id() == std::this_thread::get_id()) { return; }
   _worker.join();
-  _stop_cb.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -161,15 +168,16 @@ void query_event_subscriber::on_stop_requested() noexcept {}
 
 void query_event_subscriber::run() noexcept
 {
-  using namespace std::chrono_literals;
-  constexpr auto poll_interval = 100ms;
-
-  while (_draining.load(std::memory_order_relaxed) && !_stop_token.stop_requested()) {
-    std::shared_ptr<query_events> event;
-    if (!_queue->wait_dequeue_timed(event, poll_interval)) { continue; }
-    if (event == nullptr) { break; }  // close sentinel
+  // pop() returns null exactly once the mailbox closes, which every teardown
+  // path does -- so the loop needs no second exit condition of its own.
+  while (auto event = _queue->pop()) {
     dispatch(*event);
   }
+  // Reported here, after the last hook, so a subscriber sees its events and its
+  // shutdown in one order on one thread.  Only when the publisher is what
+  // stopped us: a caller of @ref stop does not need telling.
+  if (_stop_token.stop_requested()) { on_stop_requested(); }
+  _worker_live.store(false, std::memory_order_release);
 }
 
 void query_event_subscriber::dispatch(query_events const& event) noexcept
