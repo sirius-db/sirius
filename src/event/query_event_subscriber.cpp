@@ -65,12 +65,11 @@ query_event_subscriber::query_event_subscriber(query_event_publisher& publisher,
 
 query_event_subscriber::~query_event_subscriber()
 {
-  // Order matters: the worker may still be running a hook against the derived
-  // object, so it has to be down before the base ends.  Only then is the
-  // routing pointer safe to drop; leaving it in place would let a concurrent
-  // publish write into a queue whose subscriber is halfway through teardown.
-  stop();
-  if (auto publisher = _publisher.lock()) { publisher->unregister_subscriber(_queue); }
+  stop();  // A hook that stops its own subscriber would be joining itself, which throws
+  // -- and throwing out of a noexcept function terminates.  Leave instead: the
+  // mailbox is closed, so the worker exits as soon as the hook returns, and
+  // @c ~jthread joins it.
+  if (_worker.joinable()) { _worker.join(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,25 +96,13 @@ void query_event_subscriber::stop() noexcept
   if (_state == worker_state::stopped) { return; }
   auto const was_running = _state == worker_state::running;
   _state                 = worker_state::stopped;  // terminal: @ref start is a no-op from here
-  if (!was_running) { return; }
 
-  // Closing the mailbox is the whole teardown: it wakes the worker at once, and
-  // it turns every later publish into a drop, so a stopped subscriber cannot
-  // accumulate events nobody will drain.  interrupt() closes before it enqueues
-  // its wake-up sentinels, so a throw from that allocation still leaves the
-  // mailbox closed and the worker comes out on the queue's poll backstop --
-  // which is what lets this stay noexcept.
+  if (auto publisher = _publisher.lock()) { publisher->unregister_subscriber(_queue); }
+
   try {
     _queue->interrupt();
   } catch (...) {  // NOLINT(bugprone-empty-catch)
   }
-
-  // A hook that stops its own subscriber would be joining itself, which throws
-  // -- and throwing out of a noexcept function terminates.  Leave instead: the
-  // mailbox is closed, so the worker exits as soon as the hook returns, and
-  // @c ~jthread joins it.
-  if (_worker.get_id() == std::this_thread::get_id()) { return; }
-  _worker.join();
 }
 
 // ---------------------------------------------------------------------------

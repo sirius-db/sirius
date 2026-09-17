@@ -766,6 +766,66 @@ TEST_CASE("destroying a subscriber drops it from every event's routing",
   CHECK(witness.count() == 1);
 }
 
+TEST_CASE("stopping a subscriber drops it from every event's routing",
+          "[event][query_event_publisher]")
+{
+  // A stopped subscriber is silent either way, so silence proves nothing.  The
+  // event ID does: publish() takes an ID only after finding the event's bucket
+  // non-empty, so an ID that does not advance is the bucket being genuinely
+  // empty -- i.e. the stopped subscriber off the routing list, not merely
+  // ignoring what it is still handed.
+  auto publisher = std::make_shared<query_event_publisher>();
+
+  metadata_subscriber quitter{*publisher};
+  quitter.start();
+  publisher->publish_task_queue_empty();
+  REQUIRE(wait_for(quitter, 1));
+  auto const before = quitter.events().front().first;
+
+  quitter.stop();
+  for (int i = 0; i < 100; ++i) {
+    publisher->publish_task_queue_empty();
+  }
+
+  metadata_subscriber after{*publisher};
+  after.start();
+  publisher->publish_task_queue_empty();
+  REQUIRE(wait_for(after, 1));
+
+  // Consecutive across the gap: the hundred in between cost no ID because
+  // nobody was registered.  Still routed to the stopped subscriber, they would
+  // have taken one each.
+  CHECK(after.events().front().first == before + 1);
+}
+
+TEST_CASE("stopping the publisher drops every subscriber from its routing",
+          "[event][query_event_publisher]")
+{
+  // Same instrument, other end: after the publisher stops, its own routing
+  // table is empty, so a publish costs no ID either.
+  auto publisher = std::make_shared<query_event_publisher>();
+  metadata_subscriber subscriber{*publisher};
+  subscriber.start();
+  publisher->publish_task_queue_empty();
+  REQUIRE(wait_for(subscriber, 1));
+  auto const before = subscriber.events().front().first;
+
+  publisher->stop();
+  for (int i = 0; i < 100; ++i) {
+    publisher->publish_task_queue_empty();
+  }
+
+  auto fresh = std::make_shared<query_event_publisher>();
+  metadata_subscriber after{*fresh};
+  after.start();
+  fresh->publish_task_queue_empty();
+  REQUIRE(wait_for(after, 1));
+
+  // The ID counter is process-wide, so a fresh publisher continues the same
+  // sequence -- which is what makes it readable across the stopped one.
+  CHECK(after.events().front().first == before + 1);
+}
+
 TEST_CASE("every event is published and no unsubscribed one is delivered",
           "[event][query_event_publisher]")
 {

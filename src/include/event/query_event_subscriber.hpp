@@ -34,9 +34,9 @@ namespace sirius::event {
  * @brief Receives the execution-stage events a @ref query_event_publisher
  *        publishes, on a thread of its own.
  *
- * The subscriber registers a mailbox in its constructor and drops it in its
- * destructor.  In between, @ref start puts a worker on that mailbox and @ref
- * stop closes it.  Events published before @ref start ACCUMULATE in the mailbox
+ * The subscriber registers a mailbox in its constructor and drops it in @ref
+ * stop, which its destructor calls.  In between, @ref start puts a worker on
+ * that mailbox.  Events published before @ref start ACCUMULATE in the mailbox
  * and are replayed when the worker comes on; events published after @ref stop
  * are dropped at the publisher, because the mailbox is closed.  There is one
  * subscription per subscriber, and its lifetime is the subscriber's own.
@@ -91,11 +91,11 @@ class query_event_subscriber {
   /// mailbox and gets replayed in order.
   void start();
 
-  /// Close the mailbox and join the worker.  Terminal: subsequent @ref start
-  /// calls are no-ops, and the publisher stops feeding the mailbox from here
-  /// on, so a stopped subscriber accumulates nothing.  Does NOT drop the
-  /// registration --- that happens once, at destruction.  Safe to call when
-  /// not started, and safe to call twice.  Does not stop the publisher.
+  /// Drop the registration, close the mailbox, and join the worker.  Terminal:
+  /// subsequent @ref start calls are no-ops, and the publisher routes nothing
+  /// here from now on, so a stopped subscriber accumulates nothing.  Safe to
+  /// call when not started, and safe to call twice.  Does not stop the
+  /// publisher.
   ///
   /// Callable from a hook, where it cannot join (that would be a self-join) and
   /// so returns with the worker still on its way out: it exits as soon as the
