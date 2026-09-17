@@ -17,6 +17,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include "config.hpp"
+#include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -37,18 +38,18 @@ namespace op {
 // operator_data
 //===--------------------------------------------------------------------===//
 
-const std::vector<std::shared_ptr<cucascade::data_batch>>&
+const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
 {
   return _data_batches;
 }
 
-std::vector<cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches()
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches()
   const
 {
   if (_read_only_data_batches.has_value()) { return *_read_only_data_batches; }
 
-  std::vector<cucascade::read_only_data_batch> ro_batches;
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
   ro_batches.reserve(_data_batches.size());
   for (const auto& batch : _data_batches) {
     if (batch) {
@@ -61,7 +62,7 @@ std::vector<cucascade::read_only_data_batch> pipelineable_operator_data::get_rea
 }
 
 void pipelineable_operator_data::prepare_for_processing(
-  const cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
   remove_read_only_lock();
 
@@ -77,15 +78,23 @@ void pipelineable_operator_data::prepare_for_processing(
       if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
             pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
         pipeline::lock_and_prepare_batch_result result = *maybe_result;
-        if (result.new_batch.has_value()) {
-          // result has returned a read_only accessor to a clone (for the case of cross-GPU
-          // input/target_mem_space), so the ro_lock accessor here references a different batch
-          // than `batch` from `_data_batches`. Update the vector so _data_batches now holds the
-          // new updated batch, upholding the invariant that _data_batches[i] is the batch
-          // underlying accessor _read_only_data_batches[i].
-          batch = std::move(*result.new_batch);
-        }
-        ro_batches.push_back(std::move(result.ro_lock));
+
+        std::visit(cucascade::utils::overloaded{
+                     [&ro_batches](pipeline::lock_to_existing_batch& result) {
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                     [&batch, &ro_batches](pipeline::lock_to_new_batch& result) {
+                       // result has returned a read_only accessor to a clone (for the case of
+                       // cross-GPU input/target_mem_space), so the ro_lock accessor here references
+                       // a different batch than `batch` from `_data_batches`. Update the vector so
+                       // _data_batches now holds the new updated batch, upholding the invariant
+                       // that _data_batches[i] is the batch underlying accessor
+                       // _read_only_data_batches[i].
+                       batch = std::move(result.new_batch);
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                   },
+                   result);
       } else {
         throw sirius::internal_exception(
           "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
@@ -263,11 +272,11 @@ std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_
 {
   // not doing anything for now
   return std::make_unique<pipelineable_operator_data>(
-    std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
-                                               std::shared_ptr<cucascade::data_batch> batch)
+                                               std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) {
@@ -335,7 +344,7 @@ std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_dat
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
-  std::vector<::std::shared_ptr<cucascade::data_batch>> input_batch;
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
     if (!port_ptr->repo) { continue; }  // dependency-only port; nothing to pop
     // For Pipeline barrier: need at least one data batch in the port's repository

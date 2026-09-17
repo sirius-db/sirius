@@ -35,13 +35,19 @@
 namespace sirius {
 namespace pipeline {
 
-struct lock_and_prepare_batch_result {
-  // A new batch that may have been created to appropriately prepare the batch.
-  // If set, the ro_lock is a lock on this new batch which may be stored for
-  // future reference.
-  std::optional<std::shared_ptr<cucascade::data_batch>> new_batch;
+struct lock_to_existing_batch {
   cucascade::read_only_data_batch ro_lock;
 };
+
+// A new batch was created to appropriately prepare the batch.
+// The ro_lock is a lock on this new batch which may be stored for
+// future reference.
+struct lock_to_new_batch {
+  std::shared_ptr<cucascade::data_batch> new_batch;
+  cucascade::read_only_data_batch ro_lock;
+};
+
+using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_to_new_batch>;
 
 /**
  * @brief Lock or prepare a single data batch for processing in the requested memory space.
@@ -111,10 +117,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   // Memory space matches — return the read-only accessor directly
   if (read_accessor.get_memory_space() != nullptr &&
       read_accessor.get_memory_space()->get_id() == target_space->get_id()) {
-    return lock_and_prepare_batch_result{
-      .new_batch = std::nullopt,
-      .ro_lock   = std::move(read_accessor),
-    };
+    return lock_to_existing_batch{.ro_lock = std::move(read_accessor)};
   }
 
   // Memory space mismatch — clone or move depending on where the data lives.
@@ -134,7 +137,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
         auto clone = read_accessor.clone_to<cucascade::gpu_table_representation>(
           registry, get_next_batch_id(), target_space, stream);
-        return lock_and_prepare_batch_result{
+        return lock_to_new_batch{
           .new_batch = clone,
           .ro_lock   = clone->to_read_only(),
         };
@@ -155,9 +158,8 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           // Already in the target space — skip the wasteful same-space deep copy.
           std::ignore = cucascade::data_batch::to_idle(
             std::move(mut_accessor));  // release the exclusive write lock
-          return lock_and_prepare_batch_result{
-            .new_batch = std::nullopt,
-            .ro_lock   = batch->to_read_only(),
+          return lock_to_existing_batch{
+            .ro_lock = batch->to_read_only(),
           };
         }
 
@@ -169,7 +171,7 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
           // TODO(dhruv9vats): thread operator batch telemetry to cloned batch
           auto clone = mut_accessor.clone_to<cucascade::gpu_table_representation>(
             registry, sirius::get_next_batch_id(), target_space, stream);
-          return lock_and_prepare_batch_result{
+          return lock_to_new_batch{
             .new_batch = clone,
             .ro_lock   = clone->to_read_only(),
           };
@@ -186,9 +188,8 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         // exclusive mutable access dropped.
       }
 
-      return lock_and_prepare_batch_result{
-        .new_batch = std::nullopt,
-        .ro_lock   = batch->to_read_only(),
+      return lock_to_existing_batch{
+        .ro_lock = batch->to_read_only(),
       };
     }
     case cucascade::memory::Tier::HOST: {
@@ -222,9 +223,8 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
         }
         // exclusive mutable access dropped.
       }
-      return lock_and_prepare_batch_result{
-        .new_batch = std::nullopt,
-        .ro_lock   = batch->to_read_only(),
+      return lock_to_existing_batch{
+        .ro_lock = batch->to_read_only(),
       };
     }
     default:
