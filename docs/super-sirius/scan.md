@@ -305,6 +305,23 @@ statistics with DuckDB's `CheckStatistics`. Supported filters include typed comp
 filters, type mismatches, and runtime dynamic filters keep the chunk. Surviving chunks still pass
 through the normal GPU filter; pruning a HOST-tier chunk also avoids its H2D copy.
 
+**Per-group statistics.** A second, finer pass captures min/max per group of
+`sirius.operator_params.pinned_zone_map_group_rows` rows (8192 by default) within each chunk, over
+the same column allowlist. Group bounds sit in one contiguous arena per pinned table, column-major,
+so a filter reads a few large runs and never touches the other columns. They refine what the
+per-chunk pass already kept: a chunk that survives its own bounds can still have most of its groups
+skipped, which turns an all-or-nothing chunk decision into a partial read. Set `0` to capture chunk
+statistics only.
+
+**Group statistics need ordered rows, which is what `cluster_by` is for.** Sub-chunk bounds are only
+narrower than the chunk's if the rows are ordered on the filtered column; in an unordered chunk every
+group spans nearly the full range and nothing prunes. `pin_table`'s `cluster_by` sorts each chunk on
+the given key columns at pin time to create that order. The two are worth little apart — on TPC-H
+SF1000 clustering alone is slightly negative (it trades away the natural join-key order) and group
+capture alone is inside noise — and about −11% on the pinned suite together. Note the sort is
+per-chunk: which rows land in which chunk never changes, so the chunk-level bounds are identical
+whether or not the table is clustered, and only the group index can see the new order.
+
 **Sentinel chunk.** If every chunk is proven empty, chunk 0 is still served so the scan can signal
 pipeline completion; the normal GPU filter then removes its rows.
 

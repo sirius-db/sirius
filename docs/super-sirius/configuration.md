@@ -108,6 +108,7 @@ sirius:
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    pinned_zone_map_group_rows: 8192  # rows per sub-chunk zone-map group; 0 captures chunk stats only
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -431,6 +432,7 @@ individually.
 | `dense_count_join_memory_fraction` | 0.10 | Fraction of the smallest visible GPU's capacity used to resolve `dense_count_join_max_bytes` when it is 0 (auto). |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
+| `pinned_zone_map_group_rows` | 8192 | Rows per zone-map group within a pinned chunk. Groups refine the per-chunk bounds, so a scan can skip part of a chunk instead of all-or-nothing. `0` captures chunk statistics only. Ignored when `enable_pinned_zone_map_pruning` is false; only pays off when the chunk's rows are ordered on the filtered column, which is what `pin_table`'s `cluster_by` arranges. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 
@@ -686,6 +688,7 @@ Pinned-table zone-map capture and pruning are automatic. The advanced YAML escap
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `enable_pinned_zone_map_pruning` | true | Capture pinned-chunk zone maps at pin time and use them to prune cached scans. |
+| `pinned_zone_map_group_rows` | 8192 | Rows per sub-chunk zone-map group; `0` keeps chunk-granularity statistics only. |
 
 Setting the YAML value to `false` before startup avoids the extra GPU reductions and creates a
 statless entry. Enabling it later does not add statistics to that entry; re-pin the table with
