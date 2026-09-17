@@ -117,6 +117,7 @@ class sirius_engine {
   void telemetry_executing();
   void telemetry_exit();
   [[nodiscard]] quent::Uuid telemetry_query_id() const;
+  void initialize_plan(op::sirius_physical_operator& plan);
 
   sirius::query_id_t query_id_;
   /// The planner query for this execution: the pipeline set plus the operator->pipeline and

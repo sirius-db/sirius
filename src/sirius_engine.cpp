@@ -219,7 +219,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
   telemetry_planning();
   reset();
   sirius_owned_plan = std::move(plan);
-  initialize_internal(*sirius_owned_plan);
+  initialize_plan(*sirius_owned_plan);
 }
 
 void sirius_engine::execute()
@@ -290,6 +290,13 @@ void sirius_engine::execute()
 }
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
+{
+  // Borrowed plans do not pass through initialize().
+  telemetry_planning();
+  initialize_plan(plan);
+}
+
+void sirius_engine::initialize_plan(op::sirius_physical_operator& plan)
 {
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx_ptr) {
