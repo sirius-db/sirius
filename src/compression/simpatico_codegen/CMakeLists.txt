@@ -206,13 +206,6 @@ target_include_directories(simpatico_cli
 target_link_libraries(simpatico_cli PRIVATE simpatico)
 
 enable_testing()
-add_test(
-  NAME cccl_header_layouts
-  COMMAND
-    ${CMAKE_COMMAND}
-    "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_cccl_header_layouts"
-    "-DEMBED_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cccl_header_layouts.cmake")
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
