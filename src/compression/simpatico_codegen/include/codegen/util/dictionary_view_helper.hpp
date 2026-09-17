@@ -5,6 +5,8 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
+
 namespace simpatico {
 
 /// View kind for dictionary column children. Used to get read-only column_view
