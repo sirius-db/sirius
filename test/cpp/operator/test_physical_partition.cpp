@@ -18,6 +18,8 @@
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "utils/data_utils.hpp"
 
@@ -451,4 +453,192 @@ TEST_CASE(
   REQUIRE(sirius::get_cudf_table_view(
             *dynamic_cast<const pipelineable_operator_data&>(*outputs).get_data_batches()[0])
             .num_rows() == num_values);
+}
+
+namespace {
+
+struct sizing_source : sirius_physical_operator {
+  sizing_source() : sirius_physical_operator(SiriusPhysicalOperatorType::PROJECTION, {}, 0) {}
+
+  std::optional<std::size_t> total_source_output_bytes() const override { return projected_bytes; }
+  std::optional<std::size_t> projected_bytes;
+};
+
+struct sizing_pipeline : sirius::pipeline::sirius_pipeline {
+  explicit sizing_pipeline(const sirius::pipeline::pipeline_build_context& ctx)
+    : sirius_pipeline(ctx)
+  {
+  }
+  bool is_pipeline_finished() const override { return finished; }
+  bool finished = false;
+};
+
+// Observe the sizing input at the consumer boundary, without context-level test counters.
+// NESTED_LOOP_JOIN supplies a key-free partition; these tests exercise scheduling, not hashing.
+struct sizing_consumer : sirius_physical_partition_consumer_operator {
+  sizing_consumer()
+    : sirius_physical_partition_consumer_operator(
+        SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, {}, 0)
+  {
+  }
+
+  partition_strategy get_partition_strategy(const partition_sizing_input& in) override
+  {
+    inputs.push_back(in.total_bytes);
+    count = natural_num_partitions(in.total_bytes, target_bytes, 1);
+    return {count, false, false};
+  }
+
+  uint64_t target_bytes = 1;
+  int count             = 0;
+  std::vector<uint64_t> inputs;
+};
+
+struct partition_sizing_fixture {
+  explicit partition_sizing_fixture(bool enabled = true)
+    : partition({}, 0, &consumer, false, nullptr, enabled)
+  {
+    // This fixture bypasses plan conversion, which normally assigns IDs before port wiring.
+    source.operator_id    = 0;
+    partition.operator_id = 1;
+    consumer.operator_id  = 2;
+
+    auto* space = memory_manager->get_memory_space(Tier::GPU, 0);
+    REQUIRE(space != nullptr);
+    auto stream = default_stream();
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(
+      std::vector<int32_t>(100, 1), stream, get_resource_ref(*space)));
+    auto representation = std::make_unique<gpu_table_representation>(
+      std::make_unique<cudf::table>(std::move(columns)), *space, stream);
+    received_bytes = representation->get_size_in_bytes();
+    REQUIRE(received_bytes > 0);
+    consumer.target_bytes = received_bytes;
+    repo.add_data_batch(data_batch::make(sirius::get_next_batch_id(), std::move(representation)));
+
+    source.set_pipeline(producer);
+    sirius::pipeline::sirius_pipeline_build_state build_state;
+    build_state.set_pipeline_source(*producer, source);
+    build_state.set_pipeline_operators(*producer, {source});
+    build_state.set_pipeline_sink(
+      *producer, sirius::optional_ptr<sirius_physical_operator>(&source), 0);
+    auto port          = std::make_unique<sirius_physical_operator::port>();
+    port->type         = enabled ? MemoryBarrierType::PARTIAL : MemoryBarrierType::FULL;
+    port->repo         = &repo;
+    port->src_pipeline = producer;
+    partition.add_port("default", std::move(port));
+  }
+
+  void finish(std::size_t bytes)
+  {
+    producer->get_memory_history().record(
+      sirius::pipeline::task_memory_record{bytes, bytes, bytes});
+    producer->finished = true;
+  }
+
+  decltype(sirius::test::operator_utils::initialize_memory_manager()) memory_manager =
+    sirius::test::operator_utils::initialize_memory_manager();
+  sirius::pipeline::pipeline_build_context context{nullptr, true};
+  duckdb::shared_ptr<sizing_pipeline> producer = duckdb::make_shared_ptr<sizing_pipeline>(context);
+  sizing_source source;
+  shared_data_repository repo;
+  sizing_consumer consumer;
+  sirius_physical_partition partition;
+  std::size_t received_bytes = 0;
+};
+
+}  // namespace
+
+TEST_CASE("partition sizing uses a projection and keeps its first decision",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = 4 * f.received_bytes;
+  auto hint                = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  // Scheduling and sizing must agree even if the source projection changes between them.
+  f.source.projected_bytes = 6 * f.received_bytes;
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
+  CHECK(f.consumer.count == 4);
+
+  // A later sizing attempt must keep the count, even when the final total differs.
+  f.finish(8 * f.received_bytes);
+  CHECK_FALSE(f.partition.get_next_task_input_data());
+  CHECK(f.consumer.inputs.size() == 1);
+}
+
+TEST_CASE("partition sizing waits for an estimate even with a queued batch",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  auto hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK(hint->producer == &f.source);
+  CHECK(f.consumer.inputs.empty());
+
+  // Completion supplies an exact total even when no projection was available.
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+  CHECK(f.partition.no_history_peak_memory_estimate({1, f.received_bytes}) == 0);
+}
+
+TEST_CASE("partition sizing uses completed output instead of a stale source projection",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = 8 * f.received_bytes;
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("partition sizing floors a projection at the bytes already received",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  f.source.projected_bytes = f.received_bytes / 2;
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("disabled partition estimation waits for completion and uses measured input",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f(false);
+  f.source.projected_bytes = 4 * f.received_bytes;
+  auto hint                = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+  CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("partition sizing preserves integer bytes above double precision",
+          "[physical_partition][size_estimation]")
+{
+  partition_sizing_fixture f;
+  constexpr uint64_t bytes = (uint64_t{1} << 53) + 1;
+  f.consumer.target_bytes  = bytes;
+  SECTION("projected") { f.source.projected_bytes = bytes; }
+  SECTION("upstream complete") { f.finish(bytes); }
+
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.inputs == std::vector<uint64_t>{bytes});
+  CHECK(f.consumer.count == 1);
 }

@@ -177,9 +177,6 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// Multiplier applied to projected totals before partition sizing.
-  double size_estimate_safety_factor = 1.0;
-
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

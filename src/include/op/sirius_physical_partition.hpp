@@ -64,8 +64,7 @@ class sirius_physical_partition : public sirius_physical_operator {
     sirius_physical_operator* key_source,
     bool is_build                                              = false,
     duckdb::SiriusContext* compressed_materialization_observer = nullptr,
-    bool enable_size_estimation                                = false,
-    double size_estimate_safety_factor                         = 1.0);
+    bool enable_size_estimation                                = false);
 
   std::string get_name() const override;
 
@@ -194,11 +193,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
-  /// Non-owning counter sink. Registered state owns the context for the plan's lifetime.
-  duckdb::SiriusContext* _context_observer = nullptr;
+  /// Non-owning observer for the narrow-passthrough counter. Registered state owns the context
+  /// for the plan's lifetime; unit-test operators may leave it null.
+  duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};
-  double _size_estimate_safety_factor{1.0};
   /// Raw projection, latched so the task hint and sizing decision agree. Guarded by `lock`.
   std::optional<pipeline::data_size_estimate> _size_estimate;
 
@@ -208,8 +207,6 @@ class sirius_physical_partition : public sirius_physical_operator {
     projected,
   };
   static const char* sizing_basis_name(sizing_basis basis);
-  /// Publish the sizing basis when the partition count is fixed.
-  void record_sizing_basis() const;
   sizing_basis _sizing_basis{sizing_basis::measured};
   uint64_t _sizing_bytes{0};
   /// Bytes processed, used to report projection error.

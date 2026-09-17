@@ -3131,9 +3131,6 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // current_setting still reported the old value.
 }
 
-/// Reject implausible multipliers before converting the scaled total to uint64_t.
-static constexpr double kMaxSizeEstimateSafetyFactor = 1000.0;
-
 static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
@@ -3142,23 +3139,6 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
   params->enable_runtime_size_estimation = BooleanValue::Get(parameter);
   SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_SIZE_ESTIMATION to {}",
                    params->enable_runtime_size_estimation);
-}
-
-static void SetSizeEstimateSafetyFactor(ClientContext& context, SetScope scope, Value& parameter)
-{
-  auto* params = get_operator_params(context);
-  if (!params) { return; }
-  auto slot           = lock_operator_params_slot(context);
-  const double factor = parameter.GetValue<double>();
-  if (!std::isfinite(factor) || factor <= 0.0 || factor > kMaxSizeEstimateSafetyFactor) {
-    throw InvalidInputException(
-      "size_estimate_safety_factor must be finite and in (0.0, %g], got %f",
-      kMaxSizeEstimateSafetyFactor,
-      factor);
-  }
-  params->size_estimate_safety_factor = factor;
-  SIRIUS_LOG_DEBUG("Updated config SIZE_ESTIMATE_SAFETY_FACTOR to {}",
-                   params->size_estimate_safety_factor);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
@@ -3532,15 +3512,6 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
-
-  config.AddExtensionOption(
-    "size_estimate_safety_factor",
-    "Multiplier applied to a projected data size before it is used to size partitions; raise "
-    "above 1.0 to bias toward more (smaller) partitions when projections undershoot. Measured "
-    "totals are used as-is",
-    LogicalType::DOUBLE,
-    Value::DOUBLE(operator_defaults.size_estimate_safety_factor),
-    SetSizeEstimateSafetyFactor);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned
