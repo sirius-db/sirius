@@ -2199,10 +2199,8 @@ have read fewer. `posix_fadvise(FADV_DONTNEED)` is advisory, but here it is meas
 fused-scan tier-B fallback count, which correlates weakly (15.0 in high runs vs 12.6 in low) but
 overlaps at 14 and so is not the switch.
 
-**Open, and worth a ticket:** what the binary condition is. The next step is instrumentation rather
-than more repetitions — per-query `hpln_source::stats().transport` (trap §6.20's `std::ifstream`
-demotion is still live and would plausibly produce exactly two modes) and per-operator timing with
-telemetry on, comparing one run from each mode.
+**Diagnosed with logs + nsys (2026-09-17): it is the `.hpln` ingest pipeline starving, and it is
+OUR code.** See §6.23.
 
 **What to quote:** the low mode is **−20.0%** against `dev` parquet and the median of 15 is
 **−19.5%**; the high mode is −13.5%. Any single cold run in this document is one draw from this
@@ -2260,6 +2258,64 @@ coarse per-chunk `BaseStatistics` by reduction, recovering ~70% of the pin cost 
 resolution; (2) skip the group capture when it cannot pay — no `cluster_by` and no group narrower
 than its chunk — which is decidable at capture time and would remove the +1.8 s an unclustered pin
 currently pays for nothing.
+
+### 6.23 The bimodal cold run, diagnosed: the `.hpln` ingest starves, parquet never does (2026-09-17)
+
+§6.21 left the binary condition open. Logs and nsys close it, and the answer is not the benign one:
+**the instability is confined to the `.hpln` ingest path, which is code this branch introduces**
+(`dev` has the uring reactor but none of `hpln_io.cpp`, `simpatico_file_ingest.cpp`,
+`simpatico_gpu_ingestible.cpp`). It is not a property of the benchmark host.
+
+**A 4-query reproducer replaces a 22-query suite.** q3 flips one way and q9/q13/q21 the other, so
+the q9/q3 ratio separates the modes with no overlap: 2.04–2.05 (fast) against 3.30–3.32 (slow),
+and q3 lands on 1.621 s in BOTH slow runs — reproducible to the millisecond, which already says
+"discrete state", not "noise". q9 alone is bimodal, so the mode does not depend on a prior query.
+
+**Parquet is the control, and it is flat.** Same process, back-to-back with the `.hpln` query, same
+device, same page-cache state, over four nsys profiles:
+
+| | parquet q9 | `.hpln` q9 |
+|---|---|---|
+| wall | 4840.1 / 4846.6 / 4816.8 / 4822.5 ms | 5430.4 / 4840.8 / 5593.5 / 4807.9 ms |
+| spread | **0.6%** | **16.3%** |
+| kernel time | 1493–1496 ms (0.2%) | 869–873 ms (0.4%) |
+
+That single comparison kills every machine-wide explanation — CPU contention, clock state, device
+bandwidth, memory pressure, thermal, page cache would all have moved parquet too.
+
+**The GPU is exonerated, and so is the device.** For the `.hpln` query itself: kernel time 869.0 /
+869.5 (slow) against 872.7 / 871.1 (fast), the SAME 3062 launches, memcpy within 1.7%. The GPU is
+busy only **16–18% of wall** — this is a storage-fed query. Raw `O_DIRECT` reads of the same file
+from 16 threads measure **24.26 / 24.24 / 24.25 GB/s**, i.e. the disk is constant; Sirius extracts
+18.6 GB/s in the fast mode and 16.5 in the slow one.
+
+**Where the time goes: the pipeline stops feeding the device.** H2D volume is identical (132.7 GB)
+but the delivery rate is not — 27.4 GB/s against 24.4, with the loss concentrated in the first two
+seconds (14.5 vs **10.2 GB/s**) and extra 250 ms buckets with ZERO bytes delivered:
+
+    GB per 250 ms, slow:  1.8  0.0  4.1  1.9  2.1  6.3  1.1  3.1  8.4  0.0  8.4 ...
+    GB per 250 ms, fast:  1.8  2.1  3.9  0.0  4.2  4.2  5.8  6.9  6.3  4.2  7.6 ...
+
+GPU-busy bucketed over the query shows the same shape: identical total busy (1887 vs 1858 ms) with
+the low-utilisation ingest phase stretched by ~600 ms.
+
+**Ruled out inside the path, by log diff of a slow run against a fast one:** plan choice and batch
+structure (identical — 37 lineitem batches of `chunks=2 decoded rows=155281854`, `pruned 0/78`
+both), request shaping (same `131 requests, 84 extents`), transport (**every** read is
+`io_context:uring` + `O_DIRECT` in both — §6.20's `std::ifstream` demotion is NOT this), and the
+fused-scan decision (`decode NOT applied, status=2` in both). Also ruled out: NUMA (one CPU node;
+nodes 1–8 are GPU HBM with no CPUs), transparent huge pages (`madvise`, `AnonHugePages: 0`), CPU
+clock (pinned flat at 3.42 GHz across one slow and two fast runs), and driving-thread identity.
+
+**Still open:** which mechanism inside the ingest stalls. The remaining candidates are the reactor /
+prefetcher thread scheduling (`uring_n_reactors: 4`, `memory_prefetcher.num_threads: 3`,
+`scan_manager.num_threads: 18`), the queue depth (`max_bytes_in_flight`), and the coalescer's
+interaction with chunk arrival order — all in the path, none yet separated. The starvation being
+front-loaded suggests a ramp-up effect: whatever it is, it is worst while the pipeline is filling.
+
+**The bigger prize is not the 12% flip.** Even the FAST mode reads at 18.6 GB/s against a device
+that delivers 24.25 — the ingest leaves **23% of available bandwidth unused on a good run, 32% on a
+bad one**. The cold `.hpln` numbers throughout this document are therefore a floor, not a ceiling.
 
 ## 6.6 Skipping decode inside a GPU-resident compressed chunk
 
