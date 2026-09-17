@@ -67,6 +67,7 @@
 #include <cudf/unary.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_device.hpp>
 
@@ -96,7 +97,11 @@ using sirius::op::dynamic_filter_route_class;
 
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
 constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
-BOTH
+constexpr auto kDays    = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+auto const kDecimal32   = cudf::data_type{cudf::type_id::DECIMAL32, -2};
+auto const kDecimal64   = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+auto const kDecimal128  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+constexpr auto kString  = cudf::data_type{cudf::type_id::STRING};
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
@@ -633,7 +638,9 @@ TEST_CASE("dynamic-filter Bloom support covers every hash-IN-list key type",
     auto const empty = cudf::column_view{type, 0, nullptr, nullptr, 0};
     REQUIRE(sirius::op::sirius_dynamic_in_list_filter::supports(empty) ==
             sirius::op::membership_key_supported(type));
-    if (sirius::op::membership_key_supported(type)) {
+    // STRING is supported but not fixed-width; its nullable-build acceptance is covered by the
+    // string probe tests instead.
+    if (sirius::op::membership_key_supported(type) && cudf::is_fixed_width(type)) {
       auto const stream   = cudf::get_default_stream();
       auto const nullable = cudf::make_fixed_width_column(
         type, 1, cudf::mask_state::ALL_NULL, stream, cudf::get_current_device_resource_ref());

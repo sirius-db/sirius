@@ -359,7 +359,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_device_replicable {
  public:
   /**
-OURS
+   * @brief Builds a Bloom filter from keys of a supported type (see `membership_key_supported`),
    * excluding nulls
    *
    * @pre Key storage remains valid until work enqueued on @p stream completes.

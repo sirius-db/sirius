@@ -200,10 +200,11 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   rmm::device_buffer needles{bytes, stream, mr};
   bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
-OURS
-      thrust::copy(
-        rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
-    });
+    return detail::with_build_key_iterator<key_type>(
+      _domain, build_keys, stream, mr, [&](auto first, auto last) {
+        thrust::copy(
+          rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
+      });
   });
   if (!copied) {
     throw std::logic_error(

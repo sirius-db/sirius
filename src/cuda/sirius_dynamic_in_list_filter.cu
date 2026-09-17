@@ -144,8 +144,8 @@ set_owner<KeyT> build_set(membership_key_domain const& domain,
   if (keys.size() > 0) {
     // The build column may sit at a same-family carrier other than the rep; the iterator converts
     // per element instead of materializing a rep-typed copy.
-    bool const inserted = detail::with_build_key_iterator<KeyT>(
-      domain, keys, stream, mr, [&](auto first, auto last) {
+    bool const inserted =
+      detail::with_build_key_iterator<KeyT>(domain, keys, stream, mr, [&](auto first, auto last) {
         set->insert_async(first, last, stream);
       });
     if (!inserted) {

@@ -710,7 +710,9 @@ TEST_CASE("hash IN-list set bytes are sized at the key rep, not the build carrie
   CHECK(bytes_of(id::UINT32) == bytes_of(id::INT32));
   CHECK(bytes_of(id::UINT64) == bytes_of(id::INT64));
   CHECK(bytes_of(id::INT64) == 2 * bytes_of(id::INT32));
-BOTH
+  CHECK(bytes_of(id::TIMESTAMP_DAYS) == bytes_of(id::INT32));
+  CHECK(bytes_of(id::TIMESTAMP_MICROSECONDS) == bytes_of(id::INT64));
+  CHECK(bytes_of(id::STRING) == bytes_of(id::INT64));  // 8-byte fingerprints, not string bytes
 }
 
 // The three filters must answer identically whatever carrier the probe arrives at, with or
@@ -1753,18 +1755,28 @@ TEST_CASE("DECIMAL128 keys build an int64 set when their values fit and are refu
     }
   }
 
-  SECTION("nulls are ignored by the range check and compacted by Bloom")
+  SECTION("nulls are ignored by the range check and compacted by every filter")
   {
     auto keys      = make_decimal<__int128_t>({5, 0, 7}, stream);
     auto null_mask = cudf::create_null_mask(3, cudf::mask_state::ALL_VALID, stream, mr);
     cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()), 1, 2, false, stream);
     keys->set_null_mask(std::move(null_mask), 1);
     REQUIRE(membership_build_fits_rep(keys->view(), stream, mr));
-    // The IN-lists still require null-free keys; Bloom drops the null before inserting.
-    CHECK_FALSE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    // Every filter drops the null slot before inserting; the IN-lists store the two valid keys.
+    REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+    REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));
+    sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+    sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
     sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
-    auto const probe = make_decimal<std::int64_t>({5, 7}, stream);
-    CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{1, 1});
+    CHECK(in_list.size() == 2);
+    CHECK(small_list.size() == 2);
+    auto const probe = make_decimal<std::int64_t>({5, 0, 7}, stream);
+    std::vector<std::uint8_t> const expected{1, 0, 1};
+    CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+    CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+    auto const bloom_mask = probe_mask(bloom, probe->view(), nullptr, stream);
+    CHECK(bloom_mask[0] == 1);
+    CHECK(bloom_mask[2] == 1);
   }
 
   SECTION("a non-decimal supported type always fits; an unsupported type never does")
