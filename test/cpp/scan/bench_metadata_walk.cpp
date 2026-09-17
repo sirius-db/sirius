@@ -15,26 +15,11 @@
  */
 
 // Hidden microbenchmark for the duckdb-native metadata prepare walk on a real
-// (unpinned) table — the P21 fix #3/#4 adjudication harness. GPU-free.
-//
-// Run:
+// unpinned table. GPU-free. Run:
 //   SIRIUS_WALK_BENCH_DB=$HOME/tpch_sf1000.duckdb \
 //     build/release/extension/sirius/test/cpp/sirius_unittest '[walk_bench]'
-//
-// Scenarios (all timings are the prepare walk only — the per-query cost a
-// plan build pays on the query thread):
-//   uncached/serial    — cache killed, 1 worker: the old build's walk cost
-//                        (same GetPartitionStats + same per-(row group,
-//                        column) statistics reads; the fusion only reorders
-//                        them into one pass).
-//   uncached/parallel  — cache killed, default workers (fix #4 alone).
-//   first (rebuild)    — cache cleared: locked probe + parallel stats
-//                        extraction + fused assemble (unpinned first-query
-//                        cost with fix #3).
-//   repeat (product)   — identical query shape: probe-only product hit.
-//   varied (assemble)  — new predicate constant each rep (--vary-predicates
-//                        shape): snapshot hit + fused assemble over cached
-//                        statistics, no storage reads.
+// Scenarios: uncached/serial, uncached/parallel, first cached query (rebuild),
+// repeat (product hit), varied predicate (snapshot hit + assemble).
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -127,9 +112,7 @@ TEST_CASE("metadata walk microbenchmark on an unpinned table", "[.][walk_bench]"
     {9, sirius::logical_type::make(type_id::VARCHAR)},  // l_linestatus
     {10, sirius::logical_type::make(type_id::DATE)},    // l_shipdate
   };
-  // SIRIUS_WALK_BENCH_HEAVY=1: add every remaining lineitem varchar — the
-  // per-varchar-column stats passes dominated the old walk, so this is the
-  // shape the P21 report's 70-190 ms band came from.
+  // SIRIUS_WALK_BENCH_HEAVY=1: add every remaining lineitem varchar.
   if (const char* heavy = std::getenv("SIRIUS_WALK_BENCH_HEAVY"); heavy && heavy[0] == '1') {
     specs.push_back({13, sirius::logical_type::make(type_id::VARCHAR)});  // l_shipinstruct
     specs.push_back({14, sirius::logical_type::make(type_id::VARCHAR)});  // l_shipmode
@@ -203,7 +186,7 @@ TEST_CASE("metadata walk microbenchmark on an unpinned table", "[.][walk_bench]"
     return time_ms([&] { run_walk(filters.get()); });
   });
 
-  //===----------Uncached, parallel (fix #4 alone)----------===//
+  //===----------Uncached, parallel----------===//
   bench("uncached/parallel", 5, [&] {
     threads_env_guard tg(nullptr);  // default worker count
     return time_ms([&] { run_walk(filters.get()); });

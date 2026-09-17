@@ -15,12 +15,7 @@
  */
 
 // GPU-free tests for the duckdb-native metadata prepare cache and the fused,
-// parallel statistics pass: keying, invalidation on structural change
-// (insert / checkpoint), non-invalidation on deletes, transaction-local
-// bypass, cached-vs-uncached walk equivalence, walk-product (layer 2)
-// hit/miss semantics, refusal-order equivalence with the old serial passes,
-// parallel-walk determinism, and torn-capture rejection under concurrent
-// commits.
+// parallel statistics pass.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -316,7 +311,7 @@ TEST_CASE("metadata cache serves varied filters from one snapshot",
 }
 
 //===--------------------------------------------------------------------===//
-// Walk-product (layer 2) semantics
+// Walk-product cache semantics
 //===--------------------------------------------------------------------===//
 
 TEST_CASE("walk product cache serves repeated query shapes and misses on new predicates",
@@ -466,10 +461,8 @@ TEST_CASE("metadata cache invalidates on committed insert", "[scan][duckdb_nativ
 TEST_CASE("metadata cache stays valid across committed deletes",
           "[scan][duckdb_native_metadata_cache]")
 {
-  // A DELETE commit changes only row-version state; the physical row-group
-  // structure (starts, counts, segments) the walk describes is untouched, so
-  // the snapshot must keep serving. Visibility of deleted rows is applied by
-  // the MVCC keep-mask machinery, never by this walk.
+  // A DELETE commit leaves the physical row-group structure untouched, so the
+  // snapshot must keep serving.
   auto& cache = duckdb_native_metadata_cache::instance();
   cache.clear();
   auto [db_owner, con] = sirius::make_test_db_and_connection();
@@ -520,11 +513,9 @@ TEST_CASE("metadata cache rebuilds after checkpoint compaction",
   REQUIRE(before.viable);
   REQUIRE(cache.rebuilds() == 1);
 
-  // Delete every row and checkpoint: fully-deleted row groups are reclaimed,
-  // so the physical structure changes and the identity probe must catch it
-  // regardless of how the rewrite happened. (This is also why the probe, not
-  // an O(1) last-commit check, is the validity test: CHECKPOINT restructures
-  // row groups without bumping the transaction manager's last_commit.)
+  // Delete every row and checkpoint: row groups are reclaimed, and the probe
+  // must catch it. CHECKPOINT does not bump last_commit, which is why the
+  // probe (not a commit counter) is the validity test.
   exec_ok(con, "COMMIT");
   exec_ok(con, "DELETE FROM t3c_ckpt");
   exec_ok(con, "CHECKPOINT");
@@ -687,12 +678,9 @@ TEST_CASE("metadata cache accepts varchar below the overflow limit",
 TEST_CASE("fused stats pass reports the column-outer, row-group-inner refusal",
           "[scan][duckdb_native_metadata_cache]")
 {
-  // Old semantics: one overflow pass PER VARCHAR COLUMN (projected order),
-  // row groups inner — the reported refusal is the min-rg refusal of the min
-  // refusing column. Here s0 (ci=0) overflows only in row group 2 and s1
-  // (ci=1) only in row group 1: the refusal must name column 0 / row group 2,
-  // NOT the (row-group-wise earlier) column 1 / row group 1 — under both the
-  // cached and uncached paths and under any worker count.
+  // The old serial pass was column-outer, row-group-inner. s0 (ci=0) overflows
+  // only in row group 2 and s1 (ci=1) only in row group 1, so the refusal must
+  // name column 0 / row group 2 under every path and worker count.
   auto& cache = duckdb_native_metadata_cache::instance();
   cache.clear();
   auto [db_owner, con] = sirius::make_test_db_and_connection();
@@ -778,16 +766,11 @@ TEST_CASE("parallel walk is deterministic across worker counts",
 }
 
 //===--------------------------------------------------------------------===//
-// Concurrent-commit consistency (the stack-t1-t2-t3 throughput hang)
+// Concurrent-commit consistency
 //===--------------------------------------------------------------------===//
 
-// A refresh stream committing INSERTs mutates the row-group tree
-// non-atomically (counts are bumped before total_rows; MergeStorage appends
-// nodes one at a time). Every snapshot the cache serves while that happens
-// must still be internally consistent — contiguous starts and
-// Σ row_count == total_rows — or be rejected (bypass). A torn capture served
-// (or installed) here is exactly the geometry corruption that poisoned the
-// SF1000 throughput run.
+// Concurrent INSERT commits mutate the row-group tree non-atomically. Every
+// snapshot served meanwhile must be internally consistent or be rejected.
 TEST_CASE("metadata cache never serves a torn snapshot under concurrent commits",
           "[scan][duckdb_native_metadata_cache]")
 {
@@ -826,9 +809,7 @@ TEST_CASE("metadata cache never serves a torn snapshot under concurrent commits"
     stop.store(true);
   });
 
-  // Readers: acquire fresh snapshots in short transactions and verify every
-  // SERVED snapshot's internal consistency (a bypass — nullopt — is a legal
-  // answer under a mid-flight commit; a torn serve is not).
+  // Readers: a bypass is legal under a mid-flight commit; a torn serve is not.
   std::vector<std::thread> readers;
   for (int t = 0; t < 3; ++t) {
     readers.emplace_back([&db_instance, &cache, storage, &stop, &served, &inconsistent] {
@@ -881,13 +862,9 @@ TEST_CASE("metadata cache never serves a torn snapshot under concurrent commits"
   exec_ok(con, "COMMIT");
 }
 
-// End-to-end variant through prepare_duckdb_native_walk: full walks (cache
-// acquire + product assemble/store/serve, plus the uncached bypass fallback)
-// racing committed appends. During the race the walks must complete without
-// throwing (a torn capture bypasses; the bypassed uncached read is the
-// pre-existing, unvalidated behavior, so its output is not asserted on); the
-// settled state afterwards must serve a product-cached walk identical to a
-// fresh assemble and account for every committed row.
+// End-to-end variant through prepare_duckdb_native_walk racing committed
+// appends. Walks must not throw during the race; the settled state must serve
+// a product-cached walk identical to a fresh assemble.
 TEST_CASE("prepared walks survive concurrent commits and settle exactly",
           "[scan][duckdb_native_metadata_cache]")
 {

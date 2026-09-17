@@ -27,9 +27,8 @@
 
 namespace sirius::op::scan {
 
-/// @brief Worker cap for the per-row-group statistics passes of the metadata
-/// prepare walk. Env `SIRIUS_METADATA_WALK_THREADS` overrides (>=1); 1 forces
-/// the serial path. Read per call so tests can flip it between walks.
+/// @brief Worker cap for the metadata walk's per-row-group passes. Env
+/// `SIRIUS_METADATA_WALK_THREADS` overrides; 1 forces the serial path.
 inline std::size_t metadata_walk_threads()
 {
   constexpr std::size_t kDefaultWalkThreads = 8;
@@ -45,18 +44,10 @@ inline std::size_t metadata_walk_threads()
 
 /// @brief Run @p body over [0, n) split into contiguous per-worker ranges.
 ///
-/// Determinism contract: workers write only to disjoint, index-addressed slots
-/// the caller preallocated, so the output is identical for every worker count
-/// (including 1). Chunk boundaries depend only on (n, worker count).
-///
-/// Small inputs run inline: parallelism only pays off when each worker gets a
-/// meaningful slice (row-group statistics reads are ~1-3 us each), so ranges
-/// below @p min_per_worker rows-groups-per-worker shed workers first. An
-/// explicit `SIRIUS_METADATA_WALK_THREADS` wins over the shedding so tests can
-/// force multi-worker runs on tiny tables.
-///
-/// The first worker exception (by worker index, for determinism) is rethrown
-/// on the calling thread after every worker joined.
+/// Workers must write only to disjoint, index-addressed slots so the output is
+/// identical for every worker count. Small inputs shed workers unless
+/// `SIRIUS_METADATA_WALK_THREADS` is set explicitly. The first worker
+/// exception (by worker index) is rethrown after all workers joined.
 inline void parallel_over_row_groups(std::size_t n,
                                      const std::function<void(std::size_t, std::size_t)>& body)
 {

@@ -53,17 +53,10 @@ bool cache_env_disabled()
 
 /// @brief Key equality for the product cache's prunable filters.
 ///
-/// TableFilter::Equals is NOT parameter-complete for every subclass: the base
-/// implementation compares only filter_type, and OptionalFilter (among others)
-/// inherits it — two OPTIONAL_FILTERs wrapping different children would compare
-/// equal, which for a product key means serving one filter's pruning decisions
-/// for another. So key equality trusts Equals only for the types whose
-/// overrides are known parameter-complete (constant/value comparisons, IN
-/// lists, deep expression equality), recurses through the structural wrappers
-/// itself, and refuses everything else (DYNAMIC_FILTER never reaches here —
-/// callers key prunable filters only; BLOOM_FILTER's Equals is already
-/// always-false because its payload is run-time built). A refusal only costs a
-/// product-cache miss: the snapshot and statistics layers still hit.
+/// TableFilter::Equals is not parameter-complete for every subclass (the base
+/// compares only filter_type), so only types with known-complete overrides are
+/// trusted, structural wrappers are recursed by hand, and anything else is
+/// never key-equal. A refusal only costs a product-cache miss.
 bool product_filter_key_equal(const duckdb::TableFilter& a, const duckdb::TableFilter& b)
 {
   if (a.filter_type != b.filter_type) { return false; }
@@ -116,16 +109,10 @@ bool product_key_matches(const walk_product_key& stored, const walk_product_key_
   return true;
 }
 
-/// Extract statistics for @p columns from the strong row-group handles this
-/// acquire's VALIDATED capture pinned (parallel to the snapshot's row groups).
-/// Reading from the handles instead of re-iterating the live tree removes the
-/// probe-to-extraction race window entirely: the handles cannot be freed, and
-/// they are exactly the row groups the returned geometry describes.
-/// RowGroup::GetStatistics locks internally (per-column stats_lock; lazy column
-/// loads under the per-row-group row_group_lock) and returns a self-contained
-/// copy, so the extraction parallelizes across row groups; a concurrent commit
-/// can only WIDEN stats, which keeps cached pruning and the varchar overflow
-/// refusal conservative.
+/// Extract statistics for @p columns from the row-group handles pinned by a
+/// validated capture, so geometry and statistics describe the same state.
+/// RowGroup::GetStatistics locks internally and returns a copy, so this
+/// parallelizes across row groups.
 std::vector<std::shared_ptr<column_stats_snapshot>> extract_column_stats(
   std::span<duckdb::shared_ptr<duckdb::RowGroup> const> row_groups,
   std::span<duckdb::idx_t const> columns)
@@ -175,8 +162,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     ++_bypasses;
     return std::nullopt;
   }
-  // Transaction-local appends are per-transaction state that GetPartitionStats
-  // folds into its result; a snapshot of them must never leak across queries.
+  // Uncommitted rows in this transaction must never leak into a shared snapshot.
   if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
     ++_bypasses;
     return std::nullopt;
@@ -192,33 +178,11 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     return std::nullopt;
   }
 
-  // Probe pass: capture the live structure ONCE, under the segment-tree lock,
-  // and validate the capture's internal consistency before it can be installed
-  // or served. Commits from other connections mutate this state non-atomically
-  // (RowGroupCollection::FinalizeAppend bumps each covered row group's `count`
-  // in order WITHOUT the tree lock; MergeStorage appends nodes one AppendSegment
-  // at a time; both update `total_rows` LAST), so an unvalidated capture racing
-  // a commit can observe geometry that never existed at any commit boundary.
-  // The tree lock serializes against node insertion/erasure; the checks below
-  // reject every remaining mid-commit state:
-  //  - contiguity: row_group_start[i] == row_group_start[0] + Σ row_count[<i].
-  //    Node starts are assigned final at insertion, so a not-yet-final tail
-  //    count (FinalizeAppend mid-loop) breaks the chain to its successor.
-  //  - accounting: Σ row_count == total_rows. Counts are bumped BEFORE
-  //    total_rows in every append path (and nodes erased before total_rows in
-  //    the revert path), so any partially-applied commit fails one side.
-  //  - stability: total_rows re-read after the walk must equal the value read
-  //    before it (a commit fully landing mid-walk moves it).
-  // Consistent captures are exactly the settled pre-/post-commit states, both
-  // of which are legitimate to serve (visibility of committed-but-invisible
-  // rows is applied downstream by the MVCC keep-mask / insert-delta / plan-gate
-  // machinery, identical to the uncached walk's physical counts).
-  // A commit's mutation window (count bumps / node splices) is microseconds
-  // wide, so a torn capture almost always settles by the next attempt. Retry
-  // the locked capture a few times before giving up: every serve during a
-  // commit window then still comes from a VALIDATED capture instead of pushing
-  // the query onto the uncached GetPartitionStats walk, which reads the same
-  // live state with no validation at all.
+  // Capture the live structure once under the segment-tree lock and reject the
+  // capture as torn unless it is internally consistent (contiguous starts, sum
+  // of counts == total_rows, total_rows stable). Concurrent commits mutate this
+  // state non-atomically, and their windows are microseconds wide, so retry a
+  // few times before bypassing.
   constexpr int kTornCaptureAttempts = 4;
 
   std::shared_ptr<table_walk_snapshot> live;
@@ -233,10 +197,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     live             = std::make_shared<table_walk_snapshot>();
     live->total_rows = total_before;
     live->block_size = storage.GetAttached().GetStorageManager().GetBlockManager().GetBlockSize();
-    // Strong handles pinned for the duration of this acquire: identity source
-    // for the probe AND the stats-extraction source (no second tree
-    // iteration). Only weak_ptrs of these enter the cached snapshot, so entry
-    // lifetime never extends DuckDB storage lifetime (safe across DETACH).
+    // Strong handles live only for this acquire; the snapshot keeps weak_ptrs.
     pinned_row_groups.clear();
     {
       auto tree_lock = tree->Lock();
@@ -262,11 +223,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
       consistent && running == total_before && collection->GetTotalRows() == total_before;
   }
   if (!consistent) {
-    // Mid-commit tear that outlasted every retry: do not install, do not
-    // serve — the caller falls through to the uncached walk, and nothing is
-    // memoized from this window. INFO (not DEBUG): this is the observable
-    // trace that a query raced a staged-refresh commit here, and it is rare
-    // enough (sub-Hz even under RF pressure) to be free.
+    // Torn across every retry: bypass to the uncached walk, install nothing.
     ++_bypasses;
     SIRIUS_LOG_INFO(
       "[duckdb_native_metadata_cache] torn capture rejected (concurrent commit, {} attempts): "
@@ -281,9 +238,6 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     return std::nullopt;
   }
   if (attempts_used > 1) {
-    // A tear was detected AND settled by a retry — the common case. Logged at
-    // INFO so guard activity is countable in benchmark logs (rejections alone
-    // undercount it: most mid-commit captures settle within one retry).
     SIRIUS_LOG_INFO(
       "[duckdb_native_metadata_cache] torn capture settled on retry {} of {}: "
       "{} row group(s), total_rows={}",
@@ -305,9 +259,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
               entry.core->row_count == live->row_count;
   if (same) {
     for (std::size_t i = 0; i < live->n_row_groups; ++i) {
-      // ABA-safe identity: an expired weak_ptr (row group freed, address
-      // possibly reused) never compares equal to a live node — and this
-      // acquire's strong handles keep the live nodes alive for the compare.
+      // An expired weak_ptr never compares equal to a live node.
       auto cached = entry.core->row_group_identity[i].lock();
       if (!cached || cached.get() != pinned_row_groups[i].get()) {
         same = false;
@@ -333,12 +285,7 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
   out.core       = entry.core;
   out.generation = entry.generation;
 
-  // Missing-column statistics are extracted in ONE parallel pass over the
-  // pinned handles (previously one serial pass per column).
-  // pinned_row_groups is parallel to entry.core's row groups in both branches:
-  // on a rebuild entry.core IS this capture; on a hit the identity loop above
-  // verified node-for-node equality. Extracting from the pinned handles (not
-  // the live tree) closes the old probe-to-extraction race window.
+  // pinned_row_groups matches entry.core node-for-node in both branches.
   std::vector<duckdb::idx_t> missing;
   for (auto const column : stats_columns) {
     if (entry.columns.find(column) == entry.columns.end()) { missing.push_back(column); }
@@ -353,8 +300,6 @@ duckdb_native_metadata_cache::acquire(duckdb::DataTable& storage,
     out.column_stats.emplace(column, entry.columns.at(column));
   }
 
-  // Product lookup: only against this entry's CURRENT snapshot (products were
-  // dropped on rebuild above, so anything found describes out.core exactly).
   if (product_key != nullptr) {
     for (auto& slot : entry.products) {
       if (product_key_matches(slot.key, *product_key)) {
@@ -386,11 +331,8 @@ void duckdb_native_metadata_cache::store_product(duckdb::DataTable& storage,
   auto it = _entries.find(&storage);
   if (it == _entries.end()) { return; }
   auto& entry = it->second;
-  // The snapshot this product was assembled from is gone (a commit landed
-  // between acquire and store): drop the product. Installing it would pair
-  // old-geometry pruning decisions with the new snapshot on later hits.
+  // The snapshot this product was assembled from has been replaced.
   if (entry.generation != generation) { return; }
-  // Idempotent under concurrent same-shape assembles: keep the incumbent.
   walk_product_key_view view;
   view.projection_signature = &key.projection_signature;
   std::vector<std::pair<duckdb::idx_t, const duckdb::TableFilter*>> borrowed;
