@@ -158,7 +158,9 @@ set_owner<KeyT> build_set(membership_key_domain const& domain,
 // The adapter converts probe values into the key domain per element; one the domain cannot
 // represent is a definite non-member, and so is a null probe row (the set holds no nulls and the
 // join never matches them). Rows the prior keep-mask killed skip the lookup. A key equal to the
-// set's reserved sentinel cannot be stored, so such a probe is kept conservatively.
+// set's reserved sentinel cannot be stored (cuco's insert of its empty key is a no-op), so such a
+// probe is kept conservatively; for the string family that is a probe whose fingerprint is
+// UINT64_MAX, which therefore always passes.
 template <class Adapter, class SetRef>
 struct set_contains {
   using key_type = typename Adapter::key_type;

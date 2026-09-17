@@ -96,10 +96,7 @@ using sirius::op::dynamic_filter_route_class;
 
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
 constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
-constexpr auto kDays    = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
-auto const kDecimal32   = cudf::data_type{cudf::type_id::DECIMAL32, -2};
-auto const kDecimal64   = cudf::data_type{cudf::type_id::DECIMAL64, -2};
-auto const kDecimal128  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
+BOTH
 
 template <typename MemoryManager>
 std::vector<sirius::op::dynamic_filter_replica_space> get_replica_spaces(
@@ -227,6 +224,34 @@ std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture
   REQUIRE(err == cudaSuccess);
   fixture.stream.synchronize();
   return column;
+}
+
+// Upload a null-free STRING column.
+std::unique_ptr<cudf::column> make_string_values(publisher_fixture const& fixture,
+                                                 std::vector<std::string> const& values)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const n  = static_cast<cudf::size_type>(values.size());
+  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(n) + 1, 0);
+  std::string chars;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    chars += values[i];
+    offsets[i + 1] = static_cast<cudf::size_type>(chars.size());
+  }
+  auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                               static_cast<cudf::size_type>(offsets.size()),
+                                               cudf::mask_state::UNALLOCATED,
+                                               fixture.stream,
+                                               mr);
+  REQUIRE(cudaMemcpyAsync(offsets_col->mutable_view().data<cudf::size_type>(),
+                          offsets.data(),
+                          offsets.size() * sizeof(cudf::size_type),
+                          cudaMemcpyHostToDevice,
+                          fixture.stream.value()) == cudaSuccess);
+  rmm::device_buffer chars_buf{chars.data(), chars.size(), fixture.stream, mr};
+  fixture.stream.synchronize();
+  return cudf::make_strings_column(
+    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
 }
 
 std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixture,
@@ -1011,6 +1036,86 @@ TEST_CASE("dynamic-filter publisher publishes DECIMAL128 membership only when th
   }
 }
 
+// A VARCHAR join key (TPC-DS i_item_id, ca_county, ...) publishes a fingerprint membership filter
+// through the same plan the planner records for it: STRING build storage type, STRING probe
+// storage type. The mask answers exact string membership for these keys (fingerprints are
+// pairwise distinct) and a zone map over the strings is emitted when zone maps are enabled.
+TEST_CASE("dynamic-filter publisher publishes fingerprint membership for STRING keys",
+          "[dynamic_filter][publisher][string]")
+{
+  publisher_fixture fixture;
+
+  auto const publish = [&](bool emit_zone_maps) {
+    auto channel = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back({.filter_set               = channel,
+                       .route_class              = dynamic_filter_route_class::scan,
+                       .accepts_zone_map_filters = true,
+                       .key_bindings             = {{.admitted_key_index   = 0,
+                                                     .channel_push_ordinal = kProbeColumnIndex,
+                                                     .probe_storage_type   = kString}}});
+    auto key            = make_int64_key(0, 0);
+    key.storage_type    = kString;
+    auto replica_spaces = fixture.replica_spaces;
+    sirius::op::dynamic_filter_publication_policy policy{};
+    policy.emit_zone_map_filters = emit_zone_maps;
+    dynamic_filter_publish_plan plan{{key}, std::move(targets), std::move(replica_spaces), policy};
+    auto const outcome =
+      sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+    REQUIRE(outcome.keys_considered == 1);
+    REQUIRE(outcome.keys_skipped_type_mismatch == 0);
+    REQUIRE(outcome.membership_filters_built == 1);
+    REQUIRE(outcome.zone_map_filters_built == (emit_zone_maps ? 1 : 0));
+    REQUIRE(outcome.filters_pushed == (emit_zone_maps ? 2 : 1));
+    return channel->filters_for_column(kProbeColumnIndex);
+  };
+
+  SECTION("small IN-list tier")
+  {
+    fixture.columns.push_back(
+      make_string_values(fixture, {"AAAAAAAAAAAAAAAA", "", "county of long names and spaces"}));
+    auto const snapshot = publish(/*emit_zone_maps=*/false);
+    REQUIRE(snapshot.size() == 1);
+    auto const* small =
+      dynamic_cast<sirius::op::sirius_dynamic_small_in_list_filter const*>(snapshot.front().get());
+    REQUIRE(small != nullptr);
+    CHECK(small->domain().rep == sirius::op::membership_key_rep::u64);
+    CHECK(small->domain().family == sirius::op::membership_key_family::string_hash);
+    CHECK(small->domain().native == kString);
+
+    auto const probe = make_string_values(
+      fixture,
+      {"AAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAB", "", " ", "county of long names and spaces"});
+    REQUIRE(membership_mask(*snapshot.front(), probe->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 0, 1, 0, 1});
+  }
+
+  SECTION("hash IN-list tier, with a zone map beside it")
+  {
+    std::vector<std::string> keys;
+    for (std::size_t i = 0; i < sirius::op::sirius_dynamic_small_in_list_filter::k_max_keys + 5;
+         ++i) {
+      keys.push_back("item_" + std::to_string(i * 2));
+    }
+    fixture.columns.push_back(make_string_values(fixture, keys));
+    auto const snapshot = publish(/*emit_zone_maps=*/true);
+    REQUIRE(snapshot.size() == 2);
+    REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(snapshot) == 1);
+    REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_in_list_filter>(snapshot) == 1);
+    auto const it      = std::find_if(snapshot.begin(), snapshot.end(), [](auto const& f) {
+      return dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(f.get()) != nullptr;
+    });
+    auto const* hashed = dynamic_cast<sirius::op::sirius_dynamic_in_list_filter const*>(it->get());
+    REQUIRE(hashed->has_persistent_set());
+    CHECK(hashed->domain().rep == sirius::op::membership_key_rep::u64);
+    CHECK(hashed->domain().family == sirius::op::membership_key_family::string_hash);
+
+    auto const probe = make_string_values(fixture, {"item_0", "item_1", "item_2", "item_", ""});
+    REQUIRE(membership_mask(**it, probe->view(), fixture) ==
+            std::vector<std::uint8_t>{1, 0, 1, 0, 0});
+  }
+}
+
 TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only its bound keys",
           "[dynamic_filter][publisher]")
 {
@@ -1523,6 +1628,23 @@ TEST_CASE("dynamic-filter publish plan rejects invalid targets and bindings",
     REQUIRE_THROWS_AS(
       dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)),
       std::invalid_argument);
+  }
+
+  SECTION("direct binding over STRING storage on both sides is accepted")
+  {
+    // Join-edge probes of CTE outputs (TPC-DS q4/q11/q74 customer_id) are STRING operator
+    // outputs; the string family admits them through the same equal-type gate as integers.
+    std::vector<dynamic_filter_publish_plan::probe_target> targets;
+    targets.push_back(
+      {.filter_set               = channel,
+       .route_class              = dynamic_filter_route_class::direct,
+       .accepts_zone_map_filters = false,
+       .key_bindings             = {
+         {.admitted_key_index = 0, .channel_push_ordinal = 0, .probe_storage_type = kString}}});
+    auto key         = make_int64_key(0, 0);
+    key.storage_type = kString;
+    REQUIRE_NOTHROW(
+      dynamic_filter_publish_plan({key}, std::move(targets), std::move(fixture.replica_spaces)));
   }
 
   SECTION("direct binding whose probe storage type differs from the admitted key's build type")

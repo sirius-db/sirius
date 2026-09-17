@@ -67,8 +67,9 @@ namespace {
 /// needles. For the small m this filter gates on (<= k_max_keys), a compare-all linear scan beats a
 /// hash probe and reserves no sentinel value. The adapter converts probe values into the needle
 /// domain per element; one the domain cannot represent is a definite non-member, and so is a null
-/// probe row (the needles hold no nulls and the join never matches them). Rows the prior
-/// keep-mask killed skip the scan.
+/// probe row (the needles hold no nulls and the join never matches them). String needles are
+/// 64-bit fingerprints compared as such (one code path, no byte compare), so the scan is exact for
+/// integers and no-false-negatives for strings. Rows the prior keep-mask killed skip the scan.
 template <class Adapter, class KeyT>
 struct small_in_list_scan {
   Adapter adapt;
@@ -199,8 +200,7 @@ sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
   rmm::device_buffer needles{bytes, stream, mr};
   bool const copied = detail::dispatch_key_rep(_domain.rep, [&](auto key_tag) {
     using key_type = decltype(key_tag);
-    return detail::with_build_key_iterator<key_type>(
-      _domain, build_keys, stream, mr, [&](auto first, auto last) {
+OURS
       thrust::copy(
         rmm::exec_policy_nosync(stream, mr), first, last, static_cast<key_type*>(needles.data()));
     });

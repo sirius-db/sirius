@@ -23,14 +23,16 @@
  *        carrier-typed build sets, cross-carrier mask identity, nulls on both sides (null build
  *        keys are dropped, null probe rows are definite non-members, the mask is never nullable),
  *        DATE / TIMESTAMP keys (native and narrow-carrier DATE probes, same-unit-only timestamps,
- *        zone map as a containment oracle), and fixed-point keys (DECIMAL32/64/128 at one scale,
- *        checked against the zone map that already lowers those types).
+ *        zone map as a containment oracle), fixed-point keys (DECIMAL32/64/128 at one scale,
+ *        checked against the zone map that already lowers those types), and STRING keys probed
+ *        through 64-bit XXHash_64 fingerprints (pinned against a host reference of the same hash).
  */
 
 #include <cudf/aggregation.hpp>
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/hashing.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -52,9 +54,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -543,6 +548,8 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
                        id::TIMESTAMP_NANOSECONDS}) {
     expect(t, membership_key_rep::i64, membership_key_family::timestamp);
   }
+  // Strings ride the u64 rep as fingerprints.
+  expect(id::STRING, membership_key_rep::u64, membership_key_family::string_hash);
 
   for (auto const t : {id::EMPTY,
                        id::BOOL8,
@@ -551,7 +558,6 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
                        id::DURATION_DAYS,
                        id::DURATION_SECONDS,
                        id::DURATION_MICROSECONDS,
-                       id::STRING,
                        id::DICTIONARY32,
                        id::LIST,
                        id::STRUCT}) {
@@ -559,16 +565,20 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
     CHECK_FALSE(membership_key_supported(cudf::data_type{t}));
   }
 
-  // The host mirror of the probe dispatch: same-signedness integer carriers only.
+  // The host mirror of the probe dispatch: same-signedness integer carriers only, and a
+  // materialized STRING column only for the string family.
   auto const signed_domain   = *classify_membership_key(cudf::data_type{id::INT64});
   auto const unsigned_domain = *classify_membership_key(cudf::data_type{id::UINT32});
+  auto const string_domain   = *classify_membership_key(cudf::data_type{id::STRING});
   for (auto const t : {id::INT8, id::INT16, id::INT32, id::INT64}) {
     CHECK(membership_probe_compatible(signed_domain, cudf::data_type{t}));
     CHECK_FALSE(membership_probe_compatible(unsigned_domain, cudf::data_type{t}));
+    CHECK_FALSE(membership_probe_compatible(string_domain, cudf::data_type{t}));
   }
   for (auto const t : {id::UINT8, id::UINT16, id::UINT32, id::UINT64}) {
     CHECK(membership_probe_compatible(unsigned_domain, cudf::data_type{t}));
     CHECK_FALSE(membership_probe_compatible(signed_domain, cudf::data_type{t}));
+    CHECK_FALSE(membership_probe_compatible(string_domain, cudf::data_type{t}));
   }
   for (auto const t : {id::FLOAT64,
                        id::TIMESTAMP_DAYS,
@@ -578,6 +588,12 @@ TEST_CASE("membership key domain classifies integer types onto four reps",
                        id::BOOL8}) {
     CHECK_FALSE(membership_probe_compatible(signed_domain, cudf::data_type{t}));
     CHECK_FALSE(membership_probe_compatible(unsigned_domain, cudf::data_type{t}));
+  }
+  CHECK(membership_probe_compatible(string_domain, cudf::data_type{id::STRING}));
+  // The u64 rep is shared with UINT64 keys, but the families never cross: a UINT64 probe is not
+  // a fingerprint and a dictionary-encoded carrier is not a string the kernel can hash.
+  for (auto const t : {id::UINT64, id::DICTIONARY32, id::INT64, id::FLOAT64}) {
+    CHECK_FALSE(membership_probe_compatible(string_domain, cudf::data_type{t}));
   }
 
   // A DATE key takes its native type or the storage carriers a pinned chunk narrows it to; a
@@ -694,8 +710,7 @@ TEST_CASE("hash IN-list set bytes are sized at the key rep, not the build carrie
   CHECK(bytes_of(id::UINT32) == bytes_of(id::INT32));
   CHECK(bytes_of(id::UINT64) == bytes_of(id::INT64));
   CHECK(bytes_of(id::INT64) == 2 * bytes_of(id::INT32));
-  CHECK(bytes_of(id::TIMESTAMP_DAYS) == bytes_of(id::INT32));
-  CHECK(bytes_of(id::TIMESTAMP_MICROSECONDS) == bytes_of(id::INT64));
+BOTH
 }
 
 // The three filters must answer identically whatever carrier the probe arrives at, with or
@@ -1760,4 +1775,411 @@ TEST_CASE("DECIMAL128 keys build an int64 set when their values fit and are refu
       cudf::data_type{cudf::type_id::FLOAT64}, 2, cudf::mask_state::UNALLOCATED, stream, mr);
     CHECK_FALSE(membership_build_fits_rep(fp->view(), stream, mr));
   }
+}
+
+//===----------------------------------------------------------------------===//
+// STRING keys: 64-bit fingerprints
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Reference XXH64 (the canonical algorithm, seed as given) over a byte string. Independent of
+// both cudf's column API and the in-kernel hasher, so a drift in either side's seed or byte view
+// shows up here rather than as silently dropped join matches.
+std::uint64_t xxh64_reference(std::string const& input, std::uint64_t seed)
+{
+  constexpr std::uint64_t p1 = 0x9E3779B185EBCA87ULL;
+  constexpr std::uint64_t p2 = 0xC2B2AE3D27D4EB4FULL;
+  constexpr std::uint64_t p3 = 0x165667B19E3779F9ULL;
+  constexpr std::uint64_t p4 = 0x85EBCA77C2B2AE63ULL;
+  constexpr std::uint64_t p5 = 0x27D4EB2F165667C5ULL;
+  auto const rotl            = [](std::uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+  auto const round           = [&](std::uint64_t acc, std::uint64_t in) {
+    acc += in * p2;
+    acc = rotl(acc, 31);
+    return acc * p1;
+  };
+  auto const merge = [&](std::uint64_t acc, std::uint64_t v) {
+    acc ^= round(0, v);
+    return acc * p1 + p4;
+  };
+  auto const* p         = reinterpret_cast<unsigned char const*>(input.data());
+  auto const* const end = p + input.size();
+  auto const read64     = [](unsigned char const* q) {
+    std::uint64_t v = 0;
+    std::memcpy(&v, q, sizeof v);
+    return v;
+  };
+  auto const read32 = [](unsigned char const* q) {
+    std::uint32_t v = 0;
+    std::memcpy(&v, q, sizeof v);
+    return v;
+  };
+
+  std::uint64_t h = 0;
+  if (input.size() >= 32) {
+    std::uint64_t v1 = seed + p1 + p2;
+    std::uint64_t v2 = seed + p2;
+    std::uint64_t v3 = seed;
+    std::uint64_t v4 = seed - p1;
+    do {
+      v1 = round(v1, read64(p));
+      v2 = round(v2, read64(p + 8));
+      v3 = round(v3, read64(p + 16));
+      v4 = round(v4, read64(p + 24));
+      p += 32;
+    } while (p <= end - 32);
+    h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
+    h = merge(h, v1);
+    h = merge(h, v2);
+    h = merge(h, v3);
+    h = merge(h, v4);
+  } else {
+    h = seed + p5;
+  }
+  h += static_cast<std::uint64_t>(input.size());
+  while (p + 8 <= end) {
+    h ^= round(0, read64(p));
+    h = rotl(h, 27) * p1 + p4;
+    p += 8;
+  }
+  if (p + 4 <= end) {
+    h ^= static_cast<std::uint64_t>(read32(p)) * p1;
+    h = rotl(h, 23) * p2 + p3;
+    p += 4;
+  }
+  while (p < end) {
+    h ^= static_cast<std::uint64_t>(*p) * p5;
+    h = rotl(h, 11) * p1;
+    ++p;
+  }
+  h ^= h >> 33;
+  h *= p2;
+  h ^= h >> 29;
+  h *= p3;
+  h ^= h >> 32;
+  return h;
+}
+
+// Upload a STRING column; a nullopt entry is a null row (its offsets span zero bytes).
+std::unique_ptr<cudf::column> make_strings(std::vector<std::optional<std::string>> const& values,
+                                           rmm::cuda_stream_view stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const n  = static_cast<cudf::size_type>(values.size());
+  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(n) + 1, 0);
+  std::string chars;
+  cudf::size_type null_count = 0;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (values[i].has_value()) {
+      chars += *values[i];
+    } else {
+      ++null_count;
+    }
+    offsets[i + 1] = static_cast<cudf::size_type>(chars.size());
+  }
+  auto offsets_col = make_values(offsets, cudf::data_type{cudf::type_id::INT32}, stream);
+  rmm::device_buffer chars_buf{chars.data(), chars.size(), stream, mr};
+  rmm::device_buffer null_mask{};
+  if (null_count > 0) {
+    null_mask = cudf::create_null_mask(n, cudf::mask_state::ALL_VALID, stream, mr);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (!values[i].has_value()) {
+        cudf::set_null_mask(static_cast<cudf::bitmask_type*>(null_mask.data()),
+                            static_cast<cudf::size_type>(i),
+                            static_cast<cudf::size_type>(i) + 1,
+                            false,
+                            stream);
+      }
+    }
+  }
+  stream.synchronize();
+  return cudf::make_strings_column(
+    n, std::move(offsets_col), std::move(chars_buf), null_count, std::move(null_mask));
+}
+
+// Same, from plain strings (a distinct name keeps brace-list calls unambiguous).
+std::unique_ptr<cudf::column> make_strings_from(std::vector<std::string> const& values,
+                                                rmm::cuda_stream_view stream)
+{
+  std::vector<std::optional<std::string>> wrapped(values.begin(), values.end());
+  return make_strings(wrapped, stream);
+}
+
+std::vector<std::uint64_t> device_fingerprints(cudf::column_view const& strings,
+                                               rmm::cuda_stream_view stream)
+{
+  auto const hashed = cudf::hashing::xxhash_64(cudf::table_view{{strings}},
+                                               cudf::DEFAULT_HASH_SEED,
+                                               stream,
+                                               cudf::get_current_device_resource_ref());
+  REQUIRE(hashed->type().id() == cudf::type_id::UINT64);
+  std::vector<std::uint64_t> host(static_cast<std::size_t>(hashed->size()));
+  REQUIRE(cudaMemcpyAsync(host.data(),
+                          hashed->view().data<std::uint64_t>(),
+                          host.size() * sizeof(std::uint64_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  return host;
+}
+
+// Strings chosen to cover every XXH64 tail path: empty, < 4, 4..7, 8..31 bytes, exactly 32, a
+// multiple of 32 plus each tail, multi-byte UTF-8, embedded NUL, and a 1 KiB string.
+std::vector<std::string> const kStringCorpus = {
+  "",
+  "a",
+  "abc",
+  "abcd",
+  "abcdefg",
+  "abcdefgh",
+  "AAAAAAAAAAAAAAAA",                                                              // 16
+  "0123456789abcdef0123456789abcde",                                               // 31
+  "0123456789abcdef0123456789abcdef",                                              // 32
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",             // 65
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234",         // 69
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",  // 76
+  std::string("nul\0inside", 10),
+  "\xC3\xA9\xE2\x82\xAC\xF0\x9F\x98\x80",  // e-acute, euro sign, emoji
+  "AAAAAAAAAAAAAAAB",                      // 16, differs from the 16 A's in the last byte
+  std::string(1024, 'z'),
+  std::string(1023, 'z') + "y",
+};
+
+}  // namespace
+
+TEST_CASE("string fingerprints: cudf::hashing::xxhash_64 matches the XXH64 reference",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  // The build side hashes with the column API; the probe side hashes in-kernel with
+  // XXHash_64<string_view>. Both must equal canonical XXH64(seed = cudf::DEFAULT_HASH_SEED) over
+  // the raw UTF-8 bytes, which is the contract the membership tests below rely on.
+  auto const stream = cudf::get_default_stream();
+  auto const column = make_strings_from(kStringCorpus, stream);
+  auto const device = device_fingerprints(column->view(), stream);
+  REQUIRE(device.size() == kStringCorpus.size());
+  for (std::size_t i = 0; i < kStringCorpus.size(); ++i) {
+    INFO("corpus[" << i << "] length=" << kStringCorpus[i].size());
+    CHECK(device[i] == xxh64_reference(kStringCorpus[i], cudf::DEFAULT_HASH_SEED));
+  }
+  // Distinct corpus strings have distinct fingerprints (a sanity floor for the oracle below).
+  auto sorted = device;
+  std::sort(sorted.begin(), sorted.end());
+  CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
+}
+
+TEST_CASE("string keys probe STRING columns through in-kernel fingerprints",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // Build keys: every other corpus entry (includes the empty string and the 1 KiB string). The
+  // probe is the whole corpus plus near-misses of build keys, repeated to cross a prior-mask word
+  // boundary.
+  std::vector<std::string> key_values;
+  for (std::size_t i = 0; i < kStringCorpus.size(); i += 2) {
+    key_values.push_back(kStringCorpus[i]);
+  }
+  std::vector<std::string> probe_values;
+  for (int rep = 0; rep < 3; ++rep) {
+    for (auto const& s : kStringCorpus) {
+      probe_values.push_back(s);
+      probe_values.push_back(s + "x");  // near-miss: same prefix, one more byte
+    }
+  }
+  REQUIRE(probe_values.size() > 64);
+
+  // Host oracle on fingerprints (what the filter can see), which for this corpus equals exact
+  // string membership because the fingerprints are pairwise distinct.
+  std::vector<std::uint64_t> key_prints;
+  for (auto const& k : key_values) {
+    key_prints.push_back(xxh64_reference(k, cudf::DEFAULT_HASH_SEED));
+  }
+  std::vector<std::uint8_t> expected;
+  std::vector<bool> keep;
+  for (std::size_t i = 0; i < probe_values.size(); ++i) {
+    auto const print = xxh64_reference(probe_values[i], cudf::DEFAULT_HASH_SEED);
+    bool const hit   = std::find(key_prints.begin(), key_prints.end(), print) != key_prints.end();
+    bool const exact =
+      std::find(key_values.begin(), key_values.end(), probe_values[i]) != key_values.end();
+    REQUIRE(hit == exact);
+    expected.push_back(hit ? 1 : 0);
+    keep.push_back(i % 3 == 0);
+  }
+  auto prior                 = upload_prior_mask(keep, stream);
+  auto const* prior_words    = static_cast<std::uint32_t const*>(prior.data());
+  auto const expected_masked = and_with(expected, keep);
+
+  auto const keys  = make_strings_from(key_values, stream);
+  auto const probe = make_strings_from(probe_values, stream);
+  REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+  REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));
+  REQUIRE(sirius_dynamic_bloom_filter::supports(keys->type()));
+
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  for (auto const* domain : {&in_list.domain(), &small_list.domain(), &bloom.domain()}) {
+    CHECK(domain->rep == membership_key_rep::u64);
+    CHECK(domain->family == membership_key_family::string_hash);
+    CHECK(domain->native.id() == cudf::type_id::STRING);
+  }
+  REQUIRE(in_list.has_persistent_set());
+
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(in_list, probe->view(), prior_words, stream) == expected_masked);
+  CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(small_list, probe->view(), prior_words, stream) == expected_masked);
+
+  auto const bloom_mask = probe_mask(bloom, probe->view(), nullptr, stream);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != 0) { CHECK(bloom_mask[i] == 1); }  // no false negatives
+  }
+  CHECK(probe_mask(bloom, probe->view(), prior_words, stream) == and_with(bloom_mask, keep));
+}
+
+TEST_CASE("string keys: a hash IN-list past the small-list cap builds a fingerprint set",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  // 1000 keys "k<i>" for even i; probe every i plus one empty string and one long string.
+  std::vector<std::string> key_values;
+  for (int i = 0; i < 2000; i += 2) {
+    key_values.push_back("k" + std::to_string(i));
+  }
+  std::vector<std::string> probe_values;
+  std::vector<std::uint8_t> expected;
+  for (int i = 0; i < 2000; ++i) {
+    probe_values.push_back("k" + std::to_string(i));
+    expected.push_back(i % 2 == 0 ? 1 : 0);
+  }
+  probe_values.emplace_back("");
+  expected.push_back(0);
+  probe_values.emplace_back(std::string(300, 'k'));
+  expected.push_back(0);
+
+  auto const keys = make_strings_from(key_values, stream);
+  REQUIRE_FALSE(sirius_dynamic_small_in_list_filter::supports(keys->view()));  // above the cap
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  REQUIRE(in_list.size() == key_values.size());
+
+  auto const probe = make_strings_from(probe_values, stream);
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+  auto const bloom_mask  = probe_mask(bloom, probe->view(), nullptr, stream);
+  std::size_t bloom_hits = 0;
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != 0) { REQUIRE(bloom_mask[i] == 1); }
+    bloom_hits += bloom_mask[i];
+  }
+  // 16 bits/key: the false-positive rate is far below 50%, so misses must mostly fail.
+  CHECK(bloom_hits < 1000 + 500);
+}
+
+TEST_CASE("string keys: null probe strings are non-members and the mask stays non-nullable",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const keys = make_strings({"apple", "", "cherry"}, stream);
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+
+  std::vector<std::optional<std::string>> const probe_values{
+    "apple", std::nullopt, "", "banana", std::nullopt, "cherry"};
+  auto const probe = make_strings(probe_values, stream);
+  REQUIRE(probe->null_count() == 2);
+
+  auto const check = [&](auto const& filter, bool exact) {
+    auto mask = filter.compute_mask(probe->view(), kDevice, stream, mr);
+    REQUIRE(mask != nullptr);
+    CHECK_FALSE(mask->nullable());  // null rows are written as false, as for integer probes
+    CHECK(mask->null_count() == 0);
+    auto const host = mask_to_host(mask->view(), stream);
+    CHECK(host[0] == 1);
+    CHECK(host[1] == 0);  // null row: definite non-member
+    CHECK(host[2] == 1);  // the empty string is a real key
+    if (exact) { CHECK(host[3] == 0); }
+    CHECK(host[4] == 0);
+    CHECK(host[5] == 1);
+  };
+  check(in_list, true);
+  check(small_list, true);
+  check(bloom, false);
+}
+
+TEST_CASE("string keys: null build strings are compacted out by all three filters",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const keys = make_strings({"apple", std::nullopt, "cherry"}, stream);
+  REQUIRE(sirius_dynamic_in_list_filter::supports(keys->view()));
+  REQUIRE(sirius_dynamic_small_in_list_filter::supports(keys->view()));  // 2 valid keys
+  REQUIRE(sirius_dynamic_bloom_filter::supports(keys->type()));
+
+  // cudf's xxhash_64 maps a null row to UINT64_MAX; every filter drops nulls before hashing so
+  // that fingerprint is never inserted on a null's behalf, and the IN-lists store the valid keys.
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter small_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  CHECK(in_list.size() == 2);
+  CHECK(small_list.size() == 2);
+
+  auto const probe = make_strings({"apple", "cherry", "durian"}, stream);
+  std::vector<std::uint8_t> const expected{1, 1, 0};
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == expected);
+  CHECK(probe_mask(small_list, probe->view(), nullptr, stream) == expected);
+  auto const mask = probe_mask(bloom, probe->view(), nullptr, stream);
+  CHECK(mask[0] == 1);
+  CHECK(mask[1] == 1);
+}
+
+TEST_CASE("string keys decline non-string probes and integer keys decline string probes",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+
+  auto const string_keys = make_strings({"a", "b", "c"}, stream);
+  sirius_dynamic_in_list_filter string_in_list{string_keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter string_small{string_keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter string_bloom{string_keys->view(), stream, mr};
+
+  // A UINT64 probe shares the rep but is not a fingerprint: it must decline, not be looked up.
+  auto const u64_probe   = make_unsigned<std::uint64_t>({1, 2, 3}, stream);
+  auto const int64_probe = make_int64({1, 2, 3}, stream);
+  for (auto const* probe : {&u64_probe, &int64_probe}) {
+    CHECK(string_in_list.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+    CHECK(string_small.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+    CHECK(string_bloom.compute_mask((*probe)->view(), kDevice, stream, mr) == nullptr);
+  }
+
+  auto const int_keys = make_unsigned<std::uint64_t>({1, 2, 3}, stream);
+  sirius_dynamic_in_list_filter int_in_list{int_keys->view(), stream, mr};
+  sirius_dynamic_small_in_list_filter int_small{int_keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter int_bloom{int_keys->view(), stream, mr};
+  auto const string_probe = make_strings({"1", "2", "3"}, stream);
+  CHECK(int_in_list.compute_mask(string_probe->view(), kDevice, stream, mr) == nullptr);
+  CHECK(int_small.compute_mask(string_probe->view(), kDevice, stream, mr) == nullptr);
+  CHECK(int_bloom.compute_mask(string_probe->view(), kDevice, stream, mr) == nullptr);
+}
+
+TEST_CASE("string keys: an empty build column builds an empty fingerprint set",
+          "[dynamic_filter][probe][key_domain][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto const keys   = make_strings_from({}, stream);
+  sirius_dynamic_in_list_filter in_list{keys->view(), stream, mr};
+  sirius_dynamic_bloom_filter bloom{keys->view(), stream, mr};
+  auto const probe = make_strings({"", "x"}, stream);
+  CHECK(probe_mask(in_list, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{0, 0});
+  CHECK(probe_mask(bloom, probe->view(), nullptr, stream) == std::vector<std::uint8_t>{0, 0});
 }

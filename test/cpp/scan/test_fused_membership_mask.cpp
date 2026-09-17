@@ -23,7 +23,8 @@
  *        narrowed decimal key) against an INT64- or DECIMAL64-built set, and a DATE stored as
  *        INT16 against a TIMESTAMP_DAYS-built set — the filtered decode must not require a
  *        materialized cast — and a nullable probe column yields a non-nullable mask that the
- *        filtered decode consumes.
+ *        filtered decode consumes. A dictionary-encoded STRING key chunk is reconstructed to
+ *        STRING before the probe, which fingerprints it in-kernel against a STRING-built set.
  */
 
 #include "api/simpatico_codegen.hpp"
@@ -32,6 +33,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -46,6 +48,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace {
@@ -685,4 +688,163 @@ TEST_CASE("filtered-decode membership probe reads a DECIMAL32-carrier key chunk"
   CHECK(column_to_host(out->view().column(0), stream) == expect_v);
   // The survivors keep the chunk's stored fixed-point type, not the set's.
   CHECK(column_to_host<std::int32_t>(out->view().column(1), stream, kDecimal32) == expect_k);
+}
+
+//===----------------------------------------------------------------------===//
+// STRING key chunk (dictionary-encoded) probed against a fingerprint set
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+std::unique_ptr<cudf::column> upload_strings(std::vector<std::string> const& host,
+                                             rmm::cuda_stream_view stream)
+{
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const n  = static_cast<cudf::size_type>(host.size());
+  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(n) + 1, 0);
+  std::string chars;
+  for (std::size_t i = 0; i < host.size(); ++i) {
+    chars += host[i];
+    offsets[i + 1] = static_cast<cudf::size_type>(chars.size());
+  }
+  auto offsets_col = upload_column(offsets, stream);
+  rmm::device_buffer chars_buf{chars.data(), chars.size(), stream, mr};
+  stream.synchronize();
+  return cudf::make_strings_column(
+    n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+}
+
+std::vector<std::string> strings_to_host(cudf::column_view const& col, rmm::cuda_stream_view stream)
+{
+  REQUIRE(col.type().id() == cudf::type_id::STRING);
+  cudf::strings_column_view const sv{col};
+  std::vector<std::string> out;
+  if (col.size() == 0) { return out; }
+  REQUIRE(sv.offsets().type().id() == cudf::type_id::INT32);
+  std::vector<cudf::size_type> offsets(static_cast<std::size_t>(col.size()) + 1);
+  REQUIRE(cudaMemcpyAsync(offsets.data(),
+                          sv.offsets().data<cudf::size_type>() + col.offset(),
+                          offsets.size() * sizeof(cudf::size_type),
+                          cudaMemcpyDeviceToHost,
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  auto const first = offsets.front();
+  auto const bytes = static_cast<std::size_t>(offsets.back() - first);
+  std::string chars(bytes, '\0');
+  if (bytes > 0) {
+    REQUIRE(cudaMemcpyAsync(chars.data(),
+                            sv.chars_begin(stream) + first,
+                            bytes,
+                            cudaMemcpyDeviceToHost,
+                            stream.value()) == cudaSuccess);
+    stream.synchronize();
+  }
+  out.reserve(static_cast<std::size_t>(col.size()));
+  for (cudf::size_type i = 0; i < col.size(); ++i) {
+    auto const b = static_cast<std::size_t>(offsets[static_cast<std::size_t>(i)] - first);
+    auto const e = static_cast<std::size_t>(offsets[static_cast<std::size_t>(i) + 1] - first);
+    out.emplace_back(chars.substr(b, e - b));
+  }
+  return out;
+}
+
+// col 0 ("v", range-filtered): i % 100. col 1 ("s", membership key): "item_<i % 50>" as STRING.
+std::string key_string(cudf::size_type i) { return "item_" + std::to_string(i % 50); }
+
+std::unique_ptr<cudf::table> make_string_source_table(rmm::cuda_stream_view stream)
+{
+  std::vector<std::int32_t> v(kRows);
+  std::vector<std::string> s(kRows);
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    v[static_cast<std::size_t>(i)] = i % 100;
+    s[static_cast<std::size_t>(i)] = key_string(i);
+  }
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(upload_column(v, stream));
+  cols.push_back(upload_strings(s, stream));
+  stream.synchronize();
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+// The key column is dictionary-encoded with bitpacked codes, the shape production pins string
+// columns in (and the dict_codes compacted route).
+constexpr char const* kStringKeyPlans =
+  "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n"
+  "---\n"
+  "input -> dictionary -> keys_offsets, keys_chars, indices\n"
+  "dictionary.indices -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n";
+
+// STRING-built fingerprint set over "item_<k>" for multiples of @p step in [0, 50).
+std::shared_ptr<sirius::op::sirius_dynamic_in_list_filter> make_string_key_set(
+  rmm::cuda_stream_view stream, int step = 5)
+{
+  std::vector<std::string> keys;
+  for (int k = 0; k < 50; k += step) {
+    keys.push_back("item_" + std::to_string(k));
+  }
+  auto col = upload_strings(keys, stream);
+  REQUIRE(col->type().id() == cudf::type_id::STRING);
+  return std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(
+    col->view(), stream, cudf::get_current_device_resource_ref());
+}
+
+}  // namespace
+
+TEST_CASE("filtered-decode membership probe fingerprints a dictionary-encoded STRING key chunk",
+          "[fused_scan_filter][dynamic_filter][string]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto table        = make_string_source_table(stream);
+  REQUIRE(table->view().column(1).type().id() == cudf::type_id::STRING);
+  auto const ct = simpatico::compress_with_plan(table->view(), kStringKeyPlans, stream, mr);
+
+  simpatico::stream_pool pool;
+  REQUIRE(pool.init(4));
+
+  bool saw_prior                = false;
+  cudf::type_id probe_type_seen = cudf::type_id::EMPTY;
+  auto filter                   = make_string_key_set(stream);
+  sirius::codegen::scan_filter_request request;
+  request.filters.push_back({0, {0, 19}});  // v in [0, 19]: 20% static selectivity
+  request.membership_filters.push_back(
+    {1,
+     [filter, &saw_prior, &probe_type_seen](cudf::column_view keys,
+                                            std::uint32_t const* prior_mask_words,
+                                            rmm::cuda_stream_view s,
+                                            rmm::device_async_resource_ref mr_) {
+       saw_prior       = prior_mask_words != nullptr;
+       probe_type_seen = keys.type().id();
+       return filter->compute_mask(keys, prior_mask_words, /*device_id=*/0, s, mr_);
+     }});
+  request.routes = {sirius::codegen::decode_route::bitpack_mask,
+                    sirius::codegen::decode_route::dict_codes};
+
+  std::vector<std::size_t> const selected{0, 1};
+  sirius::codegen::scan_filter_result result;
+  auto out = simpatico::decompress_scan_filter(ct, selected, request, result, pool, stream, mr);
+  if (gate_stayed_off(result)) {
+    WARN("filtered-decode env gate off in this process; skipping membership coverage");
+    return;
+  }
+
+  REQUIRE(result.applied);
+  CHECK(saw_prior);
+  // The decode reconstructs the dictionary carrier into a STRING column before probing: the
+  // probe never sees dictionary codes.
+  CHECK(probe_type_seen == cudf::type_id::STRING);
+
+  // Reference: (i % 100) <= 19 AND (i % 50) % 5 == 0.
+  std::vector<std::int32_t> expect_v;
+  std::vector<std::string> expect_s;
+  for (cudf::size_type i = 0; i < kRows; ++i) {
+    if (i % 100 <= 19 && (i % 50) % 5 == 0) {
+      expect_v.push_back(i % 100);
+      expect_s.push_back(key_string(i));
+    }
+  }
+  REQUIRE(result.survivor_count == static_cast<std::int64_t>(expect_v.size()));
+  REQUIRE(out->num_columns() == 2);
+  CHECK(column_to_host(out->view().column(0), stream) == expect_v);
+  CHECK(strings_to_host(out->view().column(1), stream) == expect_s);
 }

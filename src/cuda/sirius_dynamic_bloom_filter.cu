@@ -123,9 +123,7 @@ bloom_owner<Filter> build_bloom(membership_key_domain const& domain,
     // The build column may sit at a same-family carrier other than the rep; the iterator converts
     // per element instead of materializing a rep-typed copy.
     bool const added = detail::with_build_key_iterator<key_type>(
-      domain, keys, stream, mr, [&](auto first, auto last) {
-        result->add_async(first, last, stream);
-      });
+OURS
     if (!added) {
       throw std::logic_error("[sirius_dynamic_bloom_filter] build carrier does not fit its rep.");
     }
