@@ -208,6 +208,33 @@ TEST_CASE_METHOD(PinRecreateFixture,
 }
 
 TEST_CASE_METHOD(PinRecreateFixture,
+                 "pin_table - a checkpointed recreate with deletes still falls back",
+                 "[integration][gpu_execution][pin_table][pin_table_mvcc]")
+{
+  run_ok("CREATE TABLE del_recreate_t AS SELECT range AS a FROM range(50000);");
+  run_ok("CHECKPOINT;");
+  run_ok("CALL pin_table(format='duckdb', name='del_recreate_t', tier='gpu');");
+  compare_gpu_vs_cpu("SELECT sum(a) FROM del_recreate_t;");
+
+  // Checkpointing puts the recreated table's rows on disk, so the appends alone would
+  // clear the guard.
+  run_ok("DROP TABLE del_recreate_t;");
+  run_ok("CREATE TABLE del_recreate_t AS SELECT range + 1000000 AS a FROM range(50000);");
+  run_ok("CHECKPOINT;");
+
+  // Deletes are tombstones in the row groups, not transient segments: the physical image
+  // still carries the rows, and the disk-native read is blind to the version info that
+  // hides them.
+  run_ok("DELETE FROM del_recreate_t WHERE a < 1001000;");
+
+  REQUIRE(entry_exists(*con, "del_recreate_t"));
+
+  expect_fallback_matches_cpu(*this, "SELECT sum(a) FROM del_recreate_t;");
+
+  run_ok("CALL unpin_table('del_recreate_t');");
+}
+
+TEST_CASE_METHOD(PinRecreateFixture,
                  "pin_table - re-pinning a recreated table replaces the entry instead of merging",
                  "[integration][gpu_execution][pin_table][pin_table_mvcc]")
 {
