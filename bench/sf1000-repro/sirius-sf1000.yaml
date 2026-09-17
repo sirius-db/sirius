@@ -35,7 +35,7 @@ sirius:
             num_threads: 3
           num_threads: 18
           use_sirius_datasource: true
-          uring_n_reactors: 4
+          uring_n_reactors: 1
           enable_prefetch_cache: false
         pipeline:
             num_threads: 8
