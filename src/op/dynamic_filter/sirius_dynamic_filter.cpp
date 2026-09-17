@@ -416,7 +416,7 @@ void sirius_dynamic_zone_map_filter::replicate_to_devices(
              clone_scalar_to_device(
                *zone.max, _source_device, source_stream, target_stream, target_mr)});
         }
-        target_stream.synchronize();
+        target_stream.sync();
       }
       SIRIUS_LOG_DEBUG("[sirius_dynamic_zone_map_filter] replicated {} zone(s) GPU {} -> GPU {}.",
                        _zones.size(),

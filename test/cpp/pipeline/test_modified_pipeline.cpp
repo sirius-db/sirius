@@ -426,12 +426,10 @@ void validate_port_repository(sirius_physical_operator::port* port, const std::s
 /**
  * @brief Build a map from source operator to pipelines that use it as source
  */
-std::unordered_map<const sirius_physical_operator*,
-                   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
-build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+std::unordered_map<const sirius_physical_operator*, std::vector<std::shared_ptr<sirius_pipeline>>>
+build_source_to_pipelines_map(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
-  std::unordered_map<const sirius_physical_operator*,
-                     duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
+  std::unordered_map<const sirius_physical_operator*, std::vector<std::shared_ptr<sirius_pipeline>>>
     result;
   for (const auto& pipeline : pipelines) {
     result[pipeline->get_source().get()].push_back(pipeline);
@@ -442,7 +440,7 @@ build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<sirius_pip
 /**
  * @brief Count pipelines with PARTITION sinks
  */
-size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+size_t count_partition_sinks(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
@@ -454,7 +452,7 @@ size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipe
 /**
  * @brief Check if any pipeline contains a CONCAT operator
  */
-bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+bool has_concat_operator(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   for (const auto& pipeline : pipelines) {
     auto ops = pipeline->get_operators();
@@ -468,7 +466,7 @@ bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline
 /**
  * @brief Count pipelines with a specific sink type
  */
-size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+size_t count_sink_type(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
                        SiriusPhysicalOperatorType type)
 {
   size_t count = 0;
@@ -493,7 +491,7 @@ struct PipelineBreakdownInfo {
 };
 
 PipelineBreakdownInfo analyze_pipeline_breakdown(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   PipelineBreakdownInfo info;
   auto source_to_pipelines = build_source_to_pipelines_map(pipelines);
@@ -530,9 +528,8 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
  * @brief Validate pipeline breakdown for GROUP_BY:
  * Expected: local_group → PARTITION → CONCAT → global_group
  */
-void validate_groupby_breakdown(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
-  const std::string& query_name)
+void validate_groupby_breakdown(const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
+                                const std::string& query_name)
 {
   auto info = analyze_pipeline_breakdown(pipelines);
 
@@ -578,7 +575,7 @@ struct HashJoinBreakdownInfo {
  *   - Pipeline 2: PARTITION (source) → HASH_JOIN → ... → sink
  */
 HashJoinBreakdownInfo analyze_hash_join_breakdown(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
   HashJoinBreakdownInfo info;
   auto source_to_pipelines = build_source_to_pipelines_map(pipelines);

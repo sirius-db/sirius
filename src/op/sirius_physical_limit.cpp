@@ -18,10 +18,9 @@
 
 #include "data/data_batch_utils.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/copying.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 
@@ -68,7 +67,7 @@ int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, in
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 

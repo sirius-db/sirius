@@ -25,6 +25,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -136,11 +137,11 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
                                       cudf::data_type{cudf::type_id::BOOL8},
                                       c.stream,
                                       c.mr);
-  auto kept =
-    cudf::apply_boolean_mask(cudf::table_view{{search.neighbors->view(), search.distances->view()}},
-                             valid->view(),
-                             c.stream,
-                             c.mr);
+  auto kept  = sirius::ApplyRetentionMask(
+    cudf::table_view{{search.neighbors->view(), search.distances->view()}},
+    valid->view(),
+    c.stream,
+    c.mr);
   auto kept_cols = kept->release();
   auto neighbors = std::move(kept_cols[0]);  // global row ids, aligned with distances
   auto distances = std::move(kept_cols[1]);

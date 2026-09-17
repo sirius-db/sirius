@@ -9,6 +9,7 @@
 #include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/mr/cuda_async_memory_resource.hpp>
@@ -23,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -136,8 +138,7 @@ compressed_table roundtrip_once(cudf::table_view input,
 void test_async_mr_free_safety()
 {
   rmm::mr::cuda_async_memory_resource async_mr{};
-  rmm::device_async_resource_ref prev{rmm::mr::get_current_device_resource_ref()};
-  rmm::mr::set_current_device_resource_ref(async_mr);
+  auto prev = cudf::set_current_device_resource(rmm::device_async_resource_ref{async_mr});
   try {
     auto t = make_int32_table(3, 8192, 21);
     std::string dsl =
@@ -166,10 +167,10 @@ void test_async_mr_free_safety()
     }
     expect(cudaDeviceSynchronize() == cudaSuccess, "async_mr: device sync after async free");
   } catch (...) {
-    rmm::mr::set_current_device_resource_ref(prev);
+    cudf::set_current_device_resource(std::move(prev));
     throw;
   }
-  rmm::mr::set_current_device_resource_ref(prev);
+  cudf::set_current_device_resource(std::move(prev));
 }
 
 }  // namespace

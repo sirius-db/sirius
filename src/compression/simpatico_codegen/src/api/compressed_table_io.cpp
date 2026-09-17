@@ -9,6 +9,7 @@
 #include "codegen/plan/operator_registry.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -20,7 +21,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <array>
@@ -539,7 +539,7 @@ static bool parse_hpln_header(Reader& r,
                               std::string* err,
                               HeaderFieldOffsets* field_offsets = nullptr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::parse_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::parse_header"};
   // Field offsets are recorded relative to where this Reader started, which is where the header
   // begins in every caller, so they index straight into a copy of the header bytes.
   std::uint8_t const* const header_base = r.p;
@@ -649,7 +649,7 @@ static compressed_table reconstruct_from_records(std::vector<ColRecord>& recs,
                                                  rmm::device_async_resource_ref leaf_mr,
                                                  std::string* err)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::fetch_payload"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::fetch_payload"};
   auto fail = [&](std::string const& m) -> compressed_table {
     if (err) *err = m;
     return {};
@@ -900,7 +900,7 @@ std::size_t hpln_stream_writer::chunks_appended() const noexcept { return _impl-
 
 std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[append]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[append]"};
   auto& st = *_impl;
   if (st.finished) return "hpln_stream_writer: append after finish on '" + st.path + "'";
   if (!st.f) return "failed to open '" + st.path + "' for writing";
@@ -957,7 +957,7 @@ std::string hpln_stream_writer::append(compressed_table const& table, rmm::cuda_
 
 std::string hpln_stream_writer::finish(std::span<const hpln_extra_segment> extra)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[finish]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[finish]"};
   auto& st = *_impl;
   if (st.finished) return "hpln_stream_writer: finish called twice on '" + st.path + "'";
   st.finished = true;
@@ -1041,7 +1041,7 @@ std::string write_compressed_tables(std::span<compressed_table const* const> tab
                                     rmm::cuda_stream_view stream,
                                     std::span<const hpln_extra_segment> extra)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::write_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::write_table[file]"};
   if (tables.empty()) return "write_compressed_tables: no chunks to write";
 
   // The whole-file form is the streaming one with every chunk already in hand -- one writer, one
@@ -1117,7 +1117,7 @@ compressed_table read_compressed_table(std::string const& path,
                                        rmm::device_async_resource_ref mr,
                                        std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[file]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[file]"};
   auto fail = [&](std::string const& msg) -> compressed_table {
     if (error_out) *error_out = msg;
     return {};
@@ -1250,7 +1250,7 @@ std::string build_compressed_table_header(compressed_table const& table,
                                           rmm::cuda_stream_view stream,
                                           std::uint64_t payload_align)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_header"};
   auto const all_descs = table.describe(stream);
 
   out_header.clear();
@@ -1344,7 +1344,7 @@ compressed_table read_compressed_table_from_memory(
   std::string* error_out,
   std::optional<rmm::device_async_resource_ref> leaf_mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
@@ -1361,7 +1361,7 @@ compressed_table read_compressed_table_subset_from_memory(
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::read_table[memory,subset]"};
   Reader r{header.data(), header.size()};
   std::vector<ColRecord> col_records;
   if (!parse_hpln_header(r, col_records, error_out)) return {};
@@ -1525,7 +1525,7 @@ std::string build_column_subset_header(std::span<const std::uint8_t> header,
                                        std::vector<gather_range>& out_gather,
                                        std::uint64_t* out_payload_bytes)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_column_subset_header"};
   out_header.clear();
   out_gather.clear();
   if (out_payload_bytes) *out_payload_bytes = 0;
@@ -1671,7 +1671,7 @@ std::string build_chunk_subset_header(std::span<const std::uint8_t> header,
                                       std::uint64_t* out_payload_bytes,
                                       std::vector<std::uint8_t>* out_column_subsetted)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::io::build_chunk_subset_header"};
+  nvtx_scoped_range nvtx_range{"simpatico::io::build_chunk_subset_header"};
   out_header.clear();
   out_gather.clear();
   if (out_payload_bytes) *out_payload_bytes = 0;

@@ -59,10 +59,10 @@ fs::path integration_db_path()
 }
 
 //! All scheduled pipelines whose sink is a PARTITION.
-std::vector<duckdb::shared_ptr<sirius_pipeline>> partition_pipelines(
+std::vector<std::shared_ptr<sirius_pipeline>> partition_pipelines(
   pipeline_conversion_result& result)
 {
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> out;
+  std::vector<std::shared_ptr<sirius_pipeline>> out;
   for (const auto& pipeline : result.scheduled_pipelines) {
     if (pipeline->get_sink() &&
         pipeline->get_sink()->type == SiriusPhysicalOperatorType::PARTITION) {
@@ -106,7 +106,7 @@ std::string chains_to_string(pipeline_conversion_result& result)
 //! Shared PARTITION invariants: single-operator pipeline whose tree child terminated its own
 //! deeper pipeline as sink (the promotion PARTITION's build_pipelines performs).
 void require_partition_pipeline_shape(pipeline_conversion_result& result,
-                                      const duckdb::shared_ptr<sirius_pipeline>& pipeline)
+                                      const std::shared_ptr<sirius_pipeline>& pipeline)
 {
   auto ops = pipeline->get_operators();
   REQUIRE(ops.size() == 1);

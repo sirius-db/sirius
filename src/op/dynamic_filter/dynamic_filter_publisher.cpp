@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "op/dynamic_filter/dynamic_filter_source_policy.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/reduction.hpp>
@@ -26,7 +27,6 @@
 #include <cudf/types.hpp>
 
 #include <cuda_runtime_api.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -72,7 +72,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
                                                            cudf::table_view const& build_view,
                                                            rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"dynfilter::push_build_side"};
+  nvtx_scoped_range nvtx_range{"dynfilter::push_build_side"};
   assert(plan.enabled());
   dynamic_filter_publication_outcome outcome;
 
@@ -174,7 +174,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
 
     if (plan.emit_zone_map_filters() &&
         sirius::op::sirius_dynamic_zone_map_filter::supports(col.type())) {
-      nvtx3::scoped_range vr{"dynfilter::build_zone_map"};
+      nvtx_scoped_range vr{"dynfilter::build_zone_map"};
       auto min_s = cudf::reduce(col,
                                 *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
                                 col.type(),
@@ -210,7 +210,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
     char const* choice = "none";
     switch (chosen) {
       case membership_filter_kind::small_in_list: {
-        nvtx3::scoped_range vr{"dynfilter::build_small_in_list"};
+        nvtx_scoped_range vr{"dynfilter::build_small_in_list"};
         per_key_membership[admitted_key_index] =
           std::make_shared<sirius::op::sirius_dynamic_small_in_list_filter>(
             col, stream, allocator_ref);
@@ -218,14 +218,14 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
         break;
       }
       case membership_filter_kind::hash_in_list: {
-        nvtx3::scoped_range vr{"dynfilter::build_in_list"};
+        nvtx_scoped_range vr{"dynfilter::build_in_list"};
         per_key_membership[admitted_key_index] =
           std::make_shared<sirius::op::sirius_dynamic_in_list_filter>(col, stream, allocator_ref);
         choice = "in_list";
         break;
       }
       case membership_filter_kind::bloom: {
-        nvtx3::scoped_range vr{"dynfilter::build_bloom"};
+        nvtx_scoped_range vr{"dynfilter::build_bloom"};
         per_key_membership[admitted_key_index] =
           std::make_shared<sirius::op::sirius_dynamic_bloom_filter>(col, stream, allocator_ref);
         choice = "bloom";
@@ -254,7 +254,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
     stream.synchronize();
 
-    nvtx3::scoped_range replicate_range{"dynfilter::replicate_devices"};
+    nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
     auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
       if (!filter) { return; }
       auto* replicable = dynamic_cast<sirius_device_replicable*>(filter.get());

@@ -44,7 +44,7 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
 
   /// Wire EOS → update_pipeline_status(false); on_data → schedule(head) (self-nomination).
   /// Without on_data, a WAITING source stays dropped until a task completes — which never happens.
-  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
+  void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline) override;
 
   // -----------------------------------------------------------------------
   // Producer side — session / wrapper, any thread

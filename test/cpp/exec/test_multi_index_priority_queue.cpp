@@ -224,6 +224,26 @@ TEST_CASE("multi_index query index spans its levels", "[multi_index_priority_que
 }
 
 // =============================================================================
+// Per-query drain
+// =============================================================================
+
+TEST_CASE("multi_index drain(query_index) leaves the queue open for later pushes",
+          "[multi_index_priority_queue]")
+{
+  multi_index_priority_queue<payload> q(by_keys());
+  q.push(task(1, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/7)));
+
+  q.drain(query_index{7});
+
+  // Unlike interrupt(), a per-query drain must not close the queue: other queries keep
+  // producing through it, and the drained query id may even be reused by a later push.
+  REQUIRE(q.is_open());
+  q.push(task(2, keys_of(5, SiriusPhysicalOperatorType::FILTER, /*query=*/8)));
+  REQUIRE(q.size() == 1);
+  REQUIRE(q.pop()->id == 2);
+}
+
+// =============================================================================
 // Cross-index consistency
 // =============================================================================
 

@@ -122,7 +122,7 @@ replica_transfer_route enqueue_replica_copy(
                                          d2h_sources.front(),
                                          d2h_sizes.front(),
                                          cudaMemcpyDeviceToHost,
-                                         source_stream.value()));
+                                         source_stream.get()));
     } else {
 #if CUDART_VERSION >= 12080
       cudaMemcpyAttributes attributes{};
@@ -135,14 +135,14 @@ replica_transfer_route enqueue_replica_copy(
                                               d2h_sizes.size(),
                                               attributes,
                                               nullptr,
-                                              source_stream.value()));
+                                              source_stream.get()));
 #else
       CUCASCADE_CUDA_TRY(cudaMemcpyBatchAsync(d2h_destinations.data(),
                                               d2h_sources.data(),
                                               d2h_sizes.data(),
                                               d2h_sizes.size(),
                                               attributes,
-                                              source_stream.value()));
+                                              source_stream.get()));
 #endif
 #else
       for (std::size_t i = 0; i < d2h_sizes.size(); ++i) {
@@ -150,11 +150,11 @@ replica_transfer_route enqueue_replica_copy(
                                            d2h_sources[i],
                                            d2h_sizes[i],
                                            cudaMemcpyDeviceToHost,
-                                           source_stream.value()));
+                                           source_stream.get()));
       }
 #endif
     }
-    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.value()));
+    CUCASCADE_CUDA_TRY(cudaStreamSynchronize(source_stream.get()));
   }
 
   std::vector<void*> h2d_destinations;

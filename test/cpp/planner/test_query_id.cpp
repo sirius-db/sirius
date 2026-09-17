@@ -92,7 +92,7 @@ TEST_CASE("planner::query reports the id it was constructed with", "[query_id]")
   const auto query_id = make_query_id(9876);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
 
-  sirius::planner::query q(duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+  sirius::planner::query q(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
                            tctx->context(),
                            query_id,
                            tinfo);
@@ -108,16 +108,14 @@ TEST_CASE("planner::query ids are not drawn from a shared counter", "[query_id]"
   const auto query_id = make_query_id(11);
   sirius::telemetry::query_telemetry_info tinfo{tctx->engine_id(), tctx->worker_id(), query_id};
 
-  sirius::planner::query first(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo);
-  sirius::planner::query second(
-    duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
-    tctx->context(),
-    query_id,
-    tinfo);
+  sirius::planner::query first(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                               tctx->context(),
+                               query_id,
+                               tinfo);
+  sirius::planner::query second(std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+                                tctx->context(),
+                                query_id,
+                                tinfo);
 
   CHECK(first.query_id() == query_id);
   CHECK(second.query_id() == query_id);

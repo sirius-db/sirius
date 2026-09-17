@@ -23,6 +23,8 @@
 #include <rmm/device_buffer.hpp>
 
 #include <api/compressed_table_io.hpp>
+#include <cuda/stream>
+
 #include <cucascade/data/common.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -192,7 +194,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
 
   /// Clone shares the same backing blob (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   // ── Projection ──────────────────────────────────────────────────────────────
 
@@ -274,6 +276,14 @@ class compressed_host_representation : public simpatico_compressed_representatio
                              : std::span<const std::uint32_t>{};
   }
 
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
+  }
+
  private:
   /// Construct a projection sharing the same backing blob.
   compressed_host_representation(cucascade::memory::memory_space& memory_space,
@@ -292,6 +302,7 @@ class compressed_host_representation : public simpatico_compressed_representatio
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
   /// Surviving 1024-row decode chunks; null when the whole chunk is served. Shared (never
   /// mutated after being set) so a clone copies a pointer.
@@ -344,7 +355,7 @@ class compressed_device_representation : public simpatico_compressed_representat
 
   /// Clone shares the same cached table (increments shared ownership).
   [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
-    rmm::cuda_stream_view stream) override;
+    ::cuda::stream_ref stream) override;
 
   /// Projection sharing the same cached blob; decompress will skip non-selected columns.
   [[nodiscard]] std::unique_ptr<compressed_device_representation> select_columns(
@@ -386,6 +397,14 @@ class compressed_device_representation : public simpatico_compressed_representat
     return _pushdown_scan;
   }
 
+  /// Same freshly-projected-only ownership rule as the pushdown setter above.
+  void set_visibility_mask(decode_visibility_mask mask) { _visibility_mask = std::move(mask); }
+
+  [[nodiscard]] const decode_visibility_mask& visibility_mask() const noexcept
+  {
+    return _visibility_mask;
+  }
+
  private:
   compressed_device_representation(cucascade::memory::memory_space& memory_space,
                                    std::shared_ptr<compressed_device_blob> blob,
@@ -403,6 +422,7 @@ class compressed_device_representation : public simpatico_compressed_representat
   std::int64_t _num_rows;
   std::optional<std::vector<std::size_t>> _selected_indices;
   std::shared_ptr<const decompression_pushdown_scan> _pushdown_scan;
+  decode_visibility_mask _visibility_mask;
   std::shared_ptr<const per_column_byte_sizes> _column_sizes;
 };
 

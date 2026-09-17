@@ -20,8 +20,7 @@
 #include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -93,7 +92,7 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;

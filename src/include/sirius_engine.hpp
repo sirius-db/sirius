@@ -24,9 +24,11 @@
 #include "duckdb/execution/task_error_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "planner/query.hpp"
 #include "telemetry-bridge/gen/query.rs.h"
 #include "telemetry-bridge/gen/uuid.rs.h"
 #include "telemetry/telemetry_context.hpp"
@@ -71,9 +73,9 @@ class sirius_engine {
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 
   //! All pipelines of the query plan
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> sirius_pipelines;
   //! The root pipelines of the query
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> sirius_root_pipelines;
   //! The current root pipeline index
   std::size_t root_pipeline_idx;
   //! The total amount of pipelines in the query
@@ -93,9 +95,9 @@ class sirius_engine {
   //! Cancel the tasks
   void cancel_tasks();
   //! Create a child pipeline
-  duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
+  std::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
-  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
   //! Wait for the query to finish
   void wait_for_query_finish();
   //! Mutex for thread-safe access to query finish
@@ -107,6 +109,16 @@ class sirius_engine {
 
  private:
   sirius::query_id_t query_id_;
+  /// The planner query for this execution: the pipeline set plus the operator->pipeline and
+  /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this
+  /// engine's plan — outliving the plan would leave its cached operator pointers dangling with
+  /// nothing to gain.
+  duckdb::shared_ptr<planner::query> query_;
+  /// This query's completion signal, created in execute() and shared with every task through
+  /// its pipeline's global state. shared_ptr because this engine is destroyed (in
+  /// sirius_interface::cleanup_internal) before the query's cleanup drains the task queues, so a
+  /// task still unwinding must be able to report without touching freed memory.
+  std::shared_ptr<pipeline::completion_handler> completion_handler_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;
 };

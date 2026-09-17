@@ -29,6 +29,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
@@ -40,7 +41,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -172,7 +172,7 @@ std::unique_ptr<cudf::table> cluster_pin_chunk(std::unique_ptr<cudf::table> tabl
     }
   }
   if (keys.empty()) { return table; }
-  nvtx3::scoped_range range{"sirius::pin::cluster"};
+  nvtx_scoped_range range{"sirius::pin::cluster"};
   // Unstable: ties may land in any order, and clustering only cares that equal keys end up
   // adjacent. Ascending with nulls first, which is what an unspecified order gives.
   return cudf::sort_by_key(table->view(), table->view().select(keys), {}, {}, stream, mr);
@@ -367,7 +367,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // narrowing preserves them, so the native carriers are both cheaper to
     // reduce and equally conclusive.
     if (unique_probe.active()) {
-      nvtx3::scoped_range probe_range{"sirius::pin::unique_probe"};
+      nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
       unique_probe.observe(tbl->view(), stream);
     }
     if (exact_retaining) {
@@ -514,6 +514,34 @@ std::string compression_failure_warning(std::string_view what,
   return message;
 }
 
+/// Per-pin compression coverage, always at INFO. Skipped when compression wasn't
+/// requested for this pin (else "0/N compressed" would misreport by-design
+/// uncompressed pinning as a fallback). Points at "warnings above" only when a
+/// chunk actually WARNed (@p compression_failed) — a chunk can also land
+/// uncompressed silently (below min_batch_size_bytes, or under
+/// max_compressed_fraction), which gets a different reason instead.
+void log_pin_compression_coverage(std::string_view log_tag,
+                                  op::scan::gpu_ingestible& ingestible,
+                                  compression_pin_config const& compression,
+                                  std::size_t compressed_count,
+                                  std::size_t total_chunks,
+                                  bool compression_failed)
+{
+  if (!compression.enabled) { return; }
+  std::string_view suffix;
+  if (compressed_count != total_chunks) {
+    suffix = compression_failed ? " — remainder pinned UNCOMPRESSED (see warnings above)"
+                                : " — remainder pinned UNCOMPRESSED (below the compression "
+                                  "size/ratio threshold)";
+  }
+  SIRIUS_LOG_INFO("[{}] pin '{}': {}/{} chunk(s) compressed{}",
+                  log_tag,
+                  ingestible.table_info().display_name(),
+                  compressed_count,
+                  total_chunks,
+                  suffix);
+}
+
 /// Shared compress step for the host and device pin drivers: compress @p tbl per
 /// @p compression on @p stream, and when the batch qualifies (compression on and
 /// >= the size threshold) AND the compressed footprint saves enough (<=
@@ -534,7 +562,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
                               std::string_view log_tag,
                               StageFn&& stage)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
+  nvtx_scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
   if (tbl.num_columns() == 0) { return false; }
   // Total device footprint of the batch (includes string chars/offsets and null
   // masks), so string columns count toward the threshold.
@@ -598,7 +626,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
                    column_sizes->compressed.size());
 
   {
-    nvtx3::scoped_range stage_range{"sirius::compression::stage_payload"};
+    nvtx_scoped_range stage_range{"sirius::compression::stage_payload"};
     stage(std::move(ct),
           std::move(header),
           buffers,
@@ -754,6 +782,21 @@ host_pin_result materialize_pin_to_host(
         out.chunks.emplace_back(std::move(host_repr));
       }
     });
+
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (dynamic_cast<sirius::compressed_host_representation const*>(chunk.get()) != nullptr) {
+        ++compressed_count;
+      }
+    }
+    log_pin_compression_coverage("materialize_pin_to_host",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
 
   return out;
 }
@@ -926,6 +969,19 @@ device_pin_result materialize_all_batches_compressed(
           .compressed = nullptr, .columns = std::move(shared_cols), .memory_space = src_space});
       }
     });
+
+  {
+    std::size_t compressed_count = 0;
+    for (auto const& chunk : out.chunks) {
+      if (chunk.compressed) { ++compressed_count; }
+    }
+    log_pin_compression_coverage("materialize_all_batches_compressed",
+                                 ingestible,
+                                 compression,
+                                 compressed_count,
+                                 out.chunks.size(),
+                                 compression_failed);
+  }
 
   return out;
 }

@@ -25,9 +25,9 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/batch_telemetry.hpp"
+#include "telemetry/nvtx.hpp"
 #include "telemetry/telemetry_context.hpp"
 
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/system/system_error.h>
 
 #include <absl/cleanup/cleanup.h>
@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -234,7 +235,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
 
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
-  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+  nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
   auto start = std::chrono::high_resolution_clock::now();
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
@@ -551,7 +552,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
                                   pipeline->get_pipeline_id(),
                                   sink_operators->get_name(),
                                   sink_operators->get_operator_id());
-    nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+    nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
     sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
@@ -590,7 +591,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   if (sink_op) { op_chain += std::format(" -> {}", sink_op->get_name()); }
   auto nvtx_label =
     std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), get_task_id(), op_chain);
-  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+  nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
 
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
@@ -904,6 +905,31 @@ std::unique_ptr<gpu_pipeline_task> gpu_pipeline_task::create_rescheduled_task(
 {
   return std::make_unique<gpu_pipeline_task>(
     task_id, _data_repos, std::move(local_state), get_shared_global_state());
+}
+
+exec::index_keys index_keys_for(const sirius::parallel::itask& task)
+{
+  if (const auto* gpu_task = dynamic_cast<const gpu_pipeline_task*>(&task)) {
+    const exec::queue_priority priority = gpu_task->get_priority();
+
+    exec::query_key query_id         = 0;
+    exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
+    if (const auto* pipe = gpu_task->get_pipeline()) {
+      query_id = static_cast<exec::query_key>(sirius::value_of(pipe->get_query_id()));
+      if (auto source = pipe->get_source()) { operator_type = source->type; }
+    }
+
+    const auto pref = gpu_task->get_preferred_device_id();
+    return exec::index_keys{priority,
+                            operator_type,
+                            query_id,
+                            pref.has_value() ? pref.value() : exec::no_preferred_device};
+  }
+
+  return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
+                          op::SiriusPhysicalOperatorType::INVALID,
+                          0,
+                          exec::no_preferred_device};
 }
 
 }  // namespace pipeline

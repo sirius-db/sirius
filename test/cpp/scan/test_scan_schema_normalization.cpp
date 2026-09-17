@@ -142,6 +142,7 @@ class stub_table_info final : public sirius::op::scan::ingestible_table_info {
  public:
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 /// Hands execute() a caller-chosen table as the post-filter result, which is the seam where a

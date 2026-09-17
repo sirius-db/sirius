@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "helper/duckdb_chunk_staging.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -29,8 +30,6 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
@@ -113,7 +112,7 @@ std::unique_ptr<operator_data> sirius_physical_gpu_values::get_next_task_input_d
 std::unique_ptr<operator_data> sirius_physical_gpu_values::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_gpu_values::execute"};
 
   auto const* values_input = dynamic_cast<const gpu_values_input*>(&input_data);
   if (!values_input) {

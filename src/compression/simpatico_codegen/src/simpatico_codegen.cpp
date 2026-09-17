@@ -5,6 +5,7 @@
 #include "codegen/plan/representation.hpp"
 #include "codegen/selection/decompression_pushdown_policy.hpp"
 #include "codegen/selection/selection.hpp"
+#include "codegen/util/nvtx.hpp"
 #include "codegen/util/stream_pool.hpp"
 
 #include <cudf/column/column.hpp>
@@ -18,7 +19,6 @@
 #include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -432,7 +432,10 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                  k_member);
   }
   if (k_total == 0) return refuse("no mask directives (no range/bool8/membership)");
-  if (k_total > 8) return refuse("more than 8 mask sources");
+  // The keep mask is a combine source, never a directive: with no real filter the
+  // survivor rate is just the visible-row fraction, so compaction cannot pay off.
+  bool const has_keep_mask = request.keep_mask_words != nullptr;
+  if (k_total + (has_keep_mask ? 1 : 0) > 8) return refuse("more than 8 mask sources");
   if (request.routes.size() != selected.size())
     return refuse("request.routes not parallel to selected");
   if (pool.streams.empty()) return refuse("stream pool empty");
@@ -440,6 +443,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   if (num_rows <= 0) return refuse("num_rows <= 0");
   if (num_rows > std::numeric_limits<std::int32_t>::max())
     return refuse("num_rows > INT32_MAX (int32 row indices)");
+  if (has_keep_mask && request.keep_mask_rows != num_rows)
+    return refuse("keep mask row count != batch rows (positional mask misaligned)");
   for (auto const idx : selected) {
     if (idx >= table.columns.size()) return refuse("selected column index out of range");
     auto const& col = table.columns[idx];
@@ -524,6 +529,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       line += " bool8(col " + std::to_string(b.column) + " eq#" +
               std::to_string(b.equals_any.size()) + ")";
     }
+    if (has_keep_mask) { line += " keep-mask"; }
     line += " rows=" + std::to_string(num_rows);
     std::fprintf(stderr, "%s\n", line.c_str());
   }
@@ -532,6 +538,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
   // these buffers/events unwind (their stream-ordered frees must not race the
   // combine's cross-stream reads).
   std::vector<rmm::device_buffer> per_filter;
+  // Declared before the try, like per_filter, so the catch's sync_all() precedes its
+  // destruction.
+  rmm::device_buffer keep_mask_dev;
   // Full-width BOOL8 per bool8 source, retained for the wave-2 dual-delivery
   // gather; declared before the try so the catch's pool.sync_all() runs
   // before any cross-stream consumer unwinds them.
@@ -561,7 +570,7 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // the shipped BOOL8 pushdown then the packed-mask adapter.
     per_filter.reserve(k_total > 1 ? k_total - 1 : 0);
     std::vector<std::uint32_t const*> mask_ptrs;
-    mask_ptrs.reserve(k_total);
+    mask_ptrs.reserve(k_total + 1);  // +1: the optional positional keep mask
     mask_ptrs.push_back(combined);
 
     auto submit_mask_source = [&](size_t s, auto&& produce) {
@@ -686,17 +695,46 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
                    static_cast<long long>(num_rows));
     }
 
+    // ── Keep mask, appended last. No ballot producer zeroes its tail (selection.hpp:52),
+    // so the gap between the host words and alloc_words is memset here. Upload on s0
+    // keeps the combine ordered behind it.
+    if (has_keep_mask) {
+      auto const host_words = static_cast<std::size_t>((num_rows + 31) / 32);
+      keep_mask_dev =
+        rmm::device_buffer(static_cast<std::size_t>(alloc_words) * sizeof(std::uint32_t), s0, mr);
+      auto* keep_dst = static_cast<std::uint32_t*>(keep_mask_dev.data());
+      if (static_cast<int64_t>(host_words) < alloc_words &&
+          cudaMemsetAsync(
+            keep_dst + host_words,
+            0,
+            (static_cast<std::size_t>(alloc_words) - host_words) * sizeof(std::uint32_t),
+            s0.value()) != cudaSuccess) {
+        throw plan_error("fused scan-filter: keep-mask padding memset failed");
+      }
+      if (cudaMemcpyAsync(keep_dst,
+                          request.keep_mask_words,
+                          host_words * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice,
+                          s0.value()) != cudaSuccess) {
+        throw plan_error("fused scan-filter: keep-mask upload failed");
+      }
+      mask_ptrs.push_back(keep_dst);
+    }
+
     // ── Combine + CNT on stream 0. run_selection_cnt host-syncs s0 once (the
     // survivor count gates wave-2 allocations); after it returns, every wave-1
     // kernel and the combine have completed, so per_filter teardown is safe.
-    if (k_total > 1) {
-      sc::combine_masks_and(combined, mask_ptrs.data(), static_cast<int>(k_total), alloc_words, s0);
+    auto const n_combine_sources = k_total + (has_keep_mask ? 1 : 0);
+    if (n_combine_sources > 1) {
+      sc::combine_masks_and(
+        combined, mask_ptrs.data(), static_cast<int>(n_combine_sources), alloc_words, s0);
     }
     sc::selection_mask sel{
       combined, num_rows, -1, static_cast<std::uint32_t*>(result.chunk_offsets.data())};
     sc::run_selection_cnt(sel, s0, mr);
     result.survivor_count = sel.survivor_count;
     per_filter.clear();
+    keep_mask_dev = rmm::device_buffer{};  // combine consumed it; CNT synced s0
 
     // Selectivity guard, now that the survivor count is known; two regimes:
     //  * `full` outputs present: proceed only at sel <= the full-route threshold
@@ -846,8 +884,9 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
     // run_column_workers ended with pool.sync_all(), which also covers the
     // mask_to_row_indices launch on s0.
 
-    result.applied = true;
-    result.status  = sc::scan_filter_status::applied;
+    result.applied           = true;
+    result.status            = sc::scan_filter_status::applied;
+    result.keep_mask_applied = has_keep_mask;
     return cols;
   } catch (std::exception const& e) {
     std::fprintf(
@@ -911,7 +950,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[serial]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
 
   compressed_table out;
@@ -937,7 +976,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[threads]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
   leased_pool lp(column_threads);
   return compress_columns_parallel(table, plans, lp.pool, mr, column_names);
@@ -949,7 +988,7 @@ compressed_table compress_with_plan(cudf::table_view table,
                                     rmm::device_async_resource_ref mr,
                                     std::vector<std::string> column_names)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_table[pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_table[pool]"};
   auto plans = split_and_validate_plans(plan_dsl, table, column_names);
   return compress_columns_parallel(table, plans, pool, mr, column_names);
 }
@@ -960,7 +999,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[serial]"};
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(table.num_columns());
   for (auto const& col : table.columns) {
@@ -977,7 +1016,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[threads]"};
   leased_pool lp(column_threads);
   return decompress_columns_parallel(table, lp.pool, mr);
 }
@@ -986,7 +1025,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[pool]"};
   return decompress_columns_parallel(table, pool, mr);
 }
 
@@ -995,7 +1034,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         rmm::cuda_stream_view stream,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,serial]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,serial]"};
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.reserve(selected_columns.size());
   for (auto const idx : selected_columns) {
@@ -1114,7 +1153,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         int column_threads,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,threads]"};
   leased_pool lp(column_threads);
   return decompress_columns_parallel(table, selected_columns, lp.pool, mr);
 }
@@ -1124,7 +1163,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,pool]"};
   return decompress_columns_parallel(table, selected_columns, pool, mr);
 }
 
@@ -1134,7 +1173,7 @@ std::unique_ptr<cudf::table> decompress(const compressed_table& table,
                                         simpatico::stream_pool& pool,
                                         rmm::device_async_resource_ref mr)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[selected,predicated,pool]"};
   if (predicates.size() != selected_columns.size()) {
     throw plan_error("decompress: predicates and selected_columns must be the same length");
   }
@@ -1151,7 +1190,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   rmm::device_async_resource_ref mr,
   std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_table[scan_filter,pool]"};
   result = sirius::codegen::scan_filter_result{};
   if (auto cols = try_decompress_fused(table, selected_columns, request, result, pool, mr)) {
     if (sirius::codegen::decompression_pushdown_diag_enabled()) {

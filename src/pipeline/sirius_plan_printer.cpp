@@ -275,7 +275,7 @@ std::string render_content_line(const plan_printer_config& config,
 // ============================================================================
 
 sirius_plan_printer::sirius_plan_printer(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
   : pipelines_(pipelines)
 {
 }
@@ -338,7 +338,7 @@ std::string sirius_plan_printer::build_operator_chain(const sirius_pipeline& pip
   return ss.str();
 }
 
-duckdb::shared_ptr<sirius_pipeline> sirius_plan_printer::find_root_pipeline() const
+std::shared_ptr<sirius_pipeline> sirius_plan_printer::find_root_pipeline() const
 {
   for (auto& p : pipelines_) {
     auto sink = p->get_sink();

@@ -187,15 +187,12 @@ bool is_output_position(std::size_t i, std::size_t output_types_size)
 bool column_ids_need_reader_projection(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                                        std::size_t full_schema_size)
 {
-  // count(*) / zero-column scans are NOT a projection: assemble_scan_output keeps
-  // the reader's natural batch (its empty-output_layout path) so the row count the
-  // downstream aggregation consumes is preserved. Projecting to 0 columns would
-  // erase it.
+  // count(*) / zero-column scans carry no real column to project by; build_scan_plan
+  // gives them a row-count carrier instead.
   if (column_ids.empty()) { return false; }
   // Virtual columns (e.g. count(*)'s row-id marker) are not physical file columns
-  // and must never drive a by-name reader projection — a scan that reads ONLY
-  // virtual columns (count(*)) keeps the reader's natural batch.  Mirror the
-  // IsVirtualColumn guard handle_position uses below.
+  // and must never drive a by-name reader projection. Mirror the IsVirtualColumn
+  // guard handle_position uses below.
   bool any_real = false;
   for (std::size_t i = 0; i < column_ids.size(); ++i) {
     auto const primary_idx = column_ids[i].GetPrimaryIndex();
@@ -204,7 +201,7 @@ bool column_ids_need_reader_projection(duckdb::vector<duckdb::ColumnIndex> const
     // A real column read out of its identity position ⇒ pruned / reordered.
     if (primary_idx != i) { return true; }
   }
-  if (!any_real) { return false; }  // only virtual columns (count(*)) — natural batch
+  if (!any_real) { return false; }  // only virtual columns (count(*))
   // All real columns sit at identity positions: a projection only if the read is a
   // proper prefix (fewer columns than the file's full schema).
   return column_ids.size() != full_schema_size;
@@ -302,9 +299,32 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     plan.batch_position_by_column_id[c] = it->second;
   }
 
-  // The gate: a column-less scan (count(*)/virtual-only or partition-only, only
-  // known after the walk) must keep the natural batch — projecting it hands cuDF
-  // set_column_names({}), a zero-column read over live row groups that hangs.
+  // Keep one fixed-width column to carry the row count when no data columns are
+  // requested: a zero-column cudf table has none, and the natural batch decodes
+  // every column to get it.
+  if (plan.data_columns.empty() && !names.empty() && returned_types.size() == names.size()) {
+    std::optional<std::size_t> carrier;
+    std::size_t carrier_width = 0;
+    for (std::size_t p = 0; p < returned_types.size(); ++p) {
+      if (plan.partition_primary_indices.count(p) > 0) { continue; }
+      if (!returned_types[p].is_fixed_width()) { continue; }
+      auto const width = returned_types[p].fixed_width_byte_size();
+      if (width == 0) { continue; }
+      if (!carrier || width < carrier_width) {
+        carrier       = p;
+        carrier_width = width;
+      }
+    }
+    if (carrier) {
+      plan.carrier_batch_index = plan.data_columns.size();
+      plan.data_columns.push_back(scan_plan::data_column{*carrier, names.at(*carrier)});
+      plan.needs_reader_projection = true;
+    }
+  }
+
+  // The gate: a column-less scan with no usable carrier must keep the natural
+  // batch — projecting it hands cuDF set_column_names({}), a zero-column read
+  // over live row groups that hangs.
   plan.needs_reader_projection = plan.needs_reader_projection && !plan.data_columns.empty();
 
   SIRIUS_LOG_DEBUG("[scan_plan] built plan: {} data col(s), {} partition col(s), {} output entries",

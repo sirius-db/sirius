@@ -20,13 +20,13 @@
 #include "codegen/plan/plan_tree.hpp"
 #include "codegen/plan/representation.hpp"
 #include "codegen/plan/validity.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/column/column_factories.hpp>
 
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <memory>
 #include <string>
@@ -573,7 +573,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           rmm::device_async_resource_ref mr,
                                           std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::compress_column"};
+  nvtx_scoped_range nvtx_range{"simpatico::compress_column"};
   // Single-stream per column: all work runs on `stream`. Cross-column
   // parallelism is the caller's job (one column per worker thread, each on its
   // own stream). Intermediate device buffers are freed eagerly by the walk.
