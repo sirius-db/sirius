@@ -45,6 +45,7 @@
 #include <duckdb/storage/statistics/numeric_stats.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -55,90 +56,164 @@
 namespace sirius::scan_manager {
 
 namespace {
-std::optional<cudf::type_id> expected_cudf_type(duckdb::LogicalType const& type)
+
+// Wire tags for the types compute_pinned_group_stats can capture. Stable: do not renumber.
+// Anything else packs as `absent`, which prunes nothing rather than prunes wrongly.
+enum class packed_type : std::uint8_t {
+  absent = 0,
+  i8,
+  i16,
+  i32,
+  i64,
+  u8,
+  u16,
+  u32,
+  u64,
+  date,
+  timestamp
+};
+
+/// The allowlist: integers of at most 8 bytes, DATE and TIMESTAMP. Every mapping over it is a row
+/// here, so a new type is one row rather than an edit to each of the lookups below.
+struct zone_map_type {
+  duckdb::LogicalTypeId duck;
+  cudf::type_id cudf;
+  packed_type packed;
+  bool is_unsigned;
+};
+
+constexpr std::array<zone_map_type, 10> kZoneMapTypes{{
+  {duckdb::LogicalTypeId::TINYINT, cudf::type_id::INT8, packed_type::i8, false},
+  {duckdb::LogicalTypeId::SMALLINT, cudf::type_id::INT16, packed_type::i16, false},
+  {duckdb::LogicalTypeId::INTEGER, cudf::type_id::INT32, packed_type::i32, false},
+  {duckdb::LogicalTypeId::BIGINT, cudf::type_id::INT64, packed_type::i64, false},
+  {duckdb::LogicalTypeId::UTINYINT, cudf::type_id::UINT8, packed_type::u8, true},
+  {duckdb::LogicalTypeId::USMALLINT, cudf::type_id::UINT16, packed_type::u16, true},
+  {duckdb::LogicalTypeId::UINTEGER, cudf::type_id::UINT32, packed_type::u32, true},
+  {duckdb::LogicalTypeId::UBIGINT, cudf::type_id::UINT64, packed_type::u64, true},
+  {duckdb::LogicalTypeId::DATE, cudf::type_id::TIMESTAMP_DAYS, packed_type::date, false},
+  {duckdb::LogicalTypeId::TIMESTAMP,
+   cudf::type_id::TIMESTAMP_MICROSECONDS,
+   packed_type::timestamp,
+   false},
+}};
+
+template <typename Key, typename Proj>
+zone_map_type const* find_type(Key key, Proj proj)
+{
+  auto const it =
+    std::ranges::find_if(kZoneMapTypes, [&](zone_map_type const& e) { return proj(e) == key; });
+  return it == kZoneMapTypes.end() ? nullptr : &*it;
+}
+
+zone_map_type const* by_duck(duckdb::LogicalTypeId id)
+{
+  return find_type(id, [](zone_map_type const& e) { return e.duck; });
+}
+zone_map_type const* by_cudf(cudf::type_id id)
+{
+  return find_type(id, [](zone_map_type const& e) { return e.cudf; });
+}
+zone_map_type const* by_packed(packed_type p)
+{
+  return find_type(p, [](zone_map_type const& e) { return e.packed; });
+}
+
+/// Carrier -> Value. The one place a zone-map bound becomes a duckdb::Value: an unsigned carrier
+/// holds the bit pattern, so it is reinterpreted rather than range-checked (Value::Numeric would
+/// throw on a UBIGINT above INT64_MAX).
+duckdb::Value carrier_to_value(duckdb::LogicalType const& type, std::int64_t raw)
 {
   switch (type.id()) {
-    case duckdb::LogicalTypeId::TINYINT: return cudf::type_id::INT8;
-    case duckdb::LogicalTypeId::SMALLINT: return cudf::type_id::INT16;
-    case duckdb::LogicalTypeId::INTEGER: return cudf::type_id::INT32;
-    case duckdb::LogicalTypeId::BIGINT: return cudf::type_id::INT64;
-    case duckdb::LogicalTypeId::UTINYINT: return cudf::type_id::UINT8;
-    case duckdb::LogicalTypeId::USMALLINT: return cudf::type_id::UINT16;
-    case duckdb::LogicalTypeId::UINTEGER: return cudf::type_id::UINT32;
-    case duckdb::LogicalTypeId::UBIGINT: return cudf::type_id::UINT64;
-    case duckdb::LogicalTypeId::DATE: return cudf::type_id::TIMESTAMP_DAYS;
-    case duckdb::LogicalTypeId::TIMESTAMP: return cudf::type_id::TIMESTAMP_MICROSECONDS;
-    default: return std::nullopt;
+    case duckdb::LogicalTypeId::TINYINT:
+      return duckdb::Value::TINYINT(static_cast<std::int8_t>(raw));
+    case duckdb::LogicalTypeId::SMALLINT:
+      return duckdb::Value::SMALLINT(static_cast<std::int16_t>(raw));
+    case duckdb::LogicalTypeId::INTEGER:
+      return duckdb::Value::INTEGER(static_cast<std::int32_t>(raw));
+    case duckdb::LogicalTypeId::BIGINT: return duckdb::Value::BIGINT(raw);
+    case duckdb::LogicalTypeId::UTINYINT:
+      return duckdb::Value::UTINYINT(static_cast<std::uint8_t>(raw));
+    case duckdb::LogicalTypeId::USMALLINT:
+      return duckdb::Value::USMALLINT(static_cast<std::uint16_t>(raw));
+    case duckdb::LogicalTypeId::UINTEGER:
+      return duckdb::Value::UINTEGER(static_cast<std::uint32_t>(raw));
+    case duckdb::LogicalTypeId::UBIGINT:
+      return duckdb::Value::UBIGINT(static_cast<std::uint64_t>(raw));
+    case duckdb::LogicalTypeId::DATE:
+      return duckdb::Value::DATE(duckdb::date_t{static_cast<std::int32_t>(raw)});
+    case duckdb::LogicalTypeId::TIMESTAMP:
+      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{raw});
+    default: return duckdb::Value();
   }
+}
+
+std::optional<cudf::type_id> expected_cudf_type(duckdb::LogicalType const& type)
+{
+  auto const* e = by_duck(type.id());
+  return e == nullptr ? std::nullopt : std::optional{e->cudf};
 }
 
 duckdb::Value scalar_to_value(cudf::scalar const& s, ::cuda::stream_ref stream)
 {
+  auto const* e = by_cudf(s.type().id());
+  if (e == nullptr) {
+    SIRIUS_LOG_DEBUG("[pinned_chunk_stats] scalar type {} outside allowlist; dropping stats cell",
+                     static_cast<std::int32_t>(s.type().id()));
+    return duckdb::Value();
+  }
+  std::int64_t raw = 0;
   switch (s.type().id()) {
     case cudf::type_id::INT8:
-      return duckdb::Value::TINYINT(
-        static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::int8_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::INT16:
-      return duckdb::Value::SMALLINT(
-        static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::int16_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::INT32:
-      return duckdb::Value::INTEGER(
-        static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::int32_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::INT64:
-      return duckdb::Value::BIGINT(
-        static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::int64_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::UINT8:
-      return duckdb::Value::UTINYINT(
-        static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::uint8_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::UINT16:
-      return duckdb::Value::USMALLINT(
-        static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::uint16_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::UINT32:
-      return duckdb::Value::UINTEGER(
-        static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream));
+      raw = static_cast<cudf::numeric_scalar<std::uint32_t> const&>(s).value(stream);
+      break;
     case cudf::type_id::UINT64:
-      return duckdb::Value::UBIGINT(
+      raw = static_cast<std::int64_t>(
         static_cast<cudf::numeric_scalar<std::uint64_t> const&>(s).value(stream));
-    case cudf::type_id::TIMESTAMP_DAYS: {
-      auto const days = static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(s)
-                          .value(stream)
-                          .time_since_epoch()
-                          .count();
-      return duckdb::Value::DATE(duckdb::date_t{days});
-    }
-    case cudf::type_id::TIMESTAMP_MICROSECONDS: {
-      auto const micros = static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(s)
-                            .value(stream)
-                            .time_since_epoch()
-                            .count();
-      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{micros});
-    }
-    default:
-      SIRIUS_LOG_DEBUG("[pinned_chunk_stats] scalar type {} outside allowlist; dropping stats cell",
-                       static_cast<std::int32_t>(s.type().id()));
-      return duckdb::Value();
+      break;
+    case cudf::type_id::TIMESTAMP_DAYS:
+      raw = static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(s)
+              .value(stream)
+              .time_since_epoch()
+              .count();
+      break;
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      raw = static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(s)
+              .value(stream)
+              .time_since_epoch()
+              .count();
+      break;
+    default: return duckdb::Value();
   }
+  return carrier_to_value(duckdb::LogicalType(e->duck), raw);
 }
-/// Host-side element -> duckdb::Value, mirroring scalar_to_value's allowlist exactly. Used by
-/// the per-group capture, which reads whole reduction-output columns back rather than scalars.
+/// Host-side element -> duckdb::Value, for the per-group capture, which reads whole
+/// reduction-output columns back rather than scalars.
 template <typename T>
 duckdb::Value element_to_value(cudf::type_id id, T raw)
 {
-  switch (id) {
-    case cudf::type_id::INT8: return duckdb::Value::TINYINT(static_cast<std::int8_t>(raw));
-    case cudf::type_id::INT16: return duckdb::Value::SMALLINT(static_cast<std::int16_t>(raw));
-    case cudf::type_id::INT32: return duckdb::Value::INTEGER(static_cast<std::int32_t>(raw));
-    case cudf::type_id::INT64: return duckdb::Value::BIGINT(static_cast<std::int64_t>(raw));
-    case cudf::type_id::UINT8: return duckdb::Value::UTINYINT(static_cast<std::uint8_t>(raw));
-    case cudf::type_id::UINT16: return duckdb::Value::USMALLINT(static_cast<std::uint16_t>(raw));
-    case cudf::type_id::UINT32: return duckdb::Value::UINTEGER(static_cast<std::uint32_t>(raw));
-    case cudf::type_id::UINT64: return duckdb::Value::UBIGINT(static_cast<std::uint64_t>(raw));
-    case cudf::type_id::TIMESTAMP_DAYS:
-      return duckdb::Value::DATE(duckdb::date_t{static_cast<std::int32_t>(raw)});
-    case cudf::type_id::TIMESTAMP_MICROSECONDS:
-      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{static_cast<std::int64_t>(raw)});
-    default: return duckdb::Value();
-  }
+  auto const* e = by_cudf(id);
+  return e == nullptr
+           ? duckdb::Value()
+           : carrier_to_value(duckdb::LogicalType(e->duck), static_cast<std::int64_t>(raw));
 }
 
 /// Copy a fixed-width reduction-output column to host as duckdb::Values, one per group.
@@ -470,13 +545,8 @@ std::optional<std::int64_t> value_carrier(duckdb::Value const& v)
 
 bool type_is_unsigned(duckdb::LogicalType const& t)
 {
-  switch (t.id()) {
-    case duckdb::LogicalTypeId::UTINYINT:
-    case duckdb::LogicalTypeId::USMALLINT:
-    case duckdb::LogicalTypeId::UINTEGER:
-    case duckdb::LogicalTypeId::UBIGINT: return true;
-    default: return false;
-  }
+  auto const* e = by_duck(t.id());
+  return e != nullptr && e->is_unsigned;
 }
 
 /// Three-way ordering on carriers, honoring the column's signedness.
@@ -507,8 +577,7 @@ packed_column_bounds group_bounds_arena::cell(std::size_t column, std::size_t ch
   return out;
 }
 
-group_bounds_arena group_bounds_arena::select_columns(
-  std::span<const std::size_t> columns) const
+group_bounds_arena group_bounds_arena::select_columns(std::span<const std::size_t> columns) const
 {
   group_bounds_arena out;
   if (columns.empty() || _n_chunks == 0) { return out; }
@@ -537,9 +606,10 @@ group_bounds_arena group_bounds_arena::select_columns(
       // Mins and maxs are adjacent in the source and stay adjacent here; the copy is what makes
       // the result standalone, so the subset outlives the arena it came from.
       dst.offset = out._storage.size();
-      out._storage.insert(out._storage.end(),
-                          _storage.begin() + static_cast<std::ptrdiff_t>(src.offset),
-                          _storage.begin() + static_cast<std::ptrdiff_t>(src.offset + 2 * src.count));
+      out._storage.insert(
+        out._storage.end(),
+        _storage.begin() + static_cast<std::ptrdiff_t>(src.offset),
+        _storage.begin() + static_cast<std::ptrdiff_t>(src.offset + 2 * src.count));
       dst.valid_offset = out._valid.size();
       out._valid.insert(out._valid.end(),
                         _valid.begin() + static_cast<std::ptrdiff_t>(src.valid_offset),
@@ -563,54 +633,16 @@ std::size_t group_bounds_arena::groups_in_chunk(std::size_t chunk) const noexcep
 
 namespace {
 
-// Wire tags for the types compute_pinned_group_stats can capture. Stable: do not renumber.
-// Anything else packs as `absent`, which prunes nothing rather than prunes wrongly.
-enum class packed_type : std::uint8_t {
-  absent = 0,
-  i8,
-  i16,
-  i32,
-  i64,
-  u8,
-  u16,
-  u32,
-  u64,
-  date,
-  timestamp
-};
-
 packed_type to_packed(duckdb::LogicalType const& t)
 {
-  switch (t.id()) {
-    case duckdb::LogicalTypeId::TINYINT: return packed_type::i8;
-    case duckdb::LogicalTypeId::SMALLINT: return packed_type::i16;
-    case duckdb::LogicalTypeId::INTEGER: return packed_type::i32;
-    case duckdb::LogicalTypeId::BIGINT: return packed_type::i64;
-    case duckdb::LogicalTypeId::UTINYINT: return packed_type::u8;
-    case duckdb::LogicalTypeId::USMALLINT: return packed_type::u16;
-    case duckdb::LogicalTypeId::UINTEGER: return packed_type::u32;
-    case duckdb::LogicalTypeId::UBIGINT: return packed_type::u64;
-    case duckdb::LogicalTypeId::DATE: return packed_type::date;
-    case duckdb::LogicalTypeId::TIMESTAMP: return packed_type::timestamp;
-    default: return packed_type::absent;
-  }
+  auto const* e = by_duck(t.id());
+  return e == nullptr ? packed_type::absent : e->packed;
 }
 
 duckdb::LogicalType from_packed(packed_type p)
 {
-  switch (p) {
-    case packed_type::i8: return duckdb::LogicalType(duckdb::LogicalTypeId::TINYINT);
-    case packed_type::i16: return duckdb::LogicalType(duckdb::LogicalTypeId::SMALLINT);
-    case packed_type::i32: return duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
-    case packed_type::i64: return duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
-    case packed_type::u8: return duckdb::LogicalType(duckdb::LogicalTypeId::UTINYINT);
-    case packed_type::u16: return duckdb::LogicalType(duckdb::LogicalTypeId::USMALLINT);
-    case packed_type::u32: return duckdb::LogicalType(duckdb::LogicalTypeId::UINTEGER);
-    case packed_type::u64: return duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT);
-    case packed_type::date: return duckdb::LogicalType(duckdb::LogicalTypeId::DATE);
-    case packed_type::timestamp: return duckdb::LogicalType(duckdb::LogicalTypeId::TIMESTAMP);
-    default: return duckdb::LogicalType(duckdb::LogicalTypeId::SQLNULL);
-  }
+  auto const* e = by_packed(p);
+  return duckdb::LogicalType(e == nullptr ? duckdb::LogicalTypeId::SQLNULL : e->duck);
 }
 
 // Explicit little-endian, matching the .hpln header's own push_le/read_le convention. A memcpy of
@@ -793,31 +825,6 @@ namespace {
 /// Inverse of @ref value_carrier: the 8-byte carrier back to a Value of @p type. Mirrors that
 /// function's allowlist exactly -- a type it cannot carry has no bound to reconstruct, and a
 /// mismatched pair here would produce bounds that prune the wrong rows rather than none.
-duckdb::Value carrier_to_value(duckdb::LogicalType const& type, std::int64_t raw)
-{
-  switch (type.id()) {
-    case duckdb::LogicalTypeId::TINYINT:
-      return duckdb::Value::TINYINT(static_cast<std::int8_t>(raw));
-    case duckdb::LogicalTypeId::SMALLINT:
-      return duckdb::Value::SMALLINT(static_cast<std::int16_t>(raw));
-    case duckdb::LogicalTypeId::INTEGER:
-      return duckdb::Value::INTEGER(static_cast<std::int32_t>(raw));
-    case duckdb::LogicalTypeId::BIGINT: return duckdb::Value::BIGINT(raw);
-    case duckdb::LogicalTypeId::UTINYINT:
-      return duckdb::Value::UTINYINT(static_cast<std::uint8_t>(raw));
-    case duckdb::LogicalTypeId::USMALLINT:
-      return duckdb::Value::USMALLINT(static_cast<std::uint16_t>(raw));
-    case duckdb::LogicalTypeId::UINTEGER:
-      return duckdb::Value::UINTEGER(static_cast<std::uint32_t>(raw));
-    case duckdb::LogicalTypeId::UBIGINT:
-      return duckdb::Value::UBIGINT(static_cast<std::uint64_t>(raw));
-    case duckdb::LogicalTypeId::DATE:
-      return duckdb::Value::DATE(duckdb::date_t{static_cast<std::int32_t>(raw)});
-    case duckdb::LogicalTypeId::TIMESTAMP:
-      return duckdb::Value::TIMESTAMP(duckdb::timestamp_t{raw});
-    default: return duckdb::Value();
-  }
-}
 
 }  // namespace
 
