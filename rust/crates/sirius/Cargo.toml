@@ -19,7 +19,7 @@ sirius-sys.workspace = true
 # the StarRocks CN consumer so the `ArrowArrayStreamReader` type unifies. The
 # `ffi` feature provides `ffi_stream` (FFI_ArrowArrayStream / reader).
 arrow-array = { version = "59", features = ["ffi"] }
-arrow-schema = "59"
+arrow-schema = "60"
 
 [dev-dependencies]
 # Building a `local_files` Substrait plan + a parquet fixture for the execute test.
