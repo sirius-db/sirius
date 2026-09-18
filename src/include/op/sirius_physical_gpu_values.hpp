@@ -44,7 +44,7 @@ class gpu_values_input : public operator_data {
   }
 
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override
+                              ::cuda::stream_ref /*stream*/) override
   {
     _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   }
@@ -122,7 +122,7 @@ class sirius_physical_gpu_values : public sirius_physical_operator {
    * 0-row table with the declared schema.
    */
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;

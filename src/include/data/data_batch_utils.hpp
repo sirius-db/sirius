@@ -22,7 +22,7 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -129,7 +129,7 @@ inline cudf::table_view get_cudf_table_view(cucascade::data_batch& batch)
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cudf::table&& table,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream,
+  ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
@@ -146,12 +146,12 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * event.
  *
  * @copydoc make_data_batch(cudf::table&&, cucascade::memory::memory_space&,
- *                          rmm::cuda_stream_view, const telemetry::batch_telemetry_info&)
+ *                          ::cuda::stream_ref, const telemetry::batch_telemetry_info&)
  */
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   std::unique_ptr<cudf::table> table,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream,
+  ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
@@ -193,7 +193,7 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch_from_view(
   Owner&& owner,
   std::size_t alloc_size,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view writer_stream,
+  ::cuda::stream_ref writer_stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(

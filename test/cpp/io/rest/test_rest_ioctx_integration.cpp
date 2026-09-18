@@ -202,13 +202,12 @@ void require_bytes_equal(std::span<std::uint8_t const> got, std::span<std::uint8
 
 std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device,
                                               std::size_t size,
-                                              rmm::cuda_stream_view stream)
+                                              ::cuda::stream_ref stream)
 {
   std::vector<std::uint8_t> out(size);
-  REQUIRE(
-    cudaMemcpyAsync(out.data(), device.data(), size, cudaMemcpyDeviceToHost, stream.value()) ==
-    cudaSuccess);
-  stream.synchronize();
+  REQUIRE(cudaMemcpyAsync(out.data(), device.data(), size, cudaMemcpyDeviceToHost, stream.get()) ==
+          cudaSuccess);
+  stream.sync();
   return out;
 }
 

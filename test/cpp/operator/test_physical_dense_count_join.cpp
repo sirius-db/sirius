@@ -52,7 +52,7 @@ std::vector<group_row> run_dense_count_join(
   std::optional<std::size_t> counted_value_idx,
   uint64_t max_bins_bytes,
   sirius_physical_dense_count_join::strategy expected_strategy,
-  rmm::cuda_stream_view stream = cudf::get_default_stream())
+  ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType(key_logical_type));
@@ -68,7 +68,7 @@ std::vector<group_row> run_dense_count_join(
   dense_count_join_input input(preserved_batches, counted_batches);
 
   auto output = op.execute(input, stream);
-  stream.synchronize();
+  stream.sync();
   REQUIRE(op.last_strategy() == expected_strategy);
 
   auto const& out_batches =
@@ -638,7 +638,7 @@ TEST_CASE("dense_count_join: retained multi-batch extrema merge on a non-default
                                             std::size_t{0},
                                             k_default_max_bytes,
                                             sirius_physical_dense_count_join::strategy::DENSE,
-                                            stream.view());
+                                            stream);
   REQUIRE((rows == std::vector<group_row>{{std::nullopt, 0}, {4, 4}, {5, 0}}));
 }
 
@@ -929,12 +929,12 @@ TEST_CASE("dense_count_join: a retried task re-executes on the same input",
     dense_count_join_input input(preserved, counted);
 
     auto first = op.execute(input, stream);
-    stream.synchronize();
+    stream.sync();
     REQUIRE(op.last_strategy() == expected);
 
     std::unique_ptr<sirius::op::operator_data> second;
     REQUIRE_NOTHROW(second = op.execute(input, stream));
-    stream.synchronize();
+    stream.sync();
     REQUIRE(op.last_strategy() == expected);
 
     auto const rows_of = [](sirius::op::operator_data const& data) {

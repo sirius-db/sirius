@@ -57,9 +57,10 @@
 
 #include "codegen/jit/fused_tree.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -134,7 +135,7 @@ struct chunk_row_set_owner {
 chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
                                         std::int64_t num_ids,
                                         std::int64_t num_rows,
-                                        rmm::cuda_stream_view stream,
+                                        ::cuda::stream_ref stream,
                                         rmm::device_async_resource_ref mr);
 
 // ── Deriving the mask form ──────────────────────────────────────────────────
@@ -159,7 +160,7 @@ chunk_row_set_owner build_chunk_row_set(std::int32_t const* row_ids,
 void row_set_to_mask(chunk_row_set const& rows,
                      std::uint32_t* mask_words,
                      std::uint32_t* all_chunk_offsets,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::codegen

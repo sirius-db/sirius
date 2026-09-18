@@ -19,7 +19,7 @@
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -67,7 +67,7 @@ namespace pipeline {
 inline std::optional<cucascade::read_only_data_batch> lock_or_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (!batch) { return std::nullopt; }
 

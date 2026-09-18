@@ -34,9 +34,9 @@
 
 #include <rmm/aligned.hpp>
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -82,7 +82,7 @@ bool require_three_gpus()
 template <typename T>
 std::unique_ptr<cudf::column> make_values(std::vector<T> const& values,
                                           cudf::data_type type,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
   auto col       = cudf::make_numeric_column(type,
                                        static_cast<cudf::size_type>(values.size()),
@@ -93,15 +93,15 @@ std::unique_ptr<cudf::column> make_values(std::vector<T> const& values,
                                    values.data(),
                                    values.size() * sizeof(T),
                                    cudaMemcpyHostToDevice,
-                                   stream.value());
+                                   stream.get());
   REQUIRE(err == cudaSuccess);
   // Callers commonly pass a temporary initializer vector. Complete the pageable-host transfer
   // before that vector is destroyed; these focused tests do not benchmark ingestion.
-  stream.synchronize();
+  stream.sync();
   return col;
 }
 
-std::vector<std::uint8_t> mask_to_host(cudf::column_view const& mask, rmm::cuda_stream_view stream)
+std::vector<std::uint8_t> mask_to_host(cudf::column_view const& mask, ::cuda::stream_ref stream)
 {
   REQUIRE(mask.type().id() == cudf::type_id::BOOL8);
   std::vector<std::uint8_t> host(static_cast<std::size_t>(mask.size()));
@@ -109,9 +109,9 @@ std::vector<std::uint8_t> mask_to_host(cudf::column_view const& mask, rmm::cuda_
                                    mask.data<bool>(),
                                    host.size() * sizeof(bool),
                                    cudaMemcpyDeviceToHost,
-                                   stream.value());
+                                   stream.get());
   REQUIRE(err == cudaSuccess);
-  stream.synchronize();
+  stream.sync();
   return host;
 }
 
@@ -190,7 +190,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
     // explicit replication, a GPU 1 caller skips the optional filter and never touches GPU 0's set.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
+      ::cuda::stream_ref const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -207,7 +207,7 @@ TEST_CASE("IN-list replica built on GPU 0 computes an exact mask on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    rmm::cuda_stream_view const stream = cudf::get_default_stream();
+    ::cuda::stream_ref const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(
@@ -435,7 +435,7 @@ TEST_CASE("Bloom replica built on GPU 0 has no false negatives on GPU 1",
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    rmm::cuda_stream_view const stream = cudf::get_default_stream();
+    ::cuda::stream_ref const stream = cudf::get_default_stream();
     // Positions 0, 2, and 4 are build keys. Misses may be Bloom false positives, so only the
     // no-false-negative contract is asserted for them.
     auto probe = make_values<std::int64_t>(
@@ -483,8 +483,8 @@ TEST_CASE("zone-map replica built on GPU 0 lowers and evaluates its AST on GPU 1
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    rmm::cuda_stream_view const stream = cudf::get_default_stream();
-    auto probe                         = cudf::sequence(10,
+    ::cuda::stream_ref const stream = cudf::get_default_stream();
+    auto probe                      = cudf::sequence(10,
                                 cudf::numeric_scalar<std::int64_t>(0, true, stream),
                                 cudf::numeric_scalar<std::int64_t>(1, true, stream),
                                 stream,
@@ -538,7 +538,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
     // published; it must never dereference the source GPU's buffer.
     {
       rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-      rmm::cuda_stream_view const probe_stream = cudf::get_default_stream();
+      ::cuda::stream_ref const probe_stream = cudf::get_default_stream();
       auto early_probe =
         make_values<std::int64_t>({2, 7}, cudf::data_type{cudf::type_id::INT64}, probe_stream);
       auto early_mask = filter->compute_mask(
@@ -555,7 +555,7 @@ TEST_CASE("small IN-list replica built on GPU 0 computes an exact mask on GPU 1"
 
   {
     rmm::cuda_set_device_raii const probe_device{rmm::cuda_device_id{kProbeDevice}};
-    rmm::cuda_stream_view const stream = cudf::get_default_stream();
+    ::cuda::stream_ref const stream = cudf::get_default_stream();
     auto probe =
       make_values<std::int64_t>({1, 2, 3, 4, 6, 9}, cudf::data_type{cudf::type_id::INT64}, stream);
     auto mask = filter->compute_mask(

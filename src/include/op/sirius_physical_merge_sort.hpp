@@ -64,7 +64,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   //! Set the final output projection (applied after merge, to remove sort-key-only columns)
   void set_final_projections(duckdb::vector<std::size_t> proj,

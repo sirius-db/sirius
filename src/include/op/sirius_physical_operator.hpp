@@ -179,8 +179,7 @@ class operator_data {
    * Override when either condition changes.
    */
   virtual void prepare_for_processing(
-    const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream) {
-  };
+    const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream) {};
 
   /**
    * @brief Estimate the uncompressed GPU memory footprint of this data.
@@ -301,7 +300,7 @@ class pipelineable_operator_data : public operator_data {
    * if any batch pointer is null or any batch fails to lock. Propagates rmm::out_of_memory.
    */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view stream) override;
+                              ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
@@ -584,7 +583,7 @@ class sirius_physical_operator {
   }
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                                 rmm::cuda_stream_view stream);
+                                                 ::cuda::stream_ref stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual sirius::OrderPreservationType operator_order() const
@@ -632,7 +631,7 @@ class sirius_physical_operator {
 
  public:
   // Sink interface
-  virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
+  virtual void sink(const operator_data& input_data, ::cuda::stream_ref stream);
 
   //! An operator is a pipeline sink iff its tree parent is a PARTITION, RIGHT_DELIM_JOIN, or
   //! DENSE_COUNT_JOIN — computed from `_parent_op` so it always reflects the final tree. Those

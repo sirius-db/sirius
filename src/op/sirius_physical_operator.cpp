@@ -81,7 +81,7 @@ std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_r
 }
 
 void pipelineable_operator_data::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
   remove_read_only_lock();
   auto data_batches = get_data_batches();
@@ -267,7 +267,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
                            " existing ports are: " + ports_string);
 }
 
-void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+void sirius_physical_operator::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   auto& pipelineable_output = dynamic_cast<const pipelineable_operator_data&>(output_data);
   for (auto& batch : pipelineable_output.get_data_batches()) {
@@ -278,7 +278,7 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
 }
 
 std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_data& input_data,
-                                                                 rmm::cuda_stream_view stream)
+                                                                 ::cuda::stream_ref stream)
 {
   // not doing anything for now
   return std::make_unique<pipelineable_operator_data>(

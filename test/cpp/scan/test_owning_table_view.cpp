@@ -40,7 +40,7 @@ using namespace sirius::op::scan;
 
 namespace {
 
-rmm::cuda_stream_view test_stream() { return cudf::get_default_stream(); }
+::cuda::stream_ref test_stream() { return cudf::get_default_stream(); }
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
 // Build an INT32 column whose single value tags the column for identification.
@@ -337,10 +337,8 @@ TEST_CASE("owning_table_view release awaits the copy before the owner reclaims m
   constexpr cudf::size_type kRows = 4 * 1024 * 1024;  // 16 MiB of INT32
   auto const kSourceBytes         = static_cast<std::size_t>(kRows) * sizeof(std::int32_t);
 
-  auto source       = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          kRows,
-                                          cudf::mask_state::UNALLOCATED,
-                                          work_stream.view());
+  auto source = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, kRows, cudf::mask_state::UNALLOCATED, work_stream);
   auto* source_data = source->mutable_view().data<std::int32_t>();
   cudaMemsetAsync(source_data, kSourceByte, kSourceBytes, work_stream.value());
   work_stream.synchronize();
@@ -360,7 +358,7 @@ TEST_CASE("owning_table_view release awaits the copy before the owner reclaims m
   // guaranteed to still be pending when release() hands back control. Without
   // the await this makes the race deterministic rather than probabilistic.
   constexpr std::size_t kBlockerBytes = 256UL * 1024 * 1024;
-  rmm::device_buffer blocker(kBlockerBytes, work_stream.view(), test_mr());
+  rmm::device_buffer blocker(kBlockerBytes, work_stream, test_mr());
   for (int i = 0; i < 8; ++i) {
     cudaMemsetAsync(blocker.data(), 0, kBlockerBytes, work_stream.value());
   }
@@ -369,7 +367,7 @@ TEST_CASE("owning_table_view release awaits the copy before the owner reclaims m
   owning_table_view handle{reclaiming_owner{probe, std::move(source_table)}, source_view};
   REQUIRE(handle.n_columns() == 1);
 
-  auto result = handle.release(work_stream.view(), test_mr());
+  auto result = handle.release(work_stream, test_mr());
   REQUIRE(result != nullptr);
 
   // The owner was destroyed by release(); the copy must already have completed.

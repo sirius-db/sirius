@@ -19,9 +19,10 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <vector>
@@ -85,7 +86,7 @@ class crc32_partition_hash {
    */
   static rmm::device_uvector<uint32_t> compute(cudf::table_view const& keys,
                                                std::vector<decimal_key> const& decimal_keys,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr);
 };
 

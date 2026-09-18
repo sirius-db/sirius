@@ -118,7 +118,7 @@ std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
-                                       rmm::cuda_stream_view stream)
+                                       ::cuda::stream_ref stream)
 {
   if (!table) { return std::move(table); }
 

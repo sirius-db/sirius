@@ -168,7 +168,7 @@ class prefetching_cache {
     size_t offset,
     size_t size,
     uint8_t* device_ptr,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     prefetching_handle* out_handle = nullptr);
 
   [[nodiscard]] std::string summary() const;

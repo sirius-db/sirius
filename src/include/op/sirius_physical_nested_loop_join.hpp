@@ -141,7 +141,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// @brief Join-type-correct output when one input side has no rows. Invoked by the regular
   /// execute path when it receives a real 0-row batch (e.g. an all-pruned scan under the
@@ -151,7 +151,7 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
                                                             const cudf::table_view& right,
                                                             bool left_side_empty,
                                                             cucascade::memory::memory_space& space,
-                                                            rmm::cuda_stream_view stream);
+                                                            ::cuda::stream_ref stream);
 
   //! Left table restricted to left_output_col_idxs (the plan's left projection map). Applied
   //! by the left-only output paths (SEMI/ANTI/MARK), whose result must match op.types;

@@ -20,7 +20,7 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstddef>
 
@@ -52,6 +52,6 @@ struct dynamic_filter_publication_outcome {
 [[nodiscard]] dynamic_filter_publication_outcome publish_dynamic_filters(
   dynamic_filter_publish_plan const& plan,
   cudf::table_view const& build_view,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 }  // namespace sirius::op

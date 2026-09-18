@@ -140,7 +140,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
  private:
   friend class sirius::planner::sirius_physical_plan_generator;

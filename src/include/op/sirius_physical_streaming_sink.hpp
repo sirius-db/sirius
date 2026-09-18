@@ -94,10 +94,10 @@ class sirius_physical_streaming_sink : public sirius_physical_operator {
 
   /// Pass-through so sink() sees the batches; base returns empty.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// N=1: native push. N>1: hash-partition; skip empty slices. Refused push = silent drop.
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
   /// 0 if N==1; ~2× when partitioned (hash_partition holds reorder + slices).
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(

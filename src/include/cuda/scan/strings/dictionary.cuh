@@ -23,7 +23,7 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -38,14 +38,14 @@ prepared_dict prepare_dict(gpu_string_codec_run const& run);
 void launch_dict_lengths(string_chunk_desc const* d_chunks,
                          uint32_t* d_lengths,
                          uint32_t n_chunks,
-                         rmm::cuda_stream_view stream);
+                         ::cuda::stream_ref stream);
 
 //! @brief Pass 2, short bucket: thread-per-row gather into @p d_chars. No-op when @p n_chunks is 0.
 void launch_dict_gather_short(string_chunk_desc const* d_chunks,
                               int32_t const* d_offsets,
                               uint8_t* d_chars,
                               uint32_t n_chunks,
-                              rmm::cuda_stream_view stream);
+                              ::cuda::stream_ref stream);
 
 //! @brief Pass 2, long bucket: warp-cooperative gather into @p d_chars. No-op when @p n_chunks is
 //! 0.
@@ -53,6 +53,6 @@ void launch_dict_gather_long(string_chunk_desc const* d_chunks,
                              int32_t const* d_offsets,
                              uint8_t* d_chars,
                              uint32_t n_chunks,
-                             rmm::cuda_stream_view stream);
+                             ::cuda::stream_ref stream);
 
 }  // namespace sirius::cuda::scan

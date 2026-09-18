@@ -68,9 +68,10 @@
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda/stream>
 
 namespace cc  = codegen;
 namespace cje = codegen::encode::jit;
@@ -252,7 +253,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                                      cudf::column const& packed_overalloc,
                                                      std::int32_t stride_words,
                                                      std::int64_t live_packed_bytes,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr)
 {
   auto check_rc = [](int rc, const char* what) {
@@ -297,7 +298,7 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                  scratch_buf = rmm::device_buffer(bytes, stream, mr);
                  return scratch_buf.data();
                },
-               stream.value()),
+               stream.get()),
              "bp_offsets");
 
     // Strided gather: copy live_words[c] = bp_offsets[c+1] - bp_offsets[c]
@@ -310,13 +311,13 @@ std::unique_ptr<cudf::column> compact_bitpack_packed(cudf::column const& chunk_c
                                           static_cast<std::int32_t>(num_chunks),
                                           stride_words,
                                           static_cast<std::int32_t>(sizeof(std::uint32_t)),
-                                          stream.value()),
+                                          stream.get()),
              "compact gather");
   }
 
   // Zero the guard words so the decode over-read returns deterministic
   // (masked-out) zeros rather than uninitialised memory.
-  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.value());
+  cudaMemsetAsync(static_cast<std::uint8_t*>(dense.data()) + live, 0, guard_bytes, stream.get());
 
   // packed is uint32 words; UINT32 (size = words) keeps a >2GB dense buffer
   // under cudf's 2^31-element cap.  The column size includes the guard words
@@ -591,7 +592,7 @@ struct masked_launch {
   /// Null for a selection that arrives after the scan: a row set carries its
   /// own geometry, so there is no mask to check against.
   ::sirius::codegen::selection_mask const* mask;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream{cudaStream_t{}};
 };
 
 // Storage for the trailing kernel arguments, bound by TAG rather than by
@@ -818,7 +819,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
                                    char const* dtype,
                                    std::int64_t num_rows,
                                    void* out,
-                                   rmm::cuda_stream_view stream,
+                                   ::cuda::stream_ref stream,
                                    VariantLaunchArgs const& va)
 {
   try {
@@ -857,7 +858,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
     };
 
     std::string err;
-    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.value(), labeled, &err)) {
+    if (!synthesize_decode_transients(tree, elem_size, alloc, stream.get(), labeled, &err)) {
       std::fprintf(stderr,
                    "simpatico::codegen: launch_decode_fused_tree: transient synth failed: %s\n",
                    err.c_str());
@@ -874,7 +875,7 @@ bool launch_decode_fused_tree_impl(codegen::jit::FusedTree const& tree,
              labeled,
              num_rows,
              reinterpret_cast<std::uintptr_t>(out),
-             reinterpret_cast<std::uintptr_t>(stream.value()),
+             reinterpret_cast<std::uintptr_t>(stream.get()),
              [&](const char* what) { _lap(what); },
              va) == 1;
   } catch (const jit::CompileError& e) {
@@ -900,7 +901,7 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,
-                              rmm::cuda_stream_view stream)
+                              ::cuda::stream_ref stream)
 {
   return launch_decode_fused_tree_impl(
     tree, labeled, dtype, num_rows, out, stream, VariantLaunchArgs{});
@@ -1021,7 +1022,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        std::int64_t num_rows,
                                        ::sirius::codegen::range_predicate pred,
                                        ::sirius::codegen::selection_mask& mask,
-                                       rmm::cuda_stream_view stream)
+                                       ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   va.shape    = cdj::kShapeMaskOut;
@@ -1043,7 +1044,7 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        rmm::cuda_stream_view stream)
+                                        ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(
@@ -1070,7 +1071,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              row_enumeration rows,
                                              std::int64_t* src_offsets_out,
                                              std::int32_t* lengths_out,
-                                             rmm::cuda_stream_view stream)
+                                             ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(va,
@@ -1100,7 +1101,7 @@ bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           void const* keys_chars,
                                           std::int32_t key_width,
                                           void* out_chars,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
   VariantLaunchArgs va;
   bind_enumeration(va,
@@ -1125,7 +1126,7 @@ bool launch_masked_char_copy(void const* chars,
                              std::int32_t const* out_offsets,
                              std::int64_t n_survivors,
                              void* out_chars,
-                             rmm::cuda_stream_view stream)
+                             ::cuda::stream_ref stream)
 {
   if (n_survivors <= 0) return true;  // empty selection: nothing to copy
   if (chars == nullptr || src_offsets == nullptr || out_offsets == nullptr ||
@@ -1155,13 +1156,13 @@ bool launch_masked_char_copy(void const* chars,
                                     1,
                                     1,
                                     0,
-                                    reinterpret_cast<CUstream>(stream.value()),
+                                    reinterpret_cast<CUstream>(stream.get()),
                                     args,
                                     nullptr),
                      false,
                      "masked char copy: cuLaunchKernel failed");
   SIMPATICO_CUDA_CHECK(
-    cudaStreamSynchronize(stream.value()), false, "masked char copy: stream sync failed");
+    cudaStreamSynchronize(stream.get()), false, "masked char copy: stream sync failed");
   return true;
 }
 
@@ -1282,7 +1283,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                          std::int64_t num_rows,
                                          std::uintptr_t data_ptr,
                                          simpatico::fused_leaf_builder* builder,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   if (builder == nullptr || cxx_dtype == nullptr) { return -1; }
@@ -1334,7 +1335,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
       if (f == "lw_shards" || (f == "packed" && !spec.buffers[i].no_pre_zero)) {
         const std::size_t bytes = spec.buffers[i].length * spec.buffers[i].elem_size;
         if (bytes > 0)
-          cudaMemsetAsync(reinterpret_cast<void*>(dev_ptrs[i]), 0, bytes, stream.value());
+          cudaMemsetAsync(reinterpret_cast<void*>(dev_ptrs[i]), 0, bytes, stream.get());
       }
     }
 
@@ -1361,7 +1362,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                       1,
                                       1,
                                       static_cast<unsigned>(spec.shared_bytes),
-                                      stream.value(),
+                                      stream.get(),
                                       args.data(),
                                       nullptr),
                        -1,
@@ -1407,11 +1408,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                             reinterpret_cast<const void*>(dev_ptrs[i_lws]),
                             kMaxBitsShards * kShardStride * sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost,
-                            stream.value()),
+                            stream.get()),
             -1,
             "cpp encode: lw_shards DtoH failed (nid=%d)",
             node_id);
-          cudaStreamSynchronize(stream.value());
+          cudaStreamSynchronize(stream.get());
           std::int64_t live_packed_bytes = 0;
           for (std::size_t s = 0; s < kMaxBitsShards; ++s)
             live_packed_bytes += static_cast<std::int64_t>(lw_shards[s * kShardStride]);
@@ -1476,7 +1477,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
             *cnt_col, *bits_col, *pkd_overalloc, stride_words, live_packed_bytes, stream, mr);
           // compact_bitpack_packed gathers on ``stream``; sync so the dense
           // bytes are safe to read from any stream before the pointer is exposed.
-          SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(stream.value()),
+          SIMPATICO_CUDA_CHECK(cudaStreamSynchronize(stream.get()),
                                -1,
                                "cpp encode: bitpack eager-compact sync failed (nid=%d)",
                                node_id);
@@ -1534,7 +1535,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                 static_cast<std::int32_t>(off_count),
                 /*d_temp_storage=*/nullptr,
                 &tmp_bytes,
-                /*stream=*/stream.value());
+                /*stream=*/stream.get());
               rc != 0) {
             std::fprintf(stderr,
                          "simpatico::codegen: cpp encode: rle_runs_offsets scan probe "
@@ -1549,7 +1550,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                 static_cast<std::int32_t>(off_count),
                 tmp_bytes > 0 ? scratch.data() : nullptr,
                 &tmp_bytes,
-                /*stream=*/stream.value());
+                /*stream=*/stream.get());
               rc != 0) {
             std::fprintf(stderr,
                          "simpatico::codegen: cpp encode: rle_runs_offsets scan run "
@@ -1738,11 +1739,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                    reinterpret_cast<const void*>(d_tail),
                                                    sizeof(std::int32_t),
                                                    cudaMemcpyDeviceToHost,
-                                                   stream.value()),
+                                                   stream.get()),
                                    -1,
                                    "RLE Raw compact (%s): total_runs DtoH failed",
                                    origin.parent_channel.c_str());
-              cudaStreamSynchronize(stream.value());
+              cudaStreamSynchronize(stream.get());
             }
 
             rmm::device_buffer compact_buf(
@@ -1757,7 +1758,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                  num_chunks,
                                                  kChunkSize,
                                                  elem_size,
-                                                 stream.value());
+                                                 stream.get());
                   rc != 0) {
                 std::fprintf(
                   stderr,
@@ -1766,7 +1767,7 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                   rc);
                 return -1;
               }
-              cudaStreamSynchronize(stream.value());
+              cudaStreamSynchronize(stream.get());
             }
 
             auto data_col = std::make_unique<cudf::column>(data_elem_type,
@@ -1782,11 +1783,11 @@ static int launch_encode_fused_tree_impl(const simpatico::CodegenHead& head,
                                                  reinterpret_cast<const void*>(dev_ptrs[i_rle_off]),
                                                  offs_bytes,
                                                  cudaMemcpyDeviceToDevice,
-                                                 stream.value()),
+                                                 stream.get()),
                                  -1,
                                  "RLE Raw compact (%s): offsets DtoD failed",
                                  origin.parent_channel.c_str());
-            cudaStreamSynchronize(stream.value());
+            cudaStreamSynchronize(stream.get());
             auto offs_col =
               std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                              static_cast<cudf::size_type>(num_chunks + 1),
@@ -1833,7 +1834,7 @@ namespace simpatico {
 
 bool launch_encode_fused_tree(CodegenHead const& head,
                               cudf::column_view const& input_col,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref const& mr,
                               fused_leaf_builder& builder,
                               std::string* error_out)
@@ -1911,7 +1912,7 @@ bool launch_encode_fused_tree(CodegenHead const& head,
 bool encode_fused_subtree(PlanTree const& tree,
                           NodeId start_node,
                           cudf::column_view input_col,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr,
                           fused_leaf_builder& builder,
                           std::string* error_out,

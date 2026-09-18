@@ -12,11 +12,11 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cctype>
@@ -122,7 +122,7 @@ struct compressed_representation {
   /// Canonical channel enumeration: this rep's named output channels, in manifest/wire order.
   /// Generic implementation: driven by channels_ + op_info(kind()).channels from the registry.
   /// Subclasses with variable-arity or lazy synthesis (dictionary, bitextract) override this.
-  virtual std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const
+  virtual std::vector<compressible_output> named_channels(::cuda::stream_ref) const
   {
     auto const& names = op_info(kind()).channels;
     std::vector<compressible_output> out;
@@ -144,7 +144,7 @@ struct compressed_representation {
   /// Wire size in bytes. Default sums each stored named channel. Fused Bitpack
   /// reps are already Compact when published; encode-only OverAllocate scratch
   /// and decode-only allocation slack are not exposed through named_channels().
-  virtual size_t compressed_size_bytes(rmm::cuda_stream_view stream) const
+  virtual size_t compressed_size_bytes(::cuda::stream_ref stream) const
   {
     size_t total = 0;
     for (auto const& o : named_channels(stream)) {
@@ -171,7 +171,7 @@ struct compressed_representation {
 struct standalone_compressed_representation : compressed_representation {
   using compressed_representation::compressed_representation;
 
-  virtual std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  virtual std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref mr) const = 0;
 };
 
@@ -181,7 +181,7 @@ struct identity_compressed_representation : standalone_compressed_representation
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
@@ -192,7 +192,7 @@ struct identity_compressed_representation : standalone_compressed_representation
     channels_.push_back(std::move(c));
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override
   {
     if (channels_.empty() || !channels_[0]) return nullptr;
@@ -208,7 +208,7 @@ struct compressor {
   virtual ~compressor() = default;
   virtual std::unique_ptr<compressed_representation> compress(
     cudf::column_view column_to_compress,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) = 0;
 };
 
@@ -217,7 +217,7 @@ struct compressor {
 /// str_split; the body is defined inline below, after str_split_compressor is declared.
 struct identity_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -228,7 +228,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
@@ -258,7 +258,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
     num_rows      = dict_column ? dict_column->size() : 0;
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   /// Evaluate @p pred against the dictionary *keys* and map the result over the
@@ -271,10 +271,10 @@ struct dictionary_compressed_representation : standalone_compressed_representati
   /// INT32 indices. Nulls propagate from the dictionary column, matching the
   /// semantics of comparing the decoded STRING column against the same values.
   std::unique_ptr<cudf::column> decompress_predicate(decode_predicate const& pred,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr) const;
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view stream) const override
+  std::vector<compressible_output> named_channels(::cuda::stream_ref stream) const override
   {
     std::vector<compressible_output> outputs;
 
@@ -295,8 +295,8 @@ struct dictionary_compressed_representation : standalone_compressed_representati
                                         stream,
                                         rmm::mr::get_current_device_resource_ref());
         cudaMemsetAsync(
-          keys_offsets_synth->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
-        cudaStreamSynchronize(stream.value());
+          keys_offsets_synth->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.get());
+        cudaStreamSynchronize(stream.get());
       }
       outputs.push_back({"keys_offsets", keys_offsets_synth->view()});
     } else {
@@ -327,9 +327,9 @@ struct dictionary_compressed_representation : standalone_compressed_representati
                         chars_ptr,
                         chars_size,
                         cudaMemcpyDeviceToDevice,
-                        stream.value());
+                        stream.get());
       }
-      cudaStreamSynchronize(stream.value());
+      cudaStreamSynchronize(stream.get());
     }
     outputs.push_back({"keys_chars", keys_chars_copy->view()});
 
@@ -361,7 +361,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
  private:
   // Copy `source`'s validity bitmask into the owned UINT8 null_mask_copy
   // column (no-op if already built).
-  void ensure_null_mask_copy(cudf::column_view const& source, rmm::cuda_stream_view stream) const
+  void ensure_null_mask_copy(cudf::column_view const& source, ::cuda::stream_ref stream) const
   {
     if (null_mask_copy) return;
     auto mr                 = rmm::mr::get_current_device_resource_ref();
@@ -370,7 +370,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
       static_cast<cudf::size_type>(cudf::bitmask_allocation_size_bytes(source.size()));
     null_mask_copy = std::make_unique<cudf::column>(
       cudf::data_type{cudf::type_id::UINT8}, mask_bytes, std::move(bits), rmm::device_buffer{}, 0);
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
   }
 };
 
@@ -378,7 +378,7 @@ struct dictionary_compressed_representation : standalone_compressed_representati
 /// keys buffer + offsets + indices (keys_offsets/keys_chars/indices form).
 struct dictionary_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -398,7 +398,7 @@ struct str_split_compressed_representation : standalone_compressed_representatio
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
@@ -413,7 +413,7 @@ struct str_split_compressed_representation : standalone_compressed_representatio
     if (null_mask) channels_.push_back(std::move(null_mask));
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   std::vector<std::string> required_channels() const override
@@ -427,7 +427,7 @@ struct str_split_compressed_representation : standalone_compressed_representatio
 
 struct str_split_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -435,7 +435,7 @@ struct str_split_compressor : compressor {
 // str_split; any other type is copied verbatim into an identity leaf.
 inline std::unique_ptr<compressed_representation> identity_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (column_to_compress.type().id() == cudf::type_id::STRING) {
@@ -500,7 +500,7 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
     return MetaT{uncompressed_size, static_cast<std::int32_t>(original_type.id())};
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override = 0;
 };
 
@@ -511,13 +511,13 @@ struct nvcomp_simple_rep_base : nvcomp_payload_rep {
 // Reconstructed generically via nvcomp_simple_from_outputs (representation_factory.cpp).
 struct ans_compressed_representation : nvcomp_simple_rep_base<OpId::Ans, leaf_meta::ans> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
 struct ans_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -533,7 +533,7 @@ struct bitcomp_compressed_representation : nvcomp_payload_rep {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
@@ -552,7 +552,7 @@ struct bitcomp_compressed_representation : nvcomp_payload_rep {
   {
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   OpId kind() const override { return OpId::Bitcomp; }
@@ -570,7 +570,7 @@ struct bitcomp_compressor : compressor {
   bitcomp_compressor(int algorithm = 0) : algorithm_(algorithm) {}
 
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 
  private:
@@ -597,7 +597,7 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out,
     leaf_meta_v const& meta = leaf_meta::none{});
@@ -623,7 +623,7 @@ struct cascaded_compressed_representation : nvcomp_payload_rep {
   {
   }
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   OpId kind() const override { return OpId::NvcompCascaded; }
@@ -645,7 +645,7 @@ struct cascaded_compressor : compressor {
   }
 
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 
  private:
@@ -662,38 +662,38 @@ struct cascaded_compressor : compressor {
 // snappy/lz4/deflate: reconstructed generically via nvcomp_simple_from_outputs.
 struct snappy_compressed_representation : nvcomp_simple_rep_base<OpId::Snappy, leaf_meta::snappy> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
 struct lz4_compressed_representation : nvcomp_simple_rep_base<OpId::Lz4, leaf_meta::lz4> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
 struct deflate_compressed_representation
   : nvcomp_simple_rep_base<OpId::Deflate, leaf_meta::deflate> {
   using nvcomp_simple_rep_base::nvcomp_simple_rep_base;
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
 struct snappy_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
 struct lz4_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
 struct deflate_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -706,7 +706,7 @@ struct alp_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
@@ -720,7 +720,7 @@ struct alp_compressed_representation : standalone_compressed_representation {
                                 std::unique_ptr<cudf::column> exception_positions_in,
                                 std::unique_ptr<cudf::column> metadata_in);
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   // Named accessors for decompress impl (channels_ in registry order).
@@ -746,7 +746,7 @@ struct alp_compressed_representation : standalone_compressed_representation {
 
 struct alp_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -760,7 +760,7 @@ struct alp_rd_compressed_representation : standalone_compressed_representation {
   static std::unique_ptr<compressed_representation> from_outputs(
     std::vector<std::string> const& output_names,
     std::vector<std::unique_ptr<cudf::column>> outputs,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr,
     std::string* error_out);
 
@@ -776,7 +776,7 @@ struct alp_rd_compressed_representation : standalone_compressed_representation {
                                    std::unique_ptr<cudf::column> exceptions_in,
                                    std::unique_ptr<cudf::column> exception_positions_in);
 
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 
   // Named accessors for decompress impl (channels_ in registry order).
@@ -808,7 +808,7 @@ struct alp_rd_compressed_representation : standalone_compressed_representation {
 
 struct alp_rd_compressor : compressor {
   std::unique_ptr<compressed_representation> compress(cudf::column_view column_to_compress,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -852,7 +852,7 @@ struct bitextract_compressed_representation : standalone_compressed_representati
   {
   }
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  std::vector<compressible_output> named_channels(::cuda::stream_ref) const override
   {
     std::vector<compressible_output> out;
     out.reserve(spec.fields.size());
@@ -863,7 +863,7 @@ struct bitextract_compressed_representation : standalone_compressed_representati
   }
 
   // Implemented in bitjoin_bitextract.cu
-  std::unique_ptr<cudf::column> decompress(rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::column> decompress(::cuda::stream_ref stream,
                                            rmm::device_async_resource_ref mr) const override;
 };
 
@@ -880,7 +880,7 @@ struct bitextract_compressor : compressor {
 
   // Implemented in bitjoin_bitextract.cu
   std::unique_ptr<compressed_representation> compress(cudf::column_view column,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr) override;
 };
 
@@ -905,7 +905,7 @@ struct codegen_fused_representation : compressed_representation {
   {
   }
 
-  std::vector<compressible_output> named_channels(rmm::cuda_stream_view) const override
+  std::vector<compressible_output> named_channels(::cuda::stream_ref) const override
   {
     std::vector<compressible_output> out;
     out.reserve(buffers.size());
@@ -926,7 +926,7 @@ struct codegen_fused_representation : compressed_representation {
 /// Callers should use this instead of calling rep->decompress() directly.
 std::unique_ptr<cudf::column> decompress_standalone_representation(
   compressed_representation const* rep,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out);
 

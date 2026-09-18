@@ -31,10 +31,10 @@
 
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/scan/gpu_native_decode.cuh>
+#include <cuda/stream>
 
 #include <duckdb/common/vector_size.hpp>
 
@@ -75,7 +75,7 @@ void decode_bitpacking_data(gpu_codec_run const& run,
                             uint8_t* d_output,
                             cudf::data_type type,
                             uint32_t type_size,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::cuda::scan
