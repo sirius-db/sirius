@@ -1,9 +1,15 @@
-//! Replays the captured TPC-H dispatch corpus (`tests/fixtures/tpch/qNN/`) through the
-//! backend's decoder: every payload must decode, its shape must match the summary captured
-//! alongside it, and the batch must have the structure the dispatcher relies on.
+//! Replays the captured dispatch corpora through the backend's decoder and the translator:
+//! every payload must decode, its shape must match the summary captured alongside it, the
+//! batch must have the structure the dispatcher relies on, and its translation must match
+//! the reviewed snapshot in `tests/snapshots/`.
 //!
-//! This is the harness the translator (P1) builds on: each `batch-NN-request.tcompact` is a
-//! real `TPipelineFragmentParamsList` from Doris FE 4.1.4 for one TPC-H query.
+//! - `tests/fixtures/tpch/qNN/`: the 22 TPC-H queries, all of which translate into one plan.
+//! - `tests/fixtures/gaps/<gNN-name>/`: probes for `semantics-gaps.md` entries that only show
+//!   at plan-node level (G-11 window, G-12 UNION, G-13 DISTINCT); the verdict of each is
+//!   pinned by [`gap_corpus_verdicts`].
+//!
+//! Each `batch-NN-request.tcompact` is a real `TPipelineFragmentParamsList` from Doris FE
+//! 4.1.4, captured with `scripts/run-tpch.sh --translate-only`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -11,7 +17,9 @@ use std::path::{Path, PathBuf};
 use doris_plan_translator::expr_translator::{
     ExprContext, SlotOverrides, aggregate_call, translate_expr,
 };
-use doris_plan_translator::{DescriptorTable, ExtensionRegistry, PlanTranslator, TranslateError};
+use doris_plan_translator::{
+    DescriptorTable, ExtensionRegistry, PlanTranslator, TranslateError, stitch_fragments,
+};
 use doris_proto::{PExecPlanFragmentRequest, PFragmentRequestVersion};
 use doris_thrift::data_sinks::TDataSink;
 use doris_thrift::exprs::TExpr;
@@ -24,10 +32,39 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tpch")
 }
 
-/// `(query name, payload path, summary path)` for every captured batch, sorted.
+fn gaps_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gaps")
+}
+
+fn snapshot_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots")
+}
+
+/// Set to regenerate `tests/snapshots/` from the current translator output.
+const UPDATE_SNAPSHOTS_ENV: &str = "UPDATE_SNAPSHOTS";
+
+/// Every formatter warning is a real gap: `explain::render` rewrites the constructs
+/// `substrait-explain` cannot textify (`local_files`, decimal literals, `IN` lists, DISTINCT).
+fn assert_renders_cleanly(text: &str, context: &str) {
+    assert!(
+        !text.contains("format warnings: "),
+        "{context}: substrait-explain could not render part of the plan\n{text}"
+    );
+    assert!(
+        !text.contains("!{"),
+        "{context}: placeholder in explain text\n{text}"
+    );
+}
+
+/// `(query name, payload path, summary path)` for every captured TPC-H batch, sorted.
 fn captured_batches() -> Vec<(String, PathBuf, PathBuf)> {
+    captured_batches_in(&corpus_dir())
+}
+
+/// `(query name, payload path, summary path)` for every captured batch under `dir`, sorted.
+fn captured_batches_in(dir: &Path) -> Vec<(String, PathBuf, PathBuf)> {
     let mut batches = Vec::new();
-    for entry in std::fs::read_dir(corpus_dir()).expect("corpus directory") {
+    for entry in std::fs::read_dir(dir).expect("corpus directory") {
         let query_dir = entry.unwrap().path();
         if !query_dir.is_dir() {
             continue;
@@ -422,14 +459,7 @@ fn every_corpus_fragment_translates_or_is_a_two_phase_aggregate() {
                 Ok(plan) => {
                     translated += 1;
                     let text = plan.explain().to_string();
-                    // `substrait-explain` cannot render everything the plans use yet
-                    // (`local_files` reads, IN lists, decimal literals); such gaps are
-                    // `Unimplemented` warnings. Anything else is a malformed plan.
-                    if let Some((_, warnings)) = text.split_once("format warnings: ") {
-                        let unexpected = warnings.matches("PlanError").count()
-                            - warnings.matches("error_type: Unimplemented").count();
-                        assert_eq!(unexpected, 0, "{query} fragment {}: {text}", fragment.index);
-                    }
+                    assert_renders_cleanly(&text, &format!("{query} fragment {}", fragment.index));
                     explained_chars += text.len();
                     assert!(
                         !plan.output_names.is_empty(),
@@ -473,11 +503,145 @@ fn every_corpus_query_stitches_into_one_plan() {
             !text.contains("sirius_stream_"),
             "{query}: an exchange survived stitching\n{text}"
         );
-        if let Some((_, warnings)) = text.split_once("format warnings: ") {
-            let unexpected = warnings.matches("PlanError").count()
-                - warnings.matches("error_type: Unimplemented").count();
-            assert_eq!(unexpected, 0, "{query}: {text}");
-        }
+        assert_renders_cleanly(&text, &query);
         assert!(!plan.output_names.is_empty(), "{query}");
     }
+}
+
+/// The reviewed snapshot text for one query: the stitched plan-node tree the stitcher
+/// produced, then the `substrait-explain` rendering of the translated plan — or the
+/// translation error, for the gap probes the translator is expected to refuse.
+fn snapshot_text(
+    corpus: &str,
+    query: &str,
+    batch: &FragmentBatch,
+    translator: &PlanTranslator,
+) -> String {
+    let fragments: Vec<_> = batch.fragments.iter().map(|f| &f.params).collect();
+    let body = match stitch_fragments(&fragments) {
+        Ok(stitched) => {
+            let tree = stitched
+                .fragment
+                .as_ref()
+                .and_then(|fragment| fragment.plan.as_ref())
+                .map(|plan| {
+                    plan.nodes
+                        .iter()
+                        .map(|node| format!("{:?}", node.node_type))
+                        .collect::<Vec<_>>()
+                        .join(" > ")
+                })
+                .unwrap_or_default();
+            match translator.translate_fragment(&stitched) {
+                Ok(plan) => format!("stitched: {tree}\n{}", plan.explain()),
+                Err(err) => format!("stitched: {tree}\ntranslation error: {err}\n"),
+            }
+        }
+        Err(err) => format!("stitch error: {err}\n"),
+    };
+    let shapes: Vec<String> = batch
+        .fragments
+        .iter()
+        .map(|f| f.shape().replace(" instances=1", ""))
+        .collect();
+    format!(
+        "# {query}: {} fragments (root first):\n#   {}\n\
+         # Reviewed by hand against tests/fixtures/{corpus}/{query}/query.sql; regenerate with\n\
+         # `{UPDATE_SNAPSHOTS_ENV}=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.\n\
+         {body}",
+        batch.fragments.len(),
+        shapes.join("\n#   "),
+    )
+}
+
+/// P1.5: the stitched plan (or refusal) of every corpus query matches its reviewed snapshot in
+/// `tests/snapshots/<query>.txt` (set `UPDATE_SNAPSHOTS=1` to rewrite them, then review the
+/// diff).
+#[test]
+fn every_corpus_query_matches_its_snapshot() {
+    let translator = PlanTranslator::new();
+    let update = std::env::var_os(UPDATE_SNAPSHOTS_ENV).is_some();
+    let mut mismatches = Vec::new();
+    let all = captured_batches()
+        .into_iter()
+        .map(|batch| ("tpch", batch))
+        .chain(
+            captured_batches_in(&gaps_dir())
+                .into_iter()
+                .map(|batch| ("gaps", batch)),
+        );
+    for (corpus, (query, payload, _)) in all {
+        let batch = decode(&payload);
+        let actual = snapshot_text(corpus, &query, &batch, &translator);
+        assert_renders_cleanly(&actual, &query);
+        let path = snapshot_dir().join(format!("{query}.txt"));
+        if update {
+            std::fs::create_dir_all(snapshot_dir()).unwrap();
+            std::fs::write(&path, &actual).unwrap();
+            continue;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_default();
+        if expected != actual {
+            let first_diff = expected
+                .lines()
+                .zip(actual.lines())
+                .position(|(e, a)| e != a)
+                .map_or(
+                    expected.lines().count().min(actual.lines().count()) + 1,
+                    |n| n + 1,
+                );
+            mismatches.push(format!(
+                "{}: differs from the translator output starting at line {first_diff}\n\
+                 ---- actual ----\n{actual}",
+                path.display()
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} snapshot(s) out of date (review, then `{UPDATE_SNAPSHOTS_ENV}=1 cargo test --test \
+         corpus -p sirius-doris-be --no-default-features` to accept):\n\n{}",
+        mismatches.len(),
+        mismatches.join("\n\n")
+    );
+}
+
+/// P1.5: node-level entries of `semantics-gaps.md`, probed with real FE 4.1.4 dispatches
+/// (`sql/gaps/*.sql`): G-11 and G-12 are refused naming the offending node, G-13 folds into
+/// a group-by without measures (Nereids never plans a distinct operator).
+#[test]
+fn gap_corpus_verdicts() {
+    let translator = PlanTranslator::new();
+    let mut seen = BTreeSet::new();
+    for (query, payload, _) in captured_batches_in(&gaps_dir()) {
+        let batch = decode(&payload);
+        let fragments: Vec<_> = batch.fragments.iter().map(|f| &f.params).collect();
+        let outcome = translator.translate_batch(&fragments);
+        let expect_refused = |node: &str| match &outcome {
+            Err(TranslateError::UnsupportedPlanNode { node_type, .. }) => {
+                assert_eq!(format!("{node_type:?}"), node, "{query}")
+            }
+            other => panic!("{query}: expected {node} to be refused, got {other:?}"),
+        };
+        match query.as_str() {
+            "g11-window" => expect_refused("ANALYTIC_EVAL_NODE"),
+            "g12-union-all" | "g12-union-distinct" => expect_refused("UNION_NODE"),
+            "g13-distinct" => {
+                let text = outcome.as_ref().unwrap().explain().to_string();
+                assert!(text.contains("Aggregate[$0 => $0]"), "{query}: {text}");
+                assert_eq!(outcome.as_ref().unwrap().output_names, ["n_regionkey"]);
+            }
+            "g13-distinct-topn" => {
+                let text = outcome.as_ref().unwrap().explain().to_string();
+                assert!(
+                    text.contains("Aggregate[$0, $1 => $0, $1]"),
+                    "{query}: {text}"
+                );
+                assert!(text.contains("Fetch[limit=3"), "{query}: {text}");
+            }
+            other => panic!("{other}: no verdict recorded for this gap probe; add one here"),
+        }
+        seen.insert(query);
+    }
+    assert_eq!(seen.len(), 5, "gap probes present: {seen:?}");
 }

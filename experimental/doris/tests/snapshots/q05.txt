@@ -1,0 +1,61 @@
+# q05: 9 fragments (root first):
+#   fragment_id=13 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=12 sink=DATA_STREAM_SINK nodes=[SORT_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=11 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=10 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=8 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=6 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=4 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q05/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_boolean
+  @  3: extension:io.substrait:functions_arithmetic
+  @  4: extension:io.substrait:functions_aggregate_generic
+Functions:
+  #  1 @  1: gte
+  #  2 @  1: lt
+  #  3 @  2: and
+  #  4 @  1: equal
+  #  5 @  3: subtract
+  #  6 @  3: multiply
+  #  7 @  4: sum
+
+=== Plan
+Root[n_name, revenue]
+  Project[$0, $1]
+    Sort[($1, &DescNullsLast) => $0, $1]
+      Sort[($1, &DescNullsLast) => $0, $1]
+        Project[$0, ($1)::!decimal?<38, 4>]
+          Aggregate[$0 => $0, sum(multiply($1, subtract(1.00:decimal<16, 2>, ($2)::!decimal?<16, 2>):decimal?<16, 2>):decimal?<31, 4>):decimal?<38, 4>]
+            Project[$2, $0, $1]
+              Join[&Inner, equal($3, $4):boolean? => $0, $1, $2, $3, $4]
+                Project[$0, $1, $4, $5]
+                  Join[&Inner, equal($2, $3):boolean? => $0, $1, $2, $3, $4, $5]
+                    Project[$2, $3, $5]
+                      Join[&Inner, and(equal($1, $4):boolean?, equal($0, $5):boolean?):boolean? => $0, $1, $2, $3, $4, $5]
+                        Project[$0, $3, $4, $5]
+                          Join[&Inner, equal($1, $2):boolean? => $0, $1, $2, $3, $4, $5]
+                            Project[$1, $2]
+                              Join[&Inner, equal($0, $3):boolean? => $0, $1, $2, $3]
+                                Project[$0, $1]
+                                  Read["local_files:/tmp/tpch-sf1/customer/part.0.parquet" => c_custkey:i32?, c_nationkey:i32?]
+                                Project[$0, $1]
+                                  Filter[and(gte($2, '1994-01-01':date):boolean?, lt($2, '1995-01-01':date):boolean?):boolean? => $0, $1, $2]
+                                    Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_custkey:i32?, o_orderdate:date?]
+                            Project[$0, $1, $2, $3]
+                              Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_orderkey:i64?, l_suppkey:i32?, l_extendedprice:decimal?<15, 2>, l_discount:decimal?<15, 2>]
+                        Project[$0, $1]
+                          Read["local_files:/tmp/tpch-sf1/supplier/part.0.parquet" => s_suppkey:i32?, s_nationkey:i32?]
+                    Project[$0, $1, $2]
+                      Read["local_files:/tmp/tpch-sf1/nation/part.0.parquet" => n_nationkey:i32?, n_name:string?, n_regionkey:i32?]
+                Project[$0]
+                  Filter[equal($1, 'ASIA'):boolean? => $0, $1]
+                    Read["local_files:/tmp/tpch-sf1/region/part.0.parquet" => r_regionkey:i32?, r_name:string?]

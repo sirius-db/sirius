@@ -1,0 +1,76 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    n_regionkey[#10]
+    n_name[#11]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  5:VMERGING-EXCHANGE
+     offset: 0
+     limit: 3
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: n_regionkey[#6], n_name[#7]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 05
+    UNPARTITIONED
+IS_MERGE: true
+
+  4:VTOP-N(234)
+  |  order by: n_regionkey[#10] ASC
+  |  algorithm: heap sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  limit: 3
+  |  distribute expr lists: n_regionkey[#8], n_name[#9]
+  |  
+  3:VAGGREGATE (merge finalize)(230)
+  |  group by: n_regionkey[#6], n_name[#7]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: n_regionkey[#6], n_name[#7]
+  |  
+  2:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    HASH_PARTITIONED: n_regionkey[#6], n_name[#7]
+
+  1:VAGGREGATE (update serialize)(222)
+  |  STREAMING
+  |  group by: n_regionkey[#4], n_name[#5]
+  |  sortByGroupKey:false
+  |  cardinality=0
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(214)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_regionkey[#2], _tvf_local.n_name[#1]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

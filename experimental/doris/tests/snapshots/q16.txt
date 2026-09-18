@@ -1,0 +1,49 @@
+# q16: 6 fragments (root first):
+#   fragment_id=7 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=6 sink=DATA_STREAM_SINK nodes=[SORT_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=5 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=4 sink=DATA_STREAM_SINK nodes=[HASH_JOIN_NODE > FILE_SCAN_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q16/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_string
+  @  2: extension:io.substrait:functions_comparison
+  @  3: extension:io.substrait:functions_boolean
+  @  4: extension:io.substrait:functions_aggregate_generic
+  @  5: extension:sirius:explain-only
+Functions:
+  #  1 @  1: like
+  #  2 @  2: equal
+  #  3 @  3: not
+  #  4 @  2: not_equal
+  #  5 @  3: and
+  #  6 @  4: count
+  #  7 @  5: in_list
+
+=== Plan
+Root[p_brand, p_type, p_size, supplier_cnt]
+  Project[$0, $1, $2, $3]
+    Sort[($3, &DescNullsLast), ($0, &AscNullsFirst), ($1, &AscNullsFirst), ($2, &AscNullsFirst) => $0, $1, $2, $3]
+      Sort[($3, &DescNullsLast), ($0, &AscNullsFirst), ($1, &AscNullsFirst), ($2, &AscNullsFirst) => $0, $1, $2, $3]
+        Project[$0, $1, $2, ($3)::!i64]
+          Aggregate[$0, $1, $2 => $0, $1, $2, count($3, distinct⇒[true]):i64]
+            Project[$3, $4, $5, $1]
+              Join[&Inner, equal($0, $2):boolean? => $0, $1, $2, $3, $4, $5]
+                Project[$0, $1]
+                  Project[$0, $1]
+                    Filter[not($2):boolean? => $0, $1, $2]
+                      Join[&LeftMark, equal($1, $2):boolean? => $0, $1, $2]
+                        Project[$0, $1]
+                          Read["local_files:/tmp/tpch-sf1/partsupp/part.0.parquet" => ps_partkey:i32?, ps_suppkey:i32?]
+                        Project[$0]
+                          Filter[like($1, '%Customer%Complaints%'):boolean? => $0, $1]
+                            Read["local_files:/tmp/tpch-sf1/supplier/part.0.parquet" => s_suppkey:i32?, s_comment:string?]
+                Project[$0, $1, $2, $3]
+                  Filter[and(not_equal($1, 'Brand#45'):boolean?, not(like($2, 'MEDIUM POLISHED%'):boolean?):boolean?, in_list($3, 49:i32, 14:i32, 23:i32, 45:i32, 19:i32, 3:i32, 36:i32, 9:i32):boolean?):boolean? => $0, $1, $2, $3]
+                    Read["local_files:/tmp/tpch-sf1/part/part.0.parquet" => p_partkey:i32?, p_brand:string?, p_type:string?, p_size:i32?]

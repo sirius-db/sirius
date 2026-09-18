@@ -1,0 +1,67 @@
+# q11: 11 fragments (root first):
+#   fragment_id=15 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=14 sink=DATA_STREAM_SINK nodes=[SORT_NODE > CROSS_JOIN_NODE > AGGREGATION_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=13 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=12 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=10 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=8 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=6 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=5 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=4 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q11/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > SORT_NODE > CROSS_JOIN_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_arithmetic
+  @  3: extension:io.substrait:functions_aggregate_generic
+Functions:
+  #  1 @  1: equal
+  #  2 @  2: multiply
+  #  3 @  3: sum
+  #  4 @  1: gt
+
+=== Plan
+Root[ps_partkey, value]
+  Project[$0, $1]
+    Sort[($1, &DescNullsLast) => $0, $1]
+      Sort[($1, &DescNullsLast) => $0, $1]
+        Project[$0, $1]
+          Filter[gt($2, $3):boolean? => $0, $1, $2, $3]
+            Project[$0, $1, $2, $4]
+              Join[&Inner, equal($3, $5):boolean? => $0, $1, $2, $3, $4, $5]
+                Project[$0, $1, $2, 1:i32]
+                  Project[$0, $1, (($1)::!decimal?<38, 6>)::!decimal?<38, 6>]
+                    Project[$0, ($1)::!decimal?<38, 2>]
+                      Aggregate[$0 => $0, sum(multiply($2, ($1)::!decimal?<10, 0>):decimal?<25, 2>):decimal?<38, 2>]
+                        Project[$0, $1, $2]
+                          Join[&Inner, equal($3, $4):boolean? => $0, $1, $2, $3, $4]
+                            Project[$0, $2, $3, $5]
+                              Join[&Inner, equal($1, $4):boolean? => $0, $1, $2, $3, $4, $5]
+                                Project[$0, $1, $2, $3]
+                                  Read["local_files:/tmp/tpch-sf1/partsupp/part.0.parquet" => ps_partkey:i32?, ps_suppkey:i32?, ps_availqty:i32?, ps_supplycost:decimal?<15, 2>]
+                                Project[$0, $1]
+                                  Read["local_files:/tmp/tpch-sf1/supplier/part.0.parquet" => s_suppkey:i32?, s_nationkey:i32?]
+                            Project[$0]
+                              Filter[equal($1, 'GERMANY'):boolean? => $0, $1]
+                                Read["local_files:/tmp/tpch-sf1/nation/part.0.parquet" => n_nationkey:i32?, n_name:string?]
+                Project[$0, 1:i32]
+                  Project[(multiply($0, 0.000002:decimal<6, 6>):decimal?<38, 6>)::!decimal?<38, 6>]
+                    Project[($0)::!decimal?<38, 2>]
+                      Aggregate[_ => sum(multiply($1, ($0)::!decimal?<10, 0>):decimal?<25, 2>):decimal?<38, 2>]
+                        Project[$0, $1]
+                          Join[&Inner, equal($2, $3):boolean? => $0, $1, $2, $3]
+                            Project[$1, $2, $4]
+                              Join[&Inner, equal($0, $3):boolean? => $0, $1, $2, $3, $4]
+                                Project[$0, $1, $2]
+                                  Read["local_files:/tmp/tpch-sf1/partsupp/part.0.parquet" => ps_suppkey:i32?, ps_availqty:i32?, ps_supplycost:decimal?<15, 2>]
+                                Project[$0, $1]
+                                  Read["local_files:/tmp/tpch-sf1/supplier/part.0.parquet" => s_suppkey:i32?, s_nationkey:i32?]
+                            Project[$0]
+                              Filter[equal($1, 'GERMANY'):boolean? => $0, $1]
+                                Read["local_files:/tmp/tpch-sf1/nation/part.0.parquet" => n_nationkey:i32?, n_name:string?]

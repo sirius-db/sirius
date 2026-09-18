@@ -1,0 +1,58 @@
+# q22: 7 fragments (root first):
+#   fragment_id=8 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=7 sink=DATA_STREAM_SINK nodes=[SORT_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=6 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > CROSS_JOIN_NODE > AGGREGATION_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=5 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > FILE_SCAN_NODE]
+#   fragment_id=3 sink=DATA_STREAM_SINK nodes=[HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q22/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > CROSS_JOIN_NODE > AGGREGATION_NODE > FILE_SCAN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_string
+  @  3: extension:io.substrait:functions_boolean
+  @  4: extension:io.substrait:functions_aggregate_generic
+  @  5: extension:sirius:explain-only
+Functions:
+  #  1 @  1: gt
+  #  2 @  2: substring
+  #  3 @  3: and
+  #  4 @  4: avg
+  #  5 @  1: equal
+  #  6 @  1: is_null
+  #  7 @  4: count
+  #  8 @  4: sum
+  #  9 @  5: in_list
+
+=== Plan
+Root[cntrycode, numcust, totacctbal]
+  Project[$0, $1, $2]
+    Sort[($0, &AscNullsFirst) => $0, $1, $2]
+      Sort[($0, &AscNullsFirst) => $0, $1, $2]
+        Project[$0, ($1)::!i64, ($2)::!decimal?<38, 2>]
+          Aggregate[$0 => $0, count():i64, sum($1):decimal?<38, 2>]
+            Project[(substring($1, 1:i32, 2:i32):varchar?<2>)::!varchar?<2>, $2]
+              Filter[gt($3, $0):boolean? => $0, $1, $2, $3]
+                Project[$0, $2, $3, $4]
+                  Join[&Inner, equal($1, $5):boolean? => $0, $1, $2, $3, $4, $5]
+                    Project[$0, 1:i32]
+                      Project[($0)::!decimal?<38, 4>]
+                        Aggregate[_ => avg($0):decimal?<38, 4>]
+                          Project[$1]
+                            Filter[and(gt($1, 0.00:decimal<15, 2>):boolean?, in_list(substring($0, 1:i32, 2:i32):varchar?<2>, '13', '31', '23', '29', '30', '18', '17'):boolean?):boolean? => $0, $1]
+                              Read["local_files:/tmp/tpch-sf1/customer/part.0.parquet" => c_phone:string?, c_acctbal:decimal?<15, 2>]
+                    Project[$0, $1, $2, 1:i32]
+                      Project[$0, $1, $2]
+                        Project[$0, $1, $2, $3]
+                          Filter[is_null($4):boolean? => $0, $1, $2, $3, $4]
+                            Join[&Left, equal($4, $3):boolean? => $0, $1, $2, $3, $4]
+                              Project[$1, $2, (($2)::!decimal?<38, 4>)::!decimal?<38, 4>, $0]
+                                Filter[in_list(substring($1, 1:i32, 2:i32):varchar?<2>, '13', '31', '23', '29', '30', '18', '17'):boolean? => $0, $1, $2]
+                                  Read["local_files:/tmp/tpch-sf1/customer/part.0.parquet" => c_custkey:i32?, c_phone:string?, c_acctbal:decimal?<15, 2>]
+                              Project[$0]
+                                Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_custkey:i32?]

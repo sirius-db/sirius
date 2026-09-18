@@ -3,13 +3,19 @@
 # backend, and collects what the FE sent us.
 #
 #   scripts/run-tpch.sh --data DIR [--queries 1,6,...] [--translate-only] [--out DIR]
+#   scripts/run-tpch.sh --data DIR --sql-dir sql/gaps --translate-only --out tests/fixtures/gaps
 #
 #   --data DIR         dataset root with <table>/part.N.parquet (generate_tpch_data.sh)
-#   --queries LIST     comma-separated query numbers (default: 1..22)
+#   --sql-dir DIR      directory of <name>.sql files to run (default: sql/tpch)
+#   --queries LIST     comma-separated query numbers (qNN in --sql-dir) or file stems
+#                      (default: 1..22 for sql/tpch, every .sql file otherwise)
 #   --translate-only   corpus mode: the backend runs with SIRIUS_BE_TRANSLATE_ONLY=1, every
-#                      query is expected to fail at fetch_data, and the fragment dump the
-#                      backend wrote for it (SIRIUS_BE_DUMP_FRAGMENTS, default log/dump) is
-#                      copied into --out/qNN/ together with the EXPLAIN output
+#                      query is expected to fail at fetch_data with a message saying whether
+#                      the dispatch translated into one Substrait plan, and the fragment dump
+#                      the backend wrote for it (SIRIUS_BE_DUMP_FRAGMENTS, default log/dump)
+#                      is copied into --out/<name>/ together with the EXPLAIN output. The
+#                      summary line counts the queries that did not translate (expected for
+#                      sql/gaps); the exit status only reflects queries that were not captured.
 #   --out DIR          where per-query artifacts go (default: tests/fixtures/tpch in corpus
 #                      mode, log/tpch otherwise)
 #   --dump-dir DIR     the backend's SIRIUS_BE_DUMP_FRAGMENTS (default: log/dump)
@@ -23,13 +29,15 @@ ROOT="$(pwd)"
 MYSQL=(mysql -h 127.0.0.1 -P "${FE_QUERY_PORT:-9030}" -u root)
 
 DATA=""
-QUERIES=$(seq -s, 1 22)
+SQL_DIR="sql/tpch"
+QUERIES=""
 TRANSLATE_ONLY=false
 OUT=""
 DUMP_DIR="${SIRIUS_BE_DUMP_FRAGMENTS:-${ROOT}/log/dump}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) DATA="$2"; shift 2 ;;
+        --sql-dir) SQL_DIR="$2"; shift 2 ;;
         --queries) QUERIES="$2"; shift 2 ;;
         --translate-only) TRANSLATE_ONLY=true; shift ;;
         --out) OUT="$2"; shift 2 ;;
@@ -42,6 +50,14 @@ if [ -z "${DATA}" ]; then
     exit 2
 fi
 DATA="$(cd "${DATA}" && pwd)"
+SQL_DIR="${SQL_DIR%/}"
+if [ -z "${QUERIES}" ]; then
+    if [ "${SQL_DIR}" = "sql/tpch" ]; then
+        QUERIES=$(seq -s, 1 22)
+    else
+        QUERIES=$(ls "${SQL_DIR}"/*.sql | xargs -n1 basename | sed 's/\.sql$//' | paste -sd, -)
+    fi
+fi
 if [ -z "${OUT}" ]; then
     if [ "${TRANSLATE_ONLY}" = true ]; then OUT="${ROOT}/tests/fixtures/tpch"; else OUT="${ROOT}/log/tpch"; fi
 fi
@@ -59,7 +75,7 @@ sed "s|@@TPCH_DIR@@|${DATA}|g" sql/tpch-views.sql | "${MYSQL[@]}"
 index="${OUT}/INDEX.md"
 if [ "${TRANSLATE_ONLY}" = true ]; then
     {
-        echo "# TPC-H fragment corpus"
+        if [ "${SQL_DIR}" = "sql/tpch" ]; then echo "# TPC-H fragment corpus"; else echo "# Fragment corpus: ${SQL_DIR}"; fi
         echo
         echo "Captured from Doris FE $(source scripts/doris-version.sh && echo "${DORIS_VERSION}") with sql/session.sql, dataset ${DATA} (SF1 parquet)."
         echo 'Per query: `query.sql`, `explain.txt`, the raw dispatch (`batch-NN-request.tcompact`, a'
@@ -74,10 +90,16 @@ fi
 
 passed=0
 failed=0
+untranslated=0
+# Dump directories of the queries this run captured (the dump dir may hold older runs).
+captured_dumps=()
 IFS=',' read -ra query_numbers <<< "${QUERIES}"
 for n in "${query_numbers[@]}"; do
-    q=$(printf "q%02d" "${n}")
-    sql_file="sql/tpch/${q}.sql"
+    case "${n}" in
+        *[!0-9]*) q="${n}" ;;
+        *) q=$(printf "q%02d" "${n}") ;;
+    esac
+    sql_file="${SQL_DIR}/${q}.sql"
     [ -f "${sql_file}" ] || { echo "missing ${sql_file}" >&2; exit 1; }
     sql=$(grep -v '^--' "${sql_file}" | sed -e 's/;[[:space:]]*$//')
     qdir="${OUT}/${q}"
@@ -107,13 +129,21 @@ for n in "${query_numbers[@]}"; do
         # Keep the replayable wire payload and the summary; the Debug-form fragment text is
         # several MB per query (regenerate it with `cargo run --bin dump-fragments -- <tcompact>`).
         cp "${DUMP_DIR}/${query_id}/"*.tcompact "${DUMP_DIR}/${query_id}/"*-summary.txt "${qdir}/"
+        # The backend's verdict on the whole dispatch (stitched into one plan or not).
+        if grep -q 'translated into one plan' "${qdir}/error.txt"; then
+            verdict="translated into one plan"
+        else
+            verdict="NOT translated: $(grep -o 'translation failed: .*' "${qdir}/error.txt" | head -c 300 || head -c 300 "${qdir}/error.txt")"
+            untranslated=$((untranslated + 1))
+        fi
         rm -f "${qdir}/error.txt"
         echo "${query_id}" > "${qdir}/query_id.txt"
+        captured_dumps+=("${DUMP_DIR}/${query_id}")
         summary=$(ls "${qdir}"/batch-*-summary.txt | head -1)
         shapes=$(grep '^\[' "${summary}" | sed -e 's/^\[[0-9]*\] //' -e 's/ instances=[0-9]*//' | tr '\n' ';' | sed 's/;$//; s/;/<br>/g')
         fragments=$(grep -c '^\[' "${summary}" || true)
         echo "| ${q} | ${fragments} | ${shapes} |" >> "${index}"
-        echo "  ${q}: ${fragments} fragment(s) captured (${elapsed}s)"
+        echo "  ${q}: ${fragments} fragment(s) captured, ${verdict} (${elapsed}s)"
         passed=$((passed + 1))
     else
         if [ "${status}" = ok ]; then
@@ -126,9 +156,9 @@ for n in "${query_numbers[@]}"; do
     fi
 done
 
-if [ "${TRANSLATE_ONLY}" = true ]; then
-    # Coverage summary: what the translator has to handle for this corpus.
-    fragments=$(cat "${DUMP_DIR}"/*/batch-*-fragment-*.txt)
+if [ "${TRANSLATE_ONLY}" = true ] && [ "${#captured_dumps[@]}" -gt 0 ]; then
+    # Coverage summary: what the translator has to handle for this corpus (this run only).
+    fragments=$(for dump in "${captured_dumps[@]}"; do cat "${dump}"/batch-*-fragment-*.txt; done)
     count_sorted() { sort | uniq -c | sort -rn | awk '{printf "%s (%s)", $2, $1; if (NR>0) printf ", "}' | sed 's/, $//'; }
     {
         echo
@@ -139,9 +169,14 @@ if [ "${TRANSLATE_ONLY}" = true ]; then
         echo '  (`NULL_LITERAL` is almost entirely `TFileScanRangeParams.default_value_of_src_slot`, one per scanned column)' 
         echo "- functions (scalar + aggregate, TFunctionName.function_name): $(echo "${fragments}" | grep -A2 'name: TFunctionName {' | grep -o 'function_name: "[^"]*"' | sed 's/function_name: //; s/"//g' | count_sorted)"
         echo "- join ops: $(echo "${fragments}" | grep -o 'join_op: [A-Z_]*' | sed 's/join_op: //' | count_sorted)"
-        echo "- sinks: $(cat "${OUT}"/q*/batch-*-summary.txt | grep -o 'sink=[A-Z_]*' | sed 's/sink=//' | count_sorted)"
+        echo "- sinks: $(cat "${OUT}"/*/batch-*-summary.txt | grep -o 'sink=[A-Z_]*' | sed 's/sink=//' | count_sorted)"
     } >> "${index}"
 fi
 
-echo "==> ${passed} ok, ${failed} failed; artifacts in ${OUT}"
-[ "${failed}" -eq 0 ]
+if [ "${TRANSLATE_ONLY}" = true ]; then
+    echo "==> ${passed} captured (${untranslated} not translated), ${failed} not captured; artifacts in ${OUT}"
+    [ "${failed}" -eq 0 ]
+else
+    echo "==> ${passed} ok, ${failed} failed; artifacts in ${OUT}"
+    [ "${failed}" -eq 0 ]
+fi

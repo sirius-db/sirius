@@ -33,9 +33,10 @@ use crate::result_encoder::{MysqlResultEncoder, ThriftBinary};
 use crate::result_store::{FetchOutcome, ResultStore, UniqueId};
 
 /// Environment variable that puts the backend in survey mode: every dispatched batch is
-/// accepted (and dumped when [`params::DUMP_FRAGMENTS_ENV`] is set) even when translation
-/// fails; the query then fails at `fetch_data` with the translation errors. On by default
-/// until the translator lands (P1); set to `0` to execute.
+/// accepted (and dumped when [`params::DUMP_FRAGMENTS_ENV`] is set) and translated, but not
+/// executed; the query then fails at `fetch_data` with a message naming the translation
+/// outcome. On by default (the engine-less build has nothing to execute with); set to `0`
+/// to execute.
 pub const TRANSLATE_ONLY_ENV: &str = "SIRIUS_BE_TRANSLATE_ONLY";
 
 /// Largest gRPC message accepted/emitted; a plan for a wide TPC-H query or a result batch
@@ -139,35 +140,35 @@ impl SiriusBackendService {
                 .flat_map(|fragment| fragment.instance_ids().map(UniqueId::from)),
         );
 
-        let translated = self.translate_batch(&batch);
+        let translated = self.translate_batch_logged(&batch);
         if Self::translate_only() {
-            let errors: Vec<String> = translated
-                .iter()
-                .filter_map(|outcome| outcome.as_ref().err().cloned())
-                .collect();
+            let outcome = match &translated {
+                Ok(plan) => format!(
+                    "all {} fragments translated into one plan with output {:?}",
+                    batch.fragments.len(),
+                    plan.output_names
+                ),
+                Err(err) => format!("translation failed: {err}"),
+            };
             slot.fail(format!(
-                "{TRANSLATE_ONLY_ENV} is set: query {query_id} was recorded, not executed \
-                 ({} of {} fragments failed to translate: {})",
-                errors.len(),
-                batch.fragments.len(),
-                errors.join("; ")
+                "{TRANSLATE_ONLY_ENV} is set: query {query_id} was recorded, not executed ({outcome})"
             ));
             return Ok(());
         }
 
-        // MVP-A0 execution: the root (result) fragment's translated plan is the whole query.
-        // Until the stitcher lands the translator rejects every fragment, so this reports its
-        // error to the FE through the result slot rather than failing dispatch (the FE has
-        // already committed the query to us at this point).
-        let Some(result_fragment) = result_fragment else {
+        // MVP-A0 execution: the whole dispatch runs as one plan on this backend, and its
+        // rows are delivered under the RESULT_SINK fragment's instance (the only one the FE
+        // fetches). A translation error is reported through the result slot rather than
+        // failing dispatch: the FE has already committed the query to us at this point.
+        if result_fragment.is_none() {
             slot.fail(format!(
                 "query {query_id}: no RESULT_SINK fragment was dispatched to this backend; \
                  multi-node execution is not implemented"
             ));
             return Ok(());
-        };
-        match &translated[result_fragment.index] {
-            Ok(plan) => match self.executor.execute(plan) {
+        }
+        match translated {
+            Ok(plan) => match self.executor.execute(&plan) {
                 Ok(result) => match MysqlResultEncoder::encode(result.batches(), 0) {
                     Ok(batch) => {
                         slot.push(batch);
@@ -177,21 +178,38 @@ impl SiriusBackendService {
                 },
                 Err(err) => slot.fail(err),
             },
-            Err(err) => slot.fail(err.clone()),
+            Err(err) => slot.fail(err),
         }
         Ok(())
     }
 
-    /// Translates every fragment of a batch, logging each outcome.
-    fn translate_batch(&self, batch: &FragmentBatch) -> Vec<Result<TranslatedPlan, String>> {
-        batch
-            .fragments
-            .iter()
-            .map(|fragment| self.translate_fragment_logged(fragment))
-            .collect()
+    /// Stitches the batch into one plan (MVP-A0) and translates it, logging the explain
+    /// text; on failure, also logs how each fragment fares on its own to narrow down the
+    /// offending one (two-phase aggregate halves are expected to be rejected there).
+    #[instrument(skip_all, fields(query_id = %UniqueId::from(&batch.query_id)))]
+    fn translate_batch_logged(&self, batch: &FragmentBatch) -> Result<TranslatedPlan, String> {
+        let fragments: Vec<_> = batch.fragments.iter().map(|f| &f.params).collect();
+        match self.translator.translate_batch(&fragments) {
+            Ok(translated) => {
+                info!(
+                    fragments = batch.fragments.len(),
+                    output_names = ?translated.output_names,
+                    plan = %translated.explain(),
+                    "translated Doris dispatch into one plan"
+                );
+                Ok(translated)
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to translate Doris dispatch");
+                for fragment in &batch.fragments {
+                    let _ = self.translate_fragment_logged(fragment);
+                }
+                Err(err.to_string())
+            }
+        }
     }
 
-    /// Converts one fragment to Substrait and logs the explain output or the error.
+    /// Converts one fragment to Substrait on its own and logs the explain output or the error.
     #[instrument(skip_all, fields(index = fragment.index, fragment_id = ?fragment.fragment_id()))]
     fn translate_fragment_logged(
         &self,
@@ -202,13 +220,13 @@ impl SiriusBackendService {
                 info!(
                     output_names = ?translated.output_names,
                     plan = %translated.explain(),
-                    "translated Doris plan fragment"
+                    "fragment translates on its own"
                 );
                 Ok(translated)
             }
             Err(err) => {
                 let message = format!("fragment {}: {err}", fragment.index);
-                warn!(error = %err, "failed to translate Doris plan fragment");
+                warn!(error = %err, "fragment does not translate on its own");
                 Err(message)
             }
         }
@@ -729,12 +747,50 @@ mod tests {
         match outcome {
             FetchOutcome::Failed(message) => {
                 assert!(message.contains(TRANSLATE_ONLY_ENV), "{message}");
-                assert!(message.contains("1 of 1 fragments failed"), "{message}");
+                assert!(
+                    message.contains(&format!("query {query} was recorded, not executed")),
+                    "{message}"
+                );
                 // The fixture's scan carries no ranges, which the translator refuses.
+                assert!(message.contains("translation failed"), "{message}");
                 assert!(
                     message.contains("unsupported scan range at node 0"),
                     "{message}"
                 );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The captured TPC-H Q6 dispatch (two fragments, a two-phase aggregate) translates as one
+    /// plan, and survey mode says so instead of executing.
+    #[test]
+    fn translate_only_reports_a_stitched_batch_as_recorded() {
+        let payload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tpch/q06/batch-00-request.tcompact");
+        let request = PExecPlanFragmentRequest {
+            request: Some(std::fs::read(payload).unwrap()),
+            compact: Some(true),
+            version: Some(PFragmentRequestVersion::Version3 as i32),
+        };
+        let service = SiriusBackendService::new();
+        with_translate_only(Some("1"), || service.dispatch(&request)).unwrap();
+        let batch = params::decode_fragment_params_list(&request).unwrap();
+        let slot = service
+            .results
+            .get(UniqueId::from(&batch.query_id))
+            .unwrap();
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(slot.fetch());
+        match outcome {
+            FetchOutcome::Failed(message) => {
+                assert!(message.contains("was recorded, not executed"), "{message}");
+                assert!(
+                    message.contains("all 2 fragments translated into one plan"),
+                    "{message}"
+                );
+                assert!(message.contains("[\"revenue\"]"), "{message}");
             }
             other => panic!("{other:?}"),
         }

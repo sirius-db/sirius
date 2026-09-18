@@ -35,6 +35,8 @@
 //! - [`stitcher`]: the MVP-A0 single-plan stitcher — the fragments of one dispatch
 //!   joined into one fragment (exchanges replaced by their senders, two-phase
 //!   aggregates collapsed) for [`PlanTranslator::translate_batch`].
+//! - [`explain`]: `substrait-explain` text for a plan, with the constructs the formatter
+//!   cannot render (`local_files`, decimal literals, `IN` lists) rewritten for display.
 //!
 //! Extension functions are registered through [`ExtensionRegistry`], which
 //! de-duplicates anchors by `(urn, name)`.
@@ -58,6 +60,7 @@ use substrait::proto::{Plan, PlanRel, RelRoot, plan_rel};
 
 pub mod descriptor_table;
 pub mod error;
+pub mod explain;
 pub mod expr_translator;
 pub mod node_translator;
 pub mod scan_ranges;
@@ -121,9 +124,10 @@ pub struct PlanExplain<'a> {
 }
 
 impl fmt::Display for PlanExplain<'_> {
-    /// Formats the plan text and appends formatter warnings when present.
+    /// Formats the plan text (see [`explain::render`]) and appends any formatter warning
+    /// that survived the display rewrites — those are real gaps, not expected noise.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (text, warnings) = substrait_explain::format(self.plan);
+        let (text, warnings) = explain::render(self.plan);
         f.write_str(&text)?;
         if !warnings.is_empty() {
             write!(f, "\nformat warnings: {warnings:?}")?;
