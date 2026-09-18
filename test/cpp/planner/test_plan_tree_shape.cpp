@@ -1494,3 +1494,50 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   sirius::planner::collect_gpu_scans(*plan, found);
   CHECK(found.size() == expected.size());
 }
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
+                 "[plan_tree_shape][union_all][isolated_context]")
+{
+  // Each arm's sink must declare the union's schema. A materialized CTE declares its
+  // materialization side instead, so copying the arm's `types` misdeclares the sink's width --
+  // which `validate_operator_output_types` only warns about, so no end-to-end test can see it.
+  auto require_sinks_match_union = [&](const std::string& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+
+    auto* union_op = find_first(plan.get(), SiriusPhysicalOperatorType::UNION);
+    REQUIRE(union_op != nullptr);
+    REQUIRE(union_op->children.size() == 2);
+
+    // The premise, pinned: the arm is really a CTE node and its width really differs from the
+    // union's, or the sink would be right by accident. DuckDB's unused-column optimizer prunes the
+    // materialization down to what the body reads and can collapse these queries silently. If this
+    // fires, reshape so the definition is unprunable or the body widens; do not relax it.
+    auto* cte = find_first(plan.get(), SiriusPhysicalOperatorType::CTE);
+    REQUIRE(cte != nullptr);
+    INFO("cte width=" << cte->types.size() << " union width=" << union_op->types.size());
+    REQUIRE(cte->types.size() != union_op->types.size());
+
+    for (auto& child : union_op->children) {
+      REQUIRE(child->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+      CHECK(child->types == union_op->types);
+    }
+  };
+
+  // Definition wider than the arity: the self-join on `other` keeps it from being pruned to `rid`.
+  require_sinks_match_union(
+    "SELECT id FROM big_left UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT rid, other FROM small_right) "
+    " SELECT m1.rid FROM m m1 JOIN m m2 ON m1.other = m2.other)");
+
+  // Definition narrower: the body widens with a computed column the materialization never held.
+  require_sinks_match_union(
+    "SELECT id, id * 2 FROM big_left UNION ALL "
+    "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m)");
+
+  // The CTE as arm 0, so `op.types` is routed through the CTE's own body resolution.
+  require_sinks_match_union(
+    "(WITH m AS MATERIALIZED (SELECT rid FROM small_right) SELECT rid, rid * 2 FROM m) "
+    "UNION ALL SELECT id, id * 2 FROM big_left");
+}
