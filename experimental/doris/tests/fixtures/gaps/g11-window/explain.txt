@@ -1,0 +1,55 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    n_name[#9]
+    rn[#10]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  3:VANALYTIC(146)
+  |  functions: [row_number()]
+  |  order by: n_nationkey[#7] ASC NULLS FIRST
+  |  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  |  final projections: n_name[#6], rn[#8]
+  |  final project output tuple id: 4
+  |  distribute expr lists: 
+  |  
+  2:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 02
+    UNPARTITIONED
+IS_MERGE: true
+
+  1:VSORT(134)
+  |  order by: n_nationkey[#7] ASC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  0:VTVF_SCAN_NODE(126)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=2250, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.n_name[#1], _tvf_local.n_nationkey[#0]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

@@ -1962,6 +1962,8 @@ mod tests {
         let update = aggregation(false, vec![agg_expr("count", false, None)]);
         match translate(vec![update, exchange(0, vec![0])], &ScanRanges::default()).unwrap_err() {
             TranslateError::UnsupportedPlanNode { reason, .. } => {
+                // G-14: a lone phase of a multi-phase aggregate is refused; the stitcher folds
+                // both phases before translation (MVP-A0).
                 assert!(reason.contains("update-phase aggregate"), "{reason}")
             }
             other => panic!("{other:?}"),
@@ -2194,14 +2196,22 @@ mod tests {
 
     #[test]
     fn unsupported_and_malformed_plans_are_named() {
-        let union = node(0, TPlanNodeType::UNION_NODE, 0, vec![0]);
-        assert!(matches!(
-            translate(vec![union], &ScanRanges::default()).unwrap_err(),
-            TranslateError::UnsupportedPlanNode {
-                node_type: TPlanNodeType::UNION_NODE,
-                ..
-            }
-        ));
+        // G-12 (UNION / INTERSECT / EXCEPT) and G-11 (window functions) are refused by node
+        // type; `tests/corpus.rs::gap_corpus_verdicts` checks the same on real FE dispatches.
+        for node_type in [
+            TPlanNodeType::UNION_NODE,
+            TPlanNodeType::INTERSECT_NODE,
+            TPlanNodeType::EXCEPT_NODE,
+            TPlanNodeType::ANALYTIC_EVAL_NODE,
+        ] {
+            let unsupported = node(0, node_type, 0, vec![0]);
+            let err = translate(vec![unsupported], &ScanRanges::default()).unwrap_err();
+            assert!(
+                matches!(err, TranslateError::UnsupportedPlanNode { node_type: t, .. } if t == node_type),
+                "{node_type:?}: {err}"
+            );
+            assert!(err.to_string().contains(&format!("{node_type:?}")), "{err}");
+        }
         // Trailing node.
         assert!(matches!(
             translate(

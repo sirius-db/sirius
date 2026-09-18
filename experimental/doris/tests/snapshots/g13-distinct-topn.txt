@@ -1,0 +1,20 @@
+# g13-distinct-topn: 3 fragments (root first):
+#   fragment_id=2 sink=RESULT_SINK nodes=[EXCHANGE_NODE]
+#   fragment_id=1 sink=DATA_STREAM_SINK nodes=[SORT_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/gaps/g13-distinct-topn/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Plan
+Root[n_regionkey, n_name]
+  Project[$0, $1]
+    Fetch[limit=3 => $0, $1]
+      Sort[($0, &AscNullsFirst) => $0, $1]
+        Fetch[limit=3 => $0, $1]
+          Sort[($0, &AscNullsFirst) => $0, $1]
+            Project[$0, $1]
+              Aggregate[$0, $1 => $0, $1]
+                Project[$1, $0]
+                  Read["local_files:/tmp/tpch-sf1/nation/part.0.parquet" => n_name:string?, n_regionkey:i32?]

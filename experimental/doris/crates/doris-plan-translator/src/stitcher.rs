@@ -19,7 +19,10 @@
 //!   computed `sum, avg, sum, count, ...`); each merge function names the partial-state slot
 //!   it reads, and that slot's position in the update output tuple picks the update
 //!   function. Doris' `partial_*` states never materialize, so `multi_distinct_count` simply
-//!   becomes one `count(DISTINCT)`;
+//!   becomes one `count(DISTINCT)`. A `SELECT DISTINCT` is the same shape with no functions
+//!   at all (a two-phase group-by), recognised by the finalizing aggregate sitting directly
+//!   on an update-phase one, and its grouping keys must read the update output tuple in
+//!   order;
 //! - the scan ranges of every fragment are merged into the one instance.
 //!
 //! The result is an ordinary `TPipelineFragmentParams` that [`crate::PlanTranslator`]
@@ -34,7 +37,7 @@ use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::descriptors::TDescriptorTable;
 use doris_thrift::exprs::{TExpr, TExprNodeType};
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TScanRangeParams};
-use doris_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType, TSortNode};
+use doris_thrift::plan_nodes::{TAggregationNode, TPlan, TPlanNode, TPlanNodeType, TSortNode};
 
 use crate::error::{Result, TranslateError};
 
@@ -350,7 +353,7 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
         .into_iter()
         .map(|child| collapse_two_phase_aggregates(child, tuples))
         .collect::<Result<Vec<_>>>()?;
-    if !is_merge_aggregate(&node)? {
+    if !is_merge_aggregate(&node, &children)? {
         return Ok(PlanTree { node, children });
     }
     if children.len() != 1 {
@@ -361,12 +364,7 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
         )));
     }
     let update = children.pop().unwrap();
-    let update_agg = update
-        .node
-        .agg_node
-        .as_ref()
-        .filter(|_| update.node.node_type == TPlanNodeType::AGGREGATION_NODE)
-        .filter(|agg| !agg.need_finalize);
+    let update_agg = update_aggregate(&update.node);
     let Some(update_agg) = update_agg else {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: node.node_id,
@@ -401,11 +399,30 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
             reason: "merge- and update-phase aggregates do not have the same number of functions",
         });
     }
-    // Each merge function reads one partial-state slot of the update output tuple; that
-    // slot's position (after the grouping keys) is the update function it continues.
+    // The merge phase reads the update output tuple: grouping key `i` is that tuple's slot
+    // `i`, and each merge function reads one partial-state slot, whose position (after the
+    // grouping keys) is the update function it continues.
     let update_slots = tuples.get(&update_agg.output_tuple_id).ok_or_else(|| {
         TranslateError::descriptor(format!("tuple {} not found", update_agg.output_tuple_id))
     })?;
+    for (index, expr) in merge_agg.grouping_exprs.iter().flatten().enumerate() {
+        let reads_key = expr
+            .nodes
+            .first()
+            .filter(|root| root.num_children == 0)
+            .and_then(|root| root.slot_ref.as_ref())
+            .is_some_and(|slot_ref| {
+                slot_ref.tuple_id == update_agg.output_tuple_id
+                    && update_slots.get(index) == Some(&slot_ref.slot_id)
+            });
+        if !reads_key {
+            return Err(TranslateError::UnsupportedPlanNode {
+                node_id: node.node_id,
+                node_type: node.node_type,
+                reason: "merge-phase grouping key does not read the matching update output slot",
+            });
+        }
+    }
     let update_names = aggregate_names(&update_agg.aggregate_functions)?;
     let mut functions = Vec::with_capacity(merge_agg.aggregate_functions.len());
     for expr in &merge_agg.aggregate_functions {
@@ -463,13 +480,29 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
     })
 }
 
+/// The aggregate description of an update-phase (`need_finalize=false`) aggregation node.
+fn update_aggregate(node: &TPlanNode) -> Option<&TAggregationNode> {
+    node.agg_node
+        .as_ref()
+        .filter(|_| node.node_type == TPlanNodeType::AGGREGATION_NODE)
+        .filter(|agg| !agg.need_finalize)
+}
+
 /// Whether a node is a finalizing aggregate whose measures merge partial states.
-fn is_merge_aggregate(node: &TPlanNode) -> Result<bool> {
+///
+/// A `SELECT DISTINCT` / `GROUP BY` without measures has no `is_merge_agg` function to tell
+/// its merge phase from a single-phase aggregate (both have `need_finalize=true`,
+/// `is_first_phase=false`); there the merge phase is the finalizing aggregate sitting
+/// directly on its update phase, which is the only thing an update phase ever feeds.
+fn is_merge_aggregate(node: &TPlanNode, children: &[PlanTree]) -> Result<bool> {
     let Some(agg) = &node.agg_node else {
         return Ok(false);
     };
     if node.node_type != TPlanNodeType::AGGREGATION_NODE || !agg.need_finalize {
         return Ok(false);
+    }
+    if agg.aggregate_functions.is_empty() {
+        return Ok(children.len() == 1 && update_aggregate(&children[0].node).is_some());
     }
     let mut merges = 0;
     for expr in &agg.aggregate_functions {
@@ -789,6 +822,141 @@ mod tests {
             vec![&0]
         );
         assert_eq!(stitched.fragment_id, Some(2));
+    }
+
+    /// A grouping key `SLOT_REF(tuple, slot)` expression.
+    fn key_ref(tuple_id: i32, slot_id: i32) -> TExpr {
+        TExpr {
+            nodes: vec![TExprNode {
+                node_type: TExprNodeType::SLOT_REF,
+                num_children: 0,
+                output_scale: -1,
+                slot_ref: Some(TSlotRef {
+                    slot_id,
+                    tuple_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// `SELECT DISTINCT k` as the FE plans it: a finalizing group-by without functions over
+    /// an update-phase group-by (update output tuple 5 = {50: k}, merge output tuple 6).
+    fn distinct_dispatch() -> Vec<TPipelineFragmentParams> {
+        let mut merge = aggregation(3, true, vec![], 6);
+        merge.agg_node.as_mut().unwrap().grouping_exprs = Some(vec![key_ref(5, 50)]);
+        let mut update = aggregation(1, false, vec![], 5);
+        update.agg_node.as_mut().unwrap().grouping_exprs = Some(vec![key_ref(0, 7)]);
+        vec![
+            fragment(
+                2,
+                TDataSinkType::RESULT_SINK,
+                0,
+                vec![exchange(4, vec![6])],
+                None,
+            ),
+            fragment(
+                1,
+                TDataSinkType::DATA_STREAM_SINK,
+                4,
+                vec![merge, exchange(2, vec![5])],
+                None,
+            ),
+            fragment(
+                0,
+                TDataSinkType::DATA_STREAM_SINK,
+                2,
+                vec![update, scan(0, 0)],
+                Some(0),
+            ),
+        ]
+    }
+
+    #[test]
+    fn collapses_a_two_phase_distinct_without_functions() {
+        let fragments = distinct_dispatch();
+        let refs: Vec<_> = fragments.iter().collect();
+        let stitched = stitch_fragments(&refs).unwrap();
+        assert_eq!(
+            shape(&stitched),
+            vec![
+                (3, TPlanNodeType::AGGREGATION_NODE, 1),
+                (0, TPlanNodeType::FILE_SCAN_NODE, 0),
+            ]
+        );
+        let agg = stitched
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes[0]
+            .agg_node
+            .clone()
+            .unwrap();
+        assert!(agg.need_finalize);
+        assert_eq!(agg.output_tuple_id, 6);
+        assert!(agg.aggregate_functions.is_empty());
+        // The key is now the update phase's, read from the scan tuple.
+        assert_eq!(agg.grouping_exprs, Some(vec![key_ref(0, 7)]));
+    }
+
+    #[test]
+    fn merge_grouping_keys_must_read_the_update_output_in_order() {
+        // The merge key reads a slot that is not the update phase's key.
+        let mut fragments = distinct_dispatch();
+        fragments[1]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0]
+            .agg_node
+            .as_mut()
+            .unwrap()
+            .grouping_exprs = Some(vec![key_ref(5, 51)]);
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { node_id: 3, reason, .. } if reason.contains("grouping key")
+        ));
+        // A finalizing group-by without functions over a non-aggregate child is a plain
+        // single-phase aggregate and is left alone.
+        let mut fragments = distinct_dispatch();
+        let leaf = &mut fragments[2]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap();
+        leaf.nodes.remove(0);
+        leaf.nodes[0].row_tuples = vec![5];
+        let refs: Vec<_> = fragments.iter().collect();
+        let stitched = stitch_fragments(&refs).unwrap();
+        assert_eq!(
+            shape(&stitched),
+            vec![
+                (3, TPlanNodeType::AGGREGATION_NODE, 1),
+                (0, TPlanNodeType::FILE_SCAN_NODE, 0),
+            ]
+        );
+        let agg = stitched
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes[0]
+            .agg_node
+            .clone()
+            .unwrap();
+        assert_eq!(agg.grouping_exprs, Some(vec![key_ref(5, 50)]));
     }
 
     #[test]
