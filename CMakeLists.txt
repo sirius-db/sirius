@@ -29,6 +29,8 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
+add_compile_definitions(CCCL_DISABLE_WARPSPEED_SCAN)
+
 # Optional features
 option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
@@ -843,6 +845,7 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator_schedule_validation.cpp
     test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp
+    test/cpp/data/test_spill_converter_ordering.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp

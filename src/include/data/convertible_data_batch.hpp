@@ -23,6 +23,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -120,6 +121,12 @@ class convertible_data_batch : public convertible_data {
       // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
         mut.rebind_stream(stream);
+      }
+
+      if (auto const* data = mut.get_data(); data != nullptr) {
+        if (cudaEvent_t const writer_event = data->get_writer_event(); writer_event != nullptr) {
+          cucascade::cuda::cuda_event_view{writer_event}.wait(::cuda::stream_ref{stream.value()});
+        }
       }
 
       auto& converter_registry = sirius::converter_registry::get();

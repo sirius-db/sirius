@@ -187,6 +187,36 @@ On allocation failure:
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))
 
+## Stream-Ordering Discipline
+
+Device memory is freed stream-ordered (RMM async pool), and the pool may rebind the virtual
+address immediately after the free executes. Batches are handed off event-ordered, not
+host-synced, and read locks are host-scoped: a consumer can enqueue kernels and drop its lock
+with device work still in flight. The invariant that keeps this safe:
+
+> No owner of device memory may die (free, pool return, or dealloc-stream rebind) until every
+> stream that may still read or write that memory is ordered before the free.
+
+Three mechanisms carry it:
+
+1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
+   batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
+   exclusive lock does not imply the producer's writes have landed.
+2. **Reader events.** A consumer publishes the reads it enqueued to each locked batch before its
+   read lock drops (`record_reader_event`, cuCascade #184). The pipeline task does this for every
+   operator input on every exit from `execute()`; the scan's `owning_table_view` does it for
+   zero-copy views. `try_to_mutable()` then refuses, and `to_mutable()` waits, until those reads
+   complete, so no downgrade can rebind or free a batch under an in-flight reader.
+3. **Quiesce before owner death.** The pipeline task synchronizes its stream after every operator
+   `execute()` and again after `publish_output`, so cross-task state freed by
+   `finalize_operator` is never freed under a straggling sink enqueue.
+
+Suspected violations show up as torn GPU→HOST conversions, scribbled string or selection
+geometry, or wild-pointer MMU faults, almost always under concurrency plus memory pressure.
+`bench/sf1000-repro/run.sh` accepts `SANITIZER=memcheck` to run the workload under
+compute-sanitizer; `verify-memcheck-sf1.sh` does so for the concurrent workload against an
+SF1-sized pressure config.
+
 ## Key Files
 
 | File | Purpose |
