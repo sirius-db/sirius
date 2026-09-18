@@ -1,0 +1,4 @@
+target/
+.pixi/
+.doris-fe/
+log/
