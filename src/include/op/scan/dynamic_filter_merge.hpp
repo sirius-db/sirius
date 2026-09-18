@@ -16,11 +16,7 @@
 
 #pragma once
 
-// libcudf's AST header uses std::variant without including <variant>.
-// clang-format off
-#include <variant>
 #include <cudf/ast/expressions.hpp>
-// clang-format on
 #include <cudf/table/table.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
