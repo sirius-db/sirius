@@ -11,9 +11,10 @@
 //      not store: Bitpack's bp_offsets cumsum (CUB ExclusiveSum + 1-thread tail
 //      patch, see offsets_cumsum.cu) and RLE scratch, into RMM-pool transients.
 //   2. KernelCache::get_or_compile_plain resolves shape -> CUkernel (keyed
-//      on a hash of the rendered CUDA source, so a shape hits the cache
-//      across compress and decompress). First touch pays the nvrtc compile;
-//      warm hits are cheap. CUfunction is derived per-device at launch time.
+//      on the rendered CUDA source and embedded CCCL fingerprint, so a shape
+//      hits the cache across compress and decompress without crossing header
+//      versions). First touch pays the nvrtc compile; warm hits are cheap.
+//      CUfunction is derived per-device at launch time.
 //   3. cuLaunchKernel binds the labeled buffers as flat per-field device
 //      pointers in the kernel's parameter order, runs over the rendered
 //      __global__ kernel, syncs the stream, and frees the transients.
