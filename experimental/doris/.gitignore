@@ -1,4 +1,5 @@
 target/
 .pixi/
 .doris-fe/
+.duckdb-substrait/
 log/

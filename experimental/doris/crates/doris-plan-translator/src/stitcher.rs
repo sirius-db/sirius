@@ -10,7 +10,10 @@
 //! - an `EXCHANGE_NODE` is replaced by its sender's plan subtree (the sender's root emits
 //!   the exchange's row layout: same tuple ids, same order);
 //! - a merging exchange (`sort_info`, with the top-N `limit`/`offset`) becomes a `SORT_NODE`
-//!   over that subtree, so the merge order and limit are kept;
+//!   over that subtree, so the merge order and limit are kept — unless the sender's root is
+//!   already a `SORT_NODE` with the same order and top-N (the usual shape: the FE sorts in
+//!   the sender and merges in the receiver), in which case merging one sorted input is the
+//!   identity and no sort is added;
 //! - a two-phase aggregate — `AGGREGATION_NODE` (merge) over `EXCHANGE_NODE` over
 //!   `AGGREGATION_NODE` (update) — collapses into one finalized aggregate: the update phase's
 //!   grouping and aggregate expressions (over its input) with the merge phase's output tuple,
@@ -22,7 +25,10 @@
 //!   becomes one `count(DISTINCT)`. A `SELECT DISTINCT` is the same shape with no functions
 //!   at all (a two-phase group-by), recognised by the finalizing aggregate sitting directly
 //!   on an update-phase one, and its grouping keys must read the update output tuple in
-//!   order;
+//!   order. When an `ORDER BY` covers the grouping keys, the FE pushes the top-N onto both
+//!   phases (`limit` + `agg_sort_info_by_group_key` on each, `SELECT DISTINCT ... ORDER BY
+//!   keys LIMIT n`); the update phase's copy is a per-instance pre-filter of the same
+//!   groups, so the collapsed aggregate keeps only the merge phase's;
 //! - the scan ranges of every fragment are merged into the one instance.
 //!
 //! The result is an ordinary `TPipelineFragmentParams` that [`crate::PlanTranslator`]
@@ -37,7 +43,9 @@ use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::descriptors::TDescriptorTable;
 use doris_thrift::exprs::{TExpr, TExprNodeType};
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TScanRangeParams};
-use doris_thrift::plan_nodes::{TAggregationNode, TPlan, TPlanNode, TPlanNodeType, TSortNode};
+use doris_thrift::plan_nodes::{
+    TAggregationNode, TPlan, TPlanNode, TPlanNodeType, TSortInfo, TSortNode,
+};
 
 use crate::error::{Result, TranslateError};
 
@@ -297,6 +305,14 @@ fn splice(
         })?;
     let offset = exchange.offset.unwrap_or(0);
     match &exchange.sort_info {
+        // The sender already produces this order and top-N: nothing to merge.
+        Some(sort_info)
+            if !sort_info.ordering_exprs.is_empty()
+                && !has_node_work(&node)
+                && already_sorted(&subtree.node, sort_info, node.limit, offset) =>
+        {
+            Ok(subtree)
+        }
         // A merging exchange keeps its order and top-N as a sort over the sender's subtree.
         Some(sort_info) if !sort_info.ordering_exprs.is_empty() => {
             let sort = TPlanNode {
@@ -329,6 +345,24 @@ fn splice(
         }),
         _ => Ok(subtree),
     }
+}
+
+/// Whether `node` is a `SORT_NODE` that emits exactly the order and top-N (`limit`, `offset`)
+/// a merging exchange asks for, so the exchange's merge adds nothing on one input.
+fn already_sorted(node: &TPlanNode, sort_info: &TSortInfo, limit: i64, offset: i64) -> bool {
+    let Some(sort) = node
+        .sort_node
+        .as_ref()
+        .filter(|_| node.node_type == TPlanNodeType::SORT_NODE)
+    else {
+        return false;
+    };
+    !sort.is_analytic_sort.unwrap_or(false)
+        && node.limit == limit
+        && sort.offset.unwrap_or(0) == offset
+        && sort.sort_info.ordering_exprs == sort_info.ordering_exprs
+        && sort.sort_info.is_asc_order == sort_info.is_asc_order
+        && sort.sort_info.nulls_first == sort_info.nulls_first
 }
 
 /// Whether a node carries conjuncts or projections of its own.
@@ -372,17 +406,26 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
             reason: "merge-phase aggregate whose input is not its update-phase aggregate",
         });
     };
-    if has_node_work(&update.node) || update.node.limit >= 0 {
+    if has_node_work(&update.node) {
         return Err(TranslateError::UnsupportedPlanNode {
             node_id: update.node.node_id,
             node_type: update.node.node_type,
-            reason: "update-phase aggregate with conjuncts, projections or a limit",
+            reason: "update-phase aggregate with conjuncts or projections",
         });
     }
     let merge_agg = node
         .agg_node
         .as_ref()
         .expect("checked by is_merge_aggregate");
+    if update.node.limit >= 0
+        && !same_top_n_by_group_key(&node, merge_agg, &update.node, update_agg, tuples)
+    {
+        return Err(TranslateError::UnsupportedPlanNode {
+            node_id: update.node.node_id,
+            node_type: update.node.node_type,
+            reason: "update-phase aggregate with a limit that is not the merge phase's top-N by group key",
+        });
+    }
     let merge_keys = merge_agg.grouping_exprs.as_ref().map_or(0, Vec::len);
     let update_keys = update_agg.grouping_exprs.as_ref().map_or(0, Vec::len);
     if merge_keys != update_keys {
@@ -478,6 +521,57 @@ fn collapse_two_phase_aggregates(tree: PlanTree, tuples: &TupleSlots) -> Result<
         node: collapsed,
         children: update.children,
     })
+}
+
+/// Whether the update phase's `limit` is the same top-N by group key the merge phase applies:
+/// equal limits, and both `agg_sort_info_by_group_key` order the same grouping-key positions
+/// of their own output tuples in the same directions. Only then is the update phase's limit
+/// a redundant pre-filter that the collapsed aggregate can drop.
+fn same_top_n_by_group_key(
+    merge: &TPlanNode,
+    merge_agg: &TAggregationNode,
+    update: &TPlanNode,
+    update_agg: &TAggregationNode,
+    tuples: &TupleSlots,
+) -> bool {
+    if merge.limit != update.limit {
+        return false;
+    }
+    let (Some(merge_sort), Some(update_sort)) = (
+        &merge_agg.agg_sort_info_by_group_key,
+        &update_agg.agg_sort_info_by_group_key,
+    ) else {
+        return false;
+    };
+    if merge_sort.is_asc_order != update_sort.is_asc_order
+        || merge_sort.nulls_first != update_sort.nulls_first
+    {
+        return false;
+    }
+    // Each ordering expression must be a slot of that phase's output tuple; compare the
+    // positions, which are the grouping-key indexes.
+    let key_positions = |exprs: &[TExpr], tuple_id: i32| -> Option<Vec<usize>> {
+        let slots = tuples.get(&tuple_id)?;
+        exprs
+            .iter()
+            .map(|expr| {
+                let root = expr.nodes.first().filter(|root| root.num_children == 0)?;
+                let slot_ref = root.slot_ref.as_ref().filter(|s| s.tuple_id == tuple_id)?;
+                slots
+                    .iter()
+                    .position(|slot_id| *slot_id == slot_ref.slot_id)
+            })
+            .collect()
+    };
+    match (
+        key_positions(&merge_sort.ordering_exprs, merge_agg.output_tuple_id),
+        key_positions(&update_sort.ordering_exprs, update_agg.output_tuple_id),
+    ) {
+        (Some(merge_keys), Some(update_keys)) => {
+            !merge_keys.is_empty() && merge_keys == update_keys
+        }
+        _ => false,
+    }
 }
 
 /// The aggregate description of an update-phase (`need_finalize=false`) aggregation node.
@@ -903,6 +997,100 @@ mod tests {
         assert_eq!(agg.grouping_exprs, Some(vec![key_ref(0, 7)]));
     }
 
+    /// `SELECT DISTINCT k ORDER BY k LIMIT 3` as the FE plans it: the top-N by group key is
+    /// on both phases (`limit` + `agg_sort_info_by_group_key` over each phase's output tuple).
+    fn distinct_top_n_dispatch(
+        update_limit: i64,
+        update_sort: bool,
+    ) -> Vec<TPipelineFragmentParams> {
+        let mut fragments = distinct_dispatch();
+        let by_key = |tuple_id: i32, slot_id: i32| TSortInfo {
+            ordering_exprs: vec![key_ref(tuple_id, slot_id)],
+            is_asc_order: vec![true],
+            nulls_first: vec![false],
+            ..Default::default()
+        };
+        let merge = &mut fragments[1]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0];
+        merge.limit = 3;
+        merge.agg_node.as_mut().unwrap().agg_sort_info_by_group_key = Some(by_key(6, 60));
+        let update = &mut fragments[2]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0];
+        update.limit = update_limit;
+        if update_sort {
+            update.agg_node.as_mut().unwrap().agg_sort_info_by_group_key = Some(by_key(5, 50));
+        }
+        fragments
+    }
+
+    #[test]
+    fn collapses_a_top_n_by_group_key_pushed_onto_both_phases() {
+        let fragments = distinct_top_n_dispatch(3, true);
+        let refs: Vec<_> = fragments.iter().collect();
+        let stitched = stitch_fragments(&refs).unwrap();
+        let node = &stitched
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes[0];
+        assert_eq!(node.node_type, TPlanNodeType::AGGREGATION_NODE);
+        assert_eq!(node.limit, 3);
+        let agg = node.agg_node.as_ref().unwrap();
+        // The merge phase's sort-by-key (over its output tuple) survives; the update copy is gone.
+        assert_eq!(
+            agg.agg_sort_info_by_group_key
+                .as_ref()
+                .unwrap()
+                .ordering_exprs,
+            vec![key_ref(6, 60)]
+        );
+        assert_eq!(agg.grouping_exprs, Some(vec![key_ref(0, 7)]));
+
+        // An update-phase limit that is not the merge phase's top-N is refused: different
+        // limit, or no sort-by-key on the update phase, or none on the merge phase.
+        for (update_limit, update_sort) in [(2, true), (3, false)] {
+            let fragments = distinct_top_n_dispatch(update_limit, update_sort);
+            let refs: Vec<_> = fragments.iter().collect();
+            assert!(matches!(
+                stitch_fragments(&refs).unwrap_err(),
+                TranslateError::UnsupportedPlanNode { node_id: 1, reason, .. } if reason.contains("top-N")
+            ));
+        }
+        let mut fragments = distinct_top_n_dispatch(3, true);
+        fragments[1]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes[0]
+            .agg_node
+            .as_mut()
+            .unwrap()
+            .agg_sort_info_by_group_key = None;
+        let refs: Vec<_> = fragments.iter().collect();
+        assert!(matches!(
+            stitch_fragments(&refs).unwrap_err(),
+            TranslateError::UnsupportedPlanNode { node_id: 1, reason, .. } if reason.contains("top-N")
+        ));
+    }
+
     #[test]
     fn merge_grouping_keys_must_read_the_update_output_in_order() {
         // The merge key reads a slot that is not the update phase's key.
@@ -1002,6 +1190,142 @@ mod tests {
         assert_eq!(sort.sort_node.as_ref().unwrap().offset, Some(2));
         assert!(sort.exchange_node.is_none());
         assert_eq!(sort.row_tuples, vec![6]);
+    }
+
+    /// Q3's shape: EXCHANGE(4, merging, limit 10) ← SORT(5, top-N 10, same order) > AGG(merge)
+    /// > EXCHANGE(2) ← AGG(update) > SCAN.
+    fn merged_top_n_dispatch() -> Vec<TPipelineFragmentParams> {
+        let by_key = || TSortInfo {
+            ordering_exprs: vec![key_ref(6, 61)],
+            is_asc_order: vec![false],
+            nulls_first: vec![false],
+            ..Default::default()
+        };
+        let mut fragments = two_phase_dispatch();
+        let root_nodes = &mut fragments[0]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes;
+        root_nodes.remove(0);
+        let exchange = &mut root_nodes[0];
+        exchange.limit = 10;
+        exchange.exchange_node.as_mut().unwrap().sort_info = Some(by_key());
+        exchange.exchange_node.as_mut().unwrap().offset = Some(0);
+        let mut sort = node(5, TPlanNodeType::SORT_NODE, 1, vec![6]);
+        sort.limit = 10;
+        sort.sort_node = Some(TSortNode {
+            sort_info: by_key(),
+            use_top_n: true,
+            offset: Some(0),
+            ..Default::default()
+        });
+        fragments[1]
+            .fragment
+            .as_mut()
+            .unwrap()
+            .plan
+            .as_mut()
+            .unwrap()
+            .nodes
+            .insert(0, sort);
+        fragments
+    }
+
+    #[test]
+    fn merging_exchange_over_the_same_sort_adds_no_sort() {
+        let fragments = merged_top_n_dispatch();
+        let refs: Vec<_> = fragments.iter().collect();
+        let stitched = stitch_fragments(&refs).unwrap();
+        // The sender's top-N sort is the whole merge: one SORT_NODE, the sender's.
+        assert_eq!(
+            shape(&stitched),
+            vec![
+                (5, TPlanNodeType::SORT_NODE, 1),
+                (3, TPlanNodeType::AGGREGATION_NODE, 1),
+                (0, TPlanNodeType::FILE_SCAN_NODE, 0),
+            ]
+        );
+        let sort = &stitched
+            .fragment
+            .as_ref()
+            .unwrap()
+            .plan
+            .as_ref()
+            .unwrap()
+            .nodes[0];
+        assert_eq!(sort.limit, 10);
+        assert!(sort.sort_node.as_ref().unwrap().use_top_n);
+
+        // Anything that makes the sender's sort differ keeps the merge as its own sort:
+        // a different limit, direction, key, offset, or work on the exchange itself.
+        fn sender_sort(fragments: &mut [TPipelineFragmentParams]) -> &mut TPlanNode {
+            &mut fragments[1]
+                .fragment
+                .as_mut()
+                .unwrap()
+                .plan
+                .as_mut()
+                .unwrap()
+                .nodes[0]
+        }
+        fn root_exchange(fragments: &mut [TPipelineFragmentParams]) -> &mut TPlanNode {
+            &mut fragments[0]
+                .fragment
+                .as_mut()
+                .unwrap()
+                .plan
+                .as_mut()
+                .unwrap()
+                .nodes[0]
+        }
+        let variants: Vec<fn(&mut [TPipelineFragmentParams])> = vec![
+            |f| sender_sort(f).limit = 5,
+            |f| {
+                sender_sort(f)
+                    .sort_node
+                    .as_mut()
+                    .unwrap()
+                    .sort_info
+                    .is_asc_order = vec![true]
+            },
+            |f| {
+                sender_sort(f)
+                    .sort_node
+                    .as_mut()
+                    .unwrap()
+                    .sort_info
+                    .nulls_first = vec![true]
+            },
+            |f| {
+                sender_sort(f)
+                    .sort_node
+                    .as_mut()
+                    .unwrap()
+                    .sort_info
+                    .ordering_exprs = vec![key_ref(6, 60)]
+            },
+            |f| sender_sort(f).sort_node.as_mut().unwrap().offset = Some(1),
+            |f| sender_sort(f).sort_node.as_mut().unwrap().is_analytic_sort = Some(true),
+            |f| root_exchange(f).conjuncts = Some(vec![key_ref(6, 60)]),
+        ];
+        for (index, variant) in variants.iter().enumerate() {
+            let mut fragments = merged_top_n_dispatch();
+            variant(&mut fragments);
+            let refs: Vec<_> = fragments.iter().collect();
+            let stitched = stitch_fragments(&refs).unwrap();
+            assert_eq!(
+                shape(&stitched)
+                    .iter()
+                    .filter(|(_, node_type, _)| *node_type == TPlanNodeType::SORT_NODE)
+                    .count(),
+                2,
+                "variant {index} must keep the merge sort"
+            );
+        }
     }
 
     #[test]

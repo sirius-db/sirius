@@ -455,8 +455,21 @@ fn translate_sort(
         None => relabel(child, &node.row_tuples, ctx, node)?,
     };
     let sorts = sort_fields(&sort.sort_info, &input, ctx)?;
+    let offset = sort.offset.unwrap_or(0);
+    // The FE plans a top-N over an aggregate as the aggregate's own limit + sort by group key
+    // (Q18) *and* a SORT_NODE with the same order and limit above it; the second sort of
+    // already sorted-and-limited rows is dropped when it would repeat what the child emitted.
+    if offset == 0 && already_sorted_and_limited(&input.rel, &sorts, node.limit) {
+        return Ok((
+            input,
+            Consumed {
+                conjuncts: false,
+                limit: true,
+            },
+        ));
+    }
     let sorted = sort_rel(input, sorts);
-    let limited = apply_limit(sorted, node.limit, sort.offset.unwrap_or(0));
+    let limited = apply_limit(sorted, node.limit, offset);
     Ok((
         limited,
         Consumed {
@@ -464,6 +477,24 @@ fn translate_sort(
             limit: true,
         },
     ))
+}
+
+/// Whether `rel` is already `Fetch[limit](Sort[sorts](..))` (or `Sort[sorts](..)` when there is
+/// no limit) with exactly these sort fields, so sorting it again the same way is a no-op.
+#[allow(deprecated)] // `CountMode::Count` is what the DuckDB consumer reads (see apply_limit)
+fn already_sorted_and_limited(rel: &Rel, sorts: &[SortField], limit: i64) -> bool {
+    let sorted = match &rel.rel_type {
+        Some(rel::RelType::Fetch(fetch)) if limit >= 0 => {
+            let same_count = fetch.count_mode == Some(fetch_rel::CountMode::Count(limit));
+            match fetch.input.as_deref() {
+                Some(input) if same_count && fetch.offset_mode.is_none() => input,
+                _ => return false,
+            }
+        }
+        _ if limit < 0 => rel,
+        _ => return false,
+    };
+    matches!(&sorted.rel_type, Some(rel::RelType::Sort(sort)) if sort.sorts == sorts)
 }
 
 /// `AGGREGATION_NODE` (finalized, single phase) → aggregate + output-type casts (+ `HAVING`,
@@ -1955,6 +1986,69 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("count()"), "{text}");
+    }
+
+    #[test]
+    fn sort_over_the_aggregate_that_already_emitted_it_is_dropped() {
+        // Q18's shape: SORT(limit 100, by a) over AGG(limit 100, sort by group key a). The
+        // sort tuple 2 = {x, y} relabels the agg output tuple 4 = {a, cnt} positionally.
+        let by_key = |tuple: i32, slot: i32| TSortInfo {
+            ordering_exprs: vec![slot_ref(tuple, slot, TPrimitiveType::INT)],
+            is_asc_order: vec![true],
+            nulls_first: vec![false],
+            ..Default::default()
+        };
+        let agg = |limit: i64| {
+            let mut agg = aggregation(true, vec![agg_expr("count", false, None)]);
+            agg.agg_node.as_mut().unwrap().agg_sort_info_by_group_key = Some(by_key(4, 9));
+            agg.limit = limit;
+            agg
+        };
+        let sort = |limit: i64, offset: i64, nulls_first: bool| {
+            let mut info = by_key(2, 4);
+            info.nulls_first = vec![nulls_first];
+            TPlanNode {
+                sort_node: Some(TSortNode {
+                    sort_info: info,
+                    use_top_n: limit >= 0,
+                    offset: Some(offset),
+                    ..Default::default()
+                }),
+                limit,
+                ..node(2, TPlanNodeType::SORT_NODE, 1, vec![2])
+            }
+        };
+        let sort_layers = |nodes: Vec<TPlanNode>| {
+            let (translated, text) = translate(nodes, &ScanRanges::default()).unwrap();
+            assert_eq!(translated.row_tuples, vec![2]);
+            (
+                text.matches("Sort[").count(),
+                text.matches("Fetch[").count(),
+            )
+        };
+        // Same order and limit: the aggregate's Fetch(Sort) is the whole top-N.
+        assert_eq!(
+            sort_layers(vec![sort(100, 0, false), agg(100), exchange(0, vec![0])]),
+            (1, 1)
+        );
+        // Anything different keeps the sort: another limit, an offset, another null order,
+        // or an aggregate without its own limit (sort by key, no fetch: not the same top-N).
+        assert_eq!(
+            sort_layers(vec![sort(10, 0, false), agg(100), exchange(0, vec![0])]),
+            (2, 2)
+        );
+        assert_eq!(
+            sort_layers(vec![sort(100, 5, false), agg(100), exchange(0, vec![0])]),
+            (2, 2)
+        );
+        assert_eq!(
+            sort_layers(vec![sort(100, 0, true), agg(100), exchange(0, vec![0])]),
+            (2, 2)
+        );
+        assert_eq!(
+            sort_layers(vec![sort(100, 0, false), agg(-1), exchange(0, vec![0])]),
+            (2, 1)
+        );
     }
 
     #[test]

@@ -19,9 +19,15 @@
 #   --out DIR          where per-query artifacts go (default: tests/fixtures/tpch in corpus
 #                      mode, log/tpch otherwise)
 #   --dump-dir DIR     the backend's SIRIUS_BE_DUMP_FRAGMENTS (default: log/dump)
+#   --expected DIR     execution mode: validate every result.tsv against the DuckDB baseline
+#                      in DIR with scripts/validate_tpch_results.py (default:
+#                      tests/expected/tpch-sf1 when --sql-dir is sql/tpch; the check is skipped
+#                      when DIR does not exist). A mismatch fails the run. Regenerate the
+#                      baseline for another dataset with `validate_tpch_results.py expected`.
+#   --no-validate      execution mode: skip that check
 #
-# Needs the `mysql` client (pixi run -e fe ...) and a healthy FE + registered backend
-# (scripts/fe.sh start; scripts/be.sh start).
+# Needs the `mysql` client and python-duckdb (pixi run -e fe ...) and a healthy FE +
+# registered backend (scripts/fe.sh start; scripts/be.sh start).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,6 +40,8 @@ QUERIES=""
 TRANSLATE_ONLY=false
 OUT=""
 DUMP_DIR="${SIRIUS_BE_DUMP_FRAGMENTS:-${ROOT}/log/dump}"
+EXPECTED=""
+VALIDATE=true
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) DATA="$2"; shift 2 ;;
@@ -42,6 +50,8 @@ while [ $# -gt 0 ]; do
         --translate-only) TRANSLATE_ONLY=true; shift ;;
         --out) OUT="$2"; shift 2 ;;
         --dump-dir) DUMP_DIR="$2"; shift 2 ;;
+        --expected) EXPECTED="$2"; shift 2 ;;
+        --no-validate) VALIDATE=false; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -62,6 +72,9 @@ if [ -z "${OUT}" ]; then
     if [ "${TRANSLATE_ONLY}" = true ]; then OUT="${ROOT}/tests/fixtures/tpch"; else OUT="${ROOT}/log/tpch"; fi
 fi
 mkdir -p "${OUT}"
+if [ -z "${EXPECTED}" ] && [ "${SQL_DIR}" = "sql/tpch" ]; then
+    EXPECTED="${ROOT}/tests/expected/tpch-sf1"
+fi
 
 if ! "${MYSQL[@]}" -e "SELECT 1" >/dev/null 2>&1 && ! "${MYSQL[@]}" -e "SHOW BACKENDS" >/dev/null 2>&1; then
     echo "error: cannot reach the FE on 127.0.0.1:${FE_QUERY_PORT:-9030}" >&2
@@ -178,5 +191,14 @@ if [ "${TRANSLATE_ONLY}" = true ]; then
     [ "${failed}" -eq 0 ]
 else
     echo "==> ${passed} ok, ${failed} failed; artifacts in ${OUT}"
-    [ "${failed}" -eq 0 ]
+    validated=0
+    if [ "${VALIDATE}" = true ] && [ -n "${EXPECTED}" ] && [ -d "${EXPECTED}" ]; then
+        # Every result.tsv against the DuckDB baseline (row order per the query's ORDER BY,
+        # numbers within tolerance); the verdicts also go to ${OUT}/summary.csv.
+        python3 scripts/validate_tpch_results.py validate --actual "${OUT}" --expected "${EXPECTED}" \
+            --sql-dir "${SQL_DIR}" --queries "${QUERIES}" --csv "${OUT}/summary.csv" || validated=$?
+    elif [ "${VALIDATE}" = true ]; then
+        echo "==> no expected results to validate against (${EXPECTED:-none}); see --expected"
+    fi
+    [ "${failed}" -eq 0 ] && [ "${validated}" -eq 0 ]
 fi

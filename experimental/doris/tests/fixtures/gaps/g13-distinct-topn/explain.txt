@@ -27,7 +27,7 @@ PLAN FRAGMENT 1
 IS_MERGE: true
 
   4:VTOP-N(234)
-  |  order by: n_regionkey[#10] ASC
+  |  order by: n_regionkey[#10] ASC, n_name[#11] ASC
   |  algorithm: heap sort
   |  local merge sort
   |  merge by exchange
@@ -37,8 +37,9 @@ IS_MERGE: true
   |  
   3:VAGGREGATE (merge finalize)(230)
   |  group by: n_regionkey[#6], n_name[#7]
-  |  sortByGroupKey:false
+  |  sortByGroupKey:true
   |  cardinality=0
+  |  limit: 3
   |  distribute expr lists: n_regionkey[#6], n_name[#7]
   |  
   2:VEXCHANGE
@@ -58,8 +59,9 @@ PLAN FRAGMENT 2
   1:VAGGREGATE (update serialize)(222)
   |  STREAMING
   |  group by: n_regionkey[#4], n_name[#5]
-  |  sortByGroupKey:false
+  |  sortByGroupKey:true
   |  cardinality=0
+  |  limit: 3
   |  distribute expr lists: 
   |  
   0:VTVF_SCAN_NODE(214)

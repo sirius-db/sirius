@@ -1,4 +1,4 @@
-query_id=82e606d3d88747d1-ac850a4c7d2c1dcd
+query_id=2ed8561c99a2470f-964880bcadfd0d50
 batch_seq=0
 fragments=4
 [0] fragment_id=4 sink=RESULT_SINK instances=1 nodes=[EXCHANGE_NODE]

@@ -3,5 +3,5 @@
 #   fragment_id=0 sink=DATA_STREAM_SINK nodes=[SORT_NODE > FILE_SCAN_NODE]
 # Reviewed by hand against tests/fixtures/gaps/g11-window/query.sql; regenerate with
 # `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
-stitched: ANALYTIC_EVAL_NODE > SORT_NODE > SORT_NODE > FILE_SCAN_NODE
+stitched: ANALYTIC_EVAL_NODE > SORT_NODE > FILE_SCAN_NODE
 translation error: unsupported plan node ANALYTIC_EVAL_NODE at node 3: plan node type is not translated (see the node table in node_translator.rs)
