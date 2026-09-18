@@ -497,23 +497,25 @@ inline std::vector<uint8_t> make_dict_fsst_segment(std::vector<std::string> cons
   for (uint32_t k = 0; k < dict_count; ++k) {
     max_entry_len = std::max(max_entry_len, static_cast<uint32_t>(entry_lens[k]));
   }
-  uint32_t string_lengths_width = std::max(1u, bitpack_width_for_value(max_entry_len));
-  uint32_t dict_indices_width   = std::max(1u, bitpack_width_for_value(dict_count - 1));
+  uint32_t string_lengths_width = bitpack_width_for_value(max_entry_len);
+  uint32_t dict_indices_width   = mode == 2 ? 0 : bitpack_width_for_value(dict_count - 1);
 
   uint32_t dict_size = 0;
   for (size_t l : entry_lens)
     dict_size += static_cast<uint32_t>(l);
 
-  // Region offsets mirror prepare_dict_fsst in gpu_decode_strings.cu.
+  // DuckDB pads each bitpacked region to groups of 32 values.
   uint32_t const header_size = 16;
   uint32_t off_dict          = synth_align_up8(header_size);
   uint32_t off_symtab        = (mode == 0) ? 0 : synth_align_up8(off_dict + dict_size);
   uint32_t off_slens =
     (mode == 0) ? off_dict + synth_align_up8(dict_size) : synth_align_up8(off_symtab + symtab_size);
-  uint32_t slens_bits = dict_count * string_lengths_width;
+  uint32_t slens_bits = ((dict_count + 31u) / 32u * 32u) * string_lengths_width;
   uint32_t off_didx   = synth_align_up8(off_slens + (slens_bits + 7u) / 8u);
   uint32_t total =
-    (mode == 2) ? off_didx : synth_align_up8(off_didx + (row_count * dict_indices_width + 7u) / 8u);
+    (mode == 2)
+      ? off_didx
+      : synth_align_up8(off_didx + ((row_count + 31u) / 32u * 32u) * dict_indices_width / 8u);
 
   std::vector<uint8_t> bytes(total, 0);
   // Header (matches dict_fsst_header_t in gpu_decode_strings.cu).
