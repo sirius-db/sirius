@@ -19,13 +19,20 @@
 //! [`TranslateError::MalformedPlan`] instead of silently producing a truncated
 //! tree. **Any node translator added here must preserve this invariant.**
 //!
+//! # Modules
+//!
+//! - [`descriptor_table`]: `TDescriptorTable` → tuples, slots in wire order, and
+//!   `(tuple_id, slot_id)` → column-index resolution for a node's `row_tuples`.
+//! - [`type_mapper`]: `TTypeDesc` → Substrait type, and the type gate (what is
+//!   rejected and which `semantics-gaps.md` entry says why).
+//!
 //! # Status
 //!
-//! P0 (scaffolding): this crate carries the public surface the backend builds
-//! against — [`PlanTranslator`], [`TranslatedPlan`], [`TranslateError`] — and a
-//! [`PlanTranslator::translate_fragment`] that rejects every fragment with a
-//! structured error naming its root node. P1 fills in the descriptor table,
-//! type mapper, expression and node translators, and the single-plan stitcher.
+//! P1 in progress. Done: descriptor table and type mapping (P1.1). Pending:
+//! expression translation, node translation, and the single-plan stitcher;
+//! until then [`PlanTranslator::translate_fragment`] rejects every fragment with
+//! a structured error naming its root node, so the backend's translate-only
+//! survey mode records exactly which node types the corpus needs.
 
 use std::fmt;
 
@@ -33,8 +40,11 @@ use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use prost::Message;
 use substrait::proto::Plan;
 
+pub mod descriptor_table;
 pub mod error;
+pub mod type_mapper;
 
+pub use descriptor_table::{DescriptorTable, SlotInfo, TupleInfo};
 use error::Result;
 pub use error::TranslateError;
 
