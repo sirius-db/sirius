@@ -1,0 +1,16 @@
+[package]
+name = "sirius-telemetry-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quent-analyzer = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
+quent-events = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c", features = ["serde"] }
+quent-store = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
+serde = { version = "1", features = ["derive"] }
+smallvec = "1"
+
+[build-dependencies]
+quent-build-info = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
+quent-store-build = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
+quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }

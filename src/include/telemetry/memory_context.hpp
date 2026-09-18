@@ -18,13 +18,16 @@
 
 #include "cucascade/memory/common.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
-#include "telemetry-bridge/gen/channel.rs.h"
-#include "telemetry-bridge/gen/memory.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <functional>
+#include <optional>
 #include <unordered_map>
 
 namespace sirius::telemetry {
+
+using memory_handle  = quent::Handle<quent::Memory>;
+using channel_handle = quent::Handle<quent::Channel>;
 
 struct channel_key {
   cucascade::memory::memory_space_id source;
@@ -49,24 +52,22 @@ struct channel_key_hash {
 
 class memory_context {
  public:
-  explicit memory_context(uuid::UUID engine_uuid,
+  explicit memory_context(quent::Uuid engine_uuid,
                           const quent::Context& context,
                           const cucascade::memory::memory_reservation_manager* manager);
-  ~memory_context();
+  ~memory_context() noexcept;
 
-  std::optional<std::reference_wrapper<const quent::memory::MemoryHandle>> get_memory_handle(
+  std::optional<std::reference_wrapper<const memory_handle>> get_memory_handle(
     cucascade::memory::memory_space_id mem_space) const noexcept;
 
-  std::optional<std::reference_wrapper<const quent::channel::ChannelHandle>> get_channel_handle(
+  std::optional<std::reference_wrapper<const channel_handle>> get_channel_handle(
     cucascade::memory::memory_space_id source,
     cucascade::memory::memory_space_id destination) const noexcept;
 
  private:
-  std::unordered_map<cucascade::memory::memory_space_id, rust::Box<quent::memory::MemoryHandle>>
-    memory_handles_{};
+  std::unordered_map<cucascade::memory::memory_space_id, memory_handle> memory_handles_{};
 
-  std::unordered_map<channel_key, rust::Box<quent::channel::ChannelHandle>, channel_key_hash>
-    channel_handles_;
+  std::unordered_map<channel_key, channel_handle, channel_key_hash> channel_handles_;
 };
 
 }  // namespace sirius::telemetry

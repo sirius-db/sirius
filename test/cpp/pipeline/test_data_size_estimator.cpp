@@ -133,7 +133,7 @@ class estimator_dag {
     consumer_op->add_port(name, std::move(port));
 
     producer_op->add_next_port_after_sink(
-      sirius_physical_operator::next_port_info{consumer_op, name, uuid::now_v7()});
+      sirius_physical_operator::next_port_info{consumer_op, name, quent::now_v7()});
   }
 
   static test_source_operator& source_of(test_pipeline& pipeline)

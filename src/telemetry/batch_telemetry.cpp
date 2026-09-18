@@ -18,8 +18,7 @@
 
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "telemetry-bridge/gen/batch_placement.rs.h"
-#include "telemetry-bridge/gen/memory_tier.rs.h"
+#include "telemetry/runtime_fsm_handle.hpp"
 #include "telemetry/telemetry_context.hpp"
 
 #include <cucascade/data/data_batch.hpp>
@@ -30,7 +29,9 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sirius::telemetry {
@@ -77,18 +78,37 @@ std::optional<batch_snapshot> snapshot(const std::shared_ptr<cucascade::data_bat
   };
 }
 
+std::optional<quent::refs::MemoryTierUsageRef> tier_usage(quent::Uuid resource_id, uint64_t bytes)
+{
+  if (resource_id == quent::nil_uuid()) { return std::nullopt; }
+  return quent::refs::MemoryTierUsageRef{
+    .target = quent::memory_tier::MemoryTierId(resource_id),
+    .data   = quent::records::MemoryTierUsage{.bytes = bytes},
+  };
+}
+
+std::optional<quent::port::PortId> optional_port_id(quent::Uuid id)
+{
+  if (id == quent::nil_uuid()) { return std::nullopt; }
+  return quent::port::PortId(id);
+}
+
 }  // namespace
 
 struct batch_telemetry_registry::impl {
-  enum class placement_state { queued, packaged, processing };
+  using placement_handle = runtime_fsm_handle<quent::BatchPlacement,
+                                              quent::batch_placement_state::BatchQueued,
+                                              quent::batch_placement_state::BatchPackaged,
+                                              quent::batch_placement_state::BatchProcessing,
+                                              quent::batch_placement_state::BatchConsumed>;
 
   struct placement {
-    rust::Box<quent::batch_placement::BatchPlacementHandle> handle;
-    uuid::UUID pipeline_uuid;
-    uuid::UUID task_uuid;  // nil until packaged
-    placement_state state;
+    placement_handle handle;
+    sirius::query_id_t query_id;
+    quent::Uuid pipeline_uuid;
+    quent::Uuid task_uuid;  // nil until packaged
     // Last seen tier/bytes, re-emitted verbatim by tier-agnostic transitions.
-    uuid::UUID tier_resource_id;
+    quent::Uuid tier_resource_id;
     uint64_t bytes;
   };
 
@@ -98,17 +118,17 @@ struct batch_telemetry_registry::impl {
   };
 
   struct port_info {
-    uuid::UUID pipeline_uuid;
-    uuid::UUID port_uuid;
+    sirius::query_id_t query_id;
+    quent::Uuid pipeline_uuid;
+    quent::Uuid port_uuid;
   };
 
   std::atomic<bool> enabled{false};
 
   // Immutable between install() and uninstall(); ordered by `enabled`.
   std::shared_ptr<const telemetry_context> context;
-  std::vector<rust::Box<quent::memory_tier::MemoryTierHandle>> tier_handles;
   // (tier, device) -> MemoryTier resource; HOST/DISK use device key 0.
-  std::unordered_map<int64_t, uuid::UUID> tier_resources;
+  std::unordered_map<int64_t, quent::Uuid> tier_resources;
 
   static int64_t tier_key(cucascade::memory::Tier tier, int32_t device_id)
   {
@@ -123,7 +143,7 @@ struct batch_telemetry_registry::impl {
 
   shard& shard_of(uint64_t batch_id) { return shards[batch_id % kNumShards]; }
 
-  uuid::UUID tier_resource_id(cucascade::memory::Tier tier, int32_t device_id) const
+  quent::Uuid tier_resource_id(cucascade::memory::Tier tier, int32_t device_id) const
   {
     if (auto it = tier_resources.find(tier_key(tier, device_id)); it != tier_resources.end()) {
       return it->second;
@@ -132,45 +152,50 @@ struct batch_telemetry_registry::impl {
     for (const auto& [key, id] : tier_resources) {
       if (static_cast<cucascade::memory::Tier>(key >> 32) == tier) { return id; }
     }
-    return uuid::new_nil();
+    return quent::nil_uuid();
   }
 
   /// Re-emit a placement's current state; the shard mutex must be held.
   void reemit_state(placement& p)
   {
-    switch (p.state) {
-      case placement_state::queued:
-        p.handle->batch_queued({
-          .tier_resource_id    = p.tier_resource_id,
-          .tier_capacity_bytes = p.bytes,
-        });
-        break;
-      case placement_state::packaged:
-        p.handle->batch_packaged({
-          .instance_name       = "",
-          .task_uuid           = p.task_uuid,
-          .tier_resource_id    = p.tier_resource_id,
-          .tier_capacity_bytes = p.bytes,
-        });
-        break;
-      case placement_state::processing:
-        p.handle->batch_processing({
-          .instance_name       = "",
-          .task_uuid           = p.task_uuid,
-          .tier_resource_id    = p.tier_resource_id,
-          .tier_capacity_bytes = p.bytes,
-        });
-        break;
+    if (p.handle.transition<quent::batch_placement_state::BatchQueued>([&p](auto&& current) {
+          return std::move(current).batch_queued(quent::batch_placement::BatchQueued{
+            .tier = tier_usage(p.tier_resource_id, p.bytes),
+          });
+        })) {
+      return;
+    }
+    if (p.handle.transition<quent::batch_placement_state::BatchPackaged>([&p](auto&& current) {
+          return std::move(current).batch_packaged(quent::batch_placement::BatchPackaged{
+            .task_uuid = p.task_uuid,
+            .tier      = tier_usage(p.tier_resource_id, p.bytes),
+          });
+        })) {
+      return;
+    }
+    if (!p.handle.transition<quent::batch_placement_state::BatchProcessing>([&p](auto&& current) {
+          return std::move(current).batch_processing(quent::batch_placement::BatchProcessing{
+            .task_uuid = p.task_uuid,
+            .tier      = tier_usage(p.tier_resource_id, p.bytes),
+          });
+        })) {
+      throw std::logic_error("invalid Quent BatchPlacement state during tier update");
     }
   }
 
   void consume(placement& p, batch_consumed_reason reason)
   {
-    p.handle->batch_consumed({
-      .instance_name = "",
-      .reason        = std::string(to_string_view(reason)),
-    });
-    p.handle->exit();
+    if (!p.handle.holds<quent::batch_placement_state::BatchConsumed>() &&
+        !p.handle.transition<quent::batch_placement_state::BatchQueued,
+                             quent::batch_placement_state::BatchPackaged,
+                             quent::batch_placement_state::BatchProcessing>(
+          [reason](auto&& current) {
+            return std::move(current).batch_consumed(quent::batch_placement::BatchConsumed{
+              .reason = std::string(to_string_view(reason)),
+            });
+          })) {
+      throw std::logic_error("invalid Quent BatchPlacement state during consumption");
+    }
   }
 };
 
@@ -197,14 +222,13 @@ void batch_telemetry_registry::install(
   auto declare_tier =
     [&](
       cucascade::memory::Tier tier, int32_t device_id, std::string name, uint64_t capacity_bytes) {
-      auto handle = quent::memory_tier::create(impl_->context->context(),
-                                               {
-                                                 .instance_name   = std::move(name),
-                                                 .parent_group_id = impl_->context->engine_id(),
-                                               });
-      handle->operating({.capacity_bytes = capacity_bytes});
-      impl_->tier_resources[impl::tier_key(tier, device_id)] = handle->uuid();
-      impl_->tier_handles.push_back(std::move(handle));
+      auto handle = impl_->context->context().memory_tier_observer()->handle();
+      handle.declaration(quent::memory_tier::Declaration{
+        .instance_name   = name,
+        .parent_group_id = quent::engine::EngineId(impl_->context->engine_id()),
+        .bounds          = quent::records::MemoryTierBounds{.bytes = capacity_bytes},
+      });
+      impl_->tier_resources[impl::tier_key(tier, device_id)] = handle.id().raw();
     };
 
   for (const auto* space :
@@ -224,7 +248,7 @@ void batch_telemetry_registry::install(
   }
 
   impl_->enabled.store(true, std::memory_order_release);
-  SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).", impl_->tier_handles.size());
+  SIRIUS_LOG_INFO("Batch telemetry installed ({} tier resources).", impl_->tier_resources.size());
 }
 
 void batch_telemetry_registry::uninstall()
@@ -244,22 +268,18 @@ void batch_telemetry_registry::uninstall()
     std::unique_lock lock(impl_->ports_mutex);
     impl_->ports.clear();
   }
-  for (auto& handle : impl_->tier_handles) {
-    handle->finalizing();
-    handle->exit();
-  }
-  impl_->tier_handles.clear();
   impl_->tier_resources.clear();
   impl_->context.reset();
 }
 
 void batch_telemetry_registry::register_consumer_port(const cucascade::shared_data_repository* repo,
-                                                      uuid::UUID pipeline_uuid,
-                                                      uuid::UUID port_uuid)
+                                                      sirius::query_id_t query_id,
+                                                      quent::Uuid pipeline_uuid,
+                                                      quent::Uuid port_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire) || repo == nullptr) { return; }
   std::unique_lock lock(impl_->ports_mutex);
-  impl_->ports[repo] = {pipeline_uuid, port_uuid};
+  impl_->ports[repo] = {query_id, pipeline_uuid, port_uuid};
 }
 
 void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::data_batch>& batch,
@@ -282,34 +302,33 @@ void batch_telemetry_registry::on_published(const std::shared_ptr<cucascade::dat
 
   auto& shard = impl_->shard_of(snap->batch_id);
   std::lock_guard lock(shard.mutex);
-  auto handle =
-    quent::batch_placement::create(impl_->context->context(),
-                                   {
-                                     .instance_name       = std::format("batch-{}", snap->batch_id),
-                                     .batch_id            = snap->batch_id,
-                                     .pipeline_uuid       = port.pipeline_uuid,
-                                     .port_uuid           = port.port_uuid,
-                                     .origin              = std::string(to_string_view(origin)),
-                                     .tier_resource_id    = tier_resource_id,
-                                     .tier_capacity_bytes = snap->bytes,
-                                   });
-  handle->batch_queued({
-    .tier_resource_id    = tier_resource_id,
-    .tier_capacity_bytes = snap->bytes,
-  });
+  auto registered = impl_->context->context().batch_placement_observer()->handle().batch_registered(
+    quent::batch_placement::BatchRegistered{
+      .instance_name = std::format("batch-{}", snap->batch_id),
+      .batch_id      = snap->batch_id,
+      .pipeline_uuid = quent::operator_::OperatorId(port.pipeline_uuid),
+      .port_uuid     = optional_port_id(port.port_uuid),
+      .origin        = std::string(to_string_view(origin)),
+      .tier          = tier_usage(tier_resource_id, snap->bytes),
+    });
+  auto queued = std::move(registered)
+                  .batch_queued(quent::batch_placement::BatchQueued{
+                    .tier = tier_usage(tier_resource_id, snap->bytes),
+                  });
   shard.placements[snap->batch_id].push_back(impl::placement{
-    .handle           = std::move(handle),
+    .handle           = impl::placement_handle{std::move(queued)},
+    .query_id         = port.query_id,
     .pipeline_uuid    = port.pipeline_uuid,
-    .task_uuid        = uuid::new_nil(),
-    .state            = impl::placement_state::queued,
+    .task_uuid        = quent::nil_uuid(),
     .tier_resource_id = tier_resource_id,
     .bytes            = snap->bytes,
   });
 }
 
 void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
-                                           uuid::UUID consumer_pipeline_uuid,
-                                           uuid::UUID task_uuid)
+                                           sirius::query_id_t query_id,
+                                           quent::Uuid consumer_pipeline_uuid,
+                                           quent::Uuid task_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
@@ -323,14 +342,15 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
   // Prefer this consumer's queued placement; else a packaged one (re-claim).
   impl::placement* target = nullptr;
   for (auto& p : placements) {
-    if (p.pipeline_uuid == consumer_pipeline_uuid && p.state == impl::placement_state::queued) {
+    if (p.query_id == query_id && p.pipeline_uuid == consumer_pipeline_uuid &&
+        p.handle.holds<quent::batch_placement_state::BatchQueued>()) {
       target = &p;
       break;
     }
   }
   if (target == nullptr) {
     for (auto& p : placements) {
-      if (p.pipeline_uuid == consumer_pipeline_uuid && p.state != impl::placement_state::queued) {
+      if (p.query_id == query_id && p.pipeline_uuid == consumer_pipeline_uuid) {
         target = &p;
         break;
       }
@@ -339,42 +359,50 @@ void batch_telemetry_registry::on_packaged(const std::shared_ptr<cucascade::data
 
   if (target == nullptr) {
     // First sighting: register lazily, then package below.
-    auto handle = quent::batch_placement::create(
-      impl_->context->context(),
-      {
-        .instance_name       = std::format("batch-{}", snap->batch_id),
-        .batch_id            = snap->batch_id,
-        .pipeline_uuid       = consumer_pipeline_uuid,
-        .port_uuid           = uuid::new_nil(),
-        .origin              = std::string(to_string_view(batch_origin::reschedule_intermediate)),
-        .tier_resource_id    = tier_resource_id,
-        .tier_capacity_bytes = snap->bytes,
-      });
+    auto registered =
+      impl_->context->context().batch_placement_observer()->handle().batch_registered(
+        quent::batch_placement::BatchRegistered{
+          .instance_name = std::format("batch-{}", snap->batch_id),
+          .batch_id      = snap->batch_id,
+          .pipeline_uuid = quent::operator_::OperatorId(consumer_pipeline_uuid),
+          .port_uuid     = std::nullopt,
+          .origin        = std::string(to_string_view(batch_origin::reschedule_intermediate)),
+          .tier          = tier_usage(tier_resource_id, snap->bytes),
+        });
+    auto packaged = std::move(registered)
+                      .batch_packaged(quent::batch_placement::BatchPackaged{
+                        .task_uuid = task_uuid,
+                        .tier      = tier_usage(tier_resource_id, snap->bytes),
+                      });
     placements.push_back(impl::placement{
-      .handle           = std::move(handle),
+      .handle           = impl::placement_handle{std::move(packaged)},
+      .query_id         = query_id,
       .pipeline_uuid    = consumer_pipeline_uuid,
-      .task_uuid        = uuid::new_nil(),
-      .state            = impl::placement_state::queued,
+      .task_uuid        = task_uuid,
       .tier_resource_id = tier_resource_id,
       .bytes            = snap->bytes,
     });
-    target = &placements.back();
+    return;
   }
 
   target->task_uuid        = task_uuid;
-  target->state            = impl::placement_state::packaged;
   target->tier_resource_id = tier_resource_id;
   target->bytes            = snap->bytes;
-  target->handle->batch_packaged({
-    .instance_name       = "",
-    .task_uuid           = task_uuid,
-    .tier_resource_id    = tier_resource_id,
-    .tier_capacity_bytes = snap->bytes,
-  });
+  if (!target->handle.transition<quent::batch_placement_state::BatchQueued,
+                                 quent::batch_placement_state::BatchPackaged,
+                                 quent::batch_placement_state::BatchProcessing>(
+        [task_uuid, tier_resource_id, bytes = snap->bytes](auto&& current) {
+          return std::move(current).batch_packaged(quent::batch_placement::BatchPackaged{
+            .task_uuid = task_uuid,
+            .tier      = tier_usage(tier_resource_id, bytes),
+          });
+        })) {
+    throw std::logic_error("invalid Quent BatchPlacement transition to packaged");
+  }
 }
 
 void batch_telemetry_registry::on_processing(const std::shared_ptr<cucascade::data_batch>& batch,
-                                             uuid::UUID task_uuid)
+                                             quent::Uuid task_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
   auto snap = snapshot(batch);
@@ -386,21 +414,21 @@ void batch_telemetry_registry::on_processing(const std::shared_ptr<cucascade::da
   auto it = shard.placements.find(snap->batch_id);
   if (it == shard.placements.end()) { return; }
   for (auto& p : it->second) {
-    if (p.task_uuid == task_uuid && p.state == impl::placement_state::packaged) {
-      p.state            = impl::placement_state::processing;
+    if (p.task_uuid == task_uuid && p.handle.holds<quent::batch_placement_state::BatchPackaged>()) {
       p.tier_resource_id = tier_resource_id;
       p.bytes            = snap->bytes;
-      p.handle->batch_processing({
-        .instance_name       = "",
-        .task_uuid           = task_uuid,
-        .tier_resource_id    = tier_resource_id,
-        .tier_capacity_bytes = snap->bytes,
-      });
+      static_cast<void>(p.handle.transition<quent::batch_placement_state::BatchPackaged>(
+        [task_uuid, tier_resource_id, bytes = snap->bytes](auto&& current) {
+          return std::move(current).batch_processing(quent::batch_placement::BatchProcessing{
+            .task_uuid = task_uuid,
+            .tier      = tier_usage(tier_resource_id, bytes),
+          });
+        }));
     }
   }
 }
 
-void batch_telemetry_registry::on_processing_by_id(uint64_t batch_id, uuid::UUID task_uuid)
+void batch_telemetry_registry::on_processing_by_id(uint64_t batch_id, quent::Uuid task_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
 
@@ -409,19 +437,19 @@ void batch_telemetry_registry::on_processing_by_id(uint64_t batch_id, uuid::UUID
   auto it = shard.placements.find(batch_id);
   if (it == shard.placements.end()) { return; }
   for (auto& p : it->second) {
-    if (p.task_uuid == task_uuid && p.state == impl::placement_state::packaged) {
-      p.state = impl::placement_state::processing;
-      p.handle->batch_processing({
-        .instance_name       = "",
-        .task_uuid           = task_uuid,
-        .tier_resource_id    = p.tier_resource_id,
-        .tier_capacity_bytes = p.bytes,
-      });
+    if (p.task_uuid == task_uuid && p.handle.holds<quent::batch_placement_state::BatchPackaged>()) {
+      static_cast<void>(p.handle.transition<quent::batch_placement_state::BatchPackaged>(
+        [task_uuid, &p](auto&& current) {
+          return std::move(current).batch_processing(quent::batch_placement::BatchProcessing{
+            .task_uuid = task_uuid,
+            .tier      = tier_usage(p.tier_resource_id, p.bytes),
+          });
+        }));
     }
   }
 }
 
-void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uuid)
+void batch_telemetry_registry::on_consumed(uint64_t batch_id, quent::Uuid task_uuid)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
 
@@ -432,9 +460,10 @@ void batch_telemetry_registry::on_consumed(uint64_t batch_id, uuid::UUID task_uu
   auto& placements = it->second;
   for (auto p = placements.begin(); p != placements.end();) {
     // Only the currently claiming task consumes; re-claims are left alone.
-    if (p->task_uuid == task_uuid && p->state != impl::placement_state::queued) {
+    if (p->task_uuid == task_uuid &&
+        !p->handle.holds<quent::batch_placement_state::BatchQueued>()) {
       impl_->consume(*p,
-                     p->state == impl::placement_state::processing
+                     p->handle.holds<quent::batch_placement_state::BatchProcessing>()
                        ? batch_consumed_reason::processed
                        : batch_consumed_reason::task_failed);
       p = placements.erase(p);
@@ -465,31 +494,42 @@ void batch_telemetry_registry::on_tier_change(uint64_t batch_id,
   }
 }
 
-uuid::UUID batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
-                                                   int32_t device_id) const
+quent::Uuid batch_telemetry_registry::tier_resource(cucascade::memory::Tier tier,
+                                                    int32_t device_id) const
 {
-  if (!impl_->enabled.load(std::memory_order_acquire)) { return uuid::new_nil(); }
+  if (!impl_->enabled.load(std::memory_order_acquire)) { return quent::nil_uuid(); }
   return impl_->tier_resource_id(tier, device_id);
 }
 
-void batch_telemetry_registry::on_query_end()
+void batch_telemetry_registry::on_query_end(sirius::query_id_t query_id)
 {
   if (!impl_->enabled.load(std::memory_order_acquire)) { return; }
 
   size_t drained = 0;
   for (auto& shard : impl_->shards) {
     std::lock_guard lock(shard.mutex);
-    for (auto& [batch_id, placements] : shard.placements) {
-      for (auto& p : placements) {
-        impl_->consume(p, batch_consumed_reason::query_end);
+    for (auto entry = shard.placements.begin(); entry != shard.placements.end();) {
+      auto& placements = entry->second;
+      for (auto placement = placements.begin(); placement != placements.end();) {
+        if (placement->query_id != query_id) {
+          ++placement;
+          continue;
+        }
+        impl_->consume(*placement, batch_consumed_reason::query_end);
+        placement = placements.erase(placement);
         ++drained;
       }
+      if (placements.empty()) {
+        entry = shard.placements.erase(entry);
+      } else {
+        ++entry;
+      }
     }
-    shard.placements.clear();
   }
   {
     std::unique_lock lock(impl_->ports_mutex);
-    impl_->ports.clear();
+    std::erase_if(impl_->ports,
+                  [query_id](const auto& entry) { return entry.second.query_id == query_id; });
   }
   if (drained > 0) {
     SIRIUS_LOG_DEBUG("Batch telemetry: drained {} placement(s) at query end.", drained);

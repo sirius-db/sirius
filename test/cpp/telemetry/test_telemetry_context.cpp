@@ -29,6 +29,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sirius;
@@ -62,7 +63,7 @@ class scoped_env_restore {
   std::optional<std::string> original_;
 };
 
-std::string uuid_str(const uuid::UUID& id) { return std::string(uuid::to_string(id)); }
+std::string uuid_str(const quent::Uuid& id) { return std::string(quent::to_string(id)); }
 
 /// Read every line of every ndjson file that the quent context wrote.
 std::vector<std::string> read_all_telemetry_lines(const std::filesystem::path& dir)
@@ -93,6 +94,11 @@ bool any_line_with_all(const std::vector<std::string>& lines,
     if (all) { return true; }
   }
   return false;
+}
+
+std::string entity_ref_field(const std::string& field, const std::string& id)
+{
+  return "\"" + field + "\":{\"target\":\"" + id + "\"";
 }
 
 }  // namespace
@@ -135,10 +141,12 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   config.engine_name      = "test-engine";
 
   std::string engine_id;
+  std::string context_id;
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id;
   {
     auto context =
       telemetry_context::create(make_quent_context(config), config, /*manager=*/nullptr, {0, 1});
+    context_id   = uuid_str(context->context().id());
     engine_id    = uuid_str(context->engine_id());
     gpu0_id      = uuid_str(context->gpu_device_group_id(0));
     gpu1_id      = uuid_str(context->gpu_device_group_id(1));
@@ -169,10 +177,79 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
       *context, "task-scheduler-thread", context->shared_group_id()};
     TaskQueueHandleWrapper task_queue{
       *context, "gpu_pipeline-task-queue", context->gpu_device_group_id(0)};
-  }  // wrappers exit, then the context drops and flushes the ndjson files
+
+    auto query_before_planning =
+      context->context().query_observer()->handle().init(quent::query::Init{
+        .instance_name  = "query-before-planning",
+        .query_group_id = quent::query_group::QueryGroupId(context->query_group_id()),
+      });
+    auto query_before_planning_exit = std::move(query_before_planning).exit();
+    static_cast<void>(query_before_planning_exit);
+
+    auto query_during_planning =
+      context->context().query_observer()->handle().init(quent::query::Init{
+        .instance_name  = "query-during-planning",
+        .query_group_id = quent::query_group::QueryGroupId(context->query_group_id()),
+      });
+    auto query_planning = std::move(query_during_planning).planning();
+    auto query_exit     = std::move(query_planning).exit();
+    static_cast<void>(query_exit);
+
+    auto tier = context->context().memory_tier_observer()->handle();
+    tier.declaration(quent::memory_tier::Declaration{
+      .instance_name   = "retry-tier",
+      .parent_group_id = quent::engine::EngineId(context->engine_id()),
+      .bounds          = quent::records::MemoryTierBounds{.bytes = 1024},
+    });
+    const auto tier_id = tier.id().raw();
+    auto placement     = context->context().batch_placement_observer()->handle().batch_registered(
+      quent::batch_placement::BatchRegistered{
+            .instance_name = "retry-batch",
+            .batch_id      = 1,
+            .pipeline_uuid = quent::operator_::OperatorId(quent::now_v7()),
+            .port_uuid     = std::nullopt,
+            .origin        = "reschedule_intermediate",
+            .tier =
+          quent::refs::MemoryTierUsageRef{
+                .target = quent::memory_tier::MemoryTierId(tier_id),
+                .data   = quent::records::MemoryTierUsage{.bytes = 512},
+          },
+      });
+    const auto first_task = quent::now_v7();
+    auto packaged   = std::move(placement).batch_packaged(quent::batch_placement::BatchPackaged{
+        .task_uuid = first_task,
+        .tier =
+        quent::refs::MemoryTierUsageRef{
+            .target = quent::memory_tier::MemoryTierId(tier_id),
+            .data   = quent::records::MemoryTierUsage{.bytes = 512},
+        },
+    });
+    auto processing = std::move(packaged).batch_processing(quent::batch_placement::BatchProcessing{
+      .task_uuid = first_task,
+      .tier =
+        quent::refs::MemoryTierUsageRef{
+          .target = quent::memory_tier::MemoryTierId(tier_id),
+          .data   = quent::records::MemoryTierUsage{.bytes = 512},
+        },
+    });
+    auto repackaged = std::move(processing)
+                        .batch_packaged(quent::batch_placement::BatchPackaged{
+                          .task_uuid = quent::now_v7(),
+                          .tier =
+                            quent::refs::MemoryTierUsageRef{
+                              .target = quent::memory_tier::MemoryTierId(tier_id),
+                              .data   = quent::records::MemoryTierUsage{.bytes = 512},
+                            },
+                        });
+    auto consumed = std::move(repackaged)
+                      .batch_consumed(quent::batch_placement::BatchConsumed{.reason = "processed"});
+    static_cast<void>(consumed);
+
+  }  // The context drops and flushes the ndjson files.
 
   const auto lines = read_all_telemetry_lines(out_dir);
   REQUIRE(!lines.empty());
+  REQUIRE(std::filesystem::is_directory(out_dir / context_id / "NvtxEvent"));
 
   // Device groups are declared under the engine, with matching ids.
   REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", engine_id, gpu0_id}));
@@ -183,12 +260,18 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   // The shared group hangs off the engine.
   REQUIRE(any_line_with_all(lines, {"\"shared\"", engine_id, shared_id}));
 
-  // Threads and queues point at their group, not at the engine.
-  REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", gpu0_exec_id}));
-  REQUIRE(!any_line_with_all(lines, {"test-gpu0-exec-0", engine_id}));
-  REQUIRE(any_line_with_all(lines, {"gpu-0-exec-manager", gpu0_mgr_id}));
-  REQUIRE(any_line_with_all(lines, {"task-scheduler-thread", shared_id}));
-  REQUIRE(any_line_with_all(lines, {"gpu_pipeline-task-queue", gpu0_id}));
+  // Threads and queues use their bucket as the direct parent and the engine as
+  // the schema scope anchor.
+  REQUIRE(any_line_with_all(
+    lines, {"test-gpu0-exec-0", entity_ref_field("parent_group_id", gpu0_exec_id)}));
+  REQUIRE(any_line_with_all(lines, {"test-gpu0-exec-0", entity_ref_field("engine_id", engine_id)}));
+  REQUIRE(any_line_with_all(
+    lines, {"gpu-0-exec-manager", entity_ref_field("parent_group_id", gpu0_mgr_id)}));
+  REQUIRE(any_line_with_all(
+    lines, {"task-scheduler-thread", entity_ref_field("parent_group_id", shared_id)}));
+  REQUIRE(any_line_with_all(
+    lines, {"gpu_pipeline-task-queue", entity_ref_field("parent_group_id", gpu0_id)}));
+  REQUIRE(any_line_with_all(lines, {"retry-batch", "\"port_uuid\":null"}));
 
   std::filesystem::remove_all(out_dir);
 }

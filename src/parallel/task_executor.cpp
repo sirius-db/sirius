@@ -52,8 +52,8 @@ void itask_executor::schedule(std::unique_ptr<itask> task)
 {
   if (task) {
     if (auto* pipeline_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get())) {
-      pipeline_task->telemetry_handle().queued({
-        .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+      pipeline_task->telemetry_queued({
+        .queue_resource_id      = _task_queue_telemetry->handle.id().raw(),
         .queue_capacity_entries = 1,
       });
     }

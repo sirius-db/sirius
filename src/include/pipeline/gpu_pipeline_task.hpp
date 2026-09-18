@@ -168,7 +168,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
                     std::unique_ptr<sirius_pipeline_task_local_state> local_state,
                     std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
-  ~gpu_pipeline_task() override;
+  ~gpu_pipeline_task() noexcept override;
 
   /**
    * @brief Method to actually execute the task
@@ -327,7 +327,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   std::vector<uint64_t> _claimed_batch_ids;
   //! The processing-space reservation reported on the preparing/computing
   //! telemetry states as a MemoryTier usage (nil id = none).
-  uuid::UUID _reservation_tier_resource_id{};
+  quent::Uuid _reservation_tier_resource_id{};
   uint64_t _reservation_bytes = 0;
 };
 
