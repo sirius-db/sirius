@@ -8,10 +8,14 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use doris_plan_translator::DescriptorTable;
+use doris_plan_translator::expr_translator::{
+    ExprContext, SlotOverrides, aggregate_call, translate_expr,
+};
+use doris_plan_translator::{DescriptorTable, ExtensionRegistry};
 use doris_proto::{PExecPlanFragmentRequest, PFragmentRequestVersion};
 use doris_thrift::data_sinks::TDataSink;
 use doris_thrift::exprs::TExpr;
+use doris_thrift::exprs::TExprNodeType;
 use doris_thrift::plan_nodes::TPlanNode;
 use doris_thrift::types::TPrimitiveType;
 use sirius_doris_be::{FragmentBatch, decode_fragment_params_list};
@@ -339,4 +343,64 @@ fn q01_descriptor_layout_matches_the_captured_plan() {
     assert!(!count_star.nullable);
     assert_eq!(count_star.output_name(), "col_66");
     assert_eq!(desc.slot_global_index(6, 66, &[6]).unwrap(), 9);
+}
+
+/// P1.2: every expression the corpus carries translates — the scalar ones through
+/// `translate_expr`, the `AGG_EXPR` roots through `aggregate_call`. Slot references are
+/// resolved with a permissive override (every slot maps to its index inside its own tuple)
+/// because which row layout an expression is evaluated over is the node translator's job.
+#[test]
+fn every_corpus_expression_translates() {
+    let mut scalar_exprs = 0;
+    let mut aggregate_exprs = 0;
+    let mut merge_exprs = 0;
+    for (query, payload, _) in captured_batches() {
+        let batch = decode(&payload);
+        let desc_tbl = batch.fragments[0].params.desc_tbl.as_ref().unwrap();
+        let desc = DescriptorTable::try_from(desc_tbl).unwrap();
+        let mut overrides = SlotOverrides::new();
+        for tuple in &desc_tbl.tuple_descriptors {
+            for (index, slot) in desc.tuple_slots(tuple.id).unwrap().iter().enumerate() {
+                overrides.insert((tuple.id, slot.slot_id), index);
+            }
+        }
+        let mut registry = ExtensionRegistry::new();
+        let row_tuples: Vec<i32> = Vec::new();
+        let mut ctx =
+            ExprContext::with_slot_overrides(&desc, &mut registry, &row_tuples, &overrides);
+
+        for fragment in &batch.fragments {
+            let plan_fragment = fragment.params.fragment.as_ref().unwrap();
+            let mut exprs: Vec<&TExpr> = Vec::new();
+            for node in &plan_fragment.plan.as_ref().unwrap().nodes {
+                exprs.extend(node_exprs(node));
+            }
+            if let Some(sink) = &plan_fragment.output_sink {
+                exprs.extend(sink_exprs(sink));
+            }
+            exprs.extend(plan_fragment.output_exprs.iter().flatten());
+            for expr in exprs {
+                let root = &expr.nodes[0];
+                if root.node_type == TExprNodeType::AGG_EXPR {
+                    let call = aggregate_call(expr, &mut ctx).unwrap_or_else(|err| {
+                        panic!("{query} fragment {}: {err}\n{root:#?}", fragment.index)
+                    });
+                    aggregate_exprs += 1;
+                    if call.is_merge {
+                        merge_exprs += 1;
+                    }
+                } else {
+                    translate_expr(expr, &mut ctx).unwrap_or_else(|err| {
+                        panic!("{query} fragment {}: {err}\n{expr:#?}", fragment.index)
+                    });
+                    scalar_exprs += 1;
+                }
+            }
+        }
+    }
+    // 40 update-phase + 37 merge-phase AGG_EXPRs (INDEX.md); the counts pin the corpus so a
+    // re-capture that changes shape shows up here.
+    assert!(scalar_exprs > 1000, "{scalar_exprs} scalar expressions");
+    assert_eq!(aggregate_exprs, 77);
+    assert_eq!(merge_exprs, 37);
 }
