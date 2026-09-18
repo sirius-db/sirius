@@ -27,6 +27,19 @@ pub enum TranslateError {
     /// Descriptor-table lookup or consistency failure.
     #[error("descriptor error: {0}")]
     Descriptor(String),
+    /// A slot's declared type is outside the type gate; `source` names the type and the gap.
+    #[error("slot {slot_id} (tuple {tuple_id}, column {col_name:?}): {source}")]
+    UnsupportedSlot {
+        /// Owning tuple id.
+        tuple_id: i32,
+        /// Slot id.
+        slot_id: i32,
+        /// Column name, empty for planner-derived slots.
+        col_name: String,
+        /// The type-gate error.
+        #[source]
+        source: Box<TranslateError>,
+    },
     /// A Doris plan node is outside the supported translation slice.
     #[error("unsupported plan node {node_type:?} at node {node_id}: {reason}")]
     UnsupportedPlanNode {
@@ -70,5 +83,10 @@ impl TranslateError {
     /// Builds a malformed-plan error from owned or borrowed text.
     pub(crate) fn malformed(message: impl Into<String>) -> Self {
         Self::MalformedPlan(message.into())
+    }
+
+    /// Builds a descriptor-table error from owned or borrowed text.
+    pub(crate) fn descriptor(message: impl Into<String>) -> Self {
+        Self::Descriptor(message.into())
     }
 }
