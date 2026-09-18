@@ -276,7 +276,7 @@ struct carrier_file_fixture {
   std::unique_ptr<scan::parquet_file_scan_info> read_file(scan::parquet_gpu_ingestible& reader)
   {
     auto task = reader.next_split_provider(
-      [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ctx; });
+      [ctx = ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ctx; });
     REQUIRE(task);
     auto info  = task();
     auto* file = dynamic_cast<scan::parquet_file_scan_info*>(info.get());
