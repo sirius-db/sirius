@@ -329,7 +329,7 @@ void check_partition_byte_delta(scan::parquet_file_scan_info const& actual,
 
 }  // namespace
 
-TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
+TEST_CASE("parquet scans without a prefetch cache retain advisory ranges",
           "[scan][parquet][prefetch]")
 {
   auto ingestible = scan::make_ingestible(make_nation_info(false));
@@ -349,7 +349,10 @@ TEST_CASE("parquet scans without a prefetch cache skip advisory ranges",
 
   auto* batch = dynamic_cast<scan::parquet_split_info*>(batches.front().get());
   REQUIRE(batch);
-  CHECK(batch->fadvise_entries().empty());
+  auto const hints = batch->fadvise_hints();
+  REQUIRE(hints.size() == 1);
+  CHECK(hints.front().datasource != nullptr);
+  CHECK_FALSE(hints.front().ranges.empty());
 }
 
 TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][sizing]")

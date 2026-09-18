@@ -207,7 +207,7 @@ void task_scheduler::drain_after_error(sirius::query_id_t query_id)
   // stale tasks from the failed query.
   _task_queue.drain();
 
-  // Interrupt each GPU executor's manager loop, wait for in-flight thread-pool
+  // Interrupt each GPU executor's publisher loop, wait for in-flight thread-pool
   // tasks to finish, then restart the manager for the next query.
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->drain_and_wait();
@@ -312,6 +312,7 @@ void task_scheduler::management_eventloop()
     // Work: let the creator pre-create for a waiting device (lookahead
     // strategy only), then sleep until something is pushed.
     if (_task_queue.empty()) {
+      _query_event_publisher->publish_task_queue_empty();
       // No query id: the task_creator picks the oldest live query itself, since this loop has
       // none to inherit.
       if (_task_creator && !_ready_devices.empty()) {
@@ -348,12 +349,30 @@ void task_scheduler::management_eventloop()
       if (!task) {
         // No dispatchable task for this device. Leave device in _ready_devices
         // and move on — it will match when an appropriate task arrives.
+        // Only interesting while the queue is NOT empty: work exists but cannot
+        // be placed here, which is a preference mismatch rather than starvation.
+        if (!_task_queue.empty()) {
+          _query_event_publisher->publish_executor_awaiting_task(device_id);
+        }
         ++it;
         continue;
       }
       uint64_t task_id = 0;
       if (auto* gpu_task = dynamic_cast<pipeline::gpu_pipeline_task*>(task.get())) {
         task_id = gpu_task->get_task_id();
+        {
+          // Priority packs query_id in its high 32 bits (see task_creator); the
+          // queue's key extractor unpacks it the same way.
+          auto const query_id = make_query_id(
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(gpu_task->get_priority()) >> 32));
+          auto const* pipe = gpu_task->get_pipeline();
+          auto const [operator_id, operator_type] =
+            pipe != nullptr ? pipe->get_source_operator()
+                            : std::pair{op::sirius_physical_operator::invalid_operator_id,
+                                        op::SiriusPhysicalOperatorType::INVALID};
+          _query_event_publisher->publish_task_deployed(
+            query_id, operator_id, operator_type, device_id);
+        }
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
