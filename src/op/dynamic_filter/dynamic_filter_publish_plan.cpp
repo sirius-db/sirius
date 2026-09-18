@@ -106,10 +106,9 @@ dynamic_filter_publish_plan::dynamic_filter_publish_plan(
         // A join-edge probe is an operator output at the key's native type, so the binding must
         // name a membership-supported build type and an identical, adaptable probe type (for a
         // decimal key, identical includes the scale).
-        auto const& key   = _admitted_keys[binding.admitted_key_index];
-        auto const domain = classify_membership_key(key.storage_type);
-        if (!domain.has_value() || binding.probe_storage_type != key.storage_type ||
-            !membership_probe_compatible(*domain, binding.probe_storage_type)) {
+        auto const& key = _admitted_keys[binding.admitted_key_index];
+        if (!membership_key_supported(key.storage_type) ||
+            binding.probe_storage_type != key.storage_type) {
           throw std::invalid_argument(
             "[dynamic_filter_publish_plan] A join-edge endpoint binding requires a "
             "membership-supported probe storage type equal to the admitted key's build storage "

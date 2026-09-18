@@ -18,8 +18,6 @@
 
 #include "helper/numeric_narrowing.hpp"
 
-#include <limits>
-
 namespace sirius::op {
 
 // Each key family owns one arm here and a matching adapter arm in
@@ -87,13 +85,12 @@ bool membership_build_fits_rep(cudf::column_view const& keys,
   if (keys.size() == 0 || keys.null_count() == keys.size()) { return true; }
   // Exact unscaled bounds over the valid rows; nullopt only for a scale outside the SQL range,
   // which DuckDB never produces, and is treated as not fitting so nothing is built on an
-  // unverified column.
+  // unverified column. Reuse the carrier-fit helper so decimal domain, scale, and bounds follow
+  // the same rules as compressed materialization.
   auto const range = sirius::compute_exact_numeric_range(keys, stream, mr);
-  if (!range.has_value() || range->domain != sirius::numeric_range_domain::DECIMAL) {
-    return false;
-  }
-  return range->minimum >= static_cast<__int128_t>(std::numeric_limits<std::int64_t>::min()) &&
-         range->maximum <= static_cast<__int128_t>(std::numeric_limits<std::int64_t>::max());
+  return range.has_value() &&
+         sirius::numeric_range_fits(cudf::data_type{cudf::type_id::DECIMAL64, keys.type().scale()},
+                                    *range);
 }
 
 // Mirrors dispatch_probe_adapter: the probe carriers each family's adapter accepts.
@@ -143,17 +140,6 @@ bool membership_probe_compatible(membership_key_domain const& domain,
     case membership_key_family::string_hash: return probe.id() == cudf::type_id::STRING;
   }
   return false;
-}
-
-cudf::data_type membership_rep_type(membership_key_rep rep) noexcept
-{
-  switch (rep) {
-    case membership_key_rep::i32: return cudf::data_type{cudf::type_id::INT32};
-    case membership_key_rep::i64: return cudf::data_type{cudf::type_id::INT64};
-    case membership_key_rep::u32: return cudf::data_type{cudf::type_id::UINT32};
-    case membership_key_rep::u64: return cudf::data_type{cudf::type_id::UINT64};
-  }
-  return cudf::data_type{cudf::type_id::EMPTY};
 }
 
 std::size_t membership_rep_bytes(membership_key_rep rep) noexcept

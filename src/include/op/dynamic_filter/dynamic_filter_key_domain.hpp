@@ -143,9 +143,6 @@ struct membership_key_domain {
 [[nodiscard]] bool membership_probe_compatible(membership_key_domain const& domain,
                                                cudf::data_type probe) noexcept;
 
-/// cudf type of the device element a rep is instantiated over (INT32/INT64/UINT32/UINT64).
-[[nodiscard]] cudf::data_type membership_rep_type(membership_key_rep rep) noexcept;
-
 /// Byte width of a rep's device element (8 for the string family's fingerprints).
 [[nodiscard]] std::size_t membership_rep_bytes(membership_key_rep rep) noexcept;
 

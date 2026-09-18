@@ -648,13 +648,12 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
           throw plan_error(err.empty() ? "filtered decode: membership key decode failed" : err);
         auto keys_typed = apply_stored_dtype(std::move(keys), col.dtype);
         auto flags = directive.probe(keys_typed->view(), /*prior_mask_words=*/nullptr, stream, mr);
-        // A null result is the probe DECLINING this column (the documented
-        // "caller skips it" answer — e.g. the chunk's stored carrier is
-        // narrower than the type the filter was published with). A join
-        // filter is never the whole filter, so dropping one only
-        // under-filters and the authoritative join still runs. Stand the
-        // source down to all-ones, the identity for the AND-combine, rather
-        // than abandoning the batch's whole filtered decode.
+        // A null result is the probe DECLINING this column (the documented "caller skips it"
+        // answer — e.g. incompatible signedness/family, decimal scale, timestamp unit, or an
+        // unavailable device replica). A join filter is never the whole filter, so dropping one
+        // only under-filters and the authoritative join still runs. Stand the source down to
+        // all-ones, the identity for the AND-combine, rather than abandoning the batch's whole
+        // filtered decode.
         if (!flags) {
           if (cudaMemsetAsync(dst,
                               0xFF,
@@ -665,8 +664,8 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
           ++declined_members;
           return;
         }
-        // A wrong type or width is NOT a decline — it breaks the probe
-        // contract, so it stays fatal and names which side broke.
+        // A non-null result with the wrong type or row count is NOT a decline — it breaks the
+        // probe contract, so it stays fatal and names which side broke.
         if (flags->type().id() != cudf::type_id::BOOL8 || flags->size() != num_rows)
           throw plan_error("filtered decode: membership probe result shape mismatch (col=" +
                            std::to_string(selected[directive.column]) +
@@ -685,11 +684,11 @@ std::optional<std::vector<std::unique_ptr<cudf::column>>> try_decompress_fused(
       });
     }
 
-    // ── Keep mask, uploaded before the combine so it primes the cascade's prior. No ballot
-    // producer zeroes its tail (selection.hpp:52), so the gap between the host words and
-    // alloc_words is memset here. Upload on s0 keeps the combine ordered behind it. With no
-    // static source nothing has written `combined` yet (the cascade owns the membership
-    // sources), so the keep mask lands there directly and is the whole prior.
+    // ── Keep mask, uploaded before the combine so it primes the cascade's prior. Unlike device
+    // ballot producers, the host keep mask supplies only ceil(num_rows / 32) words, so the gap to
+    // the full 1024-row strip allocation is memset here. Upload on s0 keeps the combine ordered
+    // behind it. With no static source nothing has written `combined` yet (the cascade owns the
+    // membership sources), so the keep mask lands there directly and is the whole prior.
     if (has_keep_mask) {
       auto const host_words   = static_cast<std::size_t>((num_rows + 31) / 32);
       std::uint32_t* keep_dst = combined;

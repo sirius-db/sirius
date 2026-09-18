@@ -63,31 +63,6 @@
 
 namespace sirius::op::detail {
 
-//===----------------------------------------------------------------------===//
-// Key reps
-//===----------------------------------------------------------------------===//
-
-template <membership_key_rep R>
-struct rep_type;
-template <>
-struct rep_type<membership_key_rep::i32> {
-  using type = std::int32_t;
-};
-template <>
-struct rep_type<membership_key_rep::i64> {
-  using type = std::int64_t;
-};
-template <>
-struct rep_type<membership_key_rep::u32> {
-  using type = std::uint32_t;
-};
-template <>
-struct rep_type<membership_key_rep::u64> {
-  using type = std::uint64_t;
-};
-template <membership_key_rep R>
-using rep_type_t = typename rep_type<R>::type;
-
 /// Invokes @p fn with a value-initialized instance of the rep's device type.
 template <class Fn>
 decltype(auto) dispatch_key_rep(membership_key_rep rep, Fn&& fn)
@@ -202,15 +177,13 @@ struct string_fingerprint_hasher {
 };
 
 /// STRING probes against a fingerprint set: hashes each probe string in-kernel, so no hashed copy
-/// of the probe column is materialized. A null probe string is a definite non-member; the kernel
-/// prologue (probe_validity) already writes `false` for null rows before consulting the adapter,
-/// so the check here only keeps the adapter from reading an offset pair a null row need not own.
+/// of the probe column is materialized. The kernel prologue (probe_validity) writes `false` for a
+/// null row before consulting this adapter, so every row passed here owns a valid string view.
 struct string_hash_adapter {
   using key_type = std::uint64_t;
   cudf::column_device_view col;
   __device__ __forceinline__ bool operator()(cudf::size_type i, std::uint64_t& out) const noexcept
   {
-    if (col.nullable() && !col.is_valid_nocheck(i)) { return false; }
     out = string_fingerprint_hasher{string_fingerprint_seed}(col.element<cudf::string_view>(i));
     return true;
   }
