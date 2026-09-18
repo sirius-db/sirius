@@ -78,7 +78,7 @@ After building Sirius above, run these commands from the repository root to buil
 package against the same DuckDB source as the extension:
 
 ```bash
-git submodule update --init --depth=1 duckdb-python
+git submodule update --init duckdb-python
 pixi run -e duckdb-python build-duckdb-python
 ```
 
