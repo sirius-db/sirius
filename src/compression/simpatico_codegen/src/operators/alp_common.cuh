@@ -35,13 +35,14 @@ struct alp_exception_columns {
 // corresponding `values_source[i]` payloads into `values`. All work is enqueued
 // on `stream`; the thrust::reduce return makes `count` valid on the host on
 // return, but the caller must sync before reading the columns from another
-// stream. `ValueT` is both the source element type and the `values` column type
-// (which must equal `value_type_id`).
+// stream. `ValueT` is the source element type and the storage type of the
+// `values` column; `value_dtype` is that column's full cudf type, taken as a
+// data_type rather than a type_id so a fixed-point column keeps its scale.
 template <typename ValueT>
 alp_exception_columns compact_exceptions(const uint8_t* d_flags,
                                          cudf::size_type n,
                                          const ValueT* values_source,
-                                         cudf::type_id value_type_id,
+                                         cudf::data_type value_dtype,
                                          rmm::cuda_stream_view stream,
                                          rmm::device_async_resource_ref mr)
 {
@@ -55,7 +56,7 @@ alp_exception_columns compact_exceptions(const uint8_t* d_flags,
   alp_exception_columns out;
   out.count  = static_cast<cudf::size_type>(exc_count);
   out.values = cudf::make_fixed_width_column(
-    cudf::data_type(value_type_id), out.count, cudf::mask_state::UNALLOCATED, stream, mr);
+    value_dtype, out.count, cudf::mask_state::UNALLOCATED, stream, mr);
   out.positions = cudf::make_fixed_width_column(
     cudf::data_type(cudf::type_id::INT32), out.count, cudf::mask_state::UNALLOCATED, stream, mr);
 

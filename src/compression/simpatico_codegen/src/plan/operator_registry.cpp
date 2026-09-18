@@ -45,6 +45,7 @@ std::vector<OperatorInfo> const& operator_registry()
     {OpId::Bitpack,        "bitpack",         {"chunk_min", "chunk_count", "chunk_bits", "packed"},                   true,  false, false, true},
     {OpId::For,            "for",             {"deltas", "references"},                                               true,  false, true,  true},
     {OpId::Zigzag,         "zigzag",          {"zigzag"},                                                             true,  false, true,  true},
+    {OpId::Factor,         "factor",          {"quotients", "divisors"},                                              true,  false, true,  true},
     {OpId::Dictionary,     "dictionary",      {},                                                                     true,  false, false, false},
     {OpId::Alp,            "alp",             {"integers", "exceptions", "exception_positions", "metadata"},          true,  false, true,  false},
     {OpId::AlpRd,          "alp_rd",          {"right_parts", "dict_indices", "dict", "metadata", "exceptions", "exception_positions"}, true, false, true, false},
@@ -195,6 +196,7 @@ std::unique_ptr<compressor> make_compressor(std::string const& name)
     case OpId::Rle:
     case OpId::Bitpack:
     case OpId::For:
+    case OpId::Factor:
     case OpId::Zigzag: return nullptr;
   }
   return nullptr;

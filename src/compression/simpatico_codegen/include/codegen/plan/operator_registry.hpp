@@ -33,6 +33,7 @@ enum class OpId : std::uint8_t {
   Alp            = 13,
   AlpRd          = 14,
   Zigzag         = 15,
+  Factor         = 18,
   // Structural / pre-processing ops — not serialised as leaf tags.
   Bitextract = 16,
   StrSplit   = 17,
