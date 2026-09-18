@@ -10,11 +10,9 @@ pub(crate) struct PortAccumulator {
     pub(crate) statistics: Option<quent_events::DynamicAttributes>,
 }
 
-impl quent_events::Entity for PortAccumulator {
-    type Event = schema::PortEvent;
-}
-
 impl EntityEventAccumulator for PortAccumulator {
+    type Event = schema::PortEvent;
+
     fn push(&mut self, event: Self::Event) {
         match event {
             schema::PortEvent::Declaration {

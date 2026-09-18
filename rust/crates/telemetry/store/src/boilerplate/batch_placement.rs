@@ -14,6 +14,10 @@ impl TransitionEvent for BatchPlacementEvent {
         }
     }
 
+    fn is_initial(&self) -> bool {
+        matches!(self, Self::BatchRegistered { .. })
+    }
+
     fn is_final(&self) -> bool {
         matches!(self, Self::BatchConsumed { .. })
     }

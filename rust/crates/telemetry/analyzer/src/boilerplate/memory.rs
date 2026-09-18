@@ -12,11 +12,9 @@ pub(crate) struct MemoryAccumulator {
     bounds: Option<schema::MemoryBounds>,
 }
 
-impl quent_events::Entity for MemoryAccumulator {
-    type Event = schema::MemoryEvent;
-}
-
 impl EntityEventAccumulator for MemoryAccumulator {
+    type Event = schema::MemoryEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::MemoryEvent::Declaration {
             instance_name,

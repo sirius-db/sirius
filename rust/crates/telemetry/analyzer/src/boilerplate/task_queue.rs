@@ -12,11 +12,9 @@ pub(crate) struct TaskQueueAccumulator {
     bounds: Option<schema::TaskQueueBounds>,
 }
 
-impl quent_events::Entity for TaskQueueAccumulator {
-    type Event = schema::TaskQueueEvent;
-}
-
 impl EntityEventAccumulator for TaskQueueAccumulator {
+    type Event = schema::TaskQueueEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::TaskQueueEvent::Declaration {
             instance_name,

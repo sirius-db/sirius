@@ -10,11 +10,9 @@ pub(crate) struct WorkerAccumulator {
     pub(crate) exited: bool,
 }
 
-impl quent_events::Entity for WorkerAccumulator {
-    type Event = schema::WorkerEvent;
-}
-
 impl EntityEventAccumulator for WorkerAccumulator {
+    type Event = schema::WorkerEvent;
+
     fn push(&mut self, event: Self::Event) {
         match event {
             schema::WorkerEvent::Init {

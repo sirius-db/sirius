@@ -13,6 +13,10 @@ impl TransitionEvent for DataBatchEvent {
         }
     }
 
+    fn is_initial(&self) -> bool {
+        matches!(self, Self::Constructed { .. })
+    }
+
     fn is_final(&self) -> bool {
         matches!(self, Self::Destructed { .. })
     }

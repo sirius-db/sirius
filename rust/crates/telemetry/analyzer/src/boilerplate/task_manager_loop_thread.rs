@@ -11,11 +11,9 @@ pub(crate) struct TaskManagerLoopThreadAccumulator {
     parent_group_id: Option<Uuid>,
 }
 
-impl quent_events::Entity for TaskManagerLoopThreadAccumulator {
-    type Event = schema::TaskManagerLoopThreadEvent;
-}
-
 impl EntityEventAccumulator for TaskManagerLoopThreadAccumulator {
+    type Event = schema::TaskManagerLoopThreadEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::TaskManagerLoopThreadEvent::Declaration {
             instance_name,

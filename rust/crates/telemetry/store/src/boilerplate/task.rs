@@ -17,6 +17,10 @@ impl TransitionEvent for TaskEvent {
         }
     }
 
+    fn is_initial(&self) -> bool {
+        matches!(self, Self::Created { .. })
+    }
+
     fn is_final(&self) -> bool {
         matches!(self, Self::Finalizing { .. })
     }

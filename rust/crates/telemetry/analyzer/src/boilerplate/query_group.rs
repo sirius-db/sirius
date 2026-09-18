@@ -9,11 +9,9 @@ pub(crate) struct QueryGroupAccumulator {
     pub(crate) engine_id: Option<Uuid>,
 }
 
-impl quent_events::Entity for QueryGroupAccumulator {
-    type Event = schema::QueryGroupEvent;
-}
-
 impl EntityEventAccumulator for QueryGroupAccumulator {
+    type Event = schema::QueryGroupEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::QueryGroupEvent::Declaration {
             instance_name,

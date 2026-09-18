@@ -10,11 +10,9 @@ pub(crate) struct EngineAccumulator {
     pub(crate) exited: bool,
 }
 
-impl quent_events::Entity for EngineAccumulator {
-    type Event = schema::EngineEvent;
-}
-
 impl EntityEventAccumulator for EngineAccumulator {
+    type Event = schema::EngineEvent;
+
     fn push(&mut self, event: Self::Event) {
         match event {
             schema::EngineEvent::Init {

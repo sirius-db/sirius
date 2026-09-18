@@ -12,11 +12,9 @@ pub(crate) struct MemoryTierAccumulator {
     bounds: Option<schema::MemoryTierBounds>,
 }
 
-impl quent_events::Entity for MemoryTierAccumulator {
-    type Event = schema::MemoryTierEvent;
-}
-
 impl EntityEventAccumulator for MemoryTierAccumulator {
+    type Event = schema::MemoryTierEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::MemoryTierEvent::Declaration {
             instance_name,

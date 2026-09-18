@@ -12,11 +12,9 @@ pub(crate) struct PlanAccumulator {
     pub(crate) edges: Vec<(Uuid, Uuid)>,
 }
 
-impl quent_events::Entity for PlanAccumulator {
-    type Event = schema::PlanEvent;
-}
-
 impl EntityEventAccumulator for PlanAccumulator {
+    type Event = schema::PlanEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::PlanEvent::Declaration {
             parent,

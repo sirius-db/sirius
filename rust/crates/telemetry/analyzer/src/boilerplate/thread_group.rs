@@ -9,11 +9,9 @@ pub(crate) struct ThreadGroupAccumulator {
     parent_group_id: Option<Uuid>,
 }
 
-impl quent_events::Entity for ThreadGroupAccumulator {
-    type Event = schema::ThreadGroupEvent;
-}
-
 impl EntityEventAccumulator for ThreadGroupAccumulator {
+    type Event = schema::ThreadGroupEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::ThreadGroupEvent::Declaration {
             instance_name,

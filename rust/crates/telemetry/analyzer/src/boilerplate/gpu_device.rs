@@ -10,11 +10,9 @@ pub(crate) struct GpuDeviceAccumulator {
     ordinal: Option<u32>,
 }
 
-impl quent_events::Entity for GpuDeviceAccumulator {
-    type Event = schema::GpuDeviceEvent;
-}
-
 impl EntityEventAccumulator for GpuDeviceAccumulator {
+    type Event = schema::GpuDeviceEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::GpuDeviceEvent::Declaration {
             instance_name,

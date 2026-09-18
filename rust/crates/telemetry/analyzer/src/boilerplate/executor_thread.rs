@@ -11,11 +11,9 @@ pub(crate) struct ExecutorThreadAccumulator {
     parent_group_id: Option<Uuid>,
 }
 
-impl quent_events::Entity for ExecutorThreadAccumulator {
-    type Event = schema::ExecutorThreadEvent;
-}
-
 impl EntityEventAccumulator for ExecutorThreadAccumulator {
+    type Event = schema::ExecutorThreadEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::ExecutorThreadEvent::Declaration {
             instance_name,

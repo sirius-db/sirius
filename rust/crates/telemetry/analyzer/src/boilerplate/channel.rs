@@ -14,11 +14,9 @@ pub(crate) struct ChannelAccumulator {
     bounds: Option<schema::ChannelBounds>,
 }
 
-impl quent_events::Entity for ChannelAccumulator {
-    type Event = schema::ChannelEvent;
-}
-
 impl EntityEventAccumulator for ChannelAccumulator {
+    type Event = schema::ChannelEvent;
+
     fn push(&mut self, event: Self::Event) {
         let schema::ChannelEvent::Declaration {
             instance_name,

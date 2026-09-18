@@ -13,6 +13,10 @@ impl TransitionEvent for QueryEvent {
         }
     }
 
+    fn is_initial(&self) -> bool {
+        matches!(self, Self::Init { .. })
+    }
+
     fn is_final(&self) -> bool {
         matches!(self, Self::Exit { .. })
     }

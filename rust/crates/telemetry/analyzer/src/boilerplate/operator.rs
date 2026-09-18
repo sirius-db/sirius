@@ -13,11 +13,9 @@ pub(crate) struct OperatorAccumulator {
     pub(crate) statistics: Option<quent_events::DynamicAttributes>,
 }
 
-impl quent_events::Entity for OperatorAccumulator {
-    type Event = schema::OperatorEvent;
-}
-
 impl EntityEventAccumulator for OperatorAccumulator {
+    type Event = schema::OperatorEvent;
+
     fn push(&mut self, event: Self::Event) {
         match event {
             schema::OperatorEvent::Declaration {
