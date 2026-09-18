@@ -120,14 +120,20 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
 
   std::shared_ptr<cucascade::data_batch> single_batch;
   if (input_batches.size() > 1) {
+    // obtain ro locks to get underlying views and concatenate.
+    std::vector<cucascade::read_only_data_batch> ro_input_batches = input.get_read_only_batches();
+
+    if (input_batches.size() != ro_input_batches.size()) {
+      SIRIUS_LOG_WARN(
+        "pipelineable_operator_data: get_data_batches.size() != get_read_only_batches.size()");
+    }
     // When multiple small batches were coalesced by get_next_task_input_data(),
     // concatenate their GPU tables into one to issue fewer, larger kernel launches.
     std::vector<cudf::table_view> table_views;
-    table_views.reserve(input_batches.size());
+    table_views.reserve(ro_input_batches.size());
 
     cucascade::memory::memory_space* space = nullptr;
-    for (const auto& batch : input_batches) {
-      cucascade::read_only_data_batch ro_batch = batch->to_read_only();
+    for (const auto& ro_batch : ro_input_batches) {
       if (const cucascade::idata_representation* data = ro_batch.get_data(); data) {
         auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
