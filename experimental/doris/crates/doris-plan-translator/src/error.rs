@@ -67,6 +67,14 @@ pub enum TranslateError {
         /// Short unsupported reason.
         reason: &'static str,
     },
+    /// A Doris scalar or aggregate function is outside the allowlist.
+    #[error("unsupported function {name:?}: {reason}")]
+    UnsupportedFunction {
+        /// Doris function name (`TFunctionName.function_name`).
+        name: String,
+        /// Short unsupported reason.
+        reason: &'static str,
+    },
     /// A Doris type is outside the supported Substrait mappings.
     #[error("unsupported type primitive={primitive:?} node={node_type:?}: {reason}")]
     UnsupportedType {

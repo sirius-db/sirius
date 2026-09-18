@@ -25,28 +25,51 @@
 //!   `(tuple_id, slot_id)` → column-index resolution for a node's `row_tuples`.
 //! - [`type_mapper`]: `TTypeDesc` → Substrait type, and the type gate (what is
 //!   rejected and which `semantics-gaps.md` entry says why).
+//! - [`expr_translator`]: `TExpr` → Substrait expression (literals, slot references,
+//!   predicates, arithmetic, casts, `IN`, `CASE`, the scalar-function allowlist)
+//!   and the decomposition of `AGG_EXPR` roots into aggregate measures.
+//!
+//! Extension functions are registered through [`ExtensionRegistry`], which
+//! de-duplicates anchors by `(urn, name)`.
 //!
 //! # Status
 //!
-//! P1 in progress. Done: descriptor table and type mapping (P1.1). Pending:
-//! expression translation, node translation, and the single-plan stitcher;
+//! P1 in progress. Done: descriptor table and type mapping (P1.1), expression
+//! translation (P1.2). Pending: node translation and the single-plan stitcher;
 //! until then [`PlanTranslator::translate_fragment`] rejects every fragment with
 //! a structured error naming its root node, so the backend's translate-only
 //! survey mode records exactly which node types the corpus needs.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use prost::Message;
 use substrait::proto::Plan;
+use substrait::proto::extensions::simple_extension_declaration;
+use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUrn};
 
 pub mod descriptor_table;
 pub mod error;
+pub mod expr_translator;
 pub mod type_mapper;
 
 pub use descriptor_table::{DescriptorTable, SlotInfo, TupleInfo};
 use error::Result;
 pub use error::TranslateError;
+
+/// Substrait comparison function extension URN.
+pub const URN_COMPARISON: &str = "extension:io.substrait:functions_comparison";
+/// Substrait boolean function extension URN.
+pub const URN_BOOLEAN: &str = "extension:io.substrait:functions_boolean";
+/// Substrait arithmetic function extension URN.
+pub const URN_ARITHMETIC: &str = "extension:io.substrait:functions_arithmetic";
+/// Substrait string function extension URN.
+pub const URN_STRING: &str = "extension:io.substrait:functions_string";
+/// Substrait datetime function extension URN.
+pub const URN_DATETIME: &str = "extension:io.substrait:functions_datetime";
+/// Substrait aggregate function extension URN.
+pub const URN_AGGREGATE: &str = "extension:io.substrait:functions_aggregate_generic";
 
 /// Result of translating one Doris plan fragment.
 #[derive(Clone, PartialEq)]
@@ -160,6 +183,86 @@ impl PlanTranslator {
 impl Default for PlanTranslator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Registry for the Substrait extension URNs and function anchors a plan emits.
+#[derive(Debug, Default)]
+pub struct ExtensionRegistry {
+    /// URN declarations in anchor allocation order.
+    urns: Vec<SimpleExtensionUrn>,
+    /// Function declarations in anchor allocation order.
+    functions: Vec<SimpleExtensionDeclaration>,
+    /// Allocated URN anchors keyed by URN.
+    urn_map: HashMap<String, u32>,
+    /// Allocated function anchors keyed by extension URN and function name.
+    function_map: HashMap<(String, String), u32>,
+    /// Next URN anchor to allocate.
+    next_urn_anchor: u32,
+    /// Next function anchor to allocate.
+    next_function_anchor: u32,
+}
+
+impl ExtensionRegistry {
+    /// Creates an empty registry with anchors starting at one.
+    pub fn new() -> Self {
+        Self {
+            next_urn_anchor: 1,
+            next_function_anchor: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Registers or reuses the function anchor for `(urn, name)`.
+    pub fn register_function(&mut self, urn: &str, name: &str) -> u32 {
+        let key = (urn.to_string(), name.to_string());
+        if let Some(anchor) = self.function_map.get(&key) {
+            return *anchor;
+        }
+        let urn_anchor = self.ensure_urn(urn);
+        let function_anchor = self.next_function_anchor;
+        self.next_function_anchor += 1;
+        self.functions.push(SimpleExtensionDeclaration {
+            mapping_type: Some(
+                simple_extension_declaration::MappingType::ExtensionFunction(
+                    simple_extension_declaration::ExtensionFunction {
+                        extension_urn_reference: urn_anchor,
+                        function_anchor,
+                        name: name.to_string(),
+                    },
+                ),
+            ),
+        });
+        self.function_map.insert(key, function_anchor);
+        function_anchor
+    }
+
+    /// The function name registered under `anchor`, if any.
+    pub fn function_name(&self, anchor: u32) -> Option<&str> {
+        self.function_map
+            .iter()
+            .find(|(_, candidate)| **candidate == anchor)
+            .map(|((_, name), _)| name.as_str())
+    }
+
+    /// Registers or reuses the anchor for an extension URN.
+    fn ensure_urn(&mut self, urn: &str) -> u32 {
+        if let Some(anchor) = self.urn_map.get(urn) {
+            return *anchor;
+        }
+        let anchor = self.next_urn_anchor;
+        self.next_urn_anchor += 1;
+        self.urns.push(SimpleExtensionUrn {
+            extension_urn_anchor: anchor,
+            urn: urn.to_string(),
+        });
+        self.urn_map.insert(urn.to_string(), anchor);
+        anchor
+    }
+
+    /// Consumes the registry into the vectors `substrait::proto::Plan` expects.
+    pub fn into_extensions(self) -> (Vec<SimpleExtensionUrn>, Vec<SimpleExtensionDeclaration>) {
+        (self.urns, self.functions)
     }
 }
 
