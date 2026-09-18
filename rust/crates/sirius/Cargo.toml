@@ -18,7 +18,7 @@ sirius-sys.workspace = true
 # Results are returned over the Arrow C Data Interface; pin to the same major as
 # the StarRocks CN consumer so the `ArrowArrayStreamReader` type unifies. The
 # `ffi` feature provides `ffi_stream` (FFI_ArrowArrayStream / reader).
-arrow-array = { version = "59", features = ["ffi"] }
+arrow-array = { version = "60", features = ["ffi"] }
 arrow-schema = "59"
 
 [dev-dependencies]
