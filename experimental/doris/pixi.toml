@@ -1,0 +1,86 @@
+[workspace]
+channels = ["rapidsai", "conda-forge"]
+name = "sirius-doris"
+# The `engine` feature links the CUDA 13 Sirius build, so the Linux platforms are CUDA-pinned
+# (mirrors the repo-root pixi.toml). `osx-arm64` is for the engine-less `be`/`fe`/`client`
+# environments: the protocol shell and translator are developed and unit-tested on a Mac
+# (`cargo test --no-default-features`, which is also what CI runs); the engine path needs a
+# Linux + NVIDIA box. CPU-only Linux hosts assert `CONDA_OVERRIDE_CUDA` to resolve.
+platforms = [
+  "osx-arm64",
+  { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
+  { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
+]
+requires-pixi = ">=0.71"
+
+[environments]
+default = ["fe", "be", "client", "engine"]
+be = ["be"]
+fe = ["fe"]
+client = ["client"]
+engine = ["engine"]
+
+[feature.client.dependencies]
+# Provides the `mysql` CLI that speaks the FE's MySQL wire protocol on query_port.
+mysql-client = "*"
+
+[feature.client.tasks]
+client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (start it with `fe-run` in another terminal first)"}
+
+[feature.be.dependencies]
+# protoc for prost/tonic codegen of the Doris proto IDL, and the thrift compiler for the
+# thrift IDL (both under the `doris/` submodule).
+libprotobuf = ">=7.35,<8"
+rust = "*"
+thrift-compiler = "*"
+
+[feature.be.tasks]
+# Build libsirius from source via the repo-root build (creates build/release, which
+# sirius-sys links by default).
+engine-build = {cmd = "pixi run --manifest-path pixi.toml make",cwd = "../..",description = "Build the Sirius engine (libsirius) from source for the BE to link"}
+
+# Engine-linked BE (default `sirius-engine` feature); needs the engine artifact and
+# the `engine` feature's toolchain/libs (in the default env).
+be-build = {cmd = "cargo build --release -p sirius-doris-be",depends-on = ["engine-build"],description = "Build the engine-linked Doris BE release binary"}
+be-test = {cmd = "cargo test -p sirius-doris-be",depends-on = ["engine-build"],description = "Run engine-linked Doris BE tests"}
+be-run = {cmd = "cargo run --release -p sirius-doris-be --",depends-on = ["engine-build"],description = "Run the engine-linked Doris BE with local FE defaults"}
+
+# Pure-Rust path (no engine, build tree, or GPU). What CI runs, and what a Mac can run.
+be-build-no-engine = {cmd = "cargo build -p sirius-doris-be --no-default-features",description = "Build the Doris BE without the embedded Sirius engine"}
+be-test-no-engine = {cmd = "cargo test --workspace --no-default-features",description = "Run Doris BE and translator tests without the embedded Sirius engine"}
+be-run-no-engine = {cmd = "cargo run -p sirius-doris-be --no-default-features --",description = "Run the engine-less Doris BE (translate-only / protocol work) with local FE defaults"}
+
+# Toolchain + libs to compile and link the engine-linked BE, copied from the
+# repo-root pixi.toml so this env can build/run it. Kept in sync with that file.
+[feature.engine]
+platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
+
+[feature.engine.dependencies]
+cxx-compiler = "*"
+cuda-version = "13.2.*"
+libcudf = "==26.08.01"
+libcuvs = "==26.08.01"
+librmm = "*"
+libcurand-dev = "*"
+yaml-cpp = "*"
+libabseil = "*"
+duckdb = "=1.5.5"
+spdlog = "1.8.*"
+sqlite = "3.*"
+liburing = "*"
+openssl = "*"
+libcurl = "*"
+
+# The Doris FE is the official release binary (never built here): `fe-fetch` downloads the
+# tarball for the pinned tag and keeps only `fe/`; JDK 17 comes from this env.
+[feature.fe.dependencies]
+openjdk = "17.*"
+curl = "*"
+mysql-client = "*"
+
+[feature.fe.tasks]
+fe-fetch = {cmd = "bash scripts/fetch-fe.sh",description = "Download the pinned official Doris release and unpack only its fe/ directory into .doris-fe/"}
+fe-run = {cmd = "bash scripts/fe.sh run",depends-on = ["fe-fetch"],description = "Start the packaged Doris FE in the foreground with the repo's conf/fe.conf"}
+fe-start = {cmd = "bash scripts/fe.sh start",depends-on = ["fe-fetch"],description = "Start the packaged Doris FE as a daemon"}
+fe-stop = {cmd = "bash scripts/fe.sh stop",description = "Stop the daemonized Doris FE"}
+fe-clean = {cmd = "bash scripts/fe.sh clean",description = "Stop the FE and wipe its metadata/logs (fresh cluster next start)"}

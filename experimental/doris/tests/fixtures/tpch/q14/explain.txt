@@ -1,0 +1,110 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    promo_revenue[#56]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  7:VAGGREGATE (merge finalize)(446)
+  |  output: sum(partial_sum(if((p_type like 'PROMO%'), (l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))), 0.0000))[#53])[#54], sum(partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))))[#52])[#55]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  final projections: (CAST((100.00 * sum(CASE WHEN (p_type like 'PROMO%') THEN (l_extendedprice * (cast(1 as DECIMALV3(16, 2)) - cast(l_discount as DECIMALV3(16, 2)))) ELSE cast(0 as DECIMALV3(31, 4)) END)[#54]) AS decimalv3(38,14)) / sum((l_extendedprice * (cast(1 as DECIMALV3(16, 2)) - cast(l_discount as DECIMALV3(16, 2)))))[#55])
+  |  final project output tuple id: 11
+  |  distribute expr lists: 
+  |  
+  6:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_partkey[#27]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:VAGGREGATE (update serialize)(440)
+  |  output: partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#50])[#52], partial_sum(if((p_type like 'PROMO%'), (l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))), 0.0000)[#51])[#53]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  4:VHASH JOIN(412)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_partkey[#27] = p_partkey[#9])
+  |  cardinality=1
+  |  vec output tuple id: 8
+  |  output tuple id: 8
+  |  vIntermediate tuple ids: 4 
+  |  hash output slot ids: 10 28 29 
+  |  final projections: (l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#49], if(p_type[#46] like 'PROMO%', (l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2))))[#49], 0.0000)
+  |  final project output tuple id: 8
+  |  intermediate projections: l_extendedprice[#39], l_discount[#40], p_type[#41], cast(l_discount as DECIMALV3(16, 2))[#42], (1.00 - cast(l_discount as DECIMALV3(16, 2)))[#43], (l_extendedprice[#39] * (1.00 - cast(l_discount as DECIMALV3(16, 2)))[#43])
+  |  intermediate tuple id: 7
+  |  intermediate projections: l_extendedprice[#35], l_discount[#36], p_type[#37], cast(l_discount as DECIMALV3(16, 2))[#38], (1.00 - cast(l_discount as DECIMALV3(16, 2))[#38])
+  |  intermediate tuple id: 6
+  |  intermediate projections: l_extendedprice[#31], l_discount[#32], p_type[#34], CAST(l_discount[#32] AS decimalv3(16,2))
+  |  intermediate tuple id: 5
+  |  distribute expr lists: l_partkey[#27]
+  |  distribute expr lists: p_partkey[#9]
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  3:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: l_partkey[#27]
+
+  2:VTVF_SCAN_NODE(387)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.l_shipdate[#21] >= '1995-09-01'), (_tvf_local.l_shipdate[#21] < '1995-10-01')
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_partkey[#12], _tvf_local.l_extendedprice[#16], _tvf_local.l_discount[#17]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: p_partkey[#9]
+
+  0:VTVF_SCAN_NODE(400)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=5130885, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.p_partkey[#0], _tvf_local.p_type[#4]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========
