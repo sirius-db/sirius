@@ -47,7 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let files = quent_schema_codegen_cpp::emit(&parsed.schema, &options)?;
-    let bridges = quent_schema_codegen_cpp::write_bridge_files(&files, &options)?;
+    let mut bridges = quent_schema_codegen_cpp::write_bridge_files(&files, &options)?;
+    bridges.push(PathBuf::from("src/nvtx_capture.rs"));
     let mut build = cxx_build::bridges(bridges);
     let include_dir = quent_schema_codegen_cpp::stage_cxx_headers(&options)?;
     build
@@ -58,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_include = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("include");
     copy_headers(&include_dir, &source_include)?;
     println!("cargo:include={}", include_dir.display());
+    println!("cargo:rerun-if-changed=src/nvtx_capture.rs");
 
     Ok(())
 }

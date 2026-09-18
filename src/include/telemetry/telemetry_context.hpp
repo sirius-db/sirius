@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "query_id.hpp"
 #include "telemetry-bridge/gen/quent.hpp"
+#include "telemetry-bridge/src/nvtx_capture.rs.h"
 #include "telemetry/memory_context.hpp"
 
 #include <cstdint>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::pipeline {
@@ -40,23 +42,46 @@ struct telemetry_config;
 
 namespace sirius::telemetry {
 
-/// Creates the Quent context described by `config`. This also installs the
-/// process-global NVTX injection hook, so call it before anything else emits
-/// NVTX. Throws `std::invalid_argument` for an unrecognised `exporter` value.
-[[nodiscard]] quent::Context make_quent_context(const sirius::telemetry_config& config);
+/// Owns Sirius's schema-generated Quent context and its non-schema integration pipelines.
+class quent_context {
+ public:
+  quent_context(const quent_context&)            = delete;
+  quent_context& operator=(const quent_context&) = delete;
+  quent_context(quent_context&&)                 = default;
+  quent_context& operator=(quent_context&&)      = default;
+
+ private:
+  friend quent_context make_quent_context(const sirius::telemetry_config& config);
+  friend class telemetry_context;
+
+  quent_context(quent::Context&& context, rust::Box<detail::NvtxCapture>&& nvtx_capture)
+    : context_(std::move(context)), nvtx_capture_(std::move(nvtx_capture))
+  {
+  }
+
+  quent::Context context_;
+  rust::Box<detail::NvtxCapture> nvtx_capture_;
+};
+
+/// Creates the Quent context described by `config`. The first enabled context
+/// also installs the process-global NVTX injection hook, so call it before
+/// anything else emits NVTX. Throws `std::invalid_argument` for an unrecognised
+/// `exporter` value.
+[[nodiscard]] quent_context make_quent_context(const sirius::telemetry_config& config);
 
 /// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
   /// Takes ownership of an already-created Quent context. Building it is the
-  /// caller's job: constructing the context installs the process-global NVTX
-  /// injection hook, and Quent drops every event dispatched before that hook
-  /// exists, so the caller must construct it before anything else emits NVTX.
+  /// caller's job: constructing the first enabled context installs the
+  /// process-global NVTX injection hook, and Quent drops every event dispatched
+  /// before that hook exists, so the caller must construct it before anything
+  /// else emits NVTX.
   ///
   /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
   /// child buckets) under the engine, so thread telemetry can nest per device.
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
-    quent::Context&& context,
+    quent_context&& context,
     const sirius::telemetry_config& config,
     const cucascade::memory::memory_reservation_manager* manager = nullptr,
     const std::vector<int>& gpu_device_ids                       = {});
@@ -93,7 +118,7 @@ class telemetry_context {
   }
 
  private:
-  telemetry_context(quent::Context&& context,
+  telemetry_context(quent_context&& context,
                     const sirius::telemetry_config& config,
                     const cucascade::memory::memory_reservation_manager* manager,
                     const std::vector<int>& gpu_device_ids);
@@ -115,6 +140,7 @@ class telemetry_context {
   mutable std::map<std::string, quent::Uuid> labeled_group_ids_;
   std::map<int, gpu_device_group_ids> gpu_group_ids_;
   quent::Context context_;
+  rust::Box<detail::NvtxCapture> nvtx_capture_;
   std::shared_ptr<quent::engine::EngineObserver> engine_observer_;
   std::shared_ptr<quent::worker::WorkerObserver> worker_observer_;
   std::shared_ptr<quent::query_group::QueryGroupObserver> query_group_observer_;

@@ -49,19 +49,49 @@ void log_finalization_failure(std::string_view resource_kind, const char* error)
   }
 }
 
+void log_inactive_nvtx_capture(const detail::NvtxCapture& capture)
+{
+  if (!capture.owns_injection_hook()) {
+    SIRIUS_LOG_WARN(
+      "NVTX capture hook is already owned by an earlier Quent context; this context will not "
+      "receive NVTX events.");
+  }
+}
+
 }  // namespace
 
-quent::Context make_quent_context(const sirius::telemetry_config& config)
+quent_context make_quent_context(const sirius::telemetry_config& config)
 {
-  if (!config.enable_quent) { return quent::Context::none(); }
-  if (config.exporter == "ndjson") { return quent::Context::ndjson(config.output_directory); }
-  if (config.exporter == "msgpack") { return quent::Context::msgpack(config.output_directory); }
-  if (config.exporter == "postcard") { return quent::Context::postcard(config.output_directory); }
+  if (!config.enable_quent) {
+    return quent_context{quent::Context::none(), detail::nvtx_capture_none()};
+  }
+
+  if (config.exporter == "ndjson") {
+    auto context = quent::Context::ndjson(config.output_directory);
+    auto nvtx_capture =
+      detail::nvtx_capture_ndjson(context.id(), rust::String(config.output_directory));
+    log_inactive_nvtx_capture(*nvtx_capture);
+    return quent_context{std::move(context), std::move(nvtx_capture)};
+  }
+  if (config.exporter == "msgpack") {
+    auto context = quent::Context::msgpack(config.output_directory);
+    auto nvtx_capture =
+      detail::nvtx_capture_msgpack(context.id(), rust::String(config.output_directory));
+    log_inactive_nvtx_capture(*nvtx_capture);
+    return quent_context{std::move(context), std::move(nvtx_capture)};
+  }
+  if (config.exporter == "postcard") {
+    auto context = quent::Context::postcard(config.output_directory);
+    auto nvtx_capture =
+      detail::nvtx_capture_postcard(context.id(), rust::String(config.output_directory));
+    log_inactive_nvtx_capture(*nvtx_capture);
+    return quent_context{std::move(context), std::move(nvtx_capture)};
+  }
   throw std::invalid_argument(std::format("unknown Quent exporter: {}", config.exporter));
 }
 
 std::shared_ptr<const telemetry_context> telemetry_context::create(
-  quent::Context&& context,
+  quent_context&& context,
   const sirius::telemetry_config& config,
   const cucascade::memory::memory_reservation_manager* manager,
   const std::vector<int>& gpu_device_ids)
@@ -70,7 +100,7 @@ std::shared_ptr<const telemetry_context> telemetry_context::create(
     new telemetry_context(std::move(context), config, manager, gpu_device_ids));
 }
 
-telemetry_context::telemetry_context(quent::Context&& context,
+telemetry_context::telemetry_context(quent_context&& context,
                                      const sirius::telemetry_config& config,
                                      const cucascade::memory::memory_reservation_manager* manager,
                                      const std::vector<int>& gpu_device_ids)
@@ -79,7 +109,8 @@ telemetry_context::telemetry_context(quent::Context&& context,
     query_group_uuid_(quent::now_v7()),
     shared_group_uuid_(quent::now_v7()),
     engine_name_(config.engine_name),
-    context_(std::move(context)),
+    context_(std::move(context.context_)),
+    nvtx_capture_(std::move(context.nvtx_capture_)),
     engine_observer_(context_.engine_observer()),
     worker_observer_(context_.worker_observer()),
     query_group_observer_(context_.query_group_observer()),

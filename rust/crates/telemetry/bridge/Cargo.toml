@@ -20,3 +20,6 @@ sirius-telemetry-instrumentation = { path = "../instrumentation", features = ["c
 cxx-build.workspace = true
 quent-schema-codegen-cpp = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
 quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "4e920a20f64045cd3cdc10944a39c768ccf1ae5c" }
+
+[dev-dependencies]
+nvtx = { version = "2", default-features = false, features = ["std"] }

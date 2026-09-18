@@ -141,10 +141,12 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
   config.engine_name      = "test-engine";
 
   std::string engine_id;
+  std::string context_id;
   std::string gpu0_id, gpu1_id, gpu0_exec_id, gpu0_mgr_id, shared_id;
   {
     auto context =
       telemetry_context::create(make_quent_context(config), config, /*manager=*/nullptr, {0, 1});
+    context_id   = uuid_str(context->context().id());
     engine_id    = uuid_str(context->engine_id());
     gpu0_id      = uuid_str(context->gpu_device_group_id(0));
     gpu1_id      = uuid_str(context->gpu_device_group_id(1));
@@ -247,6 +249,7 @@ TEST_CASE("telemetry_context nests threads under per-GPU device groups", "[telem
 
   const auto lines = read_all_telemetry_lines(out_dir);
   REQUIRE(!lines.empty());
+  REQUIRE(std::filesystem::is_directory(out_dir / context_id / "NvtxEvent"));
 
   // Device groups are declared under the engine, with matching ids.
   REQUIRE(any_line_with_all(lines, {"\"gpu-0\"", engine_id, gpu0_id}));
