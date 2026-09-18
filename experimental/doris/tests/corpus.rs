@@ -456,3 +456,28 @@ fn every_corpus_fragment_translates_or_is_a_two_phase_aggregate() {
     assert_eq!(translated + two_phase, 151);
     assert_eq!(two_phase, 49, "fragments with a two-phase aggregate");
 }
+
+/// P1.4: every query stitches into one plan (MVP-A0) whose root names are the query's
+/// output columns.
+#[test]
+fn every_corpus_query_stitches_into_one_plan() {
+    let translator = PlanTranslator::new();
+    for (query, payload, _) in captured_batches() {
+        let batch = decode(&payload);
+        let fragments: Vec<_> = batch.fragments.iter().map(|f| &f.params).collect();
+        let plan = translator
+            .translate_batch(&fragments)
+            .unwrap_or_else(|err| panic!("{query}: {err}"));
+        let text = plan.explain().to_string();
+        assert!(
+            !text.contains("sirius_stream_"),
+            "{query}: an exchange survived stitching\n{text}"
+        );
+        if let Some((_, warnings)) = text.split_once("format warnings: ") {
+            let unexpected = warnings.matches("PlanError").count()
+                - warnings.matches("error_type: Unimplemented").count();
+            assert_eq!(unexpected, 0, "{query}: {text}");
+        }
+        assert!(!plan.output_names.is_empty(), "{query}");
+    }
+}

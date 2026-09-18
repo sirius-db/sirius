@@ -5,6 +5,7 @@
 //!   dump-fragments --summary <file.tcompact>    one shape line per fragment
 //!   dump-fragments --translate <file.tcompact>  each fragment's Substrait plan (explain text)
 //!                                               or the translation error
+//!   dump-fragments --stitch <file.tcompact>     the whole dispatch stitched into one plan
 //!
 //! The file holds a TCompact `TPipelineFragmentParamsList`; it is decoded through the same
 //! path the backend uses, so what prints here is what the translator sees.
@@ -29,6 +30,9 @@ struct Args {
     /// Translate each fragment on its own and print the Substrait explain text (or the error).
     #[arg(long)]
     translate: bool,
+    /// Stitch the dispatch into one plan (MVP-A0) and print its Substrait explain text.
+    #[arg(long)]
+    stitch: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +48,14 @@ fn main() -> Result<()> {
     println!("query_id={:x}-{:x}", batch.query_id.hi, batch.query_id.lo);
     println!("fragments={}", batch.fragments.len());
     let translator = doris_plan_translator::PlanTranslator::new();
+    if args.stitch {
+        let fragments: Vec<_> = batch.fragments.iter().map(|f| &f.params).collect();
+        match translator.translate_batch(&fragments) {
+            Ok(plan) => println!("{}", plan.explain()),
+            Err(err) => println!("stitch error: {err}"),
+        }
+        return Ok(());
+    }
     for fragment in &batch.fragments {
         println!("[{}] {}", fragment.index, fragment.shape());
         if args.translate {
