@@ -20,6 +20,8 @@
 #include <atomic>
 #include <deque>
 #include <future>
+#include <memory>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <vector>
@@ -28,6 +30,33 @@ using sirius::exec::cuda_event_completion_poll;
 using sirius::exec::retire_lane;
 
 namespace {
+template <class Result>
+struct acquisition_attempt {
+  Result operator()();
+};
+
+template <class Fn>
+concept acquirable =
+  requires(cuda_event_completion_poll& poll, Fn&& fn) { poll.acquire(std::forward<Fn>(fn)); };
+
+// A contextual boolean test accepts explicit conversions and does not require !.
+struct explicit_boolean {
+  explicit operator bool() & { return true; }
+  bool operator!() = delete;
+};
+struct not_boolean {};
+static_assert(acquirable<acquisition_attempt<bool>>);
+static_assert(acquirable<acquisition_attempt<int*>>);
+static_assert(acquirable<acquisition_attempt<std::unique_ptr<int>>>);
+static_assert(acquirable<acquisition_attempt<std::optional<int>>>);
+static_assert(acquirable<acquisition_attempt<explicit_boolean>>);
+static_assert(!acquirable<acquisition_attempt<bool&>>);
+static_assert(!acquirable<acquisition_attempt<const bool&>>);
+static_assert(!acquirable<acquisition_attempt<bool&&>>);
+static_assert(!acquirable<acquisition_attempt<not_boolean>>);
+static_assert(!acquirable<acquisition_attempt<void>>);
+static_assert(!acquirable<int>);
+
 // A controlled CUDA runtime: no timing assumptions, no poisoned device context.
 // synchronize delivers callbacks only on success; errors deliberately leave
 // them pending so tests can prove ownership was not released early.
@@ -165,6 +194,44 @@ TEST_CASE("completion submissions support empty grouped RAII and idempotent comm
   }
   REQUIRE(poll.quiesce() == cudaSuccess);
   CHECK(calls == 4);
+}
+
+TEST_CASE("completion rejects empty retirement functions without changing staged work",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  int calls  = 0;
+  {
+    auto sub = lane.begin();
+    CHECK_THROWS_AS(sub.on_retire({}), std::invalid_argument);
+    sirius::exec::retire_fn fn = [&](cudaError_t) noexcept { ++calls; };
+    sub.on_retire(std::move(fn));
+    CHECK_THROWS_AS(sub.on_retire(nullptr), std::invalid_argument);
+    REQUIRE(sub.commit() == cudaSuccess);
+  }
+  CHECK(stream.callbacks.size() == 1);
+  CHECK(poll.quiesce() == cudaSuccess);
+  CHECK(calls == 1);
+  CHECK(lane.idle());
+}
+
+TEST_CASE("acquire returns a move-only resource made available by retirement",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  std::unique_ptr<int> available;
+  submit(poll.lane_for(stream.stream()),
+         [resource = std::make_unique<int>(42), &available](cudaError_t) mutable noexcept {
+           available = std::move(resource);
+         });
+  stream.complete();
+  auto acquired = poll.acquire([&] { return std::move(available); });
+  REQUIRE(acquired);
+  CHECK(*acquired == 42);
+  CHECK_FALSE(available);
 }
 
 TEST_CASE("completion preserves successful prefix and the first device failure",
@@ -321,6 +388,42 @@ TEST_CASE("concurrent drain preserves FIFO and quiesce waits for active invocati
   CHECK(quiesce.get() == cudaSuccess);
   CHECK(ordered);
   CHECK(sequence == 2);
+}
+
+TEST_CASE("terminal retirement waits for an active drainer before failing pending work",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::binary_semaphore entered{0}, release{0};
+  std::atomic<int> sequence{0};
+  bool ordered     = false;
+  cudaError_t seen = cudaSuccess;
+  submit(lane, [&](cudaError_t) noexcept {
+    entered.release();
+    release.acquire();
+    sequence = 1;
+  });
+  stream.complete();
+  std::thread first([&] { lane.drain(); });
+  entered.acquire();
+  submit(lane, [&](cudaError_t error) noexcept {
+    ordered  = sequence.load() == 1;
+    sequence = 2;
+    seen     = error;
+  });
+  stream.stop();
+  auto cleanup =
+    std::async(std::launch::async, [&] { return poll.fail_all(cudaErrorLaunchFailure); });
+  CHECK(cleanup.wait_for(std::chrono::milliseconds{20}) == std::future_status::timeout);
+  release.release();
+  first.join();
+  CHECK(cleanup.get() == 1);
+  CHECK(ordered);
+  CHECK(sequence == 2);
+  CHECK(seen == cudaErrorLaunchFailure);
+  CHECK(lane.idle());
 }
 
 TEST_CASE("detach fences in-flight query and forbids subsequent CUDA access",
