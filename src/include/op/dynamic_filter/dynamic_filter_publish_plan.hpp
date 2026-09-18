@@ -88,7 +88,8 @@ class dynamic_filter_publish_plan final {
     std::size_t admitted_key_index = 0;
     // Target consumer output ordinal.
     std::size_t channel_push_ordinal = 0;
-    // EMPTY suppresses zone maps; direct routes require an exact INT32 or INT64 match.
+    // EMPTY suppresses zone maps; direct routes require an exact match of a membership-supported
+    // type (see membership_key_supported).
     cudf::data_type probe_storage_type{cudf::type_id::EMPTY};
 
     [[nodiscard]] bool operator==(key_binding const&) const = default;
