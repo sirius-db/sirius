@@ -28,17 +28,24 @@
 //! - [`expr_translator`]: `TExpr` → Substrait expression (literals, slot references,
 //!   predicates, arithmetic, casts, `IN`, `CASE`, the scalar-function allowlist)
 //!   and the decomposition of `AGG_EXPR` roots into aggregate measures.
+//! - [`node_translator`]: `TPlan` → Substrait relation tree, one fragment at a time
+//!   (scan, exchange as a named stream, joins, aggregate, sort; conjuncts, limit
+//!   and the projection chain on every node).
+//! - [`scan_ranges`]: the parquet paths a fragment's scans read, validated.
+//! - [`stitcher`]: the MVP-A0 single-plan stitcher — the fragments of one dispatch
+//!   joined into one fragment (exchanges replaced by their senders, two-phase
+//!   aggregates collapsed) for [`PlanTranslator::translate_batch`].
 //!
 //! Extension functions are registered through [`ExtensionRegistry`], which
 //! de-duplicates anchors by `(urn, name)`.
 //!
-//! # Status
+//! # Entry points
 //!
-//! P1 in progress. Done: descriptor table and type mapping (P1.1), expression
-//! translation (P1.2). Pending: node translation and the single-plan stitcher;
-//! until then [`PlanTranslator::translate_fragment`] rejects every fragment with
-//! a structured error naming its root node, so the backend's translate-only
-//! survey mode records exactly which node types the corpus needs.
+//! - [`PlanTranslator::translate_fragment`]: one fragment in isolation; exchanges
+//!   become `ReadRel`s over `sirius_stream_<node_id>` (the shape MVP-A's real
+//!   fragments need), two-phase aggregates are rejected.
+//! - [`PlanTranslator::translate_batch`]: every fragment the FE sent this backend,
+//!   stitched into one plan (MVP-A0).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -54,12 +61,14 @@ pub mod error;
 pub mod expr_translator;
 pub mod node_translator;
 pub mod scan_ranges;
+pub mod stitcher;
 pub mod type_mapper;
 
 pub use descriptor_table::{DescriptorTable, SlotInfo, TupleInfo};
 use error::Result;
 pub use error::TranslateError;
 pub use scan_ranges::ScanRanges;
+pub use stitcher::stitch_fragments;
 
 /// Substrait comparison function extension URN.
 pub const URN_COMPARISON: &str = "extension:io.substrait:functions_comparison";
@@ -218,6 +227,15 @@ impl PlanTranslator {
             ..Default::default()
         };
         Ok(TranslatedPlan { plan, output_names })
+    }
+
+    /// Stitches the fragments of one dispatch into a single plan (MVP-A0) and translates it.
+    pub fn translate_batch(
+        &self,
+        fragments: &[&TPipelineFragmentParams],
+    ) -> Result<TranslatedPlan> {
+        let stitched = stitch_fragments(fragments)?;
+        self.translate_fragment(&stitched)
     }
 }
 
