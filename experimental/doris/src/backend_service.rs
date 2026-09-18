@@ -730,14 +730,18 @@ mod tests {
             FetchOutcome::Failed(message) => {
                 assert!(message.contains(TRANSLATE_ONLY_ENV), "{message}");
                 assert!(message.contains("1 of 1 fragments failed"), "{message}");
-                assert!(message.contains("FILE_SCAN_NODE"), "{message}");
+                // The fixture's scan carries no ranges, which the translator refuses.
+                assert!(
+                    message.contains("unsupported scan range at node 0"),
+                    "{message}"
+                );
             }
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
-    fn execute_mode_reports_p0_translator_error_through_the_slot() {
+    fn execute_mode_reports_translator_errors_through_the_slot() {
         let service = SiriusBackendService::new();
         with_translate_only(Some("0"), || service.dispatch(&result_dispatch())).unwrap();
         let slot = service.results.get(UniqueId::from_halves(1, 2)).unwrap();
@@ -745,7 +749,7 @@ mod tests {
             .unwrap()
             .block_on(slot.fetch());
         assert!(
-            matches!(&outcome, FetchOutcome::Failed(message) if message.contains("not implemented yet (P1)")),
+            matches!(&outcome, FetchOutcome::Failed(message) if message.contains("unsupported scan range at node 0")),
             "{outcome:?}"
         );
     }
