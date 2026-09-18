@@ -14,7 +14,7 @@ resolver = "2"
 anyhow = "1"
 # Pinned to the arrow version `parquet` already pulls in, so the engine→CN result interchange
 # (Arrow C Data Interface) and the parquet schema reader share one arrow build.
-arrow-array = "59"
+arrow-array = "60"
 arrow-schema = "59"
 backon = { version = "1", default-features = false, features = ["tokio-sleep"] }
 clap = { version = "4", features = ["derive", "env"] }
