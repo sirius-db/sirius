@@ -217,6 +217,17 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
   return std::make_unique<op::pipelineable_operator_data>(std::move(output));
 }
 
+/// Publish the reads an operator enqueued on `stream` to its input batches, so a downgrade
+/// cannot reclaim them while those reads are still in flight. Must run on every exit from
+/// execute(), including the throwing one: the input's read locks drop as soon as this task's
+/// operator_input_output_data is replaced or unwound.
+void record_input_reads(const op::operator_data& input, rmm::cuda_stream_view stream)
+{
+  if (auto const* pipelineable = dynamic_cast<const op::pipelineable_operator_data*>(&input)) {
+    pipelineable->record_reader_events(stream);
+  }
+}
+
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
   const op::operator_data& operator_input_data,
@@ -241,6 +252,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
   try {
     operator_output_data = op.execute(effective_input, stream);
   } catch (const std::exception& ex) {
+    record_input_reads(operator_input_data, stream);
     auto sticky_err = cudaGetLastError();
     if (sticky_err != cudaSuccess) {
       SIRIUS_LOG_WARN("Pipeline {}: {} (id={}) threw + left sticky CUDA error: [{}] {} — clearing",
@@ -257,6 +269,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
                     ex.what());
     throw;
   }
+  record_input_reads(operator_input_data, stream);
 
   if (auto sticky_err = cudaGetLastError(); sticky_err != cudaSuccess) {
     SIRIUS_LOG_WARN(
@@ -791,6 +804,8 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
       peak_bytes,
       local_state.get_reservation_size_info()->bytes_to_materialize_input);
   }
+
+  stream.synchronize();
 
   // The input pipelineable_operator_data (with its _read_only_data_batches) was destroyed
   // when compute_task replaced operator_input_output_data, releasing all shared locks.
