@@ -17,417 +17,469 @@
 #include "catch.hpp"
 #include "exec/cuda_event_completion_poll.hpp"
 
-#include <cuda_runtime.h>
-
 #include <atomic>
+#include <deque>
+#include <future>
+#include <semaphore>
 #include <thread>
 #include <vector>
 
-// The poll exists so many ordered CUDA submissions can retire callbacks from
-// one stream-ordered 64-bit frontier, without allocating a CUDA event or a
-// waiter thread per submission.  The tests below make that contract visible:
-// FIFO retirement per lane, independent progress across lanes, safe concurrent
-// producers, and destruction that drains every accepted callback.
-
 using sirius::exec::cuda_event_completion_poll;
-using sirius::exec::no_pending_v;
 using sirius::exec::retire_lane;
 
 namespace {
+// A controlled CUDA runtime: no timing assumptions, no poisoned device context.
+// synchronize delivers callbacks only on success; errors deliberately leave
+// them pending so tests can prove ownership was not released early.
+struct controlled_stream {
+  struct callback {
+    cudaStreamCallback_t fn;
+    void* data;
+  };
+  std::mutex mutex;
+  std::deque<callback> callbacks;
+  std::atomic<cudaError_t> install_error{cudaSuccess};
+  std::atomic<cudaError_t> query_error{cudaSuccess};
+  std::atomic<cudaError_t> sync_error{cudaSuccess};
+  std::atomic<int> queries{0}, synchronizations{0};
+  std::binary_semaphore* query_entered{nullptr};
+  std::binary_semaphore* query_release{nullptr};
 
-/// A real stream plus a device buffer, so submissions carry actual work the
-/// frontier has to pass rather than an empty callback.
-class stream_fixture {
- public:
-  stream_fixture()
+  cudaStream_t stream() { return reinterpret_cast<cudaStream_t>(this); }
+  static controlled_stream& get(cudaStream_t s) { return *reinterpret_cast<controlled_stream*>(s); }
+  static cudaError_t add(cudaStream_t s, cudaStreamCallback_t fn, void* data, unsigned)
   {
-    REQUIRE(cudaStreamCreate(&_stream) == cudaSuccess);
-    REQUIRE(cudaMalloc(&_dst, kBytes) == cudaSuccess);
-    REQUIRE(cudaMallocHost(&_src, kBytes) == cudaSuccess);
+    auto& self = get(s);
+    if (self.install_error.load() != cudaSuccess) { return self.install_error; }
+    std::lock_guard lock(self.mutex);
+    self.callbacks.push_back({fn, data});
+    return cudaSuccess;
   }
-
-  ~stream_fixture()
+  static cudaError_t query(cudaStream_t s)
   {
-    cudaStreamSynchronize(_stream);
-    cudaFreeHost(_src);
-    cudaFree(_dst);
-    cudaStreamDestroy(_stream);
+    auto& self = get(s);
+    ++self.queries;
+    if (self.query_entered) {
+      self.query_entered->release();
+      self.query_release->acquire();
+    }
+    return self.query_error;
   }
-
-  stream_fixture(stream_fixture const&)            = delete;
-  stream_fixture& operator=(stream_fixture const&) = delete;
-
-  [[nodiscard]] cudaStream_t stream() const noexcept { return _stream; }
-
-  /// Enqueue a copy so the ticket has something to sit behind.
-  void enqueue_work() const
+  static cudaError_t synchronize(cudaStream_t s)
   {
-    REQUIRE(cudaMemcpyAsync(_dst, _src, kBytes, cudaMemcpyHostToDevice, _stream) == cudaSuccess);
+    auto& self = get(s);
+    ++self.synchronizations;
+    if (self.sync_error.load() != cudaSuccess) { return self.sync_error; }
+    self.complete();
+    return cudaSuccess;
   }
-
- private:
-  static constexpr std::size_t kBytes = 1 << 16;
-  cudaStream_t _stream{};
-  void* _dst{nullptr};
-  void* _src{nullptr};
+  void complete(cudaError_t status = cudaSuccess)
+  {
+    std::deque<callback> ready;
+    {
+      std::lock_guard lock(mutex);
+      ready.swap(callbacks);
+    }
+    for (auto cb : ready) {
+      cb.fn(stream(), status, cb.data);
+    }
+  }
+  // Models externally established stop of device work AND callback delivery.
+  void stop()
+  {
+    std::lock_guard lock(mutex);
+    callbacks.clear();
+  }
+  static sirius::exec::detail::completion_cuda_api api() { return {add, query, synchronize}; }
 };
 
-/// Drain until `pred` holds or the budget runs out.  The frontier is advanced
-/// by a driver callback thread, so a completed copy is not instantly visible.
-template <class Pred>
-bool drain_until(cuda_event_completion_poll& r, Pred pred, int budget = 2000)
+template <class Fn>
+void submit(retire_lane& lane, Fn&& fn)
 {
-  for (int i = 0; i < budget; ++i) {
-    r.drain_all();
-    if (pred()) { return true; }
-    std::this_thread::sleep_for(std::chrono::microseconds{200});
-  }
-  return pred();
+  auto sub = lane.begin();
+  sub.on_retire(std::forward<Fn>(fn));
+  REQUIRE(sub.commit() == cudaSuccess);
 }
 
+struct real_stream {
+  cudaStream_t value{};
+  void* data{};
+  real_stream()
+  {
+    REQUIRE(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking) == cudaSuccess);
+    REQUIRE(cudaMalloc(&data, 4096) == cudaSuccess);
+  }
+  ~real_stream()
+  {
+    cudaStreamSynchronize(value);
+    cudaFree(data);
+    cudaStreamDestroy(value);
+  }
+};
 }  // namespace
 
-TEST_CASE("a committed submission retires once the stream passes it",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
+TEST_CASE("completion frontier does not retire undelivered work",
+          "[exec][cuda_event_completion_poll]")
 {
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> retired{0};
-  std::atomic<cudaError_t> seen{cudaErrorUnknown};
-
-  {
-    auto sub = lane.begin();
-    fx.enqueue_work();
-    sub.on_retire([&](cudaError_t status) noexcept {
-      seen.store(status);
-      retired.fetch_add(1);
-    });
-    CHECK(sub.commit() == cudaSuccess);
-  }
-
-  CHECK(drain_until(retirer, [&] { return retired.load() == 1; }));
-  CHECK(seen.load() == cudaSuccess);
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  int calls  = 0;
+  submit(lane, [&](cudaError_t) noexcept { ++calls; });
+  CHECK(poll.drain_all() == 0);
+  CHECK(calls == 0);
+  CHECK_FALSE(lane.idle());
+  stream.complete();
+  CHECK(poll.drain_all() == 1);
+  CHECK(poll.drain_all() == 0);
+  CHECK(calls == 1);
   CHECK(lane.idle());
 }
 
-TEST_CASE("an empty submission allocates no ticket",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
+TEST_CASE("completion submissions support empty grouped RAII and idempotent commit",
+          "[exec][cuda_event_completion_poll]")
 {
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
   {
-    auto sub = lane.begin();  // nothing staged
+    auto sub = lane.begin();
     CHECK(sub.commit() == cudaSuccess);
   }
-
-  // No ticket means nothing to wait on -- a lane that counted one here would
-  // lag its frontier forever, since no callback was enqueued for it.
   CHECK(lane.idle());
-  CHECK(lane.oldest_pending_hint() == no_pending_v);
-  CHECK(retirer.drain_all() == 0);
-}
-
-TEST_CASE("batches retire in submission order", "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  constexpr int kBatches = 8;
-  std::vector<int> order;
-  std::mutex order_m;
-
-  for (int i = 0; i < kBatches; ++i) {
-    auto sub = lane.begin();
-    fx.enqueue_work();
-    sub.on_retire([&, i](cudaError_t) noexcept {
-      std::lock_guard g(order_m);
-      order.push_back(i);
-    });
-    CHECK(sub.commit() == cudaSuccess);
-  }
-
-  CHECK(drain_until(retirer, [&] {
-    std::lock_guard g(order_m);
-    return order.size() == kBatches;
-  }));
-
-  std::lock_guard g(order_m);
-  REQUIRE(order.size() == kBatches);
-  for (int i = 0; i < kBatches; ++i) {
-    CHECK(order[i] == i);  // work completes in submission order, so retirement does too
-  }
-}
-
-TEST_CASE("several fns in one submission share a ticket",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> retired{0};
+  int calls = 0;
   {
     auto sub = lane.begin();
-    fx.enqueue_work();
     for (int i = 0; i < 3; ++i) {
-      sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
+      sub.on_retire([&](cudaError_t) noexcept { ++calls; });
     }
     CHECK(sub.commit() == cudaSuccess);
-    // One ticket for the batch, so one callback -- not three.
-    CHECK(lane.oldest_pending_locked() == 1);
-  }
-
-  CHECK(drain_until(retirer, [&] { return retired.load() == 3; }));
-  CHECK(lane.idle());
-}
-
-TEST_CASE("an uncommitted submission still retires",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  // Abandoning a scope that already launched work would recycle buffers the
-  // copy engines are still reading, so the destructor commits.
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> retired{0};
-  {
-    auto sub = lane.begin();
-    fx.enqueue_work();
-    sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
-    // deliberately no commit()
-  }
-
-  CHECK(drain_until(retirer, [&] { return retired.load() == 1; }));
-}
-
-TEST_CASE("drain does nothing while the frontier has not moved",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> retired{0};
-  {
-    auto sub = lane.begin();
-    // A long copy chain, so the batch is still outstanding when we drain.
-    for (int i = 0; i < 256; ++i) {
-      fx.enqueue_work();
-    }
-    sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
     CHECK(sub.commit() == cudaSuccess);
+    CHECK_THROWS_AS(sub.on_retire([](cudaError_t) noexcept {}), std::logic_error);
   }
-
+  CHECK(stream.callbacks.size() == 1);
   CHECK(lane.oldest_pending_locked() == 1);
-  retirer.drain_all();  // may or may not have completed; must not retire early
-  CHECK(retired.load() <= 1);
-
-  CHECK(drain_until(retirer, [&] { return retired.load() == 1; }));
-}
-
-TEST_CASE("quiesce synchronizes and retires everything",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> retired{0};
-  for (int i = 0; i < 4; ++i) {
-    auto sub = lane.begin();
-    fx.enqueue_work();
-    sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
-    CHECK(sub.commit() == cudaSuccess);
-  }
-
-  CHECK(retirer.quiesce() == cudaSuccess);
-  CHECK(retired.load() == 4);  // nothing may be left outstanding after quiesce
-  CHECK(lane.idle());
-}
-
-TEST_CASE("fail_all retires the backlog with the given status",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  std::atomic<int> failed{0};
   {
     auto sub = lane.begin();
-    for (int i = 0; i < 256; ++i) {
-      fx.enqueue_work();
-    }
-    sub.on_retire([&](cudaError_t status) noexcept {
-      if (status == cudaErrorUnknown) { failed.fetch_add(1); }
-    });
-    CHECK(sub.commit() == cudaSuccess);
+    sub.on_retire([&](cudaError_t) noexcept { ++calls; });
   }
-
-  // Terminal recovery: stop the device first, exactly as the header requires,
-  // or the fns would hand back buffers still being read.
-  REQUIRE(cudaStreamSynchronize(fx.stream()) == cudaSuccess);
-  retirer.fail_all(cudaErrorUnknown);
-
-  CHECK(failed.load() + static_cast<int>(lane.idle()) >= 1);
-  CHECK(lane.idle());
+  REQUIRE(poll.quiesce() == cudaSuccess);
+  CHECK(calls == 4);
 }
 
-TEST_CASE("acquire drains until the resource is available",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
+TEST_CASE("completion preserves successful prefix and the first device failure",
+          "[exec][cuda_event_completion_poll]")
 {
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::vector<cudaError_t> seen(3, cudaErrorUnknown);
+  submit(lane, [&](cudaError_t e) noexcept { seen[0] = e; });
+  stream.complete();
+  submit(lane, [&](cudaError_t e) noexcept { seen[1] = e; });
+  stream.complete(cudaErrorIllegalAddress);
+  submit(lane, [&](cudaError_t e) noexcept { seen[2] = e; });
+  stream.complete(cudaErrorLaunchFailure);
+  CHECK(poll.drain_all() == 3);
+  CHECK(seen[0] == cudaSuccess);
+  CHECK(seen[1] == cudaErrorIllegalAddress);
+  CHECK(seen[2] == cudaErrorIllegalAddress);
+  CHECK(lane.fault_error() == cudaErrorIllegalAddress);
+}
 
-  // A one-slot "pool" the retirement hands back, so acquire() must wait for the
-  // frontier rather than fail.
-  std::atomic<bool> available{false};
+TEST_CASE("query errors never force cache retirement", "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream a, b;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& la  = poll.lane_for(a.stream());
+  auto& lb  = poll.lane_for(b.stream());
+  int calls = 0;
+  submit(la, [&](cudaError_t) noexcept { ++calls; });
+  submit(lb, [&](cudaError_t) noexcept { ++calls; });
+  a.query_error = cudaErrorIllegalAddress;
+  CHECK_FALSE(poll.acquire([] { return false; }));
+  CHECK(calls == 0);
+  CHECK_FALSE(la.idle());
+  CHECK_FALSE(lb.idle());
+  a.complete(cudaErrorIllegalAddress);
+  b.complete();
+  CHECK(poll.drain_all() == 2);
+}
+
+TEST_CASE("failed callback installation retains ownership until safe",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::vector<cudaError_t> seen;
+  seen.reserve(2);
+  submit(lane, [&](cudaError_t e) noexcept { seen.push_back(e); });
+  stream.install_error  = cudaErrorNotSupported;
+  const bool sync_fails = GENERATE(false, true);
+  stream.sync_error     = sync_fails ? cudaErrorIllegalAddress : cudaSuccess;
   {
     auto sub = lane.begin();
-    fx.enqueue_work();
-    sub.on_retire([&](cudaError_t) noexcept { available.store(true); });
-    CHECK(sub.commit() == cudaSuccess);
+    sub.on_retire([&](cudaError_t e) noexcept { seen.push_back(e); });
+    const auto expected = sync_fails ? cudaErrorIllegalAddress : cudaErrorNotSupported;
+    CHECK(sub.commit() == expected);
+    CHECK(sub.commit() == expected);
   }
+  CHECK(lane.enqueue_error() == cudaErrorNotSupported);
+  CHECK_THROWS_AS(lane.begin(), std::logic_error);
+  if (sync_fails) {
+    CHECK(poll.drain_all() == 0);
+    CHECK(poll.quiesce() == cudaErrorIllegalAddress);
+    CHECK(seen.empty());
+    stream.sync_error = cudaSuccess;
+    CHECK(poll.quiesce() == cudaSuccess);
+  } else {
+    CHECK(seen.empty());  // no inline invocation under the submission lock
+    CHECK(poll.drain_all() == 2);
+  }
+  REQUIRE(seen.size() == 2);
+  CHECK(seen[0] == cudaSuccess);
+  CHECK(seen[1] == cudaErrorNotSupported);
+}
 
-  auto* got = retirer.acquire([&]() -> int* {
-    static int slot = 42;
-    return available.load() ? &slot : nullptr;
+TEST_CASE("terminal retirement delivers the exact requested failure once",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane       = poll.lane_for(stream.stream());
+  int calls        = 0;
+  cudaError_t seen = cudaSuccess;
+  submit(lane, [&](cudaError_t e) noexcept {
+    ++calls;
+    seen = e;
   });
-
-  REQUIRE(got != nullptr);
-  CHECK(*got == 42);
-}
-
-TEST_CASE("acquire reports failure instead of hanging when nothing is outstanding",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  static_cast<void>(retirer.lane_for(fx.stream()));
-
-  // Nothing was ever submitted, so no frontier can advance; acquire must return
-  // the falsy value rather than block forever.
-  auto* got = retirer.acquire([]() -> int* { return nullptr; });
-  CHECK(got == nullptr);
-}
-
-TEST_CASE("a detached lane never touches its stream again",
-          "[exec][cuda_event_completion_poll][gpu_execution]")
-{
-  // A lane holds a raw cudaStream_t, and an owner that does not control stream
-  // lifetime (the prefetching cache: callers pass a stream in per read) can
-  // reach teardown after the stream is gone.  Synchronizing a dangling handle
-  // faults inside the driver rather than returning an error, so detach() has to
-  // make every later call stream-free.
-  cudaStream_t s{};
-  REQUIRE(cudaStreamCreate(&s) == cudaSuccess);
-
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(s);
-
-  std::atomic<int> retired{0};
-  {
-    auto sub = lane.begin();
-    sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
-    CHECK(sub.commit() == cudaSuccess);
-  }
-  REQUIRE(cudaStreamSynchronize(s) == cudaSuccess);
-
-  // The stream's owner is finished with it -- which is what made the work safe
-  // to stop waiting on in the first place.
-  REQUIRE(cudaStreamDestroy(s) == cudaSuccess);
-
-  retirer.detach();
-  CHECK(lane.detached());
-  CHECK(lane.poll_health() == cudaErrorInvalidResourceHandle);
-
-  // Would be a segfault on an attached lane.
-  CHECK(retirer.quiesce() == cudaSuccess);
-  CHECK(retired.load() == 1);
+  stream.stop();
+  CHECK(poll.fail_all(cudaErrorLaunchFailure) == 1);
+  CHECK(poll.fail_all(cudaErrorUnknown) == 0);
+  CHECK(calls == 1);
+  CHECK(seen == cudaErrorLaunchFailure);
   CHECK(lane.idle());
-  // ~cuda_event_completion_poll quiesces again; it must stay stream-free too.
+  CHECK(lane.detached());
 }
 
-TEST_CASE("lane_for is stable per stream", "[exec][cuda_event_completion_poll][gpu_execution]")
+TEST_CASE("wait for progress retires a high ticket while a low ticket is blocked",
+          "[exec][cuda_event_completion_poll]")
 {
-  stream_fixture a;
-  stream_fixture b;
-  cuda_event_completion_poll retirer;
-
-  auto& la1 = retirer.lane_for(a.stream());
-  auto& la2 = retirer.lane_for(a.stream());
-  auto& lb  = retirer.lane_for(b.stream());
-
-  CHECK(&la1 == &la2);
-  CHECK(&la1 != &lb);
-  CHECK(la1.stream() == a.stream());
-  CHECK(lb.stream() == b.stream());
+  controlled_stream slow, fast;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& a = poll.lane_for(slow.stream());
+  auto& b = poll.lane_for(fast.stream());
+  for (int i = 0; i < 100; ++i) {
+    submit(b, [](cudaError_t) noexcept {});
+  }
+  fast.complete();
+  REQUIRE(poll.drain_all() == 100);
+  bool ready = false;
+  submit(a, [](cudaError_t) noexcept {});
+  submit(b, [&](cudaError_t) noexcept { ready = true; });
+  fast.complete();
+  CHECK(poll.wait_for_progress() == cuda_event_completion_poll::progress::made);
+  CHECK(ready);
+  CHECK_FALSE(a.idle());
+  CHECK(b.idle());
 }
 
-TEST_CASE("lanes on separate streams retire independently",
+TEST_CASE("concurrent drain preserves FIFO and quiesce waits for active invocation",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream, other;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane       = poll.lane_for(stream.stream());
+  auto& other_lane = poll.lane_for(other.stream());
+  std::binary_semaphore entered{0}, release{0};
+  std::atomic<int> sequence{0};
+  std::atomic<bool> ordered{false}, other_done{false};
+  submit(lane, [&](cudaError_t) noexcept {
+    entered.release();
+    release.acquire();
+    sequence = 1;
+  });
+  stream.complete();
+  std::thread first([&] { lane.drain(); });
+  entered.acquire();
+  submit(lane, [&](cudaError_t) noexcept {
+    ordered  = sequence.load() == 1;
+    sequence = 2;
+  });
+  stream.complete();
+  submit(other_lane, [&](cudaError_t) noexcept { other_done = true; });
+  other.complete();
+  CHECK(poll.drain_all() == 1);
+  CHECK(other_done);
+  CHECK(sequence == 0);
+  CHECK_FALSE(lane.idle());
+  auto quiesce = std::async(std::launch::async, [&] { return poll.quiesce(); });
+  CHECK(quiesce.wait_for(std::chrono::milliseconds{20}) == std::future_status::timeout);
+  release.release();
+  first.join();
+  CHECK(quiesce.get() == cudaSuccess);
+  CHECK(ordered);
+  CHECK(sequence == 2);
+}
+
+TEST_CASE("detach fences in-flight query and forbids subsequent CUDA access",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::binary_semaphore entered{0}, release{0};
+  stream.query_entered = &entered;
+  stream.query_release = &release;
+  auto query           = std::async(std::launch::async, [&] { return lane.poll_health(); });
+  entered.acquire();
+  auto detach = std::async(std::launch::async, [&] { poll.detach(); });
+  CHECK(detach.wait_for(std::chrono::milliseconds{20}) == std::future_status::timeout);
+  release.release();
+  CHECK(query.get() == cudaSuccess);
+  detach.get();
+  CHECK(lane.poll_health() == cudaErrorInvalidResourceHandle);
+  CHECK(poll.quiesce() == cudaSuccess);
+  CHECK_THROWS_AS(lane.begin(), std::logic_error);
+  CHECK_THROWS_AS(poll.lane_for(stream.stream()), std::logic_error);
+  CHECK(stream.queries == 1);
+  CHECK(stream.synchronizations == 0);
+}
+
+TEST_CASE("detach alone cannot authorize retirement", "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  int calls  = 0;
+  submit(lane, [&](cudaError_t) noexcept { ++calls; });
+  poll.detach();
+  CHECK(poll.quiesce() == cudaErrorNotReady);
+  CHECK(calls == 0);
+  CHECK_FALSE(lane.idle());
+  stream.complete();
+  CHECK(poll.quiesce() == cudaSuccess);
+  CHECK(calls == 1);
+  CHECK(stream.synchronizations == 0);
+}
+
+TEST_CASE("multiple acquirers observe another drainer's completion",
+          "[exec][cuda_event_completion_poll]")
+{
+  controlled_stream stream;
+  cuda_event_completion_poll poll(controlled_stream::api());
+  auto& lane = poll.lane_for(stream.stream());
+  std::atomic<bool> available{false};
+  std::atomic<int> attempts{0};
+  submit(lane, [&](cudaError_t) noexcept { available = true; });
+  auto acquire = [&] {
+    return poll.acquire([&] {
+      ++attempts;
+      return available.load();
+    });
+  };
+  auto a = std::async(std::launch::async, acquire);
+  auto b = std::async(std::launch::async, acquire);
+  while (attempts.load() < 4) {
+    std::this_thread::yield();
+  }
+  stream.complete();
+  poll.drain_all();
+  CHECK(a.get());
+  CHECK(b.get());
+  CHECK(poll.wait_for_progress() == cuda_event_completion_poll::progress::none);
+}
+
+TEST_CASE("real CUDA streams retire hundreds of reads once in FIFO order",
           "[exec][cuda_event_completion_poll][gpu_execution]")
 {
-  stream_fixture a;
-  stream_fixture b;
-  cuda_event_completion_poll retirer;
-
-  std::atomic<int> ra{0};
-  std::atomic<int> rb{0};
-
-  {
-    auto& lane = retirer.lane_for(a.stream());
-    auto sub   = lane.begin();
-    a.enqueue_work();
-    sub.on_retire([&](cudaError_t) noexcept { ra.fetch_add(1); });
-    CHECK(sub.commit() == cudaSuccess);
+  const int streams = GENERATE(1, 8, 16);
+  std::vector<std::unique_ptr<real_stream>> fixtures;
+  for (int i = 0; i < streams; ++i) {
+    fixtures.push_back(std::make_unique<real_stream>());
   }
-  {
-    auto& lane = retirer.lane_for(b.stream());
-    auto sub   = lane.begin();
-    b.enqueue_work();
-    sub.on_retire([&](cudaError_t) noexcept { rb.fetch_add(1); });
-    CHECK(sub.commit() == cudaSuccess);
+  cuda_event_completion_poll poll;
+  std::vector<int> retired(streams, 0);
+  std::atomic<int> failures{0};
+  constexpr int reads = 100;
+  for (int read = 0; read < reads; ++read) {
+    for (int i = 0; i < streams; ++i) {
+      auto sub = poll.lane_for(fixtures[i]->value).begin();
+      sub.on_retire([&, i, read](cudaError_t e) noexcept {
+        if (e != cudaSuccess || retired[i]++ != read) { ++failures; }
+      });
+      REQUIRE(cudaMemsetAsync(fixtures[i]->data, read, 4096, sub.stream()) == cudaSuccess);
+      REQUIRE(sub.commit() == cudaSuccess);
+    }
   }
-
-  CHECK(drain_until(retirer, [&] { return ra.load() == 1 && rb.load() == 1; }));
+  CHECK(poll.quiesce() == cudaSuccess);
+  CHECK(failures == 0);
+  for (int count : retired) {
+    CHECK(count == reads);
+  }
+  poll.detach();
 }
 
-TEST_CASE("concurrent submitters on one lane keep ticket order",
+TEST_CASE("unequal completion queues across 8 and 16 lanes drain independently",
+          "[exec][cuda_event_completion_poll]")
+{
+  const int count = GENERATE(8, 16);
+  std::vector<std::unique_ptr<controlled_stream>> streams;
+  for (int i = 0; i < count; ++i) {
+    streams.push_back(std::make_unique<controlled_stream>());
+  }
+  cuda_event_completion_poll poll(controlled_stream::api());
+  std::vector<int> retired(count, 0);
+  int expected = 0;
+  for (int i = 0; i < count; ++i) {
+    auto& lane = poll.lane_for(streams[i]->stream());
+    for (int j = 0; j < 100 + i * 7; ++j) {
+      submit(lane, [&, i](cudaError_t) noexcept { ++retired[i]; });
+    }
+    if (i % 2) {
+      streams[i]->complete();
+      expected += 100 + i * 7;
+    }
+  }
+  CHECK(poll.drain_all() == expected);
+  for (int i = 0; i < count; ++i) {
+    CHECK(retired[i] == (i % 2 ? 100 + i * 7 : 0));
+  }
+  CHECK(poll.quiesce() == cudaSuccess);
+  for (int i = 0; i < count; ++i) {
+    CHECK(retired[i] == 100 + i * 7);
+  }
+}
+
+TEST_CASE("concurrent producers preserve real CUDA ticket order",
           "[exec][cuda_event_completion_poll][gpu_execution]")
 {
-  // begin() serializes submitters, so tickets are handed out in the same order
-  // their callbacks reach the stream -- the invariant the whole design rests on.
-  stream_fixture fx;
-  cuda_event_completion_poll retirer;
-  auto& lane = retirer.lane_for(fx.stream());
-
-  constexpr int kThreads   = 4;
-  constexpr int kPerThread = 16;
-  std::atomic<int> retired{0};
-
+  real_stream stream;
+  cuda_event_completion_poll poll;
+  auto& lane = poll.lane_for(stream.value);
+  int next = 0, retired = 0;
+  std::atomic<int> errors{0};
   std::vector<std::thread> workers;
-  workers.reserve(kThreads);
-  for (int t = 0; t < kThreads; ++t) {
+  for (int i = 0; i < 4; ++i) {
     workers.emplace_back([&] {
-      for (int i = 0; i < kPerThread; ++i) {
-        auto sub = lane.begin();
-        fx.enqueue_work();
-        sub.on_retire([&](cudaError_t) noexcept { retired.fetch_add(1); });
-        CHECK(sub.commit() == cudaSuccess);
+      for (int j = 0; j < 100; ++j) {
+        auto sub        = lane.begin();
+        const int index = next++;
+        sub.on_retire([&, index](cudaError_t e) noexcept {
+          if (e != cudaSuccess || retired++ != index) { ++errors; }
+        });
+        if (cudaMemsetAsync(stream.data, index, 4096, sub.stream()) != cudaSuccess ||
+            sub.commit() != cudaSuccess) {
+          ++errors;
+        }
       }
     });
   }
-  for (auto& w : workers) {
-    w.join();
+  for (auto& worker : workers) {
+    worker.join();
   }
-
-  CHECK(drain_until(retirer, [&] { return retired.load() == kThreads * kPerThread; }));
-  CHECK(lane.idle());
+  CHECK(poll.quiesce() == cudaSuccess);
+  CHECK(retired == 400);
+  CHECK(errors == 0);
 }

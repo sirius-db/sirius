@@ -15,83 +15,7 @@
  */
 
 #pragma once
-//
-// cuda_event_completion_poll.hpp
-//
-// Defer host-side work (buffer recycling, chunk state transitions, waiter
-// wakeups) until a stream's completion frontier passes a given point --
-// without a completion thread, without one CUDA event per submission, and
-// without a shared task queue that one busy stream can flood.
-//
-// MODEL
-//   Each stream gets a lane holding:
-//     - a monotonic ticket counter, incremented once per logical submission
-//     - a `completed` word advanced in stream order by a minimal CUDA callback
-//     - a FIFO of (ticket, retire_fn)
-//
-//   Work on a stream completes in submission order, so `completed >= t`
-//   implies every ticket <= t is done. Retirement is a prefix pop, and one
-//   64-bit load tells you everything about the whole lane.
-//
-//   Nothing polls in steady state. `drain()` runs on whoever is about to need
-//   a resource:
-//
-//       pinned_buffer* acquire() {
-//         if (auto* b = free.try_pop()) return b;
-//         retirer.drain_all();                 // one relaxed load per lane
-//         if (auto* b = free.try_pop()) return b;
-//         return retirer.acquire([&]{ return free.try_pop(); });  // backpressure
-//       }
-//
-// WHY cudaStreamAddCallback AND NOT cudaLaunchHostFunc
-//   Two reasons, and the second is the important one:
-//
-//   1. A host function enqueued behind a faulting operation never executes.
-//      Its ticket strands, the frontier freezes, and every retire_fn behind it
-//      is lost -- including the ones that would move chunks out of `loading`
-//      and unpark readers. A device fault becomes a silent hang. Callbacks
-//      always fire.
-//
-//   2. Callbacks receive the stream's `cudaError_t`. Without it, retirement
-//      can only act on the *host-side* result of the read, so a faulted H2D
-//      copy would be marked cached with garbage in the device buffer. There
-//      is no way to detect that with a host function. retire_fn therefore
-//      takes the completion status, and the cached/failed decision is made
-//      with it.
-//
-//   Cost: cudaStreamAddCallback is deprecated, and -- verify against your
-//   toolkit -- is not permitted during stream capture. If you later want to
-//   capture the copy batch into a CUDA graph, this is the thing that blocks
-//   it, not the deprecation.
-//
-// INVARIANTS (violating any of these is a use-after-free, not a slowdown)
-//   1. Ticket assignment order must equal stream-enqueue order. `submission`
-//      holds the lane's submit lock across your launches to enforce this.
-//      Prefer one lane per submitting thread; then it is uncontended.
-//   2. Every allocated ticket lands exactly one callback. `completed` counts
-//      callbacks, so a ticket without one makes the frontier lag forever.
-//   3. The pending entry is published before the callback is enqueued, so a
-//      drainer can never see `completed >= t` with no entry.
-//   4. retire_fn runs outside all lane locks. It may take your freelist lock,
-//      CAS chunk control words, and unpark ParkingLot waiters.
-//
-// USAGE
-//     auto& lane = retirer.lane_for(stream);       // once, at stream setup
-//     ...
-//     {
-//       auto sub = lane.begin();                   // takes submit lock
-//       for (auto& r : ranges) cudaMemcpyAsync(..., sub.stream());
-//
-//       sub.on_retire([pinned  = std::move(pinned),
-//                      loading = std::move(loading),
-//                      host_ok = ok](cudaError_t status) noexcept {
-//         const bool ok = host_ok && status == cudaSuccess;
-//         ...                                      // ONE fn for the whole batch
-//       });
-//
-//       if (auto e = sub.commit(); e != cudaSuccess) { /* already recovered */ }
-//     }
-//
+
 #include <cuda_runtime.h>
 
 #include <absl/functional/any_invocable.h>
@@ -102,88 +26,75 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <exception>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace sirius::exec {
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-// Cache-line size, used to pad and align away false sharing.
+// Historical name: this uses stream callbacks, not CUDA events. One frontier
+// describes each stream's completed prefix. No worker is created; retire
+// functions run inline on drain/acquire/quiesce callers. Scheduling belongs to
+// the consumer (normally one on-demand pump for its 8-16 streams).
 //
-// Pinned rather than taken from std::hardware_destructive_interference_size on
-// purpose.  That constant varies with -mtune, and this one appears in `alignas`
-// on a type (completion_slot) and on members of a class defined in this header,
-// so two translation units compiled with different tuning would disagree about
-// layout and sizeof -- an ODR violation, not merely a missed optimisation.
-// This is precisely what GCC's -Winterference-size warns about, and its own
-// advice is to use a constant you define.
+// Contract:
+// * Enqueue work while its submission holds the lane lock. Stage ownership-
+//   bearing functions BEFORE launching work: on_retire and construction of
+//   its argument may allocate/throw; commit and drain allocate nothing.
+// * Retirement is FIFO per lane, including concurrent drainers. Functions
+//   must be noexcept and short. They may call nonblocking drain, but must not
+//   wait for retirement or call quiesce/fail_all on this registry.
+// * Stop producers before quiesce, terminal cleanup, or destruction. Serialize
+//   lifecycle operations externally. Draining may overlap quiesce, which waits
+//   for active retire functions. Every public call must end before destruction.
+// * Streams are borrowed. detach BEFORE external stream destruction: it fences
+//   CUDA API calls and rejects submissions, but does NOT establish completion.
+//   Keep this object alive until callbacks finish, or call fail_all only after
+//   device work AND callback delivery have stopped. cudaStreamDestroy returns
+//   asynchronously and is NOT such a proof.
+// * Failed quiescence retains unconfirmed captures. Destruction with unresolved
+//   work terminates rather than freeing live buffers or CUDA callback state.
 //
-// 64 is the line size on both host architectures Sirius builds for: x86-64 and
-// aarch64 (including Grace).
-inline constexpr std::size_t cacheline_v = 64;
-
-// Receives the stream's completion status for the batch it was staged with.
-// Must be noexcept: these run on the allocation path.
-//
-// @c absl::AnyInvocable rather than std::move_only_function:
-// the project targets C++20, and this is the move-only callable the rest of
-// the pipeline and future primitives already use.
-using retire_fn = absl::AnyInvocable<void(cudaError_t) noexcept>;
-
+// cudaStreamAddCallback is slated for eventual deprecation/removal and is
+// unsupported in stream capture. Unlike cudaLaunchHostFunc, it delivers device
+// errors. Its callback only publishes atomics: no CUDA, waits, or user code.
+inline constexpr std::size_t cacheline_v    = 64;
 inline constexpr std::uint64_t no_pending_v = ~std::uint64_t{0};
-
-// ---------------------------------------------------------------------------
-// completion_slot -- the only state the stream touches
-// ---------------------------------------------------------------------------
+using retire_fn                             = absl::AnyInvocable<void(cudaError_t) noexcept>;
 
 struct alignas(cacheline_v) completion_slot {
-  // Counts callbacks, one per ticket. Monotonic, so
-  // "completed >= t  =>  ticket t is done".
   std::atomic<std::uint64_t> completed{0};
-
-  // Lowest ticket that completed with an error, or no_pending_v. Device errors
-  // are sticky and terminal, so every ticket from here on is failed -- one
-  // number describes the whole tail.
   std::atomic<std::uint64_t> first_failed{no_pending_v};
   std::atomic<cudaError_t> first_error{cudaSuccess};
 };
-
-static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
-              "completion_slot must be lock-free; it is written from a CUDA callback");
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic<cudaError_t>::is_always_lock_free);
 
 namespace detail {
+// Deterministic error/lifetime tests can substitute this small runtime seam.
+// An alternative must obey CUDA's exactly-once, in-stream callback ordering.
+struct completion_cuda_api {
+  decltype(&cudaStreamAddCallback) add_callback = &cudaStreamAddCallback;
+  decltype(&cudaStreamQuery) query              = &cudaStreamQuery;
+  decltype(&cudaStreamSynchronize) synchronize  = &cudaStreamSynchronize;
+};
 
-// Runs on a driver callback thread, in stream order. Must not: call any CUDA
-// API, block, or allocate. Three relaxed stores at worst, one release RMW.
-inline void CUDART_CB bump_ticket(cudaStream_t, cudaError_t status, void* user_data) noexcept
+inline void CUDART_CB bump_ticket(cudaStream_t, cudaError_t status, void* data) noexcept
 {
-  auto* slot = static_cast<completion_slot*>(user_data);
-
-  if (status != cudaSuccess) {
-    // Record the failure BEFORE advancing the frontier. A drainer that sees
-    // this ticket completed must also see that it failed -- publishing in the
-    // other order lets it retire a faulted batch as a success.
-    //
-    // Callbacks are FIFO on this stream and are the only writer of completed,
-    // so `completed + 1` is this callback's ticket and the first failing
-    // callback holds the lowest failing ticket. CAS-once is therefore correct.
-    slot->first_error.store(status, std::memory_order_relaxed);
-    std::uint64_t none = no_pending_v;
-    slot->first_failed.compare_exchange_strong(none,
-                                               slot->completed.load(std::memory_order_relaxed) + 1,
-                                               std::memory_order_relaxed,
-                                               std::memory_order_relaxed);
+  auto& slot        = *static_cast<completion_slot*>(data);
+  const auto ticket = slot.completed.load(std::memory_order_relaxed) + 1;
+  // Only ordered CUDA callbacks write this state. API errors on the host must
+  // never manufacture a failed/completed device frontier.
+  if (status != cudaSuccess && slot.first_failed.load(std::memory_order_relaxed) == no_pending_v) {
+    slot.first_error.store(status, std::memory_order_relaxed);
+    slot.first_failed.store(ticket, std::memory_order_release);
   }
-
-  slot->completed.fetch_add(1, std::memory_order_release);  // publishes the above
+  slot.completed.store(ticket, std::memory_order_release);  // last access to slot
 }
 
 struct pending_entry {
@@ -191,524 +102,426 @@ struct pending_entry {
   retire_fn fn;
 };
 
+inline void completion_backoff(std::chrono::microseconds& delay) noexcept
+{
+  std::this_thread::sleep_for(delay);
+  delay = std::min(std::chrono::microseconds{256}, delay * 2);
+}
 }  // namespace detail
 
 class retire_lane;
-
-// ---------------------------------------------------------------------------
-// submission -- RAII scope that pins ticket order to stream-enqueue order
-// ---------------------------------------------------------------------------
-
 class [[nodiscard]] submission {
  public:
-  // Non-movable on purpose. A moved-from submission keeps lane_ non-null and
-  // committed_ false while its unique_lock has released submit_m_, so its
-  // destructor would commit *unlocked*: a racing ++submitted_ plus a callback
-  // with no pending entries, driving `completed` ahead of the tickets and
-  // retiring buffers that are still in flight.
-  //
-  // begin() still works: `return submission{...}` is a prvalue, so C++17
-  // guaranteed elision constructs it in place with no move.
   submission(submission&&)                 = delete;
   submission& operator=(submission&&)      = delete;
-  submission(const submission&)            = delete;
-  submission& operator=(const submission&) = delete;
-
+  submission(submission const&)            = delete;
+  submission& operator=(submission const&) = delete;
   ~submission();
 
-  // Launch all of this batch's work on this stream, inside this scope.
   [[nodiscard]] cudaStream_t stream() const noexcept;
 
-  // Stage work to run once everything launched in this scope has completed.
-  // The callable receives the stream's completion status for the batch.
-  //
-  // May be called more than once; all staged fns share one ticket and one
-  // callback. Prefer one fn covering the whole batch -- that is the difference
-  // between 100 wakeups and 1.
-  void on_retire(retire_fn f);
-
-  // Publishes the ticket and enqueues the callback. After this returns, do not
-  // enqueue further work on this stream for this batch.
-  //
-  // On failure the lane has already synchronized the stream and run the staged
-  // fns inline with the error, so the caller's buffers and chunk states are
-  // resolved either way; the error is returned for logging and propagation.
+  // Stage before enqueuing device work, including construction of fn.
+  void on_retire(retire_fn fn);
+  // Idempotent. Installation failure closes the lane. A fallback sync error
+  // takes precedence in the return value; enqueue_error() retains the cause.
+  // Unconfirmed functions remain queued; successful recovery makes them
+  // drainable with the installation error (never inline under the submit lock).
   cudaError_t commit() noexcept;
 
  private:
   friend class retire_lane;
-  submission(retire_lane& lane, std::unique_lock<std::mutex> lk) noexcept
-    : lane_(&lane), lk_(std::move(lk))
+  submission(retire_lane& lane, std::unique_lock<std::mutex> lock) noexcept
+    : lane_(&lane), lock_(std::move(lock))
   {
   }
-
   retire_lane* lane_;
-  std::unique_lock<std::mutex> lk_;
-  std::vector<retire_fn> staged_;
+  std::unique_lock<std::mutex> lock_;
+  std::list<detail::pending_entry> staged_;
   bool committed_{false};
+  cudaError_t result_{cudaSuccess};
 };
-
-// ---------------------------------------------------------------------------
-// retire_lane -- one per stream
-// ---------------------------------------------------------------------------
 
 class retire_lane {
  public:
-  explicit retire_lane(cudaStream_t s) noexcept : stream_(s) {}
-
-  ~retire_lane() { quiesce(); }
-
-  retire_lane(const retire_lane&)            = delete;
-  retire_lane& operator=(const retire_lane&) = delete;
+  explicit retire_lane(cudaStream_t stream,
+                       detail::completion_cuda_api api     = {},
+                       std::atomic<std::uint64_t>* retired = nullptr) noexcept
+    : stream_(stream), api_(api), registry_retired_(retired)
+  {
+  }
+  ~retire_lane()
+  {
+    if (!idle()) { quiesce(); }
+    if (!idle()) { std::terminate(); }
+  }
+  retire_lane(retire_lane const&)            = delete;
+  retire_lane& operator=(retire_lane const&) = delete;
 
   [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
 
-  // Opens a submission scope. Blocks only if another thread is mid-submission
-  // on this same stream -- which is why one lane per submitting thread is the
-  // recommended topology.
-  [[nodiscard]] submission begin() { return submission{*this, std::unique_lock{submit_m_}}; }
-
-  // Retires every entry whose ticket has completed, handing each its status.
-  // Returns how many ran. Safe to call from any thread, including concurrently
-  // with submitters.
-  std::size_t drain() noexcept
+  [[nodiscard]] submission begin()
   {
-    const std::uint64_t done = slot_.completed.load(std::memory_order_acquire);
-
-    // Advisory fast path: one relaxed load, no lock, no cache-line handoff.
-    // A stale-high hint only postpones retirement to the next drain; the
-    // blocking path uses oldest_pending_locked() instead.
-    if (done < oldest_hint_.load(std::memory_order_relaxed)) { return 0; }
-
-    // Ordered after the acquire above, so a failure published before the
-    // frontier moved is visible here.
-    const std::uint64_t bad = slot_.first_failed.load(std::memory_order_relaxed);
-    const cudaError_t err   = slot_.first_error.load(std::memory_order_relaxed);
-
-    std::vector<detail::pending_entry> ready;
-    {
-      std::lock_guard g(pending_m_);
-      while (!pending_.empty() && pending_.front().ticket <= done) {
-        ready.push_back(std::move(pending_.front()));
-        pending_.pop_front();
-      }
-      refresh_hint_locked();
+    std::unique_lock lock(submit_m_);
+    if (detached_ || closed_) {
+      throw std::logic_error("submission on detached or failed completion lane");
     }
-
-    // Outside every lane lock: these take freelist locks, CAS chunk control
-    // words, and unpark waiters.
-    for (auto& e : ready) {
-      e.fn(e.ticket >= bad ? err : cudaSuccess);
-    }
-    return ready.size();
+    return submission{*this, std::move(lock)};
   }
 
-  // Advisory. May read stale, which is fine for *skipping* a drain but not for
-  // concluding there is nothing left to wait on.
+  // A busy drainer must not stall a registry scan. Ownership spans invocation,
+  // not merely removal from the queue, to preserve FIFO across callers.
+  std::size_t drain() noexcept
+  {
+    const auto done = completed();
+    if (done < oldest_hint_.load(std::memory_order_relaxed)) { return 0; }
+    if (draining_.test_and_set(std::memory_order_acquire)) { return 0; }
+    const auto count = drain_owned(done, false, cudaSuccess);
+    draining_.clear(std::memory_order_release);
+    return count;
+  }
+
   [[nodiscard]] std::uint64_t oldest_pending_hint() const noexcept
   {
     return oldest_hint_.load(std::memory_order_relaxed);
   }
 
-  // Authoritative: oldest ticket not yet retired, or no_pending_v if idle.
   [[nodiscard]] std::uint64_t oldest_pending_locked() noexcept
   {
-    std::lock_guard g(pending_m_);
-    return pending_.empty() ? no_pending_v : pending_.front().ticket;
+    std::lock_guard lock(pending_m_);
+    return std::min(active_ticket_, pending_.empty() ? no_pending_v : pending_.front().ticket);
   }
 
   [[nodiscard]] bool idle() noexcept { return oldest_pending_locked() == no_pending_v; }
 
-  [[nodiscard]] bool faulted() const noexcept
-  {
-    return slot_.first_failed.load(std::memory_order_acquire) != no_pending_v;
-  }
+  [[nodiscard]] bool faulted() const noexcept { return fault_error() != cudaSuccess; }
 
   [[nodiscard]] cudaError_t fault_error() const noexcept
   {
-    return slot_.first_error.load(std::memory_order_acquire);
+    if (slot_.first_failed.load(std::memory_order_acquire) != no_pending_v) {
+      return slot_.first_error.load(std::memory_order_relaxed);
+    }
+    return host_error_.load(std::memory_order_acquire);
   }
 
-  // Blocks until `completed >= target`. Backpressure only -- never the steady
-  // state. Does not drain; call drain() after.
-  //
-  // A device fault does not strand us: the callback fires with the error, the
-  // frontier advances, and drain() retires the batch as failed. poll_health()
-  // is only an escape hatch for the case where the context is torn down from
-  // under the lane and no callback can be delivered at all.
+  [[nodiscard]] cudaError_t enqueue_error() const noexcept
+  {
+    return enqueue_error_.load(std::memory_order_acquire);
+  }
+
+  // Lane-local utility. Registry waiting deliberately never calls this.
   cudaError_t wait_for(std::uint64_t target) noexcept
   {
-    for (int i = 0; i < 64; ++i) {  // brief spin: the frontier is usually close
-      if (slot_.completed.load(std::memory_order_acquire) >= target) { return cudaSuccess; }
-      std::this_thread::yield();
-    }
-
-    // Sleep granularity here is irrelevant next to the H2D copy we are waiting
-    // on, and polling is what keeps the escape hatch reachable.
-    auto delay               = std::chrono::microseconds{4};
-    constexpr auto max_delay = std::chrono::microseconds{256};
+    auto delay = std::chrono::microseconds{4};
     for (;;) {
-      if (slot_.completed.load(std::memory_order_acquire) >= target) { return cudaSuccess; }
-      if (const cudaError_t e = poll_health(); e != cudaSuccess) { return e; }
-      std::this_thread::sleep_for(delay);
-      delay = std::min(max_delay, delay * 2);
+      if (completed() >= target) { return cudaSuccess; }
+      if (auto error = poll_health(); error != cudaSuccess) { return error; }
+      detail::completion_backoff(delay);
     }
   }
 
-  // cudaSuccess if the stream is alive (idle or busy); the sticky error
-  // otherwise. Sticky errors are context-wide, so any lane detects the fault --
-  // including lanes that never submitted the bad work.
   cudaError_t poll_health() noexcept
   {
-    if (detached_.load(std::memory_order_acquire)) { return cudaErrorInvalidResourceHandle; }
-    const cudaError_t q = cudaStreamQuery(stream_);
-    if (q == cudaSuccess || q == cudaErrorNotReady) { return cudaSuccess; }
-    mark_faulted(q);
-    return q;
+    // Serializes CUDA API access with detach's return.
+    std::unique_lock lock(submit_m_, std::try_to_lock);
+    if (!lock.owns_lock()) { return cudaSuccess; }  // a submitter must not stall all lanes
+    if (detached_) { return cudaErrorInvalidResourceHandle; }
+    const auto result = api_.query(stream_);
+    if (result == cudaSuccess || result == cudaErrorNotReady) {
+      return host_error_.load(std::memory_order_acquire);
+    }
+    remember_host_error(result);
+    return result;
   }
 
-  // Give up the stream handle: after this the lane makes no CUDA calls at all.
-  //
-  // For owners that do not control stream lifetime. A lane holds a raw
-  // cudaStream_t, and nothing stops the stream's owner from destroying it
-  // first -- at which point quiesce()'s cudaStreamSynchronize and
-  // poll_health()'s cudaStreamQuery are calls on a dangling handle, which
-  // segfaults inside the driver rather than returning an error.
-  //
-  // Retirement does not need the stream: drain() reads the frontier the
-  // callbacks already published, and anything still outstanding is reported as
-  // unconfirmed instead of waited on. Detaching is therefore safe precisely
-  // when the stream's owner has already ensured the work finished -- which it
-  // had to, in order to destroy the stream.
-  void detach() noexcept { detached_.store(true, std::memory_order_release); }
-
-  [[nodiscard]] bool detached() const noexcept { return detached_.load(std::memory_order_acquire); }
-
-  // Retires every pending entry unconditionally with `e`. Terminal recovery
-  // for the case where callbacks cannot be delivered; the normal fault path
-  // does not need it, because callbacks still fire.
-  //
-  // ORDERING: these fns hand pinned buffers back to the pool. Call this only
-  // once the device is stopped -- after the context is destroyed / reset -- so
-  // nothing can still be DMAing into them.
-  std::size_t fail_all(cudaError_t e) noexcept
+  void detach() noexcept
   {
-    std::vector<detail::pending_entry> ready;
-    {
-      std::lock_guard g(pending_m_);
-      while (!pending_.empty()) {
-        ready.push_back(std::move(pending_.front()));
-        pending_.pop_front();
-      }
-      refresh_hint_locked();
-    }
-    for (auto& p : ready) {
-      p.fn(e);
-    }
-    return ready.size();
+    std::lock_guard lock(submit_m_);
+    detached_ = true;
   }
 
-  // Synchronize the stream and retire everything. Use on shutdown and after a
-  // fault. Must not be called from inside a submission scope on this lane: it
-  // takes submit_m_ so no ticket can be allocated while the counter is resynced.
+  [[nodiscard]] bool detached() const noexcept
+  {
+    std::lock_guard lock(submit_m_);
+    return detached_;
+  }
+
+  // Caller explicitly asserts ALL device work AND CUDA callback delivery have
+  // stopped. A query/sync error or stream destruction alone is insufficient.
+  // Terminal and permanent: closes/detaches, never reuses or resets a frontier.
+  std::size_t fail_all(cudaError_t error) noexcept
+  {
+    {
+      std::lock_guard lock(submit_m_);
+      detached_ = true;
+      closed_   = true;
+    }
+    claim_drainer();
+    const auto count =
+      drain_owned(no_pending_v, true, error == cudaSuccess ? cudaErrorUnknown : error);
+    draining_.clear(std::memory_order_release);
+    return count;
+  }
+
+  // Caller stopped producers. An error does not prove completion; only drain
+  // delivered boundaries and retain everything else for external recovery.
   cudaError_t quiesce() noexcept
   {
-    std::lock_guard submit_g(submit_m_);
-
-    if (detached_.load(std::memory_order_acquire)) {
-      // No CUDA calls: the handle may already be dead. Entries whose callbacks
-      // did fire still retire with their true status; the rest are reported
-      // unconfirmed, because without the stream there is no way to learn it.
-      drain();
-      const std::uint64_t bad = slot_.first_failed.load(std::memory_order_acquire);
-      fail_all(bad == no_pending_v ? cudaErrorInvalidResourceHandle
-                                   : slot_.first_error.load(std::memory_order_relaxed));
-      slot_.completed.store(submitted_, std::memory_order_release);
-      return cudaSuccess;
+    cudaError_t result = cudaSuccess;
+    {
+      std::lock_guard lock(submit_m_);
+      if (!detached_) {
+        result = api_.synchronize(stream_);
+        if (result != cudaSuccess) { remember_host_error(result); }
+        if (result == cudaSuccess && enqueue_error_.load() != cudaSuccess) {
+          recovered_.store(submitted_, std::memory_order_release);
+        }
+      }
     }
-
-    const cudaError_t sync_err = cudaStreamSynchronize(stream_);
-    if (sync_err != cudaSuccess) { mark_faulted(sync_err); }
-
-    // Callbacks fire even on fault, so drain() normally has already emptied
-    // this and each entry got its true status. Anything left could not be
-    // delivered; give it the lane's error.
-    drain();
-
-    const std::uint64_t bad = slot_.first_failed.load(std::memory_order_acquire);
-    fail_all(bad == no_pending_v ? sync_err : slot_.first_error.load(std::memory_order_relaxed));
-
-    // Republish the frontier so the lane is reusable if the caller rebuilds
-    // the stream. Safe: everything is retired and no ticket can be in flight.
-    slot_.completed.store(submitted_, std::memory_order_release);
-    return sync_err;
+    claim_drainer();
+    drain_owned(completed(), false, cudaSuccess);
+    draining_.clear(std::memory_order_release);
+    if (result != cudaSuccess) { return result; }
+    return idle() ? cudaSuccess : cudaErrorNotReady;
   }
 
  private:
   friend class submission;
-
-  void mark_faulted(cudaError_t e) noexcept
+  std::uint64_t completed() const noexcept
   {
-    slot_.first_error.store(e, std::memory_order_relaxed);
-    std::uint64_t none = no_pending_v;
-    slot_.first_failed.compare_exchange_strong(none,
-                                               slot_.completed.load(std::memory_order_relaxed) + 1,
-                                               std::memory_order_release,
-                                               std::memory_order_relaxed);
+    return std::max(slot_.completed.load(std::memory_order_acquire),
+                    recovered_.load(std::memory_order_acquire));
   }
-
-  void refresh_hint_locked() noexcept
+  void remember_host_error(cudaError_t error) noexcept
   {
-    oldest_hint_.store(pending_.empty() ? no_pending_v : pending_.front().ticket,
-                       std::memory_order_relaxed);
+    auto expected = cudaSuccess;
+    host_error_.compare_exchange_strong(expected, error, std::memory_order_release);
   }
-
-  // Called by submission::commit() with submit_m_ held.
-  //
-  // INVARIANT: every allocated ticket lands exactly one callback. `completed`
-  // counts callbacks, so a ticket without one makes it lag `submitted_`
-  // forever -- every later batch then retires only when the *next* batch
-  // completes, and the backpressure path (which by definition stops
-  // submitting) waits on a frontier that can never advance. Every exit from
-  // this function must leave the invariant intact.
-  cudaError_t publish(std::vector<retire_fn>& staged) noexcept
+  void claim_drainer() noexcept
   {
-    // Nothing staged: no ticket, no callback, no stream stall. Nobody can be
-    // waiting on a frontier that carries no retirement work.
+    while (draining_.test_and_set(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+  std::size_t drain_owned(std::uint64_t done, bool force, cudaError_t error) noexcept
+  {
+    std::list<detail::pending_entry> ready;
+    {
+      std::lock_guard lock(pending_m_);
+      auto end = pending_.begin();
+      while (end != pending_.end() && end->ticket <= done) {
+        ++end;
+      }
+      // Splice existing nodes: no drain-time allocation.
+      ready.splice(ready.end(), pending_, pending_.begin(), end);
+      active_ticket_ = ready.empty() ? no_pending_v : ready.front().ticket;
+      oldest_hint_.store(pending_.empty() ? no_pending_v : pending_.front().ticket,
+                         std::memory_order_relaxed);
+    }
+    const auto bad           = slot_.first_failed.load(std::memory_order_acquire);
+    const auto device_error  = slot_.first_error.load(std::memory_order_relaxed);
+    const auto install_error = enqueue_error_.load(std::memory_order_acquire);
+    for (auto& entry : ready) {
+      auto status = entry.ticket >= bad ? device_error : cudaSuccess;
+      if (entry.ticket == failed_enqueue_ticket_.load(std::memory_order_relaxed)) {
+        status = install_error;
+      }
+      entry.fn(force ? error : status);
+    }
+    const auto count = ready.size();
+    ready.clear();  // release captures before publishing host retirement
+    if (registry_retired_ && count) {
+      registry_retired_->fetch_add(count, std::memory_order_release);
+    }
+    {
+      std::lock_guard lock(pending_m_);
+      active_ticket_ = no_pending_v;
+    }
+    return count;
+  }
+  cudaError_t publish(std::list<detail::pending_entry>& staged) noexcept
+  {
     if (staged.empty()) { return cudaSuccess; }
-
-    const std::uint64_t t = ++submitted_;  // guarded by submit_m_
-
-    // Publish before enqueueing: a drainer must never see completed >= t with
-    // no entry to retire.
-    {
-      std::lock_guard g(pending_m_);
-      for (auto& f : staged) {
-        pending_.push_back({t, std::move(f)});
-      }
-      refresh_hint_locked();
+    if (submitted_ == no_pending_v - 1) { std::terminate(); }  // never wrap
+    const auto ticket = ++submitted_;
+    for (auto& entry : staged) {
+      entry.ticket = ticket;
     }
-
-    // flags must be 0.
-    const cudaError_t e = cudaStreamAddCallback(stream_, &detail::bump_ticket, &slot_, 0);
-    if (e != cudaSuccess) { unwind_failed_enqueue(t, e); }
-    return e;
+    {
+      std::lock_guard lock(pending_m_);
+      pending_.splice(pending_.end(), staged);
+      oldest_hint_.store(pending_.front().ticket, std::memory_order_relaxed);
+    }
+    const auto error = api_.add_callback(stream_, &detail::bump_ticket, &slot_, 0);
+    if (error == cudaSuccess) { return error; }
+    // A missing callback permanently closes the lane. Only successful sync
+    // can make that ticket safe to drain. Preserve queue order and ownership.
+    closed_ = true;
+    enqueue_error_.store(error, std::memory_order_release);
+    failed_enqueue_ticket_.store(ticket, std::memory_order_relaxed);
+    const auto sync_error = api_.synchronize(stream_);
+    remember_host_error(sync_error == cudaSuccess ? error : sync_error);
+    if (sync_error == cudaSuccess) { recovered_.store(ticket, std::memory_order_release); }
+    return sync_error == cudaSuccess ? error : sync_error;
   }
 
-  // Ticket `t` will never complete. Called with submit_m_ held, so nobody
-  // appended after us and no drainer can have taken these (completed < t).
-  // Give the ticket back first, then sync and retire inline with the error.
-  void unwind_failed_enqueue(std::uint64_t t, cudaError_t e) noexcept
-  {
-    std::vector<detail::pending_entry> orphans;
-    {
-      std::lock_guard g(pending_m_);
-      while (!pending_.empty() && pending_.back().ticket == t) {
-        orphans.push_back(std::move(pending_.back()));
-        pending_.pop_back();
-      }
-      refresh_hint_locked();
-    }
-    --submitted_;  // restores the ticket/callback invariant
-
-    cudaStreamSynchronize(stream_);
-    for (auto it = orphans.rbegin(); it != orphans.rend(); ++it) {
-      it->fn(e);
-    }  // original order
-  }
-
-  // --- hot: written by the callback thread, read by every drainer ----------
-  completion_slot slot_{};
-
+  completion_slot slot_;
   cudaStream_t stream_;
-
-  // --- submitter side ------------------------------------------------------
-  alignas(cacheline_v) std::mutex submit_m_;
-  std::uint64_t submitted_{0};  // guarded by submit_m_
-
-  // --- queue side ----------------------------------------------------------
+  detail::completion_cuda_api api_;
+  std::atomic<std::uint64_t>* registry_retired_;
+  alignas(cacheline_v) mutable std::mutex submit_m_;
+  std::uint64_t submitted_{0};
+  bool detached_{false};
+  bool closed_{false};
+  std::atomic<cudaError_t> host_error_{cudaSuccess};
+  std::atomic<cudaError_t> enqueue_error_{cudaSuccess};
+  std::atomic<std::uint64_t> failed_enqueue_ticket_{no_pending_v};
+  std::atomic<std::uint64_t> recovered_{0};
   alignas(cacheline_v) std::mutex pending_m_;
-  std::deque<detail::pending_entry> pending_;             // guarded by pending_m_
-  std::atomic<std::uint64_t> oldest_hint_{no_pending_v};  // advisory
-
-  // Set once, never cleared: the stream handle is no longer safe to touch.
-  std::atomic<bool> detached_{false};
+  std::list<detail::pending_entry> pending_;
+  std::uint64_t active_ticket_{no_pending_v};
+  std::atomic<std::uint64_t> oldest_hint_{no_pending_v};
+  std::atomic_flag draining_ = ATOMIC_FLAG_INIT;
 };
 
-// ---------------------------------------------------------------------------
-// submission out-of-line definitions
-// ---------------------------------------------------------------------------
-
 inline cudaStream_t submission::stream() const noexcept { return lane_->stream_; }
-
-inline void submission::on_retire(retire_fn f) { staged_.push_back(std::move(f)); }
-
+inline void submission::on_retire(retire_fn fn)
+{
+  if (committed_) { throw std::logic_error("on_retire after commit"); }
+  staged_.push_back({0, std::move(fn)});
+}
 inline cudaError_t submission::commit() noexcept
 {
-  if (committed_) { return cudaSuccess; }
-  committed_ = true;
-  return lane_->publish(staged_);
+  if (!committed_) {
+    committed_ = true;
+    result_    = lane_->publish(staged_);
+  }
+  return result_;
 }
-
 inline submission::~submission()
 {
-  // Abandoning a scope that already launched work would recycle buffers the
-  // copy engines are still reading. Commit anyway; publish() recovers.
-  if (!committed_ && lane_ != nullptr) { commit(); }
+  if (!committed_) { commit(); }
 }
-
-// ---------------------------------------------------------------------------
-// cuda_event_completion_poll -- append-only registry over lanes
-// ---------------------------------------------------------------------------
 
 class cuda_event_completion_poll {
  public:
   static constexpr std::size_t max_lanes_v = 256;
-
-  cuda_event_completion_poll() noexcept = default;
-  ~cuda_event_completion_poll() { quiesce(); }
-
-  cuda_event_completion_poll(const cuda_event_completion_poll&)            = delete;
-  cuda_event_completion_poll& operator=(const cuda_event_completion_poll&) = delete;
-
-  // Registers a stream. Call once at stream setup and keep the reference --
-  // this takes a lock and does a linear scan; it is not a hot-path lookup.
-  retire_lane& lane_for(cudaStream_t s)
+  explicit cuda_event_completion_poll(detail::completion_cuda_api api = {}) noexcept : api_(api) {}
+  ~cuda_event_completion_poll()
   {
-    {
-      const std::size_t n = count_.load(std::memory_order_acquire);
-      for (std::size_t i = 0; i < n; ++i) {
-        if (lanes_[i]->stream() == s) { return *lanes_[i]; }
-      }
+    quiesce();
+    const auto count = count_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!lanes_[i]->idle()) { std::terminate(); }
     }
-    std::lock_guard g(reg_m_);
-    const std::size_t n = count_.load(std::memory_order_relaxed);
-    for (std::size_t i = 0; i < n; ++i) {
-      if (lanes_[i]->stream() == s) { return *lanes_[i]; }
-    }
-    if (n == max_lanes_v) { throw std::bad_alloc{}; }
-    owned_.push_back(std::make_unique<retire_lane>(s));
-    lanes_[n] = owned_.back().get();
-    // Registering after detach should not happen, but a lane that could still
-    // reach for a stream handle would undo the whole point of detaching.
-    if (detached_.load(std::memory_order_acquire)) { lanes_[n]->detach(); }
-    count_.store(n + 1, std::memory_order_release);  // publish last
-    return *lanes_[n];
   }
-
-  // Give up every stream handle; see retire_lane::detach(). Call this before
-  // teardown when the streams belong to somebody else -- retirement continues
-  // to work, it just stops waiting on streams it can no longer trust.
+  cuda_event_completion_poll(cuda_event_completion_poll const&)            = delete;
+  cuda_event_completion_poll& operator=(cuda_event_completion_poll const&) = delete;
+  // Registration is cold; rmm::cuda_stream_view converts to cudaStream_t.
+  // Use explicit streams, one registry per device. A per-thread default
+  // stream has no stable identity across submitting threads.
+  retire_lane& lane_for(cudaStream_t stream)
+  {
+    std::lock_guard lock(reg_m_);
+    if (detached_) { throw std::logic_error("registration after completion registry detach"); }
+    const auto count = count_.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < count; ++i) {
+      if (lanes_[i]->stream() == stream) { return *lanes_[i]; }
+    }
+    if (count == max_lanes_v) { throw std::bad_alloc{}; }
+    lanes_[count] = std::make_unique<retire_lane>(stream, api_, &retired_);
+    count_.store(count + 1, std::memory_order_release);
+    return *lanes_[count];
+  }
   void detach() noexcept
   {
-    detached_.store(true, std::memory_order_release);
-    const std::size_t n = count_.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < n; ++i) {
+    std::size_t count;
+    {
+      std::lock_guard lock(reg_m_);
+      detached_ = true;  // closes registration before snapshotting the lane set
+      count     = count_.load(std::memory_order_acquire);
+    }
+    for (std::size_t i = 0; i < count; ++i) {
       lanes_[i]->detach();
     }
   }
-
-  // One relaxed load per lane in the common "nothing ready" case.
   std::size_t drain_all() noexcept
   {
     std::size_t retired = 0;
-    const std::size_t n = count_.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < n; ++i) {
+    const auto count    = count_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < count; ++i) {
       retired += lanes_[i]->drain();
     }
     return retired;
   }
-
-  enum class progress {
-    made,        // the frontier advanced; retry
-    none,        // nothing outstanding anywhere; waiting would deadlock
-    undelivered  // callbacks cannot be delivered; nothing will ever complete
-  };
-
-  // Blocks on the globally oldest outstanding ticket.
+  enum class progress { made, none, undelivered };
+  // undelivered means waiting cannot confirm completion, NOT safe to release.
   progress wait_for_progress() noexcept
   {
-    retire_lane* target  = nullptr;
-    std::uint64_t oldest = no_pending_v;
-
-    // Authoritative read: a stale hint here would report "nothing outstanding"
-    // and turn a wait into a spurious allocation failure. We are about to
-    // block anyway, so N uncontended lane locks cost nothing.
-    const std::size_t n = count_.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < n; ++i) {
-      const std::uint64_t t = lanes_[i]->oldest_pending_locked();
-      if (t != no_pending_v && (target == nullptr || t < oldest)) {
-        oldest = t;
-        target = lanes_[i];
+    const auto before = retired_.load(std::memory_order_acquire);
+    auto delay        = std::chrono::microseconds{4};
+    for (;;) {
+      if (drain_all() || retired_.load(std::memory_order_acquire) != before) {
+        return progress::made;
       }
+      bool pending     = false;
+      bool unhealthy   = false;
+      const auto count = count_.load(std::memory_order_acquire);
+      for (std::size_t i = 0; i < count; ++i) {
+        if (!lanes_[i]->idle()) {
+          pending = true;
+          unhealthy |= lanes_[i]->poll_health() != cudaSuccess;
+        }
+      }
+      // Callbacks could have arrived during health queries.
+      if (drain_all() || retired_.load(std::memory_order_acquire) != before) {
+        return progress::made;
+      }
+      if (!pending) { return progress::none; }
+      if (unhealthy) { return progress::undelivered; }
+      detail::completion_backoff(delay);
     }
-    if (target == nullptr) { return progress::none; }
-
-    // A device fault is NOT this branch: the callback still fires, the
-    // frontier advances, and drain() retires the batch as failed. This only
-    // triggers if the context went away entirely.
-    if (target->wait_for(oldest) != cudaSuccess) { return progress::undelivered; }
-
-    target->drain();
-    return progress::made;
   }
-
-  // Terminal recovery across every lane. See retire_lane::fail_all() for the
-  // ordering constraint: stop the device first.
-  std::size_t fail_all(cudaError_t e) noexcept
+  std::size_t fail_all(cudaError_t error) noexcept
   {
-    std::size_t n_retired = 0;
-    const std::size_t n   = count_.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < n; ++i) {
-      n_retired += lanes_[i]->fail_all(e);
+    detach();
+    std::size_t retired = 0;
+    const auto count    = count_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < count; ++i) {
+      retired += lanes_[i]->fail_all(error);
     }
-    return n_retired;
+    return retired;
   }
-
-  // Retry `try_fn` -- typically a freelist pop -- draining between attempts and
-  // blocking only when there is nothing left to reclaim without waiting.
-  // Returns try_fn's falsy value rather than hanging when the resource can
-  // never become available.
   template <class TryFn>
   auto acquire(TryFn&& try_fn) -> std::invoke_result_t<TryFn&>
   {
-    if (auto r = try_fn()) { return r; }
-    if (drain_all() != 0) {
-      if (auto r = try_fn()) { return r; }
+    if (auto result = try_fn()) { return result; }
+    drain_all();
+    if (auto result = try_fn()) { return result; }
+    while (wait_for_progress() == progress::made) {
+      if (auto result = try_fn()) { return result; }
     }
-    for (;;) {
-      switch (wait_for_progress()) {
-        case progress::made:
-          if (auto r = try_fn()) { return r; }
-          break;
-        case progress::none: return try_fn();
-        case progress::undelivered:
-          // Unblock every parked reader with a failure status, then let the
-          // caller see the allocation fail. Hanging here would be worse.
-          fail_all(cudaErrorUnknown);
-          return try_fn();
-      }
-    }
+    return try_fn();  // never force-retire after a query error
   }
-
+  // Externally serialize with registration, submission, and lifecycle calls.
   cudaError_t quiesce() noexcept
   {
-    cudaError_t first   = cudaSuccess;
-    const std::size_t n = count_.load(std::memory_order_acquire);
-    for (std::size_t i = 0; i < n; ++i) {
-      const cudaError_t e = lanes_[i]->quiesce();
-      if (first == cudaSuccess) { first = e; }
+    cudaError_t first = cudaSuccess;
+    const auto count  = count_.load(std::memory_order_acquire);
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto error = lanes_[i]->quiesce();
+      if (first == cudaSuccess) { first = error; }
     }
     return first;
   }
 
  private:
-  // Append-only: lookups are lock-free, registration is not.
-  std::array<retire_lane*, max_lanes_v> lanes_{};
+  detail::completion_cuda_api api_;
+  // Must outlive lane destructor-time retirement.
+  std::atomic<std::uint64_t> retired_{0};
+  std::array<std::unique_ptr<retire_lane>, max_lanes_v> lanes_{};
   std::atomic<std::size_t> count_{0};
   std::mutex reg_m_;
-  std::vector<std::unique_ptr<retire_lane>> owned_;
-  std::atomic<bool> detached_{false};
+  bool detached_{false};
 };
 
 }  // namespace sirius::exec
