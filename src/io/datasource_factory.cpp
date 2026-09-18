@@ -20,8 +20,8 @@
 #include "io/kvikio/kvikio_context.hpp"
 #include "io/object_store_config.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/sirius_sigv4_authorizer.hpp"
-#include "io/s3/static_credentials.hpp"
+#include "io/rest/s3/sigv4_authorizer.hpp"
+#include "io/rest/s3/static_credentials.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
@@ -96,7 +96,7 @@ using factory_type        = io_context_registry::factory_type;
 
 factory_type make_kvikio_ioctx_factory()
 {
-  return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<sirius_ioctx> {
+  return [](const scan_manager::scan_manager_config&) -> std::shared_ptr<ioctx> {
     try {
       return std::make_shared<kvikio_context>();
     } catch (const std::exception& e) {
@@ -110,7 +110,7 @@ factory_type make_uring_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
   return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto* host_mr = first_host_resource(reservation_manager);
       if (host_mr == nullptr) {
@@ -136,7 +136,7 @@ factory_type make_rest_ioctx_factory(
   cucascade::memory::memory_reservation_manager& reservation_manager)
 {
   return [&reservation_manager](
-           const scan_manager::scan_manager_config& config) -> std::shared_ptr<sirius_ioctx> {
+           const scan_manager::scan_manager_config& config) -> std::shared_ptr<ioctx> {
     try {
       auto authorizer = make_s3_authorizer(config.object_store);
       if (!authorizer) {
@@ -223,7 +223,7 @@ std::optional<io_context_type> io_context_registry::lookup_path(
   return fallback;
 }
 
-std::shared_ptr<sirius_ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
+std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
 {
   std::shared_lock lk{_mtx};
   auto it = _entries.find(type);

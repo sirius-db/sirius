@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "exec/invocable.hpp"
 
-#include <absl/functional/any_invocable.h>
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -45,7 +45,7 @@ inline constexpr std::uint64_t no_pending_v = ~std::uint64_t{0};
 // Runs on a host drainer with the boundary's CUDA status. Keep it short and
 // noexcept. Reentrant drain() is allowed, but waiting for retirement or calling
 // quiesce()/fail_all() on the same lane/registry would deadlock.
-using retire_fn = absl::AnyInvocable<void(cudaError_t) noexcept>;
+using retire_fn = invocable<void(cudaError_t) noexcept>;
 
 struct alignas(cacheline_v) completion_slot {
   std::atomic<std::uint64_t> completed{0};
