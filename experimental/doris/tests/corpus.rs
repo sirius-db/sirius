@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use doris_plan_translator::expr_translator::{
     ExprContext, SlotOverrides, aggregate_call, translate_expr,
 };
-use doris_plan_translator::{DescriptorTable, ExtensionRegistry};
+use doris_plan_translator::{DescriptorTable, ExtensionRegistry, PlanTranslator, TranslateError};
 use doris_proto::{PExecPlanFragmentRequest, PFragmentRequestVersion};
 use doris_thrift::data_sinks::TDataSink;
 use doris_thrift::exprs::TExpr;
@@ -403,4 +403,56 @@ fn every_corpus_expression_translates() {
     assert!(scalar_exprs > 1000, "{scalar_exprs} scalar expressions");
     assert_eq!(aggregate_exprs, 77);
     assert_eq!(merge_exprs, 37);
+}
+
+/// P1.3: every fragment translates on its own, except those carrying one half of a two-phase
+/// aggregate (update phase emits partial states, merge phase consumes them), which the
+/// single-plan stitcher rewrites before translation. Every accepted plan renders through
+/// `substrait-explain`.
+#[test]
+fn every_corpus_fragment_translates_or_is_a_two_phase_aggregate() {
+    let translator = PlanTranslator::new();
+    let mut translated = 0;
+    let mut two_phase = 0;
+    let mut explained_chars = 0;
+    for (query, payload, _) in captured_batches() {
+        let batch = decode(&payload);
+        for fragment in &batch.fragments {
+            match translator.translate_fragment(&fragment.params) {
+                Ok(plan) => {
+                    translated += 1;
+                    let text = plan.explain().to_string();
+                    // `substrait-explain` cannot render everything the plans use yet
+                    // (`local_files` reads, IN lists, decimal literals); such gaps are
+                    // `Unimplemented` warnings. Anything else is a malformed plan.
+                    if let Some((_, warnings)) = text.split_once("format warnings: ") {
+                        let unexpected = warnings.matches("PlanError").count()
+                            - warnings.matches("error_type: Unimplemented").count();
+                        assert_eq!(unexpected, 0, "{query} fragment {}: {text}", fragment.index);
+                    }
+                    explained_chars += text.len();
+                    assert!(
+                        !plan.output_names.is_empty(),
+                        "{query} fragment {}",
+                        fragment.index
+                    );
+                }
+                Err(TranslateError::UnsupportedPlanNode { reason, .. })
+                    if reason.contains("phase aggregate") =>
+                {
+                    two_phase += 1;
+                }
+                Err(err) => panic!(
+                    "{query} fragment {}: {err}\n{}",
+                    fragment.index,
+                    fragment.shape()
+                ),
+            }
+        }
+    }
+    assert!(explained_chars > 0);
+    // 151 fragments; 26 update-phase + 26 merge-phase aggregates sit in 49 of them (three
+    // fragments hold both halves of different aggregations).
+    assert_eq!(translated + two_phase, 151);
+    assert_eq!(two_phase, 49, "fragments with a two-phase aggregate");
 }
