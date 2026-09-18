@@ -51,8 +51,10 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -555,6 +557,28 @@ void reject_untranslatable_table_filter(duckdb::TableFilter const& filter,
   }
 }
 
+// True when the MVCC-blind disk-native read of @p table would not reproduce this
+// transaction's view of it: rows the last checkpoint did not write (transaction-local
+// appends, transient segments), rows it deleted that the image still carries, or
+// in-memory update chains. Every physical column is walked, so a projection-free scan is
+// covered too. Walks every row group, so call it only where a scan is about to be
+// refused anyway (see #1160).
+[[nodiscard]] bool diverges_from_checkpointed_image(duckdb::ClientContext& context,
+                                                    duckdb::DuckTableEntry& table)
+{
+  auto& storage = table.GetStorage();
+  if (duckdb::LocalStorage::Get(context, storage.GetAttached()).GetStorage(storage)) {
+    return true;
+  }
+  std::vector<duckdb::storage_t> all_columns(storage.ColumnCount());
+  std::iota(all_columns.begin(), all_columns.end(), static_cast<duckdb::storage_t>(0));
+  if (sirius::op::scan::any_uncheckpointed_appends(storage, all_columns)) { return true; }
+  auto& transaction = duckdb::DuckTransaction::Get(context, table.ParentCatalog());
+  return sirius::op::scan::check_native_read_mvcc_state(
+           storage, all_columns, duckdb::TransactionData(transaction)) !=
+         sirius::op::scan::native_read_mvcc_state::exact;
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -659,13 +683,29 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   if (sirius_state && op.function.name == "seq_scan") {
     auto* bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
     if (bind != nullptr && bind->table.IsDuckTable()) {
-      auto& table = bind->table.Cast<duckdb::DuckTableEntry>();
-      pinned      = sirius_state->get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table.ParentCatalog().GetName(),
-        table.ParentSchema().name,
-        table.name,
-        &column_ids,
-        &op.returned_types);
+      auto& table        = bind->table.Cast<duckdb::DuckTableEntry>();
+      auto& scan_manager = sirius_state->get_scan_manager();
+      auto const catalog = table.ParentCatalog().GetName();
+      auto const& schema = table.ParentSchema().name;
+      pinned             = scan_manager.find_pinned_entry_for_duckdb_table(
+        catalog, schema, table.name, table.oid, &column_ids, &op.returned_types);
+      // A same-name pin for an older table cannot serve this scan, and the disk-native
+      // read behind it is MVCC-blind, so it may still hold the dropped table's image or
+      // this table's deleted rows.
+      if (pinned == nullptr) {
+        auto const superseded = scan_manager.pinned_entry_name_for_superseded_duckdb_table(
+          catalog, schema, table.name, table.oid);
+        if (superseded && diverges_from_checkpointed_image(context, table)) {
+          throw duckdb::NotImplementedException(
+            "duckdb-native scan: table '%s' was dropped and recreated (or altered) after "
+            "pin_table, so pinned entry '%s' holds a different table, and this table has "
+            "diverged from its last-checkpointed image, which is all the disk-native read "
+            "sees. Run CHECKPOINT, or CALL unpin_table('%s') and pin_table again",
+            table.name,
+            *superseded,
+            *superseded);
+        }
+      }
       // Rows beyond the pinned prefix serve as insert-delta splits, decoded fresh at native
       // width. A narrow sidecar over them would pay per-batch exact-range verification and, on
       // an out-of-range inserted value, fail the query over to the CPU fallback — so the
