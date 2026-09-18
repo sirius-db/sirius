@@ -17,7 +17,7 @@ TCompact `TPipelineFragmentParamsList` exactly as `exec_plan_fragment` received 
 ## Coverage
 
 - plan nodes: EXCHANGE_NODE (12), FILE_SCAN_NODE (7), AGGREGATION_NODE (6), UNION_NODE (2), SORT_NODE (2), ANALYTIC_EVAL_NODE (1)
-- expression nodes: NULL_LITERAL (95), SLOT_REF (57), COMPOUND_PRED (5), FUNCTION_CALL (4), BOOL_LITERAL (1), BINARY_PRED (1), AGG_EXPR (1)
+- expression nodes: NULL_LITERAL (95), SLOT_REF (63), COMPOUND_PRED (5), FUNCTION_CALL (4), BOOL_LITERAL (1), BINARY_PRED (1), AGG_EXPR (1)
   (`NULL_LITERAL` is almost entirely `TFileScanRangeParams.default_value_of_src_slot`, one per scanned column)
 - functions (scalar + aggregate, TFunctionName.function_name): is_null_pred (2), is_not_null_pred (2), row_number (1), eq (1)
 - join ops: 

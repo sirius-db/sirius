@@ -14,9 +14,11 @@ platforms = [
 requires-pixi = ">=0.71"
 
 [environments]
-default = ["fe", "be", "client", "engine"]
+default = ["fe", "be", "client", "check", "engine"]
 be = ["be"]
-fe = ["fe"]
+# `fe` also carries `check` so scripts/run-tpch.sh can validate results in the same env.
+fe = ["fe", "check"]
+check = ["check"]
 client = ["client"]
 engine = ["engine"]
 
@@ -77,6 +79,19 @@ libcurl = "*"
 openjdk = "17.*"
 curl = "*"
 mysql-client = "*"
+
+# DuckDB-side checks (scripts/validate_tpch_results.py): expected TPC-H results, the CPU
+# differential of the translator's plans through DuckDB's substrait consumer, and result
+# validation. python-duckdb must be the exact DuckDB version scripts/build-duckdb-substrait.sh
+# builds the substrait extension against (DUCKDB_TAG), or the extension refuses to load.
+[feature.check.dependencies]
+python = "3.12.*"
+python-duckdb = "=1.5.5"
+
+[feature.check.tasks]
+duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v1.5.5 with the repo's substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
+tpch-expected = {cmd = "python scripts/validate_tpch_results.py expected",description = "Generate tests/expected/tpch-sf1/ from the parquet dataset with DuckDB (pass --data DIR)"}
+tpch-cpu-diff = {cmd = "bash scripts/cpu-diff.sh",description = "CPU differential: export the corpus plans, run them through DuckDB's substrait consumer, validate against the expected results"}
 
 [feature.fe.tasks]
 fe-fetch = {cmd = "bash scripts/fetch-fe.sh",description = "Download the pinned official Doris release and unpack only its fe/ directory into .doris-fe/"}

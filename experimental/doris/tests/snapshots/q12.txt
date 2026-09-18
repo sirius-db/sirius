@@ -6,7 +6,7 @@
 #   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
 # Reviewed by hand against tests/fixtures/tpch/q12/query.sql; regenerate with
 # `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
-stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+stitched: SORT_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
 === Version 0.85.0
   producer: sirius-doris-plan-translator
 === Extensions
@@ -28,14 +28,13 @@ Functions:
 Root[l_shipmode, high_line_count, low_line_count]
   Project[$0, $1, $2]
     Sort[($0, &AscNullsFirst) => $0, $1, $2]
-      Sort[($0, &AscNullsFirst) => $0, $1, $2]
-        Project[$0, ($1)::!i64, ($2)::!i64]
-          Aggregate[$0 => $0, sum($2):i64, sum($1):i64]
-            Project[$0, (if_then(not($2):boolean? -> 1:i8, _ -> 0:i8))::!i8, (if_then($2 -> 1:i8, _ -> 0:i8))::!i8]
-              Project[$3, $1, (in_list($1, '1-URGENT', '2-HIGH'):boolean?)::!boolean?]
-                Join[&Inner, equal($0, $2):boolean? => $0, $1, $2, $3]
-                  Project[$0, $1]
-                    Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_orderpriority:string?]
-                  Project[$0, $4]
-                    Filter[and(in_list($4, 'MAIL', 'SHIP'):boolean?, lt($2, $3):boolean?, lt($1, $2):boolean?, gte($3, '1994-01-01':date):boolean?, lt($3, '1995-01-01':date):boolean?):boolean? => $0, $1, $2, $3, $4]
-                      Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_orderkey:i64?, l_shipdate:date?, l_commitdate:date?, l_receiptdate:date?, l_shipmode:string?]
+      Project[$0, ($1)::!i64, ($2)::!i64]
+        Aggregate[$0 => $0, sum($2):i64, sum($1):i64]
+          Project[$0, (if_then(not($2):boolean? -> 1:i8, _ -> 0:i8))::!i8, (if_then($2 -> 1:i8, _ -> 0:i8))::!i8]
+            Project[$3, $1, (in_list($1, '1-URGENT', '2-HIGH'):boolean?)::!boolean?]
+              Join[&Inner, equal($0, $2):boolean? => $0, $1, $2, $3]
+                Project[$0, $1]
+                  Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_orderpriority:string?]
+                Project[$0, $4]
+                  Filter[and(in_list($4, 'MAIL', 'SHIP'):boolean?, lt($2, $3):boolean?, lt($1, $2):boolean?, gte($3, '1994-01-01':date):boolean?, lt($3, '1995-01-01':date):boolean?):boolean? => $0, $1, $2, $3, $4]
+                    Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_orderkey:i64?, l_shipdate:date?, l_commitdate:date?, l_receiptdate:date?, l_shipmode:string?]

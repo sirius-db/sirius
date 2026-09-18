@@ -29,9 +29,10 @@ Doris FE (official 4.1.4 binary)          sirius-doris-be (this crate)
 | `src/` | the backend: `node.rs`, `backend_service.rs`, `params.rs`, `file_schema.rs`, `result_*.rs`, `fragment_executor.rs`, `engine.rs` |
 | `src/bin/dump-fragments.rs` | pretty-print a captured dispatch payload (`--summary`, `--translate` per fragment, `--stitch` as one plan) |
 | `conf/fe.conf`, `sql/` | FE config, global session defaults, TPC-H views over `local()`, the 22 queries (`sql/tpch`), probes for plan-level semantic gaps (`sql/gaps`) |
-| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh` |
+| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh`; `build-duckdb-substrait.sh`, `validate_tpch_results.py`, `cpu-diff.sh` (the DuckDB baseline and the CPU differential, below) |
 | `tests/fixtures/tpch/`, `tests/fixtures/gaps/` | captured FE→BE dispatches for all 22 TPC-H queries and for the `sql/gaps` probes (`INDEX.md` has the shapes and coverage) |
 | `tests/snapshots/` | the reviewed translation of every captured query (stitched node tree + `substrait-explain` text, or the refusal); `tests/corpus.rs` diffs against these |
+| `tests/expected/tpch-sf1/`, `tests/expected/gaps-sf1/` | the queries' results on the SF1 dataset, computed by DuckDB from the same parquet files (`INDEX.md` has the row counts); what `run-tpch.sh` and the CPU differential validate against |
 
 ## Running on a laptop (no GPU)
 
@@ -49,6 +50,9 @@ pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1 --translate-only \
 pixi run -e be be-test-no-engine        # cargo test --workspace --no-default-features
 ```
 
+With the engine (Linux + NVIDIA, `SIRIUS_BE_TRANSLATE_ONLY=0`), `run-tpch.sh --data DIR` runs
+the queries for real and validates every result against `tests/expected/tpch-sf1` (see below).
+
 In translate-only mode every query fails at `fetch_data` on purpose; the message says whether
 the dispatch translated into one plan (`all N fragments translated into one plan with output
 [...]`) or why not, and `run-tpch.sh` prints that verdict per query. Inspect a capture with
@@ -60,6 +64,38 @@ After a translator change, regenerate the snapshots and review the diff before c
 UPDATE_SNAPSHOTS=1 pixi run -e be cargo test --test corpus -p sirius-doris-be --no-default-features
 git diff tests/snapshots/
 ```
+
+## CPU differential of the translator (no GPU)
+
+The plans the translator produces can be executed without the engine: DuckDB's substrait
+consumer (`SubstraitToDuckDB` in the repo's `substrait/` submodule, the reader
+`src/sirius_ffi.cpp` compiles into libsirius) turns the bytes into a DuckDB plan, and DuckDB
+runs it on the CPU. `scripts/cpu-diff.sh` stitches every captured dispatch into one plan,
+runs it that way with the optimizer rules the FFI disables, and validates the rows against
+`tests/expected/tpch-sf1` (22/22 pass; MVP-A0 preparation, `plan-doc/tasklist.md` A0.1):
+
+```bash
+pixi run -e check duckdb-substrait-build      # once, ~3 min: DuckDB v1.5.5 + substrait extension
+                                              # under .duckdb-substrait/ (upstream tag = the
+                                              # commit substrait/.gitmodules pins; python-duckdb
+                                              # in the `check` env is the same version)
+pixi run -e check tpch-cpu-diff               # or: bash scripts/cpu-diff.sh [--data DIR] [--queries 1,6]
+ls log/cpu-diff/q01/                          # result.tsv, duckdb-plan.txt (the optimized logical plan)
+```
+
+The same script checks the gap probes that translate (`--corpus tests/fixtures/gaps --sql-dir
+sql/gaps --expected tests/expected/gaps-sf1 --queries g13-distinct,g13-distinct-topn`). To
+re-root the corpus plans, `cpu-diff.sh` rewrites their `/tmp/tpch-sf1` scan paths to `--data`
+(`dump-fragments --stitch --write-plan FILE --rewrite-path OLD=NEW` does it for one dispatch).
+
+`scripts/validate_tpch_results.py` is the shared piece: `expected` (re)generates the baseline
+from a parquet dataset (`pixi run -e check tpch-expected -- --data DIR`, for SF10 give it
+another `--out`), `consume` runs plans through the consumer and compares, `validate` compares
+a `run-tpch.sh` output tree — which `run-tpch.sh` does itself after an execution-mode run
+(`--expected DIR`, `--no-validate`). Numbers match within a relative tolerance (1e-9) or half
+a unit of the coarser decimal scale, whichever is larger (Doris types `avg(DECIMAL)` as
+DECIMAL(38,4); DuckDB computes a DOUBLE); a query with a top-level ORDER BY is compared in
+order, allowing ties in either order; the rest are compared as sets.
 
 Environment variables read by the backend:
 

@@ -6,7 +6,7 @@
 #   fragment_id=0 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
 # Reviewed by hand against tests/fixtures/tpch/q13/query.sql; regenerate with
 # `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
-stitched: SORT_NODE > SORT_NODE > AGGREGATION_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
+stitched: SORT_NODE > AGGREGATION_NODE > AGGREGATION_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE
 === Version 0.85.0
   producer: sirius-doris-plan-translator
 === Extensions
@@ -25,16 +25,15 @@ Functions:
 Root[c_count, custdist]
   Project[$0, $1]
     Sort[($1, &DescNullsLast), ($0, &DescNullsLast) => $0, $1]
-      Sort[($1, &DescNullsLast), ($0, &DescNullsLast) => $0, $1]
-        Project[$0, ($1)::!i64]
-          Aggregate[$0 => $0, count():i64]
-            Project[$1]
-              Project[$0, ($1)::!i64]
-                Aggregate[$0 => $0, count($1):i64]
-                  Project[$2, $0]
-                    Join[&Right, equal($1, $2):boolean? => $0, $1, $2]
-                      Project[$0, $1]
-                        Filter[not(like($2, '%special%requests%'):boolean?):boolean? => $0, $1, $2]
-                          Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_custkey:i32?, o_comment:string?]
-                      Project[$0]
-                        Read["local_files:/tmp/tpch-sf1/customer/part.0.parquet" => c_custkey:i32?]
+      Project[$0, ($1)::!i64]
+        Aggregate[$0 => $0, count():i64]
+          Project[$1]
+            Project[$0, ($1)::!i64]
+              Aggregate[$0 => $0, count($1):i64]
+                Project[$2, $0]
+                  Join[&Right, equal($1, $2):boolean? => $0, $1, $2]
+                    Project[$0, $1]
+                      Filter[not(like($2, '%special%requests%'):boolean?):boolean? => $0, $1, $2]
+                        Read["local_files:/tmp/tpch-sf1/orders/part.0.parquet" => o_orderkey:i64?, o_custkey:i32?, o_comment:string?]
+                    Project[$0]
+                      Read["local_files:/tmp/tpch-sf1/customer/part.0.parquet" => c_custkey:i32?]
