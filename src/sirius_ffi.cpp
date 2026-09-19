@@ -20,6 +20,7 @@
 
 #include "sirius_ffi.hpp"
 
+#include "config.hpp"                                      // duckdb::Config::LOG_*
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
@@ -40,12 +41,15 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
+#include "log/logging.hpp"                // SIRIUS_LOG_INFO
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
 #include "sirius_config.hpp"                           // sirius::sirius_config
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
+#include <chrono>
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -59,6 +63,30 @@ constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 
 // DuckDB view name a plan uses to read input stream `id`.
 std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
+
+// The embedded DuckDB never loads the Sirius extension, so nothing on this path reads the
+// SIRIUS_LOG_{BACKEND,DIR,LEVEL} environment the transparent path honors
+// (SiriusContextExtensionCallback) — the engine would run with the noop sink and no log would
+// reach the host process. Install the same sink here when the host asks for one; without any
+// of the variables the sink is left untouched (noop by default).
+void install_log_sink_from_env()
+{
+  auto const* backend_env = std::getenv("SIRIUS_LOG_BACKEND");
+  auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
+  auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
+  if (!backend_env && !log_dir_env && !level_env) { return; }
+  if (backend_env) { duckdb::Config::LOG_BACKEND = backend_env; }
+  if (log_dir_env) { duckdb::Config::LOG_DIR = log_dir_env; }
+  if (level_env) { duckdb::Config::LOG_LEVEL = level_env; }
+  // Best-effort (null db): an unknown backend is ignored rather than failing bring-up.
+  duckdb::install_configured_log_sink(nullptr);
+}
+
+double elapsed_ms(std::chrono::steady_clock::time_point since)
+{
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - since)
+    .count();
+}
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
 struct lowered_plan {
@@ -108,6 +136,7 @@ struct Context::Impl {
 
   void bring_up(sirius::sirius_config& config)
   {
+    install_log_sink_from_env();
     sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
@@ -116,6 +145,15 @@ struct Context::Impl {
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);
     db->LoadStaticExtension<duckdb::CoreFunctionsExtension>();
     db->LoadStaticExtension<duckdb::ParquetExtension>();
+    // Cache parquet footers across binds. The Substrait consumer builds the plan through the
+    // Relation API, which re-binds the whole subtree at every level, so a read of one file is
+    // bound once per operator above it; with the cache off each bind re-parses the footer and
+    // re-derives the column statistics (~0.5 s per bind for a 25 GB, 5k-row-group TPC-H SF100
+    // lineitem: Q21 spent 10 s lowering against 4.6 s executing). The option must be set at
+    // the database level: the consumer's binder does not see session-level SET variables.
+    // This DuckDB instance is private to the engine, and the cache validates file mtimes.
+    duckdb::DBConfig::GetConfig(*db->instance)
+      .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));
     conn = duckdb::make_uniq<duckdb::Connection>(*db);
     // Register the engine on the connection and disable DuckDB optimizer rewrites this
     // no-fallback FFI path cannot safely execute. The transparent path only disables
@@ -174,9 +212,14 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   // before the Arrow stream is consumed.
   impl_->conn->BeginTransaction();
   duckdb::unique_ptr<duckdb::QueryResult> result;
+  // Phase timings (lowering / physical planning / GPU execution), logged per query: the host
+  // only sees the total, and the query window in the telemetry covers execution alone.
+  double lower_ms = 0, plan_ms = 0, execute_ms = 0;
   try {
     // 1+2. Substrait → optimized DuckDB LogicalOperator.
-    auto lowered = lower_substrait(*impl_->conn, plan);
+    auto const lower_started = std::chrono::steady_clock::now();
+    auto lowered             = lower_substrait(*impl_->conn, plan);
+    lower_ms                 = elapsed_ms(lower_started);
 
     // 3. DuckDB LogicalOperator -> Sirius GPU physical plan -> execute directly
     // on the engine, inside an execution window: begin mutations and slot
@@ -186,15 +229,19 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     // pairing could call QueryEnd twice when the first cleanup threw.)
     {
       duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
+      auto const plan_started = std::chrono::steady_clock::now();
       auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(
         std::move(lowered.plan));
       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
         std::move(lowered.prepared), std::move(physical_plan));
+      plan_ms = elapsed_ms(plan_started);
 
+      auto const execute_started = std::chrono::steady_clock::now();
       sirius::sirius_interface iface(client, std::optional<std::string>(kQueryLabel));
       result = iface.sirius_execute_query(
         client, kQueryLabel, gpu_prepared, duckdb::PendingQueryParameters{}, window.query_id());
       window.finish();
+      execute_ms = elapsed_ms(execute_started);
     }
   } catch (...) {
     impl_->conn->Rollback();
@@ -202,6 +249,10 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   }
   impl_->conn->Commit();
   if (result->HasError()) { result->ThrowError(); }
+  SIRIUS_LOG_INFO("[sirius_ffi] execute_substrait: lower {:.1f} ms, plan {:.1f} ms, execute {:.1f} ms",
+                  lower_ms,
+                  plan_ms,
+                  execute_ms);
 
   // 4. Hand the result to the caller as a self-owning Arrow C Data Interface stream,
   //    written into the caller's ArrowArrayStream (addressed by `out_stream_addr`);
