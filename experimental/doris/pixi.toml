@@ -87,6 +87,10 @@ mysql-client = "*"
 [feature.check.dependencies]
 python = "3.12.*"
 python-duckdb = "=1.5.5"
+# For scripts/build-duckdb-substrait.sh; the C++ compiler stays the system one (as in CI).
+cmake = ">=3.28"
+ninja = ">=1.13.2,<2"
+ccache = ">=4.14,<5"
 
 [feature.check.tasks]
 duckdb-substrait-build = {cmd = "bash scripts/build-duckdb-substrait.sh",description = "Build DuckDB v1.5.5 with the repo's substrait consumer as a loadable extension (+ shell) under .duckdb-substrait/"}
