@@ -68,11 +68,14 @@ GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
 ```
 
-Queries with unsupported operators fall back silently to DuckDB CPU execution. To disable transparent execution for a connection:
+Queries with unsupported operators fall back silently to DuckDB CPU execution. `gpu_execution` is a session-scoped setting: an unqualified `SET` changes it for the current connection only. To change it for every connection of the database instance, including connections that other extensions open for their own SQL, use `SET GLOBAL`; a connection with its own `SET SESSION` value keeps that value.
 
 ```sql
-SET gpu_execution = false;
+SET gpu_execution = false;          -- this connection only
+SET GLOBAL gpu_execution = false;   -- every connection of this database instance without a session value
 ```
+
+Sirius does not intercept the SQL that the DuckLake extension runs on the connections it opens for its own catalog. DuckLake marks the metadata connections it creates through `DuckLakeTransaction::GetConnection()` in DuckDB's per-connection state under the key `ducklake_internal_connection`; Sirius reads the marker at the connection's first statement and leaves the connection alone for its lifetime. Connections without the marker (every connection of a DuckLake build older than the marker, such as the qualified `d8a1881e`) are recognised by the combination they set before their first statement, a hidden attached database as the default catalog and `catalog_error_max_schemas` at 0. A statement that reads a table of a hidden attached database is not intercepted either. Both hold whatever `gpu_execution` says; other extensions that open connections for themselves are intercepted like user connections unless they carry the same marker or fingerprint.
 
 To re-enable:
 
