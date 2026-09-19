@@ -29,10 +29,10 @@ Doris FE (official 4.1.4 binary)          sirius-doris-be (this crate)
 | `src/` | the backend: `node.rs`, `backend_service.rs`, `params.rs`, `file_schema.rs`, `result_*.rs`, `fragment_executor.rs`, `engine.rs` |
 | `src/bin/dump-fragments.rs` | pretty-print a captured dispatch payload (`--summary`, `--translate` per fragment, `--stitch` as one plan) |
 | `conf/fe.conf`, `sql/` | FE config, global session defaults, TPC-H views over `local()`, the 22 queries (`sql/tpch`), probes for plan-level semantic gaps (`sql/gaps`) |
-| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh`; `build-duckdb-substrait.sh`, `validate_tpch_results.py`, `cpu-diff.sh` (the DuckDB baseline and the CPU differential, below) |
+| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh`; `build-duckdb-substrait.sh`, `validate_tpch_results.py`, `cpu-diff.sh` (the DuckDB baseline and the CPU differential, below); the benchmark harness `fetch-be.sh`, `be-native.sh`, `bench.sh`, `bench-all.sh`, `bench-report.py`, `run-tpch-duckdb.sh`, `fe-audit.py`, `evict-cache.py`, `olap-load.sh` (below) |
 | `tests/fixtures/tpch/`, `tests/fixtures/gaps/` | captured FE→BE dispatches for all 22 TPC-H queries and for the `sql/gaps` probes (`INDEX.md` has the shapes and coverage) |
 | `tests/snapshots/` | the reviewed translation of every captured query (stitched node tree + `substrait-explain` text, or the refusal); `tests/corpus.rs` diffs against these |
-| `tests/expected/tpch-sf1/`, `tests/expected/gaps-sf1/` | the queries' results on the SF1 dataset, computed by DuckDB from the same parquet files (`INDEX.md` has the row counts); what `run-tpch.sh` and the CPU differential validate against |
+| `tests/expected/tpch-sf1/`, `tests/expected/tpch-sf10/`, `tests/expected/gaps-sf1/` | the queries' results on the SF1 / SF10 datasets, computed by DuckDB from the same parquet files (`INDEX.md` has the row counts); what `run-tpch.sh` and the CPU differential validate against |
 
 ## Running on a laptop (no GPU)
 
@@ -132,3 +132,45 @@ tier 12 GiB, spill and telemetry under `log/`); without it Sirius pins 90 % of h
 overrides the tree). The `be-build`/`be-run` tasks do the same but first re-run the root build
 including its C++ unit tests. See `plan-doc/doris-pseudo-be-plan.md` for the milestones (P0
 scaffolding → P1 translator → MVP-A0 single plan → MVP-A fragments → MVP-B multi-node).
+
+## Benchmark: Doris vs Doris + Sirius (plan-doc `experiments/sf10-bench/plan.md`)
+
+The same FE, the same parquet dataset (views over `local()`), the same 22 queries, with the
+backend swapped: the official Doris BE on the CPU versus this backend on the GPU, plus the
+single-process references (DuckDB, Sirius's transparent path) and Doris on internal tables.
+`bench.sh` runs one system for N rounds (round 1 cold: freshly started process + evicted page
+cache) and validates every round; `bench-all.sh` chains the systems and writes the report.
+
+```bash
+cd experimental/doris
+pixi run bash scripts/fetch-be.sh                 # once: the official BE (be/ of the same tarball) → .doris-be/be
+# dataset: tpchgen-cli -s 10 --format=parquet --parts=1 → <dir>/<table>/part.0.parquet (on the NVMe)
+pixi run -e check python scripts/validate_tpch_results.py expected --data /mnt/nvme/tpch_parquet_sf10 \
+    --out tests/expected/tpch-sf10                # the DuckDB baseline the runs are validated against
+pixi run bash scripts/bench-all.sh --data /mnt/nvme/tpch_parquet_sf10 --rounds 4 \
+    --price native-split=0.752 --price sirius-buffered=0.752   # → log/bench/sf10-<system>/, log/bench/sf10-results.md
+pixi run bash scripts/bench-all.sh --data /mnt/nvme/tpch_parquet_sf10 --systems native-olap --load-olap
+                                                  # optional: Doris on internal tables (scripts/olap-load.sh)
+```
+
+Systems (`bench.sh --system`): `native` (official BE, stock 4.1.4 session defaults,
+`sql/session-native.sql`), `native-split` (same plus `file_split_size_on_be = 0`: FE-side file
+splits, because the stock BE-side split reads a single-file `local()` table with one scanner),
+`native-olap` (internal tables), `sirius` (this backend, `conf/sirius-bench.yaml`, O_DIRECT
+reads), `sirius-buffered` (same through the page cache — the hot-run counterpart of Doris's IO
+path), `duckdb` / `duckdb-gpu` / `duckdb-gpu-pinned` (`run-tpch-duckdb.sh`: the build tree's
+DuckDB shell with `SIRIUS_DISABLE=1`, with Sirius, with every table pinned in GPU memory).
+
+Each run directory holds `env.txt` (machine, commit, config hashes, backends), `variables.txt`
+(the GLOBAL session variables in effect), the effective `sirius.yaml`, `round<k>/` (per-query
+`result.tsv`, `explain.txt`, `timings.csv` with the client wall time, the engine time and the
+FE audit numbers joined by `fe-audit.py`, `summary.csv` from the validator, `samples.csv` from
+the 0.5 s process/GPU sampler) and `rounds.csv` (everything flattened by `bench-report.py
+rounds`). `bench-report.py report` turns several run directories into the Markdown tables.
+
+Two things the harness does to keep the comparison fair: it drops this backend from the FE
+(`ALTER SYSTEM DROPP BACKEND`) while a native system runs — the backend never reports its CPU
+count, and the FE's automatic parallelism is the minimum over every registered backend, so the
+native BE would otherwise run one instance per fragment; and it never restarts the FE, only
+the backends (both stay on their own ports: this backend on 9050/9060/8040/8060, the native BE
+on 9150/9160/8140/8160 per `conf/be.conf`).

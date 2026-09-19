@@ -1,0 +1,31 @@
+# Sirius engine config template for the benchmark's Sirius backend (plan-doc
+# experiments/sf10-bench, systems B / B′ and the transparent-path reference R2). Same keys as
+# conf/sirius.yaml (the everyday config), with the @@...@@ placeholders filled by
+# scripts/bench.sh, which writes the effective file next to the run's results:
+#   @@HOST_CAPACITY@@  pinned host tier (per NUMA node); bench.sh sizes it from the host's RAM
+#                      (min(90%, RAM - 14 GiB): the FE's JVM, the BE process and, for the
+#                      buffered variant, the dataset's page cache share the box)
+#   @@SPILL_DIR@@      host→disk downgrade directory, on the local NVMe when there is one
+#   @@USE_ODIRECT@@    true = Sirius's default O_DIRECT parquet reads (every round reads the
+#                      disk); false = the B′ variant that goes through the page cache, the
+#                      hot-run counterpart of Doris's own IO path (plan §6.5)
+#   @@TELEMETRY_DIR@@  Quent per-query telemetry (memory tier events, operator timings)
+sirius:
+  topology: { num_gpus: 1 }
+  memory:
+    gpu:
+      usage_limit_fraction: 0.9
+    host:
+      capacity_bytes: @@HOST_CAPACITY@@
+    disk:
+      disk_id: 0
+      capacity_bytes: 100Gi
+      downgrade_root_dirs: "@@SPILL_DIR@@"
+  executor:
+    scan_manager:
+      local:
+        use_odirect: @@USE_ODIRECT@@
+  telemetry:
+    enable_quent: true
+    output_directory: "@@TELEMETRY_DIR@@"
+    engine_name: sirius-doris-be

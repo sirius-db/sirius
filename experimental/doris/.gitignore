@@ -1,6 +1,7 @@
 target/
 .pixi/
 .doris-fe/
+.doris-be/
 .duckdb-substrait/
 log/
 # The repo-root .gitignore drops *.tsv; the DuckDB result baselines are source.
