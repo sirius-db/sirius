@@ -2,11 +2,10 @@
 //!
 //! This crate converts a Doris `TPipelineFragmentParams` (one plan fragment the
 //! Doris frontend ships to a backend inside a `TPipelineFragmentParamsList`) into
-//! a `substrait` `Plan` for the Sirius engine. It follows the structure of the
-//! StarRocks translator (`experimental/starrocks/crates/starrocks-plan-translator`):
-//! one fragment at a time, checked invariants over breadth, and everything
-//! outside the supported surface returns a structured [`TranslateError`] that
-//! names the offending node/type.
+//! a `substrait` `Plan` for the Sirius engine. The design: one fragment at a
+//! time, checked invariants over breadth, and everything outside the supported
+//! surface returns a structured [`TranslateError`] that names the offending
+//! node/type.
 //!
 //! # Wire format: flat preorder
 //!
