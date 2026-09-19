@@ -1082,6 +1082,17 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return std::nullopt;
     }
   } else {
+    // A MARK join always runs in BUILD_PROBE mode, which get_partition_strategy selects when one
+    // of its input partitions negotiates the strategy on its first task. Polled before that — a
+    // downstream join walking WAITING_FOR_INPUT_DATA into this join as the source of its probe
+    // pipeline before either input has produced a batch (e.g. an anti-join subquery on the probe
+    // side of an inner join) — there is nothing to schedule yet, and refresh_cross_schedule would
+    // report the STANDARD-mode MARK as an invariant violation. Defer to the build producer instead:
+    // its tasks feed the build partition, which sizes this join into BUILD_PROBE.
+    if (join_type == duckdb::JoinType::MARK) {
+      auto* producer = &build_port->src_pipeline->get_operators()[0].get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
     // STANDARD / MIXED_JOIN partial barrier: schedule per-partition build x probe pairs as batches
     // arrive on either side, rather than waiting (via the base FULL-barrier hint) for both upstream
     // pipelines to finish. refresh_cross_schedule also frees fully-consumed batches, so completion
