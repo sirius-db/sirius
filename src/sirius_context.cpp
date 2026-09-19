@@ -1402,14 +1402,13 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // the unbound SQL statement — this is what gpu_execution(...) does
   // internally and it works even when LogicalGet::Copy can't.
   //
-  // Consume the capture before screening so a declined attempt leaves none behind.
+  // Consume the capture before deciding so a declined attempt leaves none behind.
   // Binder properties retain hidden catalog references even when hooks are disabled
-  // or optimization removes scans. Screen before the GPU gate and SQL replan.
+  // or optimization removes scans. Decide before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
   if (conn_state) {
     logical_plan = conn_state->take_captured_plan_if_current();
-    if (sirius::transparent::screen_planning_attempt(
-          context, *this, *conn_state, nullptr, &prepared.properties) !=
+    if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
         sirius::transparent::decline_reason::none) {
       return RebindQueryInfo::DO_NOT_REBIND;
     }
