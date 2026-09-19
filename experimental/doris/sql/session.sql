@@ -28,3 +28,16 @@ SET GLOBAL enable_profile = false;
 
 -- Generous timeout for large scale factors.
 SET GLOBAL query_timeout = 3600;
+
+-- Doris 4.1.4 splits files in two places: enable_file_scanner_v2 + file_split_size_on_be
+-- (default 64 MB) make the FE ignore file_split_size and ship file_split_size_on_fe
+-- (default 512 MB) byte ranges for the BE to cut further — a 2.4 GB SF10 lineitem arrives
+-- as five ranges, which the translator rejects (it reads whole files). BE-side splitting
+-- off + both FE sizes at 1 TB = one whole-file range per parquet file at any scale
+-- (sql/session-native.sql restores the defaults for the benchmark's native BE; GLOBAL
+-- values persist, so every variable set here is reset there and vice versa).
+SET GLOBAL file_split_size_on_be = 0;
+SET GLOBAL file_split_size_on_fe = 1099511627776;
+
+-- Same value as sql/session-native*.sql (GLOBAL values persist): no FE result cache.
+SET GLOBAL enable_sql_cache = false;

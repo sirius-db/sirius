@@ -33,7 +33,16 @@
 #   --be-log FILE      execution mode: the backend's log (default log/be.log, what be.sh writes);
 #                      the engine time of each query is read back from its "query executed on
 #                      the engine" line into --out/timings.csv (query, rows, wall_ms, engine_ms,
-#                      query_id); wall_ms is the mysql client's round trip
+#                      query_id, start_ms, end_ms); wall_ms is the mysql client's round trip,
+#                      start_ms/end_ms its epoch-millisecond window (scripts/fe-audit.py joins
+#                      the FE's audit log on it). A backend without that log line (the native
+#                      Doris BE of the benchmark) leaves engine_ms as `-`.
+#   --session-sql FILE the session variables to apply GLOBAL before the run (default
+#                      sql/session.sql, the Sirius backend's; sql/session-native.sql restores
+#                      the Doris defaults for the native BE)
+#   --db NAME          database the queries run in (default tpch, the parquet views; tpch_olap
+#                      holds the internal-table copy scripts/olap-load.sh makes). The views
+#                      over --data are (re)created in tpch either way.
 #
 # Needs the `mysql` client and python-duckdb (pixi run -e fe ...) and a healthy FE +
 # registered backend (scripts/fe.sh start; scripts/be.sh start).
@@ -54,6 +63,8 @@ VALIDATE=true
 ULPS=1
 TOLERANCE=1e-9
 BE_LOG="${SIRIUS_BE_LOG:-${ROOT}/log/be.log}"
+SESSION_SQL="sql/session.sql"
+DB="tpch"
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) DATA="$2"; shift 2 ;;
@@ -67,6 +78,8 @@ while [ $# -gt 0 ]; do
         --tolerance) TOLERANCE="$2"; shift 2 ;;
         --no-validate) VALIDATE=false; shift ;;
         --be-log) BE_LOG="$2"; shift 2 ;;
+        --session-sql) SESSION_SQL="$2"; shift 2 ;;
+        --db) DB="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -96,8 +109,8 @@ if ! "${MYSQL[@]}" -e "SELECT 1" >/dev/null 2>&1 && ! "${MYSQL[@]}" -e "SHOW BAC
     exit 1
 fi
 
-echo "==> applying sql/session.sql and TPC-H views over ${DATA}"
-"${MYSQL[@]}" < sql/session.sql
+echo "==> applying ${SESSION_SQL} and TPC-H views over ${DATA}"
+"${MYSQL[@]}" < "${SESSION_SQL}"
 sed "s|@@TPCH_DIR@@|${DATA}|g" sql/tpch-views.sql | "${MYSQL[@]}"
 
 index="${OUT}/INDEX.md"
@@ -121,7 +134,7 @@ failed=0
 untranslated=0
 timings="${OUT}/timings.csv"
 if [ "${TRANSLATE_ONLY}" != true ]; then
-    echo "query,rows,wall_ms,engine_ms,query_id" > "${timings}"
+    echo "query,rows,wall_ms,engine_ms,query_id,start_ms,end_ms" > "${timings}"
 fi
 # The backend logs one "query executed on the engine" line per query; the last one that is new
 # since the query started is this query's (the harness runs queries one at a time).
@@ -142,17 +155,18 @@ for n in "${query_numbers[@]}"; do
     mkdir -p "${qdir}"
     cp "${sql_file}" "${qdir}/query.sql"
 
-    "${MYSQL[@]}" -e "USE tpch; EXPLAIN ${sql}" > "${qdir}/explain.txt" 2>&1 || true
+    "${MYSQL[@]}" -e "USE ${DB}; EXPLAIN ${sql}" > "${qdir}/explain.txt" 2>&1 || true
 
     before=$(engine_line)
     start=$(date +%s%N)
-    if "${MYSQL[@]}" -e "USE tpch; ${sql}" > "${qdir}/result.tsv" 2> "${qdir}/error.txt"; then
+    if "${MYSQL[@]}" -e "USE ${DB}; ${sql}" > "${qdir}/result.tsv" 2> "${qdir}/error.txt"; then
         status="ok"
     else
         status="error"
     fi
     # Client-side wall time in ms (FE planning + dispatch + engine + result fetch).
-    elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+    end=$(date +%s%N)
+    elapsed=$(( (end - start) / 1000000 ))
     after=$(engine_line)
     engine_ms="-"
     query_id="-"
@@ -199,7 +213,7 @@ for n in "${query_numbers[@]}"; do
             echo "  ${q}: FAILED in ${elapsed} ms: $(head -c 200 "${qdir}/error.txt")"
             failed=$((failed + 1))
         fi
-        echo "${q},${rows},${elapsed},${engine_ms},${query_id}" >> "${timings}"
+        echo "${q},${rows},${elapsed},${engine_ms},${query_id},$((start / 1000000)),$((end / 1000000))" >> "${timings}"
     fi
 done
 

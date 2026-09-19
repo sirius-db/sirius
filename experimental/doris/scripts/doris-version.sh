@@ -5,3 +5,7 @@ DORIS_VERSION="4.1.4"
 
 # Directory the fetched FE is unpacked into (relative to experimental/doris).
 DORIS_FE_DIR=".doris-fe"
+
+# Directory the fetched official BE (the benchmark's native reference, scripts/fetch-be.sh)
+# is unpacked into (relative to experimental/doris).
+DORIS_BE_DIR=".doris-be"
