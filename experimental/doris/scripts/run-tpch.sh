@@ -24,7 +24,16 @@
 #                      tests/expected/tpch-sf1 when --sql-dir is sql/tpch; the check is skipped
 #                      when DIR does not exist). A mismatch fails the run. Regenerate the
 #                      baseline for another dataset with `validate_tpch_results.py expected`.
+#   --ulps N           execution mode: units of the coarser decimal scale the validator accepts
+#                      (default 1: the GPU's DOUBLE→DECIMAL cast truncates the last digit where
+#                      DuckDB rounds, semantics-gaps G-19; the validator's own default is 0.5 and
+#                      it reports how many values needed the extra slack)
+#   --tolerance T      execution mode: the validator's relative tolerance (default 1e-9)
 #   --no-validate      execution mode: skip that check
+#   --be-log FILE      execution mode: the backend's log (default log/be.log, what be.sh writes);
+#                      the engine time of each query is read back from its "query executed on
+#                      the engine" line into --out/timings.csv (query, rows, wall_ms, engine_ms,
+#                      query_id); wall_ms is the mysql client's round trip
 #
 # Needs the `mysql` client and python-duckdb (pixi run -e fe ...) and a healthy FE +
 # registered backend (scripts/fe.sh start; scripts/be.sh start).
@@ -42,6 +51,9 @@ OUT=""
 DUMP_DIR="${SIRIUS_BE_DUMP_FRAGMENTS:-${ROOT}/log/dump}"
 EXPECTED=""
 VALIDATE=true
+ULPS=1
+TOLERANCE=1e-9
+BE_LOG="${SIRIUS_BE_LOG:-${ROOT}/log/be.log}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) DATA="$2"; shift 2 ;;
@@ -51,7 +63,10 @@ while [ $# -gt 0 ]; do
         --out) OUT="$2"; shift 2 ;;
         --dump-dir) DUMP_DIR="$2"; shift 2 ;;
         --expected) EXPECTED="$2"; shift 2 ;;
+        --ulps) ULPS="$2"; shift 2 ;;
+        --tolerance) TOLERANCE="$2"; shift 2 ;;
         --no-validate) VALIDATE=false; shift ;;
+        --be-log) BE_LOG="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -104,6 +119,13 @@ fi
 passed=0
 failed=0
 untranslated=0
+timings="${OUT}/timings.csv"
+if [ "${TRANSLATE_ONLY}" != true ]; then
+    echo "query,rows,wall_ms,engine_ms,query_id" > "${timings}"
+fi
+# The backend logs one "query executed on the engine" line per query; the last one that is new
+# since the query started is this query's (the harness runs queries one at a time).
+engine_line() { grep -a 'query executed on the engine' "${BE_LOG}" 2>/dev/null | tail -1 || true; }
 # Dump directories of the queries this run captured (the dump dir may hold older runs).
 captured_dumps=()
 IFS=',' read -ra query_numbers <<< "${QUERIES}"
@@ -122,13 +144,22 @@ for n in "${query_numbers[@]}"; do
 
     "${MYSQL[@]}" -e "USE tpch; EXPLAIN ${sql}" > "${qdir}/explain.txt" 2>&1 || true
 
-    start=$(date +%s)
+    before=$(engine_line)
+    start=$(date +%s%N)
     if "${MYSQL[@]}" -e "USE tpch; ${sql}" > "${qdir}/result.tsv" 2> "${qdir}/error.txt"; then
         status="ok"
     else
         status="error"
     fi
-    elapsed=$(( $(date +%s) - start ))
+    # Client-side wall time in ms (FE planning + dispatch + engine + result fetch).
+    elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+    after=$(engine_line)
+    engine_ms="-"
+    query_id="-"
+    if [ -n "${after}" ] && [ "${after}" != "${before}" ]; then
+        engine_ms=$(echo "${after}" | grep -o 'engine_ms=[0-9.]*' | cut -d= -f2)
+        query_id=$(echo "${after}" | grep -o 'query_id=[0-9a-f-]*' | cut -d= -f2)
+    fi
 
     if [ "${TRANSLATE_ONLY}" = true ]; then
         rm -f "${qdir}/result.tsv"
@@ -156,16 +187,19 @@ for n in "${query_numbers[@]}"; do
         shapes=$(grep '^\[' "${summary}" | sed -e 's/^\[[0-9]*\] //' -e 's/ instances=[0-9]*//' | tr '\n' ';' | sed 's/;$//; s/;/<br>/g')
         fragments=$(grep -c '^\[' "${summary}" || true)
         echo "| ${q} | ${fragments} | ${shapes} |" >> "${index}"
-        echo "  ${q}: ${fragments} fragment(s) captured, ${verdict} (${elapsed}s)"
+        echo "  ${q}: ${fragments} fragment(s) captured, ${verdict} (${elapsed} ms)"
         passed=$((passed + 1))
     else
         if [ "${status}" = ok ]; then
-            echo "  ${q}: ok, $(($(wc -l < "${qdir}/result.tsv") - 1)) row(s) in ${elapsed}s"
+            rows=$(($(wc -l < "${qdir}/result.tsv") - 1))
+            echo "  ${q}: ok, ${rows} row(s) in ${elapsed} ms (engine ${engine_ms} ms)"
             passed=$((passed + 1))
         else
-            echo "  ${q}: FAILED in ${elapsed}s: $(head -c 200 "${qdir}/error.txt")"
+            rows=0
+            echo "  ${q}: FAILED in ${elapsed} ms: $(head -c 200 "${qdir}/error.txt")"
             failed=$((failed + 1))
         fi
+        echo "${q},${rows},${elapsed},${engine_ms},${query_id}" >> "${timings}"
     fi
 done
 
@@ -196,7 +230,8 @@ else
         # Every result.tsv against the DuckDB baseline (row order per the query's ORDER BY,
         # numbers within tolerance); the verdicts also go to ${OUT}/summary.csv.
         python3 scripts/validate_tpch_results.py validate --actual "${OUT}" --expected "${EXPECTED}" \
-            --sql-dir "${SQL_DIR}" --queries "${QUERIES}" --csv "${OUT}/summary.csv" || validated=$?
+            --sql-dir "${SQL_DIR}" --queries "${QUERIES}" --csv "${OUT}/summary.csv" \
+            --ulps "${ULPS}" --tolerance "${TOLERANCE}" || validated=$?
     elif [ "${VALIDATE}" = true ]; then
         echo "==> no expected results to validate against (${EXPECTED:-none}); see --expected"
     fi

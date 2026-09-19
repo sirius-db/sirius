@@ -8,7 +8,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
+use arrow_array::RecordBatch;
 use doris_plan_translator::{PlanTranslator, TranslatedPlan};
 use doris_proto::p_backend_service_server::{PBackendService, PBackendServiceServer};
 use doris_proto::{
@@ -25,9 +27,9 @@ use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
-use crate::fragment_executor::FragmentExecutor;
 #[cfg(test)]
 use crate::fragment_executor::StubExecutor;
+use crate::fragment_executor::{FragmentExecutor, FragmentResult};
 use crate::params::{self, DispatchedFragment, FragmentBatch};
 use crate::result_encoder::{MysqlResultEncoder, ThriftBinary};
 use crate::result_store::{FetchOutcome, ResultStore, UniqueId};
@@ -168,7 +170,7 @@ impl SiriusBackendService {
             return Ok(());
         }
         match translated {
-            Ok(plan) => match self.executor.execute(&plan) {
+            Ok(plan) => match self.execute_timed(query_id, &plan) {
                 Ok(result) => match MysqlResultEncoder::encode(result.batches(), 0) {
                     Ok(batch) => {
                         slot.push(batch);
@@ -181,6 +183,26 @@ impl SiriusBackendService {
             Err(err) => slot.fail(err),
         }
         Ok(())
+    }
+
+    /// Runs the plan on the executor and logs one line per query with the engine time and row
+    /// count (`scripts/run-tpch.sh` reads it back for its timings.csv).
+    fn execute_timed(
+        &self,
+        query_id: UniqueId,
+        plan: &TranslatedPlan,
+    ) -> Result<FragmentResult, String> {
+        let started = Instant::now();
+        let outcome = self.executor.execute(plan);
+        let engine_ms = (started.elapsed().as_secs_f64() * 1e4).round() / 10.0;
+        match &outcome {
+            Ok(result) => {
+                let rows: usize = result.batches().iter().map(RecordBatch::num_rows).sum();
+                info!(%query_id, engine_ms, rows, "query executed on the engine");
+            }
+            Err(err) => warn!(%query_id, engine_ms, error = %err, "query failed on the engine"),
+        }
+        outcome
     }
 
     /// Stitches the batch into one plan (MVP-A0) and translates it, logging the explain

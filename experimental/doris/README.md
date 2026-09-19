@@ -121,6 +121,11 @@ pixi run bash scripts/be.sh start --engine        # SIRIUS_BE_TRANSLATE_ONLY=0, 
 pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1   # execute + validate the 22 queries
 ```
 
+The run validates every result against `tests/expected/tpch-sf1` (`--ulps 1` by default: the GPU's
+DOUBLE→DECIMAL cast truncates the last digit where DuckDB rounds, see `plan-doc/reference/
+semantics-gaps.md` G-19) and writes `log/tpch/timings.csv` with each query's engine time, read
+back from the backend's `query executed on the engine` log line.
+
 `conf/sirius.yaml` sizes the engine for a small box shared with the FE (GPU 90 %, pinned host
 tier 12 GiB, spill and telemetry under `log/`); without it Sirius pins 90 % of host RAM. `be.sh
 --engine` puts the build tree and the env's `lib/` on `LD_LIBRARY_PATH` (`SIRIUS_BUILD_DIR`

@@ -18,10 +18,13 @@ one row per tuple, `NULL` for nulls, decimals with their scale) and one comparis
 Comparison (from origin/doris's validate_tpch_results.py, adapted):
   - column names are compared case-insensitively; column count must match;
   - numbers are compared with a tolerance: relative --tolerance (default 1e-9, scaled by the
-    magnitude; loosen it on the GPU if FP64 accumulation drifts) or half a unit of the coarser
-    side's decimal scale, whichever is larger. The second rule is what makes Doris's declared
-    result types acceptable: the FE types `avg(DECIMAL)` as DECIMAL(38,4) while DuckDB computes
-    a DOUBLE, so `0.0500` must match `0.04998529583839761`;
+    magnitude; loosen it on the GPU if FP64 accumulation drifts) or --ulps units of the coarser
+    side's decimal scale (default 0.5), whichever is larger. The second rule is what makes
+    Doris's declared result types acceptable: the FE types `avg(DECIMAL)` as DECIMAL(38,4) while
+    DuckDB computes a DOUBLE, so `0.0500` must match `0.04998529583839761`. `--ulps 1` also
+    accepts a truncated last digit (`0.0499`): Sirius casts DOUBLE to DECIMAL with cudf, which
+    truncates instead of rounding (semantics-gaps G-19); a verdict says how many values needed
+    that slack;
   - a query with a top-level ORDER BY is compared row by row; if that fails, the result still
     passes when it is the same multiset of rows, both sides respect the ORDER BY and the
     ORDER BY key sequences are identical (ties in a different order). A query without ORDER
@@ -201,19 +204,36 @@ def canonical(value: str) -> str:
     return text
 
 
-def scalars_match(lhs: str, rhs: str, tolerance: decimal.Decimal) -> bool:
+@dataclass
+class Tolerance:
+    """Numeric slack: relative (scaled by magnitude) or `ulps` units of the coarser decimal scale,
+    whichever is larger. `beyond_half_ulp` counts the values that only matched thanks to ulps > 0.5
+    (a truncated rather than rounded last digit); `compare` resets it per query."""
+
+    relative: decimal.Decimal = decimal.Decimal("1e-9")
+    ulps: decimal.Decimal = decimal.Decimal("0.5")
+    beyond_half_ulp: int = 0
+
+
+def scalars_match(lhs: str, rhs: str, tolerance: Tolerance) -> bool:
     if lhs == rhs:
         return True
     lnum, rnum = to_decimal(lhs), to_decimal(rhs)
     if lnum is None or rnum is None:
         return canonical(lhs) == canonical(rhs)
     coarse_scale = min(scale_of(lhs), scale_of(rhs))
-    half_ulp = decimal.Decimal(5) * decimal.Decimal(10) ** -(coarse_scale + 1)
-    relative = tolerance * max(decimal.Decimal(1), abs(lnum), abs(rnum))
-    return abs(lnum - rnum) <= max(half_ulp, relative)
+    ulp = decimal.Decimal(10) ** -coarse_scale
+    relative = tolerance.relative * max(decimal.Decimal(1), abs(lnum), abs(rnum))
+    difference = abs(lnum - rnum)
+    if difference <= max(ulp / 2, relative):
+        return True
+    if difference <= max(tolerance.ulps * ulp, relative):
+        tolerance.beyond_half_ulp += 1
+        return True
+    return False
 
 
-def rows_match(lhs: list[list[str]], rhs: list[list[str]], tolerance: decimal.Decimal) -> str | None:
+def rows_match(lhs: list[list[str]], rhs: list[list[str]], tolerance: Tolerance) -> str | None:
     """None when equal, else what differs first."""
     if len(lhs) != len(rhs):
         return f"row count {len(lhs)} != {len(rhs)}"
@@ -307,7 +327,7 @@ def respects_order(rows: list[list[str]], indices: list[tuple[int, bool]]) -> bo
     return True
 
 
-def compare(query: str, sql: str, actual: Result, expected: Result, tolerance: decimal.Decimal) -> Verdict:
+def compare(query: str, sql: str, actual: Result, expected: Result, tolerance: Tolerance) -> Verdict:
     a_cols = [c.lower() for c in actual.columns]
     e_cols = [c.lower() for c in expected.columns]
     if a_cols != e_cols:
@@ -315,24 +335,33 @@ def compare(query: str, sql: str, actual: Result, expected: Result, tolerance: d
     order = order_by_columns(sql)
     indices = [(e_cols.index(name), desc) for name, desc in order if name in e_cols]
     ordered = bool(order) and len(indices) == len(order)
+
+    def ok(note: str = "") -> Verdict:
+        # A truncated last digit is a real (if tolerated) difference; keep it visible.
+        if tolerance.beyond_half_ulp:
+            slack = f"{tolerance.beyond_half_ulp} value(s) beyond half an ulp, within --ulps {tolerance.ulps}"
+            note = f"{note}; {slack}" if note else slack
+        return Verdict(query, "OK", note, len(actual.rows))
+
+    tolerance.beyond_half_ulp = 0
     if ordered:
         diff = rows_match(actual.rows, expected.rows, tolerance)
         if diff is None:
-            return Verdict(query, "OK", rows=len(actual.rows))
+            return ok()
+        tolerance.beyond_half_ulp = 0
         same_multiset = rows_match(
             sorted(actual.rows, key=sort_key), sorted(expected.rows, key=sort_key), tolerance
         )
         if same_multiset is None and respects_order(actual.rows, indices) and respects_order(expected.rows, indices):
             keys = lambda rows: [[row[i] for i, _ in indices] for row in rows]  # noqa: E731
             if rows_match(keys(actual.rows), keys(expected.rows), tolerance) is None:
-                return Verdict(query, "OK", "ties in a different order", len(actual.rows))
+                return ok("ties in a different order")
         if same_multiset is None:
             return Verdict(query, "MISMATCH", f"same rows, different order ({diff})")
         return Verdict(query, "MISMATCH", diff)
     diff = rows_match(sorted(actual.rows, key=sort_key), sorted(expected.rows, key=sort_key), tolerance)
     if diff is None:
-        note = "" if not order else "ORDER BY on a non-output expression; compared unordered"
-        return Verdict(query, "OK", note, len(actual.rows))
+        return ok("" if not order else "ORDER BY on a non-output expression; compared unordered")
     return Verdict(query, "MISMATCH", diff)
 
 
@@ -465,8 +494,12 @@ def cmd_consume(args) -> int:
         if expected_path is None:
             summary.add(Verdict(query, "SKIPPED", f"no expected result in {args.expected}"))
             continue
-        summary.add(compare(query, load_sql(args.sql_dir, query), actual, read_result(expected_path), args.tolerance))
+        summary.add(compare(query, load_sql(args.sql_dir, query), actual, read_result(expected_path), tolerance_of(args)))
     return summary.finish(args.csv)
+
+
+def tolerance_of(args) -> Tolerance:
+    return Tolerance(relative=args.tolerance, ulps=args.ulps)
 
 
 def cmd_validate(args) -> int:
@@ -484,7 +517,7 @@ def cmd_validate(args) -> int:
             summary.add(Verdict(query, "SKIPPED", f"no expected result in {args.expected}"))
             continue
         summary.add(
-            compare(query, load_sql(args.sql_dir, query), read_result(actual_path), read_result(expected_path), args.tolerance)
+            compare(query, load_sql(args.sql_dir, query), read_result(actual_path), read_result(expected_path), tolerance_of(args))
         )
     return summary.finish(args.csv)
 
@@ -501,6 +534,12 @@ def main() -> int:
     def comparing(sub):
         sub.add_argument("--expected", type=Path, default=DEFAULT_EXPECTED_DIR, help="expected results directory")
         sub.add_argument("--tolerance", type=decimal.Decimal, default=decimal.Decimal("1e-9"), help="relative numeric tolerance")
+        sub.add_argument(
+            "--ulps",
+            type=decimal.Decimal,
+            default=decimal.Decimal("0.5"),
+            help="units of the coarser decimal scale accepted (0.5 = rounding only; 1 also accepts a truncated last digit)",
+        )
         sub.add_argument("--csv", type=Path, help="write a query,status,detail summary")
 
     sub = subparsers.add_parser("expected", help="generate expected results with DuckDB")

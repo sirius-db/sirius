@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{io::IsTerminal, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use backon::{ExponentialBuilder, Retryable};
@@ -317,6 +317,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "sirius_doris_be=info,info".into()),
         )
+        // Plain text when the log is a file (be.sh redirects it), so scripts can grep it.
+        .with_ansi(std::io::stdout().is_terminal())
         // Emit span close events so instrumented spans report their busy/idle timings.
         .with_span_events(FmtSpan::CLOSE)
         .init();
