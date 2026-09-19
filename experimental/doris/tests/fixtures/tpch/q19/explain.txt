@@ -1,0 +1,104 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    revenue[#44]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: true
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  7:VAGGREGATE (merge finalize)(480)
+  |  output: sum(partial_sum((l_extendedprice * (1.00 - cast(l_discount as DECIMALV3(16, 2)))))[#43])[#44]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  6:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: l_partkey[#29]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    UNPARTITIONED
+
+  5:VAGGREGATE (update serialize)(472)
+  |  output: partial_sum((l_extendedprice[#41] * (1.00 - CAST(l_discount[#42] AS decimalv3(16,2)))))[#43]
+  |  group by: 
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  4:VHASH JOIN(464)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (l_partkey[#29] = p_partkey[#9])
+  |  other join predicates: (((((p_brand[#38] = 'Brand#12') AND p_container[#40] IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')) AND ((l_quantity[#34] <= 11.00) AND (p_size[#39] <= 5))) OR ((((p_brand[#38] = 'Brand#23') AND p_container[#40] IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')) AND (l_quantity[#34] >= 10.00)) AND ((l_quantity[#34] <= 20.00) AND (p_size[#39] <= 10)))) OR (((p_brand[#38] = 'Brand#34') AND p_container[#40] IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')) AND (l_quantity[#34] >= 20.00)))
+  |  cardinality=1
+  |  vec output tuple id: 5
+  |  output tuple id: 5
+  |  vIntermediate tuple ids: 4 
+  |  hash output slot ids: 32 10 11 12 30 31 
+  |  final projections: l_extendedprice[#35], l_discount[#36]
+  |  final project output tuple id: 5
+  |  distribute expr lists: l_partkey[#29]
+  |  distribute expr lists: p_partkey[#9]
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  3:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    HASH_PARTITIONED: l_partkey[#29]
+
+  2:VTVF_SCAN_NODE(435)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.l_shipmode[#27] IN ('AIR', 'AIR REG'), (_tvf_local.l_shipinstruct[#26] = 'DELIVER IN PERSON'), (_tvf_local.l_quantity[#17] >= 1.00), (_tvf_local.l_quantity[#17] <= 30.00)
+     inputSplitNum=1, totalFileSize=162140518, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.l_partkey[#14], _tvf_local.l_quantity[#17], _tvf_local.l_extendedprice[#18], _tvf_local.l_discount[#19]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: p_partkey[#9]
+
+  0:VTVF_SCAN_NODE(448)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.p_size[#5] >= 1), (_tvf_local.p_size[#5] <= 15), _tvf_local.p_brand[#3] IN ('Brand#12', 'Brand#23', 'Brand#34'), _tvf_local.p_container[#6] IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG', 'MED BAG', 'MED BOX', 'MED PKG', 'MED PACK', 'LG CASE', 'LG BOX', 'LG PACK', 'LG PKG'), (((((_tvf_local.p_brand[#3] = 'Brand#12') AND _tvf_local.p_container[#6] IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')) AND (_tvf_local.p_size[#5] <= 5)) OR (((_tvf_local.p_brand[#3] = 'Brand#23') AND _tvf_local.p_container[#6] IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')) AND (_tvf_local.p_size[#5] <= 10))) OR ((_tvf_local.p_brand[#3] = 'Brand#34') AND _tvf_local.p_container[#6] IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')))
+     inputSplitNum=1, totalFileSize=5130885, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.p_partkey[#0], _tvf_local.p_brand[#3], _tvf_local.p_size[#5], _tvf_local.p_container[#6]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

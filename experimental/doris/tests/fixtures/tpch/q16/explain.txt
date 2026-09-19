@@ -1,0 +1,166 @@
+Explain String(Nereids Planner)
+PLAN FRAGMENT 0
+  OUTPUT EXPRS:
+    p_brand[#50]
+    p_type[#51]
+    p_size[#52]
+    supplier_cnt[#53]
+  PARTITION: UNPARTITIONED
+
+  HAS_COLO_PLAN_NODE: false
+
+  VRESULT SINK
+     MYSQL_PROTOCOL
+
+  12:VMERGING-EXCHANGE
+     offset: 0
+     distribute expr lists: p_brand[#50], p_type[#51], p_size[#52]
+
+PLAN FRAGMENT 1
+
+  PARTITION: HASH_PARTITIONED: p_brand[#42], p_type[#43], p_size[#44]
+
+  HAS_COLO_PLAN_NODE: true
+
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    UNPARTITIONED
+IS_MERGE: true
+
+  11:VSORT(1007)
+  |  order by: supplier_cnt[#53] DESC, p_brand[#50] ASC, p_type[#51] ASC, p_size[#52] ASC
+  |  algorithm: full sort
+  |  local merge sort
+  |  merge by exchange
+  |  offset: 0
+  |  distribute expr lists: 
+  |  
+  10:VAGGREGATE (merge finalize)(1003)
+  |  output: multi_distinct_count(partial_multi_distinct_count(ps_suppkey)[#45])[#49]
+  |  group by: p_brand[#42], p_type[#43], p_size[#44]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: p_brand[#42], p_type[#43], p_size[#44]
+  |  
+  9:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 2
+
+  PARTITION: HASH_PARTITIONED: ps_partkey[#30]
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 09
+    HASH_PARTITIONED: p_brand[#42], p_type[#43], p_size[#44]
+
+  8:VAGGREGATE (update serialize)(995)
+  |  STREAMING
+  |  output: partial_multi_distinct_count(ps_suppkey[#41])[#45]
+  |  group by: p_brand[#38], p_type[#39], p_size[#40]
+  |  sortByGroupKey:false
+  |  cardinality=1
+  |  distribute expr lists: 
+  |  
+  7:VHASH JOIN(987)
+  |  join op: INNER JOIN(PARTITIONED)[]
+  |  equal join conjunct: (ps_partkey[#30] = p_partkey[#9])
+  |  cardinality=1
+  |  vec output tuple id: 9
+  |  output tuple id: 9
+  |  vIntermediate tuple ids: 8 
+  |  hash output slot ids: 10 11 12 31 
+  |  final projections: p_brand[#35], p_type[#36], p_size[#37], ps_suppkey[#33]
+  |  final project output tuple id: 9
+  |  distribute expr lists: ps_partkey[#30]
+  |  distribute expr lists: p_partkey[#9]
+  |  
+  |----1:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  6:VEXCHANGE
+     offset: 0
+     distribute expr lists: 
+
+PLAN FRAGMENT 3
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 06
+    HASH_PARTITIONED: ps_partkey[#30]
+
+  5:VHASH JOIN(966)
+  |  join op: NULL AWARE LEFT ANTI JOIN(BROADCAST)[]
+  |  equal join conjunct: (ps_suppkey[#27] = s_suppkey[#20])
+  |  cardinality=0
+  |  vec output tuple id: 7
+  |  output tuple id: 7
+  |  vIntermediate tuple ids: 6 
+  |  hash output slot ids: 26 27 
+  |  final projections: ps_partkey[#28], ps_suppkey[#29]
+  |  final project output tuple id: 7
+  |  distribute expr lists: 
+  |  distribute expr lists: 
+  |  
+  |----3:VEXCHANGE
+  |       offset: 0
+  |       distribute expr lists: 
+  |    
+  4:VTVF_SCAN_NODE(945)
+     table: null.null.LocalTableValuedFunction
+     inputSplitNum=1, totalFileSize=38032874, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.ps_partkey[#21], _tvf_local.ps_suppkey[#22]
+     final project output tuple id: 5
+
+PLAN FRAGMENT 4
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 03
+    UNPARTITIONED
+
+  2:VTVF_SCAN_NODE(950)
+     table: null.null.LocalTableValuedFunction
+     predicates: _tvf_local.s_comment[#19] like '%Customer%Complaints%'
+     inputSplitNum=1, totalFileSize=690978, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.s_suppkey[#13]
+     final project output tuple id: 3
+
+PLAN FRAGMENT 5
+
+  PARTITION: RANDOM
+
+  HAS_COLO_PLAN_NODE: false
+
+  STREAM DATA SINK
+    EXCHANGE ID: 01
+    HASH_PARTITIONED: p_partkey[#9]
+
+  0:VTVF_SCAN_NODE(971)
+     table: null.null.LocalTableValuedFunction
+     predicates: (_tvf_local.p_brand[#3] != 'Brand#45'), (NOT _tvf_local.p_type[#4] like 'MEDIUM POLISHED%'), _tvf_local.p_size[#5] IN (49, 14, 23, 45, 19, 3, 36, 9)
+     inputSplitNum=1, totalFileSize=5130885, scanRanges=1
+     partition=0/0
+     numNodes=2
+     pushdown agg=NONE
+     final projections: _tvf_local.p_partkey[#0], _tvf_local.p_brand[#3], _tvf_local.p_type[#4], _tvf_local.p_size[#5]
+     final project output tuple id: 1
+
+
+
+========== STATISTICS ==========

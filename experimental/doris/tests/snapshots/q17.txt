@@ -1,0 +1,45 @@
+# q17: 5 fragments (root first):
+#   fragment_id=6 sink=RESULT_SINK nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=5 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE > AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=4 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=2 sink=DATA_STREAM_SINK nodes=[FILE_SCAN_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q17/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: AGGREGATION_NODE > HASH_JOIN_NODE > HASH_JOIN_NODE > FILE_SCAN_NODE > FILE_SCAN_NODE > AGGREGATION_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_boolean
+  @  3: extension:io.substrait:functions_aggregate_generic
+  @  4: extension:io.substrait:functions_arithmetic
+Functions:
+  #  1 @  1: equal
+  #  2 @  2: and
+  #  3 @  3: avg
+  #  4 @  4: multiply
+  #  5 @  1: lt
+  #  6 @  3: sum
+  #  7 @  4: divide
+
+=== Plan
+Root[avg_yearly]
+  Project[$0]
+    Project[(divide(($0)::!decimal?<38, 7>, 7.0:decimal<5, 1>):decimal?<38, 6>)::!decimal?<38, 6>]
+      Project[($0)::!decimal?<38, 2>]
+        Aggregate[_ => sum($0):decimal?<38, 2>]
+          Project[$1]
+            Join[&Inner, and(equal($2, $3):boolean?, lt(($0)::!decimal?<38, 5>, multiply(0.2:decimal<5, 1>, $4):decimal?<38, 5>):boolean?):boolean? => $0, $1, $2, $3, $4]
+              Project[$1, $2, $3]
+                Join[&Inner, equal($0, $3):boolean? => $0, $1, $2, $3]
+                  Project[$0, $1, $2]
+                    Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_partkey:i32?, l_quantity:decimal?<15, 2>, l_extendedprice:decimal?<15, 2>]
+                  Project[$0]
+                    Filter[and(equal($1, 'Brand#23'):boolean?, equal($2, 'MED BOX'):boolean?):boolean? => $0, $1, $2]
+                      Read["local_files:/tmp/tpch-sf1/part/part.0.parquet" => p_partkey:i32?, p_brand:string?, p_container:string?]
+              Project[$0, ($1)::!decimal?<38, 4>]
+                Aggregate[$0 => $0, avg($1):decimal?<38, 4>]
+                  Project[$0, $1]
+                    Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_partkey:i32?, l_quantity:decimal?<15, 2>]
