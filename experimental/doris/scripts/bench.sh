@@ -32,7 +32,10 @@
 # restarted as needed; the FE is never restarted (plan §6.1). Writes to --out:
 #   system.txt, env.txt, variables.txt, sirius.yaml (effective config), be.log (Sirius BE),
 #   round<k>/  = run-tpch.sh / run-tpch-duckdb.sh output + timings.csv (FE audit joined) +
-#                summary.csv (validation) + samples.csv (ts_ms,pid,rss_kb,read_bytes,cpu_ticks,gpu_used_mib)
+#                summary.csv (validation) + samples.csv (ts_ms,pid,rss_kb,read_bytes,cpu_ticks,
+#                gpu_used_mib,gpu_util_pct,gpu_mem_util_pct — the last three from nvidia-smi:
+#                memory in use, % of the sample interval a kernel was running, % of it the
+#                memory controller was busy; blank for the CPU systems)
 #   rounds.csv = all rounds flattened (scripts/bench-report.py rounds)
 set -euo pipefail
 
@@ -168,20 +171,22 @@ SAMPLER_PID=""
 sampler_start() { # process-pattern gpu(0|1) outfile
     local pattern="$1" gpu="$2" file="$3"
     sampler_stop
-    echo "ts_ms,pid,rss_kb,read_bytes,cpu_ticks,gpu_used_mib" > "${file}"
+    echo "ts_ms,pid,rss_kb,read_bytes,cpu_ticks,gpu_used_mib,gpu_util_pct,gpu_mem_util_pct" > "${file}"
     (
         while true; do
             pid=$(pgrep -n -f "${pattern}" || true)
-            rss=""; rb=""; cpu=""; used=""
+            rss=""; rb=""; cpu=""; gpu_cols=",,"
             if [ -n "${pid}" ] && [ -r "/proc/${pid}/stat" ]; then
                 rss=$(awk '/^VmRSS/ { print $2 }' "/proc/${pid}/status" 2>/dev/null || true)
                 rb=$(awk '/^read_bytes/ { print $2 }' "/proc/${pid}/io" 2>/dev/null || true)
                 cpu=$(awk '{ print $14 + $15 }' "/proc/${pid}/stat" 2>/dev/null || true)
             fi
             if [ "${gpu}" = 1 ]; then
-                used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+                # memory.used MiB, utilization.gpu %, utilization.memory % (nvidia-smi's own
+                # ~1 s windows; averaged over a query's window by bench-report.py)
+                gpu_cols=$(nvidia-smi --query-gpu=memory.used,utilization.gpu,utilization.memory --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo ",,")
             fi
-            echo "$(date +%s%3N),${pid},${rss},${rb},${cpu},${used}" >> "${file}"
+            echo "$(date +%s%3N),${pid},${rss},${rb},${cpu},${gpu_cols}" >> "${file}"
             sleep 0.5
         done
     ) &

@@ -165,8 +165,10 @@ Each run directory holds `env.txt` (machine, commit, config hashes, backends), `
 (the GLOBAL session variables in effect), the effective `sirius.yaml`, `round<k>/` (per-query
 `result.tsv`, `explain.txt`, `timings.csv` with the client wall time, the engine time and the
 FE audit numbers joined by `fe-audit.py`, `summary.csv` from the validator, `samples.csv` from
-the 0.5 s process/GPU sampler) and `rounds.csv` (everything flattened by `bench-report.py
-rounds`). `bench-report.py report` turns several run directories into the Markdown tables.
+the 0.5 s sampler: RSS, bytes read from disk, CPU ticks of the backend process, and for the
+GPU systems nvidia-smi's memory in use, `utilization.gpu` and `utilization.memory`) and
+`rounds.csv` (everything flattened by `bench-report.py rounds`: per query the peaks, deltas
+and mean GPU utilization over its window). `bench-report.py report` turns several run directories into the Markdown tables.
 
 Two things the harness does to keep the comparison fair: it drops this backend from the FE
 (`ALTER SYSTEM DROPP BACKEND`) while a native system runs — the backend never reports its CPU
