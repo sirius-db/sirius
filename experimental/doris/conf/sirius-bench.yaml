@@ -1,5 +1,5 @@
-# Sirius engine config template for the benchmark's Sirius backend (plan-doc
-# experiments/sf10-bench, systems B / B′ and the transparent-path reference R2). Same keys as
+# Sirius engine config template for the benchmark's Sirius backend (the `sirius*` and
+# `duckdb-gpu*` systems of docs/tpch-report.md). Same keys as
 # conf/sirius.yaml (the everyday config), with the @@...@@ placeholders filled by
 # scripts/bench.sh, which writes the effective file next to the run's results:
 #   @@HOST_CAPACITY@@  pinned host tier (per NUMA node); bench.sh sizes it from the host's RAM

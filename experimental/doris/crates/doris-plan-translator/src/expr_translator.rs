@@ -34,7 +34,7 @@
 //!   result type that DuckDB would infer differently (decimal `avg`, `year` → `SMALLINT`) has
 //!   to be re-imposed with an explicit cast at tuple boundaries; the node translator does that.
 //!
-//! # Gates (see `plan-doc/reference/semantics-gaps.md`)
+//! # Gates (`G-nn` numbers per *Semantic gaps* in the crate's `README.md`)
 //!
 //! - `LARGE_INT_LITERAL` → rejected (G-01).
 //! - `concat` → rejected (G-02: Doris is NULL-strict, DuckDB's `concat` ignores NULLs).

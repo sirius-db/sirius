@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flatten and report the benchmark runs of scripts/bench.sh (plan-doc experiments/sf10-bench).
+"""Flatten and report the benchmark runs of scripts/bench.sh (docs/tpch-report.md).
 
     bench-report.py rounds --run DIR
         one bench.sh output directory -> DIR/rounds.csv: every (round, query) with the client

@@ -26,7 +26,7 @@
 #                      baseline for another dataset with `validate_tpch_results.py expected`.
 #   --ulps N           execution mode: units of the coarser decimal scale the validator accepts
 #                      (default 1: the GPU's DOUBLE→DECIMAL cast truncates the last digit where
-#                      DuckDB rounds, semantics-gaps G-19; the validator's own default is 0.5 and
+#                      DuckDB rounds, G-19 in README.md; the validator's own default is 0.5 and
 #                      it reports how many values needed the extra slack)
 #   --tolerance T      execution mode: the validator's relative tolerance (default 1e-9)
 #   --no-validate      execution mode: skip that check

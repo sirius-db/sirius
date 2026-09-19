@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the TPC-H queries (sql/tpch/qNN.sql, the same files the FE runs) straight through the
-# Sirius build tree's DuckDB shell — the benchmark's single-process references (plan-doc
-# experiments/sf10-bench §3): R1 = DuckDB on the CPU (SIRIUS_DISABLE=1), R2 = Sirius's
+# Sirius build tree's DuckDB shell — the benchmark's single-process references (the `duckdb*`
+# systems of docs/tpch-report.md): R1 = DuckDB on the CPU (SIRIUS_DISABLE=1), R2 = Sirius's
 # transparent path (DuckDB plans, Sirius executes on the GPU). One DuckDB process per call,
 # all queries in it back to back (like the upstream harness test/tpch_performance/
 # run_tpch_parquet.sh: a fresh process would re-initialize the engine per query).

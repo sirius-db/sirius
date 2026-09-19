@@ -33,6 +33,7 @@ Doris FE (official 4.1.4 binary)          sirius-doris-be (this crate)
 | `tests/fixtures/tpch/`, `tests/fixtures/gaps/` | captured FE→BE dispatches for all 22 TPC-H queries and for the `sql/gaps` probes (`INDEX.md` has the shapes and coverage) |
 | `tests/snapshots/` | the reviewed translation of every captured query (stitched node tree + `substrait-explain` text, or the refusal); `tests/corpus.rs` diffs against these |
 | `tests/expected/tpch-sf1/`, `tests/expected/tpch-sf10/`, `tests/expected/gaps-sf1/` | the queries' results on the SF1 / SF10 datasets, computed by DuckDB from the same parquet files (`INDEX.md` has the row counts); what `run-tpch.sh` and the CPU differential validate against |
+| `docs/tpch-report.md` | the TPC-H correctness and performance report: SF1 / SF10 / SF100 on one L40S, Doris's native BE vs this backend (and the versions under test) |
 
 ## Running on a laptop (no GPU)
 
@@ -72,7 +73,7 @@ consumer (`SubstraitToDuckDB` in the repo's `substrait/` submodule, the reader
 `src/sirius_ffi.cpp` compiles into libsirius) turns the bytes into a DuckDB plan, and DuckDB
 runs it on the CPU. `scripts/cpu-diff.sh` stitches every captured dispatch into one plan,
 runs it that way with the optimizer rules the FFI disables, and validates the rows against
-`tests/expected/tpch-sf1` (22/22 pass; MVP-A0 preparation, `plan-doc/tasklist.md` A0.1):
+`tests/expected/tpch-sf1` (22/22 pass):
 
 ```bash
 pixi run -e check duckdb-substrait-build      # once, ~3 min: DuckDB v1.5.5 + substrait extension
@@ -122,18 +123,48 @@ pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1   # execute + valid
 ```
 
 The run validates every result against `tests/expected/tpch-sf1` (`--ulps 1` by default: the GPU's
-DOUBLE→DECIMAL cast truncates the last digit where DuckDB rounds, see `plan-doc/reference/
-semantics-gaps.md` G-19) and writes `log/tpch/timings.csv` with each query's engine time, read
+DOUBLE→DECIMAL cast truncates the last digit where DuckDB rounds, G-19 under *Semantic gaps*
+below) and writes `log/tpch/timings.csv` with each query's engine time, read
 back from the backend's `query executed on the engine` log line.
 
 `conf/sirius.yaml` sizes the engine for a small box shared with the FE (GPU 90 %, pinned host
 tier 12 GiB, spill and telemetry under `log/`); without it Sirius pins 90 % of host RAM. `be.sh
 --engine` puts the build tree and the env's `lib/` on `LD_LIBRARY_PATH` (`SIRIUS_BUILD_DIR`
 overrides the tree). The `be-build`/`be-run` tasks do the same but first re-run the root build
-including its C++ unit tests. See `plan-doc/doris-pseudo-be-plan.md` for the milestones (P0
-scaffolding → P1 translator → MVP-A0 single plan → MVP-A fragments → MVP-B multi-node).
+including its C++ unit tests. Today every query runs as one fused plan on one node; the next
+steps are executing the FE's fragments as engine fragments, then multi-node.
 
-## Benchmark: Doris vs Doris + Sirius (plan-doc `experiments/sf10-bench/plan.md`)
+## Semantic gaps
+
+The translator refuses or reshapes whatever Doris and the DuckDB Substrait consumer / Sirius do
+not agree on. Each case has a number (`G-nn`) that the refusal reasons, the module docs, the gap
+probes under `sql/gaps` and the tests use:
+
+| # | Doris | What the translator does |
+|---|---|---|
+| G-01 | `LARGEINT` (128-bit integer) | rejected: Sirius narrows 128-bit integers to 64 bits silently |
+| G-02 | `concat` is NULL-strict | rejected: DuckDB's `concat` ignores NULL arguments |
+| G-03 | `LIKE` escapes with `\` | only a constant pattern without a backslash is translated |
+| G-04 | `substring` follows MySQL for `pos <= 0` and negative positions | only `(expr, constant start > 0, constant length > 0)` is translated |
+| G-05 | `DECIMAL256` | rejected: exceeds the 128-bit decimal carrier |
+| G-06 | `DECIMAL(p <= 4)` | slots rejected (DuckDB stores them as `INT16`, which has no cuDF carrier); literals are widened to precision 5 |
+| G-07 | `HLL` / `BITMAP` / `QUANTILE_STATE` / `AGG_STATE` | rejected |
+| G-08 | `JSONB` / `VARIANT` | rejected (Sirius would carry them as strings) |
+| G-09 | `BINARY` / `VARBINARY` / `IPV4` / `IPV6` / `TIMEV2` / `TIMESTAMPTZ` | rejected: no mapping |
+| G-10 | `ARRAY` / `MAP` / `STRUCT` | rejected as a whole (Sirius only passes nested columns through) |
+| G-11 | window functions (`ANALYTIC_EVAL_NODE`) | rejected by node type |
+| G-12 | `UNION` / `INTERSECT` / `EXCEPT` (`UNION_NODE`) | rejected by node type (the consumer's `SetRel` takes two inputs only) |
+| G-13 | `SELECT DISTINCT`, compiled by Nereids into a two-phase group-by with no aggregate | folded by the stitcher into one aggregate |
+| G-14 | multi-phase aggregation (update → exchange → merge) | a lone phase is refused; the stitcher folds a query's phases into one aggregate |
+| G-15 | scalar functions outside the allowlist (`upper`, `lower`, `trim`, `round`, `abs`, `replace`, …) | rejected |
+| G-16 | aggregates outside the allowlist (`stddev`, `median`, `approx_count_distinct`, …) | rejected; `count(DISTINCT)` is supported |
+| G-17 | legacy `DATE` / `DATETIME` (v1) and `DECIMALV2` | rejected: only `DATEV2` / `DATETIMEV2` / `DECIMAL32/64/128I` |
+| G-18 | untyped `NULL` (`NULL_TYPE`) | rejected; typed `NULL_LITERAL`s are wrapped in a cast so the consumer does not turn them into `SQLNULL` |
+| G-19 | DECIMAL result types and DOUBLE→DECIMAL rounding | DuckDB re-derives expression types, so every projection and measure is cast back to its Doris slot type; the GPU's DOUBLE→DECIMAL cast truncates the last digit where DuckDB rounds (the validator's `--ulps 1`) |
+
+## Benchmark: Doris vs Doris + Sirius
+
+The results of the SF1 / SF10 / SF100 runs are in [`docs/tpch-report.md`](docs/tpch-report.md).
 
 The same FE, the same parquet dataset (views over `local()`), the same 22 queries, with the
 backend swapped: the official Doris BE on the CPU versus this backend on the GPU, plus the

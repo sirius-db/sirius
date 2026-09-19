@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads the official Apache Doris release tarball for the pinned version and unpacks only
-# its `be/` directory into `.doris-be/be`: the native BE the benchmark (plan-doc
-# experiments/sf10-bench) runs as the CPU reference next to this directory's Sirius backend.
+# its `be/` directory into `.doris-be/be`: the native BE the benchmark (docs/tpch-report.md)
+# runs as the CPU reference next to this directory's Sirius backend.
 # Same streaming extraction as fetch-fe.sh (the multi-GB tarball is never stored); idempotent,
 # exits early when `.doris-be/be/lib/doris_be` already exists.
 set -euo pipefail

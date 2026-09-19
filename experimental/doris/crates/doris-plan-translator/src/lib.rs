@@ -23,7 +23,7 @@
 //! - [`descriptor_table`]: `TDescriptorTable` → tuples, slots in wire order, and
 //!   `(tuple_id, slot_id)` → column-index resolution for a node's `row_tuples`.
 //! - [`type_mapper`]: `TTypeDesc` → Substrait type, and the type gate (what is
-//!   rejected and which `semantics-gaps.md` entry says why).
+//!   rejected and which gap, `G-nn` under *Semantic gaps* in `README.md`, says why).
 //! - [`expr_translator`]: `TExpr` → Substrait expression (literals, slot references,
 //!   predicates, arithmetic, casts, `IN`, `CASE`, the scalar-function allowlist)
 //!   and the decomposition of `AGG_EXPR` roots into aggregate measures.
