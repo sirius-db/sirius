@@ -43,38 +43,36 @@
 #include <vector>
 
 namespace sirius::op {
-class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
-}
+class sirius_dynamic_filter_set;
+class dynamic_filter_snapshot;
+}  // namespace sirius::op
 
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
 // Dynamic join filters, snapshotted for a decode
 //===----------------------------------------------------------------------===//
-/// One snapshot of a scan's dynamic-filter channel, shaped for decode.
+/**
+ * @brief One coherent dynamic-filter snapshot shaped into owning decode probes.
+ */
 struct membership_snapshot {
-  /// Parallel to the selected slots.
-  std::vector<std::vector<sirius::membership_probe>> probes;
-  std::uint64_t generation     = 0;  ///< set->filter_count(), read BEFORE the walk
+  std::vector<std::vector<sirius::membership_probe>>
+    probes;                          ///< Parallel to selected slots; closures retain filters.
+  std::uint64_t generation     = 0;  ///< Channel generation captured with these probes.
   std::size_t attached_probes  = 0;
   std::size_t skipped_non_mask = 0;  ///< filters without the mask-applicable mixin (zone maps)
 };
 
-/// Snapshot the channel's per-column probes over @p n_slots decoded slots.
-///
-/// THE MAPPING INVARIANT, stated once here because both callers (the
-/// scan-manager drain attach and the decode-time refresh) depend on it: slot
-/// order is output columns first, in output order, then pure-filter columns,
-/// while the filter set keys by OUTPUT-COLUMN position. Slot i therefore maps
-/// to output position i, so its probes are exactly filters_for_column(i);
-/// trailing pure-filter slots query keys the set can never hold (push_filter
-/// rejects non-output columns) and come back empty by construction.
-///
-/// `generation` is read BEFORE the walk, so it never claims probes the walk did
-/// not capture — a racing publish only ADDS an uncounted one, the safe
-/// direction for the converter's echo.
+/**
+ * @brief Shapes a coherent snapshot into probes over decoded slots.
+ *
+ * The scan manager and decode-time refresh use output columns first, in output order, followed by
+ * pure-filter columns. Snapshot bindings are output-column positions, so slot i corresponds to
+ * output position i; trailing pure-filter slots have no bindings. Each probe closure retains its
+ * filter through the decode's existing stream retirement.
+ */
 [[nodiscard]] membership_snapshot snapshot_membership_probes(
-  sirius::op::sirius_dynamic_filter_set const& set, std::size_t n_slots);
+  sirius::op::dynamic_filter_snapshot const& snapshot, std::size_t n_slots);
 
 //===----------------------------------------------------------------------===//
 // scan_operator_input

@@ -25,7 +25,7 @@
 
 namespace sirius::op {
 class sirius_dynamic_filter;
-class sirius_dynamic_filter_set;
+class dynamic_filter_snapshot;
 }  // namespace sirius::op
 
 namespace sirius::op::scan {
@@ -46,7 +46,7 @@ class dynamic_filter_gate {
   }
 
   /// True when filters exist and the gate is active or due for retraining.
-  [[nodiscard]] bool applicable(sirius::op::sirius_dynamic_filter_set const& filters) const;
+  [[nodiscard]] bool applicable(sirius::op::dynamic_filter_snapshot const& filters) const;
 
   /// Updates from one split; empty splits do not train, and disabled gates wait for channel growth.
   void record_keep_ratio(std::size_t rows_before,

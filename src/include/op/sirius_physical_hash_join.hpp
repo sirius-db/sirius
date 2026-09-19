@@ -29,6 +29,7 @@
 #include "expression/ast/node.hpp"  // complete sirius::ast::node for join_condition's destructor
 #include "expression/join_condition.hpp"
 #include "op/dynamic_filter/dynamic_filter_publish_plan.hpp"
+#include "op/dynamic_filter/dynamic_filter_publisher.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "sirius_config.hpp"
@@ -300,8 +301,11 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   void restrict_dynamic_filter_replicas(std::vector<int> const& admitted_gpu_ids)
   {
-    _dynamic_filter_plan.restrict_replicas_to(admitted_gpu_ids);
+    _dynamic_filter_session.restrict_replicas_to(admitted_gpu_ids);
   }
+
+  void seal_dynamic_filter_plan() noexcept { _dynamic_filter_session.seal_plan(); }
+  void cancel_dynamic_filter_publication() noexcept { _dynamic_filter_session.cancel(); }
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
@@ -513,24 +517,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  protected:
   std::vector<key_cast_info> key_casts;
 
-  // Requires PUBLISHING and leaves FINISHED or FAILED. Device OOM is contained; other failures
-  // propagate.
-  void publish_dynamic_filters(cudf::table_view const& build_view, rmm::cuda_stream_view stream);
-
-  enum class dynamic_filter_publication_state : std::uint8_t {
-    OPEN,
-    PUBLISHING,
-    FINISHED,
-    FAILED,  ///< Terminal: a failed window is never reopened for a sibling retry.
-    CLOSED
-  };
-
-  // Narrowed before execution; immutable during execution.
-  dynamic_filter_publish_plan _dynamic_filter_plan;
+  dynamic_filter_publication_session _dynamic_filter_session;
   // Non-owning; SiriusContext outlives the plan.
   dynamic_filter_stats* _dynamic_filter_stats = nullptr;
-  std::atomic<dynamic_filter_publication_state> _dynamic_filter_publication_state{
-    dynamic_filter_publication_state::OPEN};
 
  public:
   void push_data_batch_partitioned(std::string_view port_id,
@@ -539,7 +528,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   [[nodiscard]] dynamic_filter_publish_plan const& dynamic_filter_plan() const noexcept
   {
-    return _dynamic_filter_plan;
+    return _dynamic_filter_session.plan();
   }
 
  public:

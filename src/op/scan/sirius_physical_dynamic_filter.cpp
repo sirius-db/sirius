@@ -55,7 +55,8 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   // intervening join can race it. Keep the no-filter fast path for that transitive case and for an
   // intentionally empty publication. The gate remains filter-count-aware if later splits observe
   // additional filters.
-  if (!_filters || !_gate.applicable(*_filters)) {
+  auto snapshot = _filters ? _filters->snapshot() : dynamic_filter_snapshot{};
+  if (!_gate.applicable(snapshot)) {
     return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
@@ -66,11 +67,12 @@ std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
   output_batches.reserve(ro_batches.size());
 
   for (std::size_t i = 0; i < ro_batches.size(); ++i) {
+    if (i != 0) { snapshot = _filters->snapshot(); }
     auto const& ro = ro_batches[i];
     // A null result means nothing was dropped — the gate declined, or no published filter matched.
     // Forward the batch unchanged (zero-copy; its columns stay co-owned via the idle shared_ptr).
     auto filtered = apply_dynamic_filters_gated_view(sirius::get_cudf_table_view(ro),
-                                                     *_filters,
+                                                     snapshot,
                                                      _gate,
                                                      stream,
                                                      _mode,

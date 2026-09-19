@@ -1114,6 +1114,8 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   std::optional<gpu_expression_translator::translated_expression> dynamic_ast_expression =
     std::nullopt;
   cudf::ast::expression const* reader_filter_root = nullptr;
+  sirius::op::dynamic_filter_snapshot dynamic_snapshot;
+  bool dynamic_reader_filter = false;
 
   // Null-free conjuncts only; the dynamic-filter block below is unaffected.
   if (_static_pushdown_expression && !split.disable_filter_pushdown && !all_slices_pruned) {
@@ -1127,30 +1129,42 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     if (ast_expression) { reader_filter_root = &ast_expression->back(); }
   }
 
-  if (!split.disable_filter_pushdown && _sirius_dynamic_filters &&
-      _sirius_dynamic_filters->has_filters()) {
+  if (!split.disable_filter_pushdown && _sirius_dynamic_filters) {
+    dynamic_snapshot          = _sirius_dynamic_filters->snapshot();
+    auto const* previous_root = reader_filter_root;
     if (ast_expression) {
       reader_filter_root = merge_dynamic_filters_into_ast(ast_expression->tree,
                                                           reader_filter_root,
-                                                          *_sirius_dynamic_filters,
+                                                          dynamic_snapshot,
                                                           *split.plan,
                                                           mem_space.get_device_id());
     } else {
       dynamic_ast_expression.emplace();
       reader_filter_root = merge_dynamic_filters_into_ast(dynamic_ast_expression->tree,
                                                           /*existing_root=*/nullptr,
-                                                          *_sirius_dynamic_filters,
+                                                          dynamic_snapshot,
                                                           *split.plan,
                                                           mem_space.get_device_id());
       if (!reader_filter_root) { dynamic_ast_expression.reset(); }
     }
+    dynamic_reader_filter = reader_filter_root != previous_root;
   }
 
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto [table, _] =
-    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+  auto [table, _] = [&] {
+    try {
+      auto result =
+        cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+      // The reader AST borrows scalars owned by this checkpoint's snapshot.
+      if (dynamic_reader_filter) { stream.synchronize(); }
+      return result;
+    } catch (...) {
+      if (dynamic_reader_filter) { stream.synchronize(); }
+      throw;
+    }
+  }();
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared

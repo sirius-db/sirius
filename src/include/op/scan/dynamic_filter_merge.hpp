@@ -33,21 +33,23 @@
 
 namespace sirius::op::scan {
 
-/// Post-decode mode: membership-only after scan-time AST filtering, or AST plus membership
-/// otherwise.
+/**
+ * @brief Selects membership-only application after scan-time AST filtering, or AST plus membership
+ * otherwise.
+ */
 enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };
 
 /**
  * @brief ANDs compatible filters into @p tree
  *
  * Column references follow @p plan; hive partitions are skipped. The existing root is returned
- * when no filter applies. Returned expressions and filter-owned scalars must outlive installed
- * AST. A negative device ID selects the current device.
+ * when no filter applies. The caller retains the snapshot through the last GPU use of its
+ * filter-owned scalars. A negative device ID selects the current device.
  */
 [[nodiscard]] cudf::ast::expression const* merge_dynamic_filters_into_ast(
   cudf::ast::tree& tree,
   cudf::ast::expression const* existing_root,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& filters,
   scan_plan const& plan,
   int device_id = -1);
 
@@ -55,11 +57,12 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
  * @brief Gathers rows that pass visible filters, or returns null when no mask applies
  *
  * Input uses scan output layout. A gate may suppress low-value masks; a negative device ID selects
- * the current device.
+ * the current device. Submitted work completes before the snapshot can be released, including on
+ * exceptional exits; no consumer waits for channel publication.
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& filters,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
   dynamic_filter_gate* gate      = nullptr,
@@ -72,7 +75,7 @@ enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_ma
  */
 [[nodiscard]] std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
-  sirius::op::sirius_dynamic_filter_set const& filters,
+  sirius::op::dynamic_filter_snapshot const& filters,
   dynamic_filter_gate& gate,
   rmm::cuda_stream_view stream,
   dynamic_filter_apply_mode mode,
