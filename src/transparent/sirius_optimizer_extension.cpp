@@ -225,9 +225,8 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
-  // Screen before optimization can remove scans, including when GPU execution is off.
-  if (screen_planning_attempt(
-        context, *ctx, *conn_state, plan.get(), &input.optimizer.binder.GetStatementProperties()) !=
+  // Decide before optimization can remove scans, including when GPU execution is off.
+  if (should_use_duckdb(context, plan.get(), &input.optimizer.binder.GetStatementProperties()) !=
       decline_reason::none) {
     return;
   }
@@ -262,10 +261,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
-  if (screen_planning_attempt(context, *ctx, *conn_state, nullptr, nullptr) !=
-      decline_reason::none) {
-    return;
-  }
+  if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
 
   // Copy the optimized plan into THIS connection's per-connection state,

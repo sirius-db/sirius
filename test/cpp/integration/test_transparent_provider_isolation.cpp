@@ -22,6 +22,8 @@
 #include <catch.hpp>
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/client_config.hpp>
+#include <duckdb/main/client_context_state.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
@@ -119,6 +121,136 @@ void drop_capture(duckdb::OptimizerExtensionInput& input,
 }
 
 }  // namespace
+
+TEST_CASE_METHOD(isolation_fixture,
+                 "provider marker alone latches before the first statement",
+                 "[integration][transparent][provenance][provider_marker]")
+{
+  gpu(GENERATE(true, false));
+  auto const catalog = hidden + "_user";
+  auto const table   = catalog + ".t";
+  struct detach_catalog {
+    duckdb::Connection& con;
+    std::string const& name;
+    ~detach_catalog() { con.Query("DETACH DATABASE IF EXISTS " + name); }
+  } guard{a, catalog};
+  query(a, "ATTACH '" + disk.directory + "/user.duckdb' AS " + catalog);
+  query(a, "CREATE TABLE " + table + " AS SELECT i::INTEGER AS i FROM range(3) r(i)");
+  query(a, "CHECKPOINT " + catalog);
+  REQUIRE(state(b)->provenance() == connection_provenance::unclassified);
+  b.context->registered_state->Insert("ducklake_internal_connection",
+                                      duckdb::make_shared_ptr<duckdb::ClientContextState>());
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    CAPTURE(attempt);
+    auto before = get_transparent_execution_stats(b);
+    auto result = query(b, "SELECT i FROM " + table + " ORDER BY i");
+    auto after  = get_transparent_execution_stats(b);
+    unchanged_gpu(before, after);
+    REQUIRE(after.provider_internal_skips == before.provider_internal_skips + 1);
+    REQUIRE(after.hidden_catalog_skips == before.hidden_catalog_skips);
+    REQUIRE(after.classification_failures == before.classification_failures);
+    REQUIRE(state(b)->provenance() == connection_provenance::provider_internal);
+    REQUIRE(state(b)->attempt_declined());
+    REQUIRE(state(b)->attempt_decline_reason() == decline_reason::provider_internal);
+    REQUIRE(result->RowCount() == 3);
+    for (int row = 0; row < 3; ++row) {
+      REQUIRE(result->GetValue(0, row).GetValue<int32_t>() == row);
+    }
+    b.context->registered_state->Remove("ducklake_internal_connection");
+  }
+}
+
+TEST_CASE_METHOD(isolation_fixture,
+                 "provider marker added after a user statement is honoured on the next attempt",
+                 "[integration][transparent][provenance][provider_marker]")
+{
+  auto c      = sirius::test::g_integration_env->make_connection();
+  auto before = get_transparent_execution_stats(c);
+  auto result = query(c, "SELECT 42::INTEGER");
+  auto user   = get_transparent_execution_stats(c);
+  sirius::test::require_transparent_execution_delta(before, user, 1, 0, 1);
+  REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  REQUIRE(state(c)->provenance() == connection_provenance::user);
+  REQUIRE_FALSE(state(c)->attempt_declined());
+  REQUIRE(user.provider_internal_skips == before.provider_internal_skips);
+  REQUIRE(user.hidden_catalog_skips == before.hidden_catalog_skips);
+  REQUIRE(user.classification_failures == before.classification_failures);
+  c.context->registered_state->Insert("ducklake_internal_connection",
+                                      duckdb::make_shared_ptr<duckdb::ClientContextState>());
+
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    CAPTURE(attempt);
+    auto previous = get_transparent_execution_stats(c);
+    auto marked   = query(c, "SELECT 43::INTEGER");
+    auto after    = get_transparent_execution_stats(c);
+    unchanged_gpu(previous, after);
+    REQUIRE(after.successful_rebinds == user.successful_rebinds);
+    REQUIRE(after.provider_internal_skips == previous.provider_internal_skips + 1);
+    REQUIRE(after.hidden_catalog_skips == previous.hidden_catalog_skips);
+    REQUIRE(after.classification_failures == previous.classification_failures);
+    REQUIRE(state(c)->provenance() == connection_provenance::provider_internal);
+    REQUIRE(state(c)->attempt_declined());
+    REQUIRE(state(c)->attempt_decline_reason() == decline_reason::provider_internal);
+    REQUIRE(marked->GetValue(0, 0).GetValue<int32_t>() == 43);
+  }
+}
+
+TEST_CASE_METHOD(isolation_fixture,
+                 "provider marker takes precedence over a hidden catalog without the fingerprint",
+                 "[integration][transparent][provenance][provider_marker]")
+{
+  gpu(GENERATE(true, false));
+  query(b, "USE " + hidden);
+  query(b, "SET SESSION catalog_error_max_schemas = 100");
+  REQUIRE(state(b)->provenance() == connection_provenance::user);
+  b.context->registered_state->Insert("ducklake_internal_connection",
+                                      duckdb::make_shared_ptr<duckdb::ClientContextState>());
+  auto before = get_transparent_execution_stats(b);
+  auto result = query(b, "SELECT i FROM t ORDER BY i");
+  auto after  = get_transparent_execution_stats(b);
+  unchanged_gpu(before, after);
+  REQUIRE(after.provider_internal_skips == before.provider_internal_skips + 1);
+  REQUIRE(after.hidden_catalog_skips == before.hidden_catalog_skips);
+  REQUIRE(after.classification_failures == before.classification_failures);
+  REQUIRE(state(b)->provenance() == connection_provenance::provider_internal);
+  REQUIRE(state(b)->attempt_declined());
+  REQUIRE(state(b)->attempt_decline_reason() == decline_reason::provider_internal);
+  REQUIRE(result->RowCount() == 3);
+  for (int row = 0; row < 3; ++row) {
+    REQUIRE(result->GetValue(0, row).GetValue<int32_t>() == row + 1);
+  }
+}
+
+TEST_CASE_METHOD(isolation_fixture,
+                 "provenance failure precedes a provider marker without latching the connection",
+                 "[integration][transparent][provenance][provider_marker]")
+{
+  gpu(GENERATE(true, false));
+  duckdb::ExtensionOption fault;
+  REQUIRE(duckdb::DBConfig::GetConfig(*b.context)
+            .TryGetExtensionOption("sirius_test_inject_provenance_failure", fault));
+  auto& settings = duckdb::ClientConfig::GetConfig(*b.context).user_settings;
+  // Configure the fault without planning a SET statement on the fresh connection.
+  settings.SetUserSetting(fault.setting_index.GetIndex(), duckdb::Value::BOOLEAN(true));
+  b.context->registered_state->Insert("ducklake_internal_connection",
+                                      duckdb::make_shared_ptr<duckdb::ClientContextState>());
+  REQUIRE(state(b)->provenance() == connection_provenance::unclassified);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    CAPTURE(attempt);
+    auto before = get_transparent_execution_stats(b);
+    auto result = query(b, "SELECT 42::INTEGER");
+    auto after  = get_transparent_execution_stats(b);
+    unchanged_gpu(before, after);
+    REQUIRE(after.classification_failures == before.classification_failures + 1);
+    REQUIRE(after.provider_internal_skips == before.provider_internal_skips);
+    REQUIRE(after.hidden_catalog_skips == before.hidden_catalog_skips);
+    REQUIRE(state(b)->provenance() == connection_provenance::unclassified);
+    REQUIRE(state(b)->attempt_declined());
+    REQUIRE(state(b)->attempt_decline_reason() == decline_reason::classification_failed);
+    REQUIRE(result->GetValue(0, 0).GetValue<int32_t>() == 42);
+  }
+}
 
 TEST_CASE_METHOD(isolation_fixture,
                  "provider connection declines a table query with GPU on or off",

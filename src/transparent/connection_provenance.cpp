@@ -47,7 +47,12 @@ namespace sirius::transparent {
 
 namespace {
 
-/// DuckLake metadata connections set this to 0 before querying their hidden catalog.
+/// DuckLake registers a ClientContextState under this key on the metadata connections it
+/// opens for itself (duckdb/ducklake#1407). Presence is the signal; the state's type is not
+/// needed.
+constexpr char const* PROVIDER_MARKER_KEY = "ducklake_internal_connection";
+
+/// DuckLake builds before the marker set this to 0 before querying their hidden catalog.
 constexpr char const* PROVIDER_FINGERPRINT_SETTING = "catalog_error_max_schemas";
 
 /// Test-only setting, registered under SIRIUS_ENABLE_TEST_OPTIONS=1.
@@ -64,6 +69,12 @@ bool setting_is_zero(duckdb::ClientContext& context, char const* name)
   duckdb::Value value;
   return context.TryGetCurrentSetting(name, value) && !value.IsNull() &&
          value.GetValue<uint64_t>() == 0;
+}
+
+bool has_provider_marker(duckdb::ClientContext& context)
+{
+  return context.registered_state &&
+         context.registered_state->Get<duckdb::ClientContextState>(PROVIDER_MARKER_KEY) != nullptr;
 }
 
 /// Transaction results borrow its owning reference; temp and global results retain their own.
@@ -155,6 +166,15 @@ classification_result classify_connection_provenance(duckdb::ClientContext& cont
     if (bool_setting_is_true(context, INJECT_FAILURE_SETTING)) {
       throw std::runtime_error("injected provenance classification failure");
     }
+    if (has_provider_marker(context)) {
+      state.latch_provider_internal();
+      log_best_effort([&] {
+        SIRIUS_LOG_INFO("connection {}: provider-internal, marked '{}' by the extension",
+                        state.connection_id(),
+                        PROVIDER_MARKER_KEY);
+      });
+      return {connection_provenance::provider_internal, decline_reason::provider_internal};
+    }
     std::string catalog_name;
     if (default_catalog_is_hidden(context, catalog_name) &&
         setting_is_zero(context, PROVIDER_FINGERPRINT_SETTING)) {
@@ -223,25 +243,28 @@ decline_reason inspect_plan_for_hidden_catalog(duckdb::LogicalOperator const& pl
   return decline_reason::none;
 }
 
-decline_reason screen_planning_attempt(duckdb::ClientContext& context,
-                                       duckdb::SiriusContext& sirius,
-                                       duckdb::SiriusConnectionState& state,
-                                       duckdb::LogicalOperator const* plan,
-                                       duckdb::StatementProperties const* properties) noexcept
+decline_reason should_use_duckdb(duckdb::ClientContext& context,
+                                 duckdb::LogicalOperator const* plan,
+                                 duckdb::StatementProperties const* properties) noexcept
 {
-  if (state.attempt_declined()) { return state.attempt_decline_reason(); }
+  auto sirius = context.registered_state
+                  ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                  : nullptr;
+  auto state  = duckdb::get_sirius_connection_state(context);
+  if (!sirius || !state) { return decline_reason::none; }
+  if (state->attempt_declined()) { return state->attempt_decline_reason(); }
   auto reason = decline_reason::none;
-  if (!state.classified_this_attempt()) {
-    reason = classify_connection_provenance(context, state).reason;
-    state.mark_classified();
+  if (!state->classified_this_attempt()) {
+    reason = classify_connection_provenance(context, *state).reason;
+    state->mark_classified();
   }
   if (reason == decline_reason::none && properties) {
     reason = inspect_statement_for_hidden_catalog(context, *properties);
   }
   if (reason == decline_reason::none && plan) { reason = inspect_plan_for_hidden_catalog(*plan); }
   if (reason == decline_reason::none) { return reason; }
-  state.decline_attempt(reason);
-  sirius.record_transparent_decline(reason);
+  state->decline_attempt(reason);
+  sirius->record_transparent_decline(reason);
   return reason;
 }
 
