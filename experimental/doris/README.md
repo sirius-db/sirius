@@ -107,7 +107,23 @@ Environment variables read by the backend:
 
 ## With the engine (Linux + NVIDIA)
 
-`pixi run be-build` builds libsirius via the repo-root build and links it (`sirius-engine`
-feature, on by default); `pixi run be-run -- --fe-host <fe>` then runs queries on the GPU.
-See `plan-doc/doris-pseudo-be-plan.md` for the milestones (P0 scaffolding → P1 translator →
-MVP-A0 single plan → MVP-A fragments → MVP-B multi-node).
+The engine-linked backend (`sirius-engine` feature, on by default) links `libsirius.so` from
+the repo-root build tree and runs every dispatched query on the GPU:
+
+```bash
+# once: the engine (repo root; CUDA 13 + RAPIDS come from the root pixi env)
+git submodule update --init --depth=1 --jobs 3 duckdb substrait cucascade
+pixi run make TEST_BUILD_TARGET=                  # → build/release/extension/sirius/libsirius.so
+
+cd experimental/doris
+pixi run cargo build --release -p sirius-doris-be # default env carries the engine's toolchain/libs
+pixi run bash scripts/be.sh start --engine        # SIRIUS_BE_TRANSLATE_ONLY=0, --sirius-config conf/sirius.yaml
+pixi run -e fe bash scripts/run-tpch.sh --data /tmp/tpch-sf1   # execute + validate the 22 queries
+```
+
+`conf/sirius.yaml` sizes the engine for a small box shared with the FE (GPU 90 %, pinned host
+tier 12 GiB, spill and telemetry under `log/`); without it Sirius pins 90 % of host RAM. `be.sh
+--engine` puts the build tree and the env's `lib/` on `LD_LIBRARY_PATH` (`SIRIUS_BUILD_DIR`
+overrides the tree). The `be-build`/`be-run` tasks do the same but first re-run the root build
+including its C++ unit tests. See `plan-doc/doris-pseudo-be-plan.md` for the milestones (P0
+scaffolding → P1 translator → MVP-A0 single plan → MVP-A fragments → MVP-B multi-node).
