@@ -17,13 +17,14 @@
 // Regression coverage for Fragment::Impl::end_lifecycle() (src/sirius_ffi.cpp): a build()
 // failure while the transaction is still open must roll it back, not commit it (a7bb47e2).
 //
-// The public FFI surface links only DuckDB's substrait consumer (no substrait-plan-from-SQL
-// helper, no raw-SQL passthrough), so no test here can construct a valid Fragment or inspect
-// catalog state after a failed build(). Instead these tests use a declared column type name
-// that TransformStringToLogicalType() can never resolve, which fails build() inside
-// resolve_inputs() before `substrait_plan` is ever parsed — and check the one thing observable
-// through the public API: that end_lifecycle() leaves the connection able to start and fail a
-// second, independent Fragment cleanly.
+// These cases cannot inspect catalog state after a failed build() — they use a declared
+// column type name that TransformStringToLogicalType() can never resolve, which fails
+// build() inside resolve_inputs() before `substrait_plan` is ever parsed, and check the
+// one thing observable through the public API: that end_lifecycle() leaves the connection
+// able to start and fail a second, independent Fragment cleanly.
+//
+// Valid Fragment construction (Substrait local_files / stream views, Arrow hop) lives in
+// test_sirius_ffi_arrow.cpp.
 
 #include "sirius_ffi.hpp"
 
