@@ -74,13 +74,30 @@ case "${1:-}" in
         echo "warning: backend did not report registration within 60s; see ${BE_LOG}" >&2
         ;;
     stop)
+        pid=""
         if [ -f "${PID_FILE}" ]; then
-            kill "$(cat "${PID_FILE}")" 2>/dev/null || true
+            pid="$(cat "${PID_FILE}")"
+            kill "${pid}" 2>/dev/null || true
             rm -f "${PID_FILE}"
-            echo "backend stopped"
         else
             pkill -f "sirius-doris-be --fe-host" 2>/dev/null || true
         fi
+        # SIGTERM returns before the process is gone, and the engine's GPU pool (90 % of the
+        # device) is only released when the CUDA context is torn down; a start right behind a
+        # stop then fails its bring-up with cudaErrorMemoryAllocation. Wait for the process,
+        # then for the device to be free again (nvidia-smi is absent on the no-engine path).
+        for _ in $(seq 1 60); do
+            [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null || break
+            sleep 0.5
+        done
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            for _ in $(seq 1 60); do
+                used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+                [ -n "${used}" ] && [ "${used}" -gt 2048 ] || break
+                sleep 0.5
+            done
+        fi
+        echo "backend stopped"
         ;;
     log)
         exec tail -f "${BE_LOG}"
