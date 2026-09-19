@@ -29,7 +29,7 @@ from pathlib import Path
 ROUND_COLUMNS = [
     "system", "sf", "round", "cold", "query", "status", "rows", "wall_ms", "engine_ms", "fe_ms", "plan_ms",
     "schedule_ms", "rpc1_ms", "cpu_ms", "peak_mem_bytes", "scan_bytes", "scan_rows", "query_id", "start_ms",
-    "end_ms", "peak_rss_kb", "read_bytes", "cpu_cores", "gpu_peak_mib",
+    "end_ms", "peak_rss_kb", "read_bytes", "cpu_cores", "gpu_peak_mib", "gpu_util_pct", "gpu_mem_util_pct",
 ]
 
 
@@ -56,7 +56,7 @@ def window_samples(samples: list[dict[str, str]], start: float, end: float) -> d
     """Process/GPU numbers of one query from the sampler's 500 ms ticks: the peaks inside
     [start, end] (widened by one tick so sub-tick queries still see a sample), the read_bytes
     and CPU deltas between the last tick before the query and the first tick after it."""
-    out = {"peak_rss_kb": "-", "read_bytes": "-", "cpu_cores": "-", "gpu_peak_mib": "-"}
+    out = {"peak_rss_kb": "-", "read_bytes": "-", "cpu_cores": "-", "gpu_peak_mib": "-", "gpu_util_pct": "-", "gpu_mem_util_pct": "-"}
     if not samples:
         return out
     inside = [s for s in samples if start - 600 <= num(s["ts_ms"]) <= end + 600]
@@ -66,6 +66,13 @@ def window_samples(samples: list[dict[str, str]], start: float, end: float) -> d
         out["peak_rss_kb"] = str(int(max(rss)))
     if gpu:
         out["gpu_peak_mib"] = str(int(max(gpu)))
+    # GPU utilization: the mean over the samples strictly inside the window (nvidia-smi's
+    # percentages already cover ~1 s each), so a query shorter than a sample shows "-".
+    strictly = [s for s in samples if start <= num(s["ts_ms"]) <= end]
+    for column in ("gpu_util_pct", "gpu_mem_util_pct"):
+        values = [num(s.get(column)) for s in strictly if num(s.get(column)) is not None]
+        if values:
+            out[column] = f"{sum(values) / len(values):.0f}"
     before = [s for s in samples if num(s["ts_ms"]) <= start and num(s["read_bytes"]) is not None]
     after = [s for s in samples if num(s["ts_ms"]) >= end and num(s["read_bytes"]) is not None]
     if before and after:
@@ -292,7 +299,7 @@ def cmd_report(args) -> int:
         lines.append("")
 
     # --- resources
-    lines.append("## Resources (hot medians): peak RSS MiB / bytes read from disk MiB / CPU cores busy / peak GPU MiB")
+    lines.append("## Resources (hot medians): peak RSS MiB / bytes read from disk MiB / CPU cores busy / GPU MiB in use / GPU busy % / GPU memory-controller busy %")
     lines.append("")
     header = ["q"] + [r.system for r in runs]
     lines.append("| " + " | ".join(header) + " |")
@@ -304,14 +311,19 @@ def cmd_report(args) -> int:
             rb = r.hot(q, "read_bytes")
             cpu = r.hot(q, "cpu_cores")
             gpu = r.hot(q, "gpu_peak_mib")
+            util = r.hot(q, "gpu_util_pct")
+            mem_util = r.hot(q, "gpu_mem_util_pct")
             cells.append(
                 f"{fmt_ms(rss / 1024 if rss is not None else None)} / {fmt_ms(rb / 2**20 if rb is not None else None)} / "
-                f"{'-' if cpu is None else f'{cpu:.1f}'} / {fmt_ms(gpu)}"
+                f"{'-' if cpu is None else f'{cpu:.1f}'} / {fmt_ms(gpu)} / {fmt_ms(util)} / {fmt_ms(mem_util)}"
             )
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
     lines.append("Bytes read from disk = `/proc/<pid>/io read_bytes` delta over the query (0 on a page-cache hit; "
-                 "O_DIRECT reads always count); sampled every 0.5 s, so sub-second queries are attributed approximately.")
+                 "O_DIRECT reads always count); sampled every 0.5 s, so sub-second queries are attributed approximately. "
+                 "GPU MiB in use is the RMM pool (reserved up front, not a peak); GPU busy % = nvidia-smi `utilization.gpu` "
+                 "(share of time a kernel was running) and memory-controller busy % = `utilization.memory`, both averaged "
+                 "over the query's samples; `-` when the query was shorter than one sample.")
     lines.append("")
 
     # --- environment
