@@ -29,7 +29,7 @@ Doris FE (official 4.1.4 binary)          sirius-doris-be (this crate)
 | `src/` | the backend: `node.rs`, `backend_service.rs`, `params.rs`, `file_schema.rs`, `result_*.rs`, `fragment_executor.rs`, `engine.rs` |
 | `src/bin/dump-fragments.rs` | pretty-print a captured dispatch payload (`--summary`, `--translate` per fragment, `--stitch` as one plan) |
 | `conf/fe.conf`, `sql/` | FE config, global session defaults, TPC-H views over `local()`, the 22 queries (`sql/tpch`), probes for plan-level semantic gaps (`sql/gaps`) |
-| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh`; `build-duckdb-substrait.sh`, `validate_tpch_results.py`, `cpu-diff.sh` (the DuckDB baseline and the CPU differential, below); the benchmark harness `fetch-be.sh`, `be-native.sh`, `bench.sh`, `bench-all.sh`, `bench-report.py`, `run-tpch-duckdb.sh`, `fe-audit.py`, `evict-cache.py`, `olap-load.sh` (below) |
+| `scripts/` | `fetch-fe.sh` (official tarball → `.doris-fe/fe`), `fe.sh`, `be.sh`, `run-tpch.sh`; `build-duckdb-substrait.sh`, `validate_tpch_results.py`, `cpu-diff.sh` (the DuckDB baseline and the CPU differential, below); the benchmark harness `fetch-be.sh`, `be-native.sh`, `bench.sh`, `bench-all.sh`, `bench-report.py`, `run-tpch-duckdb.sh`, `fe-audit.py`, `evict-cache.py`, `olap-load.sh` (below), `telemetry-plans.py` (per-query engine window + pipeline shape from a Quent telemetry directory) |
 | `tests/fixtures/tpch/`, `tests/fixtures/gaps/` | captured FE→BE dispatches for all 22 TPC-H queries and for the `sql/gaps` probes (`INDEX.md` has the shapes and coverage) |
 | `tests/snapshots/` | the reviewed translation of every captured query (stitched node tree + `substrait-explain` text, or the refusal); `tests/corpus.rs` diffs against these |
 | `tests/expected/tpch-sf1/`, `tests/expected/tpch-sf10/`, `tests/expected/gaps-sf1/` | the queries' results on the SF1 / SF10 datasets, computed by DuckDB from the same parquet files (`INDEX.md` has the row counts); what `run-tpch.sh` and the CPU differential validate against |
@@ -174,6 +174,11 @@ the 0.5 s sampler: RSS, bytes read from disk, CPU ticks of the backend process, 
 GPU systems nvidia-smi's memory in use, `utilization.gpu` and `utilization.memory`) and
 `rounds.csv` (everything flattened by `bench-report.py rounds`: per query the peaks, deltas
 and mean GPU utilization over its window). `bench-report.py report` turns several run directories into the Markdown tables.
+`engine_ms` is the whole `execute_substrait` call (Substrait lowering, planning, execution,
+Arrow conversion); the engine's own query window is in the run's `telemetry/` directory
+(`scripts/telemetry-plans.py <run>/telemetry/<instance>/`) — a gap between the two is time
+spent outside the GPU, which is how the parquet-footer re-parse in the Substrait consumer
+was found (fixed in the engine by enabling `parquet_metadata_cache` on the FFI path).
 
 Two things the harness does to keep the comparison fair: it drops this backend from the FE
 (`ALTER SYSTEM DROPP BACKEND`) while a native system runs — the backend never reports its CPU
