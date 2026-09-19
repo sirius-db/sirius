@@ -361,7 +361,7 @@ TEST_CASE("compressed_schema_propagation - hash join restores keys and maps payl
     // through narrow.
     auto probe                    = make_scan(2, {k_int8, k_int8});
     probe->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    probe->sirius_dynamic_filters->register_producer({0});
+    auto producer                 = probe->sirius_dynamic_filters->register_producer({0});
     duckdb::unique_ptr<sirius_physical_operator> plan =
       make_hash_join(duckdb::JoinType::INNER,
                      std::move(probe),
@@ -528,7 +528,7 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only the
   {
     auto scan                    = make_scan(2, {k_int8, k_int8});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer({0});
+    auto producer                = scan->sirius_dynamic_filters->register_producer({0});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);
@@ -540,7 +540,7 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only the
   {
     auto scan                    = make_scan(2, {k_int8, k_int8});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer({0, 1});
+    auto producer                = scan->sirius_dynamic_filters->register_producer({0, 1});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);
@@ -552,7 +552,7 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only the
   {
     auto scan                    = make_scan(2, {k_int8, k_int8});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer({});
+    auto producer                = scan->sirius_dynamic_filters->register_producer({});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);
@@ -578,7 +578,7 @@ TEST_CASE("compressed_schema_propagation - dynamic-filter targets clear only the
     // flips it native even though that output reads column_ids position 2.
     auto scan = make_scan(2, {k_int8, k_int8}, duckdb::vector<std::size_t>{2, 0});
     scan->sirius_dynamic_filters = std::make_shared<sirius::op::sirius_dynamic_filter_set>();
-    scan->sirius_dynamic_filters->register_producer({0});
+    auto producer                = scan->sirius_dynamic_filters->register_producer({0});
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(scan);
 
     sirius::planner::propagate_compressed_schema(plan);

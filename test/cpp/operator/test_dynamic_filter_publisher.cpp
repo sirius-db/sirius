@@ -83,6 +83,40 @@ constexpr std::size_t kProbeColumnIndex = 7;
 using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
+sirius::op::dynamic_filter_publication_outcome publish_for_test(
+  dynamic_filter_publish_plan const& plan,
+  cudf::table_view const& table,
+  rmm::cuda_stream_view stream)
+{
+  std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
+  for (auto const& target : plan.probe_targets()) {
+    std::vector<std::size_t> columns;
+    for (auto const& binding : target.key_bindings) {
+      columns.push_back(binding.channel_push_ordinal);
+    }
+    producers.push_back(target.filter_set->register_producer(std::move(columns)));
+  }
+  for (auto const& target : plan.probe_targets()) {
+    target.filter_set->freeze_registration();
+  }
+  try {
+    auto result = sirius::op::publish_dynamic_filters(plan, table, stream, producers);
+    stream.synchronize();
+    for (auto const& producer : producers) {
+      producer.finish(result.filters_pushed != 0
+                        ? sirius::op::sirius_dynamic_filter_set::completion::published
+                        : sirius::op::sirius_dynamic_filter_set::completion::skipped);
+    }
+    return result;
+  } catch (...) {
+    stream.synchronize();
+    for (auto const& producer : producers) {
+      producer.finish(sirius::op::sirius_dynamic_filter_set::completion::failed);
+    }
+    throw;
+  }
+}
+
 constexpr auto kInt64   = cudf::data_type{cudf::type_id::INT64};
 constexpr auto kFloat64 = cudf::data_type{cudf::type_id::FLOAT64};
 
@@ -255,8 +289,7 @@ void require_published_membership(
             static_cast<std::size_t>(l2_bytes));
   }
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   auto const snapshot = channel->filters_for_column(kProbeColumnIndex);
   REQUIRE(snapshot.size() == 1);
@@ -344,8 +377,7 @@ void require_domain_gate_skips_only(std::size_t gated_key_index)
     std::move(targets),
     std::move(fixture.replica_spaces)};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   REQUIRE(outcome.keys_considered == 2);
   REQUIRE(outcome.keys_skipped_domain_gate == 1);
@@ -490,8 +522,7 @@ TEST_CASE("dynamic-filter publisher fans out sparsely: each target receives only
                                    std::move(targets),
                                    std::move(fixture.replica_spaces)};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   REQUIRE(outcome.keys_considered == 2);
   REQUIRE(outcome.membership_filters_built == 2);
@@ -555,8 +586,7 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps for floating-point keys
                                    std::move(fixture.replica_spaces),
                                    {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   // Suppression is a capability outcome, not the type-mismatch skip path.
   REQUIRE(outcome.keys_considered == 2);
@@ -597,19 +627,17 @@ TEST_CASE("dynamic-filter publisher fails loudly on a plan/runtime key-mapping i
   SECTION("build ordinal outside the runtime build table")
   {
     auto const plan = make_plan(make_int64_key(0, 5));
-    REQUIRE_THROWS_AS(
-      (void)sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream),
-      std::logic_error);
+    REQUIRE_THROWS_AS((void)publish_for_test(plan, fixture.build_view(), fixture.stream),
+                      std::logic_error);
   }
   SECTION("recorded storage type disagreeing with the runtime build column skips the key")
   {
     // The join stays authoritative, so a type-derivation disagreement is a counted skip, not
     // a failure.
-    auto key         = make_int64_key(0, 0);
-    key.storage_type = cudf::data_type{cudf::type_id::INT32};
-    auto const plan  = make_plan(key);
-    auto const outcome =
-      sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+    auto key           = make_int64_key(0, 0);
+    key.storage_type   = cudf::data_type{cudf::type_id::INT32};
+    auto const plan    = make_plan(key);
+    auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
     REQUIRE(outcome.keys_skipped_type_mismatch == 1);
     REQUIRE(outcome.filters_pushed == 0);
     REQUIRE(outcome.membership_filters_built == 0);
@@ -643,8 +671,7 @@ TEST_CASE("dynamic-filter publisher suppresses zone maps per binding on probe-ty
                                    std::move(fixture.replica_spaces),
                                    {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   auto const matching_snapshot = matching_channel->filters_for_column(kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(matching_snapshot) ==
@@ -686,8 +713,7 @@ TEST_CASE("dynamic-filter publisher keeps zone maps out of membership-only targe
                                    std::move(fixture.replica_spaces),
                                    {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   auto const scan_snapshot = scan_channel->filters_for_column(kProbeColumnIndex);
   REQUIRE(count_filters_of_kind<sirius::op::sirius_dynamic_zone_map_filter>(scan_snapshot) == 1);
@@ -716,8 +742,7 @@ TEST_CASE("dynamic-filter publisher completes on a plan with targets but no admi
   REQUIRE(plan.enabled());
 
   // A producer whose keys were all inadmissible still claims publication and publishes nothing.
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   REQUIRE_FALSE(channel->has_filters());
 }
 
@@ -741,8 +766,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing from an empty build",
                                    std::move(fixture.replica_spaces),
                                    {.emit_zone_map_filters = true}};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
   REQUIRE(channel->empty());
   REQUIRE_FALSE(channel->has_filters());
@@ -769,8 +793,7 @@ TEST_CASE("dynamic-filter publisher publishes nothing once every target has drai
   dynamic_filter_publish_plan plan{
     {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
   require_nothing_published(outcome);
   REQUIRE(channel->empty());
   REQUIRE_FALSE(channel->has_filters());
@@ -804,8 +827,7 @@ TEST_CASE("dynamic-filter publisher serves a live target beside a drained one",
   dynamic_filter_publish_plan plan{
     {make_int64_key(0, 0)}, std::move(targets), std::move(fixture.replica_spaces)};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   REQUIRE(outcome.keys_considered == 1);
   REQUIRE(outcome.membership_filters_built == 1);
@@ -1016,8 +1038,7 @@ TEST_CASE("dynamic-filter publisher builds filters only for bound keys",
                                    std::move(targets),
                                    std::move(fixture.replica_spaces)};
 
-  auto const outcome =
-    sirius::op::publish_dynamic_filters(plan, fixture.build_view(), fixture.stream);
+  auto const outcome = publish_for_test(plan, fixture.build_view(), fixture.stream);
 
   REQUIRE(outcome.keys_considered == 1);
   REQUIRE(outcome.membership_filters_built == 1);

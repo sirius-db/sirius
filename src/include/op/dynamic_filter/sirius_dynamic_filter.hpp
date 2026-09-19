@@ -333,16 +333,108 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   std::unique_ptr<impl> _impl;
 };
 
+class sirius_dynamic_filter_set;
+
 /**
- * @brief Thread-safe append-only channel keyed by consumer output ordinal
+ * @brief An owning observation of one endpoint's immutable filters and producer completion
+ */
+class dynamic_filter_snapshot final {
+ public:
+  /** @brief One filter and its target column in the consumer's output schema */
+  struct entry {
+    std::size_t column_index;
+    std::shared_ptr<sirius_dynamic_filter const> filter;
+  };
+
+  [[nodiscard]] std::span<entry const> entries() const noexcept { return _entries; }
+  /**
+   * @brief The generation of the snapshot (measured by the number of filters added to the endpoint)
+   */
+  [[nodiscard]] std::size_t generation() const noexcept { return _entries.size(); }
+  /**
+   * @brief Indicates if the snapshot represents a terminal state (no more filters will be added to
+   * the endpoint)
+   */
+  [[nodiscard]] bool terminal() const noexcept { return _terminal; }
+  [[nodiscard]] bool empty() const noexcept { return _entries.empty(); }
+
+ private:
+  friend class sirius_dynamic_filter_set;
+  std::vector<entry> _entries;
+  bool _terminal = false;
+};
+
+/**
+ * @brief Thread-safe append-only endpoint with identified publication owners
  *
- * Snapshots co-own immutable filters and may observe any published prefix. Closing rejects future
- * pushes.
+ * Register every producer before freeze_registration(). Only a producer can append filters, and its
+ * terminal transition follows its last possible push. Completion never removes an already-visible
+ * filter. Snapshots distinguish pending and terminal channels independently of whether filters
+ * exist.
  */
 class sirius_dynamic_filter_set {
+  struct state;
+
  public:
-  /// Returns false for a null filter or a closed or ignored column; otherwise appends it.
-  bool push_filter(std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> f);
+  enum class completion { published, skipped, failed, cancelled };
+
+  /**
+   * @brief Move-only publication right retaining its channel's state
+   *
+   * `producer` bundles 2 things:
+   *  - The right to append filters (push_filter())
+   *  - The responsibility to declare that this producer will not append more filters (finish())
+   *
+   * Destruction resolves an unfinished producer as skipped. finish() is allocation-free and
+   * idempotent; subsequent pushes are rejected. Moving or destroying the right requires exclusive
+   * ownership, while push_filter() and finish() may race safely.
+   */
+  class producer final {
+   public:
+    producer(producer const&)            = delete;
+    producer& operator=(producer const&) = delete;
+    producer(producer&&) noexcept;
+    producer& operator=(producer&&) noexcept;
+    ~producer();
+
+    /**
+     * @brief Appends a filter to the producer's channel
+     *
+     * @param col_idx The column index to append the filter to in the target consumer's output
+     *                schema
+     * @param filter The filter to append
+     * @return true if the filter was successfully appended, false otherwise
+     */
+    [[nodiscard]] bool push_filter(std::size_t col_idx,
+                                   std::shared_ptr<sirius_dynamic_filter const> filter) const;
+
+    /**
+     * @brief Declares that the producer will not append more filters
+     *
+     * @param result The completion result of the producer
+     */
+    void finish(completion result = completion::skipped) const noexcept;
+
+   private:
+    friend class sirius_dynamic_filter_set;
+    producer(std::shared_ptr<state> channel, std::size_t index) noexcept;
+    std::shared_ptr<state> _channel;
+    std::size_t _index = 0;
+  };
+
+  sirius_dynamic_filter_set();
+  sirius_dynamic_filter_set(sirius_dynamic_filter_set const&)            = delete;
+  sirius_dynamic_filter_set& operator=(sirius_dynamic_filter_set const&) = delete;
+
+  /**
+   * @brief Returns a snapshot of the current state of the dynamic filter set.
+   *
+   * @return A snapshot of the current state of the dynamic filter set, including all filters that
+   *         have been added so far.
+   * @note The snapshot is valid even if new filters are added or the filter set is destroyed after
+   *       the snapshot is taken (the snapshot owns its entries).
+   */
+  [[nodiscard]] dynamic_filter_snapshot snapshot() const;
 
   /**
    * @brief Returns an insertion-order owning snapshot valid after later pushes or destruction
@@ -350,7 +442,11 @@ class sirius_dynamic_filter_set {
   [[nodiscard]] std::vector<std::shared_ptr<sirius_dynamic_filter const>> filters_for_column(
     std::size_t col_idx) const;
 
-  /// Returns filtered columns in unspecified order.
+  /**
+   * @brief Returns the columns that have filters
+   *
+   * @note Meaningful only with producers and no unscoped producer.
+   */
   [[nodiscard]] std::vector<std::size_t> filtered_columns() const;
   [[nodiscard]] bool empty() const;
 
@@ -365,50 +461,45 @@ class sirius_dynamic_filter_set {
    * @brief Registers one producer's target output columns
    *
    * An empty vector is unscoped, so consumers must treat every column as a possible target.
+   * @return A move-only right to append filters and declare completion for the producer. The
+   *         producer handle also holds a shared_ptr to the channel state, so destroying the outer
+   *         channel object doesn't invalidate the survivor producer handle.
    */
-  void register_producer(std::vector<std::size_t> planned_target_columns);
+  [[nodiscard]] producer register_producer(std::vector<std::size_t> planned_target_columns);
 
-  [[nodiscard]] bool has_producers() const noexcept
-  {
-    return _producer_count.load(std::memory_order_acquire) > 0;
-  }
+  /**
+   * @brief Seals the producer set before execution or a manual plan's first observation
+   *
+   * Idempotent. Before this boundary snapshots are always pending, including an empty channel.
+   */
+  void freeze_registration() noexcept;
 
-  // Sorted consumer-output ordinals; meaningful only with producers and no unscoped producer.
+  [[nodiscard]] bool has_producers() const noexcept;
+
+  /**
+   * @brief Get sorted consumer-output ordinals.
+   *
+   * @note Meaningful only with producers and no unscoped producer.
+   */
   [[nodiscard]] std::vector<std::size_t> planned_target_columns() const;
 
-  [[nodiscard]] bool has_unscoped_producer() const noexcept
-  {
-    return _has_unscoped_producer.load(std::memory_order_acquire);
-  }
+  [[nodiscard]] bool has_unscoped_producer() const noexcept;
 
   void close_for_new_filters();
 
-  [[nodiscard]] bool accepting_filters() const noexcept
-  {
-    return _accepting_filters.load(std::memory_order_acquire);
-  }
+  [[nodiscard]] bool accepting_filters() const noexcept;
 
-  [[nodiscard]] bool has_filters() const noexcept
-  {
-    return _filter_count.load(std::memory_order_acquire) > 0;
-  }
+  [[nodiscard]] bool has_filters() const noexcept;
 
-  // Monotonic, allowing consumers to detect growth past a snapshot.
-  [[nodiscard]] std::size_t filter_count() const noexcept
-  {
-    return _filter_count.load(std::memory_order_acquire);
-  }
+  /**
+   * @brief The number of filters in the dynamic filter set
+   *
+   * This is a monotonic counter, allowing consumers to detect growth past a snapshot.
+   */
+  [[nodiscard]] std::size_t filter_count() const noexcept;
 
  private:
-  mutable std::mutex _mu;
-  std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
-    _filters;
-  std::unordered_set<std::size_t> _ignored_columns;
-  std::set<std::size_t> _planned_target_columns;
-  std::atomic<std::size_t> _filter_count{0};
-  std::atomic<std::size_t> _producer_count{0};
-  std::atomic<bool> _has_unscoped_producer{false};
-  std::atomic<bool> _accepting_filters{true};
+  std::shared_ptr<state> _state;
 };
 
 // Resolver results must already belong to the destination AST tree.
@@ -423,7 +514,7 @@ using column_ref_resolver_fn = std::function<cudf::ast::expression const&(std::s
 [[nodiscard]] cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(
   cudf::ast::tree& tree,
   cudf::ast::expression const& existing_root,
-  sirius_dynamic_filter_set const& set,
+  dynamic_filter_snapshot const& filters,
   column_ref_resolver_fn const& column_ref_resolver);
 
 }  // namespace sirius::op

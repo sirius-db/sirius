@@ -108,6 +108,7 @@ class sirius_engine {
   bool query_finished;
 
  private:
+  void cancel_dynamic_filter_publications() noexcept;
   sirius::query_id_t query_id_;
   /// The planner query for this execution: the pipeline set plus the operator->pipeline and
   /// scan-operator indices built over `sirius_owned_plan`. Owned here because it indexes this

@@ -466,95 +466,206 @@ cudf::ast::expression const& sirius_dynamic_zone_map_filter::to_ast(
   return *result;
 }
 
-bool sirius_dynamic_filter_set::push_filter(std::size_t col_idx,
-                                            std::shared_ptr<sirius_dynamic_filter const> f)
+//===----------sirius_dynamic_filter_set::state----------===//
+/// @brief The shared channel state of a dynamic filter set
+struct sirius_dynamic_filter_set::state {
+  struct producer_state {
+    bool terminal     = false;
+    completion result = completion::skipped;
+  };
+
+  mutable std::mutex mutex;
+  std::unordered_map<std::size_t, std::vector<std::shared_ptr<sirius_dynamic_filter const>>>
+    filters;
+  std::unordered_set<std::size_t> ignored_columns;
+  std::set<std::size_t> planned_columns;
+  std::vector<producer_state> producers;
+  std::size_t completed_producers = 0;
+  bool registration_frozen        = false;
+  std::atomic<std::size_t> filter_count{0};
+  std::atomic<std::size_t> producer_count{0};
+  std::atomic<bool> unscoped{false};
+  std::atomic<bool> accepting{true};
+};
+
+//===----------sirius_dynamic_filter_set----------===//
+sirius_dynamic_filter_set::sirius_dynamic_filter_set() : _state(std::make_shared<state>()) {}
+
+sirius_dynamic_filter_set::producer::producer(std::shared_ptr<state> channel,
+                                              std::size_t index) noexcept
+  : _channel(std::move(channel)), _index(index)
 {
-  if (!f) { return false; }
-  {
-    std::scoped_lock lk(_mu);
-    if (!_accepting_filters.load(std::memory_order_relaxed)) { return false; }
-    if (_ignored_columns.count(col_idx) != 0) { return false; }
-    _filters[col_idx].push_back(std::move(f));
+}
+
+sirius_dynamic_filter_set::producer::producer(producer&& other) noexcept = default;
+
+sirius_dynamic_filter_set::producer& sirius_dynamic_filter_set::producer::operator=(
+  producer&& other) noexcept
+{
+  if (this != &other) {
+    finish();
+    _channel = std::move(other._channel);
+    _index   = other._index;
   }
-  _filter_count.fetch_add(1, std::memory_order_release);
+  return *this;
+}
+
+sirius_dynamic_filter_set::producer::~producer()
+{
+  // finish() with skipped completion
+  finish();
+}
+
+bool sirius_dynamic_filter_set::producer::push_filter(
+  std::size_t col_idx, std::shared_ptr<sirius_dynamic_filter const> filter) const
+{
+  if (!_channel || !filter) { return false; }
+  std::scoped_lock lock(_channel->mutex);
+  if (_channel->producers[_index].terminal ||
+      !_channel->accepting.load(std::memory_order_relaxed) ||
+      _channel->ignored_columns.contains(col_idx)) {
+    return false;
+  }
+  _channel->filters[col_idx].push_back(std::move(filter));
+  _channel->filter_count.fetch_add(1, std::memory_order_release);
   return true;
+}
+
+void sirius_dynamic_filter_set::producer::finish(completion result) const noexcept
+{
+  if (!_channel) { return; }
+  std::scoped_lock lock(_channel->mutex);
+  auto& slot = _channel->producers[_index];
+  if (slot.terminal) { return; }
+  slot.result   = result;
+  slot.terminal = true;
+  ++_channel->completed_producers;
+}
+
+dynamic_filter_snapshot sirius_dynamic_filter_set::snapshot() const
+{
+  std::scoped_lock lock(_state->mutex);
+  dynamic_filter_snapshot result;
+  result._entries.reserve(_state->filter_count.load(std::memory_order_relaxed));
+  for (auto const& [column, filters] : _state->filters) {
+    for (auto const& filter : filters) {
+      result._entries.push_back({column, filter});
+    }
+  }
+  result._terminal =
+    _state->registration_frozen && _state->completed_producers == _state->producers.size();
+  return result;
 }
 
 void sirius_dynamic_filter_set::ignore_columns(std::vector<std::size_t> const& cols)
 {
-  std::scoped_lock lk(_mu);
-  _ignored_columns.insert(cols.begin(), cols.end());
+  std::scoped_lock lock(_state->mutex);
+  _state->ignored_columns.insert(cols.begin(), cols.end());
 }
 
-void sirius_dynamic_filter_set::register_producer(std::vector<std::size_t> planned_target_columns)
+sirius_dynamic_filter_set::producer sirius_dynamic_filter_set::register_producer(
+  std::vector<std::size_t> planned_target_columns)
 {
-  if (planned_target_columns.empty()) {
-    _has_unscoped_producer.store(true, std::memory_order_release);
-  } else {
-    std::scoped_lock lk(_mu);
-    _planned_target_columns.insert(planned_target_columns.begin(), planned_target_columns.end());
+  std::scoped_lock lock(_state->mutex);
+  if (_state->registration_frozen) {
+    throw std::logic_error("Dynamic-filter producers must register before execution");
   }
-  _producer_count.fetch_add(1, std::memory_order_release);
+  if (planned_target_columns.empty()) {
+    _state->unscoped.store(true, std::memory_order_release);
+  } else {
+    _state->planned_columns.insert(planned_target_columns.begin(), planned_target_columns.end());
+  }
+  auto const index = _state->producers.size();
+  _state->producers.emplace_back();
+  _state->producer_count.fetch_add(1, std::memory_order_release);
+  return producer{_state, index};
+}
+
+void sirius_dynamic_filter_set::freeze_registration() noexcept
+{
+  std::scoped_lock lock(_state->mutex);
+  _state->registration_frozen = true;
+}
+
+bool sirius_dynamic_filter_set::has_producers() const noexcept
+{
+  return _state->producer_count.load(std::memory_order_acquire) != 0;
+}
+
+bool sirius_dynamic_filter_set::has_unscoped_producer() const noexcept
+{
+  return _state->unscoped.load(std::memory_order_acquire);
+}
+
+bool sirius_dynamic_filter_set::accepting_filters() const noexcept
+{
+  return _state->accepting.load(std::memory_order_acquire);
+}
+
+bool sirius_dynamic_filter_set::has_filters() const noexcept { return filter_count() != 0; }
+
+std::size_t sirius_dynamic_filter_set::filter_count() const noexcept
+{
+  return _state->filter_count.load(std::memory_order_acquire);
 }
 
 std::vector<std::size_t> sirius_dynamic_filter_set::planned_target_columns() const
 {
-  std::scoped_lock lk(_mu);
-  return {_planned_target_columns.begin(), _planned_target_columns.end()};
+  std::scoped_lock lock(_state->mutex);
+  return {_state->planned_columns.begin(), _state->planned_columns.end()};
 }
 
 void sirius_dynamic_filter_set::close_for_new_filters()
 {
-  std::scoped_lock lk(_mu);
-  _accepting_filters.store(false, std::memory_order_release);
+  std::scoped_lock lock(_state->mutex);
+  _state->accepting.store(false, std::memory_order_release);
 }
 
 std::vector<std::shared_ptr<sirius_dynamic_filter const>>
 sirius_dynamic_filter_set::filters_for_column(std::size_t col_idx) const
 {
-  std::scoped_lock lk(_mu);
-  auto it = _filters.find(col_idx);
-  if (it == _filters.end()) { return {}; }
+  std::scoped_lock lock(_state->mutex);
+  auto it = _state->filters.find(col_idx);
+  if (it == _state->filters.end()) { return {}; }
   return it->second;
 }
 
 std::vector<std::size_t> sirius_dynamic_filter_set::filtered_columns() const
 {
-  std::scoped_lock lk(_mu);
+  std::scoped_lock lock(_state->mutex);
   std::vector<std::size_t> out;
-  out.reserve(_filters.size());
-  for (auto const& [k, _] : _filters) {
+  out.reserve(_state->filters.size());
+  for (auto const& [k, _] : _state->filters) {
     out.push_back(k);
   }
   return out;
 }
 
-bool sirius_dynamic_filter_set::empty() const
-{
-  std::scoped_lock lk(_mu);
-  return _filters.empty();
-}
+bool sirius_dynamic_filter_set::empty() const { return !has_filters(); }
 
 cudf::ast::expression const& merge_ast_dynamic_filters_into_tree(
   cudf::ast::tree& tree,
   cudf::ast::expression const& existing_root,
-  sirius_dynamic_filter_set const& set,
+  dynamic_filter_snapshot const& filters,
   column_ref_resolver_fn const& column_ref_resolver)
 {
-  if (set.empty()) { return existing_root; }
+  if (filters.empty()) { return existing_root; }
   auto const device_id = detail::resolve_dynamic_filter_device_id(-1);
 
-  auto cols = set.filtered_columns();
-  std::sort(cols.begin(), cols.end());
+  std::vector<std::size_t> cols;
+  for (auto const& entry : filters.entries()) {
+    cols.push_back(entry.column_index);
+  }
+  std::ranges::sort(cols);
+  cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
 
   cudf::ast::expression const* dynamic_root = nullptr;
   for (auto const col_idx : cols) {
-    auto filters = set.filters_for_column(col_idx);
-    if (filters.empty()) { continue; }
-
     cudf::ast::expression const* column_ref = nullptr;
     cudf::ast::expression const* per_col    = nullptr;
-    for (auto const& f : filters) {
+    for (auto const& entry : filters.entries()) {
+      if (entry.column_index != col_idx) { continue; }
+      auto const& f = entry.filter;
       if (!f->is_available_on_device(device_id)) { continue; }
       auto const* lowerable = dynamic_cast<sirius_ast_lowerable const*>(f.get());
       if (!lowerable) { continue; }
