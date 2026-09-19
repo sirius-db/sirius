@@ -69,7 +69,8 @@ case "${1:-}" in
     status)
         if healthy; then
             echo "FE: healthy (http://${FE_HTTP})"
-            mysql -h 127.0.0.1 -P "${FE_MYSQL_PORT}" -u root -e 'SHOW BACKENDS\G' 2>/dev/null \
+            # -E (vertical) rather than a trailing \G: the MySQL 9 client rejects \G inside -e.
+            mysql -h 127.0.0.1 -P "${FE_MYSQL_PORT}" -u root -E -e 'SHOW BACKENDS' 2>/dev/null \
                 | grep -E "BackendId|Host|HeartbeatPort|BrpcPort|Alive|ErrMsg|Version|NodeRole" || true
         else
             echo "FE: not healthy"
