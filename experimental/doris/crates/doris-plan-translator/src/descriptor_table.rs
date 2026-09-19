@@ -28,8 +28,8 @@
 //!
 //! Slots are keyed by `(tuple_id, slot_id)`. Doris' FE draws slot ids from one generator per
 //! query, so today an id is unique across tuples, but the `TSlotRef` carries both ids and
-//! nothing in the wire format promises uniqueness; the StarRocks translator was bitten twice
-//! by keying on the slot id alone.
+//! nothing in the wire format promises uniqueness; keying on the slot id alone would silently
+//! alias two slots the first time an FE reuses an id across tuples.
 
 use std::collections::HashMap;
 

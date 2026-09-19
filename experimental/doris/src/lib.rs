@@ -4,9 +4,9 @@
 //! The FE is the unmodified official Doris release; this crate is the whole BE side
 //! (`ALTER SYSTEM ADD BACKEND` self-registration, thrift `HeartbeatService` /
 //! `BackendService` on the heartbeat and BE ports, and the gRPC `PBackendService`
-//! on the brpc port). It follows `experimental/starrocks` structurally: a synchronous
-//! [`FragmentExecutor`] seam lets the whole protocol shell build and test without an
-//! engine (`--no-default-features`), which is what CI and a Mac run.
+//! on the brpc port). A synchronous [`FragmentExecutor`] seam lets the whole protocol
+//! shell build and test without an engine (`--no-default-features`), which is what CI
+//! and a Mac run.
 
 use std::{fmt, str::FromStr};
 
