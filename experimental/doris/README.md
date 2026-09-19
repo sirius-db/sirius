@@ -151,6 +151,11 @@ pixi run bash scripts/bench-all.sh --data /mnt/nvme/tpch_parquet_sf10 --rounds 4
     --price native-split=0.752 --price sirius-buffered=0.752   # → log/bench/sf10-<system>/, log/bench/sf10-results.md
 pixi run bash scripts/bench-all.sh --data /mnt/nvme/tpch_parquet_sf10 --systems native-olap --load-olap
                                                   # optional: Doris on internal tables (scripts/olap-load.sh)
+pixi run bash scripts/bench-all.sh --data /mnt/nvme/tpch_parquet_sf100 --expected /mnt/nvme/expected-sf100 \
+    --host-capacity 160Gi --baseline native --price native=4.529 --price sirius-buffered=4.529 --load-olap
+                                                  # SF100: the baseline is generated onto the NVMe (not into the repo), the
+                                                  # pinned host tier leaves room for the dataset's page cache, and stock
+                                                  # Doris beats the split variant at this scale
 ```
 
 Systems (`bench.sh --system`): `native` (official BE, stock 4.1.4 session defaults,

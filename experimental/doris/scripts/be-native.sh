@@ -16,6 +16,8 @@
 #      when /mnt/nvme is a writable mount, else .doris-be/storage — keep it the same across
 #      restarts: the FE remembers which disk holds each tablet, and internal tables loaded
 #      on another path show up as bad replicas), FE_QUERY_PORT (default 9030).
+# The first start after a reboot reads the 2.6 GB binary cold from EBS (≈2 min at gp3 speed;
+# 9 s warm), hence the 300 s start-up allowance.
 # The host checks of bin/start_be.sh (vm.max_map_count >= 2M, no swap, ulimit -n) are
 # skipped (SKIP_CHECK_ULIMIT=true): a single BE on a benchmark box does not need them and
 # they need root to satisfy.
@@ -86,7 +88,7 @@ case "${1:-}" in
         # The FE reports a backend that just died as Alive until a heartbeat fails, so the new
         # process must have written its pid file (it does so once it serves) before the FE's
         # verdict counts.
-        for i in $(seq 1 90); do
+        for i in $(seq 1 300); do
             if [ -f "${BE_HOME}/bin/be.pid" ] && [ "$(alive)" = "true" ]; then
                 echo "native BE alive after ${i}s (pid $(cat "${BE_HOME}/bin/be.pid")); log: ${BE_HOME}/log/be.INFO"
                 exit 0
@@ -98,7 +100,7 @@ case "${1:-}" in
             fi
             sleep 1
         done
-        echo "error: native BE not alive within 90s; see ${BE_HOME}/log/be.INFO" >&2
+        echo "error: native BE not alive within 300s; see ${BE_HOME}/log/be.INFO" >&2
         exit 1
         ;;
     stop)

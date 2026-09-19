@@ -14,7 +14,8 @@
 #                (default: from the dataset name, else 1)
 #
 # Needs the FE, and the native BE alive (scripts/be-native.sh start); the Sirius backend must
-# not be alive (it cannot take tablets). Idempotent: drops and recreates the tables.
+# not be alive (it cannot take tablets). Idempotent: drops the database (FORCE) and recreates
+# the tables.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -48,7 +49,12 @@ if "${MYSQL[@]}" -N -e "SHOW BACKENDS" | awk -F'\t' '$3 == 9050 { found = 1 } EN
 fi
 echo "==> views over ${DATA}, tables from ${ddl} into ${DB}"
 sed "s|@@TPCH_DIR@@|${DATA}|g" sql/tpch-views.sql | "${MYSQL[@]}"
-sql "CREATE DATABASE IF NOT EXISTS ${DB}"
+# FORCE: the DDL's own DROP TABLE IF EXISTS leaves the old tables in the FE's recycle bin,
+# where they keep their colocate groups alive — and a group's bucket count is fixed, so
+# loading the sf100 DDL (96 buckets) after the sf1 one (32) fails with "Colocate tables
+# must have same bucket num".
+sql "DROP DATABASE IF EXISTS ${DB} FORCE"
+sql "CREATE DATABASE ${DB}"
 "${MYSQL[@]}" -D "${DB}" < "${ddl}"
 "${MYSQL[@]}" < sql/session-native.sql
 
