@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One benchmark configuration of plan-doc experiments/sf10-bench: brings up exactly the
+# One configuration of the benchmark in docs/tpch-report.md: brings up exactly the
 # system under test, runs the 22 TPC-H queries for N rounds (round 1 cold: freshly started
 # process + evicted page cache; rounds 2..N hot), validates every round against the DuckDB
 # baseline, samples the process (RSS, bytes read from disk, CPU) and the GPU, and leaves

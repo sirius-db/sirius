@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The whole benchmark of plan-doc experiments/sf10-bench on one dataset: every system through
+# The whole benchmark of docs/tpch-report.md on one dataset: every system through
 # scripts/bench.sh, one after the other, then the report. One line to rerun on the next box.
 #
 #   pixi run bash scripts/bench-all.sh --data DIR [--systems LIST] [--rounds 4] [--out-root DIR]

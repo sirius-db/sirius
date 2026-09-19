@@ -5,8 +5,8 @@
 //! The allowlist is deliberately small: the TPC-H corpus over `local()` parquet needs
 //! `BOOLEAN`, the four signed integers, `DECIMAL32/64/128I`, `DATEV2`, `VARCHAR` and
 //! `STRING`; `FLOAT`/`DOUBLE`/`CHAR`/`DATETIMEV2` are mapped because they are
-//! unambiguous. Everything else is rejected with a reason that names the entry in
-//! `plan-doc/reference/semantics-gaps.md`:
+//! unambiguous. Everything else is rejected with a reason that names the gap (`G-nn`, the
+//! numbered list under *Semantic gaps* in the crate's `README.md`):
 //!
 //! | Doris type | Substrait | Gap |
 //! |---|---|---|
@@ -40,7 +40,7 @@ use crate::error::{Result, TranslateError};
 /// Highest decimal precision the 128-bit carrier holds (Doris `DECIMAL128I` tops out here too).
 pub const MAX_DECIMAL_PRECISION: i32 = 38;
 /// Decimal precisions at or below this are stored as INT16 by DuckDB and have no cuDF carrier
-/// (`sirius::get_cudf_type` throws; semantics-gaps G-06).
+/// (`sirius::get_cudf_type` throws; G-06).
 pub const MIN_DECIMAL_PRECISION_EXCLUSIVE: i32 = 4;
 /// Highest fractional-second scale Doris allows on `DATETIMEV2`.
 const MAX_DATETIMEV2_SCALE: i32 = 6;

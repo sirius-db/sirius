@@ -5,7 +5,8 @@ The engine's own query window (`query/*.ndjson`, Executing -> Exit) is what the 
 spent; `run-tpch.sh`'s engine_ms is the whole execute_substrait call (Substrait lowering +
 planning + execution + Arrow conversion) and the transparent path's wall time adds DuckDB's
 own parse/bind/optimize. A large gap between the two is time outside the engine — that is how
-the SF100 lowering cost (plan-doc handoff, 2026-09-19) was found. The pipeline declarations
+the SF100 Substrait-lowering cost (parquet footers re-parsed at every bind, fixed by enabling
+`parquet_metadata_cache` on the FFI path) was found. The pipeline declarations
 (`operator/*.ndjson`) give the physical plan shape, so two paths can be compared per query
 without a log sink.
 

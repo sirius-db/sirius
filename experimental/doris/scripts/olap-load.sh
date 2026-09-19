@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Loads the TPC-H parquet dataset into Doris internal (OLAP) tables for the benchmark's
-# optional reference C (plan-doc experiments/sf10-bench §3: "Doris on its home turf"):
+# optional internal-table reference (`native-olap`, "Doris on its home turf" in
+# docs/tpch-report.md):
 # the official DDL of doris/tools/tpch-tools/ddl (duplicate-key tables, hash buckets, colocated
 # lineitem/orders and part/partsupp, one replica), INSERT INTO ... SELECT from the parquet
 # views of sql/tpch-views.sql, then ANALYZE ... WITH SYNC as tools/tpch-tools/bin/load-tpch-data.sh

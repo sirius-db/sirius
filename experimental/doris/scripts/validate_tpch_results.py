@@ -23,7 +23,7 @@ Comparison (from origin/doris's validate_tpch_results.py, adapted):
     Doris's declared result types acceptable: the FE types `avg(DECIMAL)` as DECIMAL(38,4) while
     DuckDB computes a DOUBLE, so `0.0500` must match `0.04998529583839761`. `--ulps 1` also
     accepts a truncated last digit (`0.0499`): Sirius casts DOUBLE to DECIMAL with cudf, which
-    truncates instead of rounding (semantics-gaps G-19); a verdict says how many values needed
+    truncates instead of rounding (G-19 in README.md); a verdict says how many values needed
     that slack;
   - a query with a top-level ORDER BY is compared row by row; if that fails, the result still
     passes when it is the same multiset of rows, both sides respect the ORDER BY and the

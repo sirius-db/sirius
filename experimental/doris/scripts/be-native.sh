@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the official Doris BE (scripts/fetch-be.sh) against the local FE as the benchmark's
-# native CPU reference (plan-doc experiments/sf10-bench, system A). It registers itself with
+# native CPU reference (the `native` systems of docs/tpch-report.md). It registers itself with
 # the FE once (ALTER SYSTEM ADD BACKEND, idempotent) on the ports of conf/be.conf; the Sirius
 # backend stays registered too, the benchmark harness (scripts/bench.sh) keeps only one of
 # them alive at a time.

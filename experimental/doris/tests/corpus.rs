@@ -4,7 +4,7 @@
 //! the reviewed snapshot in `tests/snapshots/`.
 //!
 //! - `tests/fixtures/tpch/qNN/`: the 22 TPC-H queries, all of which translate into one plan.
-//! - `tests/fixtures/gaps/<gNN-name>/`: probes for `semantics-gaps.md` entries that only show
+//! - `tests/fixtures/gaps/<gNN-name>/`: probes for the semantic gaps (README.md) that only show
 //!   at plan-node level (G-11 window, G-12 UNION, G-13 DISTINCT); the verdict of each is
 //!   pinned by [`gap_corpus_verdicts`].
 //!
@@ -606,7 +606,7 @@ fn every_corpus_query_matches_its_snapshot() {
     );
 }
 
-/// P1.5: node-level entries of `semantics-gaps.md`, probed with real FE 4.1.4 dispatches
+/// The node-level semantic gaps (README.md), probed with real FE 4.1.4 dispatches
 /// (`sql/gaps/*.sql`): G-11 and G-12 are refused naming the offending node, G-13 folds into
 /// a group-by without measures (Nereids never plans a distinct operator).
 #[test]

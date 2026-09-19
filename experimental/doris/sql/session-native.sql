@@ -1,7 +1,7 @@
--- Session variables for the benchmark's native Doris BE (plan-doc experiments/sf10-bench,
--- system A): every variable that sql/session.sql pins for the Sirius backend goes back to
--- its Doris 4.1.4 default (fe/fe-core/.../qe/SessionVariable.java), so Doris runs the way it
--- ships — the ClickBench "default configuration, no tuning" rule. Applied GLOBAL by
+-- Session variables for the benchmark's native Doris BE (the `native` systems of
+-- docs/tpch-report.md): every variable that sql/session.sql pins for the Sirius backend goes
+-- back to its Doris 4.1.4 default (fe/fe-core/.../qe/SessionVariable.java), so Doris runs the
+-- way it ships — the ClickBench "default configuration, no tuning" rule. Applied GLOBAL by
 -- scripts/run-tpch.sh --session-sql before each native run (the GLOBAL values persist in the
 -- FE's metadata, so the two files must always undo each other).
 

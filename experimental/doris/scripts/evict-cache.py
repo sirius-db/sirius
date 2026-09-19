@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evict a dataset from the page cache before a cold run (plan-doc experiments/sf10-bench §6.4).
+"""Evict a dataset from the page cache before a cold run (round 1 of scripts/bench.sh).
 
     scripts/evict-cache.py DIR [DIR...] [--drop-caches]
 
