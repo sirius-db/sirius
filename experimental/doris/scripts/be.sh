@@ -4,11 +4,15 @@
 #   scripts/be.sh start [--engine] [extra sirius-doris-be args...]
 #       daemon; engine-less (`--no-default-features`, translate-only) unless --engine.
 #       Fragment dumps go to log/dump (SIRIUS_BE_DUMP_FRAGMENTS) unless already set.
+#       --engine links the Sirius build tree (run it in the pixi default env, which carries the
+#       engine's toolchain/libs: `pixi run bash scripts/be.sh start --engine`), executes queries
+#       on the GPU, and defaults to `--sirius-config conf/sirius.yaml` unless one is given.
 #   scripts/be.sh stop
 #   scripts/be.sh log        tail the backend log
 #
 # Env: SIRIUS_BE_TRANSLATE_ONLY (default 1 without --engine, 0 with it),
-#      SIRIUS_BE_DUMP_FRAGMENTS (default $PWD/log/dump), RUST_LOG.
+#      SIRIUS_BE_DUMP_FRAGMENTS (default $PWD/log/dump), RUST_LOG,
+#      SIRIUS_BUILD_DIR (default ../../build/release; --engine only).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -32,6 +36,19 @@ case "${1:-}" in
         export SIRIUS_BE_DUMP_FRAGMENTS="${SIRIUS_BE_DUMP_FRAGMENTS:-${LOG_DIR}/dump}"
         if [ "${engine}" = true ]; then
             export SIRIUS_BE_TRANSLATE_ONLY="${SIRIUS_BE_TRANSLATE_ONLY:-0}"
+            # The binary links libsirius.so (sirius-sys symlinks it to the DuckDB extension in
+            # the build tree) whose CUDA/RAPIDS deps live in the pixi env; neither is on the
+            # default loader path.
+            build_dir="${SIRIUS_BUILD_DIR:-$(cd ../.. && pwd)/build/release}"
+            export SIRIUS_BUILD_DIR="${build_dir}"
+            export LD_LIBRARY_PATH="${build_dir}/extension/sirius${CONDA_PREFIX:+:${CONDA_PREFIX}/lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            case " $* " in
+                *" --sirius-config "*|*" --sirius-config="*) ;;
+                *) set -- --sirius-config conf/sirius.yaml "$@" ;;
+            esac
+            # conf/sirius.yaml points the spill tier and telemetry under log/; cucascade only
+            # creates files inside an existing spill directory.
+            mkdir -p "${LOG_DIR}/sirius-spill" "${LOG_DIR}/telemetry"
             cargo build --release -p sirius-doris-be
             binary="target/release/sirius-doris-be"
         else
