@@ -18,6 +18,7 @@
 
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
+#include <op/scan/table_scan/scan_contract.hpp>
 #include <op/sirius_physical_operator.hpp>
 #include <op/sirius_physical_operator_type.hpp>
 
@@ -36,6 +37,9 @@ namespace sirius::scan_manager {
 class split_connector;
 class sirius_scan_manager;
 }  // namespace sirius::scan_manager
+namespace sirius::transparent {
+class read_view_registry;
+}
 
 namespace sirius::op {
 class sirius_dynamic_filter_set;  // membership channel (op/sirius_dynamic_filter.hpp)
@@ -89,7 +93,9 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
                            duckdb::idx_t estimated_cardinality,
                            std::shared_ptr<gpu_ingestible> ingestible,
-                           duckdb::SiriusContext* compressed_materialization_observer = nullptr);
+                           duckdb::SiriusContext* compressed_materialization_observer  = nullptr,
+                           std::shared_ptr<transparent::read_view_registry> read_views = nullptr,
+                           scan_contract_id contract_id                                = 0);
 
   ~sirius_gpu_scan_operator() override;
 
@@ -160,6 +166,13 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
   [[nodiscard]] gpu_ingestible& get_ingestible() const;
 
+  [[nodiscard]] bound_table_scan const& scan_contract() const;
+  [[nodiscard]] scan_contract_id contract_id() const noexcept { return _contract_id; }
+  [[nodiscard]] std::shared_ptr<transparent::read_view_registry> const& read_views() const noexcept
+  {
+    return _read_views;
+  }
+
   scan_manager::split_connector& get_split_connector();
 
   /// Shared handle to the connector, for components (e.g. the memory
@@ -172,6 +185,8 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
 
  private:
   std::shared_ptr<gpu_ingestible> _ingestible;
+  std::shared_ptr<transparent::read_view_registry> _read_views;
+  scan_contract_id _contract_id = 0;
   std::shared_ptr<scan_manager::split_connector> _split_connector;
   /// Latch for "compacting during decode does not pay off", shared with every
   /// split this operator hands out (see

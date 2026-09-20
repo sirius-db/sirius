@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Deferred metadata walk. CPU-only: no GPU decode path is exercised here.
+// Metadata walk under a real execution-window lease; no GPU decode is performed here.
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -28,10 +28,12 @@
 #include <duckdb/storage/storage_manager.hpp>
 #include <op/scan/duckdb_native_gpu_ingestible.hpp>
 #include <op/scan/duckdb_native_metadata.hpp>
+#include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,28 +54,19 @@ void exec_ok(duckdb::Connection& con, const std::string& q)
 }
 
 // The ingestible constructor requires a SingleFileBlockManager, hence a file-backed database.
-struct file_backed_db {
-  std::filesystem::path path;
-  std::unique_ptr<duckdb::DuckDB> db;
-  std::unique_ptr<duckdb::Connection> con;
+struct file_backed_db : sirius::test::GpuExecutionFixture {
+  std::unique_ptr<duckdb::SiriusContext::StandaloneQueryScope> window;
 
-  file_backed_db()
+  void lease(duckdb::AttachedDatabase& database)
   {
-    path = std::filesystem::temp_directory_path() /
-           ("sirius_deferred_walk_test_" + std::to_string(::getpid()) + "_" +
-            std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".duckdb");
-    std::filesystem::remove(path);
-    db  = std::make_unique<duckdb::DuckDB>(path.string());
-    con = std::make_unique<duckdb::Connection>(*db);
-  }
-
-  ~file_backed_db()
-  {
-    con.reset();
-    db.reset();
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(path.string() + ".wal", ec);
+    auto context = sirius::test::get_registered_sirius_context(*con);
+    if (!window) {
+      window = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
+        *context, *con->context, "native_metadata_test");
+    }
+    if (!context->get_scan_manager().holds_checkpoint_key(database)) {
+      context->get_scan_manager().acquire_checkpoint_key(window->query_id(), database);
+    }
   }
 };
 
@@ -99,18 +92,19 @@ projected_column real_col(duckdb::idx_t col_id)
 }
 
 std::unique_ptr<duckdb_native_ingestible_table_info> make_info(
-  duckdb::Connection& con,
+  file_backed_db& fixture,
   const std::string& table_name,
   std::vector<sirius::logical_type> types,
-  bool defer,
+  bool /*defer*/,
   duckdb::unique_ptr<duckdb::TableFilterSet> filters = nullptr)
 {
-  auto& storage             = get_storage(con, table_name);
-  auto info                 = std::make_unique<duckdb_native_ingestible_table_info>();
-  info->storage             = &storage;
-  info->context             = con.context.get();
-  info->db_path             = storage.GetAttached().GetStorageManager().GetDBPath();
-  info->defer_metadata_walk = defer;
+  auto& con     = *fixture.con;
+  auto& storage = get_storage(con, table_name);
+  fixture.lease(storage.GetAttached());
+  auto info     = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage = &storage;
+  info->context = con.context.get();
+  info->db_path = storage.GetAttached().GetStorageManager().GetDBPath();
   for (std::size_t i = 0; i < types.size(); ++i) {
     info->projected_cols.push_back(real_col(i));
     info->column_ids.push_back(duckdb::ColumnIndex(i));
@@ -131,7 +125,7 @@ std::unique_ptr<duckdb_native_ingestible_table_info> make_info(
 }  // namespace
 
 TEST_CASE("deferred walk: construction skips the row-group walk, ensure runs it",
-          "[scan][duckdb_native_deferred_walk]")
+          "[scan][duckdb_native_deferred_walk][integration]")
 {
   file_backed_db fx;
   exec_ok(*fx.con, "CREATE TABLE t(k INTEGER, v BIGINT)");
@@ -142,13 +136,7 @@ TEST_CASE("deferred walk: construction skips the row-group walk, ensure runs it"
     std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER),
                                       sirius::logical_type::make(sirius::type_id::BIGINT)};
 
-  auto eager = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false));
-  REQUIRE_FALSE(eager.metadata_walk_pending());
-  auto const& eager_plan = eager.walk_plan_for_testing();
-  REQUIRE(eager_plan.viable);
-  REQUIRE(eager_plan.n_row_groups > 1);  // 300k rows spans multiple row groups
-
-  auto deferred = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true));
+  auto deferred = duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/true));
   REQUIRE(deferred.metadata_walk_pending());
   REQUIRE_FALSE(deferred.walk_plan_for_testing().viable);  // untouched plan
 
@@ -156,9 +144,10 @@ TEST_CASE("deferred walk: construction skips the row-group walk, ensure runs it"
   REQUIRE_FALSE(deferred.metadata_walk_pending());
   auto const& lazy_plan = deferred.walk_plan_for_testing();
   REQUIRE(lazy_plan.viable);
-  REQUIRE(lazy_plan.n_row_groups == eager_plan.n_row_groups);
-  REQUIRE(lazy_plan.row_count == eager_plan.row_count);
-  REQUIRE(lazy_plan.row_group_start == eager_plan.row_group_start);
+  REQUIRE(lazy_plan.n_row_groups > 1);  // 300k rows spans multiple row groups
+  REQUIRE(std::accumulate(lazy_plan.row_count.begin(), lazy_plan.row_count.end(), uint64_t{0}) ==
+          300000);
+  REQUIRE(deferred.checkpoint_iteration() > 0);
 
   // Idempotent.
   deferred.ensure_metadata_prepared();
@@ -166,7 +155,7 @@ TEST_CASE("deferred walk: construction skips the row-group walk, ensure runs it"
 }
 
 TEST_CASE("deferred walk: filter-stat pruning is preserved when the walk runs lazily",
-          "[scan][duckdb_native_deferred_walk]")
+          "[scan][duckdb_native_deferred_walk][integration]")
 {
   file_backed_db fx;
   exec_ok(*fx.con, "CREATE TABLE t(k INTEGER)");
@@ -184,25 +173,18 @@ TEST_CASE("deferred walk: filter-stat pruning is preserved when the walk runs la
     return filters;
   };
 
-  auto eager =
-    duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false, make_filters()));
-  auto const& eager_plan = eager.walk_plan_for_testing();
-  REQUIRE(eager_plan.viable);
-  REQUIRE(eager_plan.pruned_row_groups == eager_plan.n_row_groups);
-
   auto deferred =
-    duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true, make_filters()));
+    duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/true, make_filters()));
   REQUIRE(deferred.metadata_walk_pending());
   deferred.ensure_metadata_prepared();
   auto const& lazy_plan = deferred.walk_plan_for_testing();
   REQUIRE(lazy_plan.viable);
-  REQUIRE(lazy_plan.n_row_groups == eager_plan.n_row_groups);
-  REQUIRE(lazy_plan.pruned_row_groups == eager_plan.pruned_row_groups);
-  REQUIRE(lazy_plan.pruned_decoded_bytes == eager_plan.pruned_decoded_bytes);
+  REQUIRE(lazy_plan.pruned_row_groups == lazy_plan.n_row_groups);
+  REQUIRE(lazy_plan.pruned_decoded_bytes > 0);
 }
 
 TEST_CASE("deferred walk: unsupported projected type still refuses at construction",
-          "[scan][duckdb_native_deferred_walk]")
+          "[scan][duckdb_native_deferred_walk][integration]")
 {
   file_backed_db fx;
   exec_ok(*fx.con, "CREATE TABLE t(h HUGEINT)");
@@ -213,14 +195,14 @@ TEST_CASE("deferred walk: unsupported projected type still refuses at constructi
     std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::HUGEINT)};
 
   // Eager in both modes: an undecodable type must refuse at plan time.
-  REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true)),
+  REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/true)),
                       Catch::Matchers::ContainsSubstring("128-bit"));
-  REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false)),
+  REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/false)),
                       Catch::Matchers::ContainsSubstring("128-bit"));
 }
 
 TEST_CASE("deferred walk: overflow-string refusal moves from construction to ensure",
-          "[scan][duckdb_native_deferred_walk]")
+          "[scan][duckdb_native_deferred_walk][integration]")
 {
   file_backed_db fx;
   exec_ok(*fx.con, "CREATE TABLE t(s VARCHAR)");
@@ -231,14 +213,16 @@ TEST_CASE("deferred walk: overflow-string refusal moves from construction to ens
   auto types =
     std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::VARCHAR)};
 
-  REQUIRE_THROWS_WITH(duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false)),
-                      Catch::Matchers::ContainsSubstring("overflow"));
-
-  // Deferred: construction succeeds and the refusal moves to the walk. The plan-time,
+  // Construction succeeds and the refusal moves to the execution-start walk. The plan-time,
   // table-level overflow probe in sirius_plan_get still refuses these before this point.
-  auto deferred = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true));
+  auto deferred = duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/true));
   REQUIRE(deferred.metadata_walk_pending());
   REQUIRE_THROWS_WITH(deferred.ensure_metadata_prepared(),
+                      Catch::Matchers::ContainsSubstring("overflow"));
+
+  auto second = duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/false));
+  REQUIRE(second.metadata_walk_pending());
+  REQUIRE_THROWS_WITH(second.ensure_metadata_prepared(),
                       Catch::Matchers::ContainsSubstring("overflow"));
   // The failed walk is not latched: still pending, and a retry throws again.
   REQUIRE(deferred.metadata_walk_pending());
@@ -247,7 +231,7 @@ TEST_CASE("deferred walk: overflow-string refusal moves from construction to ens
 }
 
 TEST_CASE("deferred walk: split claims see the walk's row-group count",
-          "[scan][duckdb_native_deferred_walk]")
+          "[scan][duckdb_native_deferred_walk][integration]")
 {
   file_backed_db fx;
   exec_ok(*fx.con, "CREATE TABLE t(k INTEGER)");
@@ -257,8 +241,8 @@ TEST_CASE("deferred walk: split claims see the walk's row-group count",
   auto types =
     std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)};
 
-  auto eager    = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/false));
-  auto deferred = duckdb_native_gpu_ingestible(make_info(*fx.con, "t", types, /*defer=*/true));
+  auto eager    = duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/false));
+  auto deferred = duckdb_native_gpu_ingestible(make_info(fx, "t", types, /*defer=*/true));
 
   // Advertises work before the walk, so the provider is not skipped.
   REQUIRE_FALSE(deferred.has_processed_all_metadata());
@@ -275,4 +259,38 @@ TEST_CASE("deferred walk: split claims see the walk's row-group count",
   };
   REQUIRE(count_claims(deferred) == count_claims(eager));
   REQUIRE(deferred.has_processed_all_metadata());
+}
+
+TEST_CASE("deferred walk refuses missing lease and missing or unusable Sirius state",
+          "[scan][duckdb_native_deferred_walk][integration]")
+{
+  file_backed_db fx;
+  exec_ok(*fx.con, "CREATE TABLE t(k INTEGER)");
+  exec_ok(*fx.con, "INSERT INTO t VALUES (42)");
+  exec_ok(*fx.con, "CHECKPOINT");
+  auto types =
+    std::vector<sirius::logical_type>{sirius::logical_type::make(sirius::type_id::INTEGER)};
+  duckdb_native_gpu_ingestible ingestible(make_info(fx, "t", types, true));
+  fx.window->finish();
+  auto& states  = *fx.con->context->registered_state;
+  auto original = states.Get<duckdb::SiriusContext>("sirius_state");
+  struct restore_state {
+    duckdb::RegisteredStateManager& states;
+    duckdb::shared_ptr<duckdb::SiriusContext> original;
+    ~restore_state()
+    {
+      states.Remove("sirius_state");
+      states.Insert("sirius_state", original);
+    }
+  } restore{states, original};
+  SECTION("registered context without a lease") {}
+  SECTION("missing context") { states.Remove("sirius_state"); }
+  SECTION("uninitialized context")
+  {
+    states.Remove("sirius_state");
+    states.Insert("sirius_state", duckdb::make_shared_ptr<duckdb::SiriusContext>());
+  }
+  REQUIRE_THROWS(ingestible.ensure_metadata_prepared());
+  CHECK(ingestible.metadata_walk_pending());
+  CHECK_FALSE(ingestible.walk_plan_for_testing().viable);
 }

@@ -324,7 +324,8 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
   insert_delta_job_request const& request,
   std::span<op::scan::projected_column const> op_projected_cols,
   std::shared_ptr<sirius::io::sirius_datasource> datasource,
-  duckdb::SingleFileBlockManager const* block_manager)
+  duckdb::SingleFileBlockManager const* block_manager,
+  op::scan::scan_contract_id contract_id)
 {
   std::vector<std::size_t> union_idx;
   union_idx.reserve(op_projected_cols.size());
@@ -423,6 +424,21 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       std::move(row_groups), std::move(split_datasource), block_manager);
     info->host_backed_only = !any_file_read;
     if (bundle.staging) { info->staging_keepalive.push_back(bundle.staging); }
+
+    std::vector<op::scan::split_materializer_certificate> certificates;
+    std::vector<op::scan::split_dependencies> dependencies;
+    certificates.reserve(info->row_groups.size());
+    dependencies.reserve(info->row_groups.size());
+    for (auto const& row_group : info->row_groups) {
+      certificates.push_back(
+        {contract_id,
+         static_cast<uint64_t>(row_group.row_group_index),
+         request.entry_name + "|row_group=" + std::to_string(row_group.row_group_index),
+         "duckdb_native.insert_delta",
+         info->host_backed_only ? "host" : "file"});
+      dependencies.push_back({nullptr, info->datasource, std::nullopt});
+    }
+    info->set_contract_payload(contract_id, std::move(certificates), std::move(dependencies));
 
     out.push_back({std::move(info), bundle.mask, bundle.preferred_device});
   }
