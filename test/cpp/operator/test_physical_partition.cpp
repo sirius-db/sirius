@@ -539,7 +539,7 @@ struct partition_sizing_fixture {
   decltype(sirius::test::operator_utils::initialize_memory_manager()) memory_manager =
     sirius::test::operator_utils::initialize_memory_manager();
   sirius::pipeline::pipeline_build_context context{nullptr, true};
-  duckdb::shared_ptr<sizing_pipeline> producer = duckdb::make_shared_ptr<sizing_pipeline>(context);
+  std::shared_ptr<sizing_pipeline> producer = std::make_shared<sizing_pipeline>(context);
   sizing_source source;
   shared_data_repository repo;
   sizing_consumer consumer;
