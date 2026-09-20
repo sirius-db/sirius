@@ -26,7 +26,6 @@ namespace {
 // 16 KiB to cut write-callback round trips on multi-MiB ranged GETs.
 constexpr long kRecvBufferSize     = 128L * 1024L;
 constexpr long kConnectTimeoutMs   = 5'000L;
-constexpr long kTransferTimeoutMs  = 30'000L;
 constexpr long kDnsCacheTimeoutSec = 600L;
 
 // curl_global_init must run exactly once per process, before any handle is
@@ -130,10 +129,10 @@ void configure_easy_handle(CURL* handle,
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION, 0L));
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_BUFFERSIZE, kRecvBufferSize));
 
-  // Default timeouts; the reactor may override the whole-transfer timeout per
-  // request based on its configuration.
+  // Connection establishment has a fixed safety timeout. The reactor applies
+  // the configured whole-transfer timeout to every request, including zero to
+  // clear the deadline.
   SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT_MS, kConnectTimeoutMs));
-  SIRIUS_CURL_CHECK(curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, kTransferTimeoutMs));
 
   // Minimum gap between curl_easy_upkeep PINGs per connection (the reactor
   // drives the actual upkeep calls on an idle timer).

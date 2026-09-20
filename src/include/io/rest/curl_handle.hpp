@@ -225,10 +225,11 @@ class global_curl_context {
  *
  * Sets HTTP/2, the shared DNS/TLS/cookie (and optionally connection) cache, TCP
  * tuning (NODELAY, keepalive), @c NOSIGNAL (required for multithreaded use),
- * receive buffer size, connect/transfer timeouts, disabled redirect following
+ * receive buffer size, connect timeout, disabled redirect following
  * (presigned URLs cannot survive a redirect — see the .cpp), connection
  * max-age, DNS cache timeout, and the @c curl_easy_upkeep interval.
- * Per-request options (URL, Range, write/header callbacks, TLS verification)
+ * Per-request options (URL, Range, write/header callbacks, TLS verification,
+ * whole-transfer timeout)
  * are set by the reactor at submit time.
  *
  * @param handle            the easy handle to configure.
