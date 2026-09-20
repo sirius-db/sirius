@@ -1,0 +1,4 @@
+sirius:
+  memory:
+    disk:
+      capacity_bytes: 1Gi

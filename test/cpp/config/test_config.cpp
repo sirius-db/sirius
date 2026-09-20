@@ -103,6 +103,29 @@ TEST_CASE("yaml reader validation with fraction", "[config_opt][conditional]")
   REQUIRE(f == 0.5);  // unchanged
 }
 
+TEST_CASE("yaml reader validation with positive fraction", "[config_opt][conditional]")
+{
+  SECTION("zero is rejected")
+  {
+    auto node = YAML::Load("f: 0.0");
+    double f  = 0.5;
+
+    yaml::reader r(node);
+    REQUIRE_THROWS_AS(r.optional("f", f, yaml::positive_fraction<double>{}), std::runtime_error);
+    REQUIRE(f == 0.5);
+  }
+
+  SECTION("one is accepted")
+  {
+    auto node = YAML::Load("f: 1.0");
+    double f  = 0.5;
+
+    yaml::reader r(node);
+    REQUIRE_NOTHROW(r.optional("f", f, yaml::positive_fraction<double>{}));
+    REQUIRE(f == 1.0);
+  }
+}
+
 TEST_CASE("yaml reader byte suffix parsing", "[config_opt][bytes]")
 {
   SECTION("plain integers work with bytes()")

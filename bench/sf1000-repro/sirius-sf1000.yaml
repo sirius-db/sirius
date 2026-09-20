@@ -25,7 +25,6 @@ sirius:
             pool_size: 8
             block_size: 67108864
         disk:
-            disk_id: 0
             capacity_bytes: 1000000000000
             downgrade_root_dirs: "/localhome/local-faramburu/sirius_disk_memory"
     executor:
