@@ -123,3 +123,57 @@ TEST_CASE("sirius_config accepts a zero admission_bytes_per_gpu", "[topology_con
   REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
   CHECK(cfg.get_operator_params().admission_bytes_per_gpu == 0);
 }
+
+TEST_CASE("sirius_config restricts the prefetch cache to one GPU",
+          "[topology_config][config][prefetching_cache]")
+{
+  SECTION("one GPU accepts an enabled cache")
+  {
+    scoped_yaml yaml("sirius_prefetch_cache_one_gpu.yaml",
+                     "sirius:\n"
+                     "  topology:\n"
+                     "    num_gpus: 1\n"
+                     "  executor:\n"
+                     "    scan_manager:\n"
+                     "      enable_prefetch_cache: true\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  }
+
+  SECTION("multiple GPUs accept the default disabled cache")
+  {
+    scoped_yaml yaml("sirius_prefetch_cache_multi_gpu_disabled.yaml",
+                     "sirius:\n"
+                     "  space:\n"
+                     "    gpu:\n"
+                     "      - device_id: 0\n"
+                     "        memory_capacity: 512MiB\n"
+                     "      - device_id: 1\n"
+                     "        memory_capacity: 512MiB\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_NOTHROW(cfg.load_from_file(yaml.path));
+  }
+
+  SECTION("multiple GPUs reject an enabled cache")
+  {
+    scoped_yaml yaml("sirius_prefetch_cache_multi_gpu_enabled.yaml",
+                     "sirius:\n"
+                     "  space:\n"
+                     "    gpu:\n"
+                     "      - device_id: 0\n"
+                     "        memory_capacity: 512MiB\n"
+                     "      - device_id: 1\n"
+                     "        memory_capacity: 512MiB\n"
+                     "  executor:\n"
+                     "    scan_manager:\n"
+                     "      enable_prefetch_cache: true\n");
+
+    sirius::sirius_config cfg;
+    REQUIRE_THROWS_WITH(cfg.load_from_file(yaml.path),
+                        Catch::Contains("enable_prefetch_cache") &&
+                          Catch::Contains("multiple configured GPUs") &&
+                          Catch::Contains("incorrect results"));
+  }
+}

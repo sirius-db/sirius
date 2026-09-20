@@ -1,0 +1,5 @@
+sirius:
+  executor:
+    scan_manager:
+      memory_prefetcher:
+        poll_interval_ms: 5
