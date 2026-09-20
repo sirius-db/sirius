@@ -262,7 +262,6 @@ void dynamic_filter_publication_session::observe_whole_build(
                                           operation->fanout_started = true;
                                           return true;
                                         });
-      stream.synchronize();
     } catch (...) {
       // The source pin must outlive every accepted read, including a partially built filter.
       auto error = std::current_exception();
@@ -564,8 +563,9 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
       }
     }
     SIRIUS_LOG_INFO(
-      "[publish_dynamic_filters] Pushed {} dynamic filter(s) across {} active target(s) "
-      "of {} wired target(s) ({} build rows, {} bound keys of {} admitted).",
+      "[publish_dynamic_filters] dynamic-filter publication: pushed {} dynamic filter(s) "
+      "across {} active target(s) of {} wired target(s) ({} build rows, {} bound keys of {} "
+      "admitted).",
       total_pushed,
       active_targets,
       probe_targets.size(),
