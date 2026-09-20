@@ -21,6 +21,7 @@
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
@@ -34,6 +35,9 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+
+#include <chrono>
+#include <thread>
 
 namespace sirius::transparent {
 
@@ -104,21 +108,27 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
 PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::PhysicalPlan& physical_plan,
   duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
+  candidate_origin logical_plan_origin,
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views,
+  std::vector<sirius::op::scan::bound_read_view> physical_original_views,
   std::string query_sql,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<std::string> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
-  bool cpu_plan_reads_s3,
+  plan_source_policy source_policy,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
   std::uint64_t validated_plan_pin_epoch)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
+    logical_plan_origin_(logical_plan_origin),
+    logical_original_views_(std::move(logical_original_views)),
+    physical_original_views_(std::move(physical_original_views)),
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
-    cpu_plan_reads_s3_(cpu_plan_reads_s3),
+    source_policy_(std::move(source_policy)),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
     validated_plan_pin_epoch_(validated_plan_pin_epoch)
 {
@@ -168,12 +178,27 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
     // The execution window: begin mutations and slot acquire in one scope on
     // this thread; finished (mandatory cleanup and release) below, before the
     // first Fetch exposes the result, so an abandoned result holds nothing.
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
       if (state.sirius_context) {
+        state.sirius_context->observe_native_checkpoint_for_testing(context.client,
+                                                                    "before_window");
+        duckdb::Value pause_ms;
+        if (context.client.TryGetCurrentSetting("sirius_test_pause_native_after_prepare_ms",
+                                                pause_ms) &&
+            !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
+        }
+        duckdb::Value mark_unavailable;
+        if (context.client.TryGetCurrentSetting(
+              "sirius_test_mark_runtime_unavailable_before_window", mark_unavailable) &&
+            !mark_unavailable.IsNull() && mark_unavailable.GetValue<bool>()) {
+          state.sirius_context->mark_runtime_unavailable();
+        }
         window.emplace(*state.sirius_context, context.client, "transparent_execution");
       }
       if (!validated_sirius_plan_ && !logical_plan_ && query_sql_.empty()) {
@@ -196,6 +221,13 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // with a window, but they can land between two — so reuse the plan only while the pinned
       // registry is unchanged, and otherwise rebuild against what this window actually sees.
       duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan;
+      duckdb::Value read_view_injection;
+      std::string read_view_injection_stage = "off";
+      if (context.client.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
+                                              read_view_injection) &&
+          !read_view_injection.IsNull()) {
+        read_view_injection_stage = read_view_injection.ToString();
+      }
       if (validated_sirius_plan_) {
         duckdb::Value inject_registry_change;
         if (state.sirius_context &&
@@ -208,7 +240,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         auto const current_epoch = state.sirius_context
                                      ? state.sirius_context->get_scan_manager().pin_registry_epoch()
                                      : planned_epoch;
-        if (current_epoch == planned_epoch) {
+        if (current_epoch == planned_epoch && read_view_injection_stage != "execute" &&
+            read_view_injection_stage != "execute_copy_fails") {
           sirius_plan = std::move(validated_sirius_plan_);
         } else {
           validated_sirius_plan_.reset();
@@ -226,6 +259,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
                         logical_plan_ ? "from logical plan template" : "from SQL replan");
       }
       if (!sirius_plan) {
+        if (state.sirius_context) { state.sirius_context->record_transparent_execution_rebuild(); }
         // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
         // the same prepared physical operator across multiple EXECUTE calls.
         //
@@ -234,9 +268,14 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // fall back to re-parsing + re-binding the unbound SQL statement, which
         // exercises the same bind path the very first run did.
         duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
+        auto rebuild_origin = candidate_origin::replan;
         if (logical_plan_) {
           try {
-            fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+            if (read_view_injection_stage == "execute_copy_fails") {
+              throw duckdb::NotImplementedException("injected logical-plan copy failure");
+            }
+            fresh_plan     = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
+            rebuild_origin = logical_plan_origin_;
           } catch (duckdb::NotImplementedException&) {
             // Drop logical_plan_ — we know it can't be copied, so future executes
             // will skip straight to the replan path.
@@ -258,8 +297,35 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           duckdb::Optimizer optimizer(*duckdb_planner.binder, context.client);
           fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
         }
-        sirius::planner::sirius_physical_plan_generator planner(context.client);
+        sirius::planner::sirius_physical_plan_generator planner(
+          context.client, {{sirius::value_of(window->query_id())}, 0});
         sirius_plan = planner.create_plan(std::move(fresh_plan));
+        if (read_view_injection_stage == "execute") {
+          planner.read_views->inject_mismatch_for_testing(false);
+        }
+        auto comparison =
+          compare_read_views(rebuild_origin,
+                             logical_original_views_ ? &*logical_original_views_ : nullptr,
+                             physical_original_views_,
+                             *planner.read_views);
+        if (!comparison.equal) {
+          auto message = describe_read_view_mismatch(comparison);
+          if (state.sirius_context) {
+            state.sirius_context->record_transparent_read_view_mismatch();
+          }
+          SIRIUS_LOG_INFO("Transparent execution read-view comparison failed ({}): {}",
+                          rebuild_origin == candidate_origin::copy ? "copy" : "replan",
+                          message);
+          throw duckdb::ExecutorException(message);
+        }
+        share_equal_read_view_identities(
+          logical_original_views_ ? &*logical_original_views_ : nullptr,
+          physical_original_views_,
+          *planner.read_views);
+        planner.read_views->publish_supported(
+          sirius::op::scan::certificate_evidence_scope::binding_correspondence,
+          comparison.correspondence,
+          physical_original_views_);
       }
 
       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
@@ -313,6 +379,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // backstop instead.
     if (window) {
       window->finish();
+      lease_release = window->lease_release();
       window.reset();
     }
 
@@ -326,18 +393,15 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU
       // fallback either way, so propagate as-is).
-      if (runtime_unavailable_error &&
-          (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_))) {
+      if (runtime_unavailable_error && (source_policy_.reads_sirius_owned_s3() ||
+                                        sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
       }
 
-      // S3 is GPU-only: DuckDB's CPU read_parquet cannot serve Sirius-owned s3://,
-      // so surface a clear error instead of a fallback that would fail anyway.
-      if (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_)) {
-        throw duckdb::ExecutorException(
-          "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, "
-          "and Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
-          gpu_msg);
+      try {
+        require_s3_cpu_replay(source_policy_, query_sql_, gpu_msg);
+      } catch (std::runtime_error const& error) {
+        throw duckdb::ExecutorException(error.what());
       }
 
       // Fallback disabled, or no CPU plan stashed: surface the GPU error. Sanitize
@@ -349,6 +413,24 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg);
         }
         gpu_error.Throw("Sirius GPU execution failed: ");
+      }
+
+      try {
+        require_non_s3_cpu_replay(source_policy_, gpu_msg);
+      } catch (std::runtime_error const& error) {
+        throw duckdb::ExecutorException(error.what());
+      }
+
+      if (state.sirius_context) {
+        state.sirius_context->before_cpu_replay_for_testing(context.client);
+      }
+      if (lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
+          lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered) {
+        if (state.sirius_context) { state.sirius_context->record_lease_held_at_replay(); }
+        throw duckdb::ExecutorException(
+          "Sirius CPU replay refused because checkpoint-lease cleanup did not complete");
       }
 
       // Fall back: run the stored CPU plan on a private executor bound to the same

@@ -890,6 +890,9 @@ TEST_CASE_METHOD(dense_count_join_fixture,
 TEST_CASE("dense_count_join recognizes host COUNT callbacks through a dynamically loaded extension",
           "[dense_count_join][plan][dynamic_load]")
 {
+  auto const source          = GENERATE("parquet", "native");
+  auto const host_visibility = GENERATE("local", "global");
+  CAPTURE(source, host_visibility);
   scoped_temp_directory temp;
   auto const executable = std::filesystem::canonical("/proc/self/exe");
   auto const extension =
@@ -904,7 +907,7 @@ import os
 import sys
 from pathlib import Path
 
-extension, config, temp_root = sys.argv[1:]
+extension, config, temp_root, source, host_visibility = sys.argv[1:]
 root = Path(temp_root)
 logs = root / "logs"
 logs.mkdir()
@@ -915,6 +918,12 @@ os.environ["SIRIUS_LOG_DIR"] = str(logs)
 os.environ["SIRIUS_LOG_BACKEND"] = "spdlog"
 os.environ["SIRIUS_LOG_LEVEL"] = "info"
 
+# Preserve the original default-import regression. Global visibility is additional coverage,
+# never a prerequisite for loading Sirius or verifying its scan callbacks.
+if host_visibility == "global":
+    sys.setdlopenflags(os.RTLD_NOW | os.RTLD_GLOBAL)
+else:
+    assert not (sys.getdlopenflags() & os.RTLD_GLOBAL)
 import duckdb
 
 def sql_literal(value):
@@ -922,36 +931,45 @@ def sql_literal(value):
 
 customer_path = root / "customer.parquet"
 orders_path = root / "orders.parquet"
-con = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+con = duckdb.connect(":memory:" if source == "parquet" else str(root / "native.duckdb"),
+                     config={"allow_unsigned_extensions": "true"})
 con.execute(
     f"COPY (SELECT range::INTEGER AS c_custkey FROM range(9)) "
     f"TO {sql_literal(customer_path)} (FORMAT PARQUET)"
 )
 con.execute(
     "COPY (SELECT range::BIGINT AS o_orderkey, "
-    "             (range % 8)::INTEGER AS o_custkey, "
-    "             CASE WHEN range % 5 = 0 THEN 'special x requests' ELSE 'ordinary' END AS o_comment "
-    "      FROM range(64)) "
+    "       (range % 8)::INTEGER AS o_custkey, "
+    "       CASE WHEN range % 5 = 0 THEN 'special x requests' ELSE 'ordinary' END AS o_comment "
+    "FROM range(64)) "
     f"TO {sql_literal(orders_path)} (FORMAT PARQUET)"
 )
-con.execute(
-    f"CREATE VIEW customer AS SELECT * FROM read_parquet([{sql_literal(customer_path)}])"
-)
-con.execute(
-    f"CREATE VIEW orders AS SELECT * FROM read_parquet([{sql_literal(orders_path)}])"
-)
+con.execute(f"CREATE VIEW customer AS SELECT * FROM read_parquet([{sql_literal(customer_path)}])")
+con.execute(f"CREATE VIEW orders AS SELECT * FROM read_parquet([{sql_literal(orders_path)}])")
+if source == "native":
+    con.execute("CREATE TABLE native_customer AS SELECT * FROM customer")
+    con.execute("CREATE TABLE native_orders AS SELECT * FROM orders")
+    con.execute("DROP VIEW customer")
+    con.execute("DROP VIEW orders")
+    con.execute("ALTER TABLE native_customer RENAME TO customer")
+    con.execute("ALTER TABLE native_orders RENAME TO orders")
+    con.execute("CHECKPOINT")
 
 con.execute(f"LOAD {sql_literal(extension)}")
 con.execute("SET gpu_execution = true")
 con.execute("SET enable_duckdb_fallback = false")
-con.execute(
-    f"CALL pin_table({sql_literal(customer_path)}, tier='host', "
-    "name='customer', cols=['c_custkey'])"
-).fetchall()
-con.execute(
-    f"CALL pin_table({sql_literal(orders_path)}, tier='host', "
-    "name='orders', cols=['o_custkey','o_orderkey','o_comment'])"
-).fetchall()
+# Check fresh scans before pinning, so cached inputs cannot hide host scan verification failures.
+for query, expected in [
+    ("SELECT sum(c_custkey) FROM customer WHERE c_custkey >= 3", [(33,)]),
+    ("SELECT sum(o_orderkey) FROM orders WHERE o_custkey < 3", [(696,)]),
+]:
+    actual = con.execute(query).fetchall()
+    if actual != expected:
+        raise AssertionError((query, actual, expected))
+for name, path, cols in [("customer", customer_path, "['c_custkey']"),
+                         ("orders", orders_path, "['o_custkey','o_orderkey','o_comment']")]:
+    source_arg = sql_literal(path) if source == "parquet" else "format='duckdb'"
+    con.execute(f"CALL pin_table({source_arg}, tier='host', name='{name}', cols={cols})").fetchall()
 
 queries = [
     (
@@ -994,6 +1012,8 @@ con.close()
              extension.c_str(),
              config.c_str(),
              temp.path().c_str(),
+             source,
+             host_visibility,
              static_cast<char*>(nullptr));
     ::_exit(127);
   }
@@ -1049,6 +1069,7 @@ con.close()
   }
 
   INFO("dynamic-load Sirius logs:\n" << log_text);
+  CHECK(log_text.find("has no trusted reference definition") == std::string::npos);
   REQUIRE(fusion_lines.size() >= 2);
   bool saw_count_column = false;
   bool saw_count_star   = false;

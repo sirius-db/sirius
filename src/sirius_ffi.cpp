@@ -241,8 +241,9 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
     {
       duckdb::SiriusContext::StandaloneQueryScope window(*impl_->context, client, kQueryLabel);
       auto const plan_started = std::chrono::steady_clock::now();
-      auto physical_plan      = sirius::planner::sirius_physical_plan_generator(client).create_plan(
-        std::move(lowered.plan));
+      auto physical_plan      = sirius::planner::sirius_physical_plan_generator(
+                             client, {{sirius::value_of(window.query_id())}, 0})
+                             .create_plan(std::move(lowered.plan));
       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
         std::move(lowered.prepared), std::move(physical_plan));
       plan_ms = elapsed_ms(plan_started);
@@ -513,8 +514,9 @@ void Fragment::build(const std::string& substrait_plan)
       // A result fragment takes the single-shot execution path; its leaves may be streaming
       // sources built from the bind catalog.
       auto lowered       = lower_substrait(*impl_->ctx.conn, substrait_plan);
-      auto physical_plan = sirius::planner::sirius_physical_plan_generator(client).create_plan(
-        std::move(lowered.plan));
+      auto physical_plan = sirius::planner::sirius_physical_plan_generator(
+                             client, {{sirius::value_of(impl_->lifecycle->query_id())}, 0})
+                             .create_plan(std::move(lowered.plan));
       impl_->result_plan = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
         std::move(lowered.prepared), std::move(physical_plan));
 

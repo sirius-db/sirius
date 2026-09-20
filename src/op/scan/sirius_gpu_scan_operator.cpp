@@ -32,6 +32,7 @@
 #include <scan_manager/split_connector.hpp>
 #include <sirius/exception.hpp>
 #include <sirius_context.hpp>
+#include <transparent/read_view_registry.hpp>
 
 // cudf
 #include <cudf/binaryop.hpp>
@@ -344,10 +345,14 @@ sirius_gpu_scan_operator::sirius_gpu_scan_operator(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   std::shared_ptr<gpu_ingestible> ingestible,
-  duckdb::SiriusContext* compressed_materialization_observer)
+  duckdb::SiriusContext* compressed_materialization_observer,
+  std::shared_ptr<transparent::read_view_registry> read_views,
+  scan_contract_id contract_id)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::GPU_SCAN, std::move(types), estimated_cardinality),
     _ingestible(std::move(ingestible)),
+    _read_views(std::move(read_views)),
+    _contract_id(contract_id),
     _split_connector(std::make_shared<scan_manager::split_connector>()),
     _compressed_materialization_observer(compressed_materialization_observer)
 {
@@ -433,6 +438,14 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
 //===----------------------------------------------------------------------===//
 gpu_ingestible& sirius_gpu_scan_operator::get_ingestible() const { return *_ingestible; }
 
+bound_table_scan const& sirius_gpu_scan_operator::scan_contract() const
+{
+  if (!_read_views || _contract_id == 0) {
+    throw std::runtime_error("GPU scan operator has no bound scan contract");
+  }
+  return contract_of(*_read_views, _contract_id);
+}
+
 scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()
 {
   return *_split_connector;
@@ -449,6 +462,16 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
     throw std::runtime_error(
       "[sirius_gpu_scan_operator::execute] expected input of type scan_operator_input; got " +
       std::string(typeid(input_data).name()));
+  }
+  if (scan_input->has_scan_metadata() && _contract_id != 0) {
+    try {
+      validate_split_for_gpu(_contract_id, scan_input->get_scan_info());
+    } catch (...) {
+      if (_compressed_materialization_observer) {
+        _compressed_materialization_observer->record_transparent_certificate_mismatch();
+      }
+      throw;
+    }
   }
 
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;

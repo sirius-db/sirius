@@ -147,17 +147,32 @@ int main(int argc, char* argv[])
   log_sink->set_level(lvl);
   sirius::log::set_sink(std::move(log_sink));
 
+  // This child must register a replacement before the first Sirius load. Even creating a
+  // paused shared_test_env below would initialize the process-wide callback cache too early.
+  auto const* preload_child = std::getenv("SIRIUS_REGISTRY_PRELOAD_CHILD");
+  if (preload_child && std::string(preload_child) == "1") {
+    Catch::Session session;
+    session.applyCommandLine(argc, argv);
+    return session.run();
+  }
+
   // Create shared test environments. Both start PAUSED and are only activated
   // by the listener for tests with the matching tag. This avoids GPU memory
   // conflicts with operator tests that use their own memory managers.
   // Only one environment can be active at a time.
+  auto const* child_config_override = std::getenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE");
   auto scan_config_path =
-    std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
+    child_config_override != nullptr
+      ? std::filesystem::path(child_config_override)
+      : std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
   sirius::test::shared_test_env scan_env(scan_config_path);
   scan_env.pause();
   sirius::test::g_shared_env = &scan_env;
 
-  sirius::test::shared_test_env integration_env(sirius::test::integration_config_path());
+  auto integration_config_path = child_config_override != nullptr
+                                   ? std::filesystem::path(child_config_override)
+                                   : sirius::test::integration_config_path();
+  sirius::test::shared_test_env integration_env(integration_config_path);
   integration_env.pause();
   sirius::test::g_integration_env = &integration_env;
 
