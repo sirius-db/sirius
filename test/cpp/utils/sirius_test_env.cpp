@@ -26,7 +26,8 @@ void trim_cuda_memory_pools()
 {
   int original_device{};
   int device_count{};
-  if (cudaGetDevice(&original_device) != cudaSuccess || cudaGetDeviceCount(&device_count) != cudaSuccess) {
+  if (cudaGetDevice(&original_device) != cudaSuccess ||
+      cudaGetDeviceCount(&device_count) != cudaSuccess) {
     return;
   }
 
