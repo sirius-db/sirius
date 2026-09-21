@@ -20,7 +20,7 @@ flowchart TB
     Pub --> S["Scan / probe side: mask rows, gather survivors"]
 ```
 
-PARITION counts the total number of rows flowing into the hash table build. This allows us to size the filter so that partial filters can be bitwise ORed together to produce a coherent single, global filter. As partitioned batches become available through CONCAT, those batches insert their keys into a local, partial filter. The per-GPU partial filters are combined into a global filter and broadcast out to every GPU that needs it (see "Combining Filters" below).
+PARTITION counts the total number of rows flowing into the hash table build. This allows us to size the filter so that partial filters can be bitwise ORed together to produce a coherent single, global filter. As partitioned batches become available through CONCAT, those batches insert their keys into a local, partial filter. The per-GPU partial filters are combined into a global filter and broadcast out to every GPU that needs it (see "Combining Filters" below).
 
 ## Combining Filters Across GPUs and Broadcasting the Result
 
@@ -72,7 +72,7 @@ sequenceDiagram
 
 Buffer A and B alternate so that a chunk's copy-in can be issued concurrently with the previous chunk's copy-out. This pipelined strategy is chosen over a simpler serial baseline (copy one partial in, OR it, copy the result out, repeat — no overlap) that's used as a fallback when double-buffered scratch can't be reserved or fast GPU-to-GPU copies aren't available. Whether that fast copy path exists at all is itself gated by the cuCascade dependency (see below).
 
-## Redesign: 3 Owners Instead of one Tangled Object
+## Redesign: 3 Owners Instead of 1 Tangled Object
 
 Currently, one object plays both "mutable thing being built" and "immutable thing being read," and "who's allowed to finish this filter" is a convention callers have to follow by hand. Later optimizations discovered in the optimization campaign (chunked GPU copies, a fused masking kernel, early scheduling, extra usefulness stats) had to bolt its own flag and bookkeeping onto that same semanticlaly confused core.
 
