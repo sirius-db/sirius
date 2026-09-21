@@ -163,6 +163,8 @@ jobs:
           fi
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: 0.18.0
 
       - run: |
           set -o pipefail
