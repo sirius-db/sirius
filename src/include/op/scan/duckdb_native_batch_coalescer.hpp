@@ -39,10 +39,11 @@ namespace sirius::op::scan {
 // Rowids are absolute per row group (row_group_start), so packing order does not
 // affect correctness.
 //===----------------------------------------------------------------------===//
-class batch_coalescer {
+class duckdb_native_row_group_batch_coalescer {
  public:
-  batch_coalescer(std::size_t approximate_batch_size,
-                  const std::vector<sirius::logical_type>& projected_types)
+  duckdb_native_row_group_batch_coalescer(
+    std::size_t approximate_batch_size,
+    const std::vector<sirius::logical_type>& projected_types)
     : _cap_bytes(approximate_batch_size)
   {
     _is_varchar.reserve(projected_types.size());
