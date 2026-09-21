@@ -108,6 +108,10 @@ Normally the probe side waits until the build side finishes before doing any wor
 
 CUDA peer access (the device-level "can GPU A see GPU B's memory", via `cudaDeviceEnablePeerAccess()`) is not the same as pool access (can GPU A DMA directly into the *specific RMM pool* GPU B allocated from — Sirius allocates from pools, not raw CUDA memory). Even a successful `cudaMemcpyPeerAsync` call doesn't prove real pool-to-pool DMA happened; the driver can silently stage it through host memory instead (and not the pool you want!). So the fast path needs an empirical, bidirectional probe of the actual pools involved, not just an API call that didn't error. This capability must land in cuCascade. Once merged, Sirius requests and caches grants once at startup (`SiriusContext::initialize`) for the pools filters actually use, on the active GPU set; only a pool pair that comes back "granted" uses the fast chunked-copy path. Until that PR merges, Sirius always uses the safe (slower) serial copy path. Wiring up the fast path is its own PR (#4 below), blocked on that dependency merging.
 
+## The PARTITION Total Row Count
+
+To reduce the block between PARTITION's capture of the total row count and Bloom filter construction, something like PR 1765, which uses runtime estimation to size GROUP BY partitions, should be evaluated. Deferring to PR 6, as it is perf-exploratory by nature anyway.
+
 ### Landing this: six PRs
 
 1. Session + channel core (single build, no multi-partition support yet)
@@ -115,6 +119,6 @@ CUDA peer access (the device-level "can GPU A see GPU B's memory", via `cudaDevi
 3. Shared scan consumer + fused masking kernel
 4. Fast GPU-to-GPU copy path (needs cuCascade merged first)
 5. Smarter "is this filter worth it" heuristics
-6. Optional early probe-side start
+6. Optional early probe-side start, and runtime row count estimation.
 
 PRs 1–3 can merge against `dev` today. PR 4 is blocked on the separate cuCascade PR merging. PRs 5 and 6 follow. Each PR ships its own tests, docs, and config cleanup — there's no separate cleanup-only PR at the end.
