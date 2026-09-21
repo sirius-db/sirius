@@ -18,8 +18,9 @@
 
 #include "vss/vector_search.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
@@ -55,7 +56,7 @@ struct vector_search_context {
   const cucascade::memory::memory_space& host_space;
   const scan_manager::pinned_entry& pin;
   rmm::device_async_resource_ref mr;
-  rmm::cuda_stream_view stream;
+  ::cuda::stream_ref stream{cudaStream_t{}};
   const float* query_device;  ///< [dim] FLOAT32 query already uploaded to the device.
   int target_gpu;
   std::int64_t k;  ///< min(num_rows, req.k).
@@ -68,7 +69,7 @@ std::unique_ptr<cudf::table> make_empty_vss_output(
 /// Widen gathered output columns back to their native carrier types.
 void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
                              const std::vector<sirius::logical_type>& native_types,
-                             rmm::cuda_stream_view stream,
+                             ::cuda::stream_ref stream,
                              rmm::device_async_resource_ref mr);
 
 /// Move a GPU result table to a host_data_representation the table function can

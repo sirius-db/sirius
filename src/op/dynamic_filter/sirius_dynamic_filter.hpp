@@ -29,8 +29,9 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <atomic>
 #include <cstddef>
@@ -174,7 +175,7 @@ class sirius_mask_applicable {
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const = 0;
 };
 
@@ -197,7 +198,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
    * @throw std::logic_error if the validated key type changes during construction
    */
   sirius_dynamic_in_list_filter(cudf::column_view const& keys,
-                                rmm::cuda_stream_view stream,
+                                ::cuda::stream_ref stream,
                                 rmm::device_async_resource_ref mr);
 
   ~sirius_dynamic_in_list_filter() override;
@@ -210,7 +211,7 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
@@ -248,7 +249,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
   sirius_dynamic_small_in_list_filter(cudf::column_view const& keys,
-                                      rmm::cuda_stream_view stream,
+                                      ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr);
 
   ~sirius_dynamic_small_in_list_filter() override;
@@ -267,7 +268,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
@@ -303,7 +304,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
    * @throw std::logic_error if the validated key type changes during construction
    */
   sirius_dynamic_bloom_filter(cudf::column_view const& keys,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr);
   ~sirius_dynamic_bloom_filter() override;
 
@@ -318,7 +319,7 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
   [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;

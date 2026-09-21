@@ -19,7 +19,7 @@
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -82,7 +82,7 @@ using lock_and_prepare_batch_result = std::variant<lock_to_existing_batch, lock_
 inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   const std::shared_ptr<cucascade::data_batch>& batch,
   const cucascade::memory::memory_space* requested_memory_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (!batch) { return std::nullopt; }
 

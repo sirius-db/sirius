@@ -419,7 +419,7 @@ struct cached_databatch_provider : public databatch_provider {
       cudf::table_view view(column_views);
       auto* chunk_space = chunk.memory_space ? chunk.memory_space : _entry.memory_space;
       auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-        view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+        view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
       const auto batch_id = ::sirius::get_next_batch_id();
       return ::cucascade::data_batch::make(
         batch_id,
@@ -441,7 +441,7 @@ struct cached_databatch_provider : public databatch_provider {
     auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+      view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
     const auto batch_id = ::sirius::get_next_batch_id();
     return ::cucascade::data_batch::make(
       batch_id,

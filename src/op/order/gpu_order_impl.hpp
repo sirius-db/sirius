@@ -62,7 +62,7 @@ class gpu_order_impl {
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,
     const std::vector<int>& projections,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 };

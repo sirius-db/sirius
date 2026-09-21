@@ -21,7 +21,7 @@
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -81,7 +81,7 @@ class convertible_data_batch : public convertible_data {
    */
   std::optional<std::vector<std::size_t>> convert(
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
     bool blocking) override
   {

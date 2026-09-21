@@ -5,7 +5,7 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 namespace simpatico {
 
@@ -56,7 +56,7 @@ inline cudf::column_view get_dictionary_child_view(cudf::column_view const& dict
 /// \param stream CUDA stream for accessing chars_size.
 /// \return pair of (chars data pointer, chars size in bytes)
 inline std::pair<char const*, int64_t> get_dictionary_keys_chars_info(
-  cudf::column_view const& dict_col, rmm::cuda_stream_view stream)
+  cudf::column_view const& dict_col, ::cuda::stream_ref stream)
 {
   if (dict_col.type().id() != cudf::type_id::DICTIONARY32) { return {nullptr, 0}; }
   cudf::dictionary_column_view dict_view(dict_col);

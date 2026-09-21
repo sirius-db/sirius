@@ -23,8 +23,9 @@
 #include "io/types.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <algorithm>
 #include <atomic>
@@ -131,7 +132,7 @@ concept reactor_has_device_rx = requires(R r,
                                          uint8_t* dst,
                                          size_t offset,
                                          size_t size,
-                                         rmm::cuda_stream_view stream) {
+                                         ::cuda::stream_ref stream) {
   {
     r.prep_device_rx_request(cfg, file, dst, offset, size, stream, 1)
   } -> std::same_as<typename R::request_type_ptr>;
@@ -144,7 +145,7 @@ concept reactor_has_host_to_device_rx = requires(R r,
                                                  uint8_t* dst,
                                                  size_t offset,
                                                  size_t size,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  std::span<io_object_segment> bounce) {
   {
     r.prep_host_to_device_rx_request(cfg, file, bounce, dst, offset, size, stream, 1)
@@ -355,7 +356,7 @@ class templated_ioctx : public ioctx {
                                                  size_t offset,
                                                  size_t size,
                                                  uint8_t* dst,
-                                                 rmm::cuda_stream_view stream) noexcept override
+                                                 ::cuda::stream_ref stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_device_read) {
       try {
@@ -391,7 +392,7 @@ class templated_ioctx : public ioctx {
     size_t offset,
     size_t size,
     uint8_t* dst,
-    rmm::cuda_stream_view stream) noexcept override
+    ::cuda::stream_ref stream) noexcept override
   {
     if constexpr (reactor_traits_t::supports_host_to_device_read) {
       try {

@@ -32,7 +32,7 @@
 #include <cudf/table/table_view.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 // standard library
 #include <atomic>
@@ -156,7 +156,7 @@ class scan_operator_input : public op::operator_data {
    * @param stream CUDA stream used for resident conversion.
    */
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view stream) override;
+                              ::cuda::stream_ref stream) override;
 
   using converted_column_replacements = std::vector<std::unique_ptr<cudf::column>>;
   using converted_table_builder =
@@ -172,7 +172,7 @@ class scan_operator_input : public op::operator_data {
   [[nodiscard]] std::unique_ptr<cudf::table> transactionally_steal_converted_table(
     std::size_t output_width,
     const converted_table_builder& builder,
-    rmm::cuda_stream_view stream) const;
+    ::cuda::stream_ref stream) const;
 
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override;
 

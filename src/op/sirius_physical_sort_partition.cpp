@@ -51,7 +51,7 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 }
 
 std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -121,8 +121,8 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
                                   split_positions_col->view().data<int32_t>(),
                                   num_splits * sizeof(int32_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 
     // Build slice indices: [0, split[0], split[0], split[1], ..., split[P-2], num_rows]
     std::vector<cudf::size_type> slice_indices;

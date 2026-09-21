@@ -118,7 +118,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    * carries only @c scan_operator_input).
    */
   std::unique_ptr<op::operator_data> execute(const op::operator_data& input_data,
-                                             rmm::cuda_stream_view stream) override;
+                                             ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;

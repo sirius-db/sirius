@@ -19,8 +19,9 @@
 #include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
@@ -67,7 +68,7 @@ class iceberg_delete_filter {
   /// filters and ignored by equality deletes. Returns @p tbl unchanged if nothing was deleted.
   virtual std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                              batch_layout layout,
-                                             rmm::cuda_stream_view stream,
+                                             ::cuda::stream_ref stream,
                                              rmm::device_async_resource_ref mr) = 0;
 };
 
@@ -81,7 +82,7 @@ class positional_delete_filter : public iceberg_delete_filter {
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout layout,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr) override;
 
   /// Whether any run in @p layout names a file this filter holds deletes for. Lets the
@@ -103,7 +104,7 @@ class equality_delete_filter : public iceberg_delete_filter {
 
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout layout,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr) override;
 
  private:
@@ -142,7 +143,7 @@ class iceberg_delete_pipeline {
    */
   [[nodiscard]] std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                                    batch_layout layout,
-                                                   rmm::cuda_stream_view stream,
+                                                   ::cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref mr) const;
 
  private:

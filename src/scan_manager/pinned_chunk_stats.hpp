@@ -18,8 +18,9 @@
 
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -43,7 +44,7 @@ namespace sirius::scan_manager {
 [[nodiscard]] std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> compute_pinned_chunk_stats(
   cudf::table_view const& chunk,
   duckdb::vector<duckdb::LogicalType> const& column_types,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 /**

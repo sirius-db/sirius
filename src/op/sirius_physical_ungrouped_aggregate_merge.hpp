@@ -59,7 +59,7 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   bool is_sink() const override { return true; }
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 };
 
 }  // namespace op

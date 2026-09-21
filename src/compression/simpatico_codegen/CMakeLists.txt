@@ -176,7 +176,8 @@ if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
   set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
 endif()
 target_compile_definitions(
-  simpatico PUBLIC SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
+  simpatico PUBLIC CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
+                   SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(

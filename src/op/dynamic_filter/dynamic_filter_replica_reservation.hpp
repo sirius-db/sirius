@@ -19,8 +19,9 @@
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 #include <rmm/aligned.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -63,7 +64,7 @@ class scoped_replica_reservation final {
    * @return An attached scope, or `std::nullopt` when capacity or tracker state rejects it
    */
   [[nodiscard]] static std::optional<scoped_replica_reservation> try_acquire(
-    dynamic_filter_replica_space const& target, std::size_t bytes, rmm::cuda_stream_view stream)
+    dynamic_filter_replica_space const& target, std::size_t bytes, ::cuda::stream_ref stream)
   {
     if (bytes == 0) {
       throw std::invalid_argument(
@@ -110,13 +111,13 @@ class scoped_replica_reservation final {
 
  private:
   scoped_replica_reservation(cucascade::memory::reservation_aware_resource_adaptor* allocator,
-                             rmm::cuda_stream_view stream) noexcept
+                             ::cuda::stream_ref stream) noexcept
     : _allocator{allocator}, _stream{stream}
   {
   }
 
   cucascade::memory::reservation_aware_resource_adaptor* _allocator;
-  rmm::cuda_stream_view _stream;
+  ::cuda::stream_ref _stream{cudaStream_t{}};
 };
 
 }  // namespace sirius::op::detail

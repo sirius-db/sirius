@@ -21,8 +21,9 @@
 #include <cudf/strings/strings_column_view.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <cstdint>
@@ -100,7 +101,7 @@ class like_multiliteral_pattern {
   friend std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const&,
                                                          like_multiliteral_pattern const&,
                                                          bool,
-                                                         rmm::cuda_stream_view,
+                                                         ::cuda::stream_ref,
                                                          rmm::device_async_resource_ref);
 };
 
@@ -184,7 +185,7 @@ class like_multiliteral_cache {
 std::unique_ptr<cudf::column> like_multiliteral(cudf::strings_column_view const& input,
                                                 like_multiliteral_pattern const& pattern,
                                                 bool invert,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr);
 
 }  // namespace sirius

@@ -26,7 +26,7 @@
 #include "codegen/selection/chunk_row_set.hpp"
 #include "codegen/selection/selection.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -58,7 +58,7 @@ bool launch_decode_fused_tree_mask_out(codegen::jit::FusedTree const& tree,
                                        std::int64_t num_rows,
                                        ::sirius::codegen::range_predicate pred,
                                        ::sirius::codegen::selection_mask& mask,
-                                       rmm::cuda_stream_view stream);
+                                       ::cuda::stream_ref stream);
 
 /// Compacting value decode: writes the survivors' values to ``out``, in row
 /// order, sized by ``mask.survivor_count``.
@@ -82,7 +82,7 @@ bool launch_decode_fused_tree_compacted(codegen::jit::FusedTree const& tree,
                                         ::sirius::codegen::selection_mask const& mask,
                                         row_enumeration rows,
                                         void* out,
-                                        rmm::cuda_stream_view stream);
+                                        ::cuda::stream_ref stream);
 
 /// Dictionary gather: for dictionary->bitpack string columns with
 /// CONSTANT-WIDTH, null-free keys.  ``tree`` is the codes
@@ -100,7 +100,7 @@ bool launch_decode_fused_tree_dict_gather(codegen::jit::FusedTree const& tree,
                                           void const* keys_chars,
                                           std::int32_t key_width,
                                           void* out_chars,
-                                          rmm::cuda_stream_view stream);
+                                          ::cuda::stream_ref stream);
 
 /// str_split gather, phase 1: survivor metadata.  ``tree`` is the string
 /// column's OFFSETS subtree (Bitpack- or Delta-rooted, any depth below);
@@ -118,7 +118,7 @@ bool launch_decode_fused_tree_str_split_meta(codegen::jit::FusedTree const& tree
                                              row_enumeration rows,
                                              std::int64_t* src_offsets_out,
                                              std::int32_t* lengths_out,
-                                             rmm::cuda_stream_view stream);
+                                             ::cuda::stream_ref stream);
 
 /// str_split gather, phase 2: tree-independent byte gather from the RAW chars
 /// buffer — survivor j copies out_offsets[j+1]-out_offsets[j] bytes from
@@ -130,6 +130,6 @@ bool launch_masked_char_copy(void const* chars,
                              std::int32_t const* out_offsets,
                              std::int64_t n_survivors,
                              void* out_chars,
-                             rmm::cuda_stream_view stream);
+                             ::cuda::stream_ref stream);
 
 }  // namespace simpatico

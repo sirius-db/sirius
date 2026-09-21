@@ -159,7 +159,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
 }
 
 std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
-                                                                    rmm::cuda_stream_view stream)
+                                                                    ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -316,7 +316,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     boundary_indices_host.data(),
                                     num_boundaries * sizeof(int32_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
 
       // Extract only the sort key columns from merged sample for the boundaries
       std::vector<cudf::column_view> sort_key_cols;

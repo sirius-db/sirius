@@ -81,12 +81,11 @@ exec::semi_future<size_t> kvikio_context::host_read_async_io(const io_object& ob
   return exec::make_semi_future_with([fut = std::move(fut)]() mutable { return fut.get(); });
 }
 
-exec::semi_future<size_t> kvikio_context::device_read_async_io(
-  const io_object& obj,
-  size_t offset,
-  size_t size,
-  uint8_t* dst,
-  rmm::cuda_stream_view stream) noexcept
+exec::semi_future<size_t> kvikio_context::device_read_async_io(const io_object& obj,
+                                                               size_t offset,
+                                                               size_t size,
+                                                               uint8_t* dst,
+                                                               ::cuda::stream_ref stream) noexcept
 {
   auto fut = as_kvikio(obj).datasource().device_read_async(
     offset, size, reinterpret_cast<uint8_t*>(dst), stream);
@@ -99,7 +98,7 @@ exec::semi_future<size_t> kvikio_context::host_to_device_read_async_io(
   size_t offset,
   size_t size,
   uint8_t* device_dst,
-  rmm::cuda_stream_view stream) noexcept
+  ::cuda::stream_ref stream) noexcept
 {
   return exec::make_semi_future<size_t>(std::make_exception_ptr(
     std::runtime_error("kvikio_context does not support host_to_device_read_async_io; use "

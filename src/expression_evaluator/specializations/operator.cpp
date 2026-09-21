@@ -57,7 +57,7 @@ template <typename T>
 std::unique_ptr<cudf::column> execute_numeric_in_ast(const ::sirius::ast::in_list& alt,
                                                      const cudf::column_view& input_view,
                                                      rmm::device_async_resource_ref mr,
-                                                     rmm::cuda_stream_view stream)
+                                                     ::cuda::stream_ref stream)
 {
   std::vector<T> children_vals;
   children_vals.reserve(alt.values.size());
@@ -69,7 +69,7 @@ std::unique_ptr<cudf::column> execute_numeric_in_ast(const ::sirius::ast::in_lis
                                 children_vals.data(),
                                 children_vals.size() * sizeof(T),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -84,7 +84,7 @@ template <typename DecimalT>
 std::unique_ptr<cudf::column> execute_decimal_in_ast(const ::sirius::ast::in_list& alt,
                                                      const cudf::column_view& input_view,
                                                      rmm::device_async_resource_ref mr,
-                                                     rmm::cuda_stream_view stream)
+                                                     ::cuda::stream_ref stream)
 {
   using Rep = typename DecimalT::rep;
   std::vector<Rep> children_vals;
@@ -106,7 +106,7 @@ std::unique_ptr<cudf::column> execute_decimal_in_ast(const ::sirius::ast::in_lis
                                 children_vals.data(),
                                 children_vals.size() * sizeof(Rep),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   // input_view.type() carries the scale, so the haystack column matches the needle's type.
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
@@ -122,7 +122,7 @@ template <typename CudfTimestampT>
 std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_list& alt,
                                                        const cudf::column_view& input_view,
                                                        rmm::device_async_resource_ref mr,
-                                                       rmm::cuda_stream_view stream)
+                                                       ::cuda::stream_ref stream)
 {
   using Rep = typename CudfTimestampT::rep;
   std::vector<Rep> children_vals;
@@ -148,7 +148,7 @@ std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_l
                                 children_vals.data(),
                                 children_vals.size() * sizeof(Rep),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -164,7 +164,7 @@ std::unique_ptr<cudf::column> execute_timestamp_in_ast(const ::sirius::ast::in_l
 std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& alt,
                                                   const cudf::column_view& input_view,
                                                   rmm::device_async_resource_ref mr,
-                                                  rmm::cuda_stream_view stream)
+                                                  ::cuda::stream_ref stream)
 {
   std::vector<uint8_t> children_vals;
   children_vals.reserve(alt.values.size());
@@ -176,7 +176,7 @@ std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& 
                                 children_vals.data(),
                                 children_vals.size() * sizeof(uint8_t),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   cudf::column_view children_view(input_view.type(),
                                   static_cast<cudf::size_type>(children_vals.size()),
                                   children_vals_d.data(),
@@ -189,7 +189,7 @@ std::unique_ptr<cudf::column> execute_bool_in_ast(const ::sirius::ast::in_list& 
 std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list& alt,
                                                     const cudf::column_view& input_view,
                                                     rmm::device_async_resource_ref mr,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   auto const num_strings = static_cast<cudf::size_type>(alt.values.size());
   auto const num_offsets = num_strings + 1;
@@ -211,12 +211,12 @@ std::unique_ptr<cudf::column> execute_string_in_ast(const ::sirius::ast::in_list
                                 chars.data(),
                                 chars.size() * sizeof(char),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
                                 offsets.data(),
                                 offsets.size() * sizeof(cudf::size_type),
                                 cudaMemcpyHostToDevice,
-                                stream));
+                                stream.get()));
 
   auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
                                                     num_offsets,

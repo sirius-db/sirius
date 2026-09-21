@@ -41,7 +41,7 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
     dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::membership_masks_only);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   void on_finalize_operator() override;
 

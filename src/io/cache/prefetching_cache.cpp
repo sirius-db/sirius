@@ -27,8 +27,8 @@
 #include "util/error_utils.hpp"
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -438,7 +438,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
                                                                     size_t offset,
                                                                     size_t size,
                                                                     uint8_t* dst,
-                                                                    rmm::cuda_stream_view stream,
+                                                                    ::cuda::stream_ref stream,
                                                                     cache_handle* handle)
 {
   if (size == 0 || dst == nullptr) { return std::size_t{0}; }
@@ -556,7 +556,7 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
                       c->data + (copy_start - c->offset),
                       copy_end - copy_start,
                       cudaMemcpyHostToDevice,
-                      stream);
+                      stream.get());
     }
 
     auto device_id = rmm::get_current_cuda_device();
@@ -567,8 +567,8 @@ exec::semi_future<std::size_t> prefetching_cache::device_read_async(const io_obj
     // above) before mutating chunk state, since releasing a read pin or publishing
     // loading -> cached makes a chunk evictable.  Run the continuation on the IO
     // callback pool, not inline on the reactor thread, because it blocks on
-    // stream.synchronize().  When there are no IO segments (cache-only path) we
-    // synthesize a ready future so both paths share one continuation; stream.synchronize()
+    // stream.sync().  When there are no IO segments (cache-only path) we
+    // synthesize a ready future so both paths share one continuation; stream.sync()
     // is equivalent to the previous event.synchronize() since only case-(1) copies are
     // on the stream at that point.
     auto io_fut = io_segments.empty() ? exec::make_semi_future<size_t>(size)

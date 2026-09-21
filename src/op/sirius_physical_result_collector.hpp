@@ -44,7 +44,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
   explicit sirius_physical_result_collector(::sirius::sirius_prepared_statement_data& data);
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
@@ -95,7 +95,7 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
    * host_data_representation. In the future, we should register converters for other
    * specialized data representations and invoke one such here.
    */
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& input_data, ::cuda::stream_ref stream) override;
 
  private:
   duckdb::ClientContext& _client_ctx;

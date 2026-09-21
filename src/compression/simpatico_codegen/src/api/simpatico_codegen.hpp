@@ -51,13 +51,13 @@ class compressed_table {
   /// that column. Leaf order follows PlanTree node order (node.rep before
   /// node.channels; channels in output_paths order where available).
   std::vector<std::vector<simpatico::leaf_desc>> describe(
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) const;
+    ::cuda::stream_ref stream = cudf::get_default_stream()) const;
 
   /// Decompress on a single CUDA stream.
   ///
   /// Equivalent to calling the free function simpatico::decompress(*this, ...).
   std::unique_ptr<cudf::table> decompress(
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    ::cuda::stream_ref stream         = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref()) const;
 };
 
@@ -87,7 +87,7 @@ std::vector<std::string> split_plan_dsl(std::string_view plan_dsl);
 compressed_table compress_with_plan(
   cudf::table_view table,
   std::string_view plan_dsl,
-  rmm::cuda_stream_view stream          = cudf::get_default_stream(),
+  ::cuda::stream_ref stream             = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr     = rmm::mr::get_current_device_resource_ref(),
   std::vector<std::string> column_names = {});
 
@@ -139,7 +139,7 @@ compressed_table compress_with_plan(
 /// @throws std::runtime_error on GPU error.
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 /// Decompress all columns in parallel using @p column_threads worker threads.
@@ -175,7 +175,7 @@ std::unique_ptr<cudf::table> decompress(
 std::unique_ptr<cudf::table> decompress(
   const compressed_table& table,
   std::span<const std::size_t> selected_columns,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
 
 /// Decompress a column subset in parallel using @p column_threads worker threads.
@@ -280,7 +280,7 @@ std::unique_ptr<cudf::column> decompress_column_rows(
   const compressed_table& table,
   std::size_t column_index,
   sirius::codegen::chunk_row_set const& rows,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
@@ -293,7 +293,7 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
   const compressed_table& table,
   std::size_t column_index,
   sirius::codegen::selection_mask const& mask,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
@@ -303,7 +303,7 @@ std::unique_ptr<cudf::column> decompress_column_compacted(
 std::unique_ptr<cudf::column> decompress_column_full(
   const compressed_table& table,
   std::size_t column_index,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
@@ -313,7 +313,7 @@ std::unique_ptr<cudf::table> decompress_scan_filter(
   sirius::codegen::scan_filter_request const& request,
   sirius::codegen::scan_filter_result& result,
   simpatico::stream_pool& pool,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 

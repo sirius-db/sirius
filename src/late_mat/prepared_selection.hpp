@@ -46,9 +46,10 @@
 
 #include "late_mat/column_origin.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <codegen/selection/chunk_row_set.hpp>
 
@@ -142,7 +143,7 @@ class prepared_selection {
   /// Throws if the ids do not lie within the layout's rows: an id outside the
   /// pinned table means the caller's addressing disagrees with the pin, and
   /// materializing under that disagreement would produce plausible wrong rows.
-  [[nodiscard]] canonical_selection const& canonical(rmm::cuda_stream_view stream,
+  [[nodiscard]] canonical_selection const& canonical(::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr) const;
 
   /// Whether anything has needed the canonical form yet. Diagnostics and tests

@@ -28,7 +28,7 @@
 #include <cudf/table/table.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -84,7 +84,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   duckdb_native_ingestible_table_info const& table_info,
   sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 //===----------------------------------------------------------------------===//
 // checked_array_child_advance

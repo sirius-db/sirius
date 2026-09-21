@@ -124,7 +124,7 @@ struct bfs_candidate {
 
 // Sum of every stored leaf's compressed bytes — the same accounting
 // `benchmark`'s `plan_tree_compressed_bytes` uses, so the two never drift.
-size_t plan_tree_compressed_bytes(PlanTree const& tree, rmm::cuda_stream_view stream)
+size_t plan_tree_compressed_bytes(PlanTree const& tree, ::cuda::stream_ref stream)
 {
   size_t total = 0;
   for (auto const& node : tree.nodes) {
@@ -154,7 +154,7 @@ size_t plan_tree_compressed_bytes(PlanTree const& tree, rmm::cuda_stream_view st
 // materially different true size than the BFS's unfused per-op sum suggests.
 bool measure_compressed_bytes(cudf::column_view input,
                               std::string_view plan_dsl,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref mr,
                               size_t& compressed_bytes_out,
                               std::string* err_out)
@@ -175,7 +175,7 @@ bool measure_compressed_bytes(cudf::column_view input,
 // continuity rates.
 bool round_trip_time_rr(cudf::column_view input,
                         std::string_view plan_dsl,
-                        rmm::cuda_stream_view stream,
+                        ::cuda::stream_ref stream,
                         rmm::device_async_resource_ref mr,
                         double& compress_ms_out,
                         double& decompress_ms_out,
@@ -185,7 +185,7 @@ bool round_trip_time_rr(cudf::column_view input,
   std::unique_ptr<PlanTree> plan_tree;
   std::string err;
   compress_ms_out = time_cuda_ms(
-    stream.value(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
+    stream.get(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
   if (!plan_tree) {
     if (err_out) *err_out = "compress_column: " + err;
     return false;
@@ -194,7 +194,7 @@ bool round_trip_time_rr(cudf::column_view input,
 
   std::unique_ptr<cudf::column> decompressed;
   decompress_ms_out = time_cuda_ms(
-    stream.value(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
+    stream.get(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
   if (!decompressed) {
     if (err_out) *err_out = "decompress_column: " + err;
     return false;
@@ -227,7 +227,7 @@ struct rt_stats {
 // timed decompress calls of that same tree (median).
 bool round_trip_time_stats(cudf::column_view input,
                            std::string_view plan_dsl,
-                           rmm::cuda_stream_view stream,
+                           ::cuda::stream_ref stream,
                            rmm::device_async_resource_ref mr,
                            size_t warmup,
                            size_t iters,
@@ -255,9 +255,9 @@ bool round_trip_time_stats(cudf::column_view input,
   std::vector<double> comp_ms;
   comp_ms.reserve(iters);
   for (size_t i = 0; i < iters; ++i) {
-    cudaStreamSynchronize(stream.value());  // drain, so the bracket sees only this call
+    cudaStreamSynchronize(stream.get());  // drain, so the bracket sees only this call
     double ms = time_cuda_ms(
-      stream.value(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
+      stream.get(), [&] { plan_tree = compress_column(input, plan_dsl, stream, mr, &err); });
     if (!plan_tree) {
       if (err_out) *err_out = "compress_column: " + err;
       return false;
@@ -270,10 +270,10 @@ bool round_trip_time_stats(cudf::column_view input,
   std::vector<double> decomp_ms;
   decomp_ms.reserve(iters);
   for (size_t i = 0; i < iters; ++i) {
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     std::unique_ptr<cudf::column> decompressed;
     double ms = time_cuda_ms(
-      stream.value(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
+      stream.get(), [&] { decompressed = decompress_column(*plan_tree, stream, mr, &err); });
     if (!decompressed) {
       if (err_out) *err_out = "decompress_column: " + err;
       return false;
@@ -347,7 +347,7 @@ void trim_trailing_dead_steps(bfs_candidate& c)
 // Public helpers
 // ---------------------------------------------------------------------------
 
-size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view stream)
+size_t column_size_bytes_ex(cudf::column_view const& col, ::cuda::stream_ref stream)
 {
   if (col.type().id() == cudf::type_id::STRING) {
     cudf::strings_column_view scv(col);
@@ -372,7 +372,7 @@ std::string format_output_names(std::vector<compressible_output> const& outs)
 
 operator_trial try_operator(std::string const& name,
                             cudf::column_view col,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   operator_trial r;
@@ -421,7 +421,7 @@ operator_trial try_operator(std::string const& name,
   try {
     std::string err;
     auto rep             = compress_single_op(name, col, stream, mr, &err);
-    cudaError_t sync_err = cudaStreamSynchronize(stream.value());
+    cudaError_t sync_err = cudaStreamSynchronize(stream.get());
     if (sync_err != cudaSuccess) {
       // A kernel on this stream faulted.  Clear the error so subsequent
       // operators can proceed and bail out of this attempt cleanly.
@@ -539,7 +539,7 @@ void prune_beam(std::vector<std::unique_ptr<bfs_candidate>>& beam, size_t cap, s
 
 exploration_result explore_column_compression(cudf::column_view input,
                                               exploration_config const& config,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr)
 {
   size_t const full_size = column_size_bytes_ex(input, stream);
@@ -731,10 +731,10 @@ exploration_result explore_column_compression(cudf::column_view input,
       return a->compression_ratio > b->compression_ratio;
     });
 
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     beam.clear();
     beam.swap(next_beam);
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
 
     bool has_pending = false;
     for (auto const& c2 : beam)
@@ -784,7 +784,7 @@ exploration_result explore_column_compression(cudf::column_view input,
     return a.compression_ratio > b.compression_ratio;
   });
 
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   beam.clear();
   cudaDeviceSynchronize();
 
