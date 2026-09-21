@@ -21,6 +21,8 @@
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
+#include <rmm/detail/error.hpp>
+
 #include <cuda/stream>
 
 #include <cucascade/cuda/event.hpp>
@@ -113,6 +115,15 @@ class convertible_data_batch : public convertible_data {
       auto reservation = mem_space->make_reservation_or_null(data_size);
       if (!reservation) { continue; }
 
+      if (cudaEvent_t const writer_event = mut.get_data()->get_writer_event();
+          writer_event != nullptr) {
+        cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
+      } else if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
+        // Legacy batches have no producer event, so their allocation and writes must finish
+        // before another stream can read or free their buffers.
+        RMM_CUDA_TRY(cudaDeviceSynchronize());
+      }
+
       // When downgrading off the GPU, rebind the source buffers' deallocation stream to this
       // downgrade stream so that when the conversion below frees the GPU representation, the
       // free lands on the active (downgrade) stream rather than the stream the data was
@@ -121,12 +132,6 @@ class convertible_data_batch : public convertible_data {
       // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
         mut.rebind_stream(stream);
-      }
-
-      if (auto const* data = mut.get_data(); data != nullptr) {
-        if (cudaEvent_t const writer_event = data->get_writer_event(); writer_event != nullptr) {
-          cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
-        }
       }
 
       auto& converter_registry = sirius::converter_registry::get();
