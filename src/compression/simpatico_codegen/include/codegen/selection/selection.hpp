@@ -22,9 +22,10 @@
 
 #include <cudf/column/column_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -151,7 +152,7 @@ struct filter_column_directive {
 struct membership_filter_directive {
   std::size_t column;  // key column, indexes into `selected`
   std::function<std::unique_ptr<cudf::column>(
-    cudf::column_view keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)>
+    cudf::column_view keys, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)>
     probe;
 };
 
@@ -227,7 +228,7 @@ struct scan_filter_result {
                           static_cast<uint32_t*>(chunk_offsets.data())};
   }
 
-  void set_stream(rmm::cuda_stream_view stream)
+  void set_stream(::cuda::stream_ref stream)
   {
     if (mask_words.size() != 0) mask_words.set_stream(stream);
     if (chunk_offsets.size() != 0) chunk_offsets.set_stream(stream);
@@ -248,7 +249,7 @@ void combine_masks_and(uint32_t* dst_words,
                        uint32_t const* const* src_words,
                        int num_srcs,
                        int64_t num_words,
-                       rmm::cuda_stream_view stream);
+                       ::cuda::stream_ref stream);
 
 // CNT wave: per-chunk popcount (word-per-thread, warp-reduced) + CUB exclusive
 // scan into mask.chunk_offsets (pre-allocated, ChunksFor(num_rows)+1 entries),
@@ -256,7 +257,7 @@ void combine_masks_and(uint32_t* dst_words,
 // host — this HOST-SYNCS `stream` once (the survivor count gates wave-2
 // allocations). Fills mask.survivor_count and returns it.
 int64_t run_selection_cnt(selection_mask& mask,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr);
 
 // Expand the mask to ascending int32 survivor row ids (TierB gather map).
@@ -272,7 +273,7 @@ int64_t run_selection_cnt(selection_mask& mask,
 
 void mask_to_row_indices(selection_mask const& mask,
                          int32_t* out_indices,
-                         rmm::cuda_stream_view stream);
+                         ::cuda::stream_ref stream);
 
 // BOOL8 -> packed mask adapter: flags is a
 // BOOL8/uint8 device array of num_rows (nonzero = survivor, no null mask);
@@ -282,6 +283,6 @@ void mask_to_row_indices(selection_mask const& mask,
 void mask_from_bool8(uint8_t const* flags,
                      int64_t num_rows,
                      uint32_t* mask_words,
-                     rmm::cuda_stream_view stream);
+                     ::cuda::stream_ref stream);
 
 }  // namespace sirius::codegen

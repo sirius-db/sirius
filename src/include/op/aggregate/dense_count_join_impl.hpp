@@ -20,9 +20,10 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <algorithm>
 #include <cstddef>
@@ -124,7 +125,7 @@ class dense_count_layout {
  */
 [[nodiscard]] std::optional<std::pair<int64_t, int64_t>> dense_count_global_minmax(
   std::vector<cudf::column_view> const& keys,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 /** @brief Accumulate preserved-key multiplicities and counted matches in direct-address histograms.
@@ -132,11 +133,11 @@ class dense_count_layout {
 class dense_count_state {
  public:
   dense_count_state(dense_count_layout const& layout,
-                    rmm::cuda_stream_view stream,
+                    ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr);
 
   /** @brief Accumulate non-NULL preserved keys, which must lie in the histogram domain. */
-  void accumulate_preserved(cudf::column_view const& keys, rmm::cuda_stream_view stream);
+  void accumulate_preserved(cudf::column_view const& keys, ::cuda::stream_ref stream);
 
   /** @brief Accumulate in-domain counted keys.
    *
@@ -145,14 +146,14 @@ class dense_count_state {
    */
   void accumulate_counted(cudf::column_view const& keys,
                           std::optional<cudf::column_view> const& count_argument,
-                          rmm::cuda_stream_view stream);
+                          ::cuda::stream_ref stream);
 
   /** @brief Emit `[key, BIGINT count]`, validating products when @p bounds allows overflow. */
   [[nodiscard]] std::unique_ptr<cudf::table> emit(cudf::data_type key_type,
                                                   dense_count_semantics semantics,
                                                   int64_t null_group_rows,
                                                   dense_count_bounds bounds,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr) const;
 
  private:
@@ -171,7 +172,7 @@ class dense_count_state {
   /// Defined in the .cu, where the CUDA error-checking macros it needs are already in scope.
   template <typename CountT>
   [[nodiscard]] static histograms<CountT> make_bins(std::size_t slots,
-                                                    rmm::cuda_stream_view stream,
+                                                    ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref mr);
 
   dense_count_layout _layout;
@@ -185,7 +186,7 @@ class dense_count_state {
 [[nodiscard]] std::unique_ptr<cudf::table> make_null_group_table(cudf::data_type key_type,
                                                                  dense_count_semantics semantics,
                                                                  int64_t null_group_rows,
-                                                                 rmm::cuda_stream_view stream,
+                                                                 ::cuda::stream_ref stream,
                                                                  rmm::device_async_resource_ref mr);
 
 /** @brief Validate equal-length, non-null INT64 products against BIGINT overflow.
@@ -194,7 +195,7 @@ class dense_count_state {
  */
 void throw_if_count_product_overflows(cudf::column_view const& lhs,
                                       cudf::column_view const& rhs,
-                                      rmm::cuda_stream_view stream,
+                                      ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op

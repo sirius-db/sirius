@@ -70,9 +70,9 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
-  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
 
   //! Used when PARTITION + `get_partition_strategy` selects BUILD_PROBE: merge all build batches
   //! before the join so the hash join sees a single build batch.

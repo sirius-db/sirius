@@ -19,8 +19,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstddef>
 #include <cstdint>
@@ -44,7 +45,7 @@ namespace sirius::op::scan {
  */
 std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
                                                   std::span<std::uint8_t const> keep,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr);
 
 /**
@@ -64,7 +65,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
 std::unique_ptr<cudf::table> apply_host_keep_bitmask(cudf::table_view const& view,
                                                      std::span<std::uint32_t const> keep_words,
                                                      std::size_t row_count,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::scan

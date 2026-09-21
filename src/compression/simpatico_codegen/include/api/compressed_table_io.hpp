@@ -57,14 +57,14 @@ namespace simpatico {
 /// Returns an empty string on success; a human-readable error message otherwise.
 std::string write_compressed_table(compressed_table const& table,
                                    std::string const& path,
-                                   rmm::cuda_stream_view stream = cudf::get_default_stream());
+                                   ::cuda::stream_ref stream = cudf::get_default_stream());
 
 /// Read a compressed_table from *path*.
 /// On failure writes an error to *error_out (if non-null) and returns an empty
 /// compressed_table.
 compressed_table read_compressed_table(
   std::string const& path,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 
@@ -99,17 +99,16 @@ struct payload_buffer_ref {
 /// bytes are copied — the caller stages each buffer from its `device_ptr` into
 /// its own payload store, then reconstructs later via
 /// read_compressed_table_from_memory. Returns an empty string on success.
-std::string build_compressed_table_header(
-  compressed_table const& table,
-  std::vector<std::uint8_t>& out_header,
-  std::vector<payload_buffer_ref>& out_buffers,
-  std::uint64_t& out_payload_bytes,
-  rmm::cuda_stream_view stream = cudf::get_default_stream());
+std::string build_compressed_table_header(compressed_table const& table,
+                                          std::vector<std::uint8_t>& out_header,
+                                          std::vector<payload_buffer_ref>& out_buffers,
+                                          std::uint64_t& out_payload_bytes,
+                                          ::cuda::stream_ref stream = cudf::get_default_stream());
 
 /// Copies @p size bytes of the external payload at logical @p offset into the
 /// pre-allocated device buffer @p dst_device, enqueued on @p stream.
 using payload_fetch_fn = std::function<void(
-  std::uint64_t offset, std::size_t size, void* dst_device, rmm::cuda_stream_view stream)>;
+  std::uint64_t offset, std::size_t size, void* dst_device, ::cuda::stream_ref stream)>;
 
 /// Reconstruct a compressed_table from a header produced by
 /// build_compressed_table_header plus a payload accessor. Re-parses the plan
@@ -124,7 +123,7 @@ using payload_fetch_fn = std::function<void(
 compressed_table read_compressed_table_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr,
   std::optional<rmm::device_async_resource_ref> leaf_mr = std::nullopt);
@@ -138,7 +137,7 @@ compressed_table read_compressed_table_subset_from_memory(
   std::span<const std::uint8_t> header,
   payload_fetch_fn const& fetch,
   std::span<const std::size_t> selected_columns,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref(),
   std::string* error_out            = nullptr);
 

@@ -24,7 +24,7 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -45,7 +45,7 @@ void launch_fsst_lengths(fsst_decoder_compact* d_decoders,
                          fsst_chunk_desc const* d_gather_chunks,
                          uint32_t n_segments,
                          uint32_t n_chunks,
-                         rmm::cuda_stream_view stream);
+                         ::cuda::stream_ref stream);
 
 //! @brief Pass 2: warp-per-row decode + emit into @p d_chars at the prefix-summed @p d_offsets.
 //! No-op when @p n_chunks is 0.
@@ -55,6 +55,6 @@ void launch_fsst_gather(fsst_chunk_desc const* d_gather_chunks,
                         uint32_t const* d_comp_offsets,
                         fsst_decoder_compact const* d_decoders,
                         uint32_t n_chunks,
-                        rmm::cuda_stream_view stream);
+                        ::cuda::stream_ref stream);
 
 }  // namespace sirius::cuda::scan

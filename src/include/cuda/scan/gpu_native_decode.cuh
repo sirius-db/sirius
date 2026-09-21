@@ -27,8 +27,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <duckdb/common/enums/compression_type.hpp>
 
@@ -82,7 +83,7 @@ struct gpu_column_decode_input {
 /// expected to pre-filter unsupported columns; these throws are a defensive
 /// backstop, not the primary gate.
 std::unique_ptr<cudf::table> gpu_decode_table(std::vector<gpu_column_decode_input> const& cols,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::cuda::scan

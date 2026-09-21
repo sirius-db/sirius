@@ -30,7 +30,7 @@ void iceberg_delete_pipeline::add_filter(std::shared_ptr<iceberg_delete_filter> 
 
 std::unique_ptr<cudf::table> iceberg_delete_pipeline::apply(std::unique_ptr<cudf::table> tbl,
                                                             batch_layout layout,
-                                                            rmm::cuda_stream_view stream,
+                                                            ::cuda::stream_ref stream,
                                                             rmm::device_async_resource_ref mr) const
 {
   for (auto const& f : _filters) {

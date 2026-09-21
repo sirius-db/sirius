@@ -61,7 +61,7 @@ class gpu_aggregate_impl {
     const cucascade::read_only_data_batch& input,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 
@@ -88,7 +88,7 @@ class gpu_aggregate_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});
 };

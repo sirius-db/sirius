@@ -23,7 +23,7 @@
 #include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/strings/common.cuh"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cstdint>
 
@@ -36,7 +36,7 @@ prepared_uncomp prepare_uncomp(gpu_string_codec_run const& run);
 void launch_uncomp_lengths(string_chunk_desc const* d_chunks,
                            uint32_t* d_lengths,
                            uint32_t n_chunks,
-                           rmm::cuda_stream_view stream);
+                           ::cuda::stream_ref stream);
 
 //! @brief Pass 2: gather row bytes into @p d_chars at the prefix-summed @p d_offsets. No-op when
 //! @p n_chunks is 0.
@@ -44,6 +44,6 @@ void launch_uncomp_gather(string_chunk_desc const* d_chunks,
                           int32_t const* d_offsets,
                           uint8_t* d_chars,
                           uint32_t n_chunks,
-                          rmm::cuda_stream_view stream);
+                          ::cuda::stream_ref stream);
 
 }  // namespace sirius::cuda::scan

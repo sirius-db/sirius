@@ -19,7 +19,7 @@
 #include "scan_manager/config.hpp"
 #include "scan_manager/split_connector.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -105,7 +105,7 @@ class memory_prefetcher {
   void worker_loop(std::size_t worker_index);
 
   /// Attempt one sweep over all connectors; returns the number of batches converted.
-  std::size_t sweep(rmm::cuda_stream_view stream);
+  std::size_t sweep(::cuda::stream_ref stream);
 
   memory_prefetcher_config _config;
   std::vector<std::shared_ptr<split_connector>> _connectors;
@@ -118,7 +118,7 @@ class memory_prefetcher {
 
   /// One stream per worker, borrowed (NOT owned): converted batches are
   /// dealloc-bound to it and outlive the worker that made them.
-  std::vector<rmm::cuda_stream_view> _worker_streams;
+  std::vector<::cuda::stream_ref> _worker_streams;
 
   std::atomic<bool> _running{true};
   std::atomic<std::size_t> _batches_prefetched{0};

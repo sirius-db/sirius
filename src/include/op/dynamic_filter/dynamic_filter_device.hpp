@@ -20,9 +20,9 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <helper/numeric_narrowing.hpp>
@@ -58,7 +58,7 @@ namespace sirius::op::detail {
 [[nodiscard]] inline std::unique_ptr<cudf::column> restore_probe_to(
   cudf::column_view const& probe,
   cudf::data_type want,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (probe.type() == want || !sirius::can_restore_to(probe.type(), want)) { return nullptr; }

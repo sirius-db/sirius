@@ -8,8 +8,9 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <functional>
@@ -44,7 +45,7 @@ struct CodegenHead {
 bool encode_fused_subtree(PlanTree const& tree,
                           NodeId start_node,
                           cudf::column_view input_col,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr,
                           fused_leaf_builder& builder,
                           std::string* error_out,
@@ -54,7 +55,7 @@ bool encode_fused_subtree(PlanTree const& tree,
 /// compressed leaves in ``builder``.
 bool launch_encode_fused_tree(CodegenHead const& head,
                               cudf::column_view const& input_col,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               rmm::device_async_resource_ref const& mr,
                               fused_leaf_builder& builder,
                               std::string* error_out);
@@ -72,7 +73,7 @@ using decode_materialize_fn = std::function<cudf::column const*(NodeId)>;
 std::unique_ptr<cudf::column> decode_fused_subtree(PlanTree const& tree,
                                                    NodeId start_node,
                                                    decode_materialize_fn const& materialize,
-                                                   rmm::cuda_stream_view stream,
+                                                   ::cuda::stream_ref stream,
                                                    rmm::device_async_resource_ref const& mr,
                                                    std::string* error_out);
 
@@ -84,6 +85,6 @@ bool launch_decode_fused_tree(codegen::jit::FusedTree const& tree,
                               char const* dtype,
                               std::int64_t num_rows,
                               void* out,
-                              rmm::cuda_stream_view stream);
+                              ::cuda::stream_ref stream);
 
 }  // namespace simpatico

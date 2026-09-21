@@ -212,7 +212,7 @@ MemoryBarrierType sirius_physical_partition::input_barrier_for(
 }
 
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
-                                                                  rmm::cuda_stream_view stream)
+                                                                  ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -289,7 +289,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   return std::make_unique<pipelineable_operator_data>(partitioned_results);
 }
 
-void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
+void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_partition::sink"};
   auto& pipelineable_input  = dynamic_cast<const pipelineable_operator_data&>(input_data);

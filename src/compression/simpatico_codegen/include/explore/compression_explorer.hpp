@@ -11,8 +11,9 @@
 
 #include <cudf/column/column_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <memory>
 #include <string>
@@ -115,11 +116,11 @@ struct exploration_result {
 /// for end-to-end throughput measurement.
 exploration_result explore_column_compression(cudf::column_view input,
                                               exploration_config const& config,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr);
 
 /// Byte size of a column (for compression ratio computation).
-size_t column_size_bytes_ex(cudf::column_view const& col, rmm::cuda_stream_view stream);
+size_t column_size_bytes_ex(cudf::column_view const& col, ::cuda::stream_ref stream);
 
 // ---------------------------------------------------------------------------
 // Single-op trial + DSL-step formatting (shared with the operator sweep test)
@@ -139,7 +140,7 @@ struct operator_trial {
 /// dtype, GPU error, ...).
 operator_trial try_operator(std::string const& name,
                             cudf::column_view col,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr);
 
 /// Format the `a, b, c` channel-name list for a DSL step.

@@ -90,7 +90,7 @@ sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);

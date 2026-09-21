@@ -17,7 +17,8 @@
 #pragma once
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream>
 
 #include <cstddef>
 
@@ -49,7 +50,7 @@ replica_transfer_route enqueue_replica_copy(
   void const* source,
   cucascade::memory::memory_space const& source_space,
   std::size_t bytes,
-  rmm::cuda_stream_view destination_stream,
+  ::cuda::stream_ref destination_stream,
   cucascade::memory::memory_space const& host_staging_space,
   replica_transfer_policy policy = replica_transfer_policy::automatic);
 

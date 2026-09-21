@@ -61,7 +61,7 @@ bool is_codegen_compressor(std::string const& op);
 /// eagerly as the tree walk consumes them.
 std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
                                           std::string_view plan_dsl,
-                                          rmm::cuda_stream_view stream,
+                                          ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr,
                                           std::string* error_out);
 
@@ -78,7 +78,7 @@ std::unique_ptr<PlanTree> compress_column(cudf::column_view input,
 /// and ``compressed_representation::compressed_size_bytes()`` for scoring.
 std::unique_ptr<compressed_representation> compress_single_op(std::string const& op_name,
                                                               cudf::column_view input,
-                                                              rmm::cuda_stream_view stream,
+                                                              ::cuda::stream_ref stream,
                                                               rmm::device_async_resource_ref mr,
                                                               std::string* error_out);
 
@@ -161,7 +161,7 @@ struct decode_selection {
 ///              Non-null columns are required — a null-masked decode fails
 ///              loudly (never corrupts).
 std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
-                                                rmm::cuda_stream_view stream,
+                                                ::cuda::stream_ref stream,
                                                 rmm::device_async_resource_ref mr,
                                                 std::string* error_out,
                                                 decode_predicate const* pred = nullptr,
@@ -222,7 +222,7 @@ column_decode_caps probe_column(PlanTree const& tree);
 bool decompress_column_selection_mask(PlanTree const& tree,
                                       sirius::codegen::range_predicate pred,
                                       std::uint32_t* mask_words,
-                                      rmm::cuda_stream_view stream,
+                                      ::cuda::stream_ref stream,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out);
 
@@ -239,7 +239,7 @@ bool decompress_column_selection_mask(PlanTree const& tree,
 std::unique_ptr<cudf::table> compact_scan_filter_output(
   std::vector<std::unique_ptr<cudf::column>>&& columns,
   sirius::codegen::scan_filter_result const& result,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out);
 
@@ -254,7 +254,7 @@ std::unique_ptr<compressed_representation> reconstruct_representation(
   std::string const& compressor_name,
   std::vector<std::string> const& output_names,
   std::vector<std::unique_ptr<cudf::column>> outputs,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
   std::string* error_out,
   leaf_meta_v const& meta = leaf_meta::none{});

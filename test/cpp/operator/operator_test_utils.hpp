@@ -87,7 +87,7 @@ inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory
   return space.get_default_allocator();
 }
 
-inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }
+inline ::cuda::stream_ref default_stream() { return cudf::get_default_stream(); }
 
 /**
  * @brief Horizontally concatenate multiple data_batch objects into a single data_batch.
@@ -270,7 +270,7 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch_with_nulls(
 }
 
 inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::string>& values,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   auto const strings_count = static_cast<cudf::size_type>(values.size());
@@ -300,7 +300,7 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                   offsets.data(),
                   offsets.size() * sizeof(cudf::size_type),
                   cudaMemcpyHostToDevice,
-                  stream.value());
+                  stream.get());
 
   // Chars buffer
   rmm::device_buffer chars_buf(total_chars, stream, mr);
@@ -309,7 +309,7 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
                     chars.data(),
                     chars.size() * sizeof(char),
                     cudaMemcpyHostToDevice,
-                    stream.value());
+                    stream.get());
   }
 
   return cudf::make_strings_column(strings_count,

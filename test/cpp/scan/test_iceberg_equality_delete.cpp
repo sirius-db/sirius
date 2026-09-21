@@ -52,7 +52,7 @@ using namespace sirius::op::scan;
 
 namespace {
 
-rmm::cuda_stream_view test_stream() { return cudf::get_default_stream(); }
+::cuda::stream_ref test_stream() { return cudf::get_default_stream(); }
 
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
@@ -69,8 +69,8 @@ std::unique_ptr<cudf::column> int32_column(std::vector<int32_t> const& values,
                                 values.data(),
                                 values.size() * sizeof(int32_t),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   if (!nulls.empty()) {
     REQUIRE(nulls.size() == values.size());
     // Built on the host and copied whole: sized with bitmask_allocation_size_bytes because a
@@ -86,7 +86,7 @@ std::unique_ptr<cudf::column> int32_column(std::vector<int32_t> const& values,
     }
     if (null_count > 0) {
       rmm::device_buffer mask{host_mask.data(), bytes, stream};
-      stream.synchronize();
+      stream.sync();
       col->set_null_mask(std::move(mask), null_count);
     }
   }
@@ -101,8 +101,8 @@ std::vector<int32_t> to_host(cudf::column_view const& col)
                                 col.data<int32_t>(),
                                 out.size() * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   return out;
 }
 
@@ -111,8 +111,8 @@ std::vector<uint8_t> mask_to_host(cudf::column_view const& col)
   std::vector<uint8_t> out(static_cast<std::size_t>(col.size()));
   auto stream = test_stream();
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    out.data(), col.data<uint8_t>(), out.size(), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    out.data(), col.data<uint8_t>(), out.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   return out;
 }
 
@@ -124,8 +124,8 @@ rmm::device_uvector<cudf::size_type> device_indices(std::vector<cudf::size_type>
                                 host.data(),
                                 host.size() * sizeof(cudf::size_type),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   return dev;
 }
 
@@ -134,7 +134,7 @@ class counting_filter : public iceberg_delete_filter {
  public:
   std::unique_ptr<cudf::table> apply(std::unique_ptr<cudf::table> tbl,
                                      batch_layout,
-                                     rmm::cuda_stream_view,
+                                     ::cuda::stream_ref,
                                      rmm::device_async_resource_ref) override
   {
     ++calls;

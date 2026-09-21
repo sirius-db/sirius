@@ -39,8 +39,9 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cstdint>
 #include <memory>
@@ -99,7 +100,7 @@ struct pinned_column_view {
 /// future relaxation of that gate would rest on.
 std::unique_ptr<cudf::column> materialize(pinned_column_view const& column,
                                           prepared_selection const& selection,
-                                          rmm::cuda_stream_view stream,
+                                          ::cuda::stream_ref stream,
                                           rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::late_mat

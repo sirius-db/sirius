@@ -23,8 +23,8 @@
 #include <cudf/io/text/byte_range_info.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <sys/uio.h>

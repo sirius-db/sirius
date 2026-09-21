@@ -304,14 +304,14 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& table,
     const cucascade::memory::memory_space& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,

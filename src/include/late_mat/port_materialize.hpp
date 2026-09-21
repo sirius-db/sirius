@@ -42,8 +42,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <memory>
 
@@ -67,7 +68,7 @@ namespace sirius::late_mat {
 [[nodiscard]] std::unique_ptr<cudf::table> materialize_at_port(
   port_materialize_directive const& directive,
   cudf::table_view const& batch,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::late_mat

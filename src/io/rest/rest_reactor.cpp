@@ -652,7 +652,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_device_rx_request(const reacto
                                                                     uint8_t* dst,
                                                                     size_t offset,
                                                                     size_t size,
-                                                                    rmm::cuda_stream_view stream,
+                                                                    ::cuda::stream_ref stream,
                                                                     int device_id)
 {
   if (size == 0) { return rest_rx_request::create({}); }
@@ -705,7 +705,7 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_to_device_rx_request(
   uint8_t* dst,
   size_t offset,
   size_t size,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   int device_id)
 {
   // Device read staged through caller-supplied pinned host buffers.  File-

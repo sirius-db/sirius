@@ -466,7 +466,7 @@ class cuda_event_completion_poll {
   }
   cuda_event_completion_poll(cuda_event_completion_poll const&)            = delete;
   cuda_event_completion_poll& operator=(cuda_event_completion_poll const&) = delete;
-  // Registration is cold; rmm::cuda_stream_view converts to cudaStream_t.
+  // Registration is cold; cuda::stream_ref converts to cudaStream_t.
   // Use explicit streams, one registry per device. A per-thread default
   // stream has no stable identity across submitting threads.
   // Thread-safe with registration/draining. The returned reference remains valid

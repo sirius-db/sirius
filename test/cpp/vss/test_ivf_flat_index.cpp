@@ -72,11 +72,11 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
 }
 
 // Upload a host query vector to the device (search requires a device pointer)
-rmm::device_buffer upload(std::vector<float> const& v, rmm::cuda_stream_view stream)
+rmm::device_buffer upload(std::vector<float> const& v, ::cuda::stream_ref stream)
 {
   rmm::device_buffer buf(v.size() * sizeof(float), stream);
-  cudaMemcpyAsync(buf.data(), v.data(), buf.size(), cudaMemcpyHostToDevice, stream.value());
-  stream.synchronize();
+  cudaMemcpyAsync(buf.data(), v.data(), buf.size(), cudaMemcpyHostToDevice, stream.get());
+  stream.sync();
   return buf;
 }
 

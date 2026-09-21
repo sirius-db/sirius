@@ -24,8 +24,9 @@
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <algorithm>
 #include <cassert>
@@ -62,7 +63,7 @@ concept no_alloc_materializable = requires(Owner& owner) {
 
 template <typename Owner>
 concept reader_event_recording =
-  requires(Owner const& owner, rmm::cuda_stream_view stream) { owner.record_reader_event(stream); };
+  requires(Owner const& owner, ::cuda::stream_ref stream) { owner.record_reader_event(stream); };
 
 //===----------------------------------------------------------------------===//
 // my_view
@@ -148,13 +149,13 @@ class my_view {
   /// Realize the currently-exposed columns into an owned @c cudf::table. Moves
   /// buffers out of the owner when it is @ref no_alloc_materializable, otherwise
   /// copies the selected view (allocating).
-  [[nodiscard]] std::unique_ptr<cudf::table> materialize(rmm::cuda_stream_view stream,
+  [[nodiscard]] std::unique_ptr<cudf::table> materialize(::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
   {
     return _model->materialize(_selection, stream, mr);
   }
 
-  void record_reader_event(rmm::cuda_stream_view stream) { _model->record_reader_event(stream); }
+  void record_reader_event(::cuda::stream_ref stream) { _model->record_reader_event(stream); }
 
  private:
   struct owner_concept {
@@ -164,10 +165,10 @@ class my_view {
 
     [[nodiscard]] virtual std::unique_ptr<cudf::table> materialize(
       std::span<const cudf::size_type> selection,
-      rmm::cuda_stream_view stream,
+      ::cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) = 0;
 
-    virtual void record_reader_event(rmm::cuda_stream_view) {}
+    virtual void record_reader_event(::cuda::stream_ref) {}
   };
 
   template <typename Owner>
@@ -181,7 +182,7 @@ class my_view {
 
     [[nodiscard]] std::unique_ptr<cudf::table> materialize(
       std::span<const cudf::size_type> selection,
-      rmm::cuda_stream_view stream,
+      ::cuda::stream_ref stream,
       rmm::device_async_resource_ref mr) override
     {
       if constexpr (no_alloc_materializable<Owner>) {
@@ -208,12 +209,12 @@ class my_view {
         // scan's carrier cast, the source here belongs to an external owner (a
         // pinned-cache lock), so there is no buffer of ours whose deallocation
         // stream could be rebound instead.
-        stream.synchronize();
+        stream.sync();
         return out;
       }
     }
 
-    void record_reader_event([[maybe_unused]] rmm::cuda_stream_view stream) override
+    void record_reader_event([[maybe_unused]] ::cuda::stream_ref stream) override
     {
       if constexpr (reader_event_recording<Owner>) { _owner.record_reader_event(stream); }
     }
@@ -328,17 +329,17 @@ class owning_table_view {
   /// called after enqueuing the reads and before this handle is dropped or
   /// reassigned, so a reclaim of the backing cached batch is ordered after
   /// them. No-op unless the owner tracks reader events.
-  void record_reader_event(rmm::cuda_stream_view stream) const;
+  void record_reader_event(::cuda::stream_ref stream) const;
 
   /// Realize a view state into an owned table. No-op if already materialized or
   /// empty. May allocate (copying path) depending on the underlying owner.
-  void materialize(rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  void materialize(::cuda::stream_ref stream         = cudf::get_default_stream(),
                    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /// Materialize if needed and surrender the owned table, leaving the handle
   /// empty. Returns nullptr if the handle had no valid state.
   [[nodiscard]] std::unique_ptr<cudf::table> release(
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+    ::cuda::stream_ref stream         = cudf::get_default_stream(),
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /// Release all held data, leaving the handle empty.

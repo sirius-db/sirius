@@ -190,17 +190,17 @@ expected_rows fetch_expected(duckdb::Connection& con)
 }
 
 template <typename T>
-std::vector<T> download(void const* d_ptr, std::size_t count, rmm::cuda_stream_view stream)
+std::vector<T> download(void const* d_ptr, std::size_t count, ::cuda::stream_ref stream)
 {
   std::vector<T> out(count);
-  cudaMemcpyAsync(out.data(), d_ptr, count * sizeof(T), cudaMemcpyDeviceToHost, stream.value());
-  cudaStreamSynchronize(stream.value());
+  cudaMemcpyAsync(out.data(), d_ptr, count * sizeof(T), cudaMemcpyDeviceToHost, stream.get());
+  cudaStreamSynchronize(stream.get());
   return out;
 }
 
 void require_matches_expected(cudf::table const& t,
                               expected_rows const& exp,
-                              rmm::cuda_stream_view stream)
+                              ::cuda::stream_ref stream)
 {
   auto const n = exp.id.size();
   REQUIRE(t.num_columns() == 5);
@@ -221,8 +221,8 @@ void require_matches_expected(cudf::table const& t,
                     name_col.chars_begin(cudf::get_default_stream()),
                     chars.size(),
                     cudaMemcpyDeviceToHost,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   for (std::size_t i = 0; i < n; ++i) {
     auto const start = static_cast<std::size_t>(offsets[i]);
@@ -312,9 +312,8 @@ TEST_CASE("host-backed decode matches SQL with zero file reads",
   SECTION("delta descriptor shape: block ids cleared, null datasource")
   {
     host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
-    auto table =
-      decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
-    require_matches_expected(*table, exp, stream.view());
+    auto table = decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream);
+    require_matches_expected(*table, exp, stream);
   }
 
   SECTION("host_ptr takes precedence over a still-valid block_id")
@@ -322,9 +321,8 @@ TEST_CASE("host-backed decode matches SQL with zero file reads",
     // With a null datasource any fall-through to the file lane would throw, so
     // decoding successfully proves host_ptr wins.
     host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/false);
-    auto table =
-      decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
-    require_matches_expected(*table, exp, stream.view());
+    auto table = decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream);
+    require_matches_expected(*table, exp, stream);
   }
 }
 
@@ -359,8 +357,7 @@ TEST_CASE("file reads staged without a datasource throw loudly",
 
   bool threw_datasource = false;
   try {
-    auto table =
-      decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream.view());
+    auto table = decode_duckdb_native_split(md, info, /*datasource=*/nullptr, *gpu_space, stream);
   } catch (std::exception const& e) {
     threw_datasource = std::string(e.what()).find("datasource") != std::string::npos;
   }
@@ -418,10 +415,10 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
     input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
       std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows};
 
-    auto result = ingestible->materialize_table(input, stream.view());
+    auto result = ingestible->materialize_table(input, stream);
     auto view   = result.table.view();
     REQUIRE(static_cast<std::size_t>(view.num_rows()) == kept);
-    auto ids = download<int32_t>(view.column(0).data<int32_t>(), kept, stream.view());
+    auto ids = download<int32_t>(view.column(0).data<int32_t>(), kept, stream);
     for (std::size_t k = 0; k < kept; ++k) {
       if (ids[k] != exp.id[k * 3]) { FAIL("kept-row mismatch at " << k); }
     }
@@ -438,6 +435,6 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
     input.mvcc_keep_mask   = sirius::scan_manager::mvcc_chunk_mask{
       std::shared_ptr<std::uint32_t[]>(words, words->data()), n_rows - 1};
 
-    REQUIRE_THROWS(ingestible->materialize_table(input, stream.view()));
+    REQUIRE_THROWS(ingestible->materialize_table(input, stream));
   }
 }

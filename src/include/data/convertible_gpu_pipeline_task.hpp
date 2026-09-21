@@ -25,7 +25,7 @@
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
+#include <cuda/stream>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
@@ -107,7 +107,7 @@ class convertible_gpu_pipeline_task : public convertible_data {
    */
   std::optional<std::vector<std::size_t>> convert(
     const std::vector<const cucascade::memory::memory_space*>& target_spaces,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     sirius::memory::sirius_memory_reservation_manager& res_mgr,
     bool blocking = true) override
   {

@@ -42,7 +42,7 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   bool parallel;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   bool is_limit_exhausted() const override
   {

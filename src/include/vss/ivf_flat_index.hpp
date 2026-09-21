@@ -21,8 +21,9 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <cuvs/distance/distance.hpp>
 
@@ -85,7 +86,7 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_batches(
   std::uint32_t n_lists,
   cuvs::distance::DistanceType metric,
   rmm::device_async_resource_ref index_mr,
-  rmm::cuda_stream_view stream);
+  ::cuda::stream_ref stream);
 
 /// Flattened k-NN result from an ANN search: both columns have length @c k.
 struct ann_result {
@@ -110,7 +111,7 @@ ann_result search_ivf_flat_index(any_cuvs_index const& index,
                                  std::int64_t dim,
                                  std::int64_t k,
                                  std::uint32_t n_probes,
-                                 rmm::cuda_stream_view stream,
+                                 ::cuda::stream_ref stream,
                                  rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::vss

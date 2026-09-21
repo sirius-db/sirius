@@ -29,8 +29,9 @@
 #include <cudf/types.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <cstdint>
@@ -232,7 +233,7 @@ class expression_evaluator {
    *
    * @param expressions The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
-   * @param stream The rmm::cuda_stream_view in which to evaluate any cuDF operations.
+   * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
    * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
    * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
@@ -247,7 +248,7 @@ class expression_evaluator {
   expression_evaluator(
     duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
-    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    ::cuda::stream_ref stream                   = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
@@ -258,7 +259,7 @@ class expression_evaluator {
    *
    * @param expression The expressions to evaluate.
    * @param resource_ref The rmm::device_async_resource_ref to pass to cuDF APIs for allocations.
-   * @param stream The rmm::cuda_stream_view in which to evaluate any cuDF operations.
+   * @param stream The ::cuda::stream_ref in which to evaluate any cuDF operations.
    * @param strategy The strategy to use for expression execution (AST_INTERPRET, AST_JIT, or
    * MATERIALIZE). Defaults to the value of `duckdb::Config::EXPRESSION_EVALUATOR_STRATEGY`.
    * @param min_ast_size The minimum number of nodes in an AST tree before we switch from
@@ -273,7 +274,7 @@ class expression_evaluator {
   expression_evaluator(
     sirius::ast::node const& expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
-    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    ::cuda::stream_ref stream                   = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
@@ -292,7 +293,7 @@ class expression_evaluator {
   expression_evaluator(
     sirius::ast::node const* expression,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
-    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    ::cuda::stream_ref stream                   = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
@@ -314,7 +315,7 @@ class expression_evaluator {
   expression_evaluator(
     std::vector<sirius::ast::node const*> expressions,
     rmm::device_async_resource_ref resource_ref = cudf::get_current_device_resource_ref(),
-    rmm::cuda_stream_view stream                = cudf::get_default_stream(),
+    ::cuda::stream_ref stream                   = cudf::get_default_stream(),
     expression_evaluator_strategy strategy      = strategy_from_config(),
     std::size_t min_ast_size                    = default_min_ast_size,
     bool like_swar_fastpath                     = false,
@@ -415,7 +416,8 @@ class expression_evaluator {
   std::vector<sirius::ast::node const*> _ast_expressions;  ///< The AST expressions to evaluate
   expression_evaluator_strategy _strategy;  ///< The strategy to use for expression evaluation
   rmm::device_async_resource_ref _mr;  ///< The allocator to pass to cudf APIs for any allocations
-  rmm::cuda_stream_view _stream;       ///< The stream in which to evaluate any cuDF operations
+  ::cuda::stream_ref _stream{
+    cudaStream_t{}};          ///< The stream in which to evaluate any cuDF operations
   std::size_t _min_ast_size;  ///< The minimum number of nodes in an AST tree before we switch from
                               ///< MATERIALIZE mode to AST mode
   bool _like_swar_fastpath;   ///< Whether eligible multi-literal LIKE expressions use SWAR
