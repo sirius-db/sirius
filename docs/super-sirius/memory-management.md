@@ -187,6 +187,41 @@ On allocation failure:
 - Used for GPU↔CPU transfers and scan caching
 - Configured via `sirius.yaml` (see [Configuration](configuration.md))
 
+## Stream-Ordering Discipline
+
+Device memory is freed stream-ordered (RMM async pool), and the pool may rebind the virtual
+address immediately after the free executes. Batches are handed off event-ordered, not
+host-synced, and read locks are host-scoped: a consumer can enqueue kernels and drop its lock
+with device work still in flight. The invariant that keeps this safe:
+
+> No owner of device memory may die (free, pool return, or dealloc-stream rebind) until every
+> stream that may still read or write that memory is ordered before the free.
+
+Three mechanisms carry it:
+
+1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
+   batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
+   exclusive lock does not imply the producer's writes have landed. Sirius's GPU batch helpers
+   record missing writer events before publication, including for default-stream producers, on
+   the producing thread/device. A GPU batch without a writer event is rejected before rebinding
+   or converting; there is no device-wide synchronization fallback.
+2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
+   a reader event for zero-copy views whose owner can be replaced before control returns to the
+   pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and
+   `to_mutable()` waits, until those reads complete, so no downgrade can rebind or free the batch
+   under an in-flight reader.
+3. **Quiesce before task-owned owner death.** The pipeline task synchronizes its stream after every
+   operator `execute()` and again after `publish_output`. Its exception handlers synchronize while
+   the corresponding inputs and outputs are still alive, before rethrowing lets them unwind. This
+   also ensures cross-task state freed by `finalize_operator` is not freed under a straggling sink
+   enqueue.
+
+Suspected violations show up as torn GPU→HOST conversions, scribbled string or selection
+geometry, or wild-pointer MMU faults, almost always under concurrency plus memory pressure.
+`bench/sf1000-repro/run.sh` accepts `SANITIZER=memcheck` to run the workload under
+compute-sanitizer; `verify-memcheck-sf1.sh` does so for the concurrent workload against an
+SF1-sized pressure config.
+
 ## Key Files
 
 | File | Purpose |
