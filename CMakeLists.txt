@@ -785,6 +785,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
+    test/cpp/scan_manager/test_split_connector.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
@@ -859,6 +860,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
+    test/cpp/pipeline/test_union_build_pipelines.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
     test/cpp/pipeline/test_streaming_sink_root.cpp

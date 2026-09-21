@@ -55,8 +55,9 @@ class controllable_pipeline final : public sirius_pipeline {
 
 class recording_task_creator final : public sirius::creator::task_creator {
  public:
-  explicit recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr)
-    : task_creator(sirius::creator::task_creator_config{}, mem_mgr)
+  recording_task_creator(sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                         sirius::creator::request_type strategy)
+    : task_creator(sirius::creator::task_creator_config{.strategy = strategy}, mem_mgr)
   {
   }
 
@@ -83,9 +84,11 @@ class union_fixture {
   recording_task_creator _creator;
 
  public:
-  explicit union_fixture(std::size_t num_arms)
+  explicit union_fixture(
+    std::size_t num_arms,
+    sirius::creator::request_type strategy = sirius::creator::request_type::active)
     : _memory_manager(sirius::test::operator_utils::initialize_memory_manager()),
-      _creator(*_memory_manager),
+      _creator(*_memory_manager, strategy),
       union_op({}, 0),
       union_pipeline(
         duckdb::make_shared_ptr<sirius_pipeline>(pipeline_build_context{nullptr, true}))
@@ -187,23 +190,35 @@ TEST_CASE("physical_union skips finished empty arms", "[physical_union]")
   REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
 }
 
-TEST_CASE("physical_union promotes a pre-seeded batch to one draining producer request",
+TEST_CASE("physical_union sends a full request for a pre-seeded arm only under lookahead",
           "[physical_union]")
 {
-  union_fixture fixture(1);
-  fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
+  SECTION("active strategy: latch only, no enqueue")
+  {
+    union_fixture fixture(1);
+    fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
 
-  auto hint = fixture.union_op.get_next_task_hint();
-  REQUIRE(hint.has_value());
-  REQUIRE(hint->hint == TaskCreationHint::READY);
-  REQUIRE(hint->producer == &fixture.union_op);
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
+    REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+    REQUIRE(fixture.producer_schedule_count(0) == 0);
+    REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
+    // Latched by the READY above: an empty live arm is not re-nominated.
+    REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
+    REQUIRE(fixture.producer_schedule_count(0) == 0);
+  }
 
-  REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
-  REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
-  REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
-  REQUIRE(fixture.producer_schedule_count(0) == 1);
+  SECTION("lookahead strategy: latch and exactly one full request")
+  {
+    union_fixture fixture(1, sirius::creator::request_type::lookahead);
+    fixture.repositories[0]->add_data_batch(fixture.make_batch(0));
+
+    REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+    REQUIRE(fixture.producer_schedule_count(0) == 1);
+    REQUIRE(fixture.union_op.get_next_task_hint()->hint == TaskCreationHint::READY);
+    REQUIRE(fixture.producer_schedule_count(0) == 1);
+    REQUIRE(fixture.union_op.get_next_task_input_data() != nullptr);
+    REQUIRE_FALSE(fixture.union_op.get_next_task_hint().has_value());
+    REQUIRE(fixture.producer_schedule_count(0) == 1);
+  }
 }
 
 TEST_CASE("physical_union final pop schedules one handoff without advancing early",

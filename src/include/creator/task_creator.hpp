@@ -155,6 +155,12 @@ class task_creator {
    */
   virtual void schedule(op::sirius_physical_operator* request);
 
+  //! Whether scans after the first may be started by one-task lookahead requests.
+  [[nodiscard]] bool is_lookahead_enabled() const noexcept
+  {
+    return _config.strategy == request_type::lookahead;
+  }
+
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);
 
   /**

@@ -325,11 +325,15 @@ over `children`. Distinct `UNION`, `EXCEPT` and `INTERSECT` are rejected by the 
   would hold every arm's output in repositories until all arms finished.
 - **Overrides both task-driver methods.** UNION nominates and drains arms sequentially in child
   order. Only the active arm can be nominated by UNION or popped; a finished empty arm is skipped,
-  and UNION issues one normal draining nomination per live arm. If an arm already has data from
-  startup or one-task lookahead, UNION enqueues that normal nomination while returning ready for its
-  own batch. Popping the final queued batch from a finished non-final arm advances the cursor and
+  and UNION issues one normal draining nomination per live arm. An arm that already has data when
+  it becomes active was started by `start_query`'s seed or, under lookahead, by a one-task
+  request; UNION latches it as nominated and, only under lookahead, enqueues a full request for
+  it. Popping the final queued batch from a finished non-final arm advances the cursor and
   schedules UNION once so the next arm is activated even when no producer completion can provide
   another wakeup. One arm per task also keeps each batch on the GPU that produced it.
+- **Arm pipelines are created in reverse child order.** The converter schedules child
+  meta-pipelines last-created-first, so reversing makes arm 0 pipeline #0: the scan `start_query`
+  seeds and the top execution priority. Drain order therefore matches execution order.
 - **`source_order()` is `NO_ORDER`.** `order_preservation_recursive` stops at the first `is_source()`
   operator, so this answer decides the whole plan's.
 - **Arm ports are cached.** Both task-driver methods run on every task-creation walk that reaches
