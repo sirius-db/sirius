@@ -19,6 +19,7 @@
 // sirius
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
+#include "memory/multiple_blocks_allocation_accessor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 // data utilities
 #include <data/data_batch_utils.hpp>
@@ -34,14 +35,20 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // cudf / rmm
+#include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
 
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace sirius::parallel;
@@ -69,12 +76,12 @@ const auto GPU_SPACE_ID = cucascade::memory::memory_space_id(cucascade::memory::
 // so each test registers its manager under one fixed query id.
 const sirius::query_id_t kTestQueryId = sirius::make_query_id(1);
 
-std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager()
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> make_test_memory_manager(
+  size_t gpu_capacity = 2ull << 30)
 {
   sirius::converter_registry::reset_for_testing();
 
   cucascade::memory::reservation_manager_configurator builder;
-  const size_t gpu_capacity  = 2ull << 30;
   const double limit_ratio   = 0.75;
   const size_t host_capacity = 4ull << 30;
 
@@ -132,6 +139,54 @@ downgrade_executor make_test_executor(sirius::data::data_repository_manager_regi
     .monitor_period = std::chrono::milliseconds{0}};
   return downgrade_executor(config, repo_registry, GPU_SPACE_ID, gpu_space, mem_mgr);
 }
+
+std::unique_ptr<cudf::table> make_int32_table(cucascade::memory::memory_space& gpu_space,
+                                              cudf::size_type rows,
+                                              int byte_pattern,
+                                              rmm::cuda_stream_view stream)
+{
+  auto column = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          rows,
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          gpu_space.get_default_allocator());
+  REQUIRE(cudaMemsetAsync(column->mutable_view().data<int32_t>(),
+                          byte_pattern,
+                          rows * sizeof(int32_t),
+                          stream.value()) == cudaSuccess);
+  stream.synchronize();
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(column));
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
+std::vector<int32_t> read_host_int32(cucascade::data_batch& batch, cudf::size_type rows)
+{
+  auto ro    = batch.to_read_only();
+  auto* host = dynamic_cast<cucascade::host_data_representation const*>(ro.get_data());
+  REQUIRE(host != nullptr);
+  auto const& table = host->get_host_table();
+  REQUIRE(table != nullptr);
+  REQUIRE(table->columns.size() == 1);
+  auto const& column = table->columns.front();
+  REQUIRE(column.type_id == static_cast<int32_t>(cudf::type_id::INT32));
+  REQUIRE(column.num_rows == rows);
+  REQUIRE(column.null_count == 0);
+  REQUIRE(column.has_data);
+  REQUIRE(column.data_size == rows * sizeof(int32_t));
+  sirius::memory::multiple_blocks_allocation_accessor<int32_t> accessor;
+  accessor.initialize(column.data_offset, table->allocation);
+  std::vector<int32_t> values(rows);
+  for (cudf::size_type row = 0; row < rows; ++row) {
+    values[row] = accessor.get(row, table->allocation);
+  }
+  return values;
+}
+
+struct drain_producer {
+  rmm::cuda_stream_view stream;
+  ~drain_producer() { stream.synchronize_no_throw(); }
+};
 
 }  // namespace
 
@@ -200,6 +255,81 @@ TEST_CASE("request_free_memory_and_wait downgrades GPU batches to HOST", "[downg
   REQUIRE(get_batch_tier(*batch2) == cucascade::memory::Tier::HOST);
   REQUIRE(get_batch_tier(*batch3) == cucascade::memory::Tier::HOST);
 
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory_and_wait preserves pending producer writes", "[downgrade_executor]")
+{
+  constexpr cudf::size_type rows  = 1024;
+  constexpr int32_t initial_value = 0x11111111;
+  constexpr int32_t final_value   = 0x22222222;
+  auto mem_mgr                    = make_test_memory_manager(64ull << 20);
+  auto* gpu_space                 = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  auto table     = make_int32_table(*gpu_space, rows, 0x11, producer);
+  auto* data     = table->mutable_view().column(0).data<int32_t>();
+  std::shared_ptr<cucascade::data_batch> batch;
+  drain_producer drain{producer};
+
+  REQUIRE(cudaLaunchHostFunc(
+            producer.value(), [](void*) { std::this_thread::sleep_for(1s); }, nullptr) ==
+          cudaSuccess);
+  REQUIRE(cudaMemsetAsync(data, 0x22, rows * sizeof(int32_t), producer.value()) == cudaSuccess);
+  batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, producer, sirius::telemetry::batch_telemetry_info{});
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+  {
+    auto ro = batch->to_read_only();
+    REQUIRE(ro.get_writer_event() != nullptr);
+    REQUIRE(cudaEventQuery(ro.get_writer_event()) == cudaErrorNotReady);
+  }
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+  auto const freed = executor.request_free_memory_and_wait(1ull << 30);
+  producer.synchronize();
+  REQUIRE(freed > 0);
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  auto values              = read_host_int32(*batch, rows);
+  auto const initial_count = std::count(values.begin(), values.end(), initial_value);
+  auto const final_count   = std::count(values.begin(), values.end(), final_value);
+  CAPTURE(values.front(), initial_count, final_count);
+  REQUIRE(final_count == rows);
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory_and_wait preserves a batch without a writer event",
+          "[downgrade_executor]")
+{
+  constexpr cudf::size_type rows   = 1024;
+  constexpr int32_t expected_value = 0x33333333;
+  auto mem_mgr                     = make_test_memory_manager(64ull << 20);
+  auto* gpu_space                  = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr      = *repo_registry.create_for_query(kTestQueryId);
+  auto repo           = std::make_unique<cucascade::shared_data_repository>();
+  auto table          = make_int32_table(*gpu_space, rows, 0x33, producer);
+  auto representation = std::make_unique<cucascade::gpu_table_representation>(
+    std::move(table), *gpu_space, rmm::cuda_stream_view{});
+  REQUIRE(representation->get_writer_event() == nullptr);
+  auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+  repo->add_data_batch(batch);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+  auto const freed = executor.request_free_memory_and_wait(1ull << 30);
+  REQUIRE(freed > 0);
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
+  auto values = read_host_int32(*batch, rows);
+  REQUIRE(std::count(values.begin(), values.end(), expected_value) == rows);
   executor.stop();
 }
 

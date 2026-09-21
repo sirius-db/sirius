@@ -22,7 +22,9 @@
 #include "telemetry/batch_telemetry.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/detail/error.hpp>
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -112,13 +114,19 @@ class convertible_data_batch : public convertible_data {
       auto reservation = mem_space->make_reservation_or_null(data_size);
       if (!reservation) { continue; }
 
-      // When downgrading off the GPU, rebind the source buffers' deallocation stream to this
-      // downgrade stream so that when the conversion below frees the GPU representation, the
-      // free lands on the active (downgrade) stream rather than the stream the data was
-      // originally produced on. We hold the exclusive (mutable) lock here, and convert_to()
-      // synchronizes `stream` after the D2H copy and before destroying the source
-      // representation, so the free is correctly ordered. No-op for non-GPU-table sources.
+      // When downgrading off the GPU, order `stream` after the producer before touching the
+      // buffers: rebind_stream only moves the deallocation stream and the GPU->host converters
+      // synchronize `stream`, not the stream that allocated and wrote the table. Without this
+      // edge the D2H copy can read an unfinished table and cudaFreeAsync returns the block to
+      // the pool while the producer's work is still pending. The writer event is recorded by
+      // the producer after its last write. The exclusive (mutable) lock held here excludes
+      // readers, so the producer is the only party left to order after.
       if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
+        if (auto* writer_event = mut.get_data()->get_writer_event(); writer_event != nullptr) {
+          cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
+        } else {
+          RMM_CUDA_TRY(cudaDeviceSynchronize());
+        }
         mut.rebind_stream(stream);
       }
 
