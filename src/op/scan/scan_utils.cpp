@@ -28,7 +28,6 @@
 #include <op/scan/scan_utils.hpp>
 
 // standard library
-#include <algorithm>
 #include <cstdint>
 #include <format>
 #include <limits>
@@ -59,7 +58,6 @@ std::vector<std::optional<std::size_t>> build_batch_column_map(
   for (std::size_t batch_pos = 0; batch_pos < sorted.size(); batch_pos++) {
     if (sorted[batch_pos] < column_ids_count) { map[sorted[batch_pos]] = batch_pos; }
   }
-
   return map;
 }
 
