@@ -44,21 +44,27 @@ use thrift::{
 };
 use tracing::{debug, info, instrument, warn};
 
+mod arrow_exchange;
 mod brpc;
 mod compute_node_service;
 #[cfg(feature = "sirius-engine")]
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
+#[cfg(any(test, feature = "sirius-engine"))]
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
 
 pub use brpc::BrpcServer;
+pub use compute_node_service::{ExchangeIdentity, SiriusComputeNodeService};
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
 pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use local_exchange::LocalExchange;
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

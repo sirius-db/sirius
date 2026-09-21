@@ -20,8 +20,10 @@
 
 #include "sirius_ffi.hpp"
 
-#include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
-#include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
+#include "core_functions_extension.hpp"        // duckdb::CoreFunctionsExtension
+#include "cudf/cudf_utils.hpp"                 // sirius::get_cudf_type
+#include "data/data_batch_utils.hpp"           // sirius::get_cudf_table_view, make_data_batch
+#include "data/sirius_converter_registry.hpp"  // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
@@ -46,8 +48,33 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
+#include <cudf/interop.hpp>
+#include <cudf/types.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
+#include <string>
+#include <vector>
+
+// Completes cudf's forward-declared ArrowDeviceArray to the Arrow C Device Data
+// Interface. DuckDB's arrow.hpp already filled ArrowSchema/ArrowArray (and set
+// ARROW_C_DATA_INTERFACE), so apache arrow/c/abi.h would skip those structs.
+#ifndef ARROW_C_DEVICE_DATA_INTERFACE
+#define ARROW_C_DEVICE_DATA_INTERFACE
+struct ArrowDeviceArray {
+  ArrowArray array;
+  int64_t device_id;
+  ArrowDeviceType device_type;
+  void* sync_event;
+  int64_t reserved[3];
+};
+#endif
 
 namespace sirius::ffi {
 
@@ -59,6 +86,115 @@ constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
 
 // DuckDB view name a plan uses to read input stream `id`.
 std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
+
+ArrowSchema steal_schema(cudf::unique_schema_t schema)
+{
+  ArrowSchema out = *schema;
+  schema->release = nullptr;
+  return out;
+}
+
+ArrowArray steal_host_array(cudf::unique_device_array_t host)
+{
+  ArrowArray array    = host->array;
+  host->array.release = nullptr;
+  return array;
+}
+
+// One-batch ArrowArrayStream: get_schema once, get_next once, then EOS. Matches
+// result_to_arrow's address convention (caller-owned ArrowArrayStream).
+struct exported_batch_stream {
+  ArrowSchema schema{};
+  ArrowArray array{};
+  bool schema_consumed{false};
+  bool array_consumed{false};
+  std::string last_error;
+};
+
+int exported_get_schema(ArrowArrayStream* stream, ArrowSchema* out)
+{
+  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
+  if (state->schema_consumed) {
+    state->last_error = "schema already consumed";
+    return EINVAL;
+  }
+  *out                   = state->schema;
+  state->schema.release  = nullptr;
+  state->schema_consumed = true;
+  return 0;
+}
+
+int exported_get_next(ArrowArrayStream* stream, ArrowArray* out)
+{
+  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
+  if (!state->array_consumed) {
+    *out                  = state->array;
+    state->array.release  = nullptr;
+    state->array_consumed = true;
+    return 0;
+  }
+  *out = ArrowArray{};
+  return 0;
+}
+
+const char* exported_get_last_error(ArrowArrayStream* stream)
+{
+  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
+  return state->last_error.empty() ? nullptr : state->last_error.c_str();
+}
+
+void exported_release(ArrowArrayStream* stream)
+{
+  auto* state = static_cast<exported_batch_stream*>(stream->private_data);
+  if (state->schema.release) { state->schema.release(&state->schema); }
+  if (state->array.release) { state->array.release(&state->array); }
+  delete state;
+  stream->release      = nullptr;
+  stream->private_data = nullptr;
+}
+
+void export_one_batch(ArrowArrayStream* dest, ArrowSchema schema, ArrowArray array)
+{
+  auto* state          = new exported_batch_stream;
+  state->schema        = schema;
+  state->array         = array;
+  dest->get_schema     = &exported_get_schema;
+  dest->get_next       = &exported_get_next;
+  dest->get_last_error = &exported_get_last_error;
+  dest->release        = &exported_release;
+  dest->private_data   = state;
+}
+
+std::string arrow_stream_error(ArrowArrayStream* stream, int err)
+{
+  const char* msg = (stream->get_last_error != nullptr) ? stream->get_last_error(stream) : nullptr;
+  if (msg != nullptr && msg[0] != '\0') { return msg; }
+  return "ArrowArrayStream error " + std::to_string(err);
+}
+
+void check_declared_schema(const sirius::exec::stream_input_spec& declared,
+                           const cudf::table_view& view,
+                           std::uint64_t stream_id,
+                           const char* what)
+{
+  if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    throw sirius::invalid_input_exception(
+      std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " carries " +
+      std::to_string(view.num_columns()) + " columns but the stream declares " +
+      std::to_string(declared.types.size()));
+  }
+  for (std::size_t i = 0; i < declared.types.size(); ++i) {
+    const auto expected = sirius::get_cudf_type(declared.types[i]);
+    const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+    if (actual != expected) {
+      throw sirius::invalid_input_exception(
+        std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " column " +
+        std::to_string(i) + " (" + declared.names[i] + ") is declared " +
+        declared.types[i].to_string() + " (" + cudf::type_to_name(expected) + ") but carries " +
+        cudf::type_to_name(actual));
+    }
+  }
+}
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
 struct lowered_plan {
@@ -412,7 +548,8 @@ void Fragment::build(const std::string& substrait_plan)
   impl_->require_not_built("build");
 
   // Transaction must be open for: type-name parsing (catalog lookup) and CREATE VIEW.
-  // It must be committed before QueryBeginStandalone acquires the lifecycle mutex.
+  // Committed before StandaloneQueryScope so QueryBeginStandalone does not take the
+  // lifecycle slot while this connection still holds a DuckDB transaction.
   impl_->ctx.conn->BeginTransaction();
   impl_->transaction_open = true;
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved;
@@ -445,6 +582,12 @@ void Fragment::build(const std::string& substrait_plan)
         std::to_string(impl_->outputs.size()) +
         " output stream(s); routing needs at least two destinations");
     }
+
+    // Substrait lowering binds parquet_scan / views through DuckDB catalog — same
+    // ActiveTransaction requirement as Context::execute_substrait. A second short
+    // transaction, after the slot is held, so local_files plans can bind.
+    impl_->ctx.conn->BeginTransaction();
+    impl_->transaction_open = true;
 
     if (impl_->is_result()) {
       // A result fragment takes the single-shot execution path; its leaves may be streaming
@@ -485,7 +628,9 @@ void Fragment::build(const std::string& substrait_plan)
       impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(client, std::move(spec));
       impl_->fragment->build(impl_->lifecycle->query_id());
     }
-    impl_->built = true;
+    impl_->ctx.conn->Commit();
+    impl_->transaction_open = false;
+    impl_->built            = true;
   } catch (...) {
     impl_->end_lifecycle();
     throw;
@@ -558,6 +703,133 @@ std::size_t Fragment::relay_from(Fragment& source,
   return moved;
 }
 
+bool Fragment::pull_arrow(std::uint64_t stream_id, std::uintptr_t out_array_addr)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before pull_arrow()");
+  }
+  // Same "empty vs finished" trap as relay_from: before run(), pull() returning nullopt
+  // cannot be told apart from a drained stream.
+  if (!impl_->ran) {
+    throw sirius::invalid_input_exception(
+      "Fragment: pull_arrow() requires the fragment to have run — call run() first, otherwise "
+      "an empty stream is indistinguishable from a finished one");
+  }
+  if (impl_->fragment == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: pull_arrow() requires an intermediate fragment with output streams — a result "
+      "fragment produces Arrow via result_to_arrow()");
+  }
+  if (out_array_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: pull_arrow() needs a non-null ArrowArrayStream");
+  }
+
+  auto batch = impl_->session().pull(stream_id);
+  if (!batch) { return false; }
+
+  auto read_only = (*batch)->to_read_only();
+  if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception(
+      "Fragment: batch on output stream " + std::to_string(stream_id) +
+      " is not GPU-resident; exporting a spilled batch is not supported yet");
+  }
+  auto view   = sirius::get_cudf_table_view(read_only);
+  auto* space = read_only.get_memory_space();
+  if (space == nullptr) {
+    throw sirius::invalid_input_exception("Fragment: batch on output stream " +
+                                          std::to_string(stream_id) + " has no memory space");
+  }
+
+  auto stream = cudf::get_default_stream();
+  if (cudaEvent_t writer = read_only.get_writer_event()) {
+    if (auto err = cudaStreamWaitEvent(stream.value(), writer, 0); err != cudaSuccess) {
+      throw sirius::internal_exception("Fragment: cudaStreamWaitEvent failed: {}",
+                                       cudaGetErrorString(err));
+    }
+  }
+
+  auto metadata   = cudf::interop::get_table_metadata(view);
+  auto schema_ptr = cudf::to_arrow_schema(view, metadata);
+  auto host       = cudf::to_arrow_host(view, stream);
+  stream.synchronize();
+
+  auto* dest = reinterpret_cast<ArrowArrayStream*>(out_array_addr);
+  export_one_batch(dest, steal_schema(std::move(schema_ptr)), steal_host_array(std::move(host)));
+  return true;
+}
+
+void Fragment::push_arrow(std::uint64_t stream_id, std::uintptr_t in_array_addr)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_arrow()");
+  }
+  if (in_array_addr == 0) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() needs a non-null ArrowArrayStream");
+  }
+
+  auto declared_it = impl_->resolved_inputs.find(stream_id);
+  if (declared_it == impl_->resolved_inputs.end()) {
+    throw sirius::invalid_input_exception("Fragment: push target input stream " +
+                                          std::to_string(stream_id) +
+                                          " was never declared on this fragment");
+  }
+
+  auto* in = reinterpret_cast<ArrowArrayStream*>(in_array_addr);
+  if (in->get_schema == nullptr || in->get_next == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() ArrowArrayStream is missing get_schema/get_next");
+  }
+
+  ArrowSchema schema{};
+  if (int err = in->get_schema(in, &schema); err != 0) {
+    throw sirius::invalid_input_exception("Fragment: push_arrow() get_schema failed: " +
+                                          arrow_stream_error(in, err));
+  }
+
+  ArrowArray array{};
+  if (int err = in->get_next(in, &array); err != 0) {
+    if (schema.release) { schema.release(&schema); }
+    throw sirius::invalid_input_exception("Fragment: push_arrow() get_next failed: " +
+                                          arrow_stream_error(in, err));
+  }
+  if (array.release == nullptr) {
+    if (schema.release) { schema.release(&schema); }
+    throw sirius::invalid_input_exception(
+      "Fragment: push_arrow() stream has no batch (empty get_next is EOS, not a hop)");
+  }
+
+  auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, /*device_id=*/0);
+  if (gpu_space == nullptr) {
+    if (array.release) { array.release(&array); }
+    if (schema.release) { schema.release(&schema); }
+    throw sirius::internal_exception("Fragment: push_arrow() found no GPU memory space");
+  }
+
+  auto cuda_stream = cudf::get_default_stream();
+  std::unique_ptr<cudf::table> table;
+  try {
+    table = cudf::from_arrow(&schema, &array, cuda_stream, gpu_space->get_default_allocator());
+    check_declared_schema(declared_it->second, table->view(), stream_id, "Arrow batch");
+    cuda_stream.synchronize();
+  } catch (...) {
+    if (array.release) { array.release(&array); }
+    if (schema.release) { schema.release(&schema); }
+    throw;
+  }
+  if (array.release) { array.release(&array); }
+  if (schema.release) { schema.release(&schema); }
+
+  auto data_batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, cuda_stream, telemetry::batch_telemetry_info{});
+  if (!impl_->session().push(stream_id, std::move(data_batch))) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused an Arrow batch; it had already ended");
+  }
+}
+
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 {
   if (!impl_->built) {
@@ -618,6 +890,18 @@ void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
   auto* wrapper =
     new duckdb::ResultArrowArrayStreamWrapper(std::move(impl_->result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+}
+
+bool Fragment::drained(std::uint64_t stream_id)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before drained()");
+  }
+  if (!impl_->fragment) {
+    throw sirius::invalid_input_exception(
+      "Fragment: drained() is only valid on an intermediate fragment with output streams");
+  }
+  return impl_->session().drained(stream_id);
 }
 
 std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
