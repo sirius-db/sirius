@@ -24,6 +24,7 @@
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -80,6 +81,55 @@ TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manag
   // warms the page cache, so readahead is on.
   CHECK(budget_for(cache_mode::os) == backend_budget);
   CHECK(budget_for(cache_mode::sirius) == backend_budget);
+}
+
+TEST_CASE("readahead backend selection considers only the supplied query contexts",
+          "[scan_manager][readahead]")
+{
+  using sirius::scan_manager::backend_readahead_policy;
+  using sirius::scan_manager::prefetch_strategy;
+  using sirius::scan_manager::select_readahead_backend;
+
+  // A REST context retained from a preceding query is intentionally absent:
+  // the current local query must retain the uring policy.
+  constexpr std::array local_query = {
+    backend_readahead_policy{.budget = 4, .strategy = prefetch_strategy::opportunistic}};
+  auto selected = select_readahead_backend(local_query);
+  CHECK(selected.budget == 4);
+  CHECK(selected.strategy == prefetch_strategy::opportunistic);
+
+  // Likewise, a REST context created only to LIST objects must not enable
+  // readahead for a current kvikIO query that publishes no budget.
+  constexpr std::array kvikio_query = {
+    backend_readahead_policy{.budget = 0, .strategy = prefetch_strategy::opportunistic}};
+  selected = select_readahead_backend(kvikio_query);
+  CHECK(selected.budget == 0);
+  CHECK(selected.strategy == prefetch_strategy::opportunistic);
+
+  // A genuinely mixed current query still takes the widest backend and keeps
+  // that backend's strategy paired with its budget.
+  constexpr std::array mixed_query = {
+    backend_readahead_policy{.budget = 4, .strategy = prefetch_strategy::opportunistic},
+    backend_readahead_policy{.budget = 8, .strategy = prefetch_strategy::eager}};
+  selected = select_readahead_backend(mixed_query);
+  CHECK(selected.budget == 8);
+  CHECK(selected.strategy == prefetch_strategy::eager);
+}
+
+TEST_CASE("explicit readahead settings override the selected backend policy",
+          "[scan_manager][readahead]")
+{
+  scan_manager_config cfg;
+  cfg.cache.mode          = cache_mode::sirius;
+  cfg.max_readahead_scans = 3;
+  cfg.readahead_strategy  = sirius::scan_manager::prefetch_strategy::eager;
+  cfg.pipeline_width      = 9;
+  cfg.apply_cache_mode();
+
+  auto const plan =
+    cfg.resolve_readahead(4, sirius::scan_manager::prefetch_strategy::opportunistic);
+  CHECK(plan.budget == 3);
+  CHECK(plan.strategy == sirius::scan_manager::prefetch_strategy::eager);
 }
 
 TEST_CASE("apply_cache_mode leaves the other derived knobs alone", "[scan_manager][readahead]")
