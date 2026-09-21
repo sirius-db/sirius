@@ -23,9 +23,9 @@
 
 #include <catch.hpp>
 #include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository.hpp>
 #include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
+#include <duckdb/main/materialized_query_result.hpp>
 #include <utils/pipeline_conversion_test_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 
@@ -96,10 +96,11 @@ struct fragment_fixture {
   duckdb::shared_ptr<stream_bind_catalog> catalog;
 };
 
-//! The execution window a fragment's build/run must sit inside. RAII matters here: a `REQUIRE`
+//! The execution window a FRAG-CONTROL engine must sit inside. RAII matters here: a `REQUIRE`
 //! that fails inside a hand-bracketed window would leave the slot held and self-deadlock in the
 //! test's `Rollback`, so the scope's destructor backstop is what lets a failing assertion fail.
-//! Tests that assert on post-cleanup state call `finish()` explicitly.
+//! streaming_fragment tests must not open one of these. streaming_fragment::build() owns the
+//! window.
 using query_window = duckdb::SiriusContext::StandaloneQueryScope;
 
 //! Every INTEGER value sitting in an output stream, draining it. Row counts alone would not
@@ -107,7 +108,7 @@ using query_window = duckdb::SiriusContext::StandaloneQueryScope;
 std::vector<std::int32_t> drain_values(streaming_fragment& fragment, stream_id_t id)
 {
   std::vector<std::int32_t> values;
-  while (auto batch = fragment.session().pull(id)) {
+  while (auto batch = fragment.pull(id)) {
     auto view = sirius::get_cudf_table_view(**batch);
     auto col  = sirius::test::operator_utils::copy_column_to_host<std::int32_t>(view.column(0));
     values.insert(values.end(), col.begin(), col.end());
@@ -120,7 +121,7 @@ std::vector<std::int32_t> drain_values(streaming_fragment& fragment, stream_id_t
 std::size_t drain_row_count(streaming_fragment& fragment, stream_id_t id)
 {
   std::size_t rows = 0;
-  while (auto batch = fragment.session().pull(id)) {
+  while (auto batch = fragment.pull(id)) {
     rows += static_cast<std::size_t>(sirius::get_cudf_table_view(**batch).num_rows());
   }
   return rows;
@@ -140,33 +141,13 @@ TEST_CASE_METHOD(fragment_fixture,
   spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
   spec.outputs     = {0};
 
-  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
-
   con->BeginTransaction();
   try {
     streaming_fragment fragment(*con->context, std::move(spec));
-
-    // One window spanning build + run (shared query window).
-    query_window window(*sirius_ctx, *con->context, "frag_1");
-    fragment.build(window.query_id());
-    // Pipeline completion gate: without it run() blocks forever.
+    fragment.build();
     fragment.run();
-    window.finish();
 
-    // Separate "source never produced" from "tasks ran but sink empty".
-    std::size_t created = 0, completed = 0;
-    for (const auto& p : fragment.engine().sirius_pipelines) {
-      created += p->get_tasks_created();
-      completed += p->get_tasks_completed();
-    }
-    INFO("pipelines=" << fragment.engine().sirius_pipelines.size()
-                      << " scheduled=" << fragment.engine().new_scheduled.size()
-                      << " tasks_created=" << created << " tasks_completed=" << completed);
-    REQUIRE(created > 0);
-
-    // Repositories escape data_repository_manager_ cleanup — batches survive the window.
-    REQUIRE(fragment.output_repository(0)->total_size() > 0);
+    REQUIRE(fragment.output_batch_count(0) > 0);
     REQUIRE(drain_row_count(fragment, 0) == kLeafRows);
 
     con->Rollback();
@@ -184,23 +165,17 @@ TEST_CASE_METHOD(fragment_fixture,
                  "FRAG-2: a two-fragment chain matches the equivalent single query",
                  "[integration][streaming_fragment]")
 {
-  // The answer the chain must reproduce.
   auto expected = con->Query(std::string("SELECT count(*) FROM (") + kLeafQuery + ") t");
   REQUIRE_FALSE(expected->HasError());
   auto const expected_rows = expected->GetValue(0, 0).GetValue<std::int64_t>();
 
-  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
-
   con->BeginTransaction();
   try {
-    // Sender: reads a VALUES list, writes to its output stream.
     fragment_spec sender_spec;
     sender_spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
     sender_spec.outputs     = {0};
     streaming_fragment sender(*con->context, std::move(sender_spec));
 
-    // Receiver: reads that stream instead of a table. No file, no parquet round-trip.
     fragment_spec receiver_spec;
     receiver_spec.plan_source =
       sirius::test::sql_plan_source("SELECT a FROM sirius_stream_source(0)");
@@ -211,33 +186,15 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    // Each fragment gets its own query window, spanning its build and run. The sender's
-    // output repository is session-owned, so it survives the sender's window cleanup and is
-    // still there for the relay.
-    {
-      query_window sender_window(*sirius_ctx, *con->context, "frag_sender");
-      sender.build(sender_window.query_id());
-      sender.run();
-      sender_window.finish();
-    }
+    sender.build();
+    sender.run();
 
-    query_window receiver_window(*sirius_ctx, *con->context, "frag_receiver");
-    receiver.build(receiver_window.query_id());
-
-    // The relay the compute node will perform: pull from the sender's output stream and push
-    // into the receiver's input stream, as native batches. No Arrow, no disk.
-    std::size_t relayed_batches = 0;
-    while (auto batch = sender.session().pull(0)) {
-      REQUIRE(receiver.session().push(0, *batch));
-      ++relayed_batches;
-    }
+    receiver.build();
+    auto const relayed_batches = receiver.relay_from(sender, 0, 0, 0);
     REQUIRE(relayed_batches > 0);
-    receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_window.finish();
 
-    // Values, not just a count: the chain must deliver exactly what the sender produced.
     auto const received = drain_values(receiver, 1);
     REQUIRE(received.size() == static_cast<std::size_t>(expected_rows));
     REQUIRE(received == std::vector<std::int32_t>{1, 2, 3, 4, 5});
@@ -259,10 +216,11 @@ TEST_CASE_METHOD(fragment_fixture,
 {
   auto source = sirius::test::sql_plan_source(kLeafQuery);
 
-  SECTION("no output stream")
+  SECTION("partitioning on a result fragment")
   {
     fragment_spec spec;
-    spec.plan_source = source;
+    spec.plan_source  = source;
+    spec.partitioning = sirius::op::partition_spec{{0}};
     REQUIRE_THROWS_AS(streaming_fragment(*con->context, std::move(spec)),
                       sirius::invalid_input_exception);
   }
@@ -297,13 +255,9 @@ TEST_CASE_METHOD(fragment_fixture,
         {0}};
     spec.outputs = {0};
 
-    auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     con->BeginTransaction();
     streaming_fragment fragment(*con->context, std::move(spec));
-    {
-      query_window window(*sirius_ctx, *con->context, "frag_3");
-      REQUIRE_THROWS_AS(fragment.build(window.query_id()), sirius::invalid_input_exception);
-    }
+    REQUIRE_THROWS_AS(fragment.build(), sirius::invalid_input_exception);
     con->Rollback();
   }
 }
@@ -317,14 +271,9 @@ TEST_CASE_METHOD(fragment_fixture,
                  "FRAG-CONTROL: which queries actually materialize rows on the direct path",
                  "[integration][streaming_fragment_control]")
 {
-  // Assert row count, not merely that execute() succeeded.
   auto row_count_of = [&](const std::string& query) -> std::size_t {
     std::size_t rows = 0;
-    // execute() routes through task_creator::prepare_for_query, which requires
-    // set_client_context to have already run for the engine's exact query id — that only
-    // happens for the window's own id (begin_execution_window calls it), so the engine must be
-    // built on window.query_id() rather than with_initialized_engine's default synthesized one.
-    auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    auto sirius_ctx  = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
     REQUIRE(sirius_ctx != nullptr);
     query_window window(*sirius_ctx, *con->context, "frag_control");
     sirius::test::with_initialized_engine(
@@ -371,8 +320,6 @@ TEST_CASE_METHOD(fragment_fixture,
   auto const parquet = lineitem_parquet_path();
   REQUIRE(fs::exists(parquet));
 
-  // Filter on l_quantity so row-group pruning does not collapse the scan. Still one batch
-  // per file; FRAG-5 covers multi-batch streams.
   auto const leaf =
     "SELECT l_orderkey FROM read_parquet('" + parquet.string() + "') WHERE l_quantity < 2";
 
@@ -381,9 +328,6 @@ TEST_CASE_METHOD(fragment_fixture,
   auto const expected_rows =
     static_cast<std::size_t>(expected->GetValue(0, 0).GetValue<std::int64_t>());
   REQUIRE(expected_rows > 0);
-
-  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
 
   con->BeginTransaction();
   try {
@@ -402,31 +346,14 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
-    {
-      query_window sender_window(*sirius_ctx, *con->context, "frag4_sender");
-      sender.build(sender_window.query_id());
-      sender.run();
-      sender_window.finish();
-    }
+    sender.build();
+    sender.run();
 
-    query_window receiver_window(*sirius_ctx, *con->context, "frag4_receiver");
-    receiver.build(receiver_window.query_id());
-
-    std::size_t relayed_batches = 0;
-    std::size_t relayed_rows    = 0;
-    while (auto batch = sender.session().pull(0)) {
-      relayed_rows += static_cast<std::size_t>(sirius::get_cudf_table_view(**batch).num_rows());
-      REQUIRE(receiver.session().push(0, *batch));
-      ++relayed_batches;
-    }
+    receiver.build();
+    auto const relayed_batches = receiver.relay_from(sender, 0, 0, 0);
     REQUIRE(relayed_batches > 0);
-    // Everything the sender produced crosses the hop; nothing is dropped in transit.
-    REQUIRE(relayed_rows == expected_rows);
-    receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_window.finish();
-
     REQUIRE(drain_row_count(receiver, 1) == expected_rows);
 
     con->Rollback();
@@ -444,10 +371,6 @@ TEST_CASE_METHOD(fragment_fixture,
                  "FRAG-5: a multi-batch stream drains completely",
                  "[integration][streaming_fragment]")
 {
-  auto sirius_ctx = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  REQUIRE(sirius_ctx != nullptr);
-
-  // Disjoint halves so the output identifies which batches arrived.
   constexpr const char* kFirstHalf  = "SELECT a FROM (VALUES (1), (2), (3)) t(a)";
   constexpr const char* kSecondHalf = "SELECT a FROM (VALUES (4), (5), (6)) t(a)";
 
@@ -469,44 +392,55 @@ TEST_CASE_METHOD(fragment_fixture,
     receiver_spec.inputs[0] = stream_input_spec{
       {"a"},
       sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
-      {0}};
+      {0, 1}};
     receiver_spec.outputs = {1};
     streaming_fragment receiver(*con->context, std::move(receiver_spec));
 
     for (auto* sender : {first.get(), second.get()}) {
-      query_window sender_window(*sirius_ctx, *con->context, "frag5_sender");
-      sender->build(sender_window.query_id());
+      sender->build();
       sender->run();
-      sender_window.finish();
     }
 
-    query_window receiver_window(*sirius_ctx, *con->context, "frag5_receiver");
-    receiver.build(receiver_window.query_id());
-
+    receiver.build();
     std::size_t relayed_batches = 0;
-    for (auto* sender : {first.get(), second.get()}) {
-      while (auto batch = sender->session().pull(0)) {
-        REQUIRE(receiver.session().push(0, *batch));
-        ++relayed_batches;
-      }
-    }
-    // Multi-batch premise: if only one batch arrives this degrades to FRAG-2.
+    relayed_batches += receiver.relay_from(*first, 0, 0, 0);
+    relayed_batches += receiver.relay_from(*second, 0, 0, 1);
     REQUIRE(relayed_batches > 1);
-    receiver.session().close_input(0, 0);
 
     receiver.run();
-    receiver_window.finish();
-
-    // INFO only: one batch per task today; coalescing would change the count.
-    std::size_t created = 0, completed = 0;
-    for (const auto& p : receiver.engine().sirius_pipelines) {
-      created += p->get_tasks_created();
-      completed += p->get_tasks_completed();
-    }
-    INFO("relayed_batches=" << relayed_batches << " receiver tasks_created=" << created
-                            << " tasks_completed=" << completed);
-
     REQUIRE(drain_values(receiver, 1) == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+
+    con->Rollback();
+  } catch (...) {
+    con->Rollback();
+    throw;
+  }
+}
+
+// ============================================================================
+// FRAG-6: empty outputs are a RESULT_COLLECTOR terminal on the same streaming_fragment.
+// ============================================================================
+
+TEST_CASE_METHOD(fragment_fixture,
+                 "FRAG-6: a result fragment materializes rows through take_result()",
+                 "[integration][streaming_fragment]")
+{
+  fragment_spec spec;
+  spec.plan_source = sirius::test::sql_plan_source(kLeafQuery);
+
+  con->BeginTransaction();
+  try {
+    streaming_fragment fragment(*con->context, std::move(spec));
+    fragment.build();
+    fragment.run();
+
+    auto result = fragment.take_result();
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    auto materialized =
+      duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(
+        std::move(result));
+    REQUIRE(materialized->RowCount() == kLeafRows);
 
     con->Rollback();
   } catch (...) {
