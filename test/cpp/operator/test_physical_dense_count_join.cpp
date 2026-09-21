@@ -784,9 +784,59 @@ TEST_CASE("dense_count_join first-run estimate is proportional and saturates",
                                           /*counted_key_idx=*/0,
                                           /*counted_value_idx=*/std::nullopt,
                                           /*max_bins_bytes=*/8);
-  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor + 16 * 100);
-  CHECK(sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()}) ==
-        std::numeric_limits<std::size_t>::max());
+  CHECK(sparse.no_history_peak_memory_estimate({2, 100}) >= allocation_floor);
+  // The sparse term is sized by the group count, so an absurd byte count no longer drags the
+  // estimate to SIZE_MAX. What must hold is that the saturating arithmetic does not wrap and
+  // that the estimate stays monotonic in the input.
+  auto const absurd =
+    sparse.no_history_peak_memory_estimate({2, std::numeric_limits<std::size_t>::max()});
+  CHECK(absurd > std::numeric_limits<std::size_t>::max() / 4);
+  CHECK(absurd >= sparse.no_history_peak_memory_estimate({2, 100}));
+}
+
+TEST_CASE("dense_count_join sparse estimate covers unmatched counted-side keys",
+          "[dense_count_join][no_history_peak_memory_estimate]")
+{
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::INTEGER);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  // Few preserved keys, many counted keys that match none of them: the sparse path groups the
+  // counted side in full before any join, so the emitted row count does not bound its hash state.
+  constexpr uint64_t preserved_rows = 16;
+  constexpr uint64_t counted_rows   = 4ULL * 1000 * 1000;
+  // Large enough that the stats.bytes / key_width ceiling does not clamp the group term.
+  input_stats const stats{8, 512ULL * 1024 * 1024};
+  constexpr uint64_t tiny_bins = 8;  // forces the sparse peak to dominate
+
+  sirius_physical_dense_count_join few_counted(sirius::from_duckdb_vec(types),
+                                               /*estimated_cardinality=*/preserved_rows,
+                                               /*preserved_key_idx=*/0,
+                                               /*counted_key_idx=*/0,
+                                               /*counted_value_idx=*/std::nullopt,
+                                               tiny_bins,
+                                               /*planned_histogram_bytes=*/0,
+                                               /*planned_output_rows=*/preserved_rows,
+                                               /*planned_counted_rows=*/1);
+  sirius_physical_dense_count_join many_counted(sirius::from_duckdb_vec(types),
+                                                /*estimated_cardinality=*/preserved_rows,
+                                                /*preserved_key_idx=*/0,
+                                                /*counted_key_idx=*/0,
+                                                /*counted_value_idx=*/std::nullopt,
+                                                tiny_bins,
+                                                /*planned_histogram_bytes=*/0,
+                                                /*planned_output_rows=*/preserved_rows,
+                                                /*planned_counted_rows=*/counted_rows);
+
+  auto const few  = few_counted.no_history_peak_memory_estimate(stats);
+  auto const many = many_counted.no_history_peak_memory_estimate(stats);
+
+  // Sizing the groups off the emitted rows alone would leave both estimates at the `few` value,
+  // roughly 250,000x short of the counted-side hash state.
+  constexpr std::size_t group_factor = 8;
+  constexpr std::size_t group_bytes  = sizeof(int32_t) + sizeof(int64_t);
+  CHECK(many >= group_factor * group_bytes * (counted_rows + preserved_rows));
+  CHECK(many > few);
 }
 
 TEST_CASE("dense_count_join rejects an unrepresentable histogram layout",

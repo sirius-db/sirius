@@ -100,7 +100,18 @@ constexpr bool DEFAULT_ENABLE_RUNTIME_DISTINCT_BUILD_PROBE = false;
 
 constexpr bool DEFAULT_ENABLE_DENSE_COUNT_JOIN = true;
 
-constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+/// 0 = auto: a share of GPU tier capacity, mirroring MAX_SORT_PARTITION_BYTES. The
+/// histogram is 2 * key_range * slot_bytes, so it tracks the key domain rather than
+/// any fixed size, and a constant admits it at one data size and rejects it at the next.
+constexpr uint64_t DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES = 0;
+
+/// Share of GPU tier capacity the histogram may occupy when the budget is auto. Tasks
+/// plan a full-width histogram each rather than slicing a shared one, so a concurrent
+/// pipeline can hold one per thread.
+constexpr double DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION = 0.10;
+
+/// Budget when GPU tier capacity cannot be read at planning time.
+constexpr uint64_t DENSE_COUNT_JOIN_FALLBACK_MAX_BYTES = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 
 }  // namespace config
 
@@ -189,8 +200,12 @@ struct operator_params {
   /// Enable DENSE_COUNT_JOIN planning for eligible aggregates.
   bool enable_dense_count_join = config::DEFAULT_ENABLE_DENSE_COUNT_JOIN;
 
-  /// Engine-owned histogram budget; declined ranges use exact sparse aggregation.
+  /// Engine-owned histogram budget; 0 = derive from GPU tier capacity. A key range that
+  /// does not fit declines the fusion, leaving the ordinary join + aggregate.
   uint64_t dense_count_join_max_bytes = config::DEFAULT_DENSE_COUNT_JOIN_MAX_BYTES;
+
+  /// Share of GPU tier capacity for the histogram when the budget above is 0.
+  double dense_count_join_memory_fraction = config::DEFAULT_DENSE_COUNT_JOIN_MEMORY_FRACTION;
 
   /// Admission-time GPU allocation: target bytes of projected scan output per GPU.
   /// At query start, the engine estimates total scan output bytes from the plan's
