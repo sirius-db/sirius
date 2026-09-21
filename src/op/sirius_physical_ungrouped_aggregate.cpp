@@ -27,6 +27,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -39,8 +40,6 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -297,7 +296,7 @@ duckdb::vector<sirius::logical_type> sirius_physical_ungrouped_aggregate::get_lo
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
@@ -479,7 +478,7 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_ungrouped_aggregate_merge::execute"};
   auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   if (aggregates.empty()) {
@@ -501,7 +500,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (input_batches.size() == 1) {
-    merged_batch = cucascade::data_batch::to_idle(std::move(input_batches[0]));
+    merged_batch = input.get_data_batches()[0];  // forward the owned input batch (idle at park)
   } else {
     merged_batch = gpu_merge_impl::merge_ungrouped_aggregate(
       input_batches, layout.merge_kinds, layout.merge_nth_index, stream, *space, batch_telemetry());

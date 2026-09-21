@@ -29,6 +29,7 @@
 #include "op/scan/gpu_ingestible.hpp"
 #include "scan_manager/pinned_chunk_stats.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -39,7 +40,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
@@ -219,7 +219,7 @@ narrowed_pin_chunk narrow_pin_chunk(std::unique_ptr<cudf::table> table,
 std::vector<late_mat::unique_verdict> materialize_pin_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options,
   const pin_batch_sink& on_batch)
@@ -242,7 +242,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   }
   scan_manager::round_robin_strategy placement(std::move(device_ids));
 
-  // next_split_provider takes the io_ctx by shared_ptr; sirius_ioctx derives
+  // next_split_provider takes the io_ctx by shared_ptr; ioctx derives
   // std::enable_shared_from_this and the scan manager owns it via a shared_ptr, so
   // this hands the metadata reads a valid owning reference for the read's duration.
   auto io_ctx_sp = io_ctx.shared_from_this();
@@ -328,7 +328,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
     // narrowing preserves them, so the native carriers are both cheaper to
     // reduce and equally conclusive.
     if (unique_probe.active()) {
-      nvtx3::scoped_range probe_range{"sirius::pin::unique_probe"};
+      nvtx_scoped_range probe_range{"sirius::pin::unique_probe"};
       unique_probe.observe(tbl->view(), stream);
     }
     if (exact_retaining) {
@@ -518,7 +518,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
                               std::string_view log_tag,
                               StageFn&& stage)
 {
-  nvtx3::scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
+  nvtx_scoped_range nvtx_range{"sirius::pin::compress_and_stage"};
   if (tbl.num_columns() == 0) { return false; }
   // Total device footprint of the batch (includes string chars/offsets and null
   // masks), so string columns count toward the threshold.
@@ -573,7 +573,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
   }
 
   {
-    nvtx3::scoped_range stage_range{"sirius::compression::stage_payload"};
+    nvtx_scoped_range stage_range{"sirius::compression::stage_payload"};
     stage(std::move(ct),
           std::move(header),
           buffers,
@@ -589,7 +589,7 @@ bool compress_and_stage_batch(cudf::table const& tbl,
 materialized_pin materialize_all_batches(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   pin_materialization_options options)
 {
@@ -621,7 +621,7 @@ host_pin_result materialize_pin_to_host(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
   const std::unordered_map<int, cucascade::memory::memory_space*>& host_space_by_gpu,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)
@@ -745,7 +745,7 @@ host_pin_result materialize_pin_to_host(
 device_pin_result materialize_all_batches_compressed(
   op::scan::gpu_ingestible& ingestible,
   std::span<cucascade::memory::memory_space* const> gpu_spaces,
-  io::sirius_ioctx& io_ctx,
+  io::ioctx& io_ctx,
   duckdb::vector<duckdb::LogicalType> const& pinned_column_types,
   compression_pin_config const& compression,
   pin_materialization_options options)

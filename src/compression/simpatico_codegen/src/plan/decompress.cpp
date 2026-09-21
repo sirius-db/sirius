@@ -4,6 +4,7 @@
 #include "codegen/decode/masked_launch.hpp"
 #include "codegen/plan/bitjoin_layout.hpp"
 #include "codegen/plan/plan_interpreter.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -20,7 +21,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -1288,7 +1288,7 @@ std::unique_ptr<cudf::column> decompress_column(PlanTree const& tree,
                                                 decode_predicate const* pred,
                                                 decode_selection const* sel)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_column"};
 
   if (tree.nodes.empty() || tree.nodes[0].op != "input") {
     if (error_out) *error_out = "decompress: tree missing input root";
@@ -1595,7 +1595,7 @@ bool decompress_column_selection_mask(PlanTree const& tree,
                                       rmm::device_async_resource_ref mr,
                                       std::string* error_out)
 {
-  nvtx3::scoped_range nvtx_range{"simpatico::decompress_column_selection_mask"};
+  nvtx_scoped_range nvtx_range{"simpatico::decompress_column_selection_mask"};
 
   if (tree.nodes.empty() || tree.nodes[0].op != "input") {
     if (error_out) *error_out = "decompress: tree missing input root";

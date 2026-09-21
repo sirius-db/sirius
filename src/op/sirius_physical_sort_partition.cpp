@@ -23,10 +23,9 @@
 #include "op/cudf_sort_order.hpp"
 #include "op/sirius_physical_sort_sample.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/search.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 namespace sirius {
 namespace op {
@@ -54,7 +53,7 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_sort_partition::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
@@ -63,7 +62,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   auto start           = std::chrono::high_resolution_clock::now();

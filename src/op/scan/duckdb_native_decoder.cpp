@@ -26,6 +26,7 @@
 #include "op/scan/duckdb_block_layout.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "sirius_context.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -41,8 +42,6 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -826,9 +825,9 @@ void submit_and_await(rmm::device_buffer& device_buf,
 
   // Issue the coalesced reads as one batch and await completion.
   {
-    nvtx3::scoped_range nvtx_reads{"native_reads"};
+    nvtx_scoped_range nvtx_reads{"native_reads"};
     auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.get_io_object(), ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
@@ -846,7 +845,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
   // host_alloc / reservation drop so the copies finish reading pinned memory first.
   {
-    nvtx3::scoped_range nvtx_h2d{"native_h2d"};
+    nvtx_scoped_range nvtx_h2d{"native_h2d"};
     std::vector<void*> h2d_dst;
     std::vector<void const*> h2d_src;
     std::vector<std::size_t> h2d_size;

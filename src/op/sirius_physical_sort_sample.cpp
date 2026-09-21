@@ -24,8 +24,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -162,14 +161,14 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::get_next_task_input_
 std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
                                                                     rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_sort_sample::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
 
   // Fast path: boundaries already computed — just pass through.
   if (_boundary_state.load(std::memory_order_acquire) == BoundaryState::DONE) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // do boundary computation
@@ -188,7 +187,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
 
   if (valid_batches.empty() || !space) {
     _boundary_state.store(BoundaryState::DONE, std::memory_order_release);
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Wrap GPU work in try/catch: if any allocation throws (e.g. rmm::out_of_memory), leave the state
@@ -352,7 +351,7 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+  return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
 }
 
 }  // namespace op

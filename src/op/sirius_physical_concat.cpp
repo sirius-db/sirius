@@ -20,8 +20,7 @@
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 namespace sirius {
 namespace op {
@@ -171,7 +170,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
     throw std::runtime_error(
@@ -196,9 +195,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
   if (input_batches.size() == 1) {
-    auto copy   = input_batches[0];
-    auto output = cucascade::data_batch::to_idle(std::move(copy));
-    output_batches.push_back(std::move(output));
+    // Forward the owned input batch (idle at park); no read lock carried.
+    output_batches.push_back(partitioned_input_data->get_data_batches()[0]);
   } else {
     auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
     output_batches.push_back(std::move(merged_batch));
@@ -208,7 +206,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
   auto const partition_idx_opt = partitioned_output_data->get_partition_idx();
   if (!partition_idx_opt.has_value()) {

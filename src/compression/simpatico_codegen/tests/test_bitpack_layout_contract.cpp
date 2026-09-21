@@ -20,8 +20,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -66,6 +68,40 @@ std::unique_ptr<cudf::table> make_layout_fixture()
                              host.size() * sizeof(std::int32_t),
                              cudaMemcpyHostToDevice);
   if (rc != cudaSuccess) throw std::runtime_error("fixture HtoD copy failed");
+
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.push_back(std::move(col));
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+std::unique_ptr<cudf::table> make_int64_width_fixture()
+{
+  constexpr std::int32_t num_rows = 65 * codegen::kChunkSize + kPartialRows;
+  std::vector<std::int64_t> host(static_cast<std::size_t>(num_rows));
+  for (std::int32_t chunk = 0; chunk < 66; ++chunk) {
+    auto const bits  = std::min(chunk, 64);
+    auto const count = chunk == 65 ? kPartialRows : codegen::kChunkSize;
+    auto const mask  = bits == 64 ? UINT64_MAX : (std::uint64_t{1} << bits) - 1;
+    auto const base  = std::bit_cast<std::uint64_t>(
+      bits == 0 ? std::int64_t{-7} : std::numeric_limits<std::int64_t>::min());
+    for (std::int32_t pos = 0; pos < count; ++pos) {
+      // Put both extrema at chunk boundaries; vary the intervening packed reads.
+      auto const residual = pos == 0 ? std::uint64_t{0}
+                            : pos == count - 1
+                              ? mask
+                              : (static_cast<std::uint64_t>(pos) * 0x9E3779B97F4A7C15ULL) & mask;
+      host[static_cast<std::size_t>(chunk * codegen::kChunkSize + pos)] =
+        std::bit_cast<std::int64_t>(base + residual);
+    }
+  }
+
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED);
+  auto const rc = cudaMemcpy(col->mutable_view().head<std::int64_t>(),
+                             host.data(),
+                             host.size() * sizeof(std::int64_t),
+                             cudaMemcpyHostToDevice);
+  if (rc != cudaSuccess) throw std::runtime_error("int64 fixture HtoD copy failed");
 
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
@@ -201,6 +237,33 @@ void test_compact_persistence_and_decode()
          "compact decode with synthesized bp_offsets changed data");
 }
 
+void test_int64_widths_and_tail()
+{
+  auto input        = make_int64_width_fixture();
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = rmm::mr::get_current_device_resource_ref();
+
+  auto compressed = simpatico::compress_with_plan(
+    input->view(), "input -> bitpack -> chunk_min, chunk_count, chunk_bits, packed\n", stream, mr);
+
+  auto const description = compressed.describe(stream);
+  auto const& leaf       = find_bitpack_leaf(description);
+  auto const counts      = copy_buffer<std::int32_t>(find_buffer(leaf, "chunk_count"));
+  auto const bits        = copy_buffer<std::uint8_t>(find_buffer(leaf, "chunk_bits"));
+  std::vector<std::int32_t> expected_counts(66, codegen::kChunkSize);
+  expected_counts.back() = kPartialRows;
+  std::vector<std::uint8_t> expected_bits(66);
+  std::iota(expected_bits.begin(), expected_bits.end(), std::uint8_t{0});
+  expected_bits.back() = 64;
+  expect(counts == expected_counts, "unexpected int64 per-chunk counts");
+  expect(bits == expected_bits, "unexpected int64 per-chunk bit widths");
+
+  auto output = simpatico::decompress(compressed, stream, mr);
+  expect(output != nullptr, "int64 decode returned null");
+  expect(columns_equal(input->view().column(0), output->view().column(0)),
+         "int64 decode changed data across bit widths or the tail");
+}
+
 }  // namespace
 
 int main()
@@ -211,6 +274,7 @@ int main()
   }
   try {
     test_compact_persistence_and_decode();
+    test_int64_widths_and_tail();
     std::printf("test_bitpack_layout_contract: PASS\n");
     return 0;
   } catch (std::exception const& e) {

@@ -258,11 +258,6 @@ class pipelineable_operator_data : public operator_data {
     : _data_batches(std::move(data_batches))
   {
   }
-  explicit pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
-  {
-  }
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -276,10 +271,10 @@ class pipelineable_operator_data : public operator_data {
     const;
 
   /**
-   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
+   * prepare_for_processing if present, otherwise transient read locks built from the idle batches.
    */
-  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
-    bool leave_locked = false) const;
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches() const;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
@@ -287,9 +282,6 @@ class pipelineable_operator_data : public operator_data {
   void remove_read_only_lock()
   {
     // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
-    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
-    // populated.
-    if (!_data_batches) { auto _ = get_data_batches(); }
     _read_only_data_batches = std::nullopt;
   }
 
@@ -306,7 +298,7 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches(false);
+    auto ro_batches   = get_read_only_batches();
     for (auto const& ro : ro_batches) {
       if (!ro.get_data()) { continue; }
       total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
@@ -317,7 +309,7 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::string get_origin_tiers() const override
   {
     std::array<bool, static_cast<std::size_t>(::cucascade::memory::Tier::SIZE)> present{};
-    for (auto const& ro : get_read_only_batches(false)) {
+    for (auto const& ro : get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
       auto tier = static_cast<std::size_t>(ro.get_current_tier());
       if (tier < present.size()) { present[tier] = true; }
@@ -332,8 +324,8 @@ class pipelineable_operator_data : public operator_data {
   }
 
  private:
-  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
-  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**
@@ -703,8 +695,8 @@ class sirius_physical_operator {
     /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
     /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
     ::cucascade::shared_data_repository* repo;
-    duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
-    duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    std::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
+    std::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
@@ -783,12 +775,12 @@ class sirius_physical_operator {
   bool check_pipeline_finished();
 
   //! Get pipeline
-  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
+  std::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
-  virtual void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+  virtual void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
-  duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
+  std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;
   //! Ownership container for ports, kept sorted by src_pipeline->get_pipeline_id().
