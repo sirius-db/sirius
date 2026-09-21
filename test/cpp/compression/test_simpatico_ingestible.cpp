@@ -167,7 +167,7 @@ std::vector<std::unique_ptr<sirius::op::scan::scan_info>> collect_splits(
   std::vector<std::unique_ptr<sirius::op::scan::scan_info>> batches;
   while (!ingestible.has_processed_all_metadata()) {
     auto task = ingestible.next_split_provider(
-      [](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return nullptr; });
+      [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return nullptr; });
     if (!task) { break; }
     for (auto& b : coalescer->push(task())) {
       batches.push_back(std::move(b));
@@ -239,7 +239,7 @@ TEST_CASE("simpatico ingestible - the walk emits one split and then terminates",
   REQUIRE(ingestible->has_processed_all_metadata());
   // The claim is one-shot: a second caller gets nothing rather than a duplicate of the file.
   REQUIRE(ingestible->next_split_provider(
-            [](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+            [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
               return nullptr;
             }) == nullptr);
 
@@ -431,7 +431,7 @@ TEST_CASE("simpatico ingestible - the walk emits one split per chunk, each exact
   REQUIRE(batches.size() == static_cast<std::size_t>(kChunks));
   REQUIRE(ingestible->has_processed_all_metadata());
   REQUIRE(ingestible->next_split_provider(
-            [](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> {
+            [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> {
               return nullptr;
             }) == nullptr);
 

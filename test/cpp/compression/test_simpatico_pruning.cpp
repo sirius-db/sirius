@@ -169,7 +169,7 @@ std::vector<std::unique_ptr<scan::scan_info>> collect_splits(scan::simpatico_gpu
   std::vector<std::unique_ptr<scan::scan_info>> splits;
   while (!ing.has_processed_all_metadata()) {
     auto task = ing.next_split_provider(
-      [](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return nullptr; });
+      [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return nullptr; });
     if (!task) { break; }
     splits.push_back(task());
   }

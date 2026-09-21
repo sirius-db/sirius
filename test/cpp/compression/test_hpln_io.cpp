@@ -154,7 +154,7 @@ std::vector<std::uint8_t> read_file(fs::path const& path)
 // backends
 //===----------------------------------------------------------------------===//
 
-std::shared_ptr<sirius::io::sirius_ioctx> make_uring_ioctx()
+std::shared_ptr<sirius::io::ioctx> make_uring_ioctx()
 {
   sirius::scan_manager::scan_manager_config cfg{};
   cfg.use_sirius_datasource = true;
@@ -163,7 +163,7 @@ std::shared_ptr<sirius::io::sirius_ioctx> make_uring_ioctx()
   return ctx;
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> make_rest_ioctx(std::string const& endpoint,
+std::shared_ptr<sirius::io::ioctx> make_rest_ioctx(std::string const& endpoint,
                                                           std::string const& access_key,
                                                           std::string const& secret_key,
                                                           std::string const& region)
@@ -607,7 +607,7 @@ TEST_CASE("hpln io - the same ranges read identically through the filesystem and
   }
 
   // Scattered ranges: two near each other (bridgeable) and one far away.
-  auto const read_all = [&](std::shared_ptr<sirius::io::sirius_ioctx> ctx) {
+  auto const read_all = [&](std::shared_ptr<sirius::io::ioctx> ctx) {
     auto src = sirius::open_hpln_source(path.string(), std::move(ctx), "test");
     std::vector<std::uint8_t> a(4000), b(8000), c(1 << 20);
     std::vector<sirius::hpln_extent> extents;

@@ -58,7 +58,7 @@ namespace sirius {
 
 struct hpln_open_options {
   /// Backend serving this path. Null means the local filesystem.
-  std::shared_ptr<io::sirius_ioctx> io_ctx;
+  std::shared_ptr<io::ioctx> io_ctx;
   /// How reads are coalesced into requests; see @ref hpln_io_policy for where its defaults
   /// come from.
   hpln_io_policy policy{};
@@ -138,7 +138,7 @@ struct hpln_bind_schema {
 ///
 /// Held by shared_ptr and handed out by shared_ptr: the arena is the bulk of it and it is
 /// immutable once parsed, so no consumer needs its own copy.
-class hpln_metadata final : public sirius::io::sirius_io_object_metadata {
+class hpln_metadata final : public sirius::io::io_object_metadata {
  public:
   explicit hpln_metadata(std::shared_ptr<hpln_bind_schema const> schema)
     : _schema(std::move(schema))

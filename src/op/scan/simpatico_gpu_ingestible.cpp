@@ -170,7 +170,7 @@ constexpr std::size_t ceil_div(std::size_t a, std::size_t b)
 std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
-  std::shared_ptr<io::sirius_ioctx> io_ctx)
+  std::shared_ptr<io::ioctx> io_ctx)
 {
   // The bind reads through the same transport the scan will: an `s3://` file has to be bindable
   // before it can be scanned, and binding it locally is not an option.
@@ -583,7 +583,7 @@ bool hpln_range_read_enabled()
 filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool /*like_swar_fastpath*/,
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
@@ -619,7 +619,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
   for (std::size_t i = 0; i < ingested.size(); ++i) {
     auto const& blob = *ingested[i].blob;
     simpatico::payload_fetch_fn whole_fetch =
-      [&blob](std::uint64_t off, std::size_t sz, void* dst, rmm::cuda_stream_view s) {
+      [&blob](std::uint64_t off, std::size_t sz, void* dst, ::cuda::stream_ref s) {
         copy_pinned_blocks_to_device(*blob.payload, off, dst, sz, s);
       };
 
@@ -730,7 +730,7 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
 
     // The fetch above only ENQUEUED its H2D copies on `stream`, and decompress_chunk decodes on
     // its own stream pool; sync so no pool stream reads bytes that have not landed yet.
-    stream.synchronize();
+    stream.sync();
     // A file scan carries no MVCC keep-mask: nothing deletes rows out from under a .hpln.
     auto result = sirius::decompress_chunk(
       compressed, selection, chunk_scan.get(), sirius::decode_visibility_mask{}, stream, mr);
@@ -760,12 +760,13 @@ filtered_table simpatico_gpu_ingestible::materialize_metadata_to_table(
     }
     // Re-point the decoded buffers onto `stream`: they were produced on pool streams, while the
     // concatenate below and everything downstream are ordered by `stream`.
-    decoded.push_back(sirius::rebind_table_stream(std::move(result.table), stream));
+    decoded.push_back(
+      sirius::rebind_table_stream(std::move(result.table), stream));
   }
 
   // The fetches above only ENQUEUED their H2D copies, and the pinned staging blobs die with this
   // scope -- a host free is not stream-ordered, so the bytes have to have landed first.
-  stream.synchronize();
+  stream.sync();
 
   // One table per chunk, concatenated in chunk-id order. The batch is a contiguous run of the
   // file, so concatenating in any other order would silently reshuffle its rows.
@@ -813,7 +814,7 @@ std::unique_ptr<batch_coalescer> simpatico_gpu_ingestible::create_batch_coalesce
 std::unique_ptr<cudf::table> simpatico_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* /*survivors*/,

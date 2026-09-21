@@ -373,7 +373,14 @@ struct ValidityRecord {
 };
 
 // Inverse of push_validity. Returns false on a truncated or unknown record.
-static bool read_validity(Reader& r, ValidityRecord& v)
+// @p payload_offset_at_out, when non-null, receives the header-relative byte offset of the
+// payload_offset field itself (not its value) for a mask record -- the same "field offsets"
+// bookkeeping parse_hpln_header does for every other payload-pointing field, so a chunk subset
+// can patch it in place. Set to the header base distance the caller tracks via `header_base`.
+static bool read_validity(Reader& r,
+                          ValidityRecord& v,
+                          std::uint8_t const* header_base,
+                          std::uint64_t* payload_offset_at_out = nullptr)
 {
   std::uint8_t k;
   if (!r.read_le(k)) return false;
@@ -384,7 +391,11 @@ static bool read_validity(Reader& r, ValidityRecord& v)
   if (!r.read_le(v.null_count)) return false;
   if (v.kind != validity_kind::mask) return true;
 
-  return r.read_le(v.size_bytes) && r.read_le(v.payload_offset);
+  if (!r.read_le(v.size_bytes)) return false;
+  if (payload_offset_at_out) {
+    *payload_offset_at_out = static_cast<std::uint64_t>(r.p - header_base);
+  }
+  return r.read_le(v.payload_offset);
 }
 
 // Serialize one node's structure (op, bitjoin params, edges, output names).
@@ -504,6 +515,9 @@ struct HeaderFieldOffsets {
     std::uint64_t begin_at    = 0;
     std::uint64_t end_at      = 0;
     std::uint64_t num_rows_at = 0;  // int64
+    // Set only when the column's validity record is a mask (0 otherwise, which is never a valid
+    // field offset since the header's 4-byte magic always precedes it).
+    std::uint64_t validity_payload_offset_at = 0;  // uint64
     std::vector<Leaf> leaves;
   };
   std::vector<Column> columns;
@@ -554,7 +568,12 @@ static bool parse_hpln_header(Reader& r,
     if (!r.read_le(cr.scale)) return bad("truncated col scale");
     if (field_offsets) field_offsets->columns[ci].num_rows_at = field_at();
     if (!r.read_le(cr.num_rows)) return bad("truncated col num_rows");
-    if (!read_validity(r, cr.validity)) return bad("truncated/unknown col validity");
+    if (!read_validity(r,
+                       cr.validity,
+                       header_base,
+                       field_offsets ? &field_offsets->columns[ci].validity_payload_offset_at
+                                     : nullptr))
+      return bad("truncated/unknown col validity");
 
     std::uint16_t nn;
     if (!r.read_le(nn)) return bad("truncated num_nodes");

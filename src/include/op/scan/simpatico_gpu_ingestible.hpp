@@ -174,7 +174,7 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
   /// Backend the file is read through, resolved at bind. Null means the local filesystem, which
   /// is what a host test that drives the ingestible without a scan manager gets; an `s3://` path
   /// with no io_context is refused by the transport rather than read from the local filesystem.
-  std::shared_ptr<io::sirius_ioctx> io_ctx;
+  std::shared_ptr<io::ioctx> io_ctx;
 
   simpatico_ingestible_table_info() = default;
 
@@ -191,7 +191,7 @@ class simpatico_ingestible_table_info : public ingestible_table_info {
 [[nodiscard]] std::unique_ptr<simpatico_ingestible_table_info> bind_simpatico_file(
   std::string const& path,
   cucascade::memory::memory_space& host_space,
-  std::shared_ptr<io::sirius_ioctx> io_ctx = nullptr);
+  std::shared_ptr<io::ioctx> io_ctx = nullptr);
 
 //===----------------------------------------------------------------------===//
 // simpatico_scan_info
@@ -213,7 +213,7 @@ class simpatico_scan_info : public scan_info {
   std::string path;
   /// Backend this split reads through, resolved once on the walk. Carried on the split rather
   /// than read from a member so a concurrent walk and materialize never race for it.
-  std::shared_ptr<io::sirius_ioctx> io_ctx;
+  std::shared_ptr<io::ioctx> io_ctx;
   /// File-order chunk ids this split decodes, ascending.
   std::vector<std::size_t> chunk_ids;
   /// Positional with @ref chunk_ids: the chunk's surviving 1024-row decode chunk ids, or an empty
@@ -261,14 +261,14 @@ class simpatico_gpu_ingestible : public gpu_ingestible {
   filtered_table materialize_metadata_to_table(
     scan_info const& info,
     ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache) override;
 
   std::unique_ptr<cudf::table> post_filter_and_project(
     filtered_table&& input,
     ::cucascade::memory::memory_space const& mem_space,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     bool like_swar_fastpath,
     std::shared_ptr<const sirius::like_multiliteral_cache> like_cache,
     std::unique_ptr<cudf::column>* survivors,

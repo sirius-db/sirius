@@ -278,7 +278,7 @@ char const* backend_name(io::io_context_type type)
 /// ranged reads the zone maps decide on in front of an object store.
 class ioctx_hpln_source final : public hpln_source {
  public:
-  ioctx_hpln_source(std::string path, std::shared_ptr<io::sirius_ioctx> io_ctx, char const* who)
+  ioctx_hpln_source(std::string path, std::shared_ptr<io::ioctx> io_ctx, char const* who)
     : _path(std::move(path)), _io_ctx(std::move(io_ctx))
   {
     if (!_io_ctx) {
@@ -304,12 +304,12 @@ class ioctx_hpln_source final : public hpln_source {
 
   /// Straight through to the datasource, which resolves the io_context's metadata store by the
   /// io_object's cache id -- the same path parquet's footer cache takes.
-  [[nodiscard]] std::shared_ptr<io::sirius_io_object_metadata> metadata() const override
+  [[nodiscard]] std::shared_ptr<io::io_object_metadata> metadata() const override
   {
     return _ds ? _ds->metadata() : nullptr;
   }
 
-  bool store_metadata(std::shared_ptr<io::sirius_io_object_metadata> metadata) override
+  bool store_metadata(std::shared_ptr<io::io_object_metadata> metadata) override
   {
     return _ds && _ds->store_metadata(std::move(metadata));
   }
@@ -360,7 +360,7 @@ class ioctx_hpln_source final : public hpln_source {
         segments.push_back(std::move(seg));
         ++i;
       }
-      auto fut              = _io_ctx->host_read_ranges_async_io(_ds->io_object(), segments);
+      auto fut              = _io_ctx->host_read_ranges_async_io(_ds->get_io_object(), segments);
       std::size_t const got = std::move(fut).get();
       if (got != batch_bytes) {
         throw std::runtime_error("[hpln io] '" + _path + "': short read of the " + what + ": got " +
@@ -376,7 +376,7 @@ class ioctx_hpln_source final : public hpln_source {
     for (auto const& r : requests) {
       std::uint64_t at = r.offset;
       for (auto const& d : r.dst) {
-        auto const got = _io_ctx->host_read_io(_ds->io_object(),
+        auto const got = _io_ctx->host_read_io(_ds->get_io_object(),
                                                static_cast<std::size_t>(at),
                                                static_cast<std::size_t>(d.bytes),
                                                d.data);
@@ -390,7 +390,7 @@ class ioctx_hpln_source final : public hpln_source {
   }
 
   std::string _path;
-  std::shared_ptr<io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<io::ioctx> _io_ctx;
   std::unique_ptr<io::sirius_datasource> _ds;
   std::uint64_t _size = 0;
 };
@@ -398,7 +398,7 @@ class ioctx_hpln_source final : public hpln_source {
 }  // namespace
 
 std::unique_ptr<hpln_source> open_hpln_source(std::string const& path,
-                                              std::shared_ptr<io::sirius_ioctx> io_ctx,
+                                              std::shared_ptr<io::ioctx> io_ctx,
                                               char const* who)
 {
   if (io_ctx) { return std::make_unique<ioctx_hpln_source>(path, std::move(io_ctx), who); }

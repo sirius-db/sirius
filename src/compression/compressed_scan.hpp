@@ -316,6 +316,6 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
  * nothing to re-point.
  */
 std::unique_ptr<cudf::table> rebind_table_stream(std::unique_ptr<cudf::table> table,
-                                                 rmm::cuda_stream_view stream);
+                                                 ::cuda::stream_ref stream);
 
 }  // namespace sirius

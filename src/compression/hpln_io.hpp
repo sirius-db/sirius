@@ -198,13 +198,13 @@ class hpln_source {
   /// The default is "no cache", which is what a local ifstream source and a host test get: they
   /// re-parse, which is right rather than merely acceptable, since neither has an io_context whose
   /// lifetime could bound the entry.
-  [[nodiscard]] virtual std::shared_ptr<io::sirius_io_object_metadata> metadata() const
+  [[nodiscard]] virtual std::shared_ptr<io::io_object_metadata> metadata() const
   {
     return nullptr;
   }
 
   /// Park @p metadata against this file. False when the transport has nowhere to put it.
-  virtual bool store_metadata(std::shared_ptr<io::sirius_io_object_metadata> /*metadata*/)
+  virtual bool store_metadata(std::shared_ptr<io::io_object_metadata> /*metadata*/)
   {
     return false;
   }
@@ -225,6 +225,6 @@ class hpln_source {
 /// @p who names the caller in error messages. Throws std::runtime_error if the file cannot be
 /// opened or its size cannot be resolved.
 [[nodiscard]] std::unique_ptr<hpln_source> open_hpln_source(
-  std::string const& path, std::shared_ptr<io::sirius_ioctx> io_ctx, char const* who);
+  std::string const& path, std::shared_ptr<io::ioctx> io_ctx, char const* who);
 
 }  // namespace sirius
