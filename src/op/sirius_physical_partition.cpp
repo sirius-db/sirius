@@ -247,17 +247,22 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   auto const& input_batch_ro = input_batches[0];
   auto* space                = input_batch_ro.get_memory_space();
 
-  // Track actual input for the final projection-error report.
-  if (input_batch_ro.get_data()) {
-    _actual_bytes.fetch_add(input_batch_ro.get_data()->get_size_in_bytes(),
-                            std::memory_order_relaxed);
-  }
+  auto record_actual_bytes = [&] {
+    // Only successful executions contribute to the final projection-error report. In particular,
+    // an OOM-rescheduled task must not count the same input once for every attempt.
+    if (_enable_size_estimation && input_batch_ro.get_data()) {
+      _actual_bytes.fetch_add(input_batch_ro.get_data()->get_size_in_bytes(),
+                              std::memory_order_relaxed);
+    }
+  };
 
   // Broadcast mode never hash-partitions: the build side replicates its (small) batch to every
   // slot and the probe side streams through unpartitioned. In both cases execute() just forwards
   // the input batches; the fan-out to slots happens in sink().
   if (_broadcast || _num_partitions.value() < 2 || _partition_keys.empty()) {
-    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    auto result = std::make_unique<pipelineable_operator_data>(input.get_data_batches());
+    record_actual_bytes();
+    return result;
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -310,7 +315,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
-  return std::make_unique<pipelineable_operator_data>(partitioned_results);
+  auto result = std::make_unique<pipelineable_operator_data>(partitioned_results);
+  record_actual_bytes();
+  return result;
 }
 
 void sirius_physical_partition::sink(const operator_data& input_data, ::cuda::stream_ref stream)
