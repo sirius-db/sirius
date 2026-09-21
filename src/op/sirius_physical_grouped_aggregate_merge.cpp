@@ -199,7 +199,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -211,7 +211,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   // Fast path: single batch with no post-processing needed
   if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
   // Merge multiple batches, or use single batch directly if only one

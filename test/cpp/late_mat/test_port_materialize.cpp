@@ -29,9 +29,9 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -58,7 +58,7 @@ struct fake_entry {
   pinned_entry entry;
   std::shared_ptr<pin_entry_handle> handle;
 
-  fake_entry(std::vector<std::int64_t> const& batch_rows, rmm::cuda_stream_view stream)
+  fake_entry(std::vector<std::int64_t> const& batch_rows, ::cuda::stream_ref stream)
   {
     entry.tier = cucascade::memory::Tier::GPU;
     for (auto const& name : {std::string{"c_name"}, std::string{"c_address"}}) {
@@ -77,13 +77,13 @@ struct fake_entry {
                         host.data(),
                         host.size() * sizeof(std::int32_t),
                         cudaMemcpyHostToDevice,
-                        stream.value());
+                        stream.get());
         chunks.push_back(std::shared_ptr<cudf::column>(std::move(col)));
         if (entry.cache_info.names.size() == 1) {
           entry.num_rows += static_cast<std::size_t>(rows);
         }
       }
-      cudaStreamSynchronize(stream.value());
+      cudaStreamSynchronize(stream.get());
       entry.data_batches_by_column.emplace(name, std::move(chunks));
     }
     handle = std::make_shared<pin_entry_handle>("customer", 5);
@@ -103,7 +103,7 @@ struct fake_entry {
 template <typename T>
 std::unique_ptr<cudf::column> upload(std::vector<T> const& host,
                                      cudf::type_id id,
-                                     rmm::cuda_stream_view stream)
+                                     ::cuda::stream_ref stream)
 {
   auto col = cudf::make_numeric_column(cudf::data_type{id},
                                        static_cast<cudf::size_type>(host.size()),
@@ -113,8 +113,8 @@ std::unique_ptr<cudf::column> upload(std::vector<T> const& host,
                   host.data(),
                   host.size() * sizeof(T),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  cudaStreamSynchronize(stream.value());
+                  stream.get());
+  cudaStreamSynchronize(stream.get());
   return col;
 }
 
@@ -134,7 +134,7 @@ std::vector<T> read_back(cudf::column_view const& col)
 /// splice's other half — a column that must come through untouched.
 std::unique_ptr<cudf::table> riding_batch(std::vector<std::uint64_t> const& rowids,
                                           std::vector<std::int32_t> const& payload,
-                                          rmm::cuda_stream_view stream)
+                                          ::cuda::stream_ref stream)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(upload(payload, cudf::type_id::INT32, stream));
@@ -155,7 +155,7 @@ std::vector<cudf::data_type> riding_schema()
 
 TEST_CASE("a rowid becomes its columns again, in the batch's own order", "[late_mat][port]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   auto const mr     = rmm::mr::get_current_device_resource_ref();
   fake_entry pin({300, 150, 200}, stream);
 
@@ -172,7 +172,7 @@ TEST_CASE("a rowid becomes its columns again, in the batch's own order", "[late_
   REQUIRE(port_directive_matches(pair.port, batch->view()));
 
   auto const restored = materialize_at_port(pair.port, batch->view(), stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   REQUIRE(restored->num_columns() == 3);
   REQUIRE(restored->num_rows() == static_cast<cudf::size_type>(rowids.size()));
 
@@ -189,7 +189,7 @@ TEST_CASE("a rowid becomes its columns again, in the batch's own order", "[late_
 
 TEST_CASE("a batch of another shape is declined, not materialized", "[late_mat][port]")
 {
-  auto const stream = rmm::cuda_stream_view{};
+  auto const stream = ::cuda::stream_ref{cudaStream_t{}};
   fake_entry pin({64}, stream);
 
   auto const pair = make_defer_pair(

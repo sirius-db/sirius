@@ -1,0 +1,46 @@
+[
+  {
+    "name": "lineitem",
+    "tier": "gpu"
+  },
+  {
+    "exclude": [
+      "o_comment"
+    ],
+    "name": "orders",
+    "tier": "gpu"
+  },
+  {
+    "cols": [
+      "o_orderkey",
+      "o_custkey",
+      "o_comment"
+    ],
+    "name": "main.orders",
+    "tier": "host"
+  },
+  {
+    "name": "part",
+    "tier": "host"
+  },
+  {
+    "name": "supplier",
+    "tier": "host"
+  },
+  {
+    "name": "partsupp",
+    "tier": "host"
+  },
+  {
+    "name": "nation",
+    "tier": "host"
+  },
+  {
+    "name": "region",
+    "tier": "host"
+  },
+  {
+    "name": "customer",
+    "tier": "host"
+  }
+]

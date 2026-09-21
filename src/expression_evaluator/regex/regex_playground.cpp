@@ -33,7 +33,7 @@ namespace sirius {
 namespace regex {
 
 std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_regex(
-  const cudf::column_view& input, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  const cudf::column_view& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   // libcudf's $ anchor matches before one final LF. Replacing that match retains the unmatched LF,
   // which a string-view transform cannot synthesize after extracting a non-contiguous domain.

@@ -32,8 +32,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <catch.hpp>
@@ -60,7 +59,7 @@ namespace {
 
 /// One INT64 device column holding exactly @p values.
 std::unique_ptr<cudf::column> int64_column(std::vector<std::int64_t> const& values,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
                                        static_cast<cudf::size_type>(values.size()),
@@ -70,14 +69,14 @@ std::unique_ptr<cudf::column> int64_column(std::vector<std::int64_t> const& valu
                   values.data(),
                   values.size() * sizeof(std::int64_t),
                   cudaMemcpyHostToDevice,
-                  stream.value());
-  cudaStreamSynchronize(stream.value());
+                  stream.get());
+  cudaStreamSynchronize(stream.get());
   return col;
 }
 
 /// Feed a one-column probe the given chunks and report whether it proved the column.
 bool proves_single_column(std::vector<std::vector<std::int64_t>> const& chunks,
-                          rmm::cuda_stream_view stream)
+                          ::cuda::stream_ref stream)
 {
   unique_probe probe{std::vector<bool>{true}};
   std::vector<std::unique_ptr<cudf::column>> alive;
@@ -150,7 +149,7 @@ TEST_CASE("the probe selection reads the gate", "[late_mat][pin_uniqueness]")
 TEST_CASE("a key split across chunks in the wrong order is still proven",
           "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   // Emission order is [100..102] then [0..2]: strictly-increasing-boundaries
   // would refuse this, and it is exactly what a lexicographic file glob gives us.
   REQUIRE(proves_single_column({{100, 101, 102}, {0, 1, 2}}, stream));
@@ -175,13 +174,13 @@ TEST_CASE("a key split across chunks in the wrong order is still proven",
 
 TEST_CASE("a duplicate inside one chunk is refused", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   REQUIRE_FALSE(proves_single_column({{1, 2, 2}}, stream));
 }
 
 TEST_CASE("chunks that could share a value are refused", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   // Each chunk is internally distinct, so only the range check can catch this.
   REQUIRE_FALSE(proves_single_column({{1, 2, 3}, {3, 4, 5}}, stream));
   // Overlapping without a shared endpoint: [0,10] and [4,6] — the values happen
@@ -192,7 +191,7 @@ TEST_CASE("chunks that could share a value are refused", "[late_mat][pin_uniquen
 
 TEST_CASE("a single-row chunk repeated is refused", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   // Degenerate ranges [5,5] and [5,5]: both chunks are trivially distinct on
   // their own, and the table is not.
   REQUIRE_FALSE(proves_single_column({{5}, {5}}, stream));
@@ -200,14 +199,14 @@ TEST_CASE("a single-row chunk repeated is refused", "[late_mat][pin_uniqueness]"
 
 TEST_CASE("an empty chunk carries no evidence either way", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   REQUIRE(proves_single_column({{3, 4}, {}, {1, 2}}, stream));
 }
 
 TEST_CASE("nulls are refused; a type the cheap stage cannot judge is only undecided",
           "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 
   {
@@ -237,7 +236,7 @@ TEST_CASE("nulls are refused; a type the cheap stage cannot judge is only undeci
 
 TEST_CASE("an unobserved column is never claimed", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   unique_probe probe{std::vector<bool>{true, false}};
   auto unique_col = int64_column({1, 2, 3}, stream);
   auto other_col  = int64_column({7, 8, 9}, stream);  // also unique, but not selected
@@ -253,7 +252,7 @@ TEST_CASE("undecided is told apart from refused", "[late_mat][pin_uniqueness]")
   // The exact check runs on the undecided ones only, so conflating the two
   // either wastes a sort of a column known to repeat or skips the column the
   // check exists for.
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::unique_verdict;
 
   unique_probe probe{std::vector<bool>{true, true, false}};
@@ -279,7 +278,7 @@ TEST_CASE("undecided is told apart from refused", "[late_mat][pin_uniqueness]")
 
 TEST_CASE("the exact check decides what the range test could not", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   using sirius::late_mat::exact_distinct_over_chunks;
 
   // Overlapping ranges, no shared value — the case a real multi-file pin
@@ -304,7 +303,7 @@ TEST_CASE("the exact check decides what the range test could not", "[late_mat][p
 
 TEST_CASE("a chunk of the wrong width abandons the proof", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   unique_probe probe{std::vector<bool>{true, true}};
   auto col = int64_column({1, 2, 3}, stream);
   std::vector<cudf::column_view> narrow{col->view()};  // one column, selection covers two
@@ -326,7 +325,7 @@ std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
 
 sirius::device_pin_chunk make_chunk(cucascade::memory::memory_space& space,
                                     std::size_t num_columns,
-                                    rmm::cuda_stream_view stream)
+                                    ::cuda::stream_ref stream)
 {
   sirius::device_pin_chunk chunk;
   chunk.memory_space = &space;
@@ -346,7 +345,7 @@ void pin_columns(sirius_scan_manager& manager,
                  cucascade::memory::memory_space& space,
                  std::string const& table,
                  std::vector<std::string> const& names,
-                 rmm::cuda_stream_view stream)
+                 ::cuda::stream_ref stream)
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name = table;
@@ -370,7 +369,7 @@ std::vector<std::string> pin_columns_mergeable(sirius_scan_manager& manager,
                                                cucascade::memory::memory_space& space,
                                                std::string const& table,
                                                std::vector<std::string> const& names,
-                                               rmm::cuda_stream_view stream)
+                                               ::cuda::stream_ref stream)
 {
   sirius::scan_manager::cache_entry_info info;
   info.table_name = table;
@@ -417,7 +416,7 @@ std::vector<bool> proven_of(sirius_scan_manager const& manager, std::string_view
 
 TEST_CASE("the pinned entry records the proof by name", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -439,7 +438,7 @@ TEST_CASE("the pinned entry records the proof by name", "[late_mat][pin_uniquene
 
 TEST_CASE("a replacing re-pin starts with no facts", "[late_mat][pin_uniqueness]")
 {
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);
@@ -464,7 +463,7 @@ TEST_CASE("a merge reports only the columns it actually stored", "[late_mat][pin
   // read, so attaching it to a retained column would assert distinctness about
   // bytes that never entered the cache — and this flag admits a group key. The
   // insert therefore reports what it stored, and the caller filters by it.
-  rmm::cuda_stream_view const stream{};
+  ::cuda::stream_ref const stream{cudaStream_t{}};
   auto memory   = sirius::test::operator_utils::initialize_memory_manager();
   auto topology = single_gpu_index();
   auto* space   = memory->get_memory_space(cucascade::memory::Tier::GPU, 0);

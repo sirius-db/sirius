@@ -51,9 +51,8 @@ void decode_on_current_device(int device)
   auto input = make_int32_table(kNumColumns, kNumRows, 13 + device);
 
   // Keep compression off the internal stream cache.
-  auto compressed =
-    simpatico::compress_with_plan(input->view(), kPlanDsl, serial_stream.view(), mr);
-  serial_stream.synchronize();
+  auto compressed = simpatico::compress_with_plan(input->view(), kPlanDsl, serial_stream, mr);
+  serial_stream.sync();
 
   expect(compressed.num_columns() == static_cast<std::size_t>(kNumColumns),
          (label + ": compressed column count").c_str());

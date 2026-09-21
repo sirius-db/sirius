@@ -167,7 +167,7 @@ static bool null_safe_keys_are_ast_routable(
 
 static cudf::filtered_join make_right_filtered_join(cudf::table_view const& right_keys,
                                                     cudf::null_equality compare_nulls,
-                                                    rmm::cuda_stream_view stream)
+                                                    ::cuda::stream_ref stream)
 {
   return cudf::filtered_join(right_keys, compare_nulls, stream);
 }
@@ -175,9 +175,7 @@ static cudf::filtered_join make_right_filtered_join(cudf::table_view const& righ
 // Heap-allocated variant for BUILD_PROBE mode, where one filtered_join is built once on the right
 // (filter) keys and reused across many streamed left probe batches via semi_join.
 static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
-  cudf::table_view const& right_keys,
-  cudf::null_equality compare_nulls,
-  rmm::cuda_stream_view stream)
+  cudf::table_view const& right_keys, cudf::null_equality compare_nulls, ::cuda::stream_ref stream)
 {
   return std::make_unique<cudf::filtered_join>(right_keys, compare_nulls, stream);
 }
@@ -187,7 +185,7 @@ static std::unique_ptr<cudf::filtered_join> make_right_filtered_join_ptr(
 // right; gated by mark_join_build_switch_ratio at the call site.
 static cudf::mark_join make_left_mark_join(cudf::table_view const& left_keys,
                                            cudf::null_equality compare_nulls,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   return cudf::mark_join(left_keys, compare_nulls, cudf::join_prefilter::NO, stream);
 }
@@ -1396,7 +1394,7 @@ static join_side_keys_result prepare_join_keys(
   bool cast_necessary,
   const std::vector<sirius_physical_hash_join::key_cast_info>& key_casts,
   bool is_left_side,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   join_side_keys_result result;
 
@@ -1464,7 +1462,7 @@ static std::unique_ptr<operator_data> gather_join_output(
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> right_indices,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   bool collect_left =
@@ -1527,7 +1525,7 @@ static std::unique_ptr<operator_data> gather_distinct_left_join_output(
   std::vector<cudf::size_type> const& rhs_col_idxs,
   std::unique_ptr<rmm::device_uvector<cudf::size_type>> build_indices,
   cucascade::memory::memory_space& memory_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   std::vector<std::unique_ptr<cudf::column>> out_cols;
@@ -1583,7 +1581,7 @@ static constexpr cudf::size_type k_distinct_refute_sample_rows = 1024 * 1024;
 /// @note Reads a count back to the host, so it synchronizes the stream.
 static bool build_keys_are_distinct(cudf::table_view const& build_keys,
                                     cudf::null_equality nulls_equal,
-                                    rmm::cuda_stream_view stream)
+                                    ::cuda::stream_ref stream)
 {
   auto const num_rows = build_keys.num_rows();
   if (num_rows == 1) { return true; }
@@ -1663,7 +1661,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   bool build_has_null,
   bool marks_are_definite,
   ::cucascade::read_only_data_batch const& left_batch,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info = {})
 {
   cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
@@ -1733,7 +1731,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
 }
 
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
-                                                                  rmm::cuda_stream_view stream)
+                                                                  ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_hash_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -1846,8 +1844,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         } else {
           slot.hash_table = std::make_unique<cudf::hash_join>(build_keys, compare_nulls(), stream);
         }
-        stream.synchronize();  // Ensure the hash table is fully built before we allow any probe
-                               // batches to proceed.
+        stream.sync();  // Ensure the hash table is fully built before we allow any probe
+                        // batches to proceed.
         slot.build_state.store(BUILD_HASH_TABLE_STATE::BUILT, std::memory_order_release);
       }
     }
@@ -2186,7 +2184,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 }
 
 void sirius_physical_hash_join::publish_dynamic_filters(cudf::table_view const& build_view,
-                                                        rmm::cuda_stream_view stream)
+                                                        ::cuda::stream_ref stream)
 {
   // The delivery hook owns the PUBLISHING claim until this function sets a terminal state.
   D_ASSERT(_dynamic_filter_publication_state.load(std::memory_order_acquire) ==

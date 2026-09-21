@@ -110,13 +110,14 @@ struct epoch_fixture {
               cudf::size_type n_rows,
               std::size_t n_table_columns)
   {
-    manager.insert_pinned_entry(kTable,
-                                make_cache_info(primary_indices),
-                                one_chunk(n_table_columns, n_rows),
-                                std::vector<cucascade::memory::memory_space*>{space},
-                                {},
-                                {},
-                                storage_for(primary_indices.size()));
+    static_cast<void>(
+      manager.insert_pinned_entry(kTable,
+                                  make_cache_info(primary_indices),
+                                  one_chunk(n_table_columns, n_rows),
+                                  std::vector<cucascade::memory::memory_space*>{space},
+                                  {},
+                                  {},
+                                  storage_for(primary_indices.size())));
   }
 
   [[nodiscard]] std::uint64_t epoch() const { return manager.pin_registry_epoch(); }

@@ -54,7 +54,13 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 
 echo "Generating $NUM_SETS TPC-H update set(s) at SF$SF -> $OUTPUT_DIR"
 # dbgen resolves dists.dss relative to cwd; DSS_PATH redirects the output files.
-(cd "$DBGEN_DIR" && DSS_PATH="$OUTPUT_DIR" ./dbgen -f -q -s "$SF" -U "$NUM_SETS")
+# dbgen builds each output path into a 128-byte stack buffer (print.c: char
+# upath[128]), so a long OUTPUT_DIR (e.g. under a git worktree) is a buffer
+# overflow and an abort. Generate into a short scratch dir and move the files.
+SCRATCH_DIR="$(mktemp -d /tmp/tpch_rf.XXXXXX)"
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+(cd "$DBGEN_DIR" && DSS_PATH="$SCRATCH_DIR" ./dbgen -f -q -s "$SF" -U "$NUM_SETS")
+mv "$SCRATCH_DIR"/* "$OUTPUT_DIR/"
 
 STATUS=0
 for ((n = 1; n <= NUM_SETS; n++)); do

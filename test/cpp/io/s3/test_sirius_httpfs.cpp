@@ -447,9 +447,9 @@ TEST_CASE("S3 object URI parsing preserves ordinary keys byte for byte", "[s3][f
 TEST_CASE("S3 literal-key implementation contains no retired URI escape or percent guard",
           "[s3][filesystem][glob]")
 {
-  auto const root   = fs::path{SIRIUS_PROJECT_ROOT};
-  auto const source = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
-  auto const header = read_text_file(root / "src" / "include" / "io" / "s3" / "sirius_httpfs.hpp");
+  auto const root           = fs::path{SIRIUS_PROJECT_ROOT};
+  auto const source         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.cpp");
+  auto const header         = read_text_file(root / "src" / "io" / "s3" / "sirius_httpfs.hpp");
   auto const implementation = source + header;
 
   auto const retired_escape  = std::string{"escape_s3_key_"} + "for_uri";
@@ -543,7 +543,7 @@ TEST_CASE("sirius_httpfs opens through FileOpener and reads positional ranges",
   auto datasource = require_rest_datasource(fixture, uri);
   auto const size = handle->GetFileSize();
   REQUIRE(size > 16);
-  CHECK(static_cast<std::size_t>(size) == datasource->io_object().size());
+  CHECK(static_cast<std::size_t>(size) == datasource->get_io_object().size());
   CHECK_FALSE(handle->OnDiskFile());
 
   std::vector<std::uint8_t> fs_bytes(8);

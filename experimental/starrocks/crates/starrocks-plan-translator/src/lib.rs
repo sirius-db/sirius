@@ -131,11 +131,6 @@ pub struct TranslatedPlan {
 }
 
 impl TranslatedPlan {
-    /// Returns a human-readable Substrait text formatter for logging and debugging.
-    pub fn explain(&self) -> PlanExplain<'_> {
-        PlanExplain { plan: &self.plan }
-    }
-
     /// Encodes the Substrait plan to protobuf bytes on demand.
     pub fn to_substrait_bytes(&self) -> Vec<u8> {
         self.plan.encode_to_vec()
@@ -143,37 +138,12 @@ impl TranslatedPlan {
 }
 
 impl fmt::Debug for TranslatedPlan {
-    /// Renders the translated plan using `substrait-explain` instead of protobuf debug output.
+    /// Renders the translated plan using its protobuf debug representation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TranslatedPlan")
             .field("output_names", &self.output_names)
-            .field("plan", &self.explain())
+            .field("plan", &self.plan)
             .finish()
-    }
-}
-
-/// Display/debug adapter for a Substrait plan in explain-text form.
-pub struct PlanExplain<'a> {
-    /// Plan to render with `substrait-explain`.
-    plan: &'a Plan,
-}
-
-impl fmt::Display for PlanExplain<'_> {
-    /// Formats the plan text and appends formatter warnings when present.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (text, warnings) = substrait_explain::format(self.plan);
-        f.write_str(&text)?;
-        if !warnings.is_empty() {
-            write!(f, "\nformat warnings: {warnings:?}")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for PlanExplain<'_> {
-    /// Delegates debug output to the same readable text as display output.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(self, f)
     }
 }
 
