@@ -17,6 +17,7 @@
 #include "io/rest/rest_reactor.hpp"
 
 #include "cucascade/cuda/event.hpp"
+#include "exec/thread_util.hpp"
 #include "io/details/slot_pool.hpp"
 #include "io/rest/curl_handle.hpp"
 #include "io/uri_parser.hpp"
@@ -42,6 +43,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -502,7 +504,7 @@ void rest_reactor::start()
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
   if (!_tname.empty()) {
     std::string const full_name = _tname + "_worker";
-    pthread_setname_np(_worker.native_handle(), full_name.c_str());
+    std::ignore                 = sirius::exec::thread_util::set_thread_name(_worker, full_name);
   }
 }
 

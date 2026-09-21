@@ -17,6 +17,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include "config.hpp"
+#include "cucascade/utils/overloaded.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -40,62 +41,66 @@ namespace op {
 const std::vector<std::shared_ptr<::cucascade::data_batch>>&
 pipelineable_operator_data::get_data_batches() const
 {
-  if (!_data_batches) {
-    if (!_read_only_data_batches) {
-      throw std::runtime_error("pipelineable_operator_data:get_data_batches no data batches");
-    }
-    std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
-    batches.reserve(_read_only_data_batches->size());
-    for (const auto& ro : *_read_only_data_batches) {
-      auto copy = ro;
-      batches.push_back(::cucascade::data_batch::to_idle(std::move(copy)));
-    }
-    _data_batches = std::move(batches);
-  }
-  return *_data_batches;
+  return _data_batches;
 }
 
-std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches(
-  bool leave_locked) const
+std::vector<::cucascade::read_only_data_batch> pipelineable_operator_data::get_read_only_batches()
+  const
 {
-  if (!_read_only_data_batches) {
-    if (!_data_batches) {
-      throw std::runtime_error("pipelineable_operator_data:get_read_only_batches no data batches");
-    }
-    std::vector<::cucascade::read_only_data_batch> ro_batches;
-    ro_batches.reserve(_data_batches->size());
-    for (const auto& batch : *_data_batches) {
-      if (batch) {
-        ro_batches.push_back(batch->to_read_only());
-      } else {
-        SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
-      }
-    }
-    if (leave_locked) {
-      _read_only_data_batches = std::move(ro_batches);
+  if (_read_only_data_batches.has_value()) { return *_read_only_data_batches; }
+
+  std::vector<::cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(_data_batches.size());
+  for (const auto& batch : _data_batches) {
+    if (batch) {
+      ro_batches.push_back(batch->to_read_only());
     } else {
-      return ro_batches;
+      SIRIUS_LOG_WARN("pipelineable_operator_data: null batch encountered, skipping");
     }
   }
-  return *_read_only_data_batches;
+  return ro_batches;
 }
 
 void pipelineable_operator_data::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
   remove_read_only_lock();
-  auto data_batches = get_data_batches();
-  std::vector<::cucascade::read_only_data_batch> ro_batches;
-  ro_batches.reserve(data_batches.size());
 
-  for (const auto& batch : data_batches) {
-    if (!batch) {
+  std::vector<cucascade::read_only_data_batch> ro_batches;
+  ro_batches.reserve(_data_batches.size());
+
+  for (std::shared_ptr<cucascade::data_batch>& batch : _data_batches) {
+    if (not batch) {
       throw sirius::internal_exception(
         "pipelineable_operator_data: null batch encountered during prepare_for_processing");
     }
-    std::optional<::cucascade::read_only_data_batch> ro_batch;
     try {
-      ro_batch = pipeline::lock_or_prepare_batch(batch, requested_memory_space, stream);
+      if (std::optional<pipeline::lock_and_prepare_batch_result> maybe_result =
+            pipeline::lock_and_prepare_batch(batch, requested_memory_space, stream)) {
+        pipeline::lock_and_prepare_batch_result result = *maybe_result;
+
+        std::visit(cucascade::utils::overloaded{
+                     [&ro_batches](pipeline::lock_to_existing_batch& result) {
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                     [&batch, &ro_batches](pipeline::lock_to_new_batch& result) {
+                       // result has returned a read_only accessor to a clone (for the case of
+                       // cross-GPU input/target_mem_space), so the ro_lock accessor here references
+                       // a different batch than `batch` from `_data_batches`. Update the vector so
+                       // _data_batches now holds the new updated batch, upholding the invariant
+                       // that _data_batches[i] is the batch underlying accessor
+                       // _read_only_data_batches[i].
+                       batch = std::move(result.new_batch);
+                       ro_batches.push_back(std::move(result.ro_lock));
+                     },
+                   },
+                   result);
+      } else {
+        throw sirius::internal_exception(
+          "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
+          batch->get_batch_id(),
+          static_cast<int>(batch->get_state()));
+      }
     } catch (const rmm::out_of_memory&) {
       SIRIUS_LOG_ERROR(
         "pipelineable_operator_data: OOM at batch {} preparing for processing, state: {}",
@@ -111,23 +116,8 @@ void pipelineable_operator_data::prepare_for_processing(
         e.what());
       throw;
     }
-    if (!ro_batch) {
-      throw sirius::internal_exception(
-        "pipelineable_operator_data: failed to lock batch {} for processing, state: {}",
-        batch->get_batch_id(),
-        static_cast<int>(batch->get_state()));
-    }
-    ro_batches.emplace_back(std::move(*ro_batch));
   }
-
   _read_only_data_batches = std::move(ro_batches);
-  // lock_or_prepare_batch may have returned an accessor to a clone (cross-GPU inputs), so
-  // accessor i can reference a different batch than _data_batches[i]. Reset the idle vector so
-  // get_data_batches() lazily rebuilds it from the accessors, restoring the invariant that
-  // _data_batches[i] is the batch underlying accessor i. Downstream forwarding (dynamic_filter,
-  // sink) and OOM reschedule (remove_read_only_lock materializes from the accessors) then all
-  // see the prepared batch, not a stale original.
-  _data_batches = std::nullopt;
 }
 
 std::string sirius_physical_operator::get_name() const

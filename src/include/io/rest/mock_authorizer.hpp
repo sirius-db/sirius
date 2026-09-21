@@ -17,7 +17,7 @@
 #pragma once
 
 #include "io/io_errors.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/authorizer.hpp"
 
 #include <atomic>
 #include <chrono>

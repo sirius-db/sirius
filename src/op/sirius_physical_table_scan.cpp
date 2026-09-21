@@ -107,33 +107,37 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                                                                    ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
-  auto& input                  = dynamic_cast<const pipelineable_operator_data&>(input_data);
-  const auto& ro_input_batches = input.get_read_only_batches();
+  auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
+  std::vector<std::shared_ptr<cucascade::data_batch>> input_batches = input.get_data_batches();
 
   // Passthrough inputs arrive with filter and projection already applied upstream, in
   // batches small enough that concatenation is not needed.
   if (passthrough) {
-    return std::make_unique<pipelineable_operator_data>(input.get_read_only_batches());
+    return std::make_unique<pipelineable_operator_data>(input.get_data_batches());
   }
 
-  if (ro_input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
+  if (input_batches.empty()) { return std::make_unique<pipelineable_operator_data>(); }
 
-  // Build the column_ids index → batch position mapping once.
-  // Both filter expression construction and post-filter projection use this.
-  auto batch_column_map = build_batch_column_map(projection_ids, column_ids.size());
-
-  // When multiple small batches were coalesced by get_next_task_input_data(),
-  // concatenate their GPU tables into one to issue fewer, larger kernel launches.
   std::shared_ptr<cucascade::data_batch> single_batch;
-  if (ro_input_batches.size() > 1) {
+  if (input_batches.size() > 1) {
+    // obtain ro locks to get underlying views and concatenate.
+    std::vector<cucascade::read_only_data_batch> ro_input_batches = input.get_read_only_batches();
+
+    if (input_batches.size() != ro_input_batches.size()) {
+      SIRIUS_LOG_WARN(
+        "pipelineable_operator_data: get_data_batches.size() != get_read_only_batches.size()");
+    }
+    // When multiple small batches were coalesced by get_next_task_input_data(),
+    // concatenate their GPU tables into one to issue fewer, larger kernel launches.
     std::vector<cudf::table_view> table_views;
     table_views.reserve(ro_input_batches.size());
+
     cucascade::memory::memory_space* space = nullptr;
-    for (const auto& batch : ro_input_batches) {
-      if (batch.get_data()) {
-        auto& gpu_rep = batch.get_data()->cast<cucascade::gpu_table_representation>();
+    for (const auto& ro_batch : ro_input_batches) {
+      if (const cucascade::idata_representation* data = ro_batch.get_data(); data) {
+        auto& gpu_rep = data->cast<cucascade::gpu_table_representation>();
         table_views.push_back(gpu_rep.get_table_view());
-        if (!space) { space = batch.get_memory_space(); }
+        if (!space) { space = ro_batch.get_memory_space(); }
       }
     }
     if (table_views.size() > 1 && space) {
@@ -148,14 +152,17 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
   }
 
-  // After concatenation (or if only one batch), work with a single batch.
-  // For a concatenated batch (new idle), acquire read lock. For a single input batch, use directly.
-  ::cucascade::read_only_data_batch batch_ref =
-    single_batch ? single_batch->to_read_only() : ro_input_batches[0];
-  if (!batch_ref.get_data()) { return std::make_unique<pipelineable_operator_data>(); }
+  if (not single_batch) {
+    // Only a single input batch exists, or a concatenated batch could not be made.
+    single_batch = std::move(input_batches[0]);
+  }
+
+  // Build the column_ids index → batch position mapping once.
+  // Both filter expression construction and post-filter projection use this.
+  std::vector<std::optional<std::size_t>> batch_column_map =
+    build_batch_column_map(projection_ids, column_ids.size());
 
   // Apply table filters as a GPU expression if present.
-  std::shared_ptr<cucascade::data_batch> output_batch;
   std::unique_ptr<sirius::ast::node> local_filter_expr;
   if (table_filters) {
     auto duckdb_filter = convert_table_filters_to_expression(
@@ -170,29 +177,31 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     }
   }
 
+  std::shared_ptr<cucascade::data_batch> output_batch;
   if (local_filter_expr != nullptr) {
-    sirius::expression_evaluator evaluator(*local_filter_expr,
-                                           cudf::get_current_device_resource_ref(),
-                                           stream,
-                                           strategy_from_config(),
-                                           expression_evaluator::default_min_ast_size,
-                                           like_swar_fastpath_enabled(),
-                                           like_cache());
+    cucascade::read_only_data_batch ro_single_batch = single_batch->to_read_only();
+    if (not ro_single_batch.get_data()) { return std::make_unique<pipelineable_operator_data>(); }
+
+    expression_evaluator evaluator(*local_filter_expr,
+                                   cudf::get_current_device_resource_ref(),
+                                   stream,
+                                   strategy_from_config(),
+                                   expression_evaluator::default_min_ast_size,
+                                   like_swar_fastpath_enabled(),
+                                   like_cache());
     auto filtered_table = evaluator.select(
-      batch_ref.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
-    output_batch = sirius::make_data_batch(
-      std::move(filtered_table), *batch_ref.get_memory_space(), stream, batch_telemetry());
+      ro_single_batch.get_data()->cast<cucascade::gpu_table_representation>().get_table_view());
+    output_batch = make_data_batch(
+      std::move(filtered_table), *ro_single_batch.get_memory_space(), stream, batch_telemetry());
   } else {
-    output_batch = ::cucascade::data_batch::to_idle(std::move(batch_ref));
+    output_batch = single_batch;
   }
 
   // After filtering, project away filter-only columns if the batch has more
   // columns than the operator's output type list expects.
   std::size_t expected_output_columns = types.size();
-
   if (expected_output_columns == 0) {
-    return std::make_unique<pipelineable_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+    return std::make_unique<pipelineable_operator_data>(std::vector{std::move(output_batch)});
   }
 
   // Read batch column count under read-only lock, then release lock before mutation

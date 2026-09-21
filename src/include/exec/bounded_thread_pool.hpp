@@ -16,9 +16,9 @@
 
 #pragma once
 
+#include "exec/invocable.hpp"
+#include "exec/thread_util.hpp"
 #include "log/logging.hpp"
-
-#include <absl/functional/any_invocable.h>
 
 #include <condition_variable>
 #include <latch>
@@ -26,6 +26,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -91,18 +92,12 @@ class bounded_thread_pool {
   };
 
   explicit bounded_thread_pool(int capacity,
-                               const std::string& name                             = "btp",
-                               std::vector<int> cpu_ids                            = {},
-                               absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
+                               const std::string& name                                  = "btp",
+                               std::vector<int> cpu_ids                                 = {},
+                               sirius::exec::invocable<void() noexcept> per_thread_init = nullptr)
     : capacity_(capacity)
   {
     threads_.reserve(capacity);
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    for (int id : cpu_ids) {
-      CPU_SET(id, &cpuset);
-    }
 
     std::unique_ptr<std::latch> init_latch;
     if (per_thread_init) { init_latch = std::make_unique<std::latch>(capacity); }
@@ -119,10 +114,10 @@ class bounded_thread_pool {
         work_loop();
       });
       if (!name.empty()) {
-        pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
+        std::ignore = sirius::exec::thread_util::set_thread_name(t, name + "_" + std::to_string(i));
       }
       if (!cpu_ids.empty()) {
-        pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+        std::ignore = sirius::exec::thread_util::set_thread_affinity(t, cpu_ids);
       }
     }
 
@@ -202,7 +197,7 @@ class bounded_thread_pool {
    * Consumes the slot (it becomes invalid). The function runs on a worker thread;
    * the slot is released automatically when the task completes.
    */
-  void dispatch(slot&& s, absl::AnyInvocable<void()> fn)
+  void dispatch(slot&& s, sirius::exec::invocable<void()> fn)
   {
     if (not s) { return; }
     {
@@ -240,7 +235,7 @@ class bounded_thread_pool {
   void work_loop()
   {
     while (true) {
-      absl::AnyInvocable<void() noexcept> fn;
+      sirius::exec::invocable<void() noexcept> fn;
       {
         std::unique_lock lock(mu_);
         cv_work_.wait(lock, [&] { return !work_queue_.empty() || stop_requested_; });
@@ -263,7 +258,7 @@ class bounded_thread_pool {
   bool interrupted_{false};
   bool stop_requested_{false};
 
-  std::queue<absl::AnyInvocable<void() noexcept>> work_queue_;
+  std::queue<sirius::exec::invocable<void() noexcept>> work_queue_;
   std::vector<std::thread> threads_;
 };
 

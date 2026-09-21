@@ -65,7 +65,7 @@ struct file_descriptor {
 };
 
 // ---------------------------------------------------------------------------
-// sirius_io_object
+// io_object
 // ---------------------------------------------------------------------------
 
 /**
@@ -78,9 +78,9 @@ struct file_descriptor {
  * @c shared_from_this() — this enforces at call sites that every io_object
  * passed in is already owned by a @c std::shared_ptr.
  */
-class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
+class io_object : public std::enable_shared_from_this<io_object> {
  public:
-  virtual ~sirius_io_object() = default;
+  virtual ~io_object() = default;
 
   /// Stable identifier used as the prefetching-cache key.  Often equal to
   /// @c object_path() but may differ for backends that need to distinguish
@@ -99,12 +99,12 @@ class sirius_io_object : public std::enable_shared_from_this<sirius_io_object> {
   /// Consumers compare it only for equality against a tag they captured
   /// earlier; an empty tag disables validation-based caching above —
   /// degraded performance, never wrong bytes.
-  [[nodiscard]] virtual std::string_view validation_etag() const noexcept { return {}; }
+  [[nodiscard]] virtual std::string_view validation_tag() const noexcept { return {}; }
 };
 
-class sirius_io_object_metadata {
+class io_object_metadata {
  public:
-  virtual ~sirius_io_object_metadata() = default;
+  virtual ~io_object_metadata() = default;
 };
 
 /// A read of @c size bytes starting at file @c offset, scattered into one or

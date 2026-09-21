@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1715,6 +1716,7 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
+  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
   context_ = std::move(context);

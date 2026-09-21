@@ -257,11 +257,6 @@ class pipelineable_operator_data : public operator_data {
     : _data_batches(std::move(data_batches))
   {
   }
-  explicit pipelineable_operator_data(
-    std::vector<::cucascade::read_only_data_batch> read_only_data_batches)
-    : _read_only_data_batches(std::move(read_only_data_batches))
-  {
-  }
 
   [[nodiscard]] operator_data_type get_type() const override
   {
@@ -275,10 +270,10 @@ class pipelineable_operator_data : public operator_data {
     const;
 
   /**
-   * @brief Get read-only locked batches, lazily populating from idle batches if needed.
+   * @brief Get read-only accessors for the batches. Returns the pin locks acquired by
+   * prepare_for_processing if present, otherwise transient read locks built from the idle batches.
    */
-  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches(
-    bool leave_locked = false) const;
+  [[nodiscard]] std::vector<::cucascade::read_only_data_batch> get_read_only_batches() const;
 
   /**
    * @brief Release all read-only locks by resetting _read_only_data_batches.
@@ -286,9 +281,6 @@ class pipelineable_operator_data : public operator_data {
   void remove_read_only_lock()
   {
     // Releasing the lock means getting rid of any _read_only_data_batches that we may have cached.
-    // But we want to make sure we do keep the data alive. So we ensure that the data_batches are
-    // populated.
-    if (!_data_batches) { auto _ = get_data_batches(); }
     _read_only_data_batches = std::nullopt;
   }
 
@@ -305,7 +297,7 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override
   {
     std::size_t total = 0;
-    auto ro_batches   = get_read_only_batches(false);
+    auto ro_batches   = get_read_only_batches();
     for (auto const& ro : ro_batches) {
       if (!ro.get_data()) { continue; }
       total = memory::saturating_add(total, ro.get_data()->get_uncompressed_data_size_in_bytes());
@@ -316,7 +308,7 @@ class pipelineable_operator_data : public operator_data {
   [[nodiscard]] std::string get_origin_tiers() const override
   {
     std::array<bool, static_cast<std::size_t>(::cucascade::memory::Tier::SIZE)> present{};
-    for (auto const& ro : get_read_only_batches(false)) {
+    for (auto const& ro : get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
       auto tier = static_cast<std::size_t>(ro.get_current_tier());
       if (tier < present.size()) { present[tier] = true; }
@@ -331,8 +323,8 @@ class pipelineable_operator_data : public operator_data {
   }
 
  private:
-  mutable std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> _data_batches;
-  mutable std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+  std::optional<std::vector<::cucascade::read_only_data_batch>> _read_only_data_batches;
 };
 
 /**

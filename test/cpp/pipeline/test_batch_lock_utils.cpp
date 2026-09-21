@@ -278,16 +278,19 @@ TEST_CASE("lock_or_prepare_batch cross-GPU returns a clone and leaves the source
       column_values_to_host<int64_t>(sirius::get_cudf_table_view(ro).column(0), stream);
   }
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
+  std::optional<sirius::pipeline::lock_and_prepare_batch_result> prepared =
+    sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream);
   REQUIRE(prepared.has_value());
 
   // The returned accessor references a NEW batch in the target space.
-  REQUIRE(prepared->get_batch_id() != source_id);
-  REQUIRE(prepared->get_memory_space() != nullptr);
-  REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
-  REQUIRE(prepared->get_data()->get_size_in_bytes() == source_bytes);
-  auto clone_values =
-    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream);
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_new_batch>(*prepared));
+  auto new_batch_and_lock = std::get<sirius::pipeline::lock_to_new_batch>(*prepared);
+  REQUIRE(new_batch_and_lock.ro_lock.get_batch_id() != source_id);
+  REQUIRE(new_batch_and_lock.ro_lock.get_memory_space() != nullptr);
+  REQUIRE(new_batch_and_lock.ro_lock.get_memory_space()->get_id() == f.gpu1->get_id());
+  REQUIRE(new_batch_and_lock.ro_lock.get_data()->get_size_in_bytes() == source_bytes);
+  auto clone_values = column_values_to_host<int64_t>(
+    sirius::get_cudf_table_view(new_batch_and_lock.ro_lock).column(0), stream);
   REQUIRE(clone_values == source_values);
 
   // The source was never moved or mutated: still on gpu0, and back to idle (readable /
@@ -317,7 +320,7 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
   auto reader = std::make_optional(batch->to_read_only());
 
   auto fut                               = std::async(std::launch::async, [&]() {
-    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream);
   });
   const auto status                      = fut.wait_for(std::chrono::seconds(120));
   const bool completed_while_reader_held = (status == std::future_status::ready);
@@ -328,9 +331,13 @@ TEST_CASE("lock_or_prepare_batch cross-GPU does not block on concurrent readers"
   REQUIRE(completed_while_reader_held);
 
   auto prepared = fut.get();
+
   REQUIRE(prepared.has_value());
-  REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
-  REQUIRE(prepared->get_batch_id() != batch->get_batch_id());
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_new_batch>(*prepared));
+  auto new_batch_and_lock = std::get<sirius::pipeline::lock_to_new_batch>(*prepared);
+
+  REQUIRE(new_batch_and_lock.ro_lock.get_memory_space()->get_id() == f.gpu1->get_id());
+  REQUIRE(new_batch_and_lock.ro_lock.get_batch_id() != batch->get_batch_id());
 }
 
 TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock_utils]")
@@ -354,19 +361,22 @@ TEST_CASE("lock_or_prepare_batch host to GPU keeps move semantics", "[batch_lock
   }
   stream.synchronize();
 
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream);
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream);
   REQUIRE(prepared.has_value());
 
   // Same batch object, converted in place: identical id, source object now GPU-resident and
   // read-locked by the returned accessor (no clone was made).
-  REQUIRE(prepared->get_batch_id() == source_id);
-  REQUIRE(prepared->get_current_tier() == cucascade::memory::Tier::GPU);
-  REQUIRE(prepared->get_memory_space()->get_id() == f.gpu0->get_id());
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+  auto lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+
+  REQUIRE(lock.ro_lock.get_batch_id() == source_id);
+  REQUIRE(lock.ro_lock.get_current_tier() == cucascade::memory::Tier::GPU);
+  REQUIRE(lock.ro_lock.get_memory_space()->get_id() == f.gpu0->get_id());
   REQUIRE(batch->get_state() == cucascade::batch_state::read_only);
 
   // Data integrity across the spill + upgrade round trip.
   auto upgraded_values =
-    column_values_to_host<int64_t>(sirius::get_cudf_table_view(*prepared).column(0), stream);
+    column_values_to_host<int64_t>(sirius::get_cudf_table_view(lock.ro_lock).column(0), stream);
   REQUIRE(upgraded_values == source_values);
 }
 
@@ -384,21 +394,24 @@ TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
   // post-readonly_to_mutable re-dispatch: the exclusive-lock winner converts in place, the
   // loser observes the batch already in the target space and skips the redundant copy.
   auto worker = [&](::cuda::stream_ref sv) {
-    return sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, sv);
+    return sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, sv);
   };
   ::cuda::stream_ref const stream1_ref = stream1;
   ::cuda::stream_ref const stream2_ref = stream2;
   auto fut1                            = std::async(std::launch::async, worker, stream1_ref);
   auto fut2                            = std::async(std::launch::async, worker, stream2_ref);
 
-  auto consume = [&](std::future<std::optional<cucascade::read_only_data_batch>>& fut) {
-    auto prepared = fut.get();
-    REQUIRE(prepared.has_value());
-    REQUIRE(prepared->get_batch_id() == batch->get_batch_id());  // same object, no clone
-    REQUIRE(prepared->get_current_tier() == cucascade::memory::Tier::GPU);
-    REQUIRE(prepared->get_memory_space()->get_id() == f.gpu0->get_id());
-    // prepared's accessor (a shared lock on the batch) is released at scope exit.
-  };
+  auto consume =
+    [&](std::future<std::optional<sirius::pipeline::lock_and_prepare_batch_result>>& fut) {
+      auto prepared = fut.get();
+      REQUIRE(prepared.has_value());
+      REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_existing_batch>(*prepared));
+      auto lock = std::get<sirius::pipeline::lock_to_existing_batch>(*prepared);
+      REQUIRE(lock.ro_lock.get_batch_id() == batch->get_batch_id());  // same object, no clone
+      REQUIRE(lock.ro_lock.get_current_tier() == cucascade::memory::Tier::GPU);
+      REQUIRE(lock.ro_lock.get_memory_space()->get_id() == f.gpu0->get_id());
+      // prepared's accessor (a shared lock on the batch) is released at scope exit.
+    };
 
   // Consume whichever worker finishes first and RELEASE its accessor before waiting on the
   // other: the race loser blocks inside readonly_to_mutable until every shared lock is gone,
@@ -406,8 +419,8 @@ TEST_CASE("concurrent same-GPU upgrades of a shared spilled batch race safely",
   // winner's accessor would deadlock the test (in production the winner's task releases its
   // locks independently).
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-  std::future<std::optional<cucascade::read_only_data_batch>>* first  = nullptr;
-  std::future<std::optional<cucascade::read_only_data_batch>>* second = nullptr;
+  std::future<std::optional<sirius::pipeline::lock_and_prepare_batch_result>>* first  = nullptr;
+  std::future<std::optional<sirius::pipeline::lock_and_prepare_batch_result>>* second = nullptr;
   while (first == nullptr && std::chrono::steady_clock::now() < deadline) {
     if (fut1.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
       first  = &fut1;
@@ -462,7 +475,7 @@ std::shared_ptr<cucascade::data_batch> make_normalized_gpu_list_batch(batch_lock
   }
   stream.sync();
   {
-    auto upgraded = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu0, stream);
+    auto upgraded = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu0, stream);
     REQUIRE(upgraded.has_value());
   }
   return batch;
@@ -502,10 +515,14 @@ TEST_CASE("LIST columns survive a cross-GPU clone with INT32 offsets", "[batch_l
   // Cross-GPU clone of the (normalized) GPU-resident source: the peer copy preserves the
   // source's column types exactly, so the clone's LIST offsets stay INT32 with no fixup on
   // the clone path.
-  auto prepared = sirius::pipeline::lock_or_prepare_batch(batch, f.gpu1, stream);
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, f.gpu1, stream);
   REQUIRE(prepared.has_value());
-  REQUIRE(prepared->get_memory_space()->get_id() == f.gpu1->get_id());
-  cudf::lists_column_view clone_lcv(sirius::get_cudf_table_view(*prepared).column(0));
+  REQUIRE(std::holds_alternative<sirius::pipeline::lock_to_new_batch>(*prepared));
+  auto new_batch_and_lock = std::get<sirius::pipeline::lock_to_new_batch>(*prepared);
+
+  REQUIRE(new_batch_and_lock.ro_lock.get_memory_space()->get_id() == f.gpu1->get_id());
+  cudf::lists_column_view clone_lcv(
+    sirius::get_cudf_table_view(new_batch_and_lock.ro_lock).column(0));
   REQUIRE(clone_lcv.offsets().type().id() == cudf::type_id::INT32);
   REQUIRE(column_values_to_host<int32_t>(clone_lcv.offsets(), stream) ==
           expected_list_offsets(kNumLists));
