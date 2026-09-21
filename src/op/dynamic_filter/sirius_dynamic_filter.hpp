@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/dynamic_filter/dynamic_filter_key_domain.hpp"
 #include "op/dynamic_filter/dynamic_filter_replica_space.hpp"
 
 // libcudf's AST header uses std::variant without including <variant>.
@@ -35,6 +36,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -168,32 +170,72 @@ class sirius_mask_applicable {
   /**
    * @brief Returns `probe.size()` BOOL8 values (`true` keeps), or null for an incompatible probe
    *
-   * A probe whose carrier is a narrowed form of the filter's key type is restored first rather
-   * than declined -- a pinned chunk may store the key narrower than the type the filter was
-   * published with (@ref sirius::op::detail::restore_probe_to).
+   * The membership implementations accept any integer carrier of the key's signedness
+   * (INT8..INT64 for signed keys, UINT8..UINT64 for unsigned) and, for decimal keys, any
+   * fixed-point width at the key's scale (DECIMAL32/64/128), converting per element in-kernel: a
+   * pinned chunk may store the key narrower than the type the filter was published with, and no
+   * consumer should have to materialize a widened copy to probe it. A DATE key accepts
+   * TIMESTAMP_DAYS or its INT8/INT16/INT32 storage carriers; a sub-day timestamp key accepts only
+   * its own unit. String keys accept a STRING probe, fingerprinted in-kernel with the hash the
+   * build side used. `membership_probe_compatible` is the host-side mirror of what a filter
+   * accepts.
+   *
+   * The result is never nullable. A null probe row is written as `false`: admission never routes
+   * a null-safe comparison to a dynamic filter and the authoritative join runs with
+   * `null_equality::UNEQUAL`, so a null key is a definite non-member on either side.
    */
   [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
     cudf::column_view const& probe,
     int device_id,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const = 0;
+
+  /**
+   * @brief Prior-mask-aware variant: rows the prior keep-mask already killed skip the probe
+   *
+   * @p prior_mask_words is packed 1 bit/row over @p probe's rows (bit `row % 32` of word
+   * `row / 32`, 1 = keep), or null for no restriction. A pruning hint only: ignoring it is sound
+   * because every caller ANDs the result with that same mask.
+   */
+  [[nodiscard]] virtual std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const
+  {
+    (void)prior_mask_words;
+    return compute_mask(probe, device_id, stream, mr);
+  }
 };
 
 /**
- * @brief Exact hash membership filter
+ * @brief Hash membership filter: exact for integer keys, no false negatives for string keys
  *
- * The backing set cannot store `numeric_limits<KeyT>::min()`; probes with that value are kept to
- * avoid false negatives.
+ * String keys are stored as 64-bit XXHash_64 fingerprints (see `membership_key_domain`), so two
+ * distinct strings sharing a fingerprint pass a probe the authoritative join then drops. The
+ * backing set reserves one sentinel value it cannot store (`numeric_limits::min()` for signed
+ * reps, `::max()` for unsigned and string fingerprints); probes equal to it are kept to avoid
+ * false negatives. Null build keys are compacted out (they match nothing under the join's
+ * `null_equality::UNEQUAL`).
  */
 class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
                                             public sirius_mask_applicable,
                                             public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a persistent set from null-free INT32 or INT64 keys
+   * @brief Builds a persistent set from keys of a supported type (see
+   * `membership_key_supported`), excluding nulls
+   *
+   * The set is typed at the key's rep: a build column arriving at a narrowed carrier (INT8/INT16,
+   * UINT8/UINT16, DECIMAL32 for a DECIMAL64 key) widens per element into a 32-bit set; a temporal
+   * column is read through its integer storage (int32 epoch days, int64 ticks); a DECIMAL128
+   * column narrows into the int64 set once `membership_build_fits_rep` has verified it; a STRING
+   * build column is hashed once into a UINT64 fingerprint set. `size()` reports the valid keys
+   * stored.
    *
    * @pre The backing storage for @p keys remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    */
@@ -214,18 +256,27 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] bool has_persistent_set() const noexcept;
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
+  /// Baseline footprint of a set over @p num_keys keys of @p key_type, sized at the key's rep.
   [[nodiscard]] static std::size_t estimated_set_bytes(std::size_t num_keys,
                                                        cudf::data_type key_type) noexcept;
 
  private:
-  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
   struct set_impl;
@@ -233,7 +284,12 @@ class sirius_dynamic_in_list_filter final : public sirius_dynamic_filter,
 };
 
 /**
- * @brief Exact linear membership over a small, null-free INT32 or INT64 set
+ * @brief Linear membership over a small key set of a supported type
+ *
+ * Needles are stored at the key's rep (see `membership_key_domain`): integer, temporal, and
+ * decimal needles compare exactly; string needles are 64-bit fingerprints compared against the
+ * probe's in-kernel fingerprint, so the filter has no false negatives rather than being exact.
+ * Null build keys are compacted out; `supports()` and `size()` count the valid keys.
  */
 class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
                                                   public sirius_mask_applicable,
@@ -245,7 +301,7 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
    * @brief Copies a small build-key set into device-local storage
    *
    * @pre The backing storage for @p keys remains valid until the copy on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    */
   sirius_dynamic_small_in_list_filter(cudf::column_view const& keys,
@@ -271,15 +327,23 @@ class sirius_dynamic_small_in_list_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept { return _num_keys; }
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::column_view const& keys) noexcept;
 
  private:
-  cudf::data_type _key_type{cudf::type_id::EMPTY};
+  membership_key_domain _domain{};
   std::size_t _num_keys = 0;
 
   struct needle_store;
@@ -296,10 +360,11 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
                                           public sirius_device_replicable {
  public:
   /**
-   * @brief Builds a Bloom filter from INT32 or INT64 keys, excluding nulls
+   * @brief Builds a Bloom filter from keys of a supported type (see `membership_key_supported`),
+   * excluding nulls
    *
    * @pre Key storage remains valid until work enqueued on @p stream completes.
-   * @throw std::invalid_argument if @p keys is unsupported
+   * @throw std::invalid_argument if @p keys is unsupported or its values do not fit the key rep
    * @throw std::runtime_error if the current CUDA device cannot be identified
    * @throw std::logic_error if the validated key type changes during construction
    */
@@ -322,14 +387,23 @@ class sirius_dynamic_bloom_filter final : public sirius_dynamic_filter,
     ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const override;
 
+  [[nodiscard]] std::unique_ptr<cudf::column> compute_mask(
+    cudf::column_view const& probe,
+    std::uint32_t const* prior_mask_words,
+    int device_id,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const override;
+
   void replicate_to_devices(std::span<dynamic_filter_replica_space const> spaces) override;
   [[nodiscard]] bool is_available_on_device(int device_id) const noexcept override;
 
   [[nodiscard]] std::size_t replica_count() const noexcept;
+  [[nodiscard]] membership_key_domain const& domain() const noexcept { return _domain; }
   [[nodiscard]] static bool supports(cudf::data_type t) noexcept;
   [[nodiscard]] static std::size_t estimated_bytes(std::size_t num_keys) noexcept;
 
  private:
+  membership_key_domain _domain{};
   struct impl;
   std::unique_ptr<impl> _impl;
 };

@@ -820,7 +820,7 @@ TEST_CASE("sirius_dynamic_small_in_list_filter: kind, size, capabilities, and su
   auto f64 =
     make_values_table<double>({0.0, 1.0, 2.0}, cudf::data_type{cudf::type_id::FLOAT64}, stream);
 
-  // supports() gate: 1..k_max_keys keys, INT32/INT64, no nulls.
+  // supports() gate: 1..k_max_keys *valid* integer keys; the all-null column has none.
   REQUIRE(F::supports(one_i32->view()));
   REQUIRE(F::supports(max_i32->view()));
   REQUIRE_FALSE(F::supports(empty_i32->view()));
