@@ -73,8 +73,7 @@ else()
   )
 endif()
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
-                    ${_SIMPATICO_INCLUDE_DIRS})
+include_directories(${_SIMPATICO_INCLUDE_DIRS})
 
 add_compile_definitions(LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
@@ -91,12 +90,12 @@ add_custom_command(
   OUTPUT "${EMBED_JIT_HEADERS_OUT}"
   COMMAND
     ${CMAKE_COMMAND}
-    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+    "-DIN_STDINT=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+    "-DIN_RLE=${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
     "-DOUT=${EMBED_JIT_HEADERS_OUT}" -P
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/stdint_shim.hpp"
-          "${CMAKE_CURRENT_SOURCE_DIR}/include/codegen/decode/rle_block.cuh"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
@@ -177,12 +176,13 @@ if(NOT DEFINED SIRIUS_NVTX_DOMAIN_NAME)
   set(SIRIUS_NVTX_DOMAIN_NAME "sirius")
 endif()
 target_compile_definitions(
-  simpatico PUBLIC SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
+  simpatico PUBLIC CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER
+                   SIRIUS_NVTX_DOMAIN_NAME="${SIRIUS_NVTX_DOMAIN_NAME}")
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
   simpatico
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
           "${CMAKE_CURRENT_BINARY_DIR}/generated" "${CUDA_TOOLKIT_INCLUDE}"
           "${CUDA_CCCL_INCLUDE}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC

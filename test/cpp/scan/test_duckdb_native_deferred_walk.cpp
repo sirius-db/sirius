@@ -265,9 +265,8 @@ TEST_CASE("deferred walk: split claims see the walk's row-group count",
   // Claims are counted, never executed, so a null ioctx resolver is fine.
   auto count_claims = [](duckdb_native_gpu_ingestible& ing) {
     std::size_t n = 0;
-    while (
-      auto task = ing.next_split_provider(
-        [](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return nullptr; })) {
+    while (auto task = ing.next_split_provider(
+             [](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return nullptr; })) {
       ++n;
     }
     return n;

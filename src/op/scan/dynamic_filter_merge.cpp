@@ -62,7 +62,7 @@ cudf::ast::expression const* merge_dynamic_filters_into_ast(
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
   int device_id)
@@ -143,7 +143,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
       }
     }
   } catch (...) {
-    if (submitted) { stream.synchronize(); }
+    if (submitted) { stream.sync(); }
     throw;
   }
 
@@ -228,7 +228,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& snapshot,
   dynamic_filter_gate& gate,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   int device_id)
 {

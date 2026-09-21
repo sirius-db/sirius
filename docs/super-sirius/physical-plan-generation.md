@@ -88,7 +88,7 @@ Composition substitutes each outer select-list reference (`#i`) with a clone of 
 
 ### `sirius_pipeline`
 
-**File:** `src/include/pipeline/sirius_pipeline.hpp`
+**File:** `src/pipeline/sirius_pipeline.hpp`
 
 A pipeline is an ordered list of operators:
 
@@ -114,7 +114,7 @@ Key methods:
 
 ### `sirius_meta_pipeline`
 
-**File:** `src/include/pipeline/sirius_meta_pipeline.hpp`
+**File:** `src/pipeline/sirius_meta_pipeline.hpp`
 
 Groups pipelines that share the same sink operator. Manages inter-pipeline dependencies and build order.
 
@@ -132,7 +132,7 @@ Build order rules:
 
 ### `sirius_pipeline_build_state`
 
-**File:** `src/include/pipeline/sirius_pipeline_build_state.hpp`
+**File:** `src/pipeline/sirius_pipeline_build_state.hpp`
 
 Provides controlled write access to pipeline internals during construction:
 - `set_pipeline_source()` / `set_pipeline_sink()` — assign source/sink operators

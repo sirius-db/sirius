@@ -168,7 +168,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
-                                                               rmm::cuda_stream_view stream)
+                                                               ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
@@ -195,9 +195,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
   if (input_batches.size() == 1) {
-    auto copy   = input_batches[0];
-    auto output = cucascade::data_batch::to_idle(std::move(copy));
-    output_batches.push_back(std::move(output));
+    // Forward the owned input batch (idle at park); no read lock carried.
+    output_batches.push_back(partitioned_input_data->get_data_batches()[0]);
   } else {
     auto merged_batch = gpu_merge_impl::concat(input_batches, stream, *space, batch_telemetry());
     output_batches.push_back(std::move(merged_batch));
@@ -205,7 +204,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
-void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+void sirius_physical_concat::sink(const operator_data& output_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);

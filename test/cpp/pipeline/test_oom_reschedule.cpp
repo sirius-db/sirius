@@ -138,12 +138,12 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  std::unique_ptr<sirius::op::operator_data> compute_task(rmm::cuda_stream_view) override
+  std::unique_ptr<sirius::op::operator_data> compute_task(::cuda::stream_ref) override
   {
     return nullptr;
   }
 
-  void publish_output(sirius::op::operator_data&, rmm::cuda_stream_view) override {}
+  void publish_output(sirius::op::operator_data&, ::cuda::stream_ref) override {}
 
   sirius::pipeline::reservation_size_info get_estimated_reservation_size_info(
     const cucascade::memory::memory_space* /*target_space*/) const override
@@ -159,10 +159,9 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   // RAII guard that resets the stream reservation on destruction.
   struct allocator_guard {
     cucascade::memory::reservation_aware_resource_adaptor* allocator;
-    rmm::cuda_stream_view stream;
+    ::cuda::stream_ref stream{cudaStream_t{}};
 
-    allocator_guard(cucascade::memory::reservation_aware_resource_adaptor* a,
-                    rmm::cuda_stream_view s)
+    allocator_guard(cucascade::memory::reservation_aware_resource_adaptor* a, ::cuda::stream_ref s)
       : allocator(a), stream(s)
     {
     }
@@ -177,7 +176,7 @@ class oom_test_task_base : public sirius::pipeline::gpu_pipeline_task {
   // Performs the common reservation → allocator → attach → cleanup setup.
   // Returns the allocator guard on success, or nullptr on failure (after
   // recording an error on global_state).
-  std::unique_ptr<allocator_guard> setup_allocator(rmm::cuda_stream_view stream,
+  std::unique_ptr<allocator_guard> setup_allocator(::cuda::stream_ref stream,
                                                    const std::string& task_label)
   {
     auto& global = _global_state->cast<oom_test_global_state>();
@@ -220,7 +219,7 @@ class oom_test_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
     auto& local  = _local_state->cast<sirius::pipeline::gpu_pipeline_task_local_state>();
@@ -270,7 +269,7 @@ class small_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
 
@@ -307,7 +306,7 @@ class xl_task : public oom_test_task_base {
  public:
   using oom_test_task_base::oom_test_task_base;
 
-  void execute(rmm::cuda_stream_view stream) override
+  void execute(::cuda::stream_ref stream) override
   {
     auto& global = _global_state->cast<oom_test_global_state>();
     auto& local  = _local_state->cast<sirius::pipeline::gpu_pipeline_task_local_state>();

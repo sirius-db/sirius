@@ -55,7 +55,7 @@ struct test_env {
   {
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 test_env& env()
@@ -69,7 +69,7 @@ class dummy_task_local_state : public sirius::parallel::itask_local_state {};
 class dummy_task : public sirius::parallel::itask {
  public:
   dummy_task() : itask(0, std::make_unique<dummy_task_local_state>(), nullptr) {}
-  void execute(rmm::cuda_stream_view /*stream*/) override {}
+  void execute(::cuda::stream_ref /*stream*/) override {}
 };
 
 /// Trivial index-keys extractor: puts every task in one priority level, which

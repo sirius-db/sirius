@@ -211,7 +211,7 @@ void combine_masks_and(uint32_t* dst_words,
                        uint32_t const* const* src_words,
                        int num_srcs,
                        int64_t num_words,
-                       rmm::cuda_stream_view stream)
+                       ::cuda::stream_ref stream)
 {
   if (num_srcs < 1 || num_srcs > 8)
     throw std::runtime_error("selection_wave: combine_masks_and needs 1..8 sources");
@@ -222,13 +222,13 @@ void combine_masks_and(uint32_t* dst_words,
   for (int s = 0; s < num_srcs; ++s)
     srcs.p[s] = src_words[s];
   int64_t const num_quads = num_words / 4;
-  mask_and_combine_kernel<<<grid_for(num_quads, kBlock), kBlock, 0, stream.value()>>>(
+  mask_and_combine_kernel<<<grid_for(num_quads, kBlock), kBlock, 0, stream.get()>>>(
     dst_words, srcs, num_srcs, num_quads);
   throw_on_cuda(cudaPeekAtLastError(), "mask_and_combine launch");
 }
 
 int64_t run_selection_cnt(selection_mask& mask,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr)
 {
   if (mask.words == nullptr || mask.chunk_offsets == nullptr || mask.num_rows <= 0)
@@ -241,7 +241,7 @@ int64_t run_selection_cnt(selection_mask& mask,
   auto* counts = static_cast<uint32_t*>(counts_buf.data());
 
   int const warps_per_block = kBlock / 32;
-  chunk_popcount_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.value()>>>(
+  chunk_popcount_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.get()>>>(
     mask.words, nc, counts);
   throw_on_cuda(cudaPeekAtLastError(), "chunk_popcount launch");
 
@@ -249,14 +249,14 @@ int64_t run_selection_cnt(selection_mask& mask,
   std::size_t tmp_bytes = 0;
   throw_on_cuda(
     cub::DeviceScan::ExclusiveSum(
-      nullptr, tmp_bytes, counts, mask.chunk_offsets, static_cast<int>(nc), stream.value()),
+      nullptr, tmp_bytes, counts, mask.chunk_offsets, static_cast<int>(nc), stream.get()),
     "chunk_offsets scan probe");
   rmm::device_buffer tmp(tmp_bytes, stream, mr);
   throw_on_cuda(
     cub::DeviceScan::ExclusiveSum(
-      tmp.data(), tmp_bytes, counts, mask.chunk_offsets, static_cast<int>(nc), stream.value()),
+      tmp.data(), tmp_bytes, counts, mask.chunk_offsets, static_cast<int>(nc), stream.get()),
     "chunk_offsets scan");
-  chunk_offsets_tail_kernel<<<1, 1, 0, stream.value()>>>(counts, nc, mask.chunk_offsets);
+  chunk_offsets_tail_kernel<<<1, 1, 0, stream.get()>>>(counts, nc, mask.chunk_offsets);
   throw_on_cuda(cudaPeekAtLastError(), "chunk_offsets tail launch");
 
   // The one host sync of the selection wave: survivor_count gates wave-2
@@ -264,9 +264,9 @@ int64_t run_selection_cnt(selection_mask& mask,
   uint32_t total = 0;
   throw_on_cuda(
     cudaMemcpyAsync(
-      &total, mask.chunk_offsets + nc, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream.value()),
+      &total, mask.chunk_offsets + nc, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream.get()),
     "survivor_count D2H");
-  throw_on_cuda(cudaStreamSynchronize(stream.value()), "survivor_count sync");
+  throw_on_cuda(cudaStreamSynchronize(stream.get()), "survivor_count sync");
 
   mask.survivor_count = static_cast<int64_t>(total);
   return mask.survivor_count;
@@ -275,13 +275,13 @@ int64_t run_selection_cnt(selection_mask& mask,
 void mask_from_bool8(uint8_t const* flags,
                      int64_t num_rows,
                      uint32_t* mask_words,
-                     rmm::cuda_stream_view stream)
+                     ::cuda::stream_ref stream)
 {
   if (flags == nullptr || mask_words == nullptr || num_rows <= 0)
     throw std::runtime_error("selection_wave: mask_from_bool8 on unbound buffers");
   int64_t const num_words   = selection_mask::WordsFor(num_rows);
   int const warps_per_block = kBlock / 32;
-  mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.value()>>>(
+  mask_from_bool8_kernel<<<grid_for(num_words, warps_per_block), kBlock, 0, stream.get()>>>(
     flags, num_rows, num_words, mask_words);
   throw_on_cuda(cudaPeekAtLastError(), "mask_from_bool8 launch");
 }
@@ -307,14 +307,14 @@ int64_t count_touched_chunks(uint32_t const* chunk_offsets, int64_t num_chunks)
 
 void mask_to_row_indices(selection_mask const& mask,
                          int32_t* out_indices,
-                         rmm::cuda_stream_view stream)
+                         ::cuda::stream_ref stream)
 {
   if (mask.survivor_count < 0 || mask.chunk_offsets == nullptr)
     throw std::runtime_error("selection_wave: mask_to_row_indices before CNT ran");
   if (mask.survivor_count == 0) return;
   int64_t const nc          = selection_mask::ChunksFor(mask.num_rows);
   int const warps_per_block = kBlock / 32;
-  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.value()>>>(
+  mask_to_indices_kernel<<<grid_for(nc, warps_per_block), kBlock, 0, stream.get()>>>(
     mask.words, mask.chunk_offsets, nc, out_indices);
   throw_on_cuda(cudaPeekAtLastError(), "mask_to_indices launch");
 }

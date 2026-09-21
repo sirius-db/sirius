@@ -85,8 +85,8 @@ TEST_CASE_METHOD(decode_env,
   std::vector<int64_t> a(800), b(1200);
   std::iota(a.begin(), a.end(), 0);
   std::iota(b.begin(), b.end(), 800);
-  auto da  = upload(a, stream.view());
-  auto db  = upload(b, stream.view());
+  auto da  = upload(a, stream);
+  auto db  = upload(b, stream);
   auto col = one_codec_column(I64,
                               a.size() + b.size(),
                               CompressionType::COMPRESSION_UNCOMPRESSED,
@@ -105,8 +105,8 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - UNCOMPRESSED with nulls", "[sca
   std::vector<int32_t> values = {10, 20, 30, 40, 50, 60, 70, 80};
   std::vector<bool> valid     = {true, true, false, true, false, false, true, true};
   auto valid_bytes            = pack_validity(valid);
-  auto d_data                 = upload(values, stream.view());
-  rmm::device_buffer d_validity(valid_bytes.data(), valid_bytes.size(), stream.view());
+  auto d_data                 = upload(values, stream);
+  rmm::device_buffer d_validity(valid_bytes.data(), valid_bytes.size(), stream);
 
   auto col = one_codec_column(I32,
                               values.size(),
@@ -139,9 +139,9 @@ TEST_CASE_METHOD(decode_env,
   auto packed_a = pack_validity({all_valid.begin(), all_valid.begin() + 16});
   auto packed_b = pack_validity({all_valid.begin() + 16, all_valid.end()});
 
-  auto d_data = upload(values, stream.view());
-  rmm::device_buffer d_va(packed_a.data(), packed_a.size(), stream.view());
-  rmm::device_buffer d_vb(packed_b.data(), packed_b.size(), stream.view());
+  auto d_data = upload(values, stream);
+  rmm::device_buffer d_va(packed_a.data(), packed_a.size(), stream);
+  rmm::device_buffer d_vb(packed_b.data(), packed_b.size(), stream);
 
   auto col = one_codec_column(I32,
                               N,
@@ -173,7 +173,7 @@ TEST_CASE_METHOD(decode_env,
                  "[scan][decode]")
 {
   std::vector<int64_t> va = {7}, vb = {-3};
-  auto da = upload(va, stream.view()), db = upload(vb, stream.view());
+  auto da = upload(va, stream), db = upload(vb, stream);
   auto col = one_codec_column(
     I64, 1500, CompressionType::COMPRESSION_CONSTANT, {segment(da, 0, 800), segment(db, 800, 700)});
   auto t   = decode({col});
@@ -194,7 +194,7 @@ TEST_CASE_METHOD(decode_env,
   std::vector<uint8_t> pattern(16);
   for (uint32_t i = 0; i < 16; ++i)
     pattern[i] = static_cast<uint8_t>(0xA0u + i);
-  rmm::device_buffer d_val(pattern.data(), pattern.size(), stream.view());
+  rmm::device_buffer d_val(pattern.data(), pattern.size(), stream);
 
   constexpr uint32_t ROWS = 257;
   auto col                = one_codec_column(
@@ -215,8 +215,8 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - mixed codecs across columns", "
   std::iota(b.begin(), b.end(), 500);
   std::vector<int64_t> k = {99};
   std::vector<double> dv(1000, 1.5);
-  auto da = upload(a, stream.view()), db = upload(b, stream.view());
-  auto dk = upload(k, stream.view()), dd = upload(dv, stream.view());
+  auto da = upload(a, stream), db = upload(b, stream);
+  auto dk = upload(k, stream), dd = upload(dv, stream);
 
   std::vector<gpu_column_decode_input> cols = {
     one_codec_column(I32,
@@ -241,7 +241,7 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - mixed codecs across columns", "
 TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on unsupported codec", "[scan][decode]")
 {
   std::vector<int32_t> dummy = {0};
-  auto d                     = upload(dummy, stream.view());
+  auto d                     = upload(dummy, stream);
   // DICTIONARY is a real DuckDB codec that this dispatcher doesn't yet
   // implement — picking it gives us a concrete "unimplemented codec" path
   // without inventing a fake enum. (RLE and BITPACKING used to fill this
@@ -257,7 +257,7 @@ TEST_CASE_METHOD(decode_env, "gpu_decode_table - throws on non-fixed-width type"
   // ever reached it. The dispatcher must refuse the type *before* asking cudf
   // for its size; this test pins that ordering.
   std::vector<uint8_t> bytes = {0};
-  auto d                     = upload(bytes, stream.view());
+  auto d                     = upload(bytes, stream);
   auto col =
     one_codec_column(STR, 1, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 1)});
 
@@ -270,8 +270,8 @@ TEST_CASE_METHOD(decode_env,
 {
   std::vector<int32_t> values(16, 0);
   std::vector<uint8_t> v_bytes = {0xFFu, 0xFFu};
-  auto d_data                  = upload(values, stream.view());
-  rmm::device_buffer d_validity(v_bytes.data(), v_bytes.size(), stream.view());
+  auto d_data                  = upload(values, stream);
+  rmm::device_buffer d_validity(v_bytes.data(), v_bytes.size(), stream);
 
   auto col = one_codec_column(I32,
                               values.size(),
@@ -311,7 +311,7 @@ TEST_CASE_METHOD(decode_env,
   // (16 bytes vs the 64 needed). Without the bytes_size check the dispatcher
   // would memcpy past end-of-buffer.
   std::vector<int32_t> small_buffer = {1, 2, 3, 4};
-  auto d                            = upload(small_buffer, stream.view());
+  auto d                            = upload(small_buffer, stream);
   auto col =
     one_codec_column(I32, 16, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, 0, 16)});
 
@@ -325,9 +325,8 @@ TEST_CASE_METHOD(decode_env,
   // Claims 64 rows of validity but only one byte (8 bits) is staged.
   std::vector<int32_t> values(64, 0);
   std::vector<uint8_t> too_small_validity = {0xFFu};
-  auto d_data                             = upload(values, stream.view());
-  rmm::device_buffer d_validity(
-    too_small_validity.data(), too_small_validity.size(), stream.view());
+  auto d_data                             = upload(values, stream);
+  rmm::device_buffer d_validity(too_small_validity.data(), too_small_validity.size(), stream);
 
   auto col = one_codec_column(I32,
                               values.size(),
@@ -347,7 +346,7 @@ TEST_CASE_METHOD(decode_env,
   // Claims a segment covering [50..150) but the column only has 100 rows.
   // Without the bounds check the codec would write 50 rows past end-of-buffer.
   std::vector<int32_t> data(100, 7);
-  auto d   = upload(data, stream.view());
+  auto d   = upload(data, stream);
   auto col = one_codec_column(
     I32, 100, CompressionType::COMPRESSION_UNCOMPRESSED, {segment(d, /*row_offset=*/50, 100)});
 
@@ -365,8 +364,8 @@ TEST_CASE_METHOD(decode_env,
   // perf/fault risk on some GPUs).
   cudf::data_type const I16{cudf::type_id::INT16};
   std::vector<int16_t> va = {111}, vb = {-222};
-  auto da  = upload(va, stream.view());
-  auto db  = upload(vb, stream.view());
+  auto da  = upload(va, stream);
+  auto db  = upload(vb, stream);
   auto col = one_codec_column(I16,
                               12,
                               CompressionType::COMPRESSION_CONSTANT,
@@ -388,7 +387,7 @@ TEST_CASE_METHOD(decode_env,
   // allocation — no need for the dummy segment to actually back that many
   // rows. Pins the guard so a future edit doesn't silently drop it.
   std::vector<int32_t> dummy = {0};
-  auto d                     = upload(dummy, stream.view());
+  auto d                     = upload(dummy, stream);
 
   gpu_column_decode_input col;
   col.out_type   = I32;

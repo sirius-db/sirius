@@ -313,6 +313,7 @@ set(EXTENSION_SOURCES
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
+    src/data/spill_chunked_converters.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
     src/expression/ast/constant_range.cpp
@@ -345,6 +346,10 @@ set(EXTENSION_SOURCES
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp
+    src/exec/thread_util.cpp
+    # Query lifecycle event bus (publisher + subscriber)
+    src/event/query_event_publisher.cpp
+    src/event/query_event_subscriber.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -358,10 +363,10 @@ set(EXTENSION_SOURCES
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
-    src/io/s3/s3_list_parser.cpp
-    src/io/s3/sigv4.cpp
+    src/io/rest/s3/list_parser.cpp
+    src/io/rest/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/log/duckdb_sink.cpp
@@ -619,10 +624,11 @@ foreach(_target sirius_extension sirius_loadable_extension)
 
   target_include_directories(
     ${_target}
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+           $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -721,9 +727,9 @@ set_target_properties(
              CXX_STANDARD_REQUIRED ON
              CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(
-  sirius_shared
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
-         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/sirius>)
+  sirius_shared PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_features(sirius_shared PUBLIC cxx_std_20)
 target_link_libraries(
   sirius_shared
   PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,sirius_extension>" duckdb_static
@@ -785,6 +791,11 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
+install(
+  DIRECTORY include/sirius
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+  COMPONENT sirius_library)
+
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
@@ -800,10 +811,6 @@ install(
   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}" COMPONENT sirius_library
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT sirius_library)
-install(
-  FILES src/include/sirius_ffi.hpp
-  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/sirius"
-  COMPONENT sirius_library)
 install(
   EXPORT sirius-targets
   FILE sirius-targets.cmake
@@ -836,6 +843,7 @@ set(TEST_SOURCES
     test/cpp/config/test_topology_config.cpp
     test/cpp/creator/test_task_creator_query_state.cpp
     test/cpp/creator/test_task_creator_schedule_validation.cpp
+    test/cpp/data/test_chunked_spill_copy.cpp
     test/cpp/data/test_convertible_data_batch.cpp
     test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
@@ -843,16 +851,20 @@ set(TEST_SOURCES
     test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
+    test/cpp/event/test_query_event_publisher.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
+    test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_streaming_fragment.cpp
+    test/cpp/exec/test_thread_util.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -1097,16 +1109,10 @@ endif()
 target_include_directories(
   sirius_unittest
   PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
-    # Late-materialization headers include codegen/selection/chunk_row_set.hpp
-    # and row_id_space.hpp, so a test that includes
-    # late_mat/prepared_selection.hpp needs the simpatico include root. It was
-    # dropped as dead in #1474 (8a3de03c), which was true until this feature
-    # landed.
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/src>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
@@ -1162,7 +1168,8 @@ endif()
 
 target_include_directories(
   parquet_benchmark
-  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 
 target_link_libraries(
   parquet_benchmark

@@ -1323,7 +1323,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "[integration][gpu_execution][iceberg]")
 {
   // The delete file covers every data row — an all-false mask, which is where an
-  // apply_boolean_mask that mishandles the empty result shows up.
+  // A retention-mask implementation that mishandles the empty result shows up.
   require_delete_files(all_del_path, 1);
   expect_iceberg_rows(
     "SELECT fruit, count FROM " + pinned_scan(all_del_path) + ";", kEqualityDeleteRoute, {});

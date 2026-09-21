@@ -84,9 +84,7 @@ using sirius::op::dynamic_filter_publish_plan;
 using sirius::op::dynamic_filter_route_class;
 
 sirius::op::dynamic_filter_publication_outcome publish_for_test(
-  dynamic_filter_publish_plan const& plan,
-  cudf::table_view const& table,
-  rmm::cuda_stream_view stream)
+  dynamic_filter_publish_plan const& plan, cudf::table_view const& table, ::cuda::stream_ref stream)
 {
   std::vector<sirius::op::sirius_dynamic_filter_set::producer> producers;
   for (auto const& target : plan.probe_targets()) {
@@ -101,7 +99,7 @@ sirius::op::dynamic_filter_publication_outcome publish_for_test(
   }
   try {
     auto result = sirius::op::publish_dynamic_filters(plan, table, stream, producers);
-    stream.synchronize();
+    stream.sync();
     for (auto const& producer : producers) {
       producer.finish(result.filters_pushed != 0
                         ? sirius::op::sirius_dynamic_filter_set::completion::published
@@ -109,7 +107,7 @@ sirius::op::dynamic_filter_publication_outcome publish_for_test(
     }
     return result;
   } catch (...) {
-    stream.synchronize();
+    stream.sync();
     for (auto const& producer : producers) {
       producer.finish(sirius::op::sirius_dynamic_filter_set::completion::failed);
     }
@@ -161,7 +159,7 @@ struct publisher_fixture {
     sirius::test::operator_utils::initialize_memory_manager(1);
   std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces =
     get_replica_spaces(*memory_manager);
-  rmm::cuda_stream_view stream = replica_spaces.front().get_gpu_space().acquire_stream();
+  ::cuda::stream_ref stream = replica_spaces.front().get_gpu_space().acquire_stream();
 
   std::vector<std::unique_ptr<cudf::column>> columns;
 
@@ -199,9 +197,9 @@ std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture
                                    values.data(),
                                    values.size() * sizeof(std::int64_t),
                                    cudaMemcpyHostToDevice,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return column;
 }
 
@@ -217,9 +215,9 @@ std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixtu
                                    values.data(),
                                    values.size() * sizeof(double),
                                    cudaMemcpyHostToDevice,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return column;
 }
 
@@ -239,9 +237,9 @@ std::vector<std::uint8_t> membership_mask(sirius::op::sirius_dynamic_filter cons
                                    mask->view().data<bool>(),
                                    host.size() * sizeof(bool),
                                    cudaMemcpyDeviceToHost,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return host;
 }
 

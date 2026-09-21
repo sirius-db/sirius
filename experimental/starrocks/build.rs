@@ -49,7 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = prost_build::Config::new();
     config.disable_comments(["."]);
     config.service_generator(Box::new(BrpcServiceGenerator));
-    config.compile_protos(&protos, &[brpc_dir.join("src"), proto_dir])?;
+    let file_descriptors = protox::compile(&protos, &[brpc_dir.join("src"), proto_dir])?;
+    config.compile_fds(file_descriptors)?;
 
     Ok(())
 }

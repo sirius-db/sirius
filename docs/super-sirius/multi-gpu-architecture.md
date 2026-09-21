@@ -100,7 +100,7 @@ Ownership goes one direction: `SiriusContext` owns everything below it. Connecti
 `SiriusContext::initialize()` is the single point where multi-GPU state comes online. The sequence (`src/sirius_context.cpp`):
 
 1. **Discover GPUs.** `topology_discovery` enumerates devices visible to the process (respects `CUDA_VISIBLE_DEVICES`), and records each GPU's NUMA node. A NUMA node the OS cannot resolve stays `-1` ("unknown") — the sentinel is carried through rather than normalized to node 0, and consumers fall back explicitly (e.g. the first host space) when they meet it.
-2. **Build the topology index.** After the memory manager is populated, `initialize()` builds one immutable `sirius::memory::topology_index` (`src/include/memory/topology_index.hpp`) — the single NUMA↔GPU map — and injects it (as `shared_ptr<const>`) into the `task_creator`, the `sirius_scan_manager`, the NUMA-aware small pinned host resource, and the per-GPU downgrade configs (`numa_node_of(device_id)`). `terminate()` resets it. Locality decisions all route through `topology_index::gpus_of()` / `numa_node_of()` rather than component-private maps.
+2. **Build the topology index.** After the memory manager is populated, `initialize()` builds one immutable `sirius::memory::topology_index` (`src/memory/topology_index.hpp`) — the single NUMA↔GPU map — and injects it (as `shared_ptr<const>`) into the `task_creator`, the `sirius_scan_manager`, the NUMA-aware small pinned host resource, and the per-GPU downgrade configs (`numa_node_of(device_id)`). `terminate()` resets it. Locality decisions all route through `topology_index::gpus_of()` / `numa_node_of()` rather than component-private maps.
 3. **Build memory spaces.** A `reservation_manager_configurator` is configured with per-GPU usage limits, per-host capacities, optional disk mounts, and NUMA pairings. `builder.build()` produces `memory_space_config`s, which `sirius_memory_reservation_manager` consumes to construct all tier × gpu spaces.
 4. **Install per-GPU device resource refs.** For each GPU, `sirius_memory_reservation_manager`'s constructor sets that GPU's `cuda_async_memory_resource` as cudf's `current_device_resource_ref` (saving the previous ref for restoration on shutdown). This ensures cudf operations on each GPU allocate through that GPU's reservation-tracked pool.
 5. **Construct the scan manager and its local ioctx.** The scan manager creates one `uring_ioctx` for local files. Its reactor pool accepts device-read requests for any visible GPU.
@@ -178,7 +178,7 @@ The pin also survives OOM reschedule. When a partitioned task OOMs and is rebuil
 
 ## Cross-GPU Data Movement
 
-When an operator must consume data on GPU A that lives on GPU B (e.g., a hash join's probe side has chunks scattered across all GPUs), `lock_or_prepare_batch` (`src/include/pipeline/batch_lock_utils.hpp`) **clones the batch into the consumer's memory space under a shared (read) lock** via `read_only_data_batch::clone_to`. The source batch is never exclusively locked and never mutated: it stays resident on GPU B for consumers local to that device, concurrent readers proceed during the transfer, and the source drops back to the idle state as soon as the prepare completes — making it immediately downgrade-eligible. Source lifetime is ownership-driven: repositories and other tasks holding the batch keep it alive, and the consuming task releases its own pin on the original right after prepare, so a single-consumer source is freed as soon as its clone exists. The clone's allocation is charged to the consuming task's memory reservation, and the reservation estimator counts GPU inputs residing in a different memory space in `bytes_to_materialize_input`.
+When an operator must consume data on GPU A that lives on GPU B (e.g., a hash join's probe side has chunks scattered across all GPUs), `lock_or_prepare_batch` (`src/pipeline/batch_lock_utils.hpp`) **clones the batch into the consumer's memory space under a shared (read) lock** via `read_only_data_batch::clone_to`. The source batch is never exclusively locked and never mutated: it stays resident on GPU B for consumers local to that device, concurrent readers proceed during the transfer, and the source drops back to the idle state as soon as the prepare completes — making it immediately downgrade-eligible. Source lifetime is ownership-driven: repositories and other tasks holding the batch keep it alive, and the consuming task releases its own pin on the original right after prepare, so a single-consumer source is freed as soon as its clone exists. The clone's allocation is charged to the consuming task's memory reservation, and the reservation estimator counts GPU inputs residing in a different memory space in `bytes_to_materialize_input`.
 
 Host- and disk-resident inputs intentionally keep **move semantics**: `lock_or_prepare_batch` upgrades them to the GPU in place, freeing the spilled copy — the common case is a single consumer re-materializing a downgraded batch.
 
@@ -203,12 +203,12 @@ Single-GPU configurations may still opt out via `use_sirius_datasource=false`; t
 
 The Sirius path:
 
-1. **Managed file reads go through `sirius_ioctx::open_datasource(path)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. With single-GPU `use_sirius_datasource=false`, local parquet takes the cudf-bundled path instead.
+1. **Managed file reads go through `ioctx::open_datasource(path)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. With single-GPU `use_sirius_datasource=false`, local parquet takes the cudf-bundled path instead.
 2. **An ioctx is shared across GPUs.** The ioctx and its reactors bind no device at construction. A device read captures the caller's current CUDA device at dispatch and carries it on the request. The reactor makes that device current for the H2D copy, and holds copy events for every visible device.
 3. **Paths are resolved through `io_context_registry`.** The registry runs each backend's path checker and returns a backend type. Uring's checker is a filesystem stat, applied after the scan manager strips a leading `file://`. Local files use the shared uring ioctx, `s3://` the REST ioctx. A kvikio catch-all claims what no explicit backend takes. A null datasource means the resolved backend's factory declined to construct, for example an unconfigured object store.
 4. **Pin-table placement is carried by `memory_space`.** All files of a pin go through the same ioctx. The destination GPU comes from the current-device guard and the target space's allocator, and is recorded per chunk for task creation.
 
-Every managed read on the multi-GPU path resolves through `sirius_ioctx::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Local parquet reaches `cudf::io::datasource::create(path)` only under the single-GPU `use_sirius_datasource=false` opt-out. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps sirius datasources through the `datasource*` overload.
+Every managed read on the multi-GPU path resolves through `ioctx::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Local parquet reaches `cudf::io::datasource::create(path)` only under the single-GPU `use_sirius_datasource=false` opt-out. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps sirius datasources through the `datasource*` overload.
 
 ## Memory Pressure: Reservations and Downgrade
 
@@ -234,9 +234,9 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `dst_guard` around HtoD memcpy in `alloc_and_peer_copy_async` | Same file (Phase 23 fix) | Outer `target_guard` doesn't propagate through `reconstruct_column_p2p`; broken-peer-DMA hardware needs the inner guard |
 | `run_p2p_probe_locked` restores caller's device context on exit | `cucascade/src/memory/common.cpp` (Phase 23 fix) | Probe was hardcoding `cudaSetDevice(0)`, clobbering caller's RAII guard |
 | `cudaDeviceSynchronize` per GPU before `cudaMemPoolDestroy` | `src/memory/sirius_memory_reservation_manager.cpp` (post-Phase-24 fix) | Pending `cudaFreeAsync` against a soon-destroyed pool corrupts the driver's per-device pool list |
-| A device read carries the caller's device id; the reactor sets that device for the H2D copy | `src/include/io/templated_ioctx.hpp`, `src/include/io/io_request.hpp` | The ioctx is shared across GPUs. Copying without setting the device lands the bytes on whichever GPU the reactor thread happens to have current |
+| A device read carries the caller's device id; the reactor sets that device for the H2D copy | `src/io/templated_ioctx.hpp`, `src/io/io_request.hpp` | The ioctx is shared across GPUs. Copying without setting the device lands the bytes on whichever GPU the reactor thread happens to have current |
 | `_per_thread_init` in `downgrade_executor` gated on `tier == GPU` | `src/downgrade/downgrade_executor.cpp` (Phase 22.2 K.6) | HOST-tier workers must not call `cudaSetDevice(-1)` |
-| `chunk_memory_spaces[i]` parallel to `data_batches_by_column[col][i]` | `src/include/scan_manager/sirius_scan_manager.hpp` | Pin-table merge must preserve owning-space per chunk (Phase 22 Pitfall 3) |
+| `chunk_memory_spaces[i]` parallel to `data_batches_by_column[col][i]` | `src/scan_manager/sirius_scan_manager.hpp` | Pin-table merge must preserve owning-space per chunk (Phase 22 Pitfall 3) |
 | All tasks of a partition pinned to one admitted GPU via `partition_idx % _active_gpu_ids.size()`; pin preserved across OOM reschedule | `src/creator/task_creator.cpp`, `src/pipeline/gpu_pipeline_executor.cpp` | A cuco hash table is valid only on the GPU it was built on; cross-device access trips `cudaErrorInvalidValue`. Indexing the admitted executor set avoids phantom pins when `num_gpus` < physical GPU count, and keeps a query off devices it was not admitted onto |
 | Locality-derived device preferences (operator hint, GPU-resident bytes, NUMA `gpus_of()`, cached-chunk home) clamped into `_active_gpu_ids` | `src/creator/task_creator.cpp` | These are computed from where data lives, not from the admitted set, so any of them can name an excluded device — and the scheduler treats a preference as binding |
 | HYG-02 invariant: 0 new `rmm::cuda_stream_default` in `src/` outside `legacy/` | grep gate | Default-stream usage breaks per-task-device contract under SCHED-RR |
@@ -257,8 +257,8 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 |------|------|
 | `src/sirius_context.{hpp,cpp}` | `SiriusContext`, per-GPU memory/topology initialization, P2P peer-access enablement |
 | `src/memory/sirius_memory_reservation_manager.{hpp,cpp}` | Extends `cucascade::memory_reservation_manager`; sets cudf device resource refs per GPU; synchronizes on destruction |
-| `src/include/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
-| `src/include/memory/topology_index.hpp` | `topology_index` — the single NUMA↔GPU map injected into task creator, scan manager, downgrade configs |
+| `src/scan_manager/sirius_scan_manager.hpp` | `pinned_entry`, `chunk_memory_spaces` invariant |
+| `src/memory/topology_index.hpp` | `topology_index` — the single NUMA↔GPU map injected into task creator, scan manager, downgrade configs |
 | `src/pin_table.cpp` | Pin materialization; per-batch round-robin placement, target-device guard, target-space allocator |
 | `src/scan_manager/split_provider.cpp` | Fresh-read split provider; resolves an ioctx per file |
 | `src/scan_manager/sirius_scan_manager.cpp` | `cached_databatch_provider`; ioctx ownership and path routing |
@@ -266,7 +266,7 @@ After a downgrade frees enough space, the rescheduled task retries. The reservat
 | `src/io/uring/uring_reactor.cpp` | `uring_reactor`; holds copy events for every visible device and sets the request's device for each H2D copy |
 | `src/op/scan/sirius_gpu_scan_operator.cpp` | Unified `GPU_SCAN` source operator (multi-GPU-aware) |
 | `src/creator/task_creator.cpp` | Per-task `preferred_device_id` resolution, partition device pin |
-| `src/include/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
+| `src/pipeline/gpu_pipeline_task.hpp` | `preferred_device_id` two-level lookup |
 | `src/pipeline/gpu_pipeline_executor.cpp` + `task_scheduler.cpp` | Ready-device matching, reservation-device execution, OOM-reschedule pin carry-forward |
 | `src/downgrade/downgrade_executor.cpp` | Per-tier downgrade workers, K.6-gated `cudaSetDevice` |
 | `cucascade/src/data/representation_converter.cpp` | `convert_gpu_to_gpu` / `alloc_and_peer_copy_async` with peer-DMA probe + dst_guard |

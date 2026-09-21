@@ -1,6 +1,6 @@
 # Runtime Data Size Estimation
 
-**Files:** `src/include/pipeline/data_size_estimator.hpp`, `src/pipeline/data_size_estimator.cpp`
+**Files:** `src/pipeline/data_size_estimator.hpp`, `src/pipeline/data_size_estimator.cpp`
 
 An API that projects how many bytes will *ultimately* arrive at an operator's input port, by
 chaining upstream pipelines' measured input→output ratios back to the first pipeline that has

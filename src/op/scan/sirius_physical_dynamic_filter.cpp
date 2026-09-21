@@ -46,7 +46,7 @@ void sirius_physical_dynamic_filter::on_finalize_operator()
 }
 
 std::unique_ptr<operator_data> sirius_physical_dynamic_filter::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_dynamic_filter::execute"};
   auto& input = dynamic_cast<const pipelineable_operator_data&>(input_data);
