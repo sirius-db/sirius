@@ -21,6 +21,7 @@
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/representation_converter.hpp>
+#include <data/spill_chunked_converters.hpp>
 #include <log/logging.hpp>
 
 #include <memory>
@@ -43,18 +44,27 @@ class converter_registry {
   using registry_type = cucascade::representation_converter_registry;
 
   /**
-   * @brief Initialize the converter registry with builtin converters.
+   * @brief Initialize the converter registry with builtin and configured converters.
    *
    * This should be called once when the extension is loaded.
-   * Safe to call multiple times - subsequent calls are no-ops.
+   * Calls with the same configuration are no-ops; conflicting configurations throw.
    */
-  static void initialize()
+  static void initialize(std::size_t copy_chunk_bytes = 1ull << 30)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (instance_) { return; }  // Already initialized, no-op
-    instance_ = std::make_unique<registry_type>();
-    cucascade::register_builtin_converters(*instance_);
-    sirius::register_compression_converters(*instance_);
+    if (instance_) {
+      if (copy_chunk_bytes_ != copy_chunk_bytes) {
+        throw std::runtime_error(
+          "converter_registry already initialized with a different copy_chunk_bytes value");
+      }
+      return;
+    }
+    auto registry = std::make_unique<registry_type>();
+    cucascade::register_builtin_converters(*registry);
+    sirius::register_compression_converters(*registry);
+    sirius::spill::register_chunked_spill_converters(*registry, copy_chunk_bytes);
+    copy_chunk_bytes_ = copy_chunk_bytes;
+    instance_         = std::move(registry);
   }
 
   /**
@@ -83,6 +93,7 @@ class converter_registry {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     instance_.reset();
+    copy_chunk_bytes_ = 0;
   }
 
   /**
@@ -92,11 +103,13 @@ class converter_registry {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     instance_.reset();
+    copy_chunk_bytes_ = 0;
   }
 
  private:
   converter_registry() = default;
   static inline std::unique_ptr<registry_type> instance_;
+  static inline std::size_t copy_chunk_bytes_{0};
   static inline std::mutex mutex_;
 };
 

@@ -203,12 +203,12 @@ Single-GPU configurations may still opt out via `use_sirius_datasource=false`; t
 
 The Sirius path:
 
-1. **Managed file reads go through `sirius_ioctx::open_datasource(path)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. With single-GPU `use_sirius_datasource=false`, local parquet takes the cudf-bundled path instead.
+1. **Managed file reads go through `ioctx::open_datasource(path)`.** Never `cudf::io::datasource::create(path)` and never `cudf::io::source_info{path}`. With single-GPU `use_sirius_datasource=false`, local parquet takes the cudf-bundled path instead.
 2. **An ioctx is shared across GPUs.** The ioctx and its reactors bind no device at construction. A device read captures the caller's current CUDA device at dispatch and carries it on the request. The reactor makes that device current for the H2D copy, and holds copy events for every visible device.
 3. **Paths are resolved through `io_context_registry`.** The registry runs each backend's path checker and returns a backend type. Uring's checker is a filesystem stat, applied after the scan manager strips a leading `file://`. Local files use the shared uring ioctx, `s3://` the REST ioctx. A kvikio catch-all claims what no explicit backend takes. A null datasource means the resolved backend's factory declined to construct, for example an unconfigured object store.
 4. **Pin-table placement is carried by `memory_space`.** All files of a pin go through the same ioctx. The destination GPU comes from the current-device guard and the target space's allocator, and is recorded per chunk for task creation.
 
-Every managed read on the multi-GPU path resolves through `sirius_ioctx::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Local parquet reaches `cudf::io::datasource::create(path)` only under the single-GPU `use_sirius_datasource=false` opt-out. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps sirius datasources through the `datasource*` overload.
+Every managed read on the multi-GPU path resolves through `ioctx::open_datasource` — the unified `sirius_gpu_scan_operator`, the split providers, `sirius_extension`, and the pin path all route through it. Local parquet reaches `cudf::io::datasource::create(path)` only under the single-GPU `use_sirius_datasource=false` opt-out. The kvikio catch-all still serves paths no explicit backend claims. The parquet reader wraps sirius datasources through the `datasource*` overload.
 
 ## Memory Pressure: Reservations and Downgrade
 
