@@ -33,11 +33,11 @@
 #include "codegen/jit/kernel_cache.hpp"
 #include "codegen/jit/nvrtc_compiler.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda.h>
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -58,10 +58,10 @@ struct GpuEncoded {
   // returned pointer is immediately usable by a driver launch or copy.
   CUdeviceptr alloc(std::size_t bytes)
   {
-    const rmm::cuda_stream_view s{};
+    const ::cuda::stream_ref s{cudaStream_t{}};
     owned.emplace_back(
       bytes == 0 ? std::size_t{1} : bytes, s, rmm::mr::get_current_device_resource_ref());
-    cudaStreamSynchronize(s.value());
+    cudaStreamSynchronize(s.get());
     return reinterpret_cast<CUdeviceptr>(owned.back().data());
   }
 
@@ -118,8 +118,8 @@ inline GpuEncoded gpu_encode_tree(const codegen::jit::FusedTree& tree,
 
   // Device allocations come from the RMM async pool; `out.owned` keeps them
   // alive for the caller (the decode that follows reads these buffers).
-  const rmm::cuda_stream_view stream{};
-  cudaStream_t cs = stream.value();
+  const ::cuda::stream_ref stream{cudaStream_t{}};
+  cudaStream_t cs = stream.get();
   auto mr         = rmm::mr::get_current_device_resource_ref();
 
   GpuEncoded out;

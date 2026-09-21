@@ -544,7 +544,7 @@ __global__ void kernel_dict_fsst_mark_nulls(dict_fsst_desc const* __restrict__ d
 //! Prepare DICT_FSST state after host validation. Synchronizes for headers and, when rows
 //! are present, for device-built offsets, decoders and decoded totals needed by the host.
 prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
-                                     rmm::cuda_stream_view stream,
+                                     ::cuda::stream_ref stream,
                                      rmm::device_async_resource_ref mr)
 {
   prepared_dict_fsst out;
@@ -602,14 +602,14 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
                                pre.data(),
                                pre.size() * sizeof(dict_fsst_pre_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
   rmm::device_buffer d_decoders_buf(num_segs * sizeof(fsst_decoder_compact), stream, mr);
   rmm::device_buffer d_byte_off_buf(total_dict_entries * sizeof(uint32_t), stream, mr);
   rmm::device_buffer d_dec_off_buf(total_dict_entries * sizeof(uint32_t), stream, mr);
   rmm::device_buffer d_per_seg_total_buf(num_segs * sizeof(uint32_t), stream, mr);
   rmm::device_buffer d_per_seg_inline_null_buf(num_segs * sizeof(uint8_t), stream, mr);
 
-  kernel_build_dict_fsst_data<<<num_segs, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_build_dict_fsst_data<<<num_segs, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     static_cast<dict_fsst_pre_desc const*>(d_pre_buf.data()),
     num_segs,
     static_cast<fsst_decoder_compact*>(d_decoders_buf.data()),
@@ -645,28 +645,28 @@ prepared_dict_fsst prepare_dict_fsst(gpu_string_codec_run const& run,
                                d_decoders_buf.data(),
                                num_segs * sizeof(fsst_decoder_compact),
                                cudaMemcpyDeviceToHost,
-                               stream.value()));
+                               stream.get()));
   RMM_CUDA_TRY(cudaMemcpyAsync(pin_byte_off,
                                d_byte_off_buf.data(),
                                total_dict_entries * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost,
-                               stream.value()));
+                               stream.get()));
   RMM_CUDA_TRY(cudaMemcpyAsync(pin_dec_off,
                                d_dec_off_buf.data(),
                                total_dict_entries * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost,
-                               stream.value()));
+                               stream.get()));
   RMM_CUDA_TRY(cudaMemcpyAsync(pin_per_seg_total,
                                d_per_seg_total_buf.data(),
                                num_segs * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost,
-                               stream.value()));
+                               stream.get()));
   RMM_CUDA_TRY(cudaMemcpyAsync(pin_per_seg_inline_null,
                                d_per_seg_inline_null_buf.data(),
                                num_segs * sizeof(uint8_t),
                                cudaMemcpyDeviceToHost,
-                               stream.value()));
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+                               stream.get()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 
   std::memcpy(out.decoders.data(), pin_decoders, num_segs * sizeof(fsst_decoder_compact));
   std::memcpy(out.byte_offsets.data(), pin_byte_off, total_dict_entries * sizeof(uint32_t));
@@ -712,10 +712,10 @@ void launch_dict_fsst_lengths(dict_fsst_desc const* d_chunks,
                               uint32_t* d_lengths,
                               uint32_t const* d_decoded_offsets,
                               uint32_t n_chunks,
-                              rmm::cuda_stream_view stream)
+                              ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
-  kernel_compute_lengths_dict_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_lengths_dict_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_chunks, d_lengths, d_decoded_offsets, n_chunks);
 }
 
@@ -726,10 +726,10 @@ void launch_dict_fsst_predecode(dict_fsst_desc const* d_descs,
                                 uint8_t* d_predecode,
                                 uint32_t n_segments,
                                 uint32_t total_predecode_bytes,
-                                rmm::cuda_stream_view stream)
+                                ::cuda::stream_ref stream)
 {
   if (n_segments == 0 || total_predecode_bytes == 0) return;
-  kernel_predecode_dict_fsst<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_predecode_dict_fsst<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_descs, d_byte_offsets, d_decoded_offsets, d_decoders, d_predecode, n_segments);
 }
 
@@ -741,39 +741,38 @@ void launch_dict_fsst_gather(dict_fsst_desc const* d_chunks,
                              uint8_t const* d_predecode,
                              fsst_decoder_compact const* d_decoders,
                              uint32_t n_chunks,
-                             rmm::cuda_stream_view stream)
+                             ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
   // Launch both instantiations over the full descriptor array: FsstOnly=false
   // handles DICTIONARY / DICT_FSST, FsstOnly=true handles FSST_ONLY. Each
   // early-returns on segments outside its mode class.
   kernel_gather_dict_fsst<false>
-    <<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(d_chunks,
-                                                         d_offsets,
-                                                         d_chars,
-                                                         d_byte_offsets,
-                                                         d_decoded_offsets,
-                                                         d_predecode,
-                                                         d_decoders,
-                                                         n_chunks);
-  kernel_gather_dict_fsst<true>
-    <<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(d_chunks,
-                                                         d_offsets,
-                                                         d_chars,
-                                                         d_byte_offsets,
-                                                         d_decoded_offsets,
-                                                         d_predecode,
-                                                         d_decoders,
-                                                         n_chunks);
+    <<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(d_chunks,
+                                                       d_offsets,
+                                                       d_chars,
+                                                       d_byte_offsets,
+                                                       d_decoded_offsets,
+                                                       d_predecode,
+                                                       d_decoders,
+                                                       n_chunks);
+  kernel_gather_dict_fsst<true><<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(d_chunks,
+                                                                                  d_offsets,
+                                                                                  d_chars,
+                                                                                  d_byte_offsets,
+                                                                                  d_decoded_offsets,
+                                                                                  d_predecode,
+                                                                                  d_decoders,
+                                                                                  n_chunks);
 }
 
 void launch_dict_fsst_mark_nulls(dict_fsst_desc const* d_descs,
                                  uint8_t* d_null_mask,
                                  uint32_t n_segments,
-                                 rmm::cuda_stream_view stream)
+                                 ::cuda::stream_ref stream)
 {
   if (n_segments == 0) return;
-  kernel_dict_fsst_mark_nulls<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_dict_fsst_mark_nulls<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_descs, d_null_mask, n_segments);
 }
 

@@ -80,7 +80,7 @@ std::vector<std::string> decode_one_dict(std::vector<uint8_t> const& bytes,
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                               static_cast<uint32_t>(d_seg.size()),
@@ -93,7 +93,7 @@ std::vector<std::string> decode_one_dict(std::vector<uint8_t> const& bytes,
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_DICTIONARY, {seg}});
 
-  auto column = gpu_decode_strings_column(col, stream.view(), mr);
+  auto column = gpu_decode_strings_column(col, stream, mr);
   cudf::strings_column_view scv(column->view());
 
   std::vector<int32_t> offsets =
@@ -130,7 +130,7 @@ std::vector<std::string> decode_one_segment(std::vector<uint8_t> const& bytes,
     host_src  = staged.data();
     host_size = staged.size();
   }
-  rmm::device_buffer d_seg(host_src, host_size, stream.view());
+  rmm::device_buffer d_seg(host_src, host_size, stream);
 
   gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()) + lead_pad,
                               static_cast<uint32_t>(bytes.size()),
@@ -143,7 +143,7 @@ std::vector<std::string> decode_one_segment(std::vector<uint8_t> const& bytes,
   col.has_nulls  = false;
   col.data.push_back({codec, {seg}});
 
-  auto column = gpu_decode_strings_column(col, stream.view(), mr);
+  auto column = gpu_decode_strings_column(col, stream, mr);
   cudf::strings_column_view scv(column->view());
 
   std::vector<int32_t> offsets =
@@ -167,7 +167,7 @@ std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& 
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_string_segment_desc seg{static_cast<uint8_t const*>(d_seg.data()),
                               static_cast<uint32_t>(d_seg.size()),
@@ -180,7 +180,7 @@ std::vector<std::string> decode_invalid_with_canary(std::vector<uint8_t> const& 
   col.has_nulls  = false;
   col.data.push_back({codec, {seg}});
 
-  auto column = gpu_decode_strings_column(col, stream.view(), mr);
+  auto column = gpu_decode_strings_column(col, stream, mr);
   cudf::strings_column_view scv(column->view());
   std::vector<int32_t> offsets =
     download<int32_t>(scv.offsets().data<int32_t>(), row_count + 1, stream.value());
@@ -672,14 +672,14 @@ TEST_CASE("gpu_decode_strings - unsupported codec throws", "[scan][decode][strin
   std::vector<uint8_t> bytes(16, 0);
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   gpu_string_segment_desc seg{
     static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 4, 0, 8u};
   gpu_string_column_decode_input col;
   col.total_rows = 4;
   col.has_nulls  = false;
   col.data.push_back({CompressionType::COMPRESSION_CONSTANT, {seg}});
-  REQUIRE_THROWS_WITH(gpu_decode_strings_column(col, stream.view(), mr),
+  REQUIRE_THROWS_WITH(gpu_decode_strings_column(col, stream, mr),
                       Catch::Contains("viability invariant violated"));
 }
 

@@ -66,7 +66,7 @@ std::unique_ptr<cudf::table> make_table(std::unique_ptr<cudf::column> column)
 std::unique_ptr<cudf::column> with_nulls(
   std::unique_ptr<cudf::column> column,
   std::vector<bool> const& valid,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   REQUIRE(static_cast<std::size_t>(column->size()) == valid.size());
@@ -78,7 +78,7 @@ std::unique_ptr<cudf::column> with_nulls(
 
 void require_columns_equal(cudf::column_view const& actual,
                            cudf::column_view const& expected,
-                           rmm::cuda_stream_view stream,
+                           ::cuda::stream_ref stream,
                            rmm::device_async_resource_ref mr)
 {
   REQUIRE(actual.type() == expected.type());
@@ -100,7 +100,7 @@ void require_columns_equal(cudf::column_view const& actual,
 
 void require_tables_equal(cudf::table_view const& actual,
                           cudf::table_view const& expected,
-                          rmm::cuda_stream_view stream,
+                          ::cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr)
 {
   REQUIRE(actual.num_columns() == expected.num_columns());
@@ -112,7 +112,7 @@ void require_tables_equal(cudf::table_view const& actual,
 
 void require_encode_contract(
   cudf::table_view const& keys,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  ::cuda::stream_ref stream         = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   auto expected = cudf::encode(keys, stream, mr);
@@ -137,7 +137,7 @@ struct host_column {
 
 template <typename T>
 host_column<T> copy_to_host(cudf::column_view const& column,
-                            rmm::cuda_stream_view stream,
+                            ::cuda::stream_ref stream,
                             rmm::device_async_resource_ref mr)
 {
   host_column<T> result{std::vector<T>(column.size()), std::vector<std::uint8_t>(column.size(), 1)};
@@ -145,7 +145,7 @@ host_column<T> copy_to_host(cudf::column_view const& column,
                           column.data<T>(),
                           result.values.size() * sizeof(T),
                           cudaMemcpyDeviceToHost,
-                          stream.value()) == cudaSuccess);
+                          stream.get()) == cudaSuccess);
 
   std::unique_ptr<cudf::column> validity;
   if (column.nullable()) {
@@ -155,15 +155,15 @@ host_column<T> copy_to_host(cudf::column_view const& column,
                             validity->view().data<bool>(),
                             result.valid.size(),
                             cudaMemcpyDeviceToHost,
-                            stream.value()) == cudaSuccess);
+                            stream.get()) == cudaSuccess);
   }
-  stream.synchronize();
+  stream.sync();
   return result;
 }
 
 void require_floating_columns_equivalent(cudf::column_view const& actual,
                                          cudf::column_view const& expected,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   REQUIRE(actual.type() == expected.type());
@@ -366,23 +366,22 @@ TEST_CASE("group key labels use the supplied stream and memory resource",
 
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(vector_to_cudf_column<gpu_type_traits<int32_t>>(
-    std::vector<int32_t>{2, 1, 2, 3, 1}, stream.view(), mr));
+    std::vector<int32_t>{2, 1, 2, 3, 1}, stream, mr));
   columns.push_back(vector_to_cudf_column<gpu_type_traits<string_tag>>(
-    std::vector<std::string>{"b", "a", "b", "c", "a"}, stream.view(), mr));
+    std::vector<std::string>{"b", "a", "b", "c", "a"}, stream, mr));
   auto keys = make_table(std::move(columns));
 
-  auto expected = cudf::encode(keys->view(), stream.view(), mr);
-  auto actual   = make_group_key_labels(keys->view(), stream.view(), mr);
+  auto expected = cudf::encode(keys->view(), stream, mr);
+  auto actual   = make_group_key_labels(keys->view(), stream, mr);
   auto rebuilt  = cudf::gather(actual.sorted_unique_keys->view(),
                               actual.labels->view(),
                               cudf::out_of_bounds_policy::DONT_CHECK,
-                              stream.view(),
+                              stream,
                               mr);
 
-  require_tables_equal(
-    actual.sorted_unique_keys->view(), expected.first->view(), stream.view(), mr);
-  require_columns_equal(actual.labels->view(), expected.second->view(), stream.view(), mr);
-  require_tables_equal(rebuilt->view(), keys->view(), stream.view(), mr);
+  require_tables_equal(actual.sorted_unique_keys->view(), expected.first->view(), stream, mr);
+  require_columns_equal(actual.labels->view(), expected.second->view(), stream, mr);
+  require_tables_equal(rebuilt->view(), keys->view(), stream, mr);
 
   auto contents = actual.labels->release();
   REQUIRE(contents.data != nullptr);

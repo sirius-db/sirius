@@ -395,7 +395,7 @@ __global__ __launch_bounds__(STRINGS_BLOCK_DIM) void kernel_gather_fsst_chunked(
 
 }  // namespace
 
-prepared_fsst prepare_fsst(gpu_string_codec_run const& run, rmm::cuda_stream_view stream)
+prepared_fsst prepare_fsst(gpu_string_codec_run const& run, ::cuda::stream_ref stream)
 {
   prepared_fsst out;
   out.total_fsst_row_count = 0;
@@ -476,17 +476,17 @@ void launch_fsst_lengths(fsst_decoder_compact* d_decoders,
                          fsst_chunk_desc const* d_gather_chunks,
                          uint32_t n_segments,
                          uint32_t n_chunks,
-                         rmm::cuda_stream_view stream)
+                         ::cuda::stream_ref stream)
 {
   if (n_segments == 0) return;
   // On-device symbol-table parse: one CTA per segment, coalesced symtab load into
   // shmem then a single-thread parse into d_decoders.
-  kernel_build_fsst_decoders<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_build_fsst_decoders<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_length_descs, n_segments, d_decoders);
   // A+B per-segment (prefix-sum state lives in one CTA); C per-chunk.
-  kernel_compute_compressed_offsets_fsst<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_compressed_offsets_fsst<<<n_segments, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_comp_offsets, d_length_descs, d_row_starts, n_segments);
-  kernel_compute_decompressed_lengths_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_decompressed_lengths_fsst<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_gather_chunks, d_lengths, d_comp_offsets, d_decoders, n_chunks);
 }
 
@@ -496,10 +496,10 @@ void launch_fsst_gather(fsst_chunk_desc const* d_gather_chunks,
                         uint32_t const* d_comp_offsets,
                         fsst_decoder_compact const* d_decoders,
                         uint32_t n_chunks,
-                        rmm::cuda_stream_view stream)
+                        ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_fsst_chunked<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_gather_fsst_chunked<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_gather_chunks, d_offsets, d_chars, d_comp_offsets, d_decoders, n_chunks);
 }
 

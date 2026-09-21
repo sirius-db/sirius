@@ -39,7 +39,7 @@ void copy_device_to_pinned_blocks(
   cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation& dst,
   std::uint64_t dst_offset,
   std::size_t size,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (size == 0) return;
   const std::size_t bs = dst.block_size();
@@ -50,7 +50,7 @@ void copy_device_to_pinned_blocks(
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - d_off);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.value()));
+      dst.at(d_idx).data() + d_off, src + copied, chunk, cudaMemcpyDeviceToHost, stream.get()));
     copied += chunk;
     d_off += chunk;
     if (d_off == bs) {
@@ -65,7 +65,7 @@ void copy_pinned_blocks_to_device(
   std::uint64_t src_offset,
   void* dst_device,
   std::size_t size,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (size == 0) return;
   const std::size_t bs = src.block_size();
@@ -76,7 +76,7 @@ void copy_pinned_blocks_to_device(
   while (copied < size) {
     const std::size_t chunk = std::min(size - copied, bs - s_off);
     CUCASCADE_CUDA_TRY(cudaMemcpyAsync(
-      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.value()));
+      dst + copied, src.at(s_idx).data() + s_off, chunk, cudaMemcpyHostToDevice, stream.get()));
     copied += chunk;
     s_off += chunk;
     if (s_off == bs) {

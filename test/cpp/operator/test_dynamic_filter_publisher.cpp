@@ -127,7 +127,7 @@ struct publisher_fixture {
     sirius::test::operator_utils::initialize_memory_manager(1);
   std::vector<sirius::op::dynamic_filter_replica_space> replica_spaces =
     get_replica_spaces(*memory_manager);
-  rmm::cuda_stream_view stream = replica_spaces.front().get_gpu_space().acquire_stream();
+  ::cuda::stream_ref stream = replica_spaces.front().get_gpu_space().acquire_stream();
 
   std::vector<std::unique_ptr<cudf::column>> columns;
 
@@ -165,9 +165,9 @@ std::unique_ptr<cudf::column> make_int64_values(publisher_fixture const& fixture
                                    values.data(),
                                    values.size() * sizeof(std::int64_t),
                                    cudaMemcpyHostToDevice,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return column;
 }
 
@@ -183,9 +183,9 @@ std::unique_ptr<cudf::column> make_float64_values(publisher_fixture const& fixtu
                                    values.data(),
                                    values.size() * sizeof(double),
                                    cudaMemcpyHostToDevice,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return column;
 }
 
@@ -205,9 +205,9 @@ std::vector<std::uint8_t> membership_mask(sirius::op::sirius_dynamic_filter cons
                                    mask->view().data<bool>(),
                                    host.size() * sizeof(bool),
                                    cudaMemcpyDeviceToHost,
-                                   fixture.stream.value());
+                                   fixture.stream.get());
   REQUIRE(err == cudaSuccess);
-  fixture.stream.synchronize();
+  fixture.stream.sync();
   return host;
 }
 

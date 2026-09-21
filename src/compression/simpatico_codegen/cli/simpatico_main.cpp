@@ -29,13 +29,15 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/memory_resource>
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -56,6 +58,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -72,17 +75,15 @@ namespace {
 
 struct pool_mr_guard {
   rmm::mr::cuda_async_memory_resource mr{};
-  rmm::device_async_resource_ref previous{rmm::mr::get_current_device_resource_ref()};
-  bool installed = false;
+  std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>> previous;
 
   void install()
   {
-    rmm::mr::set_current_device_resource_ref(mr);
-    installed = true;
+    previous.emplace(cudf::set_current_device_resource(rmm::device_async_resource_ref{mr}));
   }
   ~pool_mr_guard()
   {
-    if (installed) rmm::mr::set_current_device_resource_ref(previous);
+    if (previous) { cudf::set_current_device_resource(std::move(*previous)); }
   }
 };
 
@@ -287,7 +288,7 @@ void cuda_sync()
 }
 
 std::size_t column_input_bytes(cudf::column_view col,
-                               rmm::cuda_stream_view stream = cudf::get_default_stream())
+                               ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   if (col.type().id() == cudf::type_id::STRING) {
     cudf::strings_column_view scv(col);
@@ -298,7 +299,7 @@ std::size_t column_input_bytes(cudf::column_view col,
 }
 
 std::size_t table_input_bytes(cudf::table_view tv,
-                              rmm::cuda_stream_view stream = cudf::get_default_stream())
+                              ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (int i = 0; i < tv.num_columns(); ++i)
@@ -431,13 +432,13 @@ bool verify_roundtrip(cudf::table_view source, simpatico::compressed_table const
 // ── Compressed-size accounting ────────────────────────────────────────────────
 
 std::size_t rep_bytes(simpatico::compressed_representation const* rep,
-                      rmm::cuda_stream_view stream = cudf::get_default_stream())
+                      ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   return rep ? rep->compressed_size_bytes(stream) : 0;
 }
 
 std::size_t plan_tree_compressed_bytes(simpatico::PlanTree const& tree,
-                                       rmm::cuda_stream_view stream = cudf::get_default_stream())
+                                       ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (auto const& node : tree.nodes) {
@@ -449,7 +450,7 @@ std::size_t plan_tree_compressed_bytes(simpatico::PlanTree const& tree,
 }
 
 std::size_t compressed_table_bytes(simpatico::compressed_table const& ct,
-                                   rmm::cuda_stream_view stream = cudf::get_default_stream())
+                                   ::cuda::stream_ref stream = cudf::get_default_stream())
 {
   std::size_t total = 0;
   for (auto const& col : ct.columns)
@@ -707,10 +708,10 @@ void init_gpu()
 /// the regular atexit path). The nvcomp-backed operators drive the low-level
 /// batched API with all memory owned by RMM and hold no stream-bound state, so
 /// this stream just needs to outlive the work enqueued on it.
-rmm::cuda_stream_view driver_stream()
+::cuda::stream_ref driver_stream()
 {
   static rmm::cuda_stream stream{rmm::cuda_stream::flags::non_blocking};
-  return stream.view();
+  return stream;
 }
 
 // ── BENCHMARK mode ────────────────────────────────────────────────────────────

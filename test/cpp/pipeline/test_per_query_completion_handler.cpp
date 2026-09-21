@@ -44,7 +44,7 @@ using sirius::pipeline::sirius_pipeline_task_global_state;
 std::shared_ptr<sirius_pipeline_task_global_state> make_global_state(
   const sirius::pipeline::pipeline_build_context& ctx, std::shared_ptr<completion_handler> handler)
 {
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(ctx);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
   auto gs       = std::make_shared<sirius_pipeline_task_global_state>(
     pipeline, sirius::test::make_test_telemetry_context());
   gs->set_completion_handler(std::move(handler));
@@ -140,7 +140,7 @@ TEST_CASE("a global state built without a query carries no handler",
           "[completion_handler][per_query]")
 {
   sirius::pipeline::pipeline_build_context ctx{nullptr, true};
-  auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(ctx);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(ctx);
   sirius_pipeline_task_global_state gs(pipeline, sirius::test::make_test_telemetry_context());
 
   // Reporting sites are all null-guarded, so a state built outside a query (tests) is inert

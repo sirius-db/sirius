@@ -61,10 +61,10 @@ struct schedule_fixture {
   }
 
   //! Place @p op in a pipeline the way planner::query::build_indices does.
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> place(
-    sirius::op::sirius_physical_operator& op, sirius::query_id_t query_id)
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> place(sirius::op::sirius_physical_operator& op,
+                                                           sirius::query_id_t query_id)
   {
-    auto pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+    auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
     sirius::pipeline::sirius_pipeline_build_state build_state;
     build_state.set_pipeline_source(*pipeline, op);
     build_state.set_pipeline_sink(*pipeline, &op, /*sink_pipeline_count=*/1);

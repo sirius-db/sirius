@@ -39,8 +39,7 @@
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
-
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -173,7 +172,7 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
-  nvtx3::scoped_range nvtx_range{"sirius::query"};
+  nvtx_scoped_range nvtx_range{"sirius::query"};
   query_handle_->executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -292,8 +291,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
   // Build meta-pipeline tree from operator plan
   pipeline::sirius_pipeline_build_state state;
-  auto root_pipeline =
-    duckdb::make_shared_ptr<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
+  auto root_pipeline = std::make_shared<pipeline::sirius_meta_pipeline>(build_ctx, state, nullptr);
   root_pipeline->build(*sirius_physical_plan);
   root_pipeline->ready();
   root_pipeline->get_pipelines(sirius_root_pipelines, false);

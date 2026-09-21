@@ -16,7 +16,7 @@
 
 #include "io/rest/rest_ioctx.hpp"
 
-#include "io/s3/sigv4.hpp"
+#include "io/rest/s3/sigv4.hpp"
 #include "io/uri_parser.hpp"
 
 #include <algorithm>
@@ -152,7 +152,7 @@ std::size_t rest_ioctx::list_max_matches() const
                            : _reactors.front()->get_config().list_max_matches;
 }
 
-std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
+std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);
   if (parsed.scheme != "s3") {
@@ -172,7 +172,7 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path)
                                           std::move(head.etag));
 }
 
-std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
+std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, open_hint hint)
 {
   if (hint == open_hint::parquet_footer_probe) {
     return create_footer_probe_object(std::move(path));
@@ -180,8 +180,7 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
   return create_io_object(std::move(path));
 }
 
-std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
-                                                               std::uint64_t known_size)
+std::shared_ptr<io_object> rest_ioctx::create_io_object(std::string path, std::uint64_t known_size)
 {
   auto parsed = sirius::io::parse(path);
   if (parsed.scheme != "s3") {
@@ -196,7 +195,7 @@ std::shared_ptr<sirius_io_object> rest_ioctx::create_io_object(std::string path,
                                           static_cast<size_t>(known_size));
 }
 
-std::shared_ptr<sirius_io_object> rest_ioctx::create_footer_probe_object(std::string path)
+std::shared_ptr<io_object> rest_ioctx::create_footer_probe_object(std::string path)
 {
   auto parsed = sirius::io::parse(path);
   if (parsed.scheme != "s3") {

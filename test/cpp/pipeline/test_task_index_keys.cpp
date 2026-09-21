@@ -45,16 +45,16 @@ using sirius::pipeline::index_keys_for;
 class plain_task : public sirius::parallel::itask {
  public:
   plain_task() : itask(/*task_id=*/1, nullptr, nullptr) {}
-  void execute(rmm::cuda_stream_view /*stream*/) override {}
+  void execute(::cuda::stream_ref /*stream*/) override {}
 };
 
 struct task_fixture {
   //! A pipeline needs a real source/sink: ~gpu_pipeline_task calls mark_task_completed(), which
   //! walks the pipeline's operators.
-  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> make_pipeline(
+  std::shared_ptr<sirius::pipeline::sirius_pipeline> make_pipeline(
     sirius::query_id_t query_id, sirius::exec::queue_priority priority)
   {
-    auto pipeline  = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+    auto pipeline  = std::make_shared<sirius::pipeline::sirius_pipeline>(build_ctx);
     auto& op       = *operators.emplace_back(std::make_unique<sirius::op::sirius_physical_operator>(
       sirius::op::SiriusPhysicalOperatorType::FILTER,
       duckdb::vector<sirius::logical_type>{},
@@ -71,7 +71,7 @@ struct task_fixture {
   }
 
   std::unique_ptr<sirius::pipeline::gpu_pipeline_task> make_task(
-    const duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>& pipeline,
+    const std::shared_ptr<sirius::pipeline::sirius_pipeline>& pipeline,
     sirius::exec::queue_priority priority)
   {
     auto global_state = std::make_shared<sirius::pipeline::gpu_pipeline_task_global_state>(

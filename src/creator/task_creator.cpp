@@ -331,7 +331,7 @@ void task_creator::reset_all()
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   op::sirius_physical_operator* node,
-  std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
+  std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
 {
   if (node == nullptr) { return nullptr; }
   if (auto pipeline = node->get_pipeline()) { visited_pipelines.push_back(std::move(pipeline)); }
@@ -537,7 +537,7 @@ void task_creator::manager_loop()
       continue;
     }
 
-    std::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
+    std::vector<std::shared_ptr<pipeline::sirius_pipeline>> visited_pipelines;
     node = get_operator_for_next_task(node, visited_pipelines);
 
     if (node == nullptr) {

@@ -15,7 +15,7 @@
  */
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/stream_compaction.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 
 #include <rmm/detail/error.hpp>
@@ -50,7 +50,7 @@ bool positional_delete_filter::affects(batch_layout layout) const
 
 std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
                                                              batch_layout layout,
-                                                             rmm::cuda_stream_view stream,
+                                                             ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
 {
   auto const num_rows = static_cast<int64_t>(tbl->num_rows());
@@ -97,12 +97,12 @@ std::unique_ptr<cudf::table> positional_delete_filter::apply(std::unique_ptr<cud
                                keep.data(),
                                static_cast<size_t>(num_rows) * sizeof(uint8_t),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
   // `keep` is host memory feeding an async copy and must outlive it. A pinned staging buffer
   // would avoid the sync; a one-byte-per-row mask does not justify it yet.
-  stream.synchronize();
+  stream.sync();
 
-  return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream, mr);
+  return sirius::ApplyRetentionMask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan
