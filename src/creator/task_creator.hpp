@@ -88,20 +88,13 @@ struct task_creation_request {
   int device_id = exec::no_preferred_device;
 };
 
-/// Why @ref task_creator::get_operator_for_next_task stopped.
-enum class next_task_state {
-  /// An operator is ready to have a task created for it.
-  ready,
-  /// No operator in the chain can produce right now.  Not necessarily terminal:
-  /// an operator waiting on input reports this until its input arrives.
-  depleted,
-};
-
 /// The operator @ref task_creator::get_operator_for_next_task settled on,
-/// together with what it means -- see @c next_task_state.
+/// together with whether it is ready to have a task created. A false value is
+/// not necessarily terminal: an operator waiting on input is not ready until
+/// its input arrives.
 struct next_task_result {
   op::sirius_physical_operator* op{nullptr};
-  next_task_state state{next_task_state::depleted};
+  bool is_ready{false};
 };
 
 class task_creator {

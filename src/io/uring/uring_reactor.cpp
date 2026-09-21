@@ -338,7 +338,7 @@ void attach_common(uring_io_op& op,
 
   std::vector<std::unique_ptr<uring_io_op>> result;
 
-  if (slice.is_staged()) {
+  if (slice.needs_staging()) {
     if (!slice.has_device_request()) {
       throw std::invalid_argument("uring_reactor: staging requires a device destination");
     }

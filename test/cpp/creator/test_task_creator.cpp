@@ -394,7 +394,7 @@ TEST_CASE("get_operator_for_next_task records every pipeline the hint walk visit
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto const next = creator.get_operator_for_next_task(op_a.get(), visited);
 
-  REQUIRE(next.state == next_task_state::depleted);
+  REQUIRE_FALSE(next.is_ready);
   // The last operator actually asked, not the one the request named -- that is
   // what makes a depleted walk attributable.
   REQUIRE(next.op == op_b.get());
@@ -424,7 +424,7 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   auto const next_op = creator.get_operator_for_next_task(mock_op.get(), visited);
 
   // Nothing should be scheduled
-  REQUIRE(next_op.state == next_task_state::depleted);
+  REQUIRE_FALSE(next_op.is_ready);
 }
 
 TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
@@ -464,7 +464,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   std::vector<std::shared_ptr<sirius_pipeline>> visited;
   auto const next_op = creator.get_operator_for_next_task(source_op.get(), visited);
 
-  REQUIRE(next_op.state == next_task_state::ready);
+  REQUIRE(next_op.is_ready);
   REQUIRE(next_op.op == hint_op.get());
 
   // // Verify that schedule was called with the hint_op
