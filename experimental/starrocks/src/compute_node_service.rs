@@ -335,7 +335,7 @@ impl SiriusComputeNodeService {
         Ok(())
     }
 
-    /// Converts a StarRocks thrift plan fragment to Substrait, logs substrait-explain output, and
+    /// Converts a StarRocks thrift plan fragment to Substrait, logs its protobuf debug output, and
     /// returns the translated plan for execution.
     #[instrument(skip_all)]
     fn translate_fragment_logged(
@@ -349,7 +349,7 @@ impl SiriusComputeNodeService {
             .map_err(|err| err.to_string())?;
         info!(
             output_names = ?translated.output_names,
-            plan = %translated.explain(),
+            plan = ?translated.plan,
             "translated StarRocks plan fragment"
         );
         Self::dump_substrait(&translated, dump_seq);
