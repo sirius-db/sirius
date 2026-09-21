@@ -52,7 +52,7 @@ cudf::ast::expression const& or_join(cudf::ast::tree& tree,
 template <typename ScalarT>
 auto scalar_value_to_host(cudf::scalar const& source,
                           int source_device,
-                          rmm::cuda_stream_view source_stream)
+                          ::cuda::stream_ref source_stream)
 {
   rmm::cuda_set_device_raii source_guard{rmm::cuda_device_id{source_device}};
   auto const& typed = static_cast<ScalarT const&>(source);
@@ -62,8 +62,8 @@ auto scalar_value_to_host(cudf::scalar const& source,
 
 std::unique_ptr<cudf::scalar> clone_scalar_to_device(cudf::scalar const& source,
                                                      int source_device,
-                                                     rmm::cuda_stream_view source_stream,
-                                                     rmm::cuda_stream_view target_stream,
+                                                     ::cuda::stream_ref source_stream,
+                                                     ::cuda::stream_ref target_stream,
                                                      rmm::device_async_resource_ref target_mr)
 {
   switch (source.type().id()) {

@@ -20,7 +20,7 @@
 namespace simpatico {
 
 std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
   auto& offsets   = channels_[0];
   auto& chars     = channels_[1];
@@ -51,7 +51,7 @@ std::unique_ptr<cudf::column> str_split_compressed_representation::decompress(
 
 std::unique_ptr<compressed_representation> str_split_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (column_to_compress.type().id() != cudf::type_id::STRING) {
@@ -65,10 +65,10 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
     // cudf::make_empty_column(STRING), has no offsets child to copy from.
     auto offsets = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::INT32}, 1, cudf::mask_state::UNALLOCATED, stream, mr);
-    cudaMemsetAsync(offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.value());
+    cudaMemsetAsync(offsets->mutable_view().head<void>(), 0, sizeof(std::int32_t), stream.get());
     auto chars = cudf::make_fixed_width_column(
       cudf::data_type{cudf::type_id::UINT8}, 0, cudf::mask_state::UNALLOCATED, stream, mr);
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
     return std::make_unique<str_split_compressed_representation>(
       0, std::move(offsets), std::move(chars), nullptr);
   }
@@ -115,11 +115,11 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
                     scv.chars_begin(stream),
                     static_cast<size_t>(chars_bytes),
                     cudaMemcpyDeviceToDevice,
-                    stream.value());
+                    stream.get());
     std::int64_t const padded = static_cast<std::int64_t>(nelem) * bpe;
     if (padded > chars_bytes) {
       cudaMemsetAsync(
-        dst + chars_bytes, 0, static_cast<size_t>(padded - chars_bytes), stream.value());
+        dst + chars_bytes, 0, static_cast<size_t>(padded - chars_bytes), stream.get());
     }
   }
 
@@ -132,7 +132,7 @@ std::unique_ptr<compressed_representation> str_split_compressor::compress(
     null_mask               = std::make_unique<cudf::column>(
       cudf::data_type{cudf::type_id::UINT8}, mbytes, std::move(mbuf), rmm::device_buffer{}, 0);
   }
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
 
   return std::make_unique<str_split_compressed_representation>(
     n, std::move(offsets), std::move(chars), std::move(null_mask));

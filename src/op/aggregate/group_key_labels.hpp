@@ -20,8 +20,9 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 #include <memory>
 
@@ -51,7 +52,7 @@ struct group_key_labels {
  * @return The sorted unique keys and one non-nullable INT32 label per input row
  */
 [[nodiscard]] group_key_labels make_group_key_labels(cudf::table_view const& keys,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::op::detail

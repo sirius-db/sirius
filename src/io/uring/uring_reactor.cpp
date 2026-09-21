@@ -233,7 +233,7 @@ struct io_slot {
                                                           size_t req_offset,
                                                           size_t req_size,
                                                           uint8_t* dst,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           int device_id,
                                                           size_t file_size,
                                                           std::shared_ptr<request_manager> manager)
@@ -284,7 +284,7 @@ struct io_slot {
   size_t req_offset,
   size_t req_size,
   uint8_t* dst,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   int device_id,
   size_t file_size,
   std::shared_ptr<request_manager> manager)
@@ -583,7 +583,7 @@ request_type_ptr uring_reactor::prep_device_rx_request(const reactor_config_type
                                                        uint8_t* dst,
                                                        size_t offset,
                                                        size_t size,
-                                                       rmm::cuda_stream_view stream,
+                                                       ::cuda::stream_ref stream,
                                                        int device_id)
 {
   if (size == 0) { return rx_request::create({}); }
@@ -624,7 +624,7 @@ request_type_ptr uring_reactor::prep_host_to_device_rx_request(
   uint8_t* dst,
   size_t offset,
   size_t size,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   int device_id)
 {
   // Device read staged through caller-supplied pinned host buffers.  The

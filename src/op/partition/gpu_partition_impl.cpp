@@ -31,7 +31,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   const std::vector<int>& partition_key_idx,
   const std::vector<cudf::data_type>& partition_key_cast_types,
   int num_partitions,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
@@ -112,7 +112,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
 std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
   const cucascade::read_only_data_batch& input,
   int num_partitions,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   cucascade::memory::memory_space& memory_space,
   const telemetry::batch_telemetry_info& telemetry_info)
 {

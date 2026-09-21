@@ -38,7 +38,8 @@
 
 // rmm
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda/stream>
 
 // duckdb
 #include <duckdb/common/vector_size.hpp>
@@ -179,7 +180,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 
 void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
                            std::shared_ptr<data_batch> const& batch,
-                           rmm::cuda_stream_view stream)
+                           ::cuda::stream_ref stream)
 {
   // Use get_cudf_table_view which internally acquires a read-only lock.
   auto const view       = sirius::get_cudf_table_view(*batch);

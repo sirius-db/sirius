@@ -343,7 +343,7 @@ std::unique_ptr<cudf::table> decompress_with_pushdown(simpatico::compressed_tabl
                                                       std::span<const std::size_t> selected,
                                                       pushdown_request const& request,
                                                       decode_visibility_mask const& keep_mask,
-                                                      rmm::cuda_stream_view stream,
+                                                      ::cuda::stream_ref stream,
                                                       rmm::device_async_resource_ref mr,
                                                       pushdown_outcome& outcome)
 {
@@ -596,7 +596,7 @@ decompress_result decompress_chunk(simpatico::compressed_table const& chunk,
                                    std::span<const std::size_t> selected,
                                    decompression_pushdown_scan const* scan,
                                    decode_visibility_mask const& keep_mask,
-                                   rmm::cuda_stream_view stream,
+                                   ::cuda::stream_ref stream,
                                    rmm::device_async_resource_ref mr)
 {
   decompress_result out;

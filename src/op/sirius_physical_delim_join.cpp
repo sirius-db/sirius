@@ -194,7 +194,7 @@ void sirius_physical_right_delim_join::build_pipelines(
 }
 
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
   return std::make_unique<pipelineable_operator_data>(
@@ -202,7 +202,7 @@ std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
 }
 
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
   return std::make_unique<pipelineable_operator_data>(

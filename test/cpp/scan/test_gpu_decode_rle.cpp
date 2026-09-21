@@ -63,7 +63,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
 {
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = type;
@@ -75,7 +75,7 @@ std::vector<T> decode_one(std::vector<uint8_t> const& bytes,
                                         0,
                                         row_count}}});
 
-  auto t = gpu_decode_table({col}, stream.view(), mr);
+  auto t = gpu_decode_table({col}, stream, mr);
   REQUIRE(t->num_rows() == static_cast<cudf::size_type>(row_count));
   return download<T>(t->get_column(0).view().data<T>(), row_count, stream.value());
 }
@@ -201,8 +201,8 @@ TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
 
   auto bytes_a = make_rle_block<int32_t>({7}, {50});
   auto bytes_b = make_rle_block<int32_t>({100, 200}, {30, 20});  // 50 rows total
-  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream.view());
-  rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream.view());
+  rmm::device_buffer d_a(bytes_a.data(), bytes_a.size(), stream);
+  rmm::device_buffer d_b(bytes_b.data(), bytes_b.size(), stream);
 
   gpu_column_decode_input col;
   col.out_type   = I32;
@@ -214,7 +214,7 @@ TEST_CASE("gpu_decode_table RLE - multi-segment column", "[scan][decode][rle]")
       gpu_segment_desc{
         static_cast<uint8_t const*>(d_b.data()), static_cast<uint32_t>(d_b.size()), 50, 50}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto t   = gpu_decode_table({col}, stream, mr);
   auto out = download<int32_t>(t->get_column(0).view().data<int32_t>(), 100, stream.value());
   for (uint32_t i = 0; i < 50; ++i)
     REQUIRE(out[i] == 7);
@@ -282,7 +282,7 @@ TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctl
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 30;
   gpu_column_decode_input col;
@@ -293,7 +293,7 @@ TEST_CASE("gpu_decode_table RLE - narrow-type alignment padding decodes correctl
     {CompressionType::COMPRESSION_RLE,
      {gpu_segment_desc{static_cast<uint8_t const*>(d_seg.data()), seg_bytes, 0, total_rows}}});
 
-  auto t   = gpu_decode_table({col}, stream.view(), mr);
+  auto t   = gpu_decode_table({col}, stream, mr);
   auto out = download<uint8_t>(t->get_column(0).view().data<uint8_t>(), total_rows, stream.value());
   auto expected = expand_runs<uint8_t>(values, counts);
   REQUIRE(out == expected);
@@ -310,9 +310,8 @@ inline std::vector<int32_t> decode_invalid_with_canary(rmm::cuda_stream& stream,
                                                        uint32_t total_rows)
 {
   std::vector<uint8_t> canary(size_t{total_rows} * sizeof(int32_t), 0xCC);
-  rmm::device_buffer d_out(canary.data(), canary.size(), stream.view());
-  decode_rle_data(
-    run, static_cast<uint8_t*>(d_out.data()), I32, sizeof(int32_t), stream.view(), mr);
+  rmm::device_buffer d_out(canary.data(), canary.size(), stream);
+  decode_rle_data(run, static_cast<uint8_t*>(d_out.data()), I32, sizeof(int32_t), stream, mr);
   return download<int32_t>(d_out.data(), total_rows, stream.value());
 }
 }  // namespace
@@ -344,7 +343,7 @@ TEST_CASE("gpu_decode_table RLE - over-cap entry count zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
   gpu_codec_run run{
     CompressionType::COMPRESSION_RLE,
     {gpu_segment_desc{
@@ -364,7 +363,7 @@ TEST_CASE("gpu_decode_table RLE - rle_count_offset past segment zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 32;
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -387,7 +386,7 @@ TEST_CASE("gpu_decode_table RLE - rle_count_offset below header zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 16;
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -408,7 +407,7 @@ TEST_CASE("gpu_decode_table RLE - count walk underflows row_count zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 100;  // claim more than counts provide
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -429,7 +428,7 @@ TEST_CASE("gpu_decode_table RLE - count walk overflows row_count zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 100;
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -452,7 +451,7 @@ TEST_CASE("gpu_decode_table RLE - zero count with sum underflow zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 20;
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -474,7 +473,7 @@ TEST_CASE("gpu_decode_table RLE - segment too small for header zero-fills",
 
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   uint32_t const total_rows = 8;
   gpu_codec_run run{CompressionType::COMPRESSION_RLE,
@@ -493,7 +492,7 @@ TEST_CASE("gpu_decode_table RLE - unsupported type_size throws", "[scan][decode]
   rmm::cuda_stream stream;
   rmm::mr::cuda_async_memory_resource mr;
   auto bytes = make_rle_block<int32_t>({1}, {8});
-  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream.view());
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
 
   auto const DEC128 = cudf::data_type{cudf::type_id::DECIMAL128, /*scale=*/-2};
   gpu_column_decode_input col;
@@ -503,7 +502,7 @@ TEST_CASE("gpu_decode_table RLE - unsupported type_size throws", "[scan][decode]
     {CompressionType::COMPRESSION_RLE,
      {gpu_segment_desc{
        static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, 8}}});
-  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream.view(), mr),
+  REQUIRE_THROWS_WITH(gpu_decode_table({col}, stream, mr),
                       Catch::Contains("viability invariant violated"));
 }
 
@@ -531,7 +530,7 @@ auto build_uniform_runs_column(uint32_t n_runs,
   segs.reserve(n_segs);
   auto seg_bytes = make_uniform_runs<T>(n_runs, run_len);
   for (uint32_t i = 0; i < n_segs; ++i) {
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
                     static_cast<uint32_t>(bufs.back().size()),
                     i * seg_rows,
@@ -558,7 +557,7 @@ TEST_CASE("gpu_decode_table RLE bench-scale - long_runs verify", "[scan][decode]
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
 
-  verify_decoded_column<int64_t>(stream.view(), mr, col, [](uint32_t r) -> int64_t {
+  verify_decoded_column<int64_t>(stream, mr, col, [](uint32_t r) -> int64_t {
     return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN);
   });
 }
@@ -573,7 +572,7 @@ TEST_CASE("gpu_decode_table RLE bench-scale - medium_runs verify", "[scan][decod
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int64_t>(N_RUNS, RUN_LEN, N_SEGS, I64, stream, bufs);
 
-  verify_decoded_column<int64_t>(stream.view(), mr, col, [](uint32_t r) -> int64_t {
+  verify_decoded_column<int64_t>(stream, mr, col, [](uint32_t r) -> int64_t {
     return static_cast<int64_t>((r % SEG_ROWS) / RUN_LEN);
   });
 }
@@ -591,7 +590,7 @@ TEST_CASE("gpu_decode_table RLE bench-scale - short_runs verify (gmem path)",
   std::vector<rmm::device_buffer> bufs;
   auto col = build_uniform_runs_column<int32_t>(N_RUNS, RUN_LEN, N_SEGS, I32, stream, bufs);
 
-  verify_decoded_column<int32_t>(stream.view(), mr, col, [](uint32_t r) -> int32_t {
+  verify_decoded_column<int32_t>(stream, mr, col, [](uint32_t r) -> int32_t {
     return static_cast<int32_t>((r % SEG_ROWS) / RUN_LEN);
   });
 }
@@ -613,7 +612,7 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify", "[scan][decod
 
   for (uint32_t s = 0; s < N_SEGS; ++s) {
     auto seg_bytes = make_pareto_runs<int64_t>(SEG_ROWS, /*seed=*/s + 1, 400.0);
-    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream.view());
+    bufs.emplace_back(seg_bytes.data(), seg_bytes.size(), stream);
     segs.push_back({static_cast<uint8_t const*>(bufs.back().data()),
                     static_cast<uint32_t>(bufs.back().size()),
                     s * SEG_ROWS,
@@ -643,5 +642,5 @@ TEST_CASE("gpu_decode_table RLE bench-scale - pareto_runs verify", "[scan][decod
   col.data.push_back({CompressionType::COMPRESSION_RLE, segs});
 
   verify_decoded_column<int64_t>(
-    stream.view(), mr, col, [&](uint32_t r) -> int64_t { return expected[r]; });
+    stream, mr, col, [&](uint32_t r) -> int64_t { return expected[r]; });
 }

@@ -1998,25 +1998,21 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   rmm::cuda_stream build_stream;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (allocator == nullptr ||
-      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+      !allocator->attach_reservation_to_tracker(build_stream, std::move(reservation))) {
     throw InvalidInputException(
       "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
   }
   // Release the reservation whether the build succeeds or throws. On release the
   // arena hands back its unused slack and keeps the resident index accounted.
   absl::Cleanup reset_reservation = [allocator, &build_stream] {
-    allocator->reset_stream_reservation(build_stream.view());
+    allocator->reset_stream_reservation(build_stream);
   };
 
   // Build IVF-Flat on the build stream
   std::unique_ptr<sirius::vss::any_cuvs_index> handle;
   try {
-    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
-                                                            dim,
-                                                            n_lists,
-                                                            metric,
-                                                            target_space->get_default_allocator(),
-                                                            build_stream.view());
+    handle = sirius::vss::build_ivf_flat_index_from_batches(
+      chunk_views, dim, n_lists, metric, target_space->get_default_allocator(), build_stream);
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
@@ -2040,9 +2036,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists      = static_cast<int64_t>(n_lists);
   meta.metric       = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
-  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
-    allocator->get_peak_allocated_bytes(build_stream.view());
+    allocator->get_peak_allocated_bytes(build_stream);
 
   // Release the reservation before the build stream moves into the cache.
   std::move(reset_reservation).Invoke();
@@ -3002,16 +2998,31 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
   auto const bytes = UBigIntValue::Get(parameter);
-  if (bytes == 0) {
-    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
-  }
-  auto* params = get_operator_params(context);
+  auto* params     = get_operator_params(context);
   if (!params) { return; }
   auto slot                          = lock_operator_params_slot(context);
   params->dense_count_join_max_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
                    params->dense_count_join_max_bytes);
+}
+
+static void SetDenseCountJoinMemoryFraction(ClientContext& context,
+                                            SetScope scope,
+                                            Value& parameter)
+{
+  auto const fraction = DoubleValue::Get(parameter);
+  if (!(fraction > 0.0) || fraction > 1.0) {
+    throw InvalidInputException("dense_count_join_memory_fraction must be in (0.0, 1.0], got %f",
+                                fraction);
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                = lock_operator_params_slot(context);
+  params->dense_count_join_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MEMORY_FRACTION to {}",
+                   params->dense_count_join_memory_fraction);
 }
 
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -3297,6 +3308,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
                     SetDenseCountJoinMaxBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_memory_fraction",
+                    "internal test hook for the derived dense count-join histogram budget",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(operator_defaults.dense_count_join_memory_fraction),
+                    SetDenseCountJoinMemoryFraction);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",
