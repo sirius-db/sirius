@@ -320,9 +320,16 @@ class chunk_state {
   static constexpr std::uint32_t MAX_PINS        = (1U << 12) - 1;
   static constexpr std::uint32_t MAX_SUBSCRIBERS = (1U << 16) - 1;
 
-  /// Widest extent the packed field can express, in pages.  The chunk size must
-  /// stay under this many pages; @ref buffer_pool checks it at construction.
+  /// Widest partial extent the packed field can express, in pages.
   [[nodiscard]] static constexpr std::uint32_t max_fill_pages() noexcept { return (1U << 14) - 1; }
+
+  /// Largest supported cache chunk.  Partial fills use at most
+  /// @ref max_fill_pages pages; the separate full bit represents this final
+  /// page as part of the whole chunk without storing its page count.
+  [[nodiscard]] static constexpr std::size_t max_chunk_bytes() noexcept
+  {
+    return (static_cast<std::size_t>(max_fill_pages()) + 1) * io::IO_BLOCK_SIZE;
+  }
 
   chunk_state() noexcept = default;
 

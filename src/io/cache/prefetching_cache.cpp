@@ -264,15 +264,13 @@ prefetching_cache::prefetching_cache(
     _armed(_io_ctx->can_use_prefetching_cache())
 {
   _chunk_size          = _pool->chunk_size();
-  auto const max_bytes = static_cast<size_t>(chunk_state::max_fill_pages()) * io::IO_BLOCK_SIZE;
+  auto const max_bytes = chunk_state::max_chunk_bytes();
   if (_chunk_size == 0) {
     throw std::invalid_argument("prefetching_cache: chunk size must be non-zero");
   }
   if (_chunk_size > max_bytes) {
-    throw std::invalid_argument(
-      std::format("prefetching_cache: chunk size {} exceeds the {}-byte packed fill limit",
-                  _chunk_size,
-                  max_bytes));
+    throw std::invalid_argument(std::format(
+      "prefetching_cache: chunk size {} exceeds the {}-byte maximum", _chunk_size, max_bytes));
   }
 
   _evictor_thread = std::jthread([this](const std::stop_token& st) { evict_loop(st); },
