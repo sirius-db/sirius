@@ -342,6 +342,7 @@ set(EXTENSION_SOURCES
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
+    src/exec/exchange_staging_arena.cpp
     src/exec/stream_session.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
@@ -852,12 +853,14 @@ set(TEST_SOURCES
     test/cpp/downgrade/test_spill_policy.cpp
     test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
+    test/cpp/exec/test_exchange_staging_arena.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/event/test_query_event_publisher.cpp
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
+    test/cpp/exec/test_sirius_ffi_packed.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
     test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
@@ -1119,6 +1122,13 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
+
+# Vendored Substrait protobuf must beat conda protobuf: sirius_extension
+# compiles the generated .pb.cc against these headers, so a test that includes
+# plan.pb.h has to see the same ones (ODR).
+target_include_directories(
+  sirius_unittest BEFORE PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/third_party
+                                 ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
 target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")

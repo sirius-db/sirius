@@ -50,15 +50,31 @@ mod compute_node_service;
 mod engine;
 mod file_schema;
 mod fragment_executor;
+mod local_exchange;
+mod nixl_chunk;
+mod nixl_transport;
+#[cfg(any(test, feature = "sirius-engine"))]
+mod parked_registry;
 mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
 
 pub use brpc::BrpcServer;
+pub use compute_node_service::{ExchangeIdentity, SiriusComputeNodeService};
 #[cfg(feature = "sirius-engine")]
 pub use engine::SiriusEngine;
-pub use fragment_executor::{FragmentExecutor, FragmentResult, StubExecutor};
+pub use fragment_executor::{
+    FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch, StubExecutor,
+};
+pub use local_exchange::{LocalExchange, ReadyFragment};
+pub use nixl_chunk::{NixlMdHandler, RemoteLease, StagingLeaseHandler};
+pub use nixl_transport::NixlTransport;
+
+/// Serializes GPU-using tests inside this process. Cross-process GPU exclusion is the
+/// `gpu-lock.sh` wrapper used by the e2e scripts, not this mutex.
+#[cfg(all(test, feature = "nixl-transport"))]
+pub(crate) static GPU_ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const COMPUTE_NODE_PROC_PATH: &str = "/compute_nodes";
 

@@ -20,8 +20,10 @@
 
 #include "sirius_ffi.hpp"
 
-#include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
-#include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
+#include "core_functions_extension.hpp"        // duckdb::CoreFunctionsExtension
+#include "cudf/cudf_utils.hpp"                 // sirius::get_cudf_type
+#include "data/data_batch_utils.hpp"           // sirius::get_cudf_table_view, make_data_batch
+#include "data/sirius_converter_registry.hpp"  // sirius::converter_registry
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"    // duckdb::ResultArrowArrayStreamWrapper
 #include "duckdb/common/enums/optimizer_type.hpp"          // duckdb::OptimizerType
 #include "duckdb/execution/column_binding_resolver.hpp"    // duckdb::ColumnBindingResolver
@@ -35,6 +37,7 @@
 #include "duckdb/optimizer/optimizer.hpp"                  // duckdb::Optimizer
 #include "duckdb/parser/statement/relation_statement.hpp"  // duckdb::RelationStatement
 #include "duckdb/planner/planner.hpp"                      // duckdb::Planner
+#include "exec/exchange_staging_arena.hpp"                 // sirius::exec::exchange_staging_arena
 #include "exec/stream_bind_catalog.hpp"                    // sirius::exec::stream_bind_catalog
 #include "exec/stream_plan_bindings.hpp"  // sirius::exec::register_stream_source_function
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
@@ -46,8 +49,22 @@
 #include "sirius_context.hpp"                          // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/span.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
+#include <string>
+#include <vector>
 
 namespace sirius::ffi {
 
@@ -56,9 +73,36 @@ namespace {
 constexpr const char* kSiriusStateKey   = "sirius_state";
 constexpr const char* kQueryLabel       = "sirius_ffi";
 constexpr duckdb::idx_t kArrowBatchSize = 1u << 20;
+/// chunked_pack gather granularity. Every next() span must be exactly this long, so a lease is
+/// the payload plus one chunk of slack for the final span. 1 MiB is cudf's minimum.
+constexpr std::size_t kPackChunkBytes = 8u << 20;
 
 // DuckDB view name a plan uses to read input stream `id`.
 std::string stream_view_name_of(std::uint64_t id) { return "sirius_stream_" + std::to_string(id); }
+
+void check_declared_schema(const sirius::exec::stream_input_spec& declared,
+                           const cudf::table_view& view,
+                           std::uint64_t stream_id,
+                           const char* what)
+{
+  if (static_cast<std::size_t>(view.num_columns()) != declared.types.size()) {
+    throw sirius::invalid_input_exception(
+      std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " carries " +
+      std::to_string(view.num_columns()) + " columns but the stream declares " +
+      std::to_string(declared.types.size()));
+  }
+  for (std::size_t i = 0; i < declared.types.size(); ++i) {
+    const auto expected = sirius::get_cudf_type(declared.types[i]);
+    const auto actual   = view.column(static_cast<cudf::size_type>(i)).type();
+    if (actual != expected) {
+      throw sirius::invalid_input_exception(
+        std::string("Fragment: ") + what + " for stream " + std::to_string(stream_id) + " column " +
+        std::to_string(i) + " (" + declared.names[i] + ") is declared " +
+        declared.types[i].to_string() + " (" + cudf::type_to_name(expected) + ") but carries " +
+        cudf::type_to_name(actual));
+    }
+  }
+}
 
 // Lower a Substrait plan to a bound+optimized DuckDB LogicalOperator.
 struct lowered_plan {
@@ -105,6 +149,12 @@ struct Context::Impl {
   duckdb::unique_ptr<duckdb::Connection> conn;
   //! stream_bind_catalog: also in registered_state; held here past registered_state resets.
   duckdb::shared_ptr<sirius::exec::stream_bind_catalog> stream_catalog;
+  //! Cross-node exchange staging (opt-in via SIRIUS_EXCHANGE_STAGING_BYTES; null otherwise, and
+  //! every staging call errors loudly). Plain cudaMalloc by contract — see the arena's header.
+  //! `shared_ptr` so a `StagingArena` handle can serve leases from other threads (the arena's
+  //! internal mutex makes that safe) and outlive this context; there is still exactly ONE
+  //! allocator — the handle shares it, never mirrors it.
+  std::shared_ptr<sirius::exec::exchange_staging_arena> staging_arena;
 
   void bring_up(sirius::sirius_config& config)
   {
@@ -131,6 +181,10 @@ struct Context::Impl {
     stream_catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
     client.registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, stream_catalog);
     sirius::exec::register_stream_source_function(*db->instance);
+
+    // After engine bring-up so the arena's cudaMalloc comes out of the headroom the operator
+    // left beside the pool budget, not out of memory the pool then misses.
+    staging_arena                  = sirius::exec::exchange_staging_arena::from_env();
     client.config.enable_optimizer = true;
     auto& disabled = duckdb::DBConfig::GetConfig(client).options.disabled_optimizers;
     disabled.insert(duckdb::OptimizerType::IN_CLAUSE);
@@ -210,12 +264,63 @@ void Context::execute_substrait(const std::string& plan, std::uintptr_t out_stre
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
 }
 
+std::uint64_t Context::staging_lease(std::uint64_t len)
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).lease(len);
+}
+
+void Context::staging_release(std::uint64_t offset)
+{
+  sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).release(offset);
+}
+
+std::uintptr_t Context::staging_base() const
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).base();
+}
+
+std::uint64_t Context::staging_capacity() const
+{
+  return sirius::exec::exchange_staging_arena::require(impl_->staging_arena.get()).capacity();
+}
+
+std::unique_ptr<StagingArena> Context::staging_arena_handle() const
+{
+  if (impl_->staging_arena == nullptr) { return nullptr; }
+  return std::make_unique<StagingArena>(impl_->staging_arena);
+}
+
 std::unique_ptr<Context> make_context() { return std::make_unique<Context>(); }
 
 std::unique_ptr<Context> make_context_from_config(const std::string& config_path)
 {
   return std::make_unique<Context>(config_path);
 }
+
+// ---------------------------------------------------------------------------
+// StagingArena
+// ---------------------------------------------------------------------------
+
+// Thread-safety contract (documented on the class): every method below only touches the arena,
+// whose lease/release serialize on its internal std::mutex and make no CUDA calls — so unlike
+// the Context methods above, these are callable from any thread.
+
+StagingArena::StagingArena(std::shared_ptr<sirius::exec::exchange_staging_arena> arena)
+  : arena_(std::move(arena))
+{
+}
+
+StagingArena::~StagingArena() = default;
+
+std::uint64_t StagingArena::lease(std::uint64_t len) const { return arena_->lease(len); }
+
+void StagingArena::release(std::uint64_t offset) const { arena_->release(offset); }
+
+std::uintptr_t StagingArena::base() const noexcept { return arena_->base(); }
+
+std::uint64_t StagingArena::capacity() const noexcept { return arena_->capacity(); }
+
+std::size_t StagingArena::outstanding() const { return arena_->outstanding(); }
 
 // ---------------------------------------------------------------------------
 // Fragment
@@ -412,7 +517,8 @@ void Fragment::build(const std::string& substrait_plan)
   impl_->require_not_built("build");
 
   // Transaction must be open for: type-name parsing (catalog lookup) and CREATE VIEW.
-  // It must be committed before QueryBeginStandalone acquires the lifecycle mutex.
+  // Committed before StandaloneQueryScope so QueryBeginStandalone does not take the
+  // lifecycle slot while this connection still holds a DuckDB transaction.
   impl_->ctx.conn->BeginTransaction();
   impl_->transaction_open = true;
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved;
@@ -445,6 +551,12 @@ void Fragment::build(const std::string& substrait_plan)
         std::to_string(impl_->outputs.size()) +
         " output stream(s); routing needs at least two destinations");
     }
+
+    // Substrait lowering binds parquet_scan / views through DuckDB catalog — same
+    // ActiveTransaction requirement as Context::execute_substrait. A second short
+    // transaction, after the slot is held, so local_files plans can bind.
+    impl_->ctx.conn->BeginTransaction();
+    impl_->transaction_open = true;
 
     if (impl_->is_result()) {
       // A result fragment takes the single-shot execution path; its leaves may be streaming
@@ -485,7 +597,9 @@ void Fragment::build(const std::string& substrait_plan)
       impl_->fragment = std::make_unique<sirius::exec::streaming_fragment>(client, std::move(spec));
       impl_->fragment->build(impl_->lifecycle->query_id());
     }
-    impl_->built = true;
+    impl_->ctx.conn->Commit();
+    impl_->transaction_open = false;
+    impl_->built            = true;
   } catch (...) {
     impl_->end_lifecycle();
     throw;
@@ -558,6 +672,147 @@ std::size_t Fragment::relay_from(Fragment& source,
   return moved;
 }
 
+std::unique_ptr<std::vector<std::uint8_t>> Fragment::export_packed(std::uint64_t stream_id,
+                                                                   std::uint64_t& offset,
+                                                                   std::uint64_t& length,
+                                                                   std::uint64_t& rows)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before export_packed()");
+  }
+  // Same "empty vs finished" trap as relay_from: before run(), pull() returning nullopt
+  // cannot be told apart from a drained stream.
+  if (!impl_->ran) {
+    throw sirius::invalid_input_exception(
+      "Fragment: export_packed() requires the fragment to have run — call run() first, otherwise "
+      "an empty stream is indistinguishable from a finished one");
+  }
+  if (impl_->fragment == nullptr) {
+    throw sirius::invalid_input_exception(
+      "Fragment: export_packed() requires an intermediate fragment with output streams — a result "
+      "fragment produces Arrow via result_to_arrow()");
+  }
+  auto& arena = sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get());
+
+  offset     = 0;
+  length     = 0;
+  rows       = 0;
+  auto batch = impl_->session().pull(stream_id);
+  if (!batch) { return nullptr; }
+
+  // The shared lock holds residency and immutability for the whole pack; it releases when this
+  // scope ends, after the packing stream has been synchronized and the data lives in the lease.
+  auto read_only = (*batch)->to_read_only();
+  if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+    throw sirius::invalid_input_exception(
+      "Fragment: batch on output stream " + std::to_string(stream_id) +
+      " is not GPU-resident; exporting a spilled batch is not supported yet");
+  }
+  auto view   = sirius::get_cudf_table_view(read_only);
+  auto* space = read_only.get_memory_space();
+  if (space == nullptr) {
+    throw sirius::invalid_input_exception("Fragment: batch on output stream " +
+                                          std::to_string(stream_id) + " has no memory space");
+  }
+  rows = static_cast<std::uint64_t>(view.num_rows());
+
+  auto stream = cudf::get_default_stream();
+  if (cudaEvent_t writer = read_only.get_writer_event()) {
+    if (auto err = cudaStreamWaitEvent(stream.value(), writer, 0); err != cudaSuccess) {
+      throw sirius::internal_exception("Fragment: cudaStreamWaitEvent failed: {}",
+                                       cudaGetErrorString(err));
+    }
+  }
+
+  auto packer =
+    cudf::chunked_pack::create(view, kPackChunkBytes, stream, space->get_default_allocator());
+  const std::uint64_t total = packer->get_total_contiguous_size();
+
+  // A zero-row batch packs to a metadata-only frame: no payload, no lease. offset==0 with
+  // length==0 means "no lease exists for this batch".
+  if (total == 0) { return packer->build_metadata(); }
+
+  const auto lease_offset = arena.lease(total + kPackChunkBytes);
+  std::unique_ptr<std::vector<std::uint8_t>> metadata;
+  try {
+    auto* lease         = reinterpret_cast<std::uint8_t*>(arena.base()) + lease_offset;
+    std::size_t written = 0;
+    while (packer->has_next()) {
+      written += packer->next(cudf::device_span<std::uint8_t>(lease + written, kPackChunkBytes));
+    }
+    if (written != total) {
+      throw sirius::internal_exception(
+        "Fragment: chunked_pack wrote {} of {} bytes for output stream {}",
+        written,
+        total,
+        stream_id);
+    }
+    metadata = packer->build_metadata();
+    stream.synchronize();
+  } catch (...) {
+    arena.release(lease_offset);
+    throw;
+  }
+  offset = lease_offset;
+  length = total;
+  return metadata;
+}
+
+void Fragment::push_packed(std::uint64_t stream_id,
+                           std::uintptr_t metadata_addr,
+                           std::size_t metadata_len,
+                           std::uint64_t offset,
+                           std::uint64_t length)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before push_packed()");
+  }
+  auto& arena = sirius::exec::exchange_staging_arena::require(impl_->ctx.staging_arena.get());
+  if (metadata_addr == 0 || metadata_len == 0) {
+    throw sirius::invalid_input_exception("Fragment: push_packed() requires pack metadata");
+  }
+  if (offset > arena.capacity() || length > arena.capacity() - offset) {
+    throw sirius::invalid_input_exception(
+      "Fragment: push_packed() range [{}, +{}) exceeds the staging arena capacity {}",
+      offset,
+      length,
+      arena.capacity());
+  }
+
+  auto declared_it = impl_->resolved_inputs.find(stream_id);
+  if (declared_it == impl_->resolved_inputs.end()) {
+    throw sirius::invalid_input_exception("Fragment: push target input stream " +
+                                          std::to_string(stream_id) +
+                                          " was never declared on this fragment");
+  }
+
+  const auto* metadata = reinterpret_cast<const std::uint8_t*>(metadata_addr);
+  const auto* payload  = reinterpret_cast<const std::uint8_t*>(arena.base()) + offset;
+  auto unpacked        = cudf::unpack(metadata, payload);
+  check_declared_schema(declared_it->second, unpacked, stream_id, "packed batch");
+
+  auto* gpu_space = impl_->ctx.context->get_memory_manager().get_memory_space(
+    cucascade::memory::Tier::GPU, /*device_id=*/0);
+  if (gpu_space == nullptr) {
+    throw sirius::internal_exception("Fragment: push_packed() found no GPU memory space");
+  }
+
+  auto stream = cudf::get_default_stream();
+  auto table  = std::make_unique<cudf::table>(unpacked, stream, gpu_space->get_default_allocator());
+  stream.synchronize();
+
+  auto data_batch = sirius::make_data_batch(
+    std::move(table), *gpu_space, stream, telemetry::batch_telemetry_info{});
+  bool const pushed = impl_->session().push(stream_id, std::move(data_batch));
+  // GROUP BY shuffle has no InboundStore: the receiver lease is consumed here. length==0 means the
+  // sender never leased, so offset 0 must not be released.
+  if (length != 0) { arena.release(offset); }
+  if (!pushed) {
+    throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(stream_id) +
+                                          " refused a packed batch; it had already ended");
+  }
+}
+
 void Fragment::close_input(std::uint64_t stream_id, std::uint32_t sender_id)
 {
   if (!impl_->built) {
@@ -618,6 +873,18 @@ void Fragment::result_to_arrow(std::uintptr_t out_stream_addr)
   auto* wrapper =
     new duckdb::ResultArrowArrayStreamWrapper(std::move(impl_->result), kArrowBatchSize);
   *reinterpret_cast<ArrowArrayStream*>(out_stream_addr) = wrapper->stream;
+}
+
+bool Fragment::drained(std::uint64_t stream_id)
+{
+  if (!impl_->built) {
+    throw sirius::invalid_input_exception("Fragment: build() must run before drained()");
+  }
+  if (!impl_->fragment) {
+    throw sirius::invalid_input_exception(
+      "Fragment: drained() is only valid on an intermediate fragment with output streams");
+  }
+  return impl_->session().drained(stream_id);
 }
 
 std::size_t Fragment::output_batch_count(std::uint64_t stream_id) const
