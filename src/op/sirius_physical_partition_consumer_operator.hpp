@@ -20,11 +20,79 @@
 #include "sirius_config.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace sirius {
 namespace op {
+
+/// One physical column of the partial aggregate input, as the PARTITION actually observed it on
+/// the device. Recorded per column rather than summarized because only the MERGE_GROUP_BY consumer
+/// knows which columns are grouping keys and which are aggregate partial states.
+struct bypass_column_meta {
+  /// `cudf::type_id` value, kept as an int so this header stays free of cuDF includes.
+  int type_id = 0;
+  /// Fixed element width in bytes; 0 means the type is not fixed-width (STRING/LIST/STRUCT/
+  /// DICTIONARY32), which the v1 whitelist rejects.
+  uint32_t fixed_width_bytes = 0;
+  /// The column carries a validity mask in at least one input batch, so the merge will allocate
+  /// one for it. Charged explicitly in the memory model rather than being ignored.
+  bool nullable = false;
+};
+
+/// Complete-input metadata for the group-by memory-aware bypass prototype (issue #1746 point 2).
+///
+/// Built by the PARTITION operator, which owns the input repository and its lock, and handed to
+/// the MERGE_GROUP_BY consumer through @ref partition_sizing_input. Populated **only** when the
+/// prototype setting is on: with the setting off the partition never walks its batches for this,
+/// so the default sizing path does no extra work.
+///
+/// Every quantity that can be genuinely unknown is an optional. A missing value and a real zero
+/// are different answers — "this input has no nullable columns" must not be confused with "the
+/// column metadata could not be read" — and the policy rejects the candidate on the latter.
+struct group_by_bypass_metadata {
+  /// The partition's input pipeline has finished: every partial batch has actually arrived. This
+  /// is what makes the row/type metadata below trustworthy, and it is a stronger claim than
+  /// point 3's `data_size_estimate::exact`, which only says the byte total is known.
+  bool upstream_complete = false;
+
+  /// Every batch is GPU-resident in exactly one memory space.
+  bool single_gpu_resident = false;
+
+  /// Per-column physical metadata, in table order (grouping keys first, then aggregate partial
+  /// states — the order `merge_grouped_aggregate` itself assumes). Absent when the schema could
+  /// not be read, or was inconsistent between batches.
+  std::optional<std::vector<bypass_column_meta>> columns;
+
+  /// Total partial rows over all batches; absent when the metadata could not be read.
+  std::optional<uint64_t> total_rows;
+
+  /// Bytes the executor could still reserve on the target space: its reservation limit minus
+  /// everything already charged (live allocations *and* outstanding reservation arenas share one
+  /// counter, so nothing is subtracted twice). Absent when it could not be determined.
+  ///
+  /// Deliberately not `memory_space::get_available_memory()`, which measures headroom against the
+  /// larger allocation capacity and over-states what a reservation can obtain. See
+  /// docs/super-sirius/group-by-bypass.md.
+  std::optional<uint64_t> admissible_additional_budget;
+  /// The target space's reservation limit (`get_max_memory()`), for the decision record.
+  std::optional<uint64_t> space_capacity;
+  /// Bytes already charged against that limit, for the decision record.
+  std::optional<uint64_t> charged_bytes;
+
+  /// Device the input actually lives on. -1 when unknown; never assumed to be 0.
+  int target_device_id = -1;
+  /// Distinct GPU memory spaces the batches were found in. Anything but 1 rejects the candidate.
+  std::size_t distinct_memory_spaces = 0;
+  std::size_t num_batches            = 0;
+  uint64_t total_bytes               = 0;
+
+  /// Declared empirical margin, from operator_params.
+  double headroom_fraction = 0.25;
+};
 
 /// What the upstream PARTITION operator measures/knows and forwards to its downstream consumer so
 /// the consumer can decide how many partitions to produce (and whether to broadcast).
@@ -37,6 +105,11 @@ struct partition_sizing_input {
   /// partition has no sibling). A consumer whose task holds both join inputs at once sizes from
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
+
+  /// Group-by bypass prototype metadata, or nullptr when the prototype is off / not applicable.
+  /// Non-owning; valid only for the duration of the get_partition_strategy call, which runs under
+  /// the partition's lock with the batches pinned in its repository.
+  const group_by_bypass_metadata* bypass_metadata = nullptr;
 };
 
 /// The partitioning decision returned by a consumer's get_partition_strategy. `num_partitions` is

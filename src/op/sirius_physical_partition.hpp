@@ -82,6 +82,18 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// Whether this partition may use a projected input size.
   [[nodiscard]] bool is_size_estimation_enabled() const { return _enable_size_estimation; }
 
+  /// Enable the group-by memory-aware bypass prototype (issue #1746 point 2) on this partition.
+  /// Set at plan time for aggregate-fanout partitions only. With it off, `get_next_task_input_data`
+  /// does not collect bypass metadata at all, so the default sizing path is byte-for-byte
+  /// unchanged. See docs/super-sirius/group-by-bypass.md.
+  void set_memory_aware_bypass(bool enabled, double headroom_fraction)
+  {
+    _enable_memory_aware_bypass = enabled;
+    _bypass_headroom_fraction   = headroom_fraction;
+  }
+
+  [[nodiscard]] bool is_memory_aware_bypass_enabled() const { return _enable_memory_aware_bypass; }
+
   void set_drives_partition_count(bool drives) { _drives_partition_count = drives; }
 
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
@@ -165,6 +177,14 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// @pre `lock` is held.
   std::optional<uint64_t> estimated_total_input_bytes();
 
+  /// Read the complete-input metadata the group-by bypass prototype needs from the batches
+  /// waiting on this partition's input port. Returns nullopt when the prototype is off.
+  ///
+  /// Reads batch metadata only — no key scan, no host copy, no extra aggregation — under the
+  /// repository's existing read-only handle, and never blocks on memory.
+  /// @pre `lock` is held.
+  std::optional<group_by_bypass_metadata> collect_bypass_metadata();
+
   /// The partition slot for a batch residing on `device_id`: its index in `_active_gpu_ids`
   /// (so task_creator routes that slot back to the same GPU). Returns 0 if not found (a
   /// safe fallback that keeps the batch on some valid slot).
@@ -195,6 +215,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool _broadcast{false};
   /// Non-owning observer for the narrow-passthrough counter. Registered state owns the context
   /// for the plan's lifetime; unit-test operators may leave it null.
+  bool _enable_memory_aware_bypass{false};
+  double _bypass_headroom_fraction{0.25};
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};

@@ -47,9 +47,13 @@ struct reservation_size_info {
     0;  ///< Cost to materialize input into the task's target space (host/disk upgrades plus
         ///< cross-GPU clones); 0 for scans
   std::size_t peak_memory_estimate = 0;  ///< Predicted operator peak; 2*input_basis if no history
-  std::size_t retry_reservation_floor = 0;      ///< OOM-derived lower bound
-  std::size_t reservation_size        = 0;      ///< max(normal estimate, retry floor)
-  bool had_history                    = false;  ///< Estimate used pipeline history
+  std::size_t retry_reservation_floor = 0;  ///< OOM-derived lower bound
+  std::size_t reservation_size        = 0;  ///< max(normal estimate, retry floor)
+  /// Policy-derived lower bound on @ref peak_memory_estimate, applied with or without history.
+  /// Nonzero only when an operator asserted a requirement it decided rather than learned — see
+  /// sirius_physical_operator::mandatory_peak_memory_floor.
+  std::size_t mandatory_floor = 0;
+  bool had_history            = false;  ///< Estimate used pipeline history
 };
 
 /**

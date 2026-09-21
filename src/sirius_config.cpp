@@ -311,6 +311,14 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("enable_group_by_memory_aware_bypass", opt.enable_group_by_memory_aware_bypass);
+  r.optional("group_by_bypass_headroom_fraction", opt.group_by_bypass_headroom_fraction);
+  // Bounded so the one empirical knob cannot silently disable the margin (negative) or inflate
+  // the requirement past any plausible budget and make every candidate look infeasible.
+  if (opt.group_by_bypass_headroom_fraction < 0.0 || opt.group_by_bypass_headroom_fraction > 4.0) {
+    throw std::runtime_error(
+      "'operator_params.group_by_bypass_headroom_fraction': must be between 0.0 and 4.0");
+  }
   r.reject_unknown();
 }
 

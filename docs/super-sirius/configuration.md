@@ -109,6 +109,8 @@ sirius:
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
+    enable_group_by_memory_aware_bypass: false  # EXPERIMENT: merge a grouped aggregation unpartitioned when it fits
+    group_by_bypass_headroom_fraction: 0.25  # margin the bypass model adds to its requirement
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -435,6 +437,14 @@ individually.
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
+| `enable_group_by_memory_aware_bypass` | false | **Experiment (issue #1746 point 2), not a production knob.** When a grouped aggregation's automatic partition count is above 1, model the memory an unpartitioned merge would need and choose `P = 1` instead if it fits the admitted GPU's remaining budget. Restricted to a single admitted GPU, complete GPU-resident input, fixed-width integral grouping keys, `SUM`/`COUNT`/`MIN`/`MAX` partial states, and a bounded result-collection downstream; every other plan keeps the automatic count and logs why. Registered as an internal option, so it is only visible with `SIRIUS_ENABLE_TEST_OPTIONS=1`. |
+| `group_by_bypass_headroom_fraction` | 0.25 | Declared empirical margin the bypass model adds on top of its modelled requirement, as a fraction of it. Must be in [0.0, 4.0]. The only tuning knob the prototype introduces, and it is reported in every decision record. Only read when `enable_group_by_memory_aware_bypass` is on. |
+
+**Note:** `enable_group_by_memory_aware_bypass` is an experiment kept off by default. Its memory
+model has not been verified against the pinned cuDF implementation. GB300 measurements show
+benefits for two supported SF1000 group-bys, but no TPC-H bypass activation. See the
+[design](group-by-bypass.md) for the supported cases, memory accounting, and recovery work
+required before considering default-on.
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 

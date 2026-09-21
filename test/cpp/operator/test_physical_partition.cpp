@@ -485,6 +485,12 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override
   {
     inputs.push_back(in.total_bytes);
+    // Copied, not aliased: the metadata is only valid for the duration of this call.
+    if (in.bypass_metadata != nullptr) {
+      bypass_metadata = *in.bypass_metadata;
+    } else {
+      saw_null_bypass_metadata = true;
+    }
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
     return {count, false, false};
   }
@@ -492,6 +498,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   uint64_t target_bytes = 1;
   int count             = 0;
   std::vector<uint64_t> inputs;
+  std::optional<group_by_bypass_metadata> bypass_metadata;
+  bool saw_null_bypass_metadata = false;
 };
 
 struct partition_sizing_fixture {
@@ -545,6 +553,10 @@ struct partition_sizing_fixture {
   sizing_consumer consumer;
   sirius_physical_partition partition;
   std::size_t received_bytes = 0;
+};
+
+struct bypass_metadata_fixture : partition_sizing_fixture {
+  bypass_metadata_fixture() : partition_sizing_fixture(false) {}
 };
 
 }  // namespace
@@ -641,4 +653,95 @@ TEST_CASE("partition sizing preserves integer bytes above double precision",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{bytes});
   CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("bypass metadata is only collected when the prototype is enabled",
+          "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  REQUIRE_FALSE(f.partition.is_memory_aware_bypass_enabled());
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  // With the setting off the PARTITION must not walk its batches at all, so the consumer sees no
+  // metadata and the existing sizing path is unchanged.
+  CHECK(f.consumer.saw_null_bypass_metadata);
+  CHECK_FALSE(f.consumer.bypass_metadata.has_value());
+}
+
+TEST_CASE("bypass metadata reports the real rows, schema and target device",
+          "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  f.partition.set_memory_aware_bypass(true, 0.25);
+  REQUIRE(f.partition.is_memory_aware_bypass_enabled());
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  auto const& meta = *f.consumer.bypass_metadata;
+  CHECK(meta.upstream_complete);
+  CHECK(meta.single_gpu_resident);
+  CHECK(meta.distinct_memory_spaces == 1);
+  CHECK(meta.num_batches == 1);
+  CHECK(meta.total_bytes == f.received_bytes);
+  REQUIRE(meta.total_rows.has_value());
+  CHECK(*meta.total_rows == 100);  // the fixture deposits one 100-row INT32 column
+
+  REQUIRE(meta.columns.has_value());
+  REQUIRE(meta.columns->size() == 1);
+  CHECK((*meta.columns)[0].type_id == static_cast<int>(cudf::type_id::INT32));
+  CHECK((*meta.columns)[0].fixed_width_bytes == sizeof(int32_t));
+  CHECK_FALSE((*meta.columns)[0].nullable);
+
+  // The budget and device come from the space the input actually lives in, never from a
+  // hardcoded device 0 lookup.
+  auto* space = f.memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  CHECK(meta.target_device_id == space->get_device_id());
+  REQUIRE(meta.admissible_additional_budget.has_value());
+  REQUIRE(meta.space_capacity.has_value());
+  REQUIRE(meta.charged_bytes.has_value());
+
+  // The budget must be what the executor could actually *reserve*, which is the space's
+  // reservation limit minus everything already charged against it — not device memory that merely
+  // happens to be unallocated. get_available_memory() measures the latter, against the larger
+  // allocation capacity, and can exceed get_max_memory() outright when the reservation limit is
+  // below capacity; a budget taken from it would over-admit by the bytes already in use.
+  CHECK(*meta.space_capacity == space->get_max_memory());
+  CHECK(
+    *meta.admissible_additional_budget ==
+    (*meta.space_capacity > *meta.charged_bytes ? *meta.space_capacity - *meta.charged_bytes : 0));
+  CHECK(*meta.admissible_additional_budget <= *meta.space_capacity);
+  CHECK(meta.headroom_fraction == 0.25);
+}
+
+TEST_CASE("bypass metadata marks a still-running upstream as incomplete",
+          "[physical_partition][group_by_bypass]")
+{
+  // Production scheduling waits at the FULL barrier. Call the input hook directly to verify
+  // that the metadata still identifies incomplete input defensively.
+  bypass_metadata_fixture f;
+  f.partition.set_memory_aware_bypass(true, 0.25);
+  REQUIRE(f.partition.get_next_task_input_data());
+
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  CHECK_FALSE(f.consumer.bypass_metadata->upstream_complete);
+  CHECK(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+}
+
+TEST_CASE("bypass preserves the full-input barrier", "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  f.partition.set_memory_aware_bypass(true, 0.25);
+  auto hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK_FALSE(f.consumer.bypass_metadata.has_value());
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  CHECK(f.consumer.bypass_metadata->upstream_complete);
 }

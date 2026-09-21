@@ -574,6 +574,27 @@ class sirius_physical_operator {
     return memory::saturating_mul(stats.bytes, 2);
   }
 
+  /**
+   * @brief A lower bound on this operator's peak GPU memory that must hold regardless of history.
+   *
+   * Unlike @ref no_history_peak_memory_estimate, which
+   * gpu_pipeline_task::get_estimated_reservation_size_info consults *only* when the pipeline has
+   * no memory history yet, this floor is applied in both branches. An operator whose memory
+   * requirement was derived from a policy decision — rather than learned from previous tasks —
+   * needs that, because a warm pipeline's history can predict far less than the decision assumed
+   * and would silently override a cold-start-only estimate on the second query.
+   *
+   * The default is 0, meaning "no floor". Larger history estimates and OOM-derived retry floors
+   * still win; this only raises a too-small estimate.
+   *
+   * @param stats  Batch count and total input bytes for the task about to run.
+   * @return Minimum peak GPU bytes to reserve for this operator, or 0 for no constraint.
+   */
+  [[nodiscard]] virtual std::size_t mandatory_peak_memory_floor(const input_stats& stats) const
+  {
+    return 0;
+  }
+
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                                  ::cuda::stream_ref stream);
 

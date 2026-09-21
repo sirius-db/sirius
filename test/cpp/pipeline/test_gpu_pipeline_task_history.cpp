@@ -105,9 +105,17 @@ class stub_operator : public sirius::op::sirius_physical_operator {
     return sirius_physical_operator::no_history_peak_memory_estimate(stats);
   }
 
+  [[nodiscard]] std::size_t mandatory_peak_memory_floor(
+    const sirius::op::input_stats& stats) const override
+  {
+    if (mandatory_floor_override) { return *mandatory_floor_override; }
+    return sirius_physical_operator::mandatory_peak_memory_floor(stats);
+  }
+
   execute_fn on_execute;
   sink_fn on_sink;
   std::optional<std::size_t> no_history_estimate_override;
+  std::optional<std::size_t> mandatory_floor_override;
   bool acts_as_sink = false;
 };
 
@@ -580,6 +588,98 @@ TEST_CASE("pipeline memory history clamps extrapolated estimates",
     auto const estimate = history.estimate_peak_memory(max_size);
     REQUIRE(estimate.has_value());
     CHECK(*estimate == max_size);
+  }
+}
+
+TEST_CASE("a mandatory peak memory floor survives warm pipeline history",
+          "[gpu_pipeline_task][history][estimation][group_by_bypass]")
+{
+  // The point of this hook. no_history_peak_memory_estimate is consulted only on a cold pipeline;
+  // once history exists the learned value is used verbatim. A group-by that decided to merge its
+  // whole input unpartitioned has a requirement history cannot have seen — the recorded tasks were
+  // partitioned merges that each saw a fraction of it — so a cold-start-only floor would vanish on
+  // the second query.
+  constexpr std::size_t kInputBasis = 4096;
+  constexpr std::size_t kFloor      = 64ULL * 1024 * 1024;
+
+  auto make_task = [](pipeline_context& ctx, std::size_t basis) {
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    return std::make_pair(std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+                            1,
+                            std::vector<cucascade::shared_data_repository*>{},
+                            std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(
+                              std::make_unique<sized_input>(basis)),
+                            global_state),
+                          global_state);
+  };
+
+  SECTION("with no history the floor raises the cold-start estimate")
+  {
+    auto ctx                              = create_pipeline_context();
+    ctx.stub_op->mandatory_floor_override = kFloor;
+    auto [task, gs]                       = make_task(ctx, kInputBasis);
+
+    auto const info = task->get_estimated_reservation_size_info(nullptr);
+    CHECK_FALSE(info.had_history);
+    CHECK(info.mandatory_floor == kFloor);
+    CHECK(info.peak_memory_estimate == kFloor);
+    CHECK(info.reservation_size == kFloor);
+  }
+
+  SECTION("a warm history that predicts less than the floor does not win")
+  {
+    auto ctx                              = create_pipeline_context();
+    ctx.stub_op->mandatory_floor_override = kFloor;
+    auto [task, gs]                       = make_task(ctx, kInputBasis);
+    // Every recorded task peaked at half its input — a ratio far below what the floor asserts.
+    gs->get_memory_history().record({kInputBasis, kInputBasis / 2, kInputBasis});
+
+    auto const info = task->get_estimated_reservation_size_info(nullptr);
+    CHECK(info.had_history);
+    CHECK(info.mandatory_floor == kFloor);
+    CHECK(info.peak_memory_estimate == kFloor);
+    CHECK(info.reservation_size == kFloor);
+  }
+
+  SECTION("a history larger than the floor still wins")
+  {
+    auto ctx                              = create_pipeline_context();
+    ctx.stub_op->mandatory_floor_override = kFloor;
+    auto [task, gs]                       = make_task(ctx, kInputBasis);
+    constexpr std::size_t kBigPeak        = kFloor * 4;
+    gs->get_memory_history().record({kInputBasis, kBigPeak, kInputBasis});
+
+    auto const info = task->get_estimated_reservation_size_info(nullptr);
+    CHECK(info.had_history);
+    CHECK(info.peak_memory_estimate == kBigPeak);
+    CHECK(info.reservation_size == kBigPeak);
+  }
+
+  SECTION("an OOM-derived retry floor still wins")
+  {
+    auto ctx                              = create_pipeline_context();
+    ctx.stub_op->mandatory_floor_override = kFloor;
+    auto [task, gs]                       = make_task(ctx, kInputBasis);
+    constexpr std::size_t kRetryFloor     = kFloor * 3;
+    auto* ls = dynamic_cast<sirius::pipeline::gpu_pipeline_task_local_state*>(task->local_state());
+    REQUIRE(ls != nullptr);
+    ls->update_retry_reservation_floor_after_oom(kRetryFloor, kRetryFloor, kRetryFloor);
+
+    auto const info = task->get_estimated_reservation_size_info(nullptr);
+    CHECK(info.reservation_size >= kRetryFloor);
+    CHECK(info.reservation_size > kFloor);
+  }
+
+  SECTION("operators without a floor are unaffected")
+  {
+    auto ctx        = create_pipeline_context();
+    auto [task, gs] = make_task(ctx, kInputBasis);
+
+    auto const info = task->get_estimated_reservation_size_info(nullptr);
+    CHECK(info.mandatory_floor == 0);
+    // Unchanged from the baseline: the task-level 2x fallback.
+    CHECK(info.peak_memory_estimate == kInputBasis * 2);
   }
 }
 

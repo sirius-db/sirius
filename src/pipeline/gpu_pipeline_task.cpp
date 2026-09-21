@@ -925,6 +925,19 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       (max_estimate > 0) ? max_estimate : memory::saturating_mul(input_basis, 2);
   }
 
+  // A policy-derived floor applies whether or not history exists. History is learned from past
+  // tasks; an operator that decided its own memory requirement (the group-by bypass prototype
+  // selecting an unpartitioned merge) has a requirement history cannot have seen, and the warm
+  // path above would otherwise use a smaller learned estimate from the partitioned shape.
+  std::size_t mandatory_floor = 0;
+  if (auto* pipeline = gs.get_pipeline()) {
+    for (auto& op_ref : pipeline->get_operators()) {
+      mandatory_floor = std::max(mandatory_floor, op_ref.get().mandatory_peak_memory_floor(stats));
+    }
+  }
+  info.mandatory_floor      = mandatory_floor;
+  info.peak_memory_estimate = std::max(info.peak_memory_estimate, mandatory_floor);
+
   auto const normal_reservation =
     memory::saturating_add(info.peak_memory_estimate, bytes_to_materialize);
   info.reservation_size = std::max(normal_reservation, info.retry_reservation_floor);

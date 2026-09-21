@@ -18,7 +18,9 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/group_by_bypass_policy.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -27,6 +29,8 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
+
+#include <string>
 
 namespace sirius {
 namespace op {
@@ -150,23 +154,197 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
+namespace {
+
+/// Fixed-width integral types the v1 bypass model covers. Floats and decimals are excluded
+/// deliberately: their merge-time partial states are not modelled here (see
+/// docs/super-sirius/group-by-bypass.md).
+[[nodiscard]] bool bypass_supported_column_type(int type_id) noexcept
+{
+  switch (static_cast<cudf::type_id>(type_id)) {
+    case cudf::type_id::BOOL8:
+    case cudf::type_id::INT8:
+    case cudf::type_id::INT16:
+    case cudf::type_id::INT32:
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT8:
+    case cudf::type_id::UINT16:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::UINT64: return true;
+    default: return false;
+  }
+}
+
+/// Whether the path from @p merge to the first downstream sink is a bounded result-collection
+/// path: unary, non-expanding, and terminating at a RESULT_COLLECTOR.
+///
+/// Anything that buffers or reshapes — TOP_N, ORDER_BY, a second GROUP BY, a join, a further
+/// PARTITION — makes the merge's output feed work this model does not account for, so v1 declines
+/// rather than guessing. Returns {supported, materializes_copy}; the second flag says a
+/// PROJECTION/FILTER will allocate a transformed copy while the merge output is still live.
+struct downstream_shape {
+  bool supported         = false;
+  bool materializes_copy = false;
+};
+
+[[nodiscard]] downstream_shape classify_bypass_downstream(
+  const sirius_physical_operator& merge) noexcept
+{
+  using T = SiriusPhysicalOperatorType;
+  downstream_shape shape;
+  if (merge.owning_delim_join() != nullptr) { return shape; }
+  for (auto* cur = merge.get_parent_op(); cur != nullptr; cur = cur->get_parent_op()) {
+    switch (cur->type) {
+      case T::RESULT_COLLECTOR: shape.supported = true; return shape;
+      case T::PROJECTION:
+      case T::FILTER:
+      case T::LIMIT:
+      case T::STREAMING_LIMIT:
+        if (cur->children.size() != 1) { return shape; }
+        shape.materializes_copy = true;
+        break;
+      default: return shape;
+    }
+  }
+  return shape;
+}
+
+}  // namespace
+
+bool sirius_physical_grouped_aggregate_merge::bypass_supported_aggregates() const
+{
+  // AVG and COUNT(DISTINCT) need post-merge projection (a cast/divide, or list element counting)
+  // whose allocations are outside the model.
+  if (has_avg || has_count_distinct) { return false; }
+  if (cudf_aggregates.empty()) { return false; }
+  for (auto kind : cudf_aggregates) {
+    switch (kind) {
+      case cudf::aggregation::Kind::SUM:
+      case cudf::aggregation::Kind::MIN:
+      case cudf::aggregation::Kind::MAX:
+      case cudf::aggregation::Kind::COUNT_ALL:
+      case cudf::aggregation::Kind::COUNT_VALID: break;
+      // COLLECT_SET arrives as a LIST and re-merges with MERGE_SETS; not modelled.
+      default: return false;
+    }
+  }
+  return true;
+}
+
+int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
+  const partition_sizing_input& in, int natural)
+{
+  // With the prototype off the PARTITION passes no metadata, so there is nothing to do and the
+  // automatic count is returned without any extra work on this path.
+  if (in.bypass_metadata == nullptr) { return natural; }
+  auto const& meta = *in.bypass_metadata;
+
+  group_by_bypass::candidate_input candidate;
+  candidate.auto_num_partitions = natural;
+  candidate.num_admitted_gpus   = _num_gpus;
+  candidate.upstream_complete   = meta.upstream_complete;
+  // A single admitted GPU must also mean the input really is on one device.
+  candidate.single_gpu_resident = meta.single_gpu_resident && meta.distinct_memory_spaces == 1;
+  candidate.headroom_fraction   = meta.headroom_fraction;
+  candidate.total_rows          = meta.total_rows;
+  candidate.admissible_additional_budget = meta.admissible_additional_budget;
+
+  auto const shape                       = classify_bypass_downstream(*this);
+  candidate.supported_downstream         = shape.supported;
+  candidate.downstream_materializes_copy = shape.materializes_copy;
+
+  // Split the observed physical columns at the grouping-key boundary — the same boundary
+  // merge_grouped_aggregate itself uses — and check each side against the whitelist.
+  auto const num_group_cols = group_idx.size();
+  if (meta.columns.has_value() && meta.columns->size() == num_group_cols + cudf_aggregates.size()) {
+    auto const& cols        = *meta.columns;
+    bool types_ok           = bypass_supported_aggregates();
+    std::uint64_t key_width = 0;
+    std::uint64_t agg_width = 0;
+    std::size_t null_keys   = 0;
+    std::size_t null_aggs   = 0;
+    for (std::size_t c = 0; c < cols.size(); ++c) {
+      auto const& col = cols[c];
+      if (col.fixed_width_bytes == 0 || !bypass_supported_column_type(col.type_id)) {
+        types_ok = false;
+        break;
+      }
+      if (c < num_group_cols) {
+        key_width += col.fixed_width_bytes;
+        null_keys += col.nullable ? 1 : 0;
+      } else {
+        agg_width += col.fixed_width_bytes;
+        null_aggs += col.nullable ? 1 : 0;
+      }
+    }
+    candidate.supported_state = types_ok;
+    if (types_ok) {
+      candidate.key_width_bytes      = key_width;
+      candidate.agg_width_bytes      = agg_width;
+      candidate.nullable_key_columns = null_keys;
+      candidate.nullable_agg_columns = null_aggs;
+    }
+  } else {
+    // Either the schema could not be read, or it does not match this merge's own column layout.
+    // Both are "unknown", not "zero".
+    candidate.supported_state = false;
+  }
+
+  auto const decision = group_by_bypass::decide(candidate);
+  // Only a bypass this policy actually selected gets a reservation floor. `already_one` is the
+  // pre-existing automatic choice and must not acquire new reservation behaviour.
+  _bypass_reservation_floor.store((decision.prototype_activated && decision.model_evaluated)
+                                    ? static_cast<std::size_t>(decision.model.additional_needed)
+                                    : 0,
+                                  std::memory_order_release);
+
+  SIRIUS_LOG_INFO(
+    "group_by_bypass: operator_id={} device={} reason={} auto_p={} chosen_p={} "
+    "model_evaluated={} additional_needed={} required={} budget={}",
+    get_operator_id(),
+    meta.target_device_id,
+    group_by_bypass::reason_name(decision.reason),
+    natural,
+    decision.num_partitions,
+    decision.model_evaluated,
+    decision.model.additional_needed,
+    decision.model.required_bytes,
+    candidate.admissible_additional_budget.has_value()
+      ? std::to_string(*candidate.admissible_additional_budget)
+      : "unknown");
+
+  return decision.num_partitions;
+}
+
+std::size_t sirius_physical_grouped_aggregate_merge::mandatory_peak_memory_floor(
+  const op::input_stats& stats) const
+{
+  // A task with no input has nothing to merge; do not hold a reservation open for it.
+  if (stats.bytes == 0) { return 0; }
+  return _bypass_reservation_floor.load(std::memory_order_acquire);
+}
+
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
+  // Preserve automatic sizing unless the opt-in policy accepts the whole merge.
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  // The prototype may turn AUTO > 1 into 1. It returns `natural` unchanged in every other
+  // case, including when it is disabled.
+  int const chosen = apply_memory_aware_bypass(in, natural);
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (chosen > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(chosen) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(chosen));
       }
     }
   }
-  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+  return {chosen, /*broadcast=*/false, /*build_probe=*/false};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
