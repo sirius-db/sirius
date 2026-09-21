@@ -27,14 +27,15 @@
 #include "cuda/scan/detail/warp.cuh"
 #include "cuda/scan/gpu_decode_strings.cuh"
 
-#include <cuda/stream>
 #include <rmm/detail/error.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -105,6 +106,9 @@ constexpr uint32_t MIN_ROWS_PER_CHUNK =
        ///< per chunk -> 8 rows per warp at this minimum.
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
+//! Kernels form bit positions and row indices in 32-bit signed arithmetic.
+constexpr uint64_t KERNEL_INDEX_LIMIT = std::numeric_limits<int32_t>::max();
+
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
 /// over-allocation.
@@ -152,16 +156,11 @@ struct prepared_dict_fsst {
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
 
 //! Mirror of BitpackingPrimitives::GetRequiredSize: DuckDB reserves whole groups of 32 values
-//! for each bitpacked region.
+//! for each bitpacked region. The host validators size every bitpacked region with it, so a
+//! header whose next region starts before DuckDB would have placed it is refused before decode.
 constexpr uint64_t bitpacked_region_bytes(uint64_t count, uint64_t width)
 {
   return ((count + 31u) / 32u) * 32u * width / 8u;
-}
-
-//! Minimum whole-word storage needed by unpack_value for count values of width bits.
-constexpr uint64_t packed_words_bytes(uint64_t count, uint64_t width)
-{
-  return (count * width + 31u) / 32u * 4u;
 }
 
 //! Pinned scratch storage retained until destruction; capacity grows on demand.
@@ -227,6 +226,28 @@ Header const* fetch_segment_headers(gpu_string_codec_run const& run,
   throw std::runtime_error(std::string(codec_name) + " segment " + std::to_string(seg_idx) +
                            " (rows " + std::to_string(seg.row_offset) + "+" +
                            std::to_string(seg.row_count) + "): " + what);
+}
+
+//! Refuse a bitpacking width the kernels cannot unpack; @p name is the header field.
+template <class Fail>
+void check_bitpacking_width(char const* name, uint32_t width, Fail&& fail)
+{
+  if (width > MAX_BITPACKING_WIDTH) {
+    fail(std::string(name) + " " + std::to_string(width) + " > " +
+         std::to_string(MAX_BITPACKING_WIDTH));
+  }
+}
+
+//! Refuse @p count values of @p width bits when a row or bit index would not fit the kernels'
+//! 32-bit signed index arithmetic. Call after check_bitpacking_width so count * width cannot
+//! overflow.
+template <class Fail>
+void check_kernel_index_range(uint64_t count, uint64_t width, Fail&& fail)
+{
+  if (count > KERNEL_INDEX_LIMIT || count * width > KERNEL_INDEX_LIMIT) {
+    fail("row or bit index for rows " + std::to_string(count) +
+         " does not fit the kernels' 32-bit index arithmetic");
+  }
 }
 
 //! @brief Target CTA count for chunking segments: two full device waves at

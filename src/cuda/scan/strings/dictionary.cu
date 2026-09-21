@@ -68,17 +68,11 @@ void validate_dict_segment(size_t seg_idx,
     throw_malformed_segment(DICTIONARY_CODEC_NAME, seg_idx, seg, what);
   };
   uint64_t const bytes_size = seg.bytes_size;
-  if (hdr.bitpacking_width > MAX_BITPACKING_WIDTH) {
-    fail("bitpacking_width " + std::to_string(hdr.bitpacking_width) + " > 32");
-  }
+  check_bitpacking_width("bitpacking_width", hdr.bitpacking_width, fail);
   uint64_t const rows_end = uint64_t{seg.seg_row_start} + seg.row_count;
-  // The kernels form row and bit indices in 32-bit signed arithmetic.
-  constexpr uint64_t kernel_index_limit = std::numeric_limits<int32_t>::max();
-  if (rows_end > kernel_index_limit || rows_end * hdr.bitpacking_width > kernel_index_limit) {
-    fail("row or bit index for rows " + std::to_string(rows_end) +
-         " does not fit the kernels' 32-bit index arithmetic");
-  }
-  if (sizeof(dict_header_t) + packed_words_bytes(rows_end, hdr.bitpacking_width) >
+  check_kernel_index_range(rows_end, hdr.bitpacking_width, fail);
+  // DuckDB sizes the selection buffer with BitpackingPrimitives::GetRequiredSize.
+  if (sizeof(dict_header_t) + bitpacked_region_bytes(rows_end, hdr.bitpacking_width) >
       hdr.index_buffer_offset) {
     fail("selection buffer for rows " + std::to_string(rows_end) +
          " reaches into the index buffer");

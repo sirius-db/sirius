@@ -99,9 +99,11 @@ inline std::vector<uint8_t> make_dict_segment(std::vector<std::string> const& di
   uint32_t const width     = bitpack_width_for_count(dict_count);
   auto sel_packed          = pack_uint32(selections, width);
 
-  uint32_t const header_size  = 20;
-  uint32_t const sel_buf_off  = header_size;
-  uint32_t const sel_buf_size = static_cast<uint32_t>(sel_packed.size() * sizeof(uint32_t));
+  uint32_t const header_size   = 20;
+  uint32_t const sel_buf_off   = header_size;
+  size_t const sel_group_bytes = ((selections.size() + 31u) / 32u * 32u) * width / 8u;
+  uint32_t const sel_buf_size =
+    static_cast<uint32_t>(std::max(sel_group_bytes, sel_packed.size() * sizeof(uint32_t)));
   uint32_t const idx_buf_off  = sel_buf_off + sel_buf_size;
   uint32_t const idx_buf_size = dict_count * sizeof(uint32_t);
   uint32_t const dict_off     = idx_buf_off + idx_buf_size;
@@ -112,7 +114,8 @@ inline std::vector<uint8_t> make_dict_segment(std::vector<std::string> const& di
   uint32_t hdr[5] = {dict_size, dict_end, idx_buf_off, dict_count, width};
   std::memcpy(bytes.data(), hdr, sizeof(hdr));
   if (sel_buf_size > 0) {
-    std::memcpy(bytes.data() + sel_buf_off, sel_packed.data(), sel_buf_size);
+    std::memcpy(
+      bytes.data() + sel_buf_off, sel_packed.data(), sel_packed.size() * sizeof(uint32_t));
   }
   std::memcpy(bytes.data() + idx_buf_off, idx_buf.data(), idx_buf_size);
   // Dict bytes packed in REVERSE: entry K starts at dict_end - idx_buf[K].
@@ -348,9 +351,12 @@ inline std::vector<uint8_t> make_fsst_segment(std::vector<std::string> const& st
   uint32_t const lengths_off = header_size;
   size_t lengths_total_bits  = size_t{row_count} * bitpacking_width;
   uint32_t lengths_bytes_raw = static_cast<uint32_t>((lengths_total_bits + 31u) / 32u * 4u);
-  uint32_t lengths_padded    = lengths_bytes_raw + 4u;  // +1 word: unpack_value reads 8B
-  uint32_t symtab_off        = synth_align_up8(lengths_off + lengths_padded);
-  uint32_t comp_bytes_off    = synth_align_up8(symtab_off + symtab_size);
+  uint32_t lengths_group_bytes =
+    static_cast<uint32_t>(((size_t{row_count} + 31u) / 32u * 32u) * bitpacking_width / 8u);
+  // The packer appends a guard word; reserve space for its entire output.
+  uint32_t lengths_padded = std::max(lengths_group_bytes, lengths_bytes_raw + 4u);
+  uint32_t symtab_off     = synth_align_up8(lengths_off + lengths_padded);
+  uint32_t comp_bytes_off = synth_align_up8(symtab_off + symtab_size);
 
   size_t total_comp_bytes = 0;
   for (size_t l : lenOut)

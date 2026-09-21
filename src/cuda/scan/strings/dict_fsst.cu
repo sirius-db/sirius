@@ -109,9 +109,6 @@ constexpr char const* DICT_FSST_CODEC_NAME = "DICT_FSST";
 //! (DuckDB Storage::MAX_ROW_GROUP_SIZE = 2^30).
 constexpr uint64_t DICT_FSST_MAX_DICT_COUNT = (uint64_t{1} << 30) + 1u;
 
-//! Kernels form bit positions and row indices in 32-bit signed arithmetic.
-constexpr uint64_t KERNEL_INDEX_LIMIT = std::numeric_limits<int32_t>::max();
-
 constexpr uint64_t align_up8_u64(uint64_t n) { return (n + 7u) & ~uint64_t{7}; }
 
 //! Validate header bounds and row/bit index ranges before decoding. Zero widths are legal: no
@@ -132,12 +129,8 @@ dict_fsst_layout validate_dict_fsst_segment(size_t seg_idx,
   if (hdr.dict_count > DICT_FSST_MAX_DICT_COUNT) {
     fail("dict_count " + std::to_string(hdr.dict_count) + " exceeds a row group");
   }
-  if (hdr.string_lengths_width > MAX_BITPACKING_WIDTH) {
-    fail("string_lengths_width " + std::to_string(hdr.string_lengths_width) + " > 32");
-  }
-  if (hdr.dictionary_indices_width > MAX_BITPACKING_WIDTH) {
-    fail("dictionary_indices_width " + std::to_string(hdr.dictionary_indices_width) + " > 32");
-  }
+  check_bitpacking_width("string_lengths_width", hdr.string_lengths_width, fail);
+  check_bitpacking_width("dictionary_indices_width", hdr.dictionary_indices_width, fail);
   bool const has_symtab = hdr.mode != DICT_FSST_MODE_DICTIONARY;
   if (has_symtab && hdr.symbol_table_size > FSST_SYMTAB_MAX_BYTES) {
     fail("symbol_table_size " + std::to_string(hdr.symbol_table_size) + " > " +
@@ -164,10 +157,9 @@ dict_fsst_layout validate_dict_fsst_segment(size_t seg_idx,
   if (slens_end > bytes_size) { fail("string_lengths region ends past bytes_size"); }
 
   uint64_t const rows_end = uint64_t{seg.seg_row_start} + seg.row_count;
-  if (rows_end > KERNEL_INDEX_LIMIT ||
-      uint64_t{hdr.dict_count} * hdr.string_lengths_width > KERNEL_INDEX_LIMIT ||
-      rows_end * hdr.dictionary_indices_width > KERNEL_INDEX_LIMIT) {
-    fail("row or bit index for rows " + std::to_string(rows_end) +
+  check_kernel_index_range(rows_end, hdr.dictionary_indices_width, fail);
+  if (uint64_t{hdr.dict_count} * hdr.string_lengths_width > KERNEL_INDEX_LIMIT) {
+    fail("bit index for dict entries " + std::to_string(hdr.dict_count) +
          " does not fit the kernels' 32-bit index arithmetic");
   }
   uint64_t off_didx = 0;

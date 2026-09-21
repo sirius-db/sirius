@@ -583,6 +583,49 @@ TEST_CASE("gpu_decode_strings DICTIONARY - NULL via index 0", "[scan][decode][st
   REQUIRE(out[4] == "x");
 }
 
+TEST_CASE("gpu_decode_strings DICTIONARY rejects whole-word selection padding",
+          "[scan][decode][strings][dictionary][defensive]")
+{
+  uint32_t const row_count = 100;
+  std::vector<std::string> dict(65);
+  for (uint32_t i = 1; i < dict.size(); ++i) {
+    dict[i] = "value-" + std::to_string(i);
+  }
+  std::vector<uint32_t> selections(row_count);
+  std::vector<std::string> expected(row_count);
+  for (uint32_t i = 0; i < row_count; ++i) {
+    selections[i] = i % 64 + 1;
+    expected[i]   = dict[selections[i]];
+  }
+  auto bytes = make_dict_segment(dict, selections);
+  uint32_t header[5];
+  std::memcpy(header, bytes.data(), sizeof(header));
+  REQUIRE(header[4] == 7);
+  REQUIRE(header[2] == sizeof(header) + 112);
+  REQUIRE(decode_one_dict(bytes, row_count, 8) == expected);
+
+  uint32_t const old_region_bytes = (row_count * header[4] + 31u) / 32u * 4u + 4u;
+  uint32_t const old_index_offset = sizeof(header) + old_region_bytes;
+  REQUIRE(old_index_offset < header[2]);
+  uint32_t const removed = header[2] - old_index_offset;
+  bytes.erase(bytes.begin() + old_index_offset, bytes.begin() + header[2]);
+  header[1] -= removed;
+  header[2] = old_index_offset;
+  std::memcpy(bytes.data(), header, sizeof(header));
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  gpu_string_codec_run run{CompressionType::COMPRESSION_DICTIONARY,
+                           {{static_cast<uint8_t const*>(device.data()),
+                             static_cast<uint32_t>(bytes.size()),
+                             0,
+                             row_count,
+                             0,
+                             8}}};
+  REQUIRE_THROWS_WITH(sirius::cuda::scan::prepare_dict(run, stream.view()),
+                      Catch::Contains("reaches into the index buffer"));
+}
+
 TEST_CASE("gpu_decode_strings DICTIONARY - empty dict, all NULL",
           "[scan][decode][strings][dictionary]")
 {
@@ -721,6 +764,41 @@ TEST_CASE("gpu_decode_strings FSST - many distinct strings", "[scan][decode][str
                                               << out[i] << "'");
     }
   }
+}
+
+TEST_CASE("gpu_decode_strings FSST rejects whole-word length padding",
+          "[scan][decode][strings][fsst][defensive]")
+{
+  uint32_t const row_count = 100;
+  std::vector<std::string> rows(row_count, std::string(512, 'a'));
+  auto bytes = make_fsst_segment(rows);
+  uint32_t header[4];
+  std::memcpy(header, bytes.data(), sizeof(header));
+  REQUIRE(header[2] == 7);
+  REQUIRE(header[3] == sizeof(header) + 112);
+  REQUIRE(decode_one_segment(bytes, CompressionType::COMPRESSION_FSST, row_count, 512) == rows);
+
+  uint32_t const old_region_bytes = (row_count * header[2] + 31u) / 32u * 4u + 4u;
+  uint32_t const old_symbol_offset =
+    sirius::test::decode::strings::synth_align_up8(sizeof(header) + old_region_bytes);
+  REQUIRE(old_symbol_offset < header[3]);
+  uint32_t const removed = header[3] - old_symbol_offset;
+  bytes.erase(bytes.begin() + old_symbol_offset, bytes.begin() + header[3]);
+  header[1] -= removed;
+  header[3] = old_symbol_offset;
+  std::memcpy(bytes.data(), header, sizeof(header));
+
+  rmm::cuda_stream stream;
+  rmm::device_buffer device(bytes.data(), bytes.size(), stream.view());
+  gpu_string_codec_run run{CompressionType::COMPRESSION_FSST,
+                           {{static_cast<uint8_t const*>(device.data()),
+                             static_cast<uint32_t>(bytes.size()),
+                             0,
+                             row_count,
+                             0,
+                             512}}};
+  REQUIRE_THROWS_WITH(sirius::cuda::scan::prepare_fsst(run, stream.view()),
+                      Catch::Contains("reach into the symbol table"));
 }
 
 // --- DICT_FSST happy path: modes 0 (raw dict), 1 (FSST dict), 2 (no dict) ---

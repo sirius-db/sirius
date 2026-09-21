@@ -93,22 +93,16 @@ void validate_fsst_segment(size_t seg_idx,
     fail("seg_row_start " + std::to_string(seg.seg_row_start) +
          ": the FSST length pass decodes whole segments only");
   }
-  if (hdr.bitpacking_width > MAX_BITPACKING_WIDTH) {
-    fail("bitpacking_width " + std::to_string(hdr.bitpacking_width) + " > 32");
-  }
+  check_bitpacking_width("bitpacking_width", hdr.bitpacking_width, fail);
   if (hdr.dict_end > bytes_size) { fail("dict_end past bytes_size"); }
   if (uint64_t{hdr.fsst_symbol_table_offset} + FSST_SYMTAB_HEADER_BYTES > hdr.dict_end) {
     fail("symbol table header at offset " + std::to_string(hdr.fsst_symbol_table_offset) +
          " reaches past dict_end");
   }
   uint64_t const rows = seg.row_count;
-  // The kernels form row and bit indices in 32-bit signed arithmetic.
-  constexpr uint64_t kernel_index_limit = std::numeric_limits<int32_t>::max();
-  if (rows > kernel_index_limit || rows * hdr.bitpacking_width > kernel_index_limit) {
-    fail("row or bit index for rows " + std::to_string(rows) +
-         " does not fit the kernels' 32-bit index arithmetic");
-  }
-  if (sizeof(fsst_header_t) + packed_words_bytes(rows, hdr.bitpacking_width) >
+  check_kernel_index_range(rows, hdr.bitpacking_width, fail);
+  // DuckDB sizes the packed lengths with BitpackingPrimitives::GetRequiredSize.
+  if (sizeof(fsst_header_t) + bitpacked_region_bytes(rows, hdr.bitpacking_width) >
       hdr.fsst_symbol_table_offset) {
     fail("packed lengths for rows " + std::to_string(rows) + " reach into the symbol table");
   }
