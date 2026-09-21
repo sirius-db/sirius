@@ -681,6 +681,7 @@ fused_op_channels canonical_fused_channels(std::string const& op)
   if (op == "delta") return {{"differences"}, {}};
   if (op == "rle") return {{"runs", "values"}, {}};
   if (op == "for") return {{"deltas"}, {"references"}};
+  if (op == "factor") return {{"quotients"}, {"divisors"}};
   return {};  // bitpack / zigzag: rep->named_channels() are already canonical
 }
 

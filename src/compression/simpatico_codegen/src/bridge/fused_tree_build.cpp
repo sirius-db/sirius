@@ -118,6 +118,24 @@ std::shared_ptr<jit::FusedTree> build_rec(PlanTree const& tree, NodeId nid, Buil
     return t;
   }
 
+  if (node.op == "factor") {
+    // Dual-mode, mirroring `for`: fuse a codegen quotients child, or
+    // synthesize a Raw passthrough that materialises the quotient stream.
+    PlanEdge const* quotients = find_edge(node, "quotients");
+    auto t                    = jit::FusedTree::make(OpKind::Factor);
+    out.preorder.push_back({t.get(), nid, false, 0});
+    std::shared_ptr<jit::FusedTree> quotients_child;
+    if (quotients != nullptr && is_codegen_compressor(tree.nodes[quotients->child].op)) {
+      quotients_child = build_rec(tree, quotients->child, out);
+      if (!quotients_child) return nullptr;
+    } else {
+      quotients_child = jit::FusedTree::make(OpKind::Raw);
+      out.preorder.push_back({quotients_child.get(), 0, true, nid, "factor", "quotients"});
+    }
+    t->children.emplace("quotients", std::move(quotients_child));
+    return t;
+  }
+
   return nullptr;  // non-fusable op
 }
 
