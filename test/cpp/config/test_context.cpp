@@ -285,6 +285,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -313,6 +314,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET dense_count_join_max_bytes = 1024");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
+    result = con.Query("SET dense_count_join_memory_fraction = 0.25");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -331,6 +335,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 0);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 0);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
+    REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
   }
 
@@ -347,6 +352,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "enable_runtime_distinct_build_probe") == 1);
     REQUIRE(setting_count(con, "enable_dense_count_join") == 1);
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
+    REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
@@ -396,11 +402,21 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     result = con.Query("SET dense_count_join_max_bytes = 1024");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
+    // 0 selects the derived budget rather than being rejected.
     result = con.Query("SET dense_count_join_max_bytes = 0");
     REQUIRE(result != nullptr);
-    REQUIRE(result->HasError());
-    REQUIRE_THAT(result->GetError(), Catch::Contains("must be greater than zero"));
+    REQUIRE_FALSE(result->HasError());
     result = con.Query("RESET dense_count_join_max_bytes");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_memory_fraction = 0.25");
+    REQUIRE(result != nullptr);
+    REQUIRE_FALSE(result->HasError());
+    result = con.Query("SET dense_count_join_memory_fraction = 2.0");
+    REQUIRE(result != nullptr);
+    REQUIRE(result->HasError());
+    REQUIRE_THAT(result->GetError(), Catch::Contains("must be in (0.0, 1.0]"));
+    result = con.Query("RESET dense_count_join_memory_fraction");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());
     result = con.Query("SET concat_batch_bytes = 1048576");
