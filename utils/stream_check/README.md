@@ -85,7 +85,7 @@ int main() {
 │  │   if (g_throw_on_default_stream) {        │  │
 │  │     throw runtime_error(...);             │  │
 │  │   }                                        │  │
-│  │   return ::cuda::stream_ref{cudaStream_t{}};         │  │
+│  │   return ::cuda::stream_ref{cudaStream_t{}};│  │
 │  │ }                                          │  │
 │  └───────────────────────────────────────────┘  │
 │                                                  │
