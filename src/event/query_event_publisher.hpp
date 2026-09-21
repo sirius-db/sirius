@@ -47,14 +47,17 @@ class event_queue {
   void complete(event_id_t id) noexcept;
   void interrupt();
   void delivery_failed() noexcept;
-  bool wait_before(event_id_t cutoff, std::chrono::milliseconds timeout);
+  bool wait_before(event_id_t cutoff, std::chrono::steady_clock::time_point deadline);
 
  private:
+  friend struct query_event_test_access;
+
   exec::interruptible_mpmc<std::shared_ptr<query_events>> _queue;
-  std::mutex _mutex;
-  std::condition_variable _completed;
+  std::timed_mutex _mutex;
+  std::condition_variable_any _completed;
   std::set<event_id_t> _pending;
-  bool _failed{false};
+  // Failure must be recordable even when acquiring the mailbox mutex throws.
+  std::atomic<bool> _failed{false};
   bool _closed{false};
 };
 
@@ -163,6 +166,7 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
 
  private:
   friend class query_event_subscriber;
+  friend struct query_event_test_access;
 
   bool flush(std::shared_ptr<event_queue> const& queue, std::chrono::milliseconds timeout);
 
@@ -200,22 +204,27 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   template <typename Event, typename... Args>
   void publish(Args&&... args) noexcept
   {
-    std::shared_lock g{_queues_mtx};
-    auto const& subscribers = _by_event[event_index_v<Event>];
-    if (subscribers.empty()) { return; }
     try {
-      auto const event_id  = _next_event_id.fetch_add(1, std::memory_order_relaxed);
-      auto const timestamp = std::chrono::system_clock::now();
-      auto payload         = std::make_shared<query_events>(
-        Event{event_id, timestamp, typename Event::param_type{std::forward<Args>(args)...}});
-      for (auto* q : subscribers) {
-        std::ignore = q->push(payload);
+      std::shared_lock g{_queues_mtx};
+      auto const& subscribers = _by_event[event_index_v<Event>];
+      if (subscribers.empty()) { return; }
+      try {
+        auto const event_id  = _next_event_id.fetch_add(1, std::memory_order_relaxed);
+        auto const timestamp = std::chrono::system_clock::now();
+        auto payload         = std::make_shared<query_events>(
+          Event{event_id, timestamp, typename Event::param_type{std::forward<Args>(args)...}});
+        for (auto* q : subscribers) {
+          std::ignore = q->push(payload);
+        }
+      } catch (...) {
+        // Execution remains best effort, but observers must not report an incomplete snapshot.
+        for (auto* q : subscribers) {
+          q->delivery_failed();
+        }
       }
     } catch (...) {
-      // Execution remains best effort, but observers must not report an incomplete snapshot.
-      for (auto* q : subscribers) {
-        q->delivery_failed();
-      }
+      // Lock acquisition can throw too. Without the routing lock, it is not
+      // safe to inspect subscribers; keep reporting best effort and noexcept.
     }
   }
 
@@ -224,7 +233,7 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// Shared by every subscriber: one request_stop takes them all down together.
   std::stop_source _stop_source;
 
-  mutable std::shared_mutex _queues_mtx;
+  mutable std::shared_timed_mutex _queues_mtx;
   /// Owns the registered queues; the buckets below only point into it.
   std::vector<std::shared_ptr<event_queue>> _queues;
   /// One subscriber list per event, indexed by @ref event_index_v.  This is

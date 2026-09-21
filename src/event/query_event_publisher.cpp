@@ -24,31 +24,46 @@ namespace sirius::event {
 
 bool event_queue::push(std::shared_ptr<query_events> payload) noexcept
 {
-  auto const id = std::visit([](auto const& e) { return e.event_id; }, *payload);
-  std::lock_guard lock{_mutex};
-  if (_closed) { return false; }
   try {
-    _pending.insert(id);
-    if (_queue.push(std::move(payload))) { return true; }
+    auto const id = std::visit([](auto const& e) { return e.event_id; }, *payload);
+    std::lock_guard lock{_mutex};
+    if (_closed) { return false; }
+    try {
+      _pending.insert(id);
+      if (_queue.push(std::move(payload))) { return true; }
+    } catch (...) {
+    }
+    _pending.erase(id);
   } catch (...) {
+    // The lock can fail before there is safe access to the pending set.
   }
-  _pending.erase(id);
-  _failed = true;
-  _completed.notify_all();
+  delivery_failed();
   return false;
 }
 
 void event_queue::complete(event_id_t id) noexcept
 {
-  std::lock_guard lock{_mutex};
-  _pending.erase(id);
-  _completed.notify_all();
+  try {
+    std::lock_guard lock{_mutex};
+    _pending.erase(id);
+    _completed.notify_all();
+  } catch (...) {
+    delivery_failed();
+  }
 }
 
 void event_queue::delivery_failed() noexcept
 {
-  std::lock_guard lock{_mutex};
-  _failed = true;
+  // Publish failure independently of the mutex so even a failed lock cannot
+  // leave observers reporting success. The lock normally synchronises this
+  // notification with wait_before's predicate check and transition to waiting.
+  _failed.store(true, std::memory_order_relaxed);
+  try {
+    std::lock_guard lock{_mutex};
+  } catch (...) {
+    // A waiter still checks the sticky failure flag when its deadline expires
+    // if this exceptional path races with its transition to waiting.
+  }
   _completed.notify_all();
 }
 
@@ -62,26 +77,32 @@ void event_queue::interrupt()
   _queue.interrupt();
 }
 
-bool event_queue::wait_before(event_id_t cutoff, std::chrono::milliseconds timeout)
+bool event_queue::wait_before(event_id_t cutoff, std::chrono::steady_clock::time_point deadline)
 {
-  std::unique_lock lock{_mutex};
+  std::unique_lock lock{_mutex, std::defer_lock};
+  if (!lock.try_lock_until(deadline)) { return false; }
   auto drained = [&] { return _pending.empty() || *_pending.begin() >= cutoff; };
-  return _completed.wait_for(lock, timeout, [&] { return _closed || _failed || drained(); }) &&
-         !_closed && !_failed && drained();
+  return _completed.wait_until(
+           lock,
+           deadline,
+           [&] { return _closed || _failed.load(std::memory_order_relaxed) || drained(); }) &&
+         !_closed && !_failed.load(std::memory_order_relaxed) && drained();
 }
 
 bool query_event_publisher::flush(std::shared_ptr<event_queue> const& queue,
                                   std::chrono::milliseconds timeout)
 {
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
   event_id_t cutoff;
   {
     // Finish every in-flight enqueue before capturing the boundary. Release
     // the routing lock before waiting: a subscriber hook may publish events.
-    std::unique_lock lock{_queues_mtx};
+    std::unique_lock lock{_queues_mtx, std::defer_lock};
+    if (!lock.try_lock_until(deadline)) { return false; }
     if (_stopped) { return false; }
     cutoff = _next_event_id.load(std::memory_order_relaxed);
   }
-  return queue->wait_before(cutoff, timeout);
+  return queue->wait_before(cutoff, deadline);
 }
 
 // ---------------------------------------------------------------------------

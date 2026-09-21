@@ -105,6 +105,8 @@ class query_event_subscriber {
 
   /// Wait until hooks have returned for every delivery published before this
   /// call captures its boundary. Later publications need not be consumed.
+  /// One timeout budget covers acquiring the routing/mailbox locks and waiting
+  /// for callbacks; time spent acquiring a lock does not restart the budget.
   /// Returns false on timeout, shutdown, or any dropped delivery. Call after
   /// the operation being observed has finished; never call from a hook.
   [[nodiscard]] bool flush(std::chrono::milliseconds timeout = std::chrono::seconds{5});
