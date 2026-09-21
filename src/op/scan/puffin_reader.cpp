@@ -368,7 +368,7 @@ std::vector<int64_t> read_deletion_vector(DeletionVectorRef const& ref)
       std::to_string(kMaxDeletionVectorPositions) + " this reader will materialize while planning");
   }
 
-  // Apache manifests record URIs; this reader bypasses sirius_ioctx, so nothing else strips them.
+  // Apache manifests record URIs; this reader bypasses ioctx, so nothing else strips them.
   auto const local_path = sirius::io::strip_file_scheme(puffin_path);
 
   std::ifstream f(local_path, std::ios::binary);

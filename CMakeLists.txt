@@ -363,10 +363,10 @@ set(EXTENSION_SOURCES
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
-    src/io/s3/s3_list_parser.cpp
-    src/io/s3/sigv4.cpp
+    src/io/rest/s3/list_parser.cpp
+    src/io/rest/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
-    src/io/s3/sirius_sigv4_authorizer.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
     src/log/duckdb_sink.cpp
@@ -859,6 +859,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_semi_future.cpp
     test/cpp/exec/test_sirius_ffi_fragment.cpp
     test/cpp/exec/test_stream_bind_catalog.cpp
+    test/cpp/exec/test_cuda_event_completion_poll.cpp
     test/cpp/exec/test_stream_session.cpp
     test/cpp/exec/test_streaming_fragment.cpp
     test/cpp/exec/test_thread_util.cpp
