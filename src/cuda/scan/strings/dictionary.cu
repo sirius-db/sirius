@@ -209,10 +209,10 @@ prepared_dict prepare_dict(gpu_string_codec_run const& run)
 void launch_dict_lengths(string_chunk_desc const* d_chunks,
                          uint32_t* d_lengths,
                          uint32_t n_chunks,
-                         rmm::cuda_stream_view stream)
+                         ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
-  kernel_compute_lengths_dict<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_compute_lengths_dict<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_chunks, d_lengths, n_chunks);
 }
 
@@ -220,10 +220,10 @@ void launch_dict_gather_short(string_chunk_desc const* d_chunks,
                               int32_t const* d_offsets,
                               uint8_t* d_chars,
                               uint32_t n_chunks,
-                              rmm::cuda_stream_view stream)
+                              ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_dict<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_gather_dict<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_chunks, d_offsets, d_chars, n_chunks);
 }
 
@@ -231,10 +231,10 @@ void launch_dict_gather_long(string_chunk_desc const* d_chunks,
                              int32_t const* d_offsets,
                              uint8_t* d_chars,
                              uint32_t n_chunks,
-                             rmm::cuda_stream_view stream)
+                             ::cuda::stream_ref stream)
 {
   if (n_chunks == 0) return;
-  kernel_gather_dict_warp<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.value()>>>(
+  kernel_gather_dict_warp<<<n_chunks, STRINGS_BLOCK_DIM, 0, stream.get()>>>(
     d_chunks, d_offsets, d_chars, n_chunks);
 }
 

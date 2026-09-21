@@ -12,7 +12,7 @@ Two classes do this, at two different layers:
 
 | | `exec::streaming_fragment` | `sirius::ffi::Fragment` |
 |---|---|---|
-| **Files** | `src/include/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp` | `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp` |
+| **Files** | `src/exec/streaming_fragment.hpp`, `src/exec/streaming_fragment.cpp` | `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp` |
 | **Caller** | C++ code already inside a live `duckdb::ClientContext` and transaction (e.g. the transparent path, `Context::execute_substrait`) | Any caller that must not include DuckDB/cuDF headers — the Rust bindings, or a standalone C++ embedder |
 | **Owns the connection?** | No — borrows the caller's `ClientContext` | Yes — brings up its own embedded `duckdb::DuckDB` + `Connection` (`Context`) |
 | **Transaction / query window** | Caller's responsibility to bracket | Manages its own, internally, across two phases (see below) |
@@ -53,8 +53,8 @@ receiver->run();
 
 ## `stream_bind_catalog` + `sirius_stream_source` — bridging bind time and plan time
 
-**Files:** `src/include/exec/stream_bind_catalog.hpp`, `src/exec/stream_bind_catalog.cpp`,
-`src/include/exec/stream_plan_bindings.hpp`, `src/exec/stream_plan_bindings.cpp`
+**Files:** `src/exec/stream_bind_catalog.hpp`, `src/exec/stream_bind_catalog.cpp`,
+`src/exec/stream_plan_bindings.hpp`, `src/exec/stream_plan_bindings.cpp`
 
 A fragment's input streams do not exist as DuckDB tables — there is nothing in the catalog for the
 binder to look up. `sirius_stream_source(id)`, a table function, stands in for one: its **bind**
@@ -187,7 +187,7 @@ declared input types before any batch moves.
 
 ## `sirius::ffi::Fragment` — the cross-language lifecycle
 
-**Files:** `src/include/sirius_ffi.hpp`, `src/sirius_ffi.cpp`
+**Files:** `include/sirius/ffi.hpp`, `src/sirius_ffi.cpp`
 
 `Context` is an RAII handle to one embedded engine: its own `duckdb::SiriusContext`, its own
 `duckdb::DuckDB` + `Connection`, and its own `stream_bind_catalog` — everything a fragment needs,

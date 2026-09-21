@@ -21,8 +21,7 @@
 #include "scan/test_utils.hpp"
 #include "utils/telemetry_utils.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <chrono>
@@ -98,7 +97,7 @@ class routing_test_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute(rmm::cuda_stream_view) override
+  void execute(::cuda::stream_ref) override
   {
     auto& global = _global_state->cast<routing_test_global_state>();
     auto& local  = _local_state->cast<routing_test_local_state>();

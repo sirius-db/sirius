@@ -65,7 +65,7 @@ int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, in
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_streaming_limit::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);

@@ -45,7 +45,6 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
-#include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -121,12 +120,12 @@ extern "C" int cudaProfilerStop();
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-// PinTableFunction routes parquet reads through the scan manager's sirius_ioctx
+// PinTableFunction routes parquet reads through the scan manager's ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
 // and binds to a single CUDA context). This is mandatory in multi-GPU
 // configurations (enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
 // Single-GPU users may still opt out via use_sirius_datasource=false; the
-// pin pipeline always routes through sirius_ioctx when one is available.
+// pin pipeline always routes through ioctx when one is available.
 //
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
@@ -135,7 +134,7 @@ extern "C" int cudaProfilerStop();
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
-#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/types.hpp"                // sirius::io::ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
 
 #include <dlfcn.h>
@@ -1999,25 +1998,21 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   rmm::cuda_stream build_stream;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (allocator == nullptr ||
-      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+      !allocator->attach_reservation_to_tracker(build_stream, std::move(reservation))) {
     throw InvalidInputException(
       "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
   }
   // Release the reservation whether the build succeeds or throws. On release the
   // arena hands back its unused slack and keeps the resident index accounted.
   absl::Cleanup reset_reservation = [allocator, &build_stream] {
-    allocator->reset_stream_reservation(build_stream.view());
+    allocator->reset_stream_reservation(build_stream);
   };
 
   // Build IVF-Flat on the build stream
   std::unique_ptr<sirius::vss::any_cuvs_index> handle;
   try {
-    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
-                                                            dim,
-                                                            n_lists,
-                                                            metric,
-                                                            target_space->get_default_allocator(),
-                                                            build_stream.view());
+    handle = sirius::vss::build_ivf_flat_index_from_batches(
+      chunk_views, dim, n_lists, metric, target_space->get_default_allocator(), build_stream);
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
@@ -2041,9 +2036,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists      = static_cast<int64_t>(n_lists);
   meta.metric       = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
-  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
-    allocator->get_peak_allocated_bytes(build_stream.view());
+    allocator->get_peak_allocated_bytes(build_stream);
 
   // Release the reservation before the build stream moves into the cache.
   std::move(reset_reservation).Invoke();
@@ -3003,16 +2998,31 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
   auto const bytes = UBigIntValue::Get(parameter);
-  if (bytes == 0) {
-    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
-  }
-  auto* params = get_operator_params(context);
+  auto* params     = get_operator_params(context);
   if (!params) { return; }
   auto slot                          = lock_operator_params_slot(context);
   params->dense_count_join_max_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
                    params->dense_count_join_max_bytes);
+}
+
+static void SetDenseCountJoinMemoryFraction(ClientContext& context,
+                                            SetScope scope,
+                                            Value& parameter)
+{
+  auto const fraction = DoubleValue::Get(parameter);
+  if (!(fraction > 0.0) || fraction > 1.0) {
+    throw InvalidInputException("dense_count_join_memory_fraction must be in (0.0, 1.0], got %f",
+                                fraction);
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                = lock_operator_params_slot(context);
+  params->dense_count_join_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MEMORY_FRACTION to {}",
+                   params->dense_count_join_memory_fraction);
 }
 
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -3128,6 +3138,16 @@ static void SetEnableCompressedMaterialization(ClientContext& /*context*/,
   // compressed_materialization_enabled(). A copy kept in shared state would answer for every
   // connection, so one connection's SET would redirect another's scans while that connection's
   // current_setting still reported the old value.
+}
+
+static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                              = lock_operator_params_slot(context);
+  params->enable_runtime_size_estimation = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_RUNTIME_SIZE_ESTIMATION to {}",
+                   params->enable_runtime_size_estimation);
 }
 
 void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
@@ -3298,6 +3318,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
                     SetDenseCountJoinMaxBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_memory_fraction",
+                    "internal test hook for the derived dense count-join histogram budget",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(operator_defaults.dense_count_join_memory_fraction),
+                    SetDenseCountJoinMemoryFraction);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",
@@ -3499,6 +3526,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::UBIGINT,
     Value::UBIGINT(operator_defaults.avg_variable_column_bytes),
     SetAvgVariableColumnBytes);
+
+  config.AddExtensionOption(
+    "enable_runtime_size_estimation",
+    "Let a grouped aggregation's PARTITION size itself from a projected input total instead of "
+    "waiting for its whole input, turning that hard barrier into a partial one. Off by default",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
+    SetEnableRuntimeSizeEstimation);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned
@@ -3617,7 +3652,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // unknown backend name is reported here rather than swallowed by the ctor.
   install_configured_log_sink(&db);
 
-  sirius::converter_registry::initialize();
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
   SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());

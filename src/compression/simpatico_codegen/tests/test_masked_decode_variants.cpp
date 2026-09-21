@@ -33,8 +33,7 @@
 #include "codegen/selection/selection.hpp"
 #include "gpu_encode.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
-
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -202,7 +201,7 @@ bool run_roundtrip(const std::string& dtype, std::int64_t base, std::int64_t ran
 {
   const std::int64_t n  = 5 * kChunk + 700;  // partial tail chunk
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   const std::vector<Element> data = gen_data<Element>(n, base, range);
 
@@ -496,7 +495,7 @@ bool run_delta_masked(const std::string& dtype, int arch)
 {
   const std::int64_t n  = 5 * kChunk + 700;
   const std::int64_t nc = codegen::num_chunks_for(n);
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   // Orderkey-like: monotone with small steps (delta diffs bitpack tightly).
   std::vector<Element> data(static_cast<std::size_t>(n));
@@ -623,7 +622,7 @@ bool run_dict_gather(std::int32_t key_width, int arch)
   const std::int64_t n        = 3 * kChunk + 511;
   const std::int64_t nc       = codegen::num_chunks_for(n);
   const std::int32_t num_keys = 3;
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
 
   std::vector<std::int32_t> codes(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i) {
@@ -709,7 +708,7 @@ bool run_str_split_masked(bool deep, int arch)
   const std::int64_t n     = 4 * kChunk + 300;            // string rows
   const std::int64_t n_off = n + 1;                       // offsets elements
   const std::int64_t nc    = codegen::num_chunks_for(n);  // row chunks
-  const rmm::cuda_stream_view stream{};
+  const ::cuda::stream_ref stream{cudaStream_t{}};
   const char* tag = deep ? "str-deep" : "str-shallow";
 
   // Host strings: offsets cumulative; chars pseudo-random bytes.

@@ -70,7 +70,7 @@ std::size_t device_l2_cache_bytes(
 
 dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publish_plan const& plan,
                                                            cudf::table_view const& build_view,
-                                                           rmm::cuda_stream_view stream)
+                                                           ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"dynfilter::push_build_side"};
   assert(plan.enabled());
@@ -252,7 +252,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(dynamic_filter_publis
   auto const built = [](auto const& f) { return static_cast<bool>(f); };
   if (std::any_of(per_key_membership.begin(), per_key_membership.end(), built) ||
       std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
-    stream.synchronize();
+    stream.sync();
 
     nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
     auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {

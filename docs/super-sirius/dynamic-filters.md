@@ -152,9 +152,9 @@ The settings live under `sirius.operator_params`:
 ## Implementation map
 
 - Planning and routing: `src/planner/sirius_plan_comparison_join.cpp` and `src/planner/dynamic_filter/`
-- Publication metadata and policy: `src/include/op/dynamic_filter/dynamic_filter_publish_plan.hpp` and `src/include/op/dynamic_filter/dynamic_filter_source_policy.hpp`
+- Publication metadata and policy: `src/op/dynamic_filter/dynamic_filter_publish_plan.hpp` and `src/op/dynamic_filter/dynamic_filter_source_policy.hpp`
 - Runtime publication: `src/op/dynamic_filter/dynamic_filter_publisher.cpp` and `src/op/sirius_physical_hash_join.cpp`
-- Filter capabilities and channel: `src/include/op/dynamic_filter/sirius_dynamic_filter.hpp`
+- Filter capabilities and channel: `src/op/dynamic_filter/sirius_dynamic_filter.hpp`
 - Consumer application: `src/op/scan/dynamic_filter_merge.cpp`, `src/op/scan/sirius_physical_dynamic_filter.cpp`, and `src/op/scan/parquet_gpu_ingestible.cpp`
 - GPU membership implementations: `src/cuda/sirius_dynamic_small_in_list_filter.cu`, `src/cuda/sirius_dynamic_in_list_filter.cu`, and `src/cuda/sirius_dynamic_bloom_filter.cu`
 - Focused validation: dynamic-filter tests under `test/cpp/planner/`, `test/cpp/operator/`, `test/cpp/scan/`, `test/cpp/pipeline/`, and `test/cpp/integration/`

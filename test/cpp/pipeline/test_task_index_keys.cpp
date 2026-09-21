@@ -45,7 +45,7 @@ using sirius::pipeline::index_keys_for;
 class plain_task : public sirius::parallel::itask {
  public:
   plain_task() : itask(/*task_id=*/1, nullptr, nullptr) {}
-  void execute(rmm::cuda_stream_view /*stream*/) override {}
+  void execute(::cuda::stream_ref /*stream*/) override {}
 };
 
 struct task_fixture {

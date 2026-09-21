@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-// Implementation of the public FFI surface (sirius_ffi.hpp). This is the one
+// Implementation of the public FFI surface (sirius/ffi.hpp). This is the one
 // translation unit that sees the heavy internal types, so consumers (e.g. the
 // Rust bindings) never include sirius_context.hpp.
-
-#include "sirius_ffi.hpp"
 
 #include "core_functions_extension.hpp"                    // duckdb::CoreFunctionsExtension
 #include "data/sirius_converter_registry.hpp"              // sirius::converter_registry
@@ -42,8 +40,9 @@
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
 #include "parquet_extension.hpp"          // duckdb::ParquetExtension
 #include "planner/sirius_physical_plan_generator.hpp"  // sirius::planner::sirius_physical_plan_generator
-#include "sirius_config.hpp"                           // sirius::sirius_config
-#include "sirius_context.hpp"                          // duckdb::SiriusContext
+#include "sirius/ffi.hpp"
+#include "sirius_config.hpp"     // sirius::sirius_config
+#include "sirius_context.hpp"    // duckdb::SiriusContext
 #include "sirius_interface.hpp"  // sirius::sirius_interface, sirius::sirius_prepared_statement_data
 
 #include <map>
@@ -108,11 +107,9 @@ struct Context::Impl {
 
   void bring_up(sirius::sirius_config& config)
   {
+    sirius::converter_registry::initialize(config.get_downgrade_executor_config().copy_chunk_bytes);
     context = duckdb::make_shared_ptr<duckdb::SiriusContext>();
     context->initialize(config);
-    // Register the builtin + parquet representation converters the GPU scan/result
-    // path needs. Idempotent; the transparent path does this at extension load.
-    sirius::converter_registry::initialize();
 
     // Substrait lowering uses core functions and resolves local_files reads to parquet_scan.
     db = duckdb::make_uniq<duckdb::DuckDB>(nullptr);

@@ -32,8 +32,9 @@
 #include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // standard library
 #include <memory>
@@ -138,7 +139,7 @@ std::unique_ptr<cudf::column> expression_evaluator::evaluate_result::release_col
 expression_evaluator::expression_evaluator(
   duckdb::vector<std::unique_ptr<sirius::ast::node>> const& expressions,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -159,7 +160,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   sirius::ast::node const& expression,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -177,7 +178,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   sirius::ast::node const* expression,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,
@@ -195,7 +196,7 @@ expression_evaluator::expression_evaluator(
 expression_evaluator::expression_evaluator(
   std::vector<sirius::ast::node const*> expressions,
   rmm::device_async_resource_ref resource_ref,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   expression_evaluator_strategy strategy,
   std::size_t min_ast_size,
   bool like_swar_fastpath,

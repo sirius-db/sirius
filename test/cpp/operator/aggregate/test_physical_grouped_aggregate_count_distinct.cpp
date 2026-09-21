@@ -79,7 +79,7 @@ template <typename ValTraits>
 std::unique_ptr<cudf::table> make_count_distinct_input(
   const std::vector<int32_t>& keys,
   const std::vector<typename ValTraits::type>& values,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -93,7 +93,7 @@ std::unique_ptr<cudf::table> make_count_distinct_input(
 // ---------------------------------------------------------------------------
 std::unique_ptr<cudf::table> make_count_distinct_expected(const std::vector<int32_t>& exp_keys,
                                                           const std::vector<int64_t>& exp_counts,
-                                                          rmm::cuda_stream_view stream,
+                                                          ::cuda::stream_ref stream,
                                                           rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
