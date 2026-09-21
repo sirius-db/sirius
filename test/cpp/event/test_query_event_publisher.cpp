@@ -16,6 +16,9 @@
 
 #include "catch.hpp"
 #include "event/query_event_subscriber.hpp"
+#include "utils/compressed_materialization_recorder.hpp"
+
+#include <future>
 
 // Query lifecycle producers and consumers live on different threads and most
 // subscribers care about only a subset of events. This suite documents why the
@@ -209,6 +212,14 @@ class selective_subscriber : public query_event_subscriber {
     record(event_type::wait_for_memory_for_task, "wait_for_memory_for_task");
   }
 
+  void on_compressed_materialization(event_id_t,
+                                     timestamp_t,
+                                     compressed_materialization_activity,
+                                     std::uint64_t) noexcept override
+  {
+    record(event_type::compressed_materialization, "compressed_materialization");
+  }
+
   [[nodiscard]] std::vector<std::string> seen() const
   {
     std::lock_guard g{_mtx};
@@ -256,6 +267,8 @@ void publish_one_of_each(query_event_publisher& publisher)
   publisher.publish_executor_awaiting_task(0);
   publisher.publish_memory_downgrade_for_task(make_query_id(1), 2, 0, 4096);
   publisher.publish_wait_for_memory_for_task(make_query_id(1), 2, 0, 4096);
+  publisher.publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 3);
 }
 
 constexpr auto some_op_type                     = op::SiriusPhysicalOperatorType::GPU_SCAN;
@@ -659,11 +672,11 @@ static_assert(n_query_events == all_query_events.size());
 TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publisher]")
 {
   auto publisher = std::make_shared<query_event_publisher>();
-  // Records all eight, subscribed to one. Anything but "task_queue_empty" in
+  // Records all events, subscribed to one. Anything but "task_queue_empty" in
   // the result means the routing delivered something nobody asked for.
   selective_subscriber subscriber{*publisher, {event_type::task_queue_empty}};
   // A subscriber subscribed to everything, purely as the sync point: once it has
-  // all eight, every delivery this round has been made.
+  // all events, every delivery this round has been made.
   selective_subscriber witness{*publisher,
                                {event_type::task_created,
                                 event_type::task_deployed,
@@ -672,16 +685,19 @@ TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publi
                                 event_type::pipeline_closed,
                                 event_type::executor_awaiting_task,
                                 event_type::memory_downgrade_for_task,
-                                event_type::wait_for_memory_for_task}};
+                                event_type::wait_for_memory_for_task,
+                                event_type::compressed_materialization}};
   subscriber.start();
   witness.start();
 
   publish_one_of_each(*publisher);
 
-  REQUIRE(wait_for(witness, 8));
+  REQUIRE(witness.flush());
+  REQUIRE(witness.count() == n_query_events);
+  REQUIRE(subscriber.flush());
   CHECK(subscriber.unsubscribed_count() == 0);
   CHECK(subscriber.seen() == std::vector<std::string>{"task_queue_empty"});
-  // The witness subscribed to all eight, so nothing it got was unsubscribed
+  // The witness subscribed to all events, so nothing it got was unsubscribed
   // either -- otherwise the counter would be measuring the wrong thing.
   CHECK(witness.unsubscribed_count() == 0);
 }
@@ -690,7 +706,8 @@ TEST_CASE("a subscriber subscribed to nothing receives nothing", "[event][query_
 {
   auto publisher = std::make_shared<query_event_publisher>();
   selective_subscriber subscriber{*publisher, {}};
-  selective_subscriber witness{*publisher, {event_type::wait_for_memory_for_task}};
+  selective_subscriber witness{
+    *publisher, {event_type::wait_for_memory_for_task, event_type::compressed_materialization}};
   subscriber.start();
   witness.start();
 
@@ -703,7 +720,7 @@ TEST_CASE("a subscriber subscribed to nothing receives nothing", "[event][query_
 
 TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_publisher]")
 {
-  // One subscriber per event, each recording all eight: a payload routed to the
+  // One subscriber per event, each recording all events: a payload routed to the
   // wrong bucket shows up as a second entry on somebody.
   auto publisher = std::make_shared<query_event_publisher>();
   std::vector<std::unique_ptr<selective_subscriber>> subscribers;
@@ -714,7 +731,8 @@ TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_
                                        "pipeline_closed",
                                        "executor_awaiting_task",
                                        "memory_downgrade_for_task",
-                                       "wait_for_memory_for_task"};
+                                       "wait_for_memory_for_task",
+                                       "compressed_materialization"};
   for (std::size_t i = 0; i < n_query_events; ++i) {
     subscribers.push_back(std::make_unique<selective_subscriber>(
       *publisher, std::initializer_list<event_type>{static_cast<event_type>(i)}));
@@ -823,7 +841,7 @@ TEST_CASE("every event is published and no unsubscribed one is delivered",
 {
   // Each subscriber subscribes to one event; every event is then published. The
   // counter is the assertion: it counts callbacks that fired for an event the
-  // subscriber never asked for, so zero across all eight means the routing
+  // subscriber never asked for, so zero across all events means the routing
   // delivered nothing it should not have.
   auto publisher = std::make_shared<query_event_publisher>();
   std::vector<std::unique_ptr<selective_subscriber>> subscribers;
@@ -840,8 +858,9 @@ TEST_CASE("every event is published and no unsubscribed one is delivered",
   for (auto const& l : subscribers) {
     REQUIRE(wait_for(*l, 2));
   }
-  // Settle: a wrongly-routed payload would arrive around now, not before.
-  std::this_thread::sleep_for(100ms);
+  for (auto const& subscriber : subscribers) {
+    REQUIRE(subscriber->flush());
+  }
   for (std::size_t i = 0; i < subscribers.size(); ++i) {
     INFO("subscriber " << i);
     CHECK(subscribers[i]->unsubscribed_count() == 0);
@@ -864,7 +883,8 @@ TEST_CASE("registration alone decides delivery", "[event][query_event_publisher]
   publisher->publish_task_queue_empty();
 
   REQUIRE(wait_for(empties, 1));
-  std::this_thread::sleep_for(100ms);  // a misroute would land about now
+  REQUIRE(empties.flush());
+  REQUIRE(closes.flush());
   CHECK(empties.count() == 1);
   CHECK(closes.count() == 0);
 
@@ -876,4 +896,142 @@ TEST_CASE("registration alone decides delivery", "[event][query_event_publisher]
   std::this_thread::sleep_for(100ms);
   CHECK(closes.count() == 1);
   CHECK(empties.count() == 1);
+}
+
+TEST_CASE("compressed materialization snapshots consume every activity and preserve counts",
+          "[event][compressed_materialization]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  sirius::test::compressed_materialization_recorder recorder{*publisher};
+  auto const before = recorder.snapshot();
+  CHECK(before.scan_columns_narrowed == 0);
+  using enum compressed_materialization_activity;
+  publisher->publish_compressed_materialization(scan_columns_narrowed, 2);
+  publisher->publish_compressed_materialization(scan_columns_restored, 3);
+  publisher->publish_compressed_materialization(pin_columns_narrowed, 5);
+  publisher->publish_compressed_materialization(scan_sidecar_installed);
+  publisher->publish_compressed_materialization(partition_narrow_columns, 7);
+  publisher->publish_compressed_materialization(scan_narrow_targets_retracted, 11);
+  auto const after = recorder.snapshot();
+  CHECK(after.scan_columns_narrowed == 2);
+  CHECK(after.scan_columns_restored == 3);
+  CHECK(after.pin_columns_narrowed == 5);
+  CHECK(after.scan_sidecars_installed == 1);
+  CHECK(after.partition_narrow_columns == 7);
+  CHECK(after.scan_narrow_targets_retracted == 11);
+  // No new publication is still a complete, meaningful observation.
+  CHECK(recorder.snapshot().pin_columns_narrowed == 5);
+}
+
+TEST_CASE("compressed materialization observations are scoped to their publisher",
+          "[event][compressed_materialization]")
+{
+  auto first  = std::make_shared<query_event_publisher>();
+  auto second = std::make_shared<query_event_publisher>();
+  first->publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 99);
+  sirius::test::compressed_materialization_recorder one{*first};
+  sirius::test::compressed_materialization_recorder two{*second};
+  first->publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 3);
+  CHECK(one.snapshot().pin_columns_narrowed == 3);
+  CHECK(two.snapshot().pin_columns_narrowed == 0);
+}
+
+TEST_CASE("flush includes every concurrent reporter and can be reused",
+          "[event][query_event_flush]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  sirius::test::compressed_materialization_recorder recorder{*publisher};
+  for (std::uint64_t round = 1; round <= 3; ++round) {
+    std::vector<std::jthread> reporters;
+    for (int thread = 0; thread < 4; ++thread) {
+      reporters.emplace_back([&] {
+        for (int i = 0; i < 500; ++i) {
+          publisher->publish_compressed_materialization(
+            compressed_materialization_activity::partition_narrow_columns, 2);
+        }
+      });
+    }
+    reporters.clear();  // Join before capturing the observation boundary.
+    CHECK(recorder.snapshot().partition_narrow_columns == round * 4000);
+  }
+}
+
+namespace {
+class blocked_subscriber : public query_event_subscriber {
+ public:
+  explicit blocked_subscriber(query_event_publisher& publisher)
+    : query_event_subscriber(publisher, {event_type::task_queue_empty}),
+      release_future(release.get_future().share())
+  {
+    start();
+  }
+  ~blocked_subscriber() override
+  {
+    unblock();
+    stop();
+  }
+  std::string_view name() const noexcept override { return "blocked"; }
+  void on_task_queue_empty(event_id_t, timestamp_t) noexcept override
+  {
+    entered.set_value();
+    release_future.wait();
+  }
+  void unblock()
+  {
+    std::call_once(released, [&] { release.set_value(); });
+  }
+  std::promise<void> entered;
+
+ private:
+  std::once_flag released;
+  std::promise<void> release;
+  std::shared_future<void> release_future;
+};
+}  // namespace
+
+TEST_CASE("flush waits for the callback to finish and reports timeout",
+          "[event][query_event_flush]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  blocked_subscriber subscriber{*publisher};
+  publisher->publish_task_queue_empty();
+  REQUIRE(subscriber.entered.get_future().wait_for(2s) == std::future_status::ready);
+  CHECK_FALSE(subscriber.flush(10ms));
+  subscriber.unblock();
+  CHECK(subscriber.flush());
+}
+
+TEST_CASE("flush fails after shutdown or before worker start", "[event][query_event_flush]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  metadata_subscriber subscriber{*publisher};
+  CHECK_FALSE(subscriber.flush(1ms));
+  subscriber.start();
+  REQUIRE(subscriber.flush());
+  SECTION("subscriber stopped") { subscriber.stop(); }
+  SECTION("publisher stopped") { publisher->stop(); }
+  CHECK_FALSE(subscriber.flush(1ms));
+}
+
+TEST_CASE("a delivery fence cannot skip an older unfinished event", "[event][query_event_flush]")
+{
+  // Exercise out-of-order completion deterministically: a largest-seen-ID
+  // implementation would incorrectly declare the fence complete after 12.
+  event_queue queue;
+  auto payload = [](event_id_t id) {
+    return std::make_shared<query_events>(task_queue_empty_event{id, {}, {}});
+  };
+  REQUIRE(queue.push(payload(10)));
+  REQUIRE(queue.push(payload(12)));
+  queue.complete(12);
+  CHECK_FALSE(queue.wait_before(13, 1ms));
+  queue.complete(10);
+  REQUIRE(queue.wait_before(13, 1ms));
+  REQUIRE(queue.push(payload(15)));
+  CHECK(queue.wait_before(13, 1ms));  // Publications beyond the fence do not hold it up.
+  SECTION("delivery failure") { queue.delivery_failed(); }
+  SECTION("shutdown") { queue.interrupt(); }
+  CHECK_FALSE(queue.wait_before(13, 1ms));
 }

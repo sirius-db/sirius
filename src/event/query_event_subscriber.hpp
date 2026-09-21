@@ -103,6 +103,12 @@ class query_event_subscriber {
   /// anything else apart must therefore stop from somewhere other than a hook.
   void stop() noexcept;
 
+  /// Wait until hooks have returned for every delivery published before this
+  /// call captures its boundary. Later publications need not be consumed.
+  /// Returns false on timeout, shutdown, or any dropped delivery. Call after
+  /// the operation being observed has finished; never call from a hook.
+  [[nodiscard]] bool flush(std::chrono::milliseconds timeout = std::chrono::seconds{5});
+
   /// Whether the worker is up.  False once it has exited, including when the
   /// publisher --- rather than @ref stop --- is what took it down.  Named apart
   /// from any @c is_running a subclass has for its own work, which is a
@@ -201,6 +207,11 @@ class query_event_subscriber {
                                            std::size_t operator_id,
                                            int gpu_id,
                                            std::size_t bytes_needed) noexcept;
+
+  virtual void on_compressed_materialization(event_id_t,
+                                             timestamp_t,
+                                             compressed_materialization_activity,
+                                             std::uint64_t count) noexcept;
 
  private:
   /// Drain until the mailbox closes, replaying each event into its hook.

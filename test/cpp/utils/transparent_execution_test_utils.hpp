@@ -18,6 +18,7 @@
 
 #include "catch.hpp"
 #include "sirius_context.hpp"
+#include "utils/compressed_materialization_recorder.hpp"
 
 #include <duckdb.hpp>
 
@@ -37,10 +38,23 @@ inline duckdb::SiriusContext::transparent_execution_stats get_transparent_execut
   return get_registered_sirius_context(con)->get_transparent_execution_stats();
 }
 
-inline duckdb::SiriusContext::compressed_materialization_stats get_compressed_materialization_stats(
+/// Keep the observer with this test connection, never in production SiriusContext.
+/// The first snapshot subscribes; take it before the operation being measured.
+class compressed_materialization_test_state : public duckdb::ClientContextState {
+ public:
+  explicit compressed_materialization_test_state(event::query_event_publisher& publisher)
+    : recorder(publisher)
+  {
+  }
+  compressed_materialization_recorder recorder;
+};
+
+inline compressed_materialization_stats get_compressed_materialization_stats(
   duckdb::Connection& con)
 {
-  return get_registered_sirius_context(con)->get_compressed_materialization_stats();
+  auto observer = con.context->registered_state->GetOrCreate<compressed_materialization_test_state>(
+    "compressed_materialization_test", get_registered_sirius_context(con)->get_event_publisher());
+  return observer->recorder.snapshot();
 }
 
 inline void require_transparent_execution_delta(

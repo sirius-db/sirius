@@ -573,7 +573,15 @@ matching-type control verifies that an unchanged pin still serves.
 
 Integration tests compare GPU and CPU results for a non-key decimal payload used both as a direct
 projection and in arithmetic, and discriminate the residency-gate states through the
-observability counters: beside
+test-side event counts. Producers publish `compressed_materialization` events through the context's
+`query_event_publisher`; the activity and count preserve the column/scan-node units below.
+`SiriusContext` owns no compressed-materialization counters or test snapshot methods. Test helpers
+subscribe before the measured operation and call the subscriber's `flush()` before each snapshot.
+The flush waits for every pending event preceding its captured boundary, including out-of-order
+publications from different threads, and reports timeout, shutdown, or delivery failure instead of
+returning a partial snapshot. Query completion alone does not imply subscriber completion.
+
+Among these observations, beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar
 after the residency gate (a later pass may still clear or prune it), a plan-time

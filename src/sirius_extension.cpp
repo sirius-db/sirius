@@ -1547,7 +1547,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                       {.capture_chunk_stats               = capture_chunk_stats,
                                        .enable_compressed_materialization = compressed_pin,
                                        .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+    sirius_ctx->get_event_publisher().publish_compressed_materialization(
+      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(host_result.column_storage));
     // entry.memory_space is metadata only; each host_chunk carries its own per-GPU
     // NUMA-local memory_space. Pass a representative (the first GPU's host space).
@@ -1579,7 +1580,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       {.capture_chunk_stats               = false,
        .enable_compressed_materialization = compressed_pin,
        .probe_unique_columns              = probe_unique_columns});
-    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+    sirius_ctx->get_event_publisher().publish_compressed_materialization(
+      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(dev_result.column_storage));
 
     scan_mgr.insert_pinned_entry_device(data.args.name,
@@ -1600,7 +1602,8 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
                                                {.capture_chunk_stats = capture_chunk_stats,
                                                 .enable_compressed_materialization = compressed_pin,
                                                 .probe_unique_columns = probe_unique_columns});
-    sirius_ctx->record_compressed_materialization_pin_columns_narrowed(
+    sirius_ctx->get_event_publisher().publish_compressed_materialization(
+      sirius::event::compressed_materialization_activity::pin_columns_narrowed,
       count_narrowed_columns(mat.column_storage));
     auto base_row_count_per_chunk = std::move(mat.base_row_count_per_chunk);
     auto const stored             = scan_mgr.insert_pinned_entry(data.args.name,
