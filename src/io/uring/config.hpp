@@ -33,6 +33,12 @@ struct config {
   std::size_t n_max_concurrent_scans{
     static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads)};
 
+  /// Whether the config named @c n_max_concurrent_scans explicitly. Needed
+  /// because the derived default follows the configured pipeline width and can
+  /// legitimately equal the struct default. Without this provenance, an
+  /// explicit value equal to the struct default is silently overwritten.
+  bool n_max_concurrent_scans_explicit{false};
+
   /// When false, worker-planned operations use the buffered page-cache handle.
   /// Defaults to O_DIRECT when a physical operation satisfies its constraints.
   bool use_odirect{true};

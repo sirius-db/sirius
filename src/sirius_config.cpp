@@ -214,7 +214,16 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 {
   yaml::reader r(node, "uring");
-  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
+  {
+    // Preserve whether the value was named: an explicit value may equal the
+    // struct default and must not be replaced by the pipeline-derived default.
+    std::optional<std::size_t> n_max;
+    r.optional("n_max_concurrent_scans", n_max);
+    if (n_max.has_value()) {
+      opt.n_max_concurrent_scans          = *n_max;
+      opt.n_max_concurrent_scans_explicit = true;
+    }
+  }
   r.reject_unknown();
 }
 
@@ -828,20 +837,20 @@ void sirius_config::derive_uring_scan_budget()
   // a config that resizes the pipeline pool would otherwise leave the readahead
   // budget pinned to the old default and unable to keep the pool fed.
   //
-  // Only the untouched default is replaced, so an explicit
-  // uring.n_max_concurrent_scans in the config still wins.
-  constexpr auto struct_default = static_cast<std::size_t>(exec::default_gpu_pipeline_num_threads);
-  if (_scan_manager_config.uring.n_max_concurrent_scans != struct_default) { return; }
+  // Only an omitted value is derived, so every explicit
+  // uring.n_max_concurrent_scans value still wins -- including one numerically
+  // equal to the struct default.
+  if (_scan_manager_config.uring.n_max_concurrent_scans_explicit) { return; }
 
   auto const pipeline_threads =
     static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
-  if (pipeline_threads == struct_default) { return; }
+  if (pipeline_threads == _scan_manager_config.uring.n_max_concurrent_scans) { return; }
 
   SIRIUS_LOG_INFO(
     "sirius_config: uring.n_max_concurrent_scans defaulted to the configured pipeline pool size "
     "({} threads), replacing the built-in default of {}",
     pipeline_threads,
-    struct_default);
+    _scan_manager_config.uring.n_max_concurrent_scans);
   _scan_manager_config.uring.n_max_concurrent_scans = pipeline_threads;
 }
 
