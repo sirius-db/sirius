@@ -4,6 +4,7 @@
  */
 
 #include "codegen/plan/representation.hpp"
+#include "codegen/util/nvtx.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -27,7 +28,6 @@
 #include <rmm/mr/per_device_resource.hpp>
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/logical.h>
@@ -45,7 +45,20 @@ namespace simpatico {
 
 namespace {
 
-constexpr size_t MAX_INDICES = 1 << 28;  // 256M rows (sanity bound)
+// Structural row bound only: a cudf column cannot exceed size_type rows, and
+// the INT32 dictionary codes index the KEY SET (K distinct values), not rows,
+// so any representable column encodes. Audit notes (iteration 6): the decode
+// gathers do their addressing in int64 (key_base/nbytes below) and the
+// constant-width fast path self-guards on nbytes > size_type max; the historic
+// `1 << 28` "sanity bound" predated the HyperLogLog cardinality gate below,
+// which now handles the real hazard (dictionary::encode's illegal access on
+// huge HIGH-CARDINALITY inputs) by distinct FRACTION rather than row count —
+// the row cap only silently forced narrow pins (>= 2^28 rows/chunk, e.g. q12's
+// 5-col lineitem pin at ~276M and 2-3-col orders pins at ~600-900M) to raw.
+// Encode transients (cudf's hash set + INT32 indices) scale O(n); an
+// allocation failure throws and the pin falls back to an uncompressed chunk,
+// visibly (see the per-pin coverage line in pin_table.cpp).
+constexpr size_t MAX_INDICES = static_cast<size_t>(std::numeric_limits<cudf::size_type>::max());
 
 // cudf::dictionary::encode faults with a context-corrupting illegal access on
 // very large, very-high-cardinality strings — inputs a dictionary can't help
@@ -60,8 +73,7 @@ constexpr double kDictMaxCardFraction  = 0.5;
 
 // Constant key byte-width if every key has the same length, else 0 (STRING: not deducible from
 // dtype).
-int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
-                                   rmm::cuda_stream_view stream)
+int64_t measure_constant_key_width(cudf::strings_column_view const& keys, ::cuda::stream_ref stream)
 {
   auto const n = keys.size();
   if (n <= 0) return 0;
@@ -75,8 +87,8 @@ int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
       rmm::exec_policy(stream), thrust::counting_iterator<int>(0), 1, [=] __device__(int) {
         d[0] = off[1] - off[0];
       });
-    cudaMemcpyAsync(&w, d, sizeof(w), cudaMemcpyDeviceToHost, stream.value());
-    cudaStreamSynchronize(stream.value());
+    cudaMemcpyAsync(&w, d, sizeof(w), cudaMemcpyDeviceToHost, stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   if (w <= 0) return 0;
   bool const all_equal =
@@ -91,7 +103,7 @@ int64_t measure_constant_key_width(cudf::strings_column_view const& keys,
 // runtime width the byte shuffle spills to local memory.
 template <int W>
 void padded_gather_chunks(
-  uint4 const* pool, int32_t const* ix, char* out, int64_t nbytes, rmm::cuda_stream_view stream)
+  uint4 const* pool, int32_t const* ix, char* out, int64_t nbytes, ::cuda::stream_ref stream)
 {
   int64_t const nchunks = (nbytes + 15) / 16;
   thrust::for_each_n(rmm::exec_policy(stream),
@@ -132,7 +144,7 @@ void padded_gather_chunks(
 std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_view const& keys,
                                                         cudf::column_view const& indices,
                                                         std::int64_t& cached_width,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   if (indices.null_count() > 0 || keys.parent().null_count() > 0) return nullptr;
@@ -229,7 +241,7 @@ std::unique_ptr<cudf::column> try_decode_constant_width(cudf::strings_column_vie
 }
 
 std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
-  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view const& col, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   if (col.type().id() != cudf::type_id::STRING) {
     throw std::runtime_error("dictionary_compressor: column must be STRING, got '" +
@@ -258,16 +270,16 @@ std::unique_ptr<dictionary_compressed_representation> dictionary_compress_impl(
   }
 
   auto dict_col = cudf::dictionary::encode(col, cudf::data_type(cudf::type_id::INT32), stream, mr);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::make_unique<dictionary_compressed_representation>(std::move(dict_col));
 }
 
 }  // namespace
 
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress"};
+  nvtx_scoped_range r{"dictionary_decompress"};
   // Decode from the stored dictionary column.
   if (dict_column == nullptr) { return nullptr; }
   if (dict_column->size() == 0) {
@@ -289,11 +301,9 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress(
 }
 
 std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_predicate(
-  decode_predicate const& pred,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr) const
+  decode_predicate const& pred, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
-  nvtx3::scoped_range r{"dictionary_decompress_predicate"};
+  nvtx_scoped_range r{"dictionary_decompress_predicate"};
   if (dict_column == nullptr || !pred.active()) { return nullptr; }
 
   auto const n_rows = dict_column->size();
@@ -363,7 +373,7 @@ std::unique_ptr<cudf::column> dictionary_compressed_representation::decompress_p
 
 std::unique_ptr<compressed_representation> dictionary_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   return dictionary_compress_impl(column_to_compress, stream, mr);

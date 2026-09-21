@@ -4,7 +4,7 @@ This document covers Super Sirius configuration: the `sirius_config` class, oper
 
 ## `sirius_config`
 
-**File:** `src/include/sirius_config.hpp`
+**File:** `src/sirius_config.hpp`
 
 The `sirius_config` class loads configuration from a YAML file or uses built-in defaults. It provides:
 
@@ -26,11 +26,23 @@ If no config file is found, Sirius initializes with built-in defaults (95% GPU m
 
 ### `SIRIUS_DISABLE`
 
-Set `SIRIUS_DISABLE=1` to prevent Super Sirius from initializing. This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks.
+`SIRIUS_DISABLE` is a process-startup kill switch for the **Super Sirius runtime**, not a query-fallback setting. Set `SIRIUS_DISABLE=1` before starting DuckDB to prevent that runtime from initializing and transparently routing queries to the GPU. The extension binary still loads and registers its SQL surface; legacy functions therefore remain available in builds that include them. Sirius also skips creating its Quent telemetry context and does not publish an automatic NVTX injection path. A caller-supplied `NVTX_INJECTION64_PATH` remains untouched.
+
+This is **required** when using the legacy code path (`gpu_buffer_init`/`gpu_processing`), because Super Sirius claims most GPU and pinned host memory on startup, leaving insufficient memory for the legacy buffer manager. It is also useful for CPU-only benchmarks. An unset value or `SIRIUS_DISABLE=0` enables normal Super Sirius initialization; any other set value disables it.
 
 ```bash
 export SIRIUS_DISABLE=1
 ```
+
+These related modes have different behavior:
+
+| Mode | Query execution | NVTX/Quent behavior |
+|------|-----------------|---------------------|
+| `SIRIUS_DISABLE=1` | Ordinary SQL runs in DuckDB; Super Sirius is never attempted | Sirius does not create its Quent context or configure automatic NVTX injection |
+| `SET gpu_execution = false` | Ordinary SQL runs in DuckDB for that connection | The process-wide Sirius runtime remains initialized and, when Quent is enabled, NVTX injection remains armed because the setting is reversible and other connections may use Sirius; DuckDB emits no NVTX events unless DuckDB or another loaded component explicitly calls NVTX |
+| Automatic CPU fallback | Sirius first rejects the GPU plan or fails during GPU execution, then DuckDB executes the CPU plan | NVTX remains active so any Sirius/libcudf work before the fallback is retained; the DuckDB portion emits events only if the executing code calls NVTX |
+
+Use `SIRIUS_DISABLE=1` for a pure DuckDB CPU baseline in a process that contains the Sirius extension. Use `SET gpu_execution = false` when the initialized Sirius runtime must remain available to turn back on later.
 
 ### Byte Suffixes
 
@@ -160,13 +172,15 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 ### Input-table compression (`sirius.compression`)
 
 These settings control optional Simpatico compression when
-`pin_table(tier=>'host')` caches input tables. Compression requires both
-`enable_pin_table_compression: true` and a matching plan in `input_plan_dir`;
-otherwise the table is pinned uncompressed.
+`pin_table` caches input tables. Prefer the per-call
+`CALL pin_table(..., compression => true)` argument to request compression for a specific pin.
+The settings below supply the default for calls that omit the argument and configure plan lookup
+and retention gates. Compression also requires a matching plan in `input_plan_dir`; otherwise the
+table is pinned uncompressed.
 
 | Key | DuckDB setting | Type | Default | Description |
 |-----|----------------|------|---------|-------------|
-| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Attempt planned compression while pinning input tables to host memory. |
+| `enable_pin_table_compression` | `pin_table_compression` | bool | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `min_batch_size_bytes` | `pin_table_compression_min_batch_size_bytes` | bytes | 1Mi | Skip compression below this uncompressed batch size. `0` disables the size gate. |
 | `max_compressed_fraction` | `pin_table_compression_max_compressed_fraction` | finite double >= 0 | 0.75 | Keep a compressed representation only at or below this fraction of the original batch size. `0` retains none; values above `1` deliberately permit expansion, primarily for testing encodability. |
 | `input_plan_dir` | `pin_table_input_compression_plan_dir` | string | "" | Directory of per-table Simpatico plan files. An empty path leaves compression inactive. |
@@ -257,7 +271,7 @@ sirius:
 
 ## Executor Configuration
 
-**Files:** `src/include/exec/config.hpp`, `src/include/creator/config.hpp`
+**Files:** `src/exec/config.hpp`, `src/creator/config.hpp`
 
 The `sirius.executor` block configures the thread pools and task scheduling. It has four
 per-pool sub-blocks: `task_creator`, `pipeline`, `downgrade`, and `scan_manager`. The
@@ -295,7 +309,7 @@ Thread pool (default `num_threads: 1`) plus:
 
 ## Scan Manager & IO Configuration
 
-**Files:** `src/include/scan_manager/config.hpp`, `src/include/io/uring/config.hpp`, `src/include/io/rest/config.hpp`, `src/include/io/cache/config.hpp`, `src/include/io/object_store_config.hpp`
+**Files:** `src/scan_manager/config.hpp`, `src/io/uring/config.hpp`, `src/io/rest/config.hpp`, `src/io/cache/config.hpp`, `src/io/object_store_config.hpp`
 
 The `sirius.executor.scan_manager` block configures the scan-metadata thread pool and the Sirius IO layer that feeds the GPU scan operators.
 
@@ -382,7 +396,7 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 ## Operator Parameters
 
-**File:** `src/include/sirius_config.hpp` — `operator_params` struct
+**File:** `src/sirius_config.hpp` — `operator_params` struct
 
 The four batch/partition sizes (`scan_task_batch_size`, `hash_partition_bytes`,
 `concat_batch_bytes`, `sort_sample_bytes`) share one built-in default. Without an
@@ -413,7 +427,8 @@ individually.
 | `dynamic_filter_inlist_max_l2_fraction` | 0.125 | Finite threshold in [0, 1]: maximum estimated cuco-set size for the exact hash IN-list, as a fraction of the smallest probe-GPU L2. Larger sets use Bloom when supported. For keys not handled by the raw IN-list, 0 selects Bloom when supported, while 1.0 reproduces the legacy L2-fit rule only when L2 size is known. If L2 size is unknown, the hash IN-list is ineligible and selection falls back to Bloom or no membership filter. The 0.125 default comes from a GB300 residency sweep: hash-set probe cost is flat below ~0.28 of L2 and degrades beyond it, while Bloom was at least 2.2x faster at every swept set size. |
 | `enable_runtime_distinct_build_probe` | true | For `BUILD_PROBE` INNER/LEFT equality joins whose build-key uniqueness the planner could not prove, test distinctness at runtime (one `cudf::distinct_count` pass over the cached build, dimension-scale builds only) and take the single-pass `cudf::distinct_hash_join` instead of the general two-pass join when the keys are distinct. |
 | `enable_dense_count_join` | true | Fuse `COUNT(col \| *) GROUP BY <preserved-side join key>` over a LEFT/RIGHT integer equi-join into the `DENSE_COUNT_JOIN` operator (TPC-H q13 shape): a direct-address count histogram over the preserved key domain replaces the join build, output materialization, and re-aggregation. |
-| `dense_count_join_max_bytes` | 2 GiB | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint; a key domain too wide for the budget takes the operator's exact sparse (eager-aggregation) strategy. Must be greater than zero. |
+| `dense_count_join_max_bytes` | 0 (auto) | Cap on `DENSE_COUNT_JOIN`'s combined direct-address histogram footprint. Auto = `dense_count_join_memory_fraction` of the smallest visible GPU's capacity (2 GiB if capacity cannot be read at planning time). At plan time, a preserved/counted cardinality estimate whose histogram would exceed the budget declines the fusion entirely, planning the ordinary join + aggregate instead; within a fused plan, a key domain that turns out too wide at runtime still takes the operator's exact sparse (eager-aggregation) strategy. |
+| `dense_count_join_memory_fraction` | 0.10 | Fraction of the smallest visible GPU's capacity used to resolve `dense_count_join_max_bytes` when it is 0 (auto). |
 | `dynamic_filter_keep_threshold` | 0.9 | Finite threshold in [0, 1] for disabling post-decode filtering once a measured split keeps more than this fraction of its rows; 1.0 keeps filtering always on. |
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
@@ -444,6 +459,7 @@ sirius:
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
 
 Per-query labels are configured separately from YAML. They can be set with the
 `sirius_set_query_label` SQL function or inline with the `query_label` named
@@ -542,9 +558,9 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `sirius_log_backend` | `spdlog` | Log sink: `spdlog`, `duckdb`, or `noop` |
-| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error (`spdlog` only) |
+| `sirius_log_level` | `info` | Log level: trace, debug, info, warn, error, critical, off (`spdlog` only) |
 | `sirius_log_dir` | `log` | Log output directory (`spdlog` only) |
-| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds (`spdlog` only) |
+| `sirius_log_flush_seconds` | 3 | Log flush interval in seconds; 0 disables periodic flushing and negative values are rejected (`spdlog` only) |
 
 - **`spdlog`** (default): writes the daily-rotated `<sirius_log_dir>/sirius.log`, honouring
   `sirius_log_level` and `sirius_log_flush_seconds`.
@@ -558,7 +574,7 @@ These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, an
 
 ### Expression Evaluation
 
-**File:** `src/include/expression_evaluator/expression_evaluator_strategy.hpp`
+**File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -603,6 +619,8 @@ SET enable_compressed_materialization = false;
 | `max_broadcast_join_size` | 256 MiB | Max build-side size eligible for a broadcast join |
 | `mark_join_build_switch_ratio` | 8.0 | STANDARD MARK join build-side switch ratio (0 disables) |
 | `enable_dense_count_join` | true | Enable the fused count-over-outer-join operator; accepted only as a strict boolean under `sirius.operator_params`. |
+| `dense_count_join_max_bytes` | 0 (auto) | Histogram budget for `DENSE_COUNT_JOIN`; auto = `dense_count_join_memory_fraction` of the smallest visible GPU's capacity |
+| `dense_count_join_memory_fraction` | 0.10 | Auto histogram-budget fraction when `dense_count_join_max_bytes` is 0 |
 
 Eligible GROUP BY and TOP_N merge pipelines are fused automatically. This is an engine-owned plan
 policy rather than a user configuration choice; see
@@ -617,7 +635,11 @@ Runtime distinct-build probing is also engine-owned and is temporarily disabled 
 Dense count-join is enabled by default and can be disabled with
 `sirius.operator_params.enable_dense_count_join: false`. Both inputs are FULL barriers and are
 hash-partitioned on the join key, so one partition of each input plus its workspace must fit one
-GPU task. Its histogram budget is engine-owned and applies per partition task.
+GPU task. Its histogram budget applies per partition task and is auto-derived from GPU capacity
+by default (`dense_count_join_max_bytes: 0`); at plan time, a preserved/counted cardinality
+estimate whose histogram would exceed that budget declines the fusion and falls back to the
+ordinary join + aggregate, so query-plan shape alone no longer guarantees `DENSE_COUNT_JOIN` is
+chosen.
 
 ### GPU Admission
 
@@ -675,9 +697,13 @@ test options; it is not part of the normal user surface.
 
 ### Pinned-Table Compression (Simpatico)
 
+Prefer the per-call `pin_table(..., compression => true/false)` argument for a specific pin. The
+variables below supply the default for calls that omit the argument and configure plan lookup and
+retention gates.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `pin_table_compression` | false | Enable Simpatico compression for `pin_table(tier=>'host')` chunks. |
+| `pin_table_compression` | false | Default for `pin_table` calls that omit the `compression` argument. |
 | `pin_table_input_compression_plan_dir` | (empty) | Directory of per-table Simpatico plan files (`<table_name>.<ext>`, multi-column plan DSL). Tables with no matching file are pinned uncompressed. No effect on spill compression. |
 | `pin_table_compression_min_batch_size_bytes` | 1 MiB | Minimum uncompressed batch size below which pin-table compression is skipped. |
 | `pin_table_compression_max_compressed_fraction` | 0.75 | Discard the compressed form and pin uncompressed when the compressed size exceeds this fraction of the original (compression saved too little). |
@@ -738,7 +764,7 @@ when built with `ENABLE_LEGACY_SIRIUS=ON`, including the `legacy-release` preset
 
 ### Static flags
 
-**File:** `src/include/config.hpp`
+**File:** `src/config.hpp`
 
 Static constants from `namespace duckdb::Config` (used by legacy Sirius) and `namespace sirius::Config`:
 
@@ -758,11 +784,11 @@ These are compile-time defaults. Runtime configuration via `sirius_config` and D
 
 | File | Purpose |
 |------|---------|
-| `src/include/sirius_config.hpp` | Config class, operator_params, thread pool configs |
-| `src/include/config.hpp` | Legacy config flags |
+| `src/sirius_config.hpp` | Config class, operator_params, thread pool configs |
+| `src/config.hpp` | Legacy config flags |
 | `src/sirius_extension.cpp` | SET variable registration |
-| `src/include/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
-| `src/include/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
+| `src/scan_manager/config.hpp` | Scan manager config (thread pool, IO reactors, prefetch cache, object store) |
+| `src/io/uring/config.hpp`, `io/rest/config.hpp`, `io/cache/config.hpp`, `io/object_store_config.hpp` | Per-backend IO / cache / object-store sub-configs |
 
 ## Tuned profile: GB300, TPC-H SF1000 host-pinned
 

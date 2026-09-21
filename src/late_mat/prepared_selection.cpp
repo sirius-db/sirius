@@ -16,7 +16,7 @@
 
 #include "late_mat/prepared_selection.hpp"
 
-#include <nvtx3/nvtx3.hpp>
+#include "telemetry/nvtx.hpp"
 
 #include <codegen/selection/row_id_space.hpp>
 
@@ -55,7 +55,7 @@ prepared_selection::prepared_selection(pinned_table_layout layout, row_id_list i
   }
 }
 
-canonical_selection const& prepared_selection::canonical(rmm::cuda_stream_view stream,
+canonical_selection const& prepared_selection::canonical(::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr) const
 {
   // call_once so the form stays single-built and single-shared even if several
@@ -63,7 +63,7 @@ canonical_selection const& prepared_selection::canonical(rmm::cuda_stream_view s
   // It propagates the exception and leaves the flag unset, so a failed build is
   // retried rather than cached.
   std::call_once(_once, [&]() {
-    nvtx3::scoped_range build_range{"sirius::late_mat::canonical_selection"};
+    nvtx_scoped_range build_range{"sirius::late_mat::canonical_selection"};
     auto built = std::make_unique<canonical_selection>();
     built->batches.resize(_layout.num_batches());
     built->out_base.assign(_layout.num_batches() + 1, 0);
@@ -79,7 +79,7 @@ canonical_selection const& prepared_selection::canonical(rmm::cuda_stream_view s
     std::int32_t const* count_dev = nullptr;
     codegen::sorted_unique_ids canon;
     if (!_ids.sorted_unique) {
-      nvtx3::scoped_range sort_range{"sirius::late_mat::sort_unique_global_ids"};
+      nvtx_scoped_range sort_range{"sirius::late_mat::sort_unique_global_ids"};
       canon     = codegen::sort_unique_global_ids(_ids.ids, _ids.count, stream, mr);
       sorted    = static_cast<std::uint64_t const*>(canon.ids.data());
       count_dev = static_cast<std::int32_t const*>(canon.count_dev.data());

@@ -330,6 +330,7 @@ static void from_yaml(const YAML::Node& node, telemetry_config& opt)
     if (!value.empty()) return true;
     throw std::runtime_error("must not be empty");
   });
+  r.optional("nvtx_injection_lib", opt.nvtx_injection_lib);
   r.reject_unknown();
 }
 
@@ -351,6 +352,7 @@ static void from_yaml(const YAML::Node& node, exec::downgrade_executor_config& o
   r.optional("num_threads", opt.thread_pool.num_threads, yaml::greater_than<int>{0});
   r.optional("cpu_affinity", opt.thread_pool.cpu_affinity_list);
   r.optional("monitor_period", opt.monitor_period);
+  r.optional("copy_chunk_bytes", yaml::bytes(opt.copy_chunk_bytes));
   r.reject_unknown();
 }
 

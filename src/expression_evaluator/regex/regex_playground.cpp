@@ -19,6 +19,7 @@
 #include "expression_evaluator/regex/regex_playground.hpp"
 // clang-format on
 
+#include <cudf/cudf_utils.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/find.hpp>
@@ -26,11 +27,13 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
+#include <vector>
+
 namespace sirius {
 namespace regex {
 
 std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_regex(
-  const cudf::column_view& input, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  const cudf::column_view& input, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   // libcudf's $ anchor matches before one final LF. Replacing that match retains the unmatched LF,
   // which a string-view transform cannot synthesize after extracting a non-contiguous domain.
@@ -108,6 +111,22 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
 )***";
 
   cudf::transform_input ti = input;
+#if CUDF_VERSION_NUM >= 2610
+  cudf::transform_output const output{cudf::data_type{cudf::type_id::STRING},
+                                      cudf::output_nullability::PRESERVE};
+  auto result  = cudf::transform(udf,
+                                cudf::udf_source_type::CUDA,
+                                cudf::null_aware::YES,
+                                std::nullopt,
+                                std::span(&ti, 1),
+                                std::span(&output, 1),
+                                std::vector<std::unique_ptr<cudf::column>>{},
+                                std::nullopt,
+                                stream,
+                                mr);
+  auto columns = result->release();
+  return std::move(columns.front());
+#else
   return cudf::transform_extended(std::span(&ti, 1),
                                   udf,
                                   cudf::data_type{cudf::type_id::STRING},
@@ -118,6 +137,7 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
                                   cudf::output_nullability::PRESERVE,
                                   stream,
                                   mr);
+#endif
 }
 
 }  // namespace regex

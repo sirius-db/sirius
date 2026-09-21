@@ -94,7 +94,8 @@ void pin_metadata_entry(sirius_scan_manager& manager,
                         std::string const& name,
                         std::vector<std::size_t> const& primary_indices)
 {
-  manager.insert_pinned_entry(name, make_cache_info(primary_indices), {}, {}, {}, {}, {});
+  static_cast<void>(
+    manager.insert_pinned_entry(name, make_cache_info(primary_indices), {}, {}, {}, {}, {}));
 }
 
 /// 'orders' covers every column but c8; the 'main.orders' split covers {0, 1, 8}.
@@ -141,7 +142,7 @@ void pin_typed_entry(sirius_scan_manager& manager,
 {
   pinned_column_storage_matrix storage{std::vector<pinned_column_storage_meta>(
     primary_indices.size(), pinned_column_storage_meta{kInt64, false, native})};
-  manager.insert_pinned_entry(
+  static_cast<void>(manager.insert_pinned_entry(
     name,
     make_cache_info(primary_indices),
     one_int64_chunk(primary_indices.size()),
@@ -149,7 +150,7 @@ void pin_typed_entry(sirius_scan_manager& manager,
       sirius::scan_test_utils::get_space(memory, cucascade::memory::Tier::GPU)},
     {},
     {},
-    std::move(storage));
+    std::move(storage)));
 }
 
 /// Both entries cover {c0, c1}; only @p matching keeps the INT64 mapping. The

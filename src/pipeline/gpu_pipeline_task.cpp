@@ -25,9 +25,9 @@
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
 #include "telemetry/batch_telemetry.hpp"
+#include "telemetry/nvtx.hpp"
 #include "telemetry/telemetry_context.hpp"
 
-#include <nvtx3/nvtx3.hpp>
 #include <thrust/system/system_error.h>
 
 #include <absl/cleanup/cleanup.h>
@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -178,7 +179,7 @@ void log_operator_data(const op::sirius_physical_operator& op,
 std::unique_ptr<op::operator_data> materialize_deferred_input(
   op::sirius_physical_operator const& op,
   op::operator_data const& input_data,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto const& directive = op.port_directive();
   if (directive.empty()) { return nullptr; }
@@ -219,7 +220,7 @@ std::unique_ptr<op::operator_data> materialize_deferred_input(
 std::unique_ptr<op::operator_data> run_one_operator(
   op::sirius_physical_operator& op,
   const op::operator_data& operator_input_data,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const sirius_pipeline* pipeline,
   uint64_t task_id,
   size_t num_operators,
@@ -234,7 +235,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
 
   auto nvtx_label = std::format(
     "Pipeline {}: {} (id={})", pipeline->get_pipeline_id(), op.get_name(), op.get_operator_id());
-  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+  nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
   auto start = std::chrono::high_resolution_clock::now();
   std::unique_ptr<op::operator_data> operator_output_data;
   try {
@@ -267,7 +268,7 @@ std::unique_ptr<op::operator_data> run_one_operator(
       cudaGetErrorString(sticky_err));
   }
 
-  stream.synchronize();
+  stream.sync();
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -309,7 +310,7 @@ std::size_t gpu_pipeline_task_local_state::get_estimated_bytes_to_materialize_in
   std::size_t input_size   = 0;
   auto* pipelineable_input = dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
   if (pipelineable_input) {
-    for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
+    for (const auto& ro : pipelineable_input->get_read_only_batches()) {
       if (!ro.get_data()) { continue; }
       const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
       const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
@@ -390,7 +391,7 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
   return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
 }
 
-std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(::cuda::stream_ref stream)
 {
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
@@ -522,7 +523,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
 }
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::materialize_sink_input(
-  op::operator_data& output_data, rmm::cuda_stream_view stream)
+  op::operator_data& output_data, ::cuda::stream_ref stream)
 {
   auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto sink_operators = pipeline->get_sink();
@@ -532,7 +533,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::materialize_sink_input(
   return materialize_deferred_input(*sink_operators, output_data, stream);
 }
 
-void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
+void gpu_pipeline_task::publish_output(op::operator_data& output_data, ::cuda::stream_ref stream)
 {
   // Interface entry point: restore and publish as one step. gpu_pipeline_task::execute takes the
   // two-step overload instead, so it can bound the OOM-reschedule window to the restoration.
@@ -542,7 +543,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda
 
 void gpu_pipeline_task::publish_output(op::operator_data& output_data,
                                        op::operator_data* materialized,
-                                       rmm::cuda_stream_view stream)
+                                       ::cuda::stream_ref stream)
 {
   auto pipeline       = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto sink_operators = pipeline->get_sink();
@@ -551,7 +552,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
                                   pipeline->get_pipeline_id(),
                                   sink_operators->get_name(),
                                   sink_operators->get_operator_id());
-    nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+    nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
     auto const sink_start = std::chrono::high_resolution_clock::now();
     sink_operators.get()->sink(materialized ? *materialized : output_data, stream);
     auto const sink_end = std::chrono::high_resolution_clock::now();
@@ -567,7 +568,7 @@ void gpu_pipeline_task::publish_output(op::operator_data& output_data,
   }
 }
 
-void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
+void gpu_pipeline_task::execute(::cuda::stream_ref stream)
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
@@ -590,7 +591,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   if (sink_op) { op_chain += std::format(" -> {}", sink_op->get_name()); }
   auto nvtx_label =
     std::format("Pipeline {} Task {} [{}]", pipeline->get_pipeline_id(), get_task_id(), op_chain);
-  nvtx3::scoped_range nvtx_range{nvtx_label.c_str()};
+  nvtx_scoped_range nvtx_range{nvtx_label.c_str()};
 
   auto const prepare_start = std::chrono::high_resolution_clock::now();
   auto reservation         = local_state.release_reservation();
@@ -634,7 +635,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     local_state._input_data->prepare_for_processing(requested_memory_space, stream);
     // synchronizing here to ensure the timing collected by Quent and logging for preparing the task
     // is accurate.
-    stream.synchronize();
+    stream.sync();
   } catch (const rmm::out_of_memory& oom) {
     auto peak_bytes = allocator->get_peak_allocated_bytes(stream);
     std::optional<std::size_t> retry_requested_bytes;
@@ -768,7 +769,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
     auto* pipelineable_output =
       dynamic_cast<const op::pipelineable_operator_data*>(output_data.get());
     if (pipelineable_output) {
-      for (const auto& batch : pipelineable_output->get_read_only_batches(false)) {
+      for (const auto& batch : pipelineable_output->get_read_only_batches()) {
         if (!batch.get_data()) { continue; }
         output_bytes = memory::saturating_add(output_bytes, batch.get_data()->get_size_in_bytes());
       }
@@ -803,7 +804,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
   auto* pipelineable_input =
     dynamic_cast<const op::pipelineable_operator_data*>(local_state._input_data.get());
   if (!pipelineable_input) { return 0; }
-  for (const auto& batch : pipelineable_input->get_read_only_batches(false)) {
+  for (const auto& batch : pipelineable_input->get_read_only_batches()) {
     if (!batch.get_data()) { continue; }
     input_size = memory::saturating_add(input_size, batch.get_data()->get_size_in_bytes());
   }
@@ -904,6 +905,31 @@ std::unique_ptr<gpu_pipeline_task> gpu_pipeline_task::create_rescheduled_task(
 {
   return std::make_unique<gpu_pipeline_task>(
     task_id, _data_repos, std::move(local_state), get_shared_global_state());
+}
+
+exec::index_keys index_keys_for(const sirius::parallel::itask& task)
+{
+  if (const auto* gpu_task = dynamic_cast<const gpu_pipeline_task*>(&task)) {
+    const exec::queue_priority priority = gpu_task->get_priority();
+
+    exec::query_key query_id         = 0;
+    exec::operator_key operator_type = op::SiriusPhysicalOperatorType::INVALID;
+    if (const auto* pipe = gpu_task->get_pipeline()) {
+      query_id = static_cast<exec::query_key>(sirius::value_of(pipe->get_query_id()));
+      if (auto source = pipe->get_source()) { operator_type = source->type; }
+    }
+
+    const auto pref = gpu_task->get_preferred_device_id();
+    return exec::index_keys{priority,
+                            operator_type,
+                            query_id,
+                            pref.has_value() ? pref.value() : exec::no_preferred_device};
+  }
+
+  return exec::index_keys{std::numeric_limits<exec::queue_priority>::max(),
+                          op::SiriusPhysicalOperatorType::INVALID,
+                          0,
+                          exec::no_preferred_device};
 }
 
 }  // namespace pipeline

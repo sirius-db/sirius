@@ -30,6 +30,12 @@ sirius:
 | `exporter` | string | `ndjson` | Quent filesystem exporter: `ndjson`, `msgpack`, or `postcard`. |
 | `output_directory` | non-empty string | `telemetry_data` | Directory for Quent telemetry files. |
 | `engine_name` | non-empty string | `siriusDB` | Engine name reported in engine-level telemetry. |
+| `nvtx_injection_lib` | string | empty | Optional NVTX injection-library override. Normally unnecessary: a loadable Sirius uses its own DSO, while a Sirius-enabled DuckDB executable resolves the initializer from itself. `NVTX_INJECTION64_PATH` takes precedence. |
+
+Quent captures NVTX emitted by dependency images such as libcudf in both deployment modes. A
+loadable Sirius is its own injection DSO. A DuckDB executable with Sirius linked into it exports the
+same initializer and handles NVTX's private injection token inside the executable, so it does not
+ship a sidecar DSO.
 
 Load the config through the normal resolution path — usually by setting
 `SIRIUS_CONFIG_FILE=/path/to/sirius.yaml` before loading the extension. Any Sirius query run with

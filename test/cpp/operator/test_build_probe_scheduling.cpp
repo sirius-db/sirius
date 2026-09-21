@@ -712,7 +712,7 @@ TEST_CASE("BUILD_PROBE byte accounting - accumulation, dedup, and the build-fini
   CHECK_FALSE(j->consumed_primary_input_bytes().has_value());
 
   sirius::pipeline::pipeline_build_context ctx{nullptr, true};
-  auto build_pipeline = duckdb::make_shared_ptr<finishable_pipeline>(ctx);
+  auto build_pipeline = std::make_shared<finishable_pipeline>(ctx);
   auto port           = std::make_unique<sirius::op::sirius_physical_operator::port>();
   port->src_pipeline  = build_pipeline;
   j->add_port("build", std::move(port));

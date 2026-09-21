@@ -96,7 +96,7 @@ class estimator_dag {
  public:
   test_pipeline& add()
   {
-    auto pipeline = duckdb::make_shared_ptr<test_pipeline>(_ctx);
+    auto pipeline = std::make_shared<test_pipeline>(_ctx);
     auto op       = std::make_unique<test_source_operator>();
     op->set_pipeline(pipeline);
     _bs.set_pipeline_source(*pipeline, *op);
@@ -153,7 +153,7 @@ class estimator_dag {
   }
 
  private:
-  duckdb::shared_ptr<sirius_pipeline> shared_for(test_pipeline& pipeline) const
+  std::shared_ptr<sirius_pipeline> shared_for(test_pipeline& pipeline) const
   {
     for (const auto& p : _pipelines) {
       if (p.get() == &pipeline) { return p; }
@@ -166,7 +166,7 @@ class estimator_dag {
   std::vector<std::unique_ptr<test_source_operator>> _ops;
   std::vector<std::unique_ptr<cucascade::shared_data_repository>> _repos;
   std::deque<std::string> _names;  // stable storage backing the port-name string_views
-  std::vector<duckdb::shared_ptr<sirius_pipeline>> _pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> _pipelines;
 };
 
 void record_task(test_pipeline& pipeline, std::size_t in_bytes, std::size_t out_bytes)

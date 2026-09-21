@@ -155,7 +155,7 @@ class NullCountFixture {
     auto ingestible = scan::make_ingestible(make_info(filter_expects_null));
     auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
     auto task       = ingestible->next_split_provider(
-      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::sirius_ioctx> { return ioctx; });
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
     REQUIRE(task);
     auto info = task();
     REQUIRE(info);

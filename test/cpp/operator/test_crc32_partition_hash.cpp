@@ -84,7 +84,7 @@ uint32_t cpu_fold_decimal_split(uint32_t seed, __int128 v)
 
 // ---- cudf column builders (host data -> device columns) ----
 
-rmm::cuda_stream_view test_stream() { return cudf::get_default_stream(); }
+::cuda::stream_ref test_stream() { return cudf::get_default_stream(); }
 rmm::device_async_resource_ref test_mr() { return cudf::get_current_device_resource_ref(); }
 
 // Build a null mask from a per-row validity vector (empty vector => no mask / all valid).
@@ -171,7 +171,7 @@ std::vector<uint32_t> run_gpu(cudf::table_view const& keys,
                               std::vector<decimal_key> const& dks = {})
 {
   auto hashes = crc32_partition_hash::compute(keys, dks, test_stream(), test_mr());
-  test_stream().synchronize();
+  test_stream().sync();
   std::vector<uint32_t> host(hashes.size());
   cudaMemcpy(host.data(), hashes.data(), hashes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost);
   return host;
@@ -453,7 +453,7 @@ TEST_CASE("CRC32 returns empty for zero-row inputs", "[crc32][partition]")
   auto empty_i32 = cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32});
   cudf::table_view keys({empty_str->view(), empty_i32->view()});
   auto hashes = crc32_partition_hash::compute(keys, {}, test_stream(), test_mr());
-  test_stream().synchronize();
+  test_stream().sync();
   REQUIRE(hashes.size() == 0);
 }
 

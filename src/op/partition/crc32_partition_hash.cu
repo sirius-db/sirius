@@ -202,7 +202,7 @@ uint8_t const* fixed_base(cudf::column_view const& col, int width)
 // Called for every column before any kernel launch, so a rejection never unwinds mid-flight.
 col_desc resolve_column(cudf::column_view const& col,
                         crc32_partition_hash::decimal_key const* spec,
-                        rmm::cuda_stream_view stream)
+                        ::cuda::stream_ref stream)
 {
   auto const id = col.type().id();
   col_desc d;
@@ -280,7 +280,7 @@ col_desc resolve_column(cudf::column_view const& col,
 rmm::device_uvector<uint32_t> crc32_partition_hash::compute(
   cudf::table_view const& keys,
   std::vector<decimal_key> const& decimal_keys,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const ncols = keys.num_columns();
@@ -320,9 +320,9 @@ rmm::device_uvector<uint32_t> crc32_partition_hash::compute(
                                 h_descs.data(),
                                 static_cast<std::size_t>(ncols) * sizeof(col_desc),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
-  fold_all<<<grid_for(n), kBlock, 0, stream.value()>>>(d_descs.data(), ncols, hashes.data(), n);
-  CUDF_CHECK_CUDA(stream.value());
+                                stream.get()));
+  fold_all<<<grid_for(n), kBlock, 0, stream.get()>>>(d_descs.data(), ncols, hashes.data(), n);
+  CUDF_CHECK_CUDA(stream.get());
   return hashes;
 }
 

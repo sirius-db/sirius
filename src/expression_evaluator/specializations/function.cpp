@@ -47,6 +47,7 @@
 
 // standard library
 #include <algorithm>
+#include <optional>
 #include <regex>
 #include <string>
 #include <variant>
@@ -183,13 +184,13 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto const start_val = static_cast<cudf::size_type>(start_raw) - 1;
     auto const stop_val  = static_cast<cudf::size_type>(len_raw) + start_val;
 
-    auto result_column =
-      cudf::strings::slice_strings(cudf::strings_column_view(input.get_column_view()),
-                                   cudf::numeric_scalar(start_val, true, _stream, _mr),
-                                   cudf::numeric_scalar(stop_val, true, _stream, _mr),
-                                   cudf::numeric_scalar<cudf::size_type>(1, true, _stream, _mr),
-                                   _stream,
-                                   _mr);
+    auto const input_strings = cudf::strings_column_view(input.get_column_view());
+    auto result_column       = cudf::strings::slice_strings(input_strings,
+                                                      std::optional<cudf::size_type>{start_val},
+                                                      std::optional<cudf::size_type>{stop_val},
+                                                      std::optional<cudf::size_type>{1},
+                                                      _stream,
+                                                      _mr);
     return evaluate_result(std::move(result_column));
   }
 

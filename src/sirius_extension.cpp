@@ -22,14 +22,13 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
 
 #include <rmm/cuda_device.hpp>
 #include <rmm/cuda_stream.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <absl/cleanup/cleanup.h>
 #include <cucascade/cudf/gpu_data_representation.hpp>
@@ -46,7 +45,6 @@ extern "C" int cudaProfilerStop();
 #include "compression/compressed_representation.hpp"
 #include "compression/compression_converters.hpp"
 #include "compression/plan_register.hpp"
-#include "data/sirius_converter_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -111,6 +109,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
+#include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
@@ -121,12 +120,12 @@ extern "C" int cudaProfilerStop();
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
-// PinTableFunction routes parquet reads through the scan manager's sirius_ioctx
+// PinTableFunction routes parquet reads through the scan manager's ioctx
 // instead of cudf's bundled file_source factory (which uses kvikio internally
 // and binds to a single CUDA context). This is mandatory in multi-GPU
 // configurations (enforced by sirius_config::enforce_sirius_datasource_for_multi_gpu()).
 // Single-GPU users may still opt out via use_sirius_datasource=false; the
-// pin pipeline always routes through sirius_ioctx when one is available.
+// pin pipeline always routes through ioctx when one is available.
 //
 // Ordering rule: include uring_reactor LAST among sirius headers — liburing.h
 // transitively pulled by uring_reactor.hpp defines a BLOCK_SIZE preprocessor
@@ -135,8 +134,10 @@ extern "C" int cudaProfilerStop();
 // connection_manager). All consumers of blockingconcurrentqueue.h must
 // precede this include.
 #include "io/s3/sirius_httpfs.hpp"     // sirius::io::s3::sirius_httpfs
-#include "io/types.hpp"                // sirius::io::sirius_ioctx
+#include "io/types.hpp"                // sirius::io::ioctx
 #include "io/uring/uring_reactor.hpp"  // sirius::io::uring_io_object
+
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <cmath>
@@ -147,6 +148,39 @@ extern "C" int cudaProfilerStop();
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+
+// Statically embedded by telemetry_bridge. Rust archives are localized by the
+// extension link (`--exclude-libs,ALL`), so this regular C++ object supplies the
+// public NVTX entry point and forwards it into the same Quent hook state used by
+// Sirius's static-injection pointer.
+extern "C" int quent_InitializeInjectionNvtx2(void* get_export_table);
+extern "C" __attribute__((visibility("default"))) int InitializeInjectionNvtx2(
+  void* get_export_table)
+{
+  return quent_InitializeInjectionNvtx2(get_export_table);
+}
+
+#ifndef DUCKDB_BUILD_LOADABLE_EXTENSION
+// NVTX v3 discovers an injector independently in each ELF image. libcudf's
+// injection pointer is local to libcudf.so and its process-global preinjection
+// lookup is compiled out, so it can only reach Quent through its dlopen path.
+// A statically linked Sirius has no DSO to name. Interpose just our private
+// sentinel and turn that request into dlopen(NULL), whose handle exposes the
+// initializer exported by the running DuckDB executable. Every other request
+// is forwarded unchanged to libc.
+extern "C" __attribute__((visibility("default"))) void* dlopen(const char* filename, int flags)
+{
+  using dlopen_fn   = void* (*)(const char*, int);
+  auto* real_dlopen = reinterpret_cast<dlopen_fn>(::dlsym(RTLD_NEXT, "dlopen"));
+  if (real_dlopen == nullptr) { return nullptr; }
+
+  if (filename != nullptr &&
+      std::string_view{filename} == sirius::telemetry::detail::static_injection_path) {
+    return real_dlopen(nullptr, flags);
+  }
+  return real_dlopen(filename, flags);
+}
+#endif
 
 namespace duckdb {
 
@@ -1176,6 +1210,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.cols = std::move(cols);
   }
 
+  auto compression_it = input.named_parameters.find("compression");
+  if (compression_it != input.named_parameters.end() && !compression_it->second.IsNull()) {
+    result->args.compression = compression_it->second.GetValue<bool>();
+  }
+
   // Resolve the source format: an explicit 'format' parameter, else inferred from
   // the path extension (.parquet -> parquet, .db/.duckdb -> duckdb).
   auto to_lower = [](std::string s) {
@@ -1364,15 +1403,16 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   // directory (if configured), then resolve it into a compression_pin_config. Both
   // the host and GPU pin paths compress with this when enabled.
   const auto& comp_cfg = sirius_ctx->get_config().get_compression_config();
-  if (comp_cfg.enable_pin_table_compression && comp_cfg.input_plan_dir.empty()) {
+  bool const compression_requested =
+    data.args.compression.value_or(comp_cfg.enable_pin_table_compression);
+  if (compression_requested && comp_cfg.input_plan_dir.empty()) {
     SIRIUS_LOG_WARN(
-      "[pin_table] '{}': pin_table_compression is enabled but "
+      "[pin_table] '{}': compression was requested but "
       "pin_table_input_compression_plan_dir is empty; pinning uncompressed",
       data.args.name);
   }
-  const bool comp_globally_enabled =
-    comp_cfg.enable_pin_table_compression && !comp_cfg.input_plan_dir.empty();
-  if (comp_globally_enabled) {
+  const bool compression_active = compression_requested && !comp_cfg.input_plan_dir.empty();
+  if (compression_active) {
     namespace fs     = std::filesystem;
     const auto& name = data.args.name;
     if (!sirius::compression::plan_register::global().resolve_table_plan(name).has_value()) {
@@ -1397,7 +1437,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
   }
 
   sirius::compression_pin_config pin_comp{};
-  if (comp_globally_enabled) {
+  if (compression_active) {
     if (auto plan_dsl =
           sirius::compression::plan_register::global().resolve_table_plan(data.args.name);
         plan_dsl.has_value()) {
@@ -1428,7 +1468,7 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       }
     } else {
       SIRIUS_LOG_WARN(
-        "[pin_table] '{}': pin_table_compression is enabled but no plan file was found in '{}'; "
+        "[pin_table] '{}': compression was requested but no plan file was found in '{}'; "
         "pinning uncompressed",
         data.args.name,
         comp_cfg.input_plan_dir);
@@ -1789,7 +1829,7 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   auto& gstate = data_p.global_state->Cast<CreateAnnIndexGlobalState>();
   if (gstate.finished) { return; }
 
-  nvtx3::scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
+  sirius::nvtx_scoped_range nvtx_range{"SiriusCreateAnnIndexFunction"};
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx) {
@@ -1958,25 +1998,21 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   rmm::cuda_stream build_stream;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   if (allocator == nullptr ||
-      !allocator->attach_reservation_to_tracker(build_stream.view(), std::move(reservation))) {
+      !allocator->attach_reservation_to_tracker(build_stream, std::move(reservation))) {
     throw InvalidInputException(
       "sirius_create_ann_index: failed to bind the index build to its GPU reservation");
   }
   // Release the reservation whether the build succeeds or throws. On release the
   // arena hands back its unused slack and keeps the resident index accounted.
   absl::Cleanup reset_reservation = [allocator, &build_stream] {
-    allocator->reset_stream_reservation(build_stream.view());
+    allocator->reset_stream_reservation(build_stream);
   };
 
   // Build IVF-Flat on the build stream
   std::unique_ptr<sirius::vss::any_cuvs_index> handle;
   try {
-    handle = sirius::vss::build_ivf_flat_index_from_batches(chunk_views,
-                                                            dim,
-                                                            n_lists,
-                                                            metric,
-                                                            target_space->get_default_allocator(),
-                                                            build_stream.view());
+    handle = sirius::vss::build_ivf_flat_index_from_batches(
+      chunk_views, dim, n_lists, metric, target_space->get_default_allocator(), build_stream);
   } catch (std::exception const& e) {
     if (removed_existing) {
       throw InvalidInputException(
@@ -2000,9 +2036,9 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   meta.n_lists      = static_cast<int64_t>(n_lists);
   meta.metric       = metric;
   // Resident index footprint, read while the reservation still tracks the arena.
-  meta.resident_bytes = allocator->get_allocated_bytes(build_stream.view());
+  meta.resident_bytes = allocator->get_allocated_bytes(build_stream);
   [[maybe_unused]] std::size_t const build_peak_bytes =
-    allocator->get_peak_allocated_bytes(build_stream.view());
+    allocator->get_peak_allocated_bytes(build_stream);
 
   // Release the reservation before the build stream moves into the cache.
   std::move(reset_reservation).Invoke();
@@ -2332,7 +2368,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
 static unique_ptr<GlobalTableFunctionState> SiriusVectorSearchInit(ClientContext& context,
                                                                    TableFunctionInitInput& input)
 {
-  nvtx3::scoped_range nvtx_range{"SiriusVectorSearchInit"};
+  sirius::nvtx_scoped_range nvtx_range{"SiriusVectorSearchInit"};
   auto& bind_data = input.bind_data->Cast<SiriusVectorSearchBindData>();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2474,6 +2510,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     pin_table.named_parameters["tier"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["name"]        = LogicalType::VARCHAR;
     pin_table.named_parameters["cols"]        = LogicalType::LIST(LogicalType::VARCHAR);
+    pin_table.named_parameters["compression"] = LogicalType::BOOLEAN;
     pin_table.named_parameters["format"]      = LogicalType::VARCHAR;
     pin_table.named_parameters["schema_name"] = LogicalType::VARCHAR;
     pin_table_set.AddFunction(std::move(pin_table));
@@ -2790,40 +2827,67 @@ static void SetLogBackend(ClientContext& context, SetScope scope, Value& paramet
     throw InvalidInputException("Unknown sirius_log_backend '%s' (expected: duckdb, spdlog, noop)",
                                 backend);
   }
-  Config::LOG_BACKEND = std::move(backend);
-  install_configured_log_sink(context.db.get());
+  auto const previous_backend = Config::LOG_BACKEND;
+  Config::LOG_BACKEND         = std::move(backend);
+  try {
+    install_configured_log_sink(context.db.get());
+  } catch (...) {
+    Config::LOG_BACKEND = previous_backend;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_BACKEND to {}", Config::LOG_BACKEND);
 }
 
 static void SetLogLevel(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_LEVEL = StringValue::Get(parameter);
-  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
-  auto parsed_level = sirius::log::string_to_enum(Config::LOG_LEVEL);
-  sirius::log::get_sink()->set_level(parsed_level.value_or(sirius::log::level::info));
+  auto level_name   = StringValue::Get(parameter);
+  auto parsed_level = sirius::log::string_to_enum(level_name);
   if (!parsed_level) {
-    SIRIUS_LOG_WARN("Unknown log level '{}', defaulting to info", Config::LOG_LEVEL);
+    throw InvalidInputException(
+      "sirius_log_level must be one of: trace, debug, info, warn, error, critical, off; got '%s'",
+      level_name);
   }
+  Config::LOG_LEVEL = std::move(level_name);
+  // Only re-targets the current sink; no rebuild (a no-op for the duckdb backend).
+  sirius::log::get_sink()->set_level(*parsed_level);
   SIRIUS_LOG_DEBUG("Updated config LOG_LEVEL to {}", Config::LOG_LEVEL);
 }
 
 static void SetLogDir(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_DIR = StringValue::Get(parameter);
+  auto const previous_log_dir = Config::LOG_DIR;
+  Config::LOG_DIR             = StringValue::Get(parameter);
   // log_dir only affects the spdlog backend; rebuild it when that one is active.
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_DIR = previous_log_dir;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_DIR to {}", Config::LOG_DIR);
 }
 
 static void SetLogFlushSeconds(ClientContext& context, SetScope scope, Value& parameter)
 {
   throw_if_sirius_runtime_unavailable(context);
-  Config::LOG_FLUSH_SECONDS = IntegerValue::Get(parameter);
+  auto const seconds = IntegerValue::Get(parameter);
+  if (seconds < 0) {
+    throw InvalidInputException(
+      "sirius_log_flush_seconds must be non-negative; zero disables periodic flushing; got %d",
+      seconds);
+  }
+  auto const previous_flush_seconds = Config::LOG_FLUSH_SECONDS;
+  Config::LOG_FLUSH_SECONDS         = seconds;
   // The flush interval is fixed at spdlog-sink construction, so rebuild it (only
   // the spdlog backend uses it).
-  if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  try {
+    if (Config::LOG_BACKEND == "spdlog") { install_configured_log_sink(context.db.get()); }
+  } catch (...) {
+    Config::LOG_FLUSH_SECONDS = previous_flush_seconds;
+    throw;
+  }
   SIRIUS_LOG_DEBUG("Updated config LOG_FLUSH_SECONDS to {}", Config::LOG_FLUSH_SECONDS);
 }
 
@@ -2934,16 +2998,31 @@ static void SetEnableDenseCountJoin(ClientContext& context, SetScope scope, Valu
 
 static void SetDenseCountJoinMaxBytes(ClientContext& context, SetScope scope, Value& parameter)
 {
+  // 0 is meaningful: it restores the derived budget (a share of GPU tier capacity).
   auto const bytes = UBigIntValue::Get(parameter);
-  if (bytes == 0) {
-    throw InvalidInputException("dense_count_join_max_bytes must be greater than zero");
-  }
-  auto* params = get_operator_params(context);
+  auto* params     = get_operator_params(context);
   if (!params) { return; }
   auto slot                          = lock_operator_params_slot(context);
   params->dense_count_join_max_bytes = bytes;
   SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MAX_BYTES to {}",
                    params->dense_count_join_max_bytes);
+}
+
+static void SetDenseCountJoinMemoryFraction(ClientContext& context,
+                                            SetScope scope,
+                                            Value& parameter)
+{
+  auto const fraction = DoubleValue::Get(parameter);
+  if (!(fraction > 0.0) || fraction > 1.0) {
+    throw InvalidInputException("dense_count_join_memory_fraction must be in (0.0, 1.0], got %f",
+                                fraction);
+  }
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                = lock_operator_params_slot(context);
+  params->dense_count_join_memory_fraction = fraction;
+  SIRIUS_LOG_DEBUG("Updated config DENSE_COUNT_JOIN_MEMORY_FRACTION to {}",
+                   params->dense_count_join_memory_fraction);
 }
 
 static void SetEnableDynamicFilter(ClientContext& context, SetScope scope, Value& parameter)
@@ -3162,6 +3241,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
   // option registration from growing scattered environment checks.
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_pin_registry_change",
+                    "simulate a pin or unpin landing between the finalize and execution windows",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_inject_transparent_gpu_error",
                     "force transparent GPU execution to fail at runtime with this message",
                     LogicalType::VARCHAR,
@@ -3223,6 +3308,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     LogicalType::UBIGINT,
                     Value::UBIGINT(operator_defaults.dense_count_join_max_bytes),
                     SetDenseCountJoinMaxBytes);
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "dense_count_join_memory_fraction",
+                    "internal test hook for the derived dense count-join histogram budget",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(operator_defaults.dense_count_join_memory_fraction),
+                    SetDenseCountJoinMemoryFraction);
   add_sirius_option(config,
                     option_visibility::internal,
                     "concat_batch_bytes",
@@ -3289,7 +3381,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                             Value(Config::LOG_DIR),
                             SetLogDir);
   config.AddExtensionOption("sirius_log_flush_seconds",
-                            "Interval in seconds between automatic log flushes",
+                            "Interval in seconds between automatic log flushes (0 disables)",
                             LogicalType::INTEGER,
                             Value::INTEGER(Config::LOG_FLUSH_SECONDS),
                             SetLogFlushSeconds);
@@ -3337,20 +3429,21 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(true),
     SetEnableGpuExecution);
 
-  config.AddExtensionOption("pin_table_compression",
-                            "Request Simpatico compression for pin_table chunks. Takes effect only "
-                            "when pin_table_input_compression_plan_dir is non-empty and contains a "
-                            "matching table plan",
-                            LogicalType::BOOLEAN,
-                            Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
-                            SetEnablePinTableCompression);
+  config.AddExtensionOption(
+    "pin_table_compression",
+    "Default for pin_table calls that omit the compression named "
+    "parameter. Takes effect only when pin_table_input_compression_plan_dir "
+    "is non-empty and contains a matching table plan",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(compression_defaults.enable_pin_table_compression),
+    SetEnablePinTableCompression);
 
   config.AddExtensionOption(
     "pin_table_input_compression_plan_dir",
     "Directory containing per-table Simpatico plan files for pin_table compression. "
     "Files are named '<table_name>.<ext>'; their contents are the multi-column plan DSL. "
-    "May be set before pin_table_compression is enabled. Tables with no matching file are pinned "
-    "uncompressed. No effect on spill compression.",
+    "May be set before a compression-enabled pin_table call. Tables with no matching file are "
+    "pinned uncompressed. No effect on spill compression.",
     LogicalType::VARCHAR,
     Value(compression_defaults.input_plan_dir),
     SetPinTableInputCompressionPlanDir);
@@ -3455,6 +3548,66 @@ static void publish_transparent_optimizer_mask(DBConfig& config)
   live.swap(updated);
 }
 
+/// Configure NVTX runtime discovery before the process's first NVTX call.
+///
+/// An existing NVTX_INJECTION64_PATH remains authoritative. Otherwise, an
+/// explicit nvtx_injection_lib from the Sirius config is used. If neither is
+/// present, the loadable extension points NVTX at its own DSO. A statically
+/// linked Sirius instead uses a private dlopen token which resolves to the
+/// running executable. In both cases Quent's injector is embedded in the same
+/// image as Sirius, so dependency images such as libcudf attach to the same hook
+/// without requiring a separately deployed injection library.
+///
+/// NVTX initialises lazily and per image, on that image's first NVTX call, so
+/// setting the variable here — after libcudf is mapped but before any NVTX call
+/// — still reaches it. That holds only while libcudf makes no NVTX call from a
+/// static constructor; should it ever do so, its image initialises during dlopen
+/// and this path becomes invisible to it. Set NVTX_INJECTION64_PATH in the
+/// environment instead if that happens.
+static void maybe_set_nvtx_injection_path(const sirius::telemetry_config& telemetry) noexcept
+{
+  if (std::getenv("NVTX_INJECTION64_PATH") != nullptr || !telemetry.enable_quent) { return; }
+
+  if (!telemetry.nvtx_injection_lib.empty()) {
+    ::setenv("NVTX_INJECTION64_PATH", telemetry.nvtx_injection_lib.c_str(), /*overwrite=*/0);
+    return;
+  }
+
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+  try {
+    Dl_info self{};
+    // Use a private function as the anchor: unlike the public NVTX initializer,
+    // its address cannot be interposed by another ELF image.
+    if (::dladdr(reinterpret_cast<void*>(&maybe_set_nvtx_injection_path), &self) == 0 ||
+        self.dli_fname == nullptr) {
+      return;
+    }
+
+    std::error_code error;
+    auto self_path = std::filesystem::canonical(self.dli_fname, error);
+    if (error) { return; }
+    ::setenv("NVTX_INJECTION64_PATH", self_path.c_str(), /*overwrite=*/0);
+  } catch (...) {
+    // NVTX capture is optional; self-path discovery must not prevent Sirius
+    // from loading.
+  }
+#else
+  // Probe the interposition path before publishing it. NVTX does not fall
+  // back to static injection after a dynamic lookup failure, so a broken
+  // final link must leave the environment unset.
+  auto* handle = ::dlopen(sirius::telemetry::detail::static_injection_path, RTLD_LAZY | RTLD_LOCAL);
+  if (handle == nullptr) { return; }
+  auto* initializer = ::dlsym(handle, "InitializeInjectionNvtx2");
+  bool const usable = initializer == reinterpret_cast<void*>(&InitializeInjectionNvtx2);
+  ::dlclose(handle);
+  if (!usable) { return; }
+
+  ::setenv("NVTX_INJECTION64_PATH",
+           sirius::telemetry::detail::static_injection_path,
+           /*overwrite=*/0);
+#endif
+}
+
 static void LoadInternal(ExtensionLoader& loader)
 {
   sirius::util::install_segfault_backtrace_handler();
@@ -3464,8 +3617,16 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // SIRIUS_DISABLE means: no Sirius runtime initialization and no mask
   // publication (the extension binary itself may still be loaded).
-  auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
-  auto* callback_ptr = callback.get();
+  auto callback              = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
+  auto* callback_ptr         = callback.get();
+  bool const sirius_disabled = callback_ptr->is_disabled();
+
+  if (!sirius_disabled) {
+    // Config loading above must remain NVTX-free. Publish discovery after its
+    // validation, but before SiriusContext can make any NVTX call.
+    maybe_set_nvtx_injection_path(callback_ptr->get_loaded_config().get_telemetry_config());
+    callback_ptr->initialize_context();
+  }
   config.GetCallbackManager().Register(std::move(callback));
 
   // The ctor already installed the db-independent backend; reinstall now that the
@@ -3473,7 +3634,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // unknown backend name is reported here rather than swallowed by the ctor.
   install_configured_log_sink(&db);
 
-  sirius::converter_registry::initialize();
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
   SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
@@ -3509,10 +3669,6 @@ static void LoadInternal(ExtensionLoader& loader)
   // above succeeded, so a failed load leaves no mask behind. SIRIUS_DISABLE
   // means no Sirius runtime initialization and no mask publication (the
   // extension binary itself may still be loaded).
-  bool const sirius_disabled = [] {
-    auto* val = std::getenv("SIRIUS_DISABLE");
-    return val != nullptr && std::string(val) != "0";
-  }();
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 

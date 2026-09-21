@@ -23,9 +23,9 @@
 
 #include "codegen/selection/selection.hpp"
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -112,7 +112,7 @@ std::vector<std::uint32_t> pack_reference(std::vector<std::uint8_t> const& flags
   return words;
 }
 
-rmm::cuda_stream_view test_stream() { return rmm::cuda_stream_view{}; }
+::cuda::stream_ref test_stream() { return ::cuda::stream_ref{cudaStream_t{}}; }
 
 //===----------------------------------------------------------------------===//
 
@@ -134,7 +134,7 @@ void test_mask_from_bool8()
   d_words.upload(poison);
 
   sirius::codegen::mask_from_bool8(d_flags.ptr, kRows, d_words.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_words.download(reference.size());
   REQUIRE_MSG(got == reference, "mask_from_bool8: packed mask != host reference");
@@ -178,7 +178,7 @@ void test_combine_masks_and()
 
   sirius::codegen::combine_masks_and(
     d_dst.ptr, pointers.data(), 3, static_cast<std::int64_t>(words), test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   REQUIRE_MSG(d_dst.download(words) == reference,
               "combine_masks_and: 3-source AND != host reference");
@@ -189,7 +189,7 @@ void test_combine_masks_and()
                                      3,
                                      static_cast<std::int64_t>(words),
                                      test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
   REQUIRE_MSG(device_sources[0].download(words) == reference,
               "combine_masks_and: aliased dst == src[0] != host reference");
   std::printf("PASS: combine_masks_and\n");
@@ -237,7 +237,7 @@ void test_cnt_and_indices()
   device_array<std::int32_t> d_indices(static_cast<std::size_t>(survivors));
   REQUIRE_MSG(d_indices.ptr, "indices: device allocation failed");
   sirius::codegen::mask_to_row_indices(mask, d_indices.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_indices.download(static_cast<std::size_t>(survivors));
   REQUIRE_MSG(got == indices_reference, "mask_to_row_indices: ids != host reference");
@@ -310,7 +310,7 @@ void test_all_survive()
   device_array<std::int32_t> d_indices(static_cast<std::size_t>(kRows));
   REQUIRE_MSG(d_indices.ptr, "all: device allocation failed");
   sirius::codegen::mask_to_row_indices(mask, d_indices.ptr, test_stream());
-  cudaStreamSynchronize(test_stream().value());
+  cudaStreamSynchronize(test_stream().get());
 
   auto const got = d_indices.download(static_cast<std::size_t>(kRows));
   for (std::int64_t r = 0; r < kRows; ++r) {

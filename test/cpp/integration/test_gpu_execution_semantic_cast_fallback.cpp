@@ -233,3 +233,23 @@ TEST_CASE_METHOD(SemanticCastFixture,
     REQUIRE(rows == cpu_rows);
   }
 }
+
+TEST_CASE_METHOD(SemanticCastFixture,
+                 "scalar cast - sum_rewriter arithmetic runs without CPU fallback",
+                 "[integration][gpu_execution][scalar_cast]")
+{
+  run_ok("CREATE TABLE hits(ResolutionWidth INTEGER, grp INTEGER);");
+  run_ok("INSERT INTO hits VALUES (1920, 1), (1280, 1), (NULL, 1), (-1, 2), (0, 2), (NULL, 3);");
+  run_ok("CHECKPOINT;");
+  // Keep Sirius's optimizer exclusions; sum_rewriter is enabled by default.
+  auto disabled = con->Query("SELECT current_setting('disabled_optimizers');");
+  REQUIRE(disabled);
+  REQUIRE_FALSE(disabled->HasError());
+  REQUIRE(disabled->GetValue(0, 0).ToString().find("sum_rewriter") == std::string::npos);
+  run_ok("SET enable_duckdb_fallback = false;");
+
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits;");
+  compare_gpu_vs_cpu("SELECT grp, SUM(ResolutionWidth + 1) FROM hits GROUP BY grp;");
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 3;");
+  compare_gpu_vs_cpu("SELECT SUM(ResolutionWidth + 1) FROM hits WHERE grp = 99;");
+}

@@ -452,22 +452,137 @@ TEST_CASE("request_downgrade with custom predicate stops when satisfied", "[down
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
   executor.start();
 
-  // Predicate returns true on first call — should stop after ~1 batch
+  // Already-true predicate: the pre-dispatch check must satisfy the request without spilling
+  // anything.
   auto future = executor.request_downgrade([&call_count]() {
     call_count.fetch_add(1, std::memory_order_relaxed);
-    return true;  // satisfied immediately after first batch
+    return true;  // satisfied before any batch is dispatched
   });
 
   size_t freed = future.get();
-  REQUIRE(freed > 0);
+  REQUIRE(freed == 0);
+  REQUIRE(call_count.load() >= 1);
 
-  // With pool width=1 and predicate satisfied immediately, at most 1-2 batches downgraded
   size_t host_count = 0;
   for (auto& b : batches) {
     if (get_batch_tier(*b) == cucascade::memory::Tier::HOST) ++host_count;
   }
-  REQUIRE(host_count >= 1);
-  REQUIRE(host_count <= 2);
+  REQUIRE(host_count == 0);
+
+  executor.stop();
+}
+
+TEST_CASE("request_downgrade stops once the predicate becomes satisfied", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (int i = 0; i < 5; ++i) {
+    auto batch = make_gpu_batch(*gpu_space);
+    batches.push_back(batch);
+    repo->add_data_batch(batch);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  std::atomic<size_t> call_count{0};
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Predicate becomes true from the second evaluation on. Pool width is 1, so the pre-dispatch
+  // check stops the loop after exactly one batch.
+  auto future = executor.request_downgrade(
+    [&call_count]() { return call_count.fetch_add(1, std::memory_order_relaxed) >= 1; });
+
+  size_t freed = future.get();
+  REQUIRE(freed > 0);
+
+  size_t host_count = 0;
+  for (auto& b : batches) {
+    if (get_batch_tier(*b) == cucascade::memory::Tier::HOST) ++host_count;
+  }
+  REQUIRE(host_count == 1);
+
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory does not overshoot its byte target", "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (int i = 0; i < 5; ++i) {
+    auto batch = make_gpu_batch(*gpu_space);
+    batches.push_back(batch);
+    repo->add_data_batch(batch);
+  }
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  size_t one_batch_size = get_batch_size(*batches[0]);
+  REQUIRE(one_batch_size > 0);
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Target of 1.5 batches: planned-bytes gating stops dispatch at 2 batches instead of
+  // continuing until a completed conversion flips the predicate.
+  size_t freed = executor.request_free_memory_and_wait(one_batch_size + one_batch_size / 2);
+  REQUIRE(freed == 2 * one_batch_size);
+
+  size_t host_count = 0;
+  for (auto& b : batches) {
+    if (get_batch_tier(*b) == cucascade::memory::Tier::HOST) ++host_count;
+  }
+  REQUIRE(host_count == 2);
+
+  executor.stop();
+}
+
+TEST_CASE("request_free_memory best-fits a small deficit instead of a whole large batch",
+          "[downgrade_executor]")
+{
+  auto mem_mgr    = make_test_memory_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  sirius::data::data_repository_manager_registry repo_registry;
+  auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
+  auto repo      = std::make_unique<cucascade::shared_data_repository>();
+  // Policy order is last partition first, so the LARGE batches are the policy picks and the
+  // small one sits last in iteration order.
+  auto batch_small  = make_gpu_batch(*gpu_space, /*num_rows=*/1000);  // partition 0
+  auto batch_large1 = make_gpu_batch(*gpu_space, /*num_rows=*/8000);  // partition 1
+  auto batch_large2 = make_gpu_batch(*gpu_space, /*num_rows=*/8000);  // partition 2
+  repo->add_data_batch(batch_small, 0);
+  repo->add_data_batch(batch_large1, 1);
+  repo->add_data_batch(batch_large2, 2);
+  repo_mgr.add_new_repository(1, "out", std::move(repo));
+
+  size_t small_size = get_batch_size(*batch_small);
+  REQUIRE(small_size > 0);
+  REQUIRE(get_batch_size(*batch_large2) > small_size);
+
+  auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  // Deficit the small batch covers: best-fit spills it, where policy order alone would have
+  // spilled batch_large2.
+  size_t freed = executor.request_free_memory_and_wait(small_size);
+  REQUIRE(freed == small_size);
+
+  REQUIRE(get_batch_tier(*batch_small) == cucascade::memory::Tier::HOST);
+  REQUIRE(get_batch_tier(*batch_large1) == cucascade::memory::Tier::GPU);
+  REQUIRE(get_batch_tier(*batch_large2) == cucascade::memory::Tier::GPU);
 
   executor.stop();
 }

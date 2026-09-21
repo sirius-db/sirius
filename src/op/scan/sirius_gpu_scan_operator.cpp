@@ -83,7 +83,7 @@ std::unique_ptr<cudf::table> substitute_deferred_columns(
   late_mat::scan_batch_origin const& origin,
   cudf::column_view const* survivors,
   std::size_t arity,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const rows = output->num_rows();
@@ -198,7 +198,7 @@ std::vector<carrier_conversion_plan> preflight_physical_schema(
   const std::vector<cudf::data_type>& targets,
   bool has_explicit_physical_schema,
   late_mat::deferred_scan_output const* deferred,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const actual_width = static_cast<std::size_t>(table.num_columns());
@@ -264,7 +264,7 @@ std::vector<carrier_conversion_plan> preflight_physical_schema(
 scan_operator_input::converted_column_replacements build_carrier_replacements(
   cudf::table_view source,
   const std::vector<carrier_conversion_plan>& plan,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   scan_operator_input::converted_column_replacements replacements(plan.size());
@@ -307,7 +307,7 @@ std::unique_ptr<cudf::table> normalize_physical_schema(
   bool has_explicit_physical_schema,
   late_mat::deferred_scan_output const* deferred,
   duckdb::SiriusContext* observer,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (targets.empty()) { return table; }
@@ -440,7 +440,7 @@ scan_manager::split_connector& sirius_gpu_scan_operator::get_split_connector()
 // execute()
 //===----------------------------------------------------------------------===//
 std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
-  const op::operator_data& input_data, rmm::cuda_stream_view stream)
+  const op::operator_data& input_data, ::cuda::stream_ref stream)
 {
   auto scan_input = dynamic_cast<const scan_operator_input*>(&input_data);
   if (!scan_input) {

@@ -82,7 +82,7 @@ std::vector<std::shared_ptr<cucascade::shared_data_repository>> make_repos(std::
 
 //! The pipeline whose `operators` contain `op`, or nullptr.
 const sirius_pipeline* pipeline_with_operator(
-  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+  const std::vector<std::shared_ptr<sirius_pipeline>>& pipelines,
   const sirius::op::sirius_physical_operator& target)
 {
   for (const auto& pipeline : pipelines) {

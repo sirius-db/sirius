@@ -16,9 +16,9 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
-#include "duckdb/common/shared_ptr_ipp.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -73,14 +73,14 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
 
-void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
+void reorder_pipelines_topologically(std::vector<std::shared_ptr<sirius_pipeline>>& pipelines)
 {
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered;
+  std::vector<std::shared_ptr<sirius_pipeline>> ordered;
   ordered.reserve(pipelines.size());
   std::unordered_set<const sirius_pipeline*> emitted;
   std::unordered_set<const sirius_pipeline*> in_progress;
 
-  auto emit = [&](auto&& self, const duckdb::shared_ptr<sirius_pipeline>& pipeline) -> void {
+  auto emit = [&](auto&& self, const std::shared_ptr<sirius_pipeline>& pipeline) -> void {
     // `in_progress` breaks dependency cycles (delim-join distribution edges); the
     // pipeline is still emitted when its own frame completes.
     if (emitted.contains(pipeline.get()) || in_progress.contains(pipeline.get())) { return; }
@@ -107,12 +107,12 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
     pipelines[i]->set_pipeline_id(i);
   }
   for (const auto& pipeline : pipelines) {
-    std::sort(pipeline->dependencies.begin(),
-              pipeline->dependencies.end(),
-              [](const duckdb::shared_ptr<sirius_pipeline>& a,
-                 const duckdb::shared_ptr<sirius_pipeline>& b) {
-                return a->get_pipeline_id() < b->get_pipeline_id();
-              });
+    std::sort(
+      pipeline->dependencies.begin(),
+      pipeline->dependencies.end(),
+      [](const std::shared_ptr<sirius_pipeline>& a, const std::shared_ptr<sirius_pipeline>& b) {
+        return a->get_pipeline_id() < b->get_pipeline_id();
+      });
   }
 #ifdef DEBUG
   // Join dependencies are build-first (finalize_pipeline_structure) and the walk above
@@ -132,11 +132,11 @@ void reorder_pipelines_topologically(duckdb::vector<duckdb::shared_ptr<sirius_pi
 #endif
 }
 
-duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::schedule_pipelines(
+std::vector<std::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::schedule_pipelines(
   sirius_meta_pipeline& root_pipeline)
 {
-  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> to_schedule;
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_scheduled;
+  std::vector<std::shared_ptr<sirius_meta_pipeline>> to_schedule;
+  std::vector<std::shared_ptr<sirius_pipeline>> sirius_scheduled;
   scheduled_.clear();
   root_pipeline.get_meta_pipelines(to_schedule, true, true);
 
@@ -148,7 +148,7 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
   int schedule_count = 0;
   int meta           = 0;
   while (schedule_count < to_schedule.size()) {
-    duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> children;
+    std::vector<std::shared_ptr<sirius_meta_pipeline>> children;
     to_schedule[to_schedule.size() - 1 - meta]->get_meta_pipelines(children, false, true);
     auto base_pipeline   = to_schedule[to_schedule.size() - 1 - meta]->get_base_pipeline();
     bool should_schedule = true;
@@ -174,7 +174,7 @@ duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> sirius_pipeline_converter::s
       }
     }
     if (should_schedule) {
-      duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> pipeline_inside;
+      std::vector<std::shared_ptr<sirius_pipeline>> pipeline_inside;
       to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
       for (auto& pipeline : pipeline_inside) {
         sirius_scheduled.push_back(pipeline);
@@ -193,7 +193,7 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 {
   // Lookup: operator -> the pipeline that starts at it, i.e. its operators[0]
   // (entry-point post-reverse) or its sink for sink-only pipelines.
-  std::unordered_map<const op::sirius_physical_operator*, duckdb::shared_ptr<sirius_pipeline>>
+  std::unordered_map<const op::sirius_physical_operator*, std::shared_ptr<sirius_pipeline>>
     dest_for_op;
   for (const auto& pipeline : scheduled_) {
     const auto ops = pipeline->get_operators();
@@ -209,8 +209,8 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
   auto emit = [&](op::sirius_physical_operator const& consumer,
                   op::sirius_physical_operator* source_op,
-                  const duckdb::shared_ptr<sirius_pipeline>& src,
-                  const duckdb::shared_ptr<sirius_pipeline>& dst) {
+                  const std::shared_ptr<sirius_pipeline>& src,
+                  const std::shared_ptr<sirius_pipeline>& dst) {
     auto const port_id = consumer.input_port_for(*source_op);
     auto const barrier = consumer.input_barrier_for(*source_op);
     repository_wirings_.push_back({port_id, barrier, source_op, src, dst});
@@ -323,8 +323,7 @@ void sirius_pipeline_converter::setup_pipeline_parents()
     pipeline->dependencies.clear();
   }
   for (const auto& wiring : repository_wirings_) {
-    wiring.source_pipeline->parents.push_back(
-      duckdb::weak_ptr<sirius_pipeline>(wiring.dest_pipeline));
+    wiring.source_pipeline->parents.push_back(std::weak_ptr<sirius_pipeline>(wiring.dest_pipeline));
   }
 }
 
@@ -503,7 +502,18 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
   auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
-  if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
+  // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
+  // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
+  // identity — two scans of the same files that apply different deletes are not the same scan.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&info)) {
+    out << "      scan: iceberg table=" << ice->table_path
+        << " deleted_files=" << (ice->delete_data ? ice->delete_data->positional_deletes.size() : 0)
+        << " files=[";
+    for (std::size_t f = 0; f < ice->resolved_file_paths.size(); ++f) {
+      out << (f == 0 ? "" : ",") << ice->resolved_file_paths[f];
+    }
+    out << "]\n";
+  } else if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {
       out << (f == 0 ? "" : ",") << pq->resolved_file_paths[f];
@@ -537,9 +547,9 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
 void dump_wirings(
   std::ostringstream& out,
   const std::vector<repository_wiring>& wirings,
-  const std::function<std::size_t(const duckdb::shared_ptr<sirius_pipeline>&)>& index_of)
+  const std::function<std::size_t(const std::shared_ptr<sirius_pipeline>&)>& index_of)
 {
-  auto pipeline_index = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+  auto pipeline_index = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::string {
     auto idx = index_of(p);
     return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
   };
@@ -612,7 +622,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
 
   // Canonical order: sort by signature so the dump is independent of emission order —
   // equivalent graphs print byte-identical output.
-  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
+  std::vector<std::shared_ptr<sirius_pipeline>> ordered = result.scheduled_pipelines;
   std::sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) -> bool {
     return compute_sig(a.get()) < compute_sig(b.get());
   });
@@ -621,7 +631,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     pipeline_to_index[ordered[i].get()] = i;
   }
-  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+  auto idx_of = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::size_t {
     auto it = pipeline_to_index.find(p.get());
     return it == pipeline_to_index.end() ? std::numeric_limits<std::size_t>::max() : it->second;
   };
@@ -644,11 +654,11 @@ std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
   for (std::size_t i = 0; i < scheduled.size(); ++i) {
     position[scheduled[i].get()] = i;
   }
-  auto idx_of = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::size_t {
+  auto idx_of = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::size_t {
     auto it = position.find(p.get());
     return it == position.end() ? std::numeric_limits<std::size_t>::max() : it->second;
   };
-  auto idx_str = [&](const duckdb::shared_ptr<sirius_pipeline>& p) -> std::string {
+  auto idx_str = [&](const std::shared_ptr<sirius_pipeline>& p) -> std::string {
     auto idx = idx_of(p);
     return idx == std::numeric_limits<std::size_t>::max() ? std::string{"?"} : std::to_string(idx);
   };

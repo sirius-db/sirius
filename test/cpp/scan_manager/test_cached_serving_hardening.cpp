@@ -106,7 +106,7 @@ struct test_env {
   {
   }
 
-  rmm::cuda_stream_view stream() { return conv_stream.view(); }
+  ::cuda::stream_ref stream() { return conv_stream; }
 };
 
 test_env& env()
@@ -286,7 +286,7 @@ pinned_entry make_host_entry(test_env& e, std::size_t n_chunks, std::size_t rows
       std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, e.stream());
     auto host_repr =
       registry.convert<cucascade::host_data_representation>(gpu_repr, e.host_space, e.stream());
-    e.stream().synchronize();
+    e.stream().sync();
     entry.host_chunks.emplace_back(std::move(host_repr));
   }
   entry.num_rows = n_chunks * rows;
@@ -300,8 +300,12 @@ std::shared_ptr<cucascade::data_batch> make_test_batch(test_env& e, std::size_t 
   std::vector<std::shared_ptr<cudf::column>> columns{col};
   std::vector<cudf::column_view> views{col->view()};
   auto const alloc_size = col->alloc_size();
-  auto repr             = std::make_unique<cucascade::gpu_table_representation>(
-    cudf::table_view(views), std::move(columns), alloc_size, *e.gpu_space, rmm::cuda_stream_view{});
+  auto repr =
+    std::make_unique<cucascade::gpu_table_representation>(cudf::table_view(views),
+                                                          std::move(columns),
+                                                          alloc_size,
+                                                          *e.gpu_space,
+                                                          ::cuda::stream_ref{cudaStream_t{}});
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(repr));
 }
 
@@ -321,7 +325,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(
     std::make_unique<cudf::table>(std::move(cols)), *e.gpu_space, e.stream());
   auto host_repr = sirius::converter_registry::get().convert<cucascade::host_data_representation>(
     gpu_repr, e.host_space, e.stream());
-  e.stream().synchronize();
+  e.stream().sync();
   return cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(host_repr));
 }
 
@@ -336,6 +340,7 @@ std::shared_ptr<cucascade::data_batch> make_host_batch(test_env& e,
 struct stub_table_info final : sirius::op::scan::ingestible_table_info {
   [[nodiscard]] std::span<std::string const> column_names() const override { return {}; }
   [[nodiscard]] std::span<std::string const> file_paths() const override { return {}; }
+  [[nodiscard]] std::string display_name() const override { return "<stub>"; }
 };
 
 struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
@@ -352,7 +357,7 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
   sirius::op::scan::filtered_table materialize_metadata_to_table(
     const sirius::op::scan::scan_info& /*info*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/,
+    ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
     std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/) override
   {
@@ -361,7 +366,7 @@ struct stub_ingestible final : sirius::op::scan::gpu_ingestible {
   std::unique_ptr<cudf::table> post_filter_and_project(
     sirius::op::scan::filtered_table&& /*input*/,
     const cucascade::memory::memory_space& /*mem_space*/,
-    rmm::cuda_stream_view /*stream*/,
+    ::cuda::stream_ref /*stream*/,
     bool /*like_swar_fastpath*/,
     std::shared_ptr<const sirius::like_multiliteral_cache> /*like_cache*/,
     std::unique_ptr<cudf::column>* /*survivors*/,
@@ -561,18 +566,17 @@ TEST_CASE("cached provider pairs chunk i with mask-set slot i", "[cached_serving
   }
 }
 
-// Gating the attach on mask-set EMPTINESS stripped the pushdown from every
-// chunk of the table once a single refresh committed, since the set is
-// slot-sized even when every slot is default. The guard must read the slot.
-TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc mask slot",
+// The mask set is slot-sized whenever the entry has any MVCC state, so the attach must
+// read the SLOT, not set emptiness. A masked slot gets the pushdown and its visibility
+// mask; a default slot gets the pushdown alone.
+TEST_CASE("cached provider composes the decode-side pushdown with the mvcc mask slot",
           "[cached_serving][scan_manager]")
 {
   auto& e = env();
   constexpr std::size_t rows{64};
 
-  // Two compressed GPU chunks. Unlike the fixtures above, the blob is empty but
-  // PRESENT: for_chunk reads the compressed_table (a range-only request survives
-  // that walk untouched).
+  // Empty cached table: a range-only request narrows through for_chunk without probing
+  // any column plan.
   pinned_entry entry;
   set_cached_columns(entry, {"k", "v"});
   entry.tier         = cucascade::memory::Tier::GPU;
@@ -591,13 +595,13 @@ TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc 
   }
   entry.num_rows = 2 * rows;
 
-  // The post-refresh shape: only the chunk holding deleted rows is masked.
+  // After deletes commit, only chunks holding deleted rows are masked.
   sirius::scan_manager::mvcc_chunk_mask_set masks;
   masks.push_back(make_test_mask(rows));
   masks.push_back({});
 
-  // Range-only, so without_row_selection() leaves nothing to ask: a masked
-  // chunk attaches no scan at all, which is what makes the two cases distinct.
+  // Range-only: both chunks attach the same scan, and only the masked one also
+  // carries a visibility mask.
   sirius::pushdown_request request;
   request.columns.resize(2);
   request.columns[0].range          = sirius::decode_range{.lo = 5, .hi = 90};
@@ -616,33 +620,45 @@ TEST_CASE("cached provider gates the decode-side pushdown per chunk on the mvcc 
                                                          /*has_physical_overrides=*/false,
                                                          request);
 
-  auto const served_scan = [](databatch_provider::batch const& b) {
+  struct served_attachments {
+    std::shared_ptr<const sirius::decompression_pushdown_scan> scan;
+    sirius::decode_visibility_mask visibility;
+  };
+  auto const served_rep = [](databatch_provider::batch const& b) -> served_attachments {
     auto ro         = b.data->to_read_only();
     auto const* rep = dynamic_cast<sirius::compressed_device_representation const*>(ro.get_data());
     REQUIRE(rep != nullptr);
-    return rep->pushdown_scan();
+    return {rep->pushdown_scan(), rep->visibility_mask()};
   };
 
-  // Masked: the classic decode + positional-mask path.
-  auto masked = provider->get_next_batch();
-  REQUIRE(masked.data);
-  REQUIRE(masked.mvcc_keep_mask.has_mask());
-  REQUIRE(served_scan(masked) == nullptr);
+  auto const check_request = [](sirius::pushdown_request const& r) {
+    REQUIRE_FALSE(r.row_selection_disabled);
+    REQUIRE(r.selects_rows());
+    REQUIRE(r.columns.size() == 2);
+    REQUIRE(r.columns[0].range.has_value());
+    REQUIRE(r.columns[0].range->lo == 5);
+    REQUIRE(r.columns[0].range->hi == 90);
+    REQUIRE_FALSE(r.columns[1].range.has_value());
+    REQUIRE(r.ranges_cover_whole_filter);
+  };
 
-  // Default slot: row dropping attached as in a mask-free pass.
-  auto clean = provider->get_next_batch();
-  REQUIRE(clean.data);
-  REQUIRE_FALSE(clean.mvcc_keep_mask.has_mask());
-  auto const scan = served_scan(clean);
-  REQUIRE(scan != nullptr);
-  REQUIRE_FALSE(scan->request().row_selection_disabled);
-  REQUIRE(scan->request().selects_rows());
-  REQUIRE(scan->request().ranges_cover_whole_filter);
-  REQUIRE(scan->request().columns.size() == 2);
-  REQUIRE(scan->request().columns[0].range.has_value());
-  REQUIRE(scan->request().columns[0].range->lo == 5);
-  REQUIRE(scan->request().columns[0].range->hi == 90);
-  REQUIRE_FALSE(scan->request().columns[1].range.has_value());
+  auto a = provider->get_next_batch();
+  REQUIRE(a.data);
+  REQUIRE(a.mvcc_keep_mask.has_mask());
+  auto const a_served = served_rep(a);
+  REQUIRE(a_served.scan != nullptr);
+  check_request(a_served.scan->request());
+  REQUIRE(a_served.visibility.has_mask());
+  REQUIRE(a_served.visibility.row_count == rows);
+  REQUIRE(a_served.visibility.words.get() == masks[0].words.get());
+
+  auto b = provider->get_next_batch();
+  REQUIRE(b.data);
+  REQUIRE_FALSE(b.mvcc_keep_mask.has_mask());
+  auto const b_served = served_rep(b);
+  REQUIRE(b_served.scan != nullptr);
+  check_request(b_served.scan->request());
+  REQUIRE_FALSE(b_served.visibility.has_mask());
 
   REQUIRE_FALSE(provider->get_next_batch().data);  // end of stream
 }
@@ -1341,7 +1357,7 @@ TEST_CASE("prepare_for_processing steals the converted table from a per-query wr
   REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
   auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
   REQUIRE(out != nullptr);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(to_host(out->view()) == values);
   REQUIRE(split.stolen_table == nullptr);
   REQUIRE(split.stolen_table_consumed);
@@ -1380,7 +1396,7 @@ TEST_CASE("prepare_for_processing never steals from a GPU-resident (pin-shaped) 
   REQUIRE(result.state == sirius::op::scan::filter_state::UNFILTERED);
   auto out = result.table.release(e.stream(), e.gpu_space->get_default_allocator());
   REQUIRE(out != nullptr);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(to_host(out->view()) == std::vector<int32_t>(4, 7));
 
   // Pin-shaped storage untouched: same representation, same bytes.
@@ -1539,7 +1555,7 @@ TEST_CASE("transactional converted-table steal rolls back and commits on retry",
                       },
                       e.stream()),
                     rmm::out_of_memory);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(first_replacement_built);
   REQUIRE(split.converted_table_steal_pending);
   REQUIRE_FALSE(split.stolen_table_consumed);
@@ -1557,7 +1573,7 @@ TEST_CASE("transactional converted-table steal rolls back and commits on retry",
   // The scheduler may retry on another stream. Re-prepare preserves the pending transaction; the
   // transaction rebinds the already-plain wrapper before casting only the first column.
   rmm::cuda_stream retry_stream;
-  auto const retry = retry_stream.view();
+  ::cuda::stream_ref const retry = retry_stream;
   split.prepare_for_processing(e.gpu_space, retry);
   REQUIRE(split.stolen_table == nullptr);
   REQUIRE(split.converted_table_steal_pending);
@@ -1575,7 +1591,7 @@ TEST_CASE("transactional converted-table steal rolls back and commits on retry",
     },
     retry);
   REQUIRE(out != nullptr);
-  retry.synchronize();
+  retry.sync();
   auto const output_view = out->view();
   REQUIRE(output_view.column(0).type().id() == cudf::type_id::INT64);
   REQUIRE(output_view.column(1).type().id() == cudf::type_id::INT32);
@@ -1623,7 +1639,7 @@ TEST_CASE("transactional steal refuses a downgraded wrapper without mutating it"
     mut.convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), e.host_space, e.stream());
   }
-  e.stream().synchronize();
+  e.stream().sync();
 
   bool builder_called = false;
   auto refused        = split.transactionally_steal_converted_table(
@@ -1683,7 +1699,7 @@ TEST_CASE("transactional steal serves decode-row-filtered splits but refuses pre
     },
     e.stream());
   REQUIRE(out != nullptr);
-  e.stream().synchronize();
+  e.stream().sync();
   REQUIRE(out->view().column(0).type().id() == cudf::type_id::INT64);
   REQUIRE(to_host_column<int64_t>(out->view(), 0) ==
           std::vector<int64_t>(values.begin(), values.end()));

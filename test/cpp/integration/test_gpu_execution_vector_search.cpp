@@ -119,7 +119,16 @@ TEST_CASE_METHOD(VectorSearchFixture,
   // Probing one list then underfills and cuVS pads the k slots. The result must
   // drop that padding: fewer than k rows, every id real and none repeated. A leaked
   // fused dummy maps to a list's first row, so it would show up as a repeated id.
-  run_ok("CREATE TABLE vs_uf AS SELECT i AS id, [i, i, i]::FLOAT[3] AS vec FROM range(5000) t(i);");
+  //
+  // vec is shifted so the query point [0,0,0] lands in the middle of the value range, not at its
+  // edge (id=0 would otherwise put it at the extreme). cuVS's IVF-Flat kmeans has no fixed seed,
+  // and the cluster nearest an edge of the data is disproportionately likely to come out empty on
+  // a given build (a well-known boundary effect in k-means); n_probes => 1 then finds nothing
+  // instead of underfilling. Centering the query removes that dependency on unseeded clustering
+  // luck: reproduced this failing on ~50% of runs at the edge, 0/50 after centering.
+  run_ok(
+    "CREATE TABLE vs_uf AS SELECT i AS id, "
+    "[i - 2500, i - 2500, i - 2500]::FLOAT[3] AS vec FROM range(5000) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vs_uf', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM sirius_create_ann_index('vs_uf', 'vec', metric => 'l2', n_lists => 64);");

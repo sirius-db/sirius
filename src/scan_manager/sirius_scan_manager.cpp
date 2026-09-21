@@ -28,12 +28,14 @@
 #include "io/parquet_helpers.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/sirius_datasource.hpp"
+#include "io/uri_parser.hpp"
 #include "late_mat/pin_uniqueness.hpp"
 #include "log/logging.hpp"
 #include "memory/topology_index.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/gpu_ingestible.hpp"
+#include "op/scan/iceberg_gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/scan/parquet_metadata.hpp"
 #include "op/scan/scan_filter_analysis.hpp"
@@ -72,6 +74,7 @@
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/transaction/duck_transaction.hpp>
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <algorithm>
@@ -89,6 +92,26 @@
 namespace sirius::scan_manager {
 
 namespace {
+
+/// Enable/disable the keep-mask version cache (default on). SIRIUS_MVCC_MASK_CACHE=0
+/// rebuilds every query, bounding the pinned host memory a cached set would hold.
+bool mvcc_mask_cache_enabled()
+{
+  static const bool enabled = []() {
+    char const* v = std::getenv("SIRIUS_MVCC_MASK_CACHE");
+    return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+/// Keyed per attached database: each has its own MVCC counter domain.
+mvcc_mask_snapshot_key capture_mvcc_mask_snapshot_key(mvcc_mask_job_request const& request)
+{
+  auto& attached = request.storage->GetAttached();
+  auto& txn      = duckdb::DuckTransaction::Get(*request.context, attached);
+  auto& manager  = duckdb::DuckTransactionManager::Get(attached);
+  return {manager.GetLastCommit(), txn.start_time, txn.ChangesMade()};
+}
 
 using sirius::pinned_column_storage_matrix;
 using sirius::pinned_column_storage_meta;
@@ -279,6 +302,12 @@ struct cached_databatch_provider : public databatch_provider {
     if (!chunk) { return nullptr; }
     if (auto* compressed = dynamic_cast<sirius::compressed_host_representation*>(chunk.get())) {
       auto projected = compressed->select_columns(_column_indices);
+      // Host-tier mirror of the device path: carrying the mask lets the decode-time
+      // membership snapshot compose with it rather than skip the split.
+      if (chunk_has_mvcc_mask(index)) {
+        auto const& mask = _mvcc_masks[index];
+        projected->set_visibility_mask(sirius::decode_visibility_mask{mask.words, mask.row_count});
+      }
       return cucascade::data_batch::make(get_next_batch_id(), std::move(projected));
     }
     auto& host          = chunk->cast<cucascade::host_data_representation>();
@@ -304,17 +333,22 @@ struct cached_databatch_provider : public databatch_provider {
         auto projected = chunk.compressed->select_columns(_column_indices);
         // Attach the scan's decode request to this projection only — never to
         // the shared pinned chunk, which other queries filter differently.
-        // for_chunk narrows it to what this chunk's compression plans make
-        // worth asking; row dropping is additionally skipped for chunks that
-        // carry an mvcc keep-mask, since a decode-compacted batch no longer
-        // lines up with a positional deleted-row mask.
+        // for_chunk narrows it to what this chunk's compression plans can evaluate. Row
+        // dropping stays on for a masked chunk: the mask attached below is ANDed into the
+        // same selection, so the compacted rows are the visible ones.
         std::shared_ptr<const sirius::decompression_pushdown_scan> pushdown_scan;
         if (!_pushdown_req.empty()) {
-          auto scan = std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
-          // Row dropping cannot compose with a positional deleted-row mask: a
-          // compacted batch no longer lines up with it.
-          if (chunk_has_mvcc_mask(index)) { scan = scan->without_row_selection(); }
-          if (scan) { pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices); }
+          auto const scan =
+            std::make_shared<const sirius::decompression_pushdown_scan>(_pushdown_req);
+          pushdown_scan = scan->for_chunk(chunk.compressed->table(), _column_indices);
+        }
+        // Carrying the mask lets the decode AND it into the wave-1 selection and compact
+        // to the visible survivors; the outcome reports whether it did. A non-applied
+        // outcome stays full-width and the scan applies the mask positionally.
+        if (chunk_has_mvcc_mask(index)) {
+          auto const& mask = _mvcc_masks[index];
+          projected->set_visibility_mask(
+            sirius::decode_visibility_mask{mask.words, mask.row_count});
         }
         // A PER-BATCH snapshot of the operator's dynamic-filter channel: join
         // builds publish mid-scan, so later batches legitimately carry more
@@ -332,15 +366,15 @@ struct cached_databatch_provider : public databatch_provider {
         // exactly filters_for_column(i); trailing pure-filter slots query keys
         // the set can never hold (push_filter rejects non-output columns) and
         // come back empty by construction — no output-arity knowledge is needed
-        // here. Same per-chunk mvcc guard as the row selection above.
+        // here. Masked chunks participate too: their mask is attached above, so probes
+        // and keep-mask land in one selection.
         //
         // This drain runs on the metadata thread at query PREPARE, before any
         // join build has published, so this snapshot is almost always EMPTY. It
         // is kept as a free early base; the authoritative snapshot is taken at
         // decode time by scan_operator_input::prepare_for_processing (same
         // builder, same mapping invariant), which replaces this one.
-        if (sirius::decompression_pushdown_enabled() && _dynamic_filters &&
-            !chunk_has_mvcc_mask(index)) {
+        if (sirius::decompression_pushdown_enabled() && _dynamic_filters) {
           if (_dynamic_filters->has_filters()) {
             auto snap = sirius::op::scan::snapshot_membership_probes(*_dynamic_filters,
                                                                      _column_indices.size());
@@ -385,7 +419,7 @@ struct cached_databatch_provider : public databatch_provider {
       cudf::table_view view(column_views);
       auto* chunk_space = chunk.memory_space ? chunk.memory_space : _entry.memory_space;
       auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-        view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+        view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
       const auto batch_id = ::sirius::get_next_batch_id();
       return ::cucascade::data_batch::make(
         batch_id,
@@ -407,7 +441,7 @@ struct cached_databatch_provider : public databatch_provider {
     auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+      view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
     const auto batch_id = ::sirius::get_next_batch_id();
     return ::cucascade::data_batch::make(
       batch_id,
@@ -592,22 +626,10 @@ scan_filter_view extract_scan_filters(op::scan::ingestible_table_info const& inf
 }
 
 /// Strip a leading "file://" scheme (case-insensitive) so the path can be
-/// resolved by a local-file backend.
-std::string normalize_path(std::string const& p)
-{
-  static constexpr std::string_view kFile = "file://";
-  if (p.size() > kFile.size()) {
-    bool is_file_uri = true;
-    for (std::size_t i = 0; i < kFile.size(); ++i) {
-      if (std::tolower(static_cast<unsigned char>(p[i])) != static_cast<unsigned char>(kFile[i])) {
-        is_file_uri = false;
-        break;
-      }
-    }
-    if (is_file_uri) { return p.substr(kFile.size()); }
-  }
-  return p;
-}
+/// resolved by a local-file backend. Thin alias for the shared helper — kept so
+/// the cache-key and routing call sites below read as they did, while there is
+/// exactly ONE implementation of the rule (sirius::io::strip_file_scheme).
+std::string normalize_path(std::string const& p) { return sirius::io::strip_file_scheme(p); }
 
 /// One operator's output schema as cuDF carriers, or empty when some column has
 /// no native carrier — which is a reason not to defer, not an error.
@@ -624,8 +646,8 @@ std::vector<cudf::data_type> physical_schema_of(op::sirius_physical_operator con
   return schema;
 }
 
-/// The rowid width this pin can address with: half the ride for a table whose
-/// rows fit 32 bits, which is every TPC-H table but lineitem at SF1000.
+/// The rowid width this pin can address with: 32 bits when the table's row count fits,
+/// halving the rowid payload, and 64 bits otherwise.
 [[nodiscard]] cudf::type_id rowid_type_for(pinned_entry const& entry)
 {
   return entry.num_rows <= static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())
@@ -1435,9 +1457,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       _scan_op_order.push_back(op);
       continue;
     }
+    // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
+    // query thread: GetPartitionStats touches ClientContext/LocalStorage.
+    op->get_ingestible().ensure_metadata_prepared();
     auto provider = std::make_unique<split_provider>(
-      op->get_ingestible(),
-      [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
+      op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
         if (!io_ctx) {
           throw std::runtime_error("scan_manager: no backend supports path: " +
@@ -1484,9 +1508,48 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // every scan op). The dispatcher is fresh and otherwise idle here. Errors
   // are loud: transparent execution can replay its retained CPU plan, while
   // fallback-disabled callers receive the error instead of stale results.
+  //
+  // Version cache: visible state only changes at commits, so a set built at the same
+  // snapshot serves this query unchanged. Keys are captured before the build — a
+  // concurrent commit increments last_commit under DuckDB's transaction lock before any
+  // transaction observing it begins, so a stored key can never be too permissive.
+  std::vector<mvcc_mask_snapshot_key> mask_snapshot_keys(_pending_mvcc_mask_jobs.size());
+  if (mvcc_mask_cache_enabled()) {
+    for (std::size_t i = 0; i < _pending_mvcc_mask_jobs.size(); ++i) {
+      auto& request         = _pending_mvcc_mask_jobs[i];
+      mask_snapshot_keys[i] = capture_mvcc_mask_snapshot_key(request);
+      auto const entry_it   = _pinned_entries.find(request.entry_name);
+      if (entry_it == _pinned_entries.end() || !entry_it->second.mvcc_mask_cache) { continue; }
+      auto& cache = *entry_it->second.mvcc_mask_cache;
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      if (cache.valid && mvcc_mask_cache_reusable(cache.built, mask_snapshot_keys[i])) {
+        request.masks       = cache.masks;
+        request.masks_ready = true;
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager] mvcc mask cache HIT for pinned entry '{}' (last_commit {})",
+          request.entry_name,
+          mask_snapshot_keys[i].last_commit);
+      }
+    }
+  }
   if (!_pending_mvcc_mask_jobs.empty()) {
     run_mvcc_mask_jobs(
       _pending_mvcc_mask_jobs, *_dispatcher, _reservation_manager, *_topology_index);
+  }
+  if (mvcc_mask_cache_enabled()) {
+    // Only writer-free builds whose snapshot covers every existing commit qualify.
+    for (std::size_t i = 0; i < _pending_mvcc_mask_jobs.size(); ++i) {
+      auto& request = _pending_mvcc_mask_jobs[i];
+      if (request.masks_ready || !mvcc_mask_cache_publishable(mask_snapshot_keys[i])) { continue; }
+      auto const entry_it = _pinned_entries.find(request.entry_name);
+      if (entry_it == _pinned_entries.end()) { continue; }
+      auto& cache_ptr = entry_it->second.mvcc_mask_cache;
+      if (!cache_ptr) { cache_ptr = std::make_shared<mvcc_mask_version_cache>(); }
+      std::lock_guard<std::mutex> lock(cache_ptr->mutex);
+      cache_ptr->built = mask_snapshot_keys[i];
+      cache_ptr->masks = request.masks;
+      cache_ptr->valid = true;
+    }
   }
   // Insert-delta jobs block in prepare for the same reason: staging and
   // masks must be finished before serving starts. No-op when no pinned
@@ -1769,7 +1832,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.
@@ -1914,6 +1977,14 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
   // serves a duckdb scan over the same catalog.schema.table. A cache of one format
   // never serves a scan of the other — the identity check below falls through (a
   // duckdb cache has empty resolved_file_paths; a parquet cache has an empty table_name).
+  // An iceberg scan carrying deletes is NOT a parquet scan over the same files, even though its
+  // bind data derives from parquet's and its file set matches exactly. A pinned entry holds the
+  // data files' rows as written; the deletes live in manifests the pin never saw. Serving that
+  // cache would return rows the table logically deleted, and would look like a cache hit rather
+  // than a correctness bug — so an iceberg scan with deletes always reads from disk.
+  if (auto const* ice = dynamic_cast<op::scan::iceberg_ingestible_table_info const*>(&other)) {
+    if (ice->delete_data && !ice->delete_data->empty()) { return {}; }
+  }
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
     if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);
@@ -1979,6 +2050,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
   // there is exactly one
@@ -2264,6 +2336,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
@@ -2346,6 +2419,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cucascade::memory::memory_space& memory_space,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
     if (chunk.compressed) {
@@ -2399,16 +2473,20 @@ void sirius_scan_manager::insert_pinned_entry_device(
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
                                                duckdb_mvcc_metadata metadata)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
   }
   it->second.mvcc = std::make_unique<duckdb_mvcc_metadata>(std::move(metadata));
+  // A (re-)pin resets the chunk layout the masks are indexed by.
+  it->second.mvcc_mask_cache.reset();
 }
 
 void sirius_scan_manager::attach_proven_unique_columns(
   const std::string& name, std::span<std::string const> unique_column_names)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_proven_unique_columns] no pinned entry named '" + name +
@@ -2428,6 +2506,7 @@ void sirius_scan_manager::attach_proven_unique_columns(
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   retire_late_mat_handle(name);
   _pinned_entries.erase(name);
 }

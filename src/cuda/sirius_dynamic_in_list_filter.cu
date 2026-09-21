@@ -200,7 +200,7 @@ struct sirius_dynamic_in_list_filter::set_impl {
 };
 
 sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view const& keys,
-                                                             rmm::cuda_stream_view stream,
+                                                             ::cuda::stream_ref stream,
                                                              rmm::device_async_resource_ref mr)
   : _key_type(keys.type()), _num_keys(static_cast<std::size_t>(keys.size()))
 {
@@ -209,7 +209,7 @@ sirius_dynamic_in_list_filter::sirius_dynamic_in_list_filter(cudf::column_view c
       "[sirius_dynamic_in_list_filter] unsupported key column (INT32/INT64, no nulls required).");
   }
 
-  cuda::stream_ref const s{stream.value()};
+  cuda::stream_ref const s{stream.get()};
   auto const factor =
     capacity_factor_for(_num_keys, static_cast<std::size_t>(cudf::size_of(_key_type)));
   auto const capacity = std::max<std::size_t>(factor * _num_keys, kMinCapacity);
@@ -277,7 +277,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<set_replica>, rmm::cuda_stream_view>> pending;
+  std::vector<std::pair<std::unique_ptr<set_replica>, ::cuda::stream_ref>> pending;
   pending.reserve(spaces.size());
   _set->replicas.reserve(_set->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -307,8 +307,8 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
             detail::scoped_replica_reservation::try_acquire(target, reservation_bytes, stream);
           if (!reservation) { return std::unique_ptr<set_replica>{}; }
 
-          auto destination_set = make_set<key_type>(
-            capacity, reservation->allocator(), cuda::stream_ref{stream.value()});
+          auto destination_set =
+            make_set<key_type>(capacity, reservation->allocator(), cuda::stream_ref{stream.get()});
           if (destination_set->capacity() != capacity) {
             throw std::runtime_error("destination static_set capacity changed during replication");
           }
@@ -353,7 +353,7 @@ void sirius_dynamic_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      stream.sync();
       _set->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(
@@ -379,7 +379,7 @@ std::size_t sirius_dynamic_in_list_filter::replica_count() const noexcept
 std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
   cudf::column_view const& probe,
   int device_id,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   // A pinned chunk may store this key narrowed while the filter was published at
@@ -403,7 +403,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_in_list_filter::compute_mask(
       auto const* d    = keys.data<key_type>();
       auto ref         = set->ref(cuco::contains);
       cub::DeviceFor::Bulk(
-        n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.value());
+        n, contains_or_sentinel<key_type, decltype(ref)>{d, outp, ref}, stream.get());
     },
     replica->set);
   if (probe.nullable() && probe.null_count() > 0) {

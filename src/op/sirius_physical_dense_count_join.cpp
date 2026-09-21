@@ -24,6 +24,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
+#include "telemetry/nvtx.hpp"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -39,8 +40,6 @@
 #include <cudf/unary.hpp>
 
 #include <rmm/aligned.hpp>
-
-#include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
@@ -98,7 +97,7 @@ namespace {
 std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
                                                   cudf::column_view const& values,
                                                   cudf::null_policy value_policy,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   cudf::groupby::groupby gb(cudf::table_view({keys}), cudf::null_policy::EXCLUDE, cudf::sorted::NO);
@@ -116,7 +115,7 @@ std::unique_ptr<cudf::table> sparse_partial_count(cudf::column_view const& keys,
 
 std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
                                                std::unique_ptr<cudf::table> rhs,
-                                               rmm::cuda_stream_view stream,
+                                               ::cuda::stream_ref stream,
                                                rmm::device_async_resource_ref mr)
 {
   std::vector<cudf::table_view> views{lhs->view(), rhs->view()};
@@ -142,7 +141,7 @@ std::unique_ptr<cudf::table> sparse_merge_pair(std::unique_ptr<cudf::table> lhs,
 std::unique_ptr<cudf::table> sparse_merge_partials(
   std::vector<std::unique_ptr<cudf::table>> partials,
   cudf::data_type key_type,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   if (partials.empty()) {
@@ -216,13 +215,19 @@ sirius_physical_dense_count_join::sirius_physical_dense_count_join(
   std::size_t counted_key_idx,
   std::optional<std::size_t> counted_value_idx,
   uint64_t max_bins_bytes,
+  uint64_t planned_histogram_bytes,
+  uint64_t planned_output_rows,
+  uint64_t planned_counted_rows,
   uint64_t hash_partition_bytes)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::DENSE_COUNT_JOIN, std::move(types), estimated_cardinality),
     _preserved_key_idx(preserved_key_idx),
     _counted_key_idx(counted_key_idx),
     _counted_value_idx(counted_value_idx),
-    _max_bins_bytes(max_bins_bytes)
+    _max_bins_bytes(max_bins_bytes),
+    _planned_histogram_bytes(planned_histogram_bytes),
+    _planned_output_rows(planned_output_rows),
+    _planned_counted_rows(planned_counted_rows)
 {
   _hash_partition_bytes = hash_partition_bytes;
   D_ASSERT(this->types.size() == 2);  // [group key, BIGINT count]
@@ -414,13 +419,26 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
 
   constexpr std::size_t allocation_floor = 1024 * 1024;
 
-  auto const histogram_bytes = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
+  // max_admitted_histogram_bytes is a gate, not a size: it reports the whole budget whenever
+  // the input is large, so an estimate built on it grows with the card. Prefer the planner's
+  // sizing, capped by the ceiling since nothing above it would have been admitted.
+  auto const admission_ceiling = max_admitted_histogram_bytes(_max_bins_bytes, stats.bytes);
+  auto const histogram_bytes =
+    _planned_histogram_bytes > 0
+      ? std::min(static_cast<std::size_t>(_planned_histogram_bytes), admission_ceiling)
+      : admission_ceiling;
 
   auto const key_width      = sirius::get_cudf_type(types[0]).id() == cudf::type_id::INT32
                                 ? sizeof(int32_t)
                                 : sizeof(int64_t);
   auto const cudf_row_limit = static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max());
-  auto const output_rows    = std::min(stats.bytes / key_width, cudf_row_limit);
+  // Output rows are distinct preserved keys, so the preserved cardinality bounds them.
+  // stats.bytes spans both sides and every column, making stats.bytes / key_width count each
+  // input byte as a key -- an error that multiplies through the three per-row terms below. It
+  // stays only as a ceiling for when the planner supplied nothing.
+  auto const planned_rows =
+    _planned_output_rows > 0 ? static_cast<std::size_t>(_planned_output_rows) : cudf_row_limit;
+  auto const output_rows = std::min({planned_rows, stats.bytes / key_width, cudf_row_limit});
   auto const selected_bytes =
     saturating_mul(sizeof(int64_t), output_rows);  // histogram bin index per key
   auto const output_bytes =
@@ -440,15 +458,34 @@ std::size_t sirius_physical_dense_count_join::no_history_peak_memory_estimate(
   auto const minmax_peak =
     saturating_add(allocation_floor, saturating_mul(stats.num_batches, extrema_per_batch));
 
-  // Sparse execution: 16 is a heuristic expansion factor
-  auto const sparse_peak = saturating_add(allocation_floor, saturating_mul(16, stats.bytes));
+  // Sparse execution: a groupby streams its input through a hash table sized by distinct
+  // keys, so residency tracks the group count rather than how many rows were read. Measured
+  // at ~107 bytes per group; the factor below carries headroom over that. One mean batch is
+  // added for the input the current groupby holds, input_stats carrying no per-batch maximum.
+  //
+  // An estimate above the tier is not the safe direction: it cannot be granted, so it yields
+  // a clamp and a partial reservation instead of a refusal.
+  constexpr std::size_t kSparseGroupFactor = 8;
+  auto const avg_batch_bytes =
+    stats.num_batches > 0 ? stats.bytes / stats.num_batches : stats.bytes;
+  // Groups every distinct counted-side key, including unmatched ones that never reach the
+  // output, so output_rows does not bound the hash state.
+  auto const planned_groups =
+    _planned_counted_rows > 0
+      ? saturating_add(static_cast<std::size_t>(_planned_counted_rows), output_rows)
+      : cudf_row_limit;
+  auto const sparse_groups = std::min({planned_groups, stats.bytes / key_width, cudf_row_limit});
+  auto sparse_peak         = saturating_add(allocation_floor, avg_batch_bytes);
+  sparse_peak              = saturating_add(
+    sparse_peak,
+    saturating_mul(saturating_mul(kSparseGroupFactor, key_width + sizeof(int64_t)), sparse_groups));
   return std::max({dense_peak, sparse_peak, minmax_peak});
 }
 
 std::unique_ptr<operator_data> sirius_physical_dense_count_join::execute(
-  operator_data const& input_data, rmm::cuda_stream_view stream)
+  operator_data const& input_data, ::cuda::stream_ref stream)
 {
-  nvtx3::scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
+  nvtx_scoped_range nvtx_range{"sirius_physical_dense_count_join::execute"};
   auto const& input          = dynamic_cast<dense_count_join_input const&>(input_data);
   auto const ro_batches      = input.get_read_only_batches();
   auto const preserved_count = input.preserved_count();

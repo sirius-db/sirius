@@ -363,17 +363,17 @@ TEST_CASE("cuvs_index_cache create binds the build to its reservation and leaks 
   rmm::cuda_stream build_stream;
   auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
   REQUIRE(alloc == adaptor);
-  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream, std::move(reservation)));
 
   auto handle = sirius::vss::build_ivf_flat_index_from_batches({col->view()},
                                                                dim,
                                                                /*n_lists=*/2,
                                                                Metric::L2SqrtExpanded,
                                                                gpu_space->get_default_allocator(),
-                                                               build_stream.view());
+                                                               build_stream);
 
-  auto const index_bytes = adaptor->get_allocated_bytes(build_stream.view());
-  adaptor->reset_stream_reservation(build_stream.view());
+  auto const index_bytes = adaptor->get_allocated_bytes(build_stream);
+  adaptor->reset_stream_reservation(build_stream);
 
   index_metadata meta = make_meta("docs", "vec", Metric::L2SqrtExpanded);
   meta.resident_bytes = index_bytes;
@@ -433,18 +433,18 @@ TEST_CASE("cuvs_index_cache build peak when a list outgrows its 32-row capacity"
   REQUIRE(reservation != nullptr);
   rmm::cuda_stream build_stream;
   auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
-  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream, std::move(reservation)));
 
   auto handle = sirius::vss::build_ivf_flat_index_from_batches({batch_a->view(), batch_b->view()},
                                                                dim,
                                                                n_lists,
                                                                Metric::L2SqrtExpanded,
                                                                gpu_space->get_default_allocator(),
-                                                               build_stream.view());
+                                                               build_stream);
 
-  std::size_t const resident = adaptor->get_allocated_bytes(build_stream.view());
-  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream.view());
-  adaptor->reset_stream_reservation(build_stream.view());
+  std::size_t const resident = adaptor->get_allocated_bytes(build_stream);
+  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream);
+  adaptor->reset_stream_reservation(build_stream);
 
   REQUIRE(handle != nullptr);
   WARN("footprint=" << footprint << " resident=" << resident << " peak=" << peak);
@@ -498,18 +498,18 @@ TEST_CASE("cuvs_index_cache reservation covers the build peak for a large low-di
   REQUIRE(reservation != nullptr);
   rmm::cuda_stream build_stream;
   auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
-  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream, std::move(reservation)));
 
   auto handle = sirius::vss::build_ivf_flat_index_from_batches(batches,
                                                                dim,
                                                                n_lists,
                                                                Metric::L2SqrtExpanded,
                                                                gpu_space->get_default_allocator(),
-                                                               build_stream.view());
+                                                               build_stream);
 
-  std::size_t const resident = adaptor->get_allocated_bytes(build_stream.view());
-  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream.view());
-  adaptor->reset_stream_reservation(build_stream.view());
+  std::size_t const resident = adaptor->get_allocated_bytes(build_stream);
+  std::size_t const peak     = adaptor->get_peak_allocated_bytes(build_stream);
+  adaptor->reset_stream_reservation(build_stream);
 
   REQUIRE(handle != nullptr);
   WARN("footprint=" << footprint << " resident=" << resident << " peak=" << peak);
@@ -641,15 +641,15 @@ TEST_CASE("cuvs_index_cache refused second build leaves the first index holding 
   REQUIRE(reservation != nullptr);
   rmm::cuda_stream build_stream;
   auto* alloc = reservation->get_memory_resource_of<mem::Tier::GPU>();
-  REQUIRE(alloc->attach_reservation_to_tracker(build_stream.view(), std::move(reservation)));
+  REQUIRE(alloc->attach_reservation_to_tracker(build_stream, std::move(reservation)));
   auto handle         = sirius::vss::build_ivf_flat_index_from_batches({col->view()},
                                                                dim,
                                                                /*n_lists=*/2,
                                                                Metric::L2SqrtExpanded,
                                                                gpu_space->get_default_allocator(),
-                                                               build_stream.view());
-  auto const l2_bytes = adaptor->get_allocated_bytes(build_stream.view());
-  adaptor->reset_stream_reservation(build_stream.view());
+                                                               build_stream);
+  auto const l2_bytes = adaptor->get_allocated_bytes(build_stream);
+  adaptor->reset_stream_reservation(build_stream);
 
   index_metadata l2 = make_meta("docs", "vec", Metric::L2SqrtExpanded);
   l2.resident_bytes = l2_bytes;
