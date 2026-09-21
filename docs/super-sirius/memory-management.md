@@ -202,14 +202,16 @@ Three mechanisms carry it:
 1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
    batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
    exclusive lock does not imply the producer's writes have landed.
-2. **Reader events.** A consumer publishes the reads it enqueued to each locked batch before its
-   read lock drops (`record_reader_event`, cuCascade #184). The pipeline task does this for every
-   operator input on every exit from `execute()`; the scan's `owning_table_view` does it for
-   zero-copy views. `try_to_mutable()` then refuses, and `to_mutable()` waits, until those reads
-   complete, so no downgrade can rebind or free a batch under an in-flight reader.
-3. **Quiesce before owner death.** The pipeline task synchronizes its stream after every operator
-   `execute()` and again after `publish_output`, so cross-task state freed by
-   `finalize_operator` is never freed under a straggling sink enqueue.
+2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
+   a reader event for zero-copy views whose owner can be replaced before control returns to the
+   pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and
+   `to_mutable()` waits, until those reads complete, so no downgrade can rebind or free the batch
+   under an in-flight reader.
+3. **Quiesce before task-owned owner death.** The pipeline task synchronizes its stream after every
+   operator `execute()` and again after `publish_output`. Its exception handlers synchronize while
+   the corresponding inputs and outputs are still alive, before rethrowing lets them unwind. This
+   also ensures cross-task state freed by `finalize_operator` is not freed under a straggling sink
+   enqueue.
 
 Suspected violations show up as torn GPU→HOST conversions, scribbled string or selection
 geometry, or wild-pointer MMU faults, almost always under concurrency plus memory pressure.

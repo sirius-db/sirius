@@ -294,23 +294,6 @@ class pipelineable_operator_data : public operator_data {
   }
 
   /**
-   * @brief Publish reads enqueued on @p stream to every locked batch.
-   *
-   * Read locks are host-scoped: once they drop, a downgrade may reclaim the batch even though
-   * kernels enqueued under the lock are still in flight. Recording a reader event makes
-   * try_to_mutable() refuse, and to_mutable() wait, until those reads complete. Call after the
-   * consumer has enqueued its work and before the locks are released. No-op when nothing is
-   * locked or the batch is not GPU-resident.
-   */
-  void record_reader_events(rmm::cuda_stream_view stream) const
-  {
-    if (!_read_only_data_batches) { return; }
-    for (auto const& ro : *_read_only_data_batches) {
-      ro.record_reader_event(::cuda::stream_ref{stream.value()});
-    }
-  }
-
-  /**
    * @brief Lock all data batches for processing in the requested memory space.
    *
    * Iterates over all idle batches and locks (or converts then locks) each one,

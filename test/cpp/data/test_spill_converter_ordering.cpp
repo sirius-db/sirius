@@ -38,8 +38,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -69,16 +74,102 @@ constexpr std::int32_t kExpected = 0x1BBBBBBB;
 
 struct delay_state {
   std::atomic<bool> release{false};
+  std::atomic<bool> entered{false};
+
+  ~delay_state() { release.store(true, std::memory_order_release); }
 };
 
 /// Host function that parks a stream until the test releases it.
 void CUDART_CB block_until_released(void* userData)
 {
   auto* state = static_cast<delay_state*>(userData);
+  state->entered.store(true, std::memory_order_release);
   while (!state->release.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
+
+bool wait_for_flag(std::atomic<bool> const& flag,
+                   std::chrono::milliseconds timeout = std::chrono::seconds(5))
+{
+  auto const deadline = std::chrono::steady_clock::now() + timeout;
+  while (!flag.load(std::memory_order_acquire)) {
+    if (std::chrono::steady_clock::now() >= deadline) { return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+void throw_if_cuda_error(cudaError_t status, char const* operation)
+{
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string{operation} + ": " + cudaGetErrorString(status));
+  }
+}
+
+/// Registers host memory and guarantees that a blocked callback is released before cleanup.
+class registered_host_memory {
+ public:
+  registered_host_memory(void* data,
+                         std::size_t bytes,
+                         rmm::cuda_stream_view stream,
+                         delay_state& gate)
+    : _data(data), _stream(stream.value()), _gate(&gate)
+  {
+    throw_if_cuda_error(cudaHostRegister(_data, bytes, 0), "cudaHostRegister");
+    _registered = true;
+  }
+
+  registered_host_memory(registered_host_memory const&)            = delete;
+  registered_host_memory& operator=(registered_host_memory const&) = delete;
+
+  ~registered_host_memory()
+  {
+    if (!_registered) { return; }
+    _gate->release.store(true, std::memory_order_release);
+    static_cast<void>(cudaStreamSynchronize(_stream));
+    static_cast<void>(cudaHostUnregister(_data));
+  }
+
+  cudaError_t unregister()
+  {
+    if (!_registered) { return cudaSuccess; }
+    auto const status = cudaHostUnregister(_data);
+    if (status == cudaSuccess) { _registered = false; }
+    return status;
+  }
+
+ private:
+  void* _data;
+  cudaStream_t _stream;
+  delay_state* _gate;
+  bool _registered{false};
+};
+
+/// Releases the CUDA callback gate before joining, including during test failure unwinding.
+class gated_thread {
+ public:
+  template <typename Function>
+  gated_thread(delay_state& gate, Function&& function)
+    : _gate(&gate), _thread(std::forward<Function>(function))
+  {
+  }
+
+  gated_thread(gated_thread const&)            = delete;
+  gated_thread& operator=(gated_thread const&) = delete;
+
+  ~gated_thread() { release_and_join(); }
+
+  void release_and_join()
+  {
+    _gate->release.store(true, std::memory_order_release);
+    if (_thread.joinable()) { _thread.join(); }
+  }
+
+ private:
+  delay_state* _gate;
+  std::jthread _thread;
+};
 
 /// Build a one-column INT32 batch on `stream`, filled with `value`, and settle it.
 std::unique_ptr<cudf::column> make_settled_column(std::int32_t value, rmm::cuda_stream_view stream)
@@ -162,7 +253,8 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
 
   delay_state gate;
   std::vector<std::int32_t> final_bytes(kRows, kExpected);
-  REQUIRE(cudaHostRegister(final_bytes.data(), kRows * sizeof(std::int32_t), 0) == cudaSuccess);
+  registered_host_memory final_bytes_registration(
+    final_bytes.data(), kRows * sizeof(std::int32_t), producer_stream.view(), gate);
   REQUIRE(cudaLaunchHostFunc(producer_stream.value(), block_until_released, &gate) == cudaSuccess);
   REQUIRE(cudaMemcpyAsync(col->mutable_view().head<void>(),
                           final_bytes.data(),
@@ -171,19 +263,32 @@ TEST_CASE("downgrade conversion orders after the producer's writer event",
                           producer_stream.value()) == cudaSuccess);
 
   auto batch = wrap_batch(std::move(col), producer_stream.view());
+  REQUIRE(wait_for_flag(gate.entered));
 
-  std::thread releaser([&gate] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
-    gate.release.store(true, std::memory_order_release);
-  });
   sirius::convertible_data_batch wrapper(batch);
-  auto result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
-  releaser.join();
+  std::optional<std::vector<std::size_t>> result;
+  std::exception_ptr worker_error;
+  std::atomic<bool> worker_started{false};
+  std::atomic<bool> converted{false};
+  gated_thread downgrader(gate, [&] {
+    worker_started.store(true, std::memory_order_release);
+    try {
+      result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
+    } catch (...) {
+      worker_error = std::current_exception();
+    }
+    converted.store(true, std::memory_order_release);
+  });
+
+  REQUIRE(wait_for_flag(worker_started));
+  REQUIRE_FALSE(wait_for_flag(converted, std::chrono::milliseconds(100)));
+  downgrader.release_and_join();
+  if (worker_error) { std::rethrow_exception(worker_error); }
   REQUIRE(result.has_value());
 
   REQUIRE(cudaStreamSynchronize(producer_stream.value()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(downgrade_stream.value()) == cudaSuccess);
-  REQUIRE(cudaHostUnregister(final_bytes.data()) == cudaSuccess);
+  REQUIRE(final_bytes_registration.unregister() == cudaSuccess);
 
   auto const out = read_back(*batch, downgrade_stream.view());
   REQUIRE(out.size() == kRows);
@@ -206,7 +311,8 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
 
   delay_state gate;
   std::vector<std::int32_t> reader_out(kRows, 0);
-  REQUIRE(cudaHostRegister(reader_out.data(), kRows * sizeof(std::int32_t), 0) == cudaSuccess);
+  registered_host_memory reader_out_registration(
+    reader_out.data(), kRows * sizeof(std::int32_t), reader_stream.view(), gate);
   {
     auto ro   = batch->to_read_only();
     auto view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
@@ -218,6 +324,7 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
                             reader_stream.value()) == cudaSuccess);
     ro.record_reader_event(::cuda::stream_ref{reader_stream.value()});
   }
+  REQUIRE(wait_for_flag(gate.entered));
   REQUIRE(batch->get_state() == cucascade::batch_state::idle);
 
   sirius::convertible_data_batch wrapper(batch);
@@ -226,24 +333,32 @@ TEST_CASE("a recorded reader event holds off the downgrade until the read comple
   REQUIRE_FALSE(batch->try_to_mutable().has_value());
 
   std::atomic<bool> converted{false};
-  std::thread downgrader([&] {
-    auto result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
-    REQUIRE(result.has_value());
-    rmm::device_buffer poison(kRows * sizeof(std::int32_t), downgrade_stream.view());
-    REQUIRE(cudaMemsetAsync(
-              poison.data(), 0xEE, kRows * sizeof(std::int32_t), downgrade_stream.value()) ==
-            cudaSuccess);
-    REQUIRE(cudaStreamSynchronize(downgrade_stream.value()) == cudaSuccess);
+  std::atomic<bool> worker_started{false};
+  std::exception_ptr worker_error;
+  gated_thread downgrader(gate, [&] {
+    worker_started.store(true, std::memory_order_release);
+    try {
+      auto result = wrapper.convert({env().host_space}, downgrade_stream.view(), *env().mgr, true);
+      if (!result.has_value()) { throw std::runtime_error("blocking downgrade did not convert"); }
+      rmm::device_buffer poison(kRows * sizeof(std::int32_t), downgrade_stream.view());
+      throw_if_cuda_error(
+        cudaMemsetAsync(
+          poison.data(), 0xEE, kRows * sizeof(std::int32_t), downgrade_stream.value()),
+        "cudaMemsetAsync");
+      throw_if_cuda_error(cudaStreamSynchronize(downgrade_stream.value()), "cudaStreamSynchronize");
+    } catch (...) {
+      worker_error = std::current_exception();
+    }
     converted.store(true, std::memory_order_release);
   });
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  CHECK_FALSE(converted.load(std::memory_order_acquire));
 
-  gate.release.store(true, std::memory_order_release);
-  downgrader.join();
+  REQUIRE(wait_for_flag(worker_started));
+  REQUIRE_FALSE(wait_for_flag(converted, std::chrono::milliseconds(100)));
+  downgrader.release_and_join();
+  if (worker_error) { std::rethrow_exception(worker_error); }
   REQUIRE(converted.load(std::memory_order_acquire));
   REQUIRE(cudaStreamSynchronize(reader_stream.value()) == cudaSuccess);
-  REQUIRE(cudaHostUnregister(reader_out.data()) == cudaSuccess);
+  REQUIRE(reader_out_registration.unregister() == cudaSuccess);
 
   auto const scribbled = count_not_expected(reader_out);
   INFO("straggler reader observed " << scribbled << " scribbled values of " << kRows);
