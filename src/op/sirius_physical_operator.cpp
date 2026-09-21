@@ -385,13 +385,12 @@ bool sirius_physical_operator::has_full_barrier_from(const pipeline::sirius_pipe
   return false;
 }
 
-duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
-  const noexcept
+std::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline() const noexcept
 {
   return _pipeline;
 }
 
-void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+void sirius_physical_operator::set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline)
 {
   assert(pipeline != nullptr);
   _pipeline = std::move(pipeline);

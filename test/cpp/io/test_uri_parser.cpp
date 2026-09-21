@@ -145,7 +145,7 @@ TEST_CASE("uri_parser rejects malformed input", "[uri_parser]")
 //===----------------------------------------------------------------------===//
 // strip_file_scheme
 //
-// Applied at sirius_ioctx::open_datasource, so it runs on EVERY datasource open. Iceberg
+// Applied at ioctx::open_datasource, so it runs on EVERY datasource open. Iceberg
 // manifests written by the Apache implementations record fully-qualified URIs
 // (file:///abs/path.parquet) — Java and Spark writers always do — while the local reactors
 // only open bare paths. An un-stripped URI reaches create_io_object and throws "unsupported

@@ -695,8 +695,8 @@ class sirius_physical_operator {
     /// Null repos are treated as "empty, not data-gating" by the base-class port handling methods
     /// (get_next_task_hint, get_next_task_input_data, all_ports_empty, push_data_batch).
     ::cucascade::shared_data_repository* repo;
-    duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
-    duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
+    std::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
+    std::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
     //! A UUID for a port on an operator at the beginning of a
     // pipeline. This port receives data from a prior pipeline,
     // forming an incoming edge from that pipeline.
@@ -775,12 +775,12 @@ class sirius_physical_operator {
   bool check_pipeline_finished();
 
   //! Get pipeline
-  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
+  std::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
 
-  virtual void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
+  virtual void set_pipeline(std::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  protected:
-  duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
+  std::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! Lookup map: port name -> raw pointer into _ports_list (never owns)
   std::unordered_map<std::string, port*> ports;
   //! Ownership container for ports, kept sorted by src_pipeline->get_pipeline_id().

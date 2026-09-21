@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1125,7 +1126,7 @@ std::shared_ptr<const sirius::telemetry::telemetry_context> SiriusContext::get_t
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::create_query(
-  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
+  std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines,
   sirius::query_id_t query_id,
   std::shared_ptr<sirius::pipeline::completion_handler> handler,
   sirius::telemetry::query_telemetry_info telemetry_info)
@@ -1715,6 +1716,7 @@ void SiriusContextExtensionCallback::initialize_context()
 {
   if (disabled_ || context_) { return; }
 
+  sirius::converter_registry::initialize(config_.get_downgrade_executor_config().copy_chunk_bytes);
   auto context = duckdb::make_shared_ptr<SiriusContext>();
   context->initialize(config_);
   context_ = std::move(context);
