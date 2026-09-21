@@ -1315,7 +1315,14 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
     };
 
     auto expand_active = [&](std::size_t free_connections) {
-      if (active_group == nullptr || active_group->empty()) return;
+      if (active_group == nullptr) return;
+      // Clear an empty group rather than returning on it: leaving it in place
+      // would park this reactor, since no further group is ever dequeued while
+      // active_group stays non-null.
+      if (active_group->empty()) {
+        active_group.reset();
+        return;
+      }
       // Capped at the same ceiling a split physical plan uses.
       if (auto const run = active_group->leading_run(rest_max_segment_bytes); run > 1) {
         if (make_fused_operation(*active_group, run)) {
@@ -1424,6 +1431,9 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
     auto next_fresh = [&](std::size_t free_connections) {
       for (;;) {
+        // The loop only exits through a dequeued request or an empty queue, so a
+        // group that never drains would spin here and keep shutdown from joining.
+        if (stop_token.stop_requested()) return std::unique_ptr<rest_io_op_request>{};
         while (!pending.empty() && !pending.front()->op->coordinator->should_continue()) {
           auto request = std::move(pending.front());
           pending.pop_front();

@@ -361,17 +361,24 @@ class templated_ioctx : public ioctx {
           begin = end;
         }
 
+        // Only non-empty partitions are published. Balancing whole runs can leave a
+        // partition with nothing, since a run goes to a single partition, and a
+        // reactor that dequeues an empty group parks on it forever.
+        std::vector<std::size_t> targets;
+        targets.reserve(partition_count);
         std::vector<std::unique_ptr<grouped_io_request>> requests;
         requests.reserve(partition_count);
         for (std::size_t i = 0; i < partition_count; ++i) {
+          if (partitions[i].empty()) continue;
+          targets.push_back(i);
           requests.push_back(
             grouped_io_request::create(owner, std::move(partitions[i]), coordinator));
         }
 
         // enqueue is noexcept by reactor contract, so once publication starts
         // ownership cannot be stranded between reactors.
-        for (std::size_t i = 0; i < partition_count; ++i) {
-          reactors[i]->enqueue(std::move(requests[i]));
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+          reactors[targets[i]]->enqueue(std::move(requests[i]));
         }
         return future;
       } catch (...) {
