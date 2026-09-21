@@ -198,6 +198,12 @@ class task_creator {
   /// \brief Overload for callers that already know the query; avoids re-deriving it.
   void schedule(op::sirius_physical_operator* request, sirius::query_id_t query_id);
 
+  //! Whether scans after the first may be started by one-task lookahead requests.
+  [[nodiscard]] bool is_lookahead_enabled() const noexcept
+  {
+    return _config.strategy == request_type::lookahead;
+  }
+
   /// \brief Warm up one not-yet-activated scan of the oldest live query.
   /// No-op when no query is registered.
   void schedule_lookahead(std::optional<int> device_id_hint = std::nullopt);

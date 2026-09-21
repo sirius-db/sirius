@@ -432,6 +432,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_order.cpp
     src/op/sirius_physical_partition.cpp
     src/op/sirius_physical_partition_consumer_operator.cpp
+    src/op/sirius_physical_passthrough_sink.cpp
     src/op/sirius_physical_projection.cpp
     src/op/sirius_physical_result_collector.cpp
     src/op/sirius_physical_sort_partition.cpp
@@ -439,6 +440,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_table_scan.cpp
     src/op/sirius_physical_top_n.cpp
     src/op/sirius_physical_ungrouped_aggregate.cpp
+    src/op/sirius_physical_union.cpp
     src/parallel/task_executor.cpp
     src/pipeline/gpu_pipeline_executor.cpp
     src/pipeline/gpu_pipeline_task.cpp
@@ -477,6 +479,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
     src/planner/sirius_plan_recursive_cte.cpp
+    src/planner/sirius_plan_set_operation.cpp
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
@@ -907,6 +910,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_gpu_execution_unique_join.cpp
+    test/cpp/integration/test_gpu_execution_union_all.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -951,10 +955,13 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/scan_manager/test_pin_registry_epoch_mutations.cpp
     test/cpp/scan_manager/test_pinned_entry_column_lookup.cpp
+    test/cpp/scan_manager/test_split_connector.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
     test/cpp/operator/test_physical_order_mgpu.cpp
     test/cpp/operator/test_task_scheduler_routing.cpp
+    test/cpp/operator/test_physical_union.cpp
+    test/cpp/operator/test_physical_union_mgpu.cpp
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
@@ -1029,6 +1036,7 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_index_keys.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
+    test/cpp/pipeline/test_union_build_pipelines.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
