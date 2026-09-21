@@ -106,7 +106,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_i
 }
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::execute(
-  const operator_data& input, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input, ::cuda::stream_ref /*stream*/)
 {
   const auto& pod = dynamic_cast<const pipelineable_operator_data&>(input);
   return std::make_unique<pipelineable_operator_data>(pod.get_data_batches());

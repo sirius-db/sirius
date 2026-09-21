@@ -107,21 +107,21 @@ void owning_table_view::select_columns(std::span<const std::size_t> positions) c
   std::get<std::unique_ptr<detail::my_view>>(_state)->select_columns(positions);
 }
 
-void owning_table_view::record_reader_event(rmm::cuda_stream_view stream) const
+void owning_table_view::record_reader_event(::cuda::stream_ref stream) const
 {
   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
     (*view)->record_reader_event(stream);
   }
 }
 
-void owning_table_view::materialize(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+void owning_table_view::materialize(::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
 {
   if (auto* view = std::get_if<std::unique_ptr<detail::my_view>>(&_state)) {
     _state = (*view)->materialize(stream, mr);
   }
 }
 
-std::unique_ptr<cudf::table> owning_table_view::release(rmm::cuda_stream_view stream,
+std::unique_ptr<cudf::table> owning_table_view::release(::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   materialize(stream, mr);

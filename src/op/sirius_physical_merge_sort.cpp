@@ -77,7 +77,7 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_d
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
-                                                                   rmm::cuda_stream_view stream)
+                                                                   ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_merge_sort::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
@@ -112,8 +112,8 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
   if (input_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     if (_final_projections.empty()) {
-      auto ro_vec = input.get_read_only_batches();
-      outputs.push_back(cucascade::data_batch::to_idle(std::move(ro_vec[0])));
+      // Forward the owned input batch (idle at park); no read lock carried.
+      outputs.push_back(input.get_data_batches()[0]);
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }

@@ -1250,7 +1250,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       // Create a dedicated CUDA stream for this thread
       cudaStream_t raw_stream;
       cudaStreamCreate(&raw_stream);
-      rmm::cuda_stream_view stream(raw_stream);
+      ::cuda::stream_ref stream(raw_stream);
 
       auto outputs =
         concat_op.execute(partitioned_operator_data(thread_inputs[thread_id], 0), default_stream());

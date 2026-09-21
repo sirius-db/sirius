@@ -46,21 +46,21 @@ LD_PRELOAD=/path/to/libstream_check.so your_application [args...]
 int main() {
     // This works fine - returns rmm default stream (no logging)
     auto stream1 = cudf::get_default_stream();
-    std::cout << "Got default stream (normal): " << stream1.value() << std::endl;
+    std::cout << "Got default stream (normal): " << stream1.get() << std::endl;
 
     // Enable logging
     enable_log_on_default_stream();
 
     // This will be logged to default_stream_traces.log
     auto stream2 = cudf::get_default_stream();
-    std::cout << "Got default stream (logged): " << stream2.value() << std::endl;
+    std::cout << "Got default stream (logged): " << stream2.get() << std::endl;
 
     // Disable logging
     disable_log_on_default_stream();
 
     // This works again without logging
     auto stream3 = cudf::get_default_stream();
-    std::cout << "Got default stream (normal): " << stream3.value() << std::endl;
+    std::cout << "Got default stream (normal): " << stream3.get() << std::endl;
 
     return 0;
 }
@@ -85,7 +85,7 @@ int main() {
 │  │   if (g_throw_on_default_stream) {        │  │
 │  │     throw runtime_error(...);             │  │
 │  │   }                                        │  │
-│  │   return rmm::cuda_stream_view{};         │  │
+│  │   return ::cuda::stream_ref{cudaStream_t{}};│  │
 │  │ }                                          │  │
 │  └───────────────────────────────────────────┘  │
 │                                                  │

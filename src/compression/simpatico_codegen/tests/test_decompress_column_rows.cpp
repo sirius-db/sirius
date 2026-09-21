@@ -44,7 +44,7 @@ struct device_row_set {
 
   device_row_set(std::vector<std::int64_t> const& rows,
                  std::int64_t num_rows,
-                 rmm::cuda_stream_view stream)
+                 ::cuda::stream_ref stream)
   {
     std::vector<std::uint32_t> chunks, offsets{0};
     std::vector<std::uint16_t> positions;
@@ -62,14 +62,14 @@ struct device_row_set {
     auto upload   = [&](void const* src, std::size_t bytes) {
       rmm::device_buffer buf(bytes, stream, mr);
       if (bytes != 0) {
-        cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value());
+        cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.get());
       }
       return buf;
     };
     chunk_ids     = upload(chunks.data(), chunks.size() * sizeof(std::uint32_t));
     block_offsets = upload(offsets.data(), offsets.size() * sizeof(std::uint32_t));
     in_chunk_rows = upload(positions.data(), positions.size() * sizeof(std::uint16_t));
-    cudaStreamSynchronize(stream.value());
+    cudaStreamSynchronize(stream.get());
 
     view.chunk_ids     = static_cast<std::uint32_t const*>(chunk_ids.data());
     view.block_offsets = static_cast<std::uint32_t const*>(block_offsets.data());
@@ -80,7 +80,7 @@ struct device_row_set {
   }
 };
 
-std::vector<std::int32_t> read_int32(cudf::column_view const& col, rmm::cuda_stream_view stream)
+std::vector<std::int32_t> read_int32(cudf::column_view const& col, ::cuda::stream_ref stream)
 {
   std::vector<std::int32_t> host(static_cast<std::size_t>(col.size()));
   if (!host.empty()) {
@@ -88,8 +88,8 @@ std::vector<std::int32_t> read_int32(cudf::column_view const& col, rmm::cuda_str
                     col.data<std::int32_t>(),
                     host.size() * sizeof(std::int32_t),
                     cudaMemcpyDeviceToHost,
-                    stream.value());
-    cudaStreamSynchronize(stream.value());
+                    stream.get());
+    cudaStreamSynchronize(stream.get());
   }
   return host;
 }

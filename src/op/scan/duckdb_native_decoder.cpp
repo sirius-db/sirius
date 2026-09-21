@@ -39,9 +39,10 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <cuda/stream>
 
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
@@ -684,7 +685,7 @@ using multiple_blocks_allocation =
 void batched_h2d(std::vector<void*> const& dst,
                  std::vector<void const*> const& src,
                  std::vector<std::size_t> const& size,
-                 rmm::cuda_stream_view stream)
+                 ::cuda::stream_ref stream)
 {
   if (dst.empty()) { return; }
 #if CUDART_VERSION >= 12080
@@ -706,14 +707,14 @@ void batched_h2d(std::vector<void*> const& dst,
                                     &attrs_idx,
                                     1,
                                     &fail_idx,
-                                    stream.value()));
+                                    stream.get()));
 #else
   RMM_CUDA_TRY(cudaMemcpyBatchAsync(
-    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.value()));
+    dst.data(), src.data(), size.data(), dst.size(), &attrs, &attrs_idx, 1, stream.get()));
 #endif
 #else
   for (std::size_t i = 0; i < dst.size(); ++i) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.value()));
+    RMM_CUDA_TRY(cudaMemcpyAsync(dst[i], src[i], size[i], cudaMemcpyHostToDevice, stream.get()));
   }
 #endif
 }
@@ -724,7 +725,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
                       cucascade::memory::memory_reservation_manager& host_mem_mgr,
                       int host_numa_node,
                       std::size_t coalesce_max_gap,
-                      rmm::cuda_stream_view stream)
+                      ::cuda::stream_ref stream)
 {
   namespace ccm = cucascade::memory;
 
@@ -827,7 +828,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   {
     nvtx_scoped_range nvtx_reads{"native_reads"};
     auto io_ctx           = datasource.io_ctx();
-    auto fut              = io_ctx->host_read_ranges_async_io(datasource.io_object(), ranges);
+    auto fut              = io_ctx->host_read_ranges_async_io(datasource.get_io_object(), ranges);
     std::size_t const got = std::move(fut).get();
     if (got != total_read) {
       throw std::runtime_error(std::string(kTag) + " short coalesced host read: got " +
@@ -839,7 +840,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
   // overwrite hazard since each segment owns a disjoint device range.
   for (auto const& h : s.host_copies) {
     RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.get()));
   }
 
   // Per-segment H2D: host (packed) -> device (16B-aligned), batched. Sync before
@@ -859,7 +860,7 @@ void submit_and_await(rmm::device_buffer& device_buf,
       h2d_size.push_back(c.size);
     }
     batched_h2d(h2d_dst, h2d_src, h2d_size, stream);
-    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
   }
 }
 
@@ -868,14 +869,14 @@ void submit_and_await(rmm::device_buffer& device_buf,
 /// source buffers' owners, same as submit_and_await.
 void submit_host_only_and_await(rmm::device_buffer& device_buf,
                                 staging_state const& s,
-                                rmm::cuda_stream_view stream)
+                                ::cuda::stream_ref stream)
 {
   auto* device_base = static_cast<uint8_t*>(device_buf.data());
   for (auto const& h : s.host_copies) {
     RMM_CUDA_TRY(cudaMemcpyAsync(
-      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.value()));
+      device_base + h.device_offset, h.src_ptr, h.size, cudaMemcpyHostToDevice, stream.get()));
   }
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -933,7 +934,7 @@ void fill_string_runs(std::vector<staged_segment> const& staged,
 std::unique_ptr<cudf::column> build_rowid_column(
   std::vector<duckdb_row_group_metadata> const& row_groups,
   cudf::size_type total_rows,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   std::vector<std::unique_ptr<cudf::column>> per_rg;
@@ -995,7 +996,7 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   duckdb_native_ingestible_table_info const& table_info,
   sirius::io::sirius_datasource* datasource,
   cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (row_groups.empty()) {
     // Preserve the projected schema so an empty or fully pruned split follows

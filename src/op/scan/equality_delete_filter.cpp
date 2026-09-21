@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <cudf/stream_compaction.hpp>
+#include <cudf/cudf_utils.hpp>
 #include <cudf/table/table.hpp>
 
 #include <log/logging.hpp>
@@ -39,7 +39,7 @@ equality_delete_filter::equality_delete_filter(std::shared_ptr<const IcebergDele
 
 std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf::table> tbl,
                                                            batch_layout layout,
-                                                           rmm::cuda_stream_view stream,
+                                                           ::cuda::stream_ref stream,
                                                            rmm::device_async_resource_ref mr)
 {
   auto const n_rows = tbl->num_rows();
@@ -103,7 +103,7 @@ std::unique_ptr<cudf::table> equality_delete_filter::apply(std::unique_ptr<cudf:
 
   auto bool_col = make_anti_join_mask(*build_indices, n_rows, stream, mr);
 
-  return cudf::apply_boolean_mask(tbl->view(), bool_col->view(), stream, mr);
+  return sirius::ApplyRetentionMask(tbl->view(), bool_col->view(), stream, mr);
 }
 
 }  // namespace sirius::op::scan

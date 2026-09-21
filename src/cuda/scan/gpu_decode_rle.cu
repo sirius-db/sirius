@@ -489,7 +489,7 @@ void decode_rle_data(gpu_codec_run const& run,
                      uint8_t* d_output,
                      cudf::data_type /*type*/,
                      uint32_t type_size,
-                     rmm::cuda_stream_view stream,
+                     ::cuda::stream_ref stream,
                      rmm::device_async_resource_ref mr)
 {
   if (type_size != 1 && type_size != 2 && type_size != 4 && type_size != 8) {
@@ -524,11 +524,11 @@ void decode_rle_data(gpu_codec_run const& run,
                                h_build_descs.data(),
                                num_live_segments * sizeof(rle_segment_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   //===----------Pass 1: Build----------===//
   kernel_build_rle<RLE_BLOCK_DIM, BUILD_VALUES_PER_THREAD, RLE_BUILD_MAX_ENTRIES>
-    <<<static_cast<uint32_t>(num_live_segments), RLE_BLOCK_DIM, 0, stream.value()>>>(
+    <<<static_cast<uint32_t>(num_live_segments), RLE_BLOCK_DIM, 0, stream.get()>>>(
       d_build_descs.data(),
       static_cast<uint32_t>(num_live_segments),
       d_segment_prefix_sums.data(),
@@ -567,36 +567,36 @@ void decode_rle_data(gpu_codec_run const& run,
                                h_expand_descs.data(),
                                h_expand_descs.size() * sizeof(rle_chunk_desc),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   auto const n_ctas = static_cast<uint32_t>(h_expand_descs.size());
 
   //===----------Pass 2: Expand----------===//
   switch (type_size) {
     case 1:
-      kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(
+      kernel_expand_rle<VALUES_PER_THREAD, uint8_t><<<n_ctas, RLE_BLOCK_DIM, 0, stream.get()>>>(
         d_expand_descs.data(), n_ctas, d_entry_counts.data(), d_output);
       break;
     case 2:
       kernel_expand_rle<VALUES_PER_THREAD, uint16_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint16_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.get()>>>(d_expand_descs.data(),
+                                                     n_ctas,
+                                                     d_entry_counts.data(),
+                                                     reinterpret_cast<uint16_t*>(d_output));
       break;
     case 4:
       kernel_expand_rle<VALUES_PER_THREAD, uint32_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint32_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.get()>>>(d_expand_descs.data(),
+                                                     n_ctas,
+                                                     d_entry_counts.data(),
+                                                     reinterpret_cast<uint32_t*>(d_output));
       break;
     case 8:
       kernel_expand_rle<VALUES_PER_THREAD, uint64_t>
-        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.value()>>>(d_expand_descs.data(),
-                                                       n_ctas,
-                                                       d_entry_counts.data(),
-                                                       reinterpret_cast<uint64_t*>(d_output));
+        <<<n_ctas, RLE_BLOCK_DIM, 0, stream.get()>>>(d_expand_descs.data(),
+                                                     n_ctas,
+                                                     d_entry_counts.data(),
+                                                     reinterpret_cast<uint64_t*>(d_output));
       break;
     default:
       // Unreachable — guarded by the type_size check at function entry.

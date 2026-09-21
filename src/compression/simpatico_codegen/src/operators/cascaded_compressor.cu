@@ -24,10 +24,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/mr/per_device_resource.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <nvcomp/cascaded.h>
@@ -142,7 +142,7 @@ bool parse_nvcomp_cascaded_suffix(std::string_view suffix, int* deltas, int* rle
 }
 
 std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
-  rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr) const
+  ::cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
   if (num_rows == 0 || payload_data() == nullptr || payload_size() == 0) {
     return cudf::make_fixed_width_column(
@@ -161,7 +161,7 @@ std::unique_ptr<cudf::column> cascaded_compressed_representation::decompress(
 
 std::unique_ptr<compressed_representation> cascaded_compressor::compress(
   cudf::column_view column_to_compress,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
 {
   auto const dt = column_to_compress.type();

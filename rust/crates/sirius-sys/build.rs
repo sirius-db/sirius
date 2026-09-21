@@ -2,7 +2,7 @@
 //!
 //! Two jobs:
 //!  1. Compile the cxx bridge glue against Sirius's lightweight public FFI header
-//!     (`src/include/sirius_ffi.h`) — no internal Sirius headers are needed, so
+//!     (`include/sirius/ffi.hpp`) — no internal Sirius headers are needed, so
 //!     this is the only include directory.
 //!  2. Link the single Sirius artifact that exports the FFI symbols (no
 //!     hand-maintained transitive dependency list). `cargo:rustc-link-{lib,search}`
@@ -31,12 +31,12 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| repo.join("build/release"));
     let static_link = std::env::var_os("CARGO_FEATURE_STATIC").is_some();
-    let ffi_header = repo.join("src/include/sirius_ffi.hpp");
+    let ffi_header = repo.join("include/sirius/ffi.hpp");
 
     // 1. Compile the cxx glue against the public FFI header only.
     cxx_build::bridge("src/lib.rs")
         .std("c++20")
-        .include(repo.join("src/include"))
+        .include(repo.join("include"))
         .compile("sirius_sys");
 
     // 2. Link the single Sirius artifact.

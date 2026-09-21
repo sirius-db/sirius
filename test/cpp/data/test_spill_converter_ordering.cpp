@@ -24,9 +24,9 @@
 #include <cudf/types.hpp>
 
 #include <rmm/cuda_stream.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime_api.h>
 
 #include <cucascade/data/data_batch.hpp>
@@ -112,9 +112,9 @@ class registered_host_memory {
  public:
   registered_host_memory(void* data,
                          std::size_t bytes,
-                         rmm::cuda_stream_view stream,
+                         ::cuda::stream_ref stream,
                          delay_state& gate)
-    : _data(data), _stream(stream.value()), _gate(&gate)
+    : _data(data), _stream(stream.get()), _gate(&gate)
   {
     throw_if_cuda_error(cudaHostRegister(_data, bytes, 0), "cudaHostRegister");
     _registered = true;
@@ -172,7 +172,7 @@ class gated_thread {
 };
 
 /// Build a one-column INT32 batch on `stream`, filled with `value`, and settle it.
-std::unique_ptr<cudf::column> make_settled_column(std::int32_t value, rmm::cuda_stream_view stream)
+std::unique_ptr<cudf::column> make_settled_column(std::int32_t value, ::cuda::stream_ref stream)
 {
   auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                        static_cast<cudf::size_type>(kRows),
@@ -183,13 +183,13 @@ std::unique_ptr<cudf::column> make_settled_column(std::int32_t value, rmm::cuda_
                           fill.data(),
                           kRows * sizeof(std::int32_t),
                           cudaMemcpyHostToDevice,
-                          stream.value()) == cudaSuccess);
-  REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
+                          stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   return col;
 }
 
 std::shared_ptr<cucascade::data_batch> wrap_batch(std::unique_ptr<cudf::column> col,
-                                                  rmm::cuda_stream_view writer_stream)
+                                                  ::cuda::stream_ref writer_stream)
 {
   std::vector<std::unique_ptr<cudf::column>> cols;
   cols.push_back(std::move(col));
@@ -200,23 +200,24 @@ std::shared_ptr<cucascade::data_batch> wrap_batch(std::unique_ptr<cudf::column> 
 }
 
 /// Bring a (possibly spilled) batch back to the GPU and return column 0's bytes.
-std::vector<std::int32_t> read_back(cucascade::data_batch& batch, rmm::cuda_stream_view stream)
+std::vector<std::int32_t> read_back(cucascade::data_batch& batch, ::cuda::stream_ref stream)
 {
-  auto ro = batch.to_read_only();
-  if (ro.get_memory_space()->get_tier() != cucascade::memory::Tier::GPU) {
-    auto mut = cucascade::data_batch::readonly_to_mutable(std::move(ro));
-    mut.convert_to<cucascade::gpu_table_representation>(
-      sirius::converter_registry::get(), env().gpu_space, ::cuda::stream_ref{stream.value()});
-    ro = cucascade::data_batch::mutable_to_readonly(std::move(mut));
+  {
+    auto mut = batch.to_mutable();
+    if (mut.get_memory_space()->get_tier() != cucascade::memory::Tier::GPU) {
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), env().gpu_space, stream);
+    }
   }
+  auto ro   = batch.to_read_only();
   auto view = ro.get_data()->cast<cucascade::gpu_table_representation>().get_table_view();
   std::vector<std::int32_t> out(static_cast<std::size_t>(view.column(0).size()));
   REQUIRE(cudaMemcpyAsync(out.data(),
                           view.column(0).head<std::int32_t>(),
                           out.size() * sizeof(std::int32_t),
                           cudaMemcpyDeviceToHost,
-                          stream.value()) == cudaSuccess);
-  REQUIRE(cudaStreamSynchronize(stream.value()) == cudaSuccess);
+                          stream.get()) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
   return out;
 }
 

@@ -29,7 +29,7 @@ Each tier has configurable thresholds:
 
 ## cuCascade Integration
 
-**File:** `src/include/memory/sirius_memory_reservation_manager.hpp`
+**File:** `src/memory/sirius_memory_reservation_manager.hpp`
 
 `sirius_memory_reservation_manager` inherits from `cucascade::memory::memory_reservation_manager`. It:
 
@@ -86,11 +86,11 @@ Wraps RMM device memory resource. On each allocation:
 
 ### Caller reservations for HOST conversions
 
-Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/include/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
+Conversions that land data on the HOST tier draw down a caller-owned reservation instead of double-committing host capacity: the caller obtains a reservation with `make_reservation_or_null(size)` and passes it to the reservation-taking `convert_to`/`clone_to` overloads, so the converter's allocation is charged against capacity the caller already holds. If the reservation cannot be made, the call falls back — with a warning — to the `memory_space*` overload (no reservation; the converter may OOM). Call sites: `lock_or_prepare_batch` in `src/pipeline/batch_lock_utils.hpp` and the materialized result collector (`src/op/sirius_physical_result_collector.cpp`). The `memory_space*` overloads remain the path for GPU/DISK targets and viability probes.
 
 ## Downgrade Executor
 
-**File:** `src/include/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`
+**File:** `src/downgrade/downgrade_executor.hpp`, `src/downgrade/downgrade_executor.cpp`
 
 One `downgrade_executor` per memory space monitors pressure and moves data to lower tiers.
 
@@ -126,7 +126,7 @@ The downgrade executor uses a request-based model with tiered candidate fetching
 
 ### Spill Copy Granularity
 
-**Files:** `src/include/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/include/data/chunked_spill_copy.hpp`
+**Files:** `src/data/spill_chunked_converters.hpp`, `src/data/spill_chunked_converters.cpp`, `src/data/chunked_spill_copy.hpp`
 
 The builtin cucascade fast converter submits an entire batch's GPU→HOST copies as one monolithic batched call followed by one blocking synchronize (18–28 GB single submissions observed on q9-class partition spills). At context initialization Sirius replaces it with a chunked converter (`executor.downgrade.copy_chunk_bytes`, default 1 GiB; 0 keeps the builtin) that produces a byte-identical `host_data_representation` but flushes copies every ~chunk while the column tree is still being walked — overlapping each chunk's DMA with the next chunk's prep — and wraps each conversion in an NVTX range. The HOST→GPU restore direction deliberately stays on the builtin converter (it runs on instrumented pipeline threads and reconstructs from the self-describing `column_metadata`).
 
@@ -141,7 +141,7 @@ Candidates are converted individually via `convertible_data::convert()`, which h
 
 ## Memory Consumption History
 
-**File:** `src/include/pipeline/pipeline_memory_history.hpp`
+**File:** `src/pipeline/pipeline_memory_history.hpp`
 
 Each GPU pipeline maintains a `pipeline_memory_history` — a thread-safe ring buffer of up to 64 `task_memory_record` entries, each recording:
 - `estimated_bytes` — pre-execution estimation basis (input data size)
@@ -165,7 +165,7 @@ A cached scan input (a resident `scan_operator_input`) is sized by a dedicated b
 
 ## Memory Pool Defragmentation
 
-**File:** `src/include/memory/defragmenter_oom_policy.hpp`, `src/memory/defragmenter_oom_policy.cpp`
+**File:** `src/memory/defragmenter_oom_policy.hpp`, `src/memory/defragmenter_oom_policy.cpp`
 
 `defragmenter_oom_policy` implements `cucascade::memory::oom_handling_policy`:
 
@@ -178,7 +178,7 @@ On allocation failure:
 
 ## Pinned Host Memory
 
-**File:** referenced in `src/include/sirius_context.hpp`
+**File:** referenced in `src/sirius_context.hpp`
 
 `small_pinned_host_memory_resource` provides fast host memory allocation:
 
@@ -223,9 +223,9 @@ SF1-sized pressure config.
 
 | File | Purpose |
 |------|---------|
-| `src/include/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
-| `src/include/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
+| `src/memory/sirius_memory_reservation_manager.hpp` | Memory manager, tier configuration |
+| `src/downgrade/downgrade_executor.hpp` | Downgrade executor interface |
 | `src/downgrade/downgrade_executor.cpp` | Processing loop, tiered candidate fetching |
-| `src/include/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
+| `src/memory/defragmenter_oom_policy.hpp` | Pool defragmentation policy |
 | `src/memory/defragmenter_oom_policy.cpp` | Fragmentation detection and trimming |
-| `src/include/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |
+| `src/pipeline/pipeline_memory_history.hpp` | Per-pipeline memory consumption history |
