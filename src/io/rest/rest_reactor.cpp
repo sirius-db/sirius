@@ -421,6 +421,12 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
     throw std::runtime_error("rest_reactor: fragmented read requires a cache block size");
   }
 
+  // A cache fill is completed atomically at chunk granularity: the completion
+  // callback publishes the whole chunk after its physical operation succeeds.
+  // Keep the normal 16 MiB REST target, but allow one indivisible fill to grow
+  // to the configured cache block size.
+  auto const max_segment_bytes = std::max(rest_max_segment_bytes, cache_block_size);
+
   std::vector<range> result;
   range current{};
   for (auto* chunk : slice.h_buffer.fragments()) {
@@ -431,17 +437,16 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
       cache::fill_span(chunk->state.get_fill(), chunk->offset, cache_block_size);
     auto const fill = range{fill_lo, fill_hi - fill_lo};
     if (fill.empty()) continue;
-    if (fill.size > rest_max_segment_bytes) {
+    if (fill.size > max_segment_bytes) {
       throw std::runtime_error("rest_reactor: one cache fill exceeds the REST segment maximum");
     }
 
     bool const contiguous = !current.empty() && current.end() == fill.offset;
-    bool const fits =
-      current.size <= rest_max_segment_bytes - std::min(fill.size, rest_max_segment_bytes);
+    bool const fits = current.size <= max_segment_bytes - std::min(fill.size, max_segment_bytes);
     if (current.empty()) {
       current = fill;
     } else if (contiguous && current.size < target && fits &&
-               current.size + fill.size <= rest_max_segment_bytes) {
+               current.size + fill.size <= max_segment_bytes) {
       current.size += fill.size;
     } else {
       result.push_back(current);
