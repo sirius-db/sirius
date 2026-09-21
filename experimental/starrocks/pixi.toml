@@ -48,8 +48,6 @@ mysql-client = "*"
 client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (run `cluster` in another terminal first)"}
 
 [feature.cn.dependencies]
-# Provides protoc for prost-build in the Substrait crates on fresh CN envs.
-libprotobuf = ">=7.35,<8"
 rust = "*"
 thrift-compiler = "*"
 

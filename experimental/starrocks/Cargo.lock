@@ -1924,6 +1924,7 @@ dependencies = [
  "proc-macro2",
  "prost",
  "prost-build",
+ "protox",
  "quote",
  "sirius",
  "starrocks-plan-translator",
