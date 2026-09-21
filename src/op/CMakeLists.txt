@@ -33,6 +33,7 @@ target_sources(
           scan/equality_delete_filter.cpp
           scan/iceberg_delete_pipeline.cpp
           scan/iceberg_gpu_ingestible.cpp
+          dynamic_filter/dynamic_filter_key_domain.cpp
           dynamic_filter/dynamic_filter_publish_plan.cpp
           dynamic_filter/dynamic_filter_publisher.cpp
           dynamic_filter/sirius_dynamic_filter.cpp
