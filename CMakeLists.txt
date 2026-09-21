@@ -496,6 +496,7 @@ set(EXTENSION_SOURCES
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
     src/telemetry/batch_telemetry.cpp
+    src/telemetry/data_batch_probe.cpp
     src/telemetry/telemetry_context.cpp
     src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
@@ -1057,6 +1058,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
+    test/cpp/telemetry/test_runtime_fsm_handle.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/vss/test_brute_force_search.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp

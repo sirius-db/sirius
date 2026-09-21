@@ -45,8 +45,10 @@
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace sirius {
 
@@ -106,6 +108,19 @@ std::shared_ptr<const telemetry::telemetry_context> get_telemetry_context_from_c
   return sirius_ctx->get_telemetry_context();
 }
 
+void log_query_telemetry_finalization_failure(sirius::query_id_t query_id,
+                                              const char* error) noexcept
+{
+  try {
+    if (error != nullptr) {
+      SIRIUS_LOG_WARN("Failed to finalize telemetry for query {}: {}", query_id, error);
+    } else {
+      SIRIUS_LOG_WARN("Failed to finalize telemetry for query {}: unknown exception", query_id);
+    }
+  } catch (...) {
+  }
+}
+
 }  // namespace
 
 sirius_engine::sirius_engine(duckdb::ClientContext& context,
@@ -115,16 +130,53 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
     sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
-    query_handle_(quent::query::create(
-      telemetry_context_->context(),
-      quent::query::Init{
-        .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
-        .query_group_id = telemetry_context_->query_group_id_for(sirius_iface.session_label),
-      }))
+    query_state_(telemetry_context_->context().query_observer()->handle().init(quent::query::Init{
+      .instance_name  = sirius_iface.query_label.value_or("unnamed_query"),
+      .query_group_id = quent::query_group::QueryGroupId(
+        telemetry_context_->query_group_id_for(sirius_iface.session_label)),
+    }))
 {
 }
 
-sirius_engine::~sirius_engine() { query_handle_->exit(); }
+sirius_engine::~sirius_engine() noexcept
+{
+  try {
+    telemetry_exit();
+  } catch (const std::exception& error) {
+    log_query_telemetry_finalization_failure(query_id_, error.what());
+  } catch (...) {
+    log_query_telemetry_finalization_failure(query_id_, nullptr);
+  }
+}
+
+void sirius_engine::telemetry_planning()
+{
+  if (!query_state_.transition<quent::query_state::Init>(
+        [](auto&& current) { return std::move(current).planning(); })) {
+    throw std::logic_error("invalid Quent Query transition to planning");
+  }
+}
+
+void sirius_engine::telemetry_executing()
+{
+  if (!query_state_.transition<quent::query_state::Planning>(
+        [](auto&& current) { return std::move(current).executing(); })) {
+    throw std::logic_error("invalid Quent Query transition to executing");
+  }
+}
+
+void sirius_engine::telemetry_exit()
+{
+  if (query_state_.holds<quent::query_state::Exit>()) { return; }
+  if (!query_state_.transition<quent::query_state::Init,
+                               quent::query_state::Planning,
+                               quent::query_state::Executing>(
+        [](auto&& current) { return std::move(current).exit(); })) {
+    throw std::logic_error("invalid Quent Query transition to exit");
+  }
+}
+
+quent::Uuid sirius_engine::telemetry_query_id() const { return query_state_.uuid(); }
 
 void sirius_engine::reset()
 {
@@ -164,16 +216,16 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
 void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> plan)
 {
   SIRIUS_LOG_DEBUG("Initializing sirius_engine");
-  query_handle_->planning();
+  telemetry_planning();
   reset();
   sirius_owned_plan = std::move(plan);
-  initialize_internal(*sirius_owned_plan);
+  initialize_plan(*sirius_owned_plan);
 }
 
 void sirius_engine::execute()
 {
   nvtx_scoped_range nvtx_range{"sirius::query"};
-  query_handle_->executing();
+  telemetry_executing();
 
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
@@ -183,7 +235,7 @@ void sirius_engine::execute()
   // Quent mints its own UUID for the query and its Init struct takes no caller-supplied id, so
   // telemetry stays UUID-native while the engine uses the numeric window id. Emit the mapping
   // once so log lines (keyed by query id) and telemetry (keyed by UUID) can be joined.
-  auto const telemetry_uuid = query_handle_->uuid();
+  auto const telemetry_uuid = telemetry_query_id();
   SIRIUS_LOG_INFO("query {} telemetry_query={:016x}{:016x}",
                   query_id_,
                   telemetry_uuid.high_bits,
@@ -238,6 +290,13 @@ void sirius_engine::execute()
 }
 
 void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
+{
+  // Borrowed plans do not pass through initialize().
+  telemetry_planning();
+  initialize_plan(plan);
+}
+
+void sirius_engine::initialize_plan(op::sirius_physical_operator& plan)
 {
   auto sirius_ctx_ptr = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_ctx_ptr) {

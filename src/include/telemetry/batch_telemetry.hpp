@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "query_id.hpp"
+#include "telemetry-bridge/gen/quent.hpp"
 
 #include <cucascade/memory/common.hpp>
 
@@ -93,8 +94,9 @@ class batch_telemetry_registry {
 
   /// Associate a consumer port's data repository with its pipeline and port.
   void register_consumer_port(const cucascade::shared_data_repository* repo,
-                              uuid::UUID pipeline_uuid,
-                              uuid::UUID port_uuid);
+                              sirius::query_id_t query_id,
+                              quent::Uuid pipeline_uuid,
+                              quent::Uuid port_uuid);
 
   /// A producer published `batch` into `repo`: registered -> queued. Call
   /// before the batch is added to the repository.
@@ -105,18 +107,19 @@ class batch_telemetry_registry {
   /// A task claimed `batch` as input: queued -> packaged (re-claims re-emit
   /// packaged; unseen batches are lazily registered).
   void on_packaged(const std::shared_ptr<cucascade::data_batch>& batch,
-                   uuid::UUID consumer_pipeline_uuid,
-                   uuid::UUID task_uuid);
+                   sirius::query_id_t query_id,
+                   quent::Uuid consumer_pipeline_uuid,
+                   quent::Uuid task_uuid);
 
   /// The claiming task started computing: packaged -> processing.
-  void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, uuid::UUID task_uuid);
+  void on_processing(const std::shared_ptr<cucascade::data_batch>& batch, quent::Uuid task_uuid);
 
   /// on_processing for batches already released by prepare, using the last
   /// recorded tier/bytes.
-  void on_processing_by_id(uint64_t batch_id, uuid::UUID task_uuid);
+  void on_processing_by_id(uint64_t batch_id, quent::Uuid task_uuid);
 
-  /// The claiming task is done with the batch: -> consumed + exit.
-  void on_consumed(uint64_t batch_id, uuid::UUID task_uuid);
+  /// The claiming task is done with the batch: -> consumed.
+  void on_consumed(uint64_t batch_id, quent::Uuid task_uuid);
 
   /// The batch's data moved to another tier: re-emit every live placement's
   /// state with the new tier usage. Callers may hold the batch's lock.
@@ -125,11 +128,11 @@ class batch_telemetry_registry {
                       int32_t device_id,
                       uint64_t bytes);
 
-  /// Drain all remaining placements and clear the consumer-port mappings.
-  void on_query_end();
+  /// Drain the query's remaining placements and clear its consumer-port mappings.
+  void on_query_end(sirius::query_id_t query_id);
 
   /// The MemoryTier resource for (tier, device); nil when not installed.
-  [[nodiscard]] uuid::UUID tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;
+  [[nodiscard]] quent::Uuid tier_resource(cucascade::memory::Tier tier, int32_t device_id) const;
 
   batch_telemetry_registry(const batch_telemetry_registry&)            = delete;
   batch_telemetry_registry& operator=(const batch_telemetry_registry&) = delete;

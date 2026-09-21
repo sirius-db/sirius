@@ -104,8 +104,8 @@ task_scheduler::~task_scheduler() { stop(); }
 void task_scheduler::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-    pipeline_task->telemetry_handle().queued({
-      .queue_resource_id      = _task_queue_telemetry->handle->uuid(),
+    pipeline_task->telemetry_queued({
+      .queue_resource_id      = _task_queue_telemetry->handle.id().raw(),
       .queue_capacity_entries = 1,
     });
   }
@@ -357,10 +357,9 @@ void task_scheduler::management_eventloop()
       }
 
       if (auto* pipeline_task = dynamic_cast<sirius_pipeline_itask*>(task.get())) {
-        pipeline_task->telemetry_handle().routing({
-          .instance_name              = "",
+        pipeline_task->telemetry_routing({
           .preferred_device_id        = device_id,
-          .manager_thread_resource_id = manager_thread_telemetry.handle->uuid(),
+          .manager_thread_resource_id = manager_thread_telemetry.handle.id().raw(),
         });
       }
 

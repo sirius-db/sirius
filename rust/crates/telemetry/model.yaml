@@ -1,0 +1,305 @@
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+quent: alpha
+model: Sirius
+doc: Sirius query-engine telemetry model.
+
+records:
+  EngineImplementationAttributes:
+    doc: Details about the Sirius engine implementation.
+    fields:
+      name: { option: string }
+      version: { option: string }
+      custom_attributes: dynamic
+
+  Edge:
+    doc: A directed edge between two operator ports.
+    fields:
+      source: { ref: Port }
+      target: { ref: Port }
+
+  PlanParent:
+    doc: The query owning a plan and its optional predecessor plan.
+    fields:
+      query_id: { scope-ref: Query }
+      plan_id: { option: { ref: Plan } }
+
+entities:
+  Engine:
+    doc: The Sirius engine and root of the resource-group tree.
+    events:
+      init:
+        attributes:
+          implementation: EngineImplementationAttributes
+          instance_name: { option: string }
+      exit: {}
+
+  Worker:
+    doc: A worker executing plans for an engine.
+    events:
+      init:
+        attributes:
+          parent_engine_id: { scope-ref: Engine }
+          instance_name: string
+      exit: {}
+
+  QueryGroup:
+    doc: A group of queries submitted to an engine.
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          engine_id: { scope-ref: Engine }
+
+  Plan:
+    doc: A directed acyclic graph of query operators.
+    events:
+      declaration:
+        attributes:
+          parent: PlanParent
+          instance_name: string
+          edges: { list: Edge }
+          worker_id: { option: { ref: Worker } }
+
+  Operator:
+    doc: A source, sink, or transformation within a plan.
+    events:
+      declaration:
+        attributes:
+          plan_id: { scope-ref: Plan }
+          parent_operator_ids: { list: { ref: Operator } }
+          instance_name: string
+          type_name: string
+          custom_attributes: dynamic
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+  Port:
+    doc: An input or output of an operator.
+    events:
+      declaration:
+        attributes:
+          operator_id: { scope-ref: Operator }
+          instance_name: string
+      statistics:
+        attributes:
+          custom_attributes: dynamic
+
+  GpuDevice:
+    doc: A per-GPU resource group nested under the engine.
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: { scope-ref: Engine }
+          ordinal: u32
+
+  ThreadGroup:
+    doc: A resource group used to organize threads by role and device.
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: ref
+          engine_id: { scope-ref: Engine }
+
+  Memory:
+    doc: A fixed-bounds memory resource.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: { scope-ref: Engine }
+          bounds: { sets-resource-bounds: true }
+
+  Channel:
+    doc: A unidirectional data-transfer resource.
+    resource:
+      bytes: { kind: rate, known-bounds: true }
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: { scope-ref: Engine }
+          source_id: { ref: Memory }
+          target_id: { ref: Memory }
+          bounds: { sets-resource-bounds: true }
+
+  MemoryTier:
+    doc: A memory tier data batches can reside in.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: { scope-ref: Engine }
+          bounds: { sets-resource-bounds: true }
+
+  TaskQueue:
+    doc: A queue that holds tasks awaiting scheduling or execution.
+    resource:
+      entries: { kind: occupancy, known-bounds: true }
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: ref
+          engine_id: { scope-ref: Engine }
+          bounds: { sets-resource-bounds: true }
+
+  TaskManagerLoopThread:
+    doc: A thread coordinating task execution.
+    resource: true
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: ref
+          engine_id: { scope-ref: Engine }
+
+  ExecutorThread:
+    doc: A thread executing tasks.
+    resource: true
+    events:
+      declaration:
+        attributes:
+          instance_name: string
+          parent_group_id: ref
+          engine_id: { scope-ref: Engine }
+
+fsms:
+  Query:
+    doc: A query progressing through planning and execution.
+    states:
+      init:
+        initial: true
+        attributes:
+          instance_name: string
+          query_group_id: { scope-ref: QueryGroup }
+        to: [planning, exit]
+      planning:
+        to: [executing, exit]
+      executing:
+        to: [exit]
+      exit: {}
+
+  Task:
+    doc: A scheduled unit of query-pipeline work.
+    states:
+      created:
+        initial: true
+        attributes:
+          instance_name: string
+          pipeline_uuid: { scope-ref: Operator }
+        to: [queued, finalizing]
+      queued:
+        attributes:
+          queue: { option: { uses: TaskQueue } }
+        to: [routing, reserving, finalizing]
+      routing:
+        attributes:
+          preferred_device_id: i64
+          manager_thread: { option: { uses: TaskManagerLoopThread } }
+        to: [queued, reserving, finalizing]
+      reserving:
+        attributes:
+          requested_bytes: u64
+          input_basis: u64
+          peak_estimate: u64
+          bytes_to_materialize: u64
+          manager_thread: { option: { uses: TaskManagerLoopThread } }
+        to: [downgrading, preparing, finalizing]
+      downgrading:
+        attributes:
+          shortfall_bytes: u64
+          partial_bytes: u64
+          manager_thread: { option: { uses: TaskManagerLoopThread } }
+        to: [preparing, finalizing]
+      preparing:
+        attributes:
+          origin_tier: string
+          target_tier: string
+          input_bytes: u64
+          executor_thread: { option: { uses: ExecutorThread } }
+          reservation: { option: { uses: MemoryTier } }
+        to: [computing, finalizing]
+      computing:
+        attributes:
+          current_operator_id: u32
+          input_bytes: u64
+          peak_allocated_bytes: u64
+          executor_thread: { option: { uses: ExecutorThread } }
+          reservation: { option: { uses: MemoryTier } }
+        to: [computing, finalizing]
+      finalizing:
+        attributes:
+          success: bool
+
+  DataBatch:
+    doc: A physical data batch moving through memory and transfer channels.
+    states:
+      constructed:
+        initial: true
+        attributes:
+          instance_name: string
+          data_batch_id: u64
+          producer_pipeline_uuid: { scope-ref: Operator }
+        to: [stationary]
+      stationary:
+        attributes:
+          memory: { option: { uses: Memory } }
+        to: [stationary, in_transit, destructed]
+      in_transit:
+        attributes:
+          source_memory: { option: { uses: Memory } }
+          dest_memory: { option: { uses: Memory } }
+          channel: { option: { uses: Channel } }
+        to: [stationary]
+      destructed: {}
+
+  BatchPlacement:
+    doc: One physical batch placement for a consuming pipeline input port.
+    states:
+      batch_registered:
+        initial: true
+        attributes:
+          instance_name: string
+          batch_id: u64
+          pipeline_uuid: { scope-ref: Operator }
+          port_uuid: { option: { ref: Port } }
+          origin: string
+          tier: { option: { uses: MemoryTier } }
+        to: [batch_queued, batch_packaged]
+      batch_queued:
+        attributes:
+          tier: { option: { uses: MemoryTier } }
+        to: [batch_queued, batch_packaged, batch_consumed]
+      batch_packaged:
+        attributes:
+          task_uuid: uuid
+          tier: { option: { uses: MemoryTier } }
+        to: [batch_packaged, batch_processing, batch_consumed]
+      batch_processing:
+        attributes:
+          task_uuid: uuid
+          tier: { option: { uses: MemoryTier } }
+        to: [batch_packaged, batch_processing, batch_consumed]
+      batch_consumed:
+        attributes:
+          reason: string

@@ -1,17 +1,21 @@
-use instrumentation_model::{Sirius, SiriusEvent};
+use quent_dynamic_attributes::DynamicValue;
 use quent_events::Event;
 pub use quent_query_engine_analyzer::QueryEngineModel;
 use quent_query_engine_analyzer::entities;
-use quent_query_engine_analyzer::ui::{QuentViewer, UiAnalyzer, ViewerEventStream};
+use quent_query_engine_analyzer::ui::UiAnalyzer;
+#[cfg(not(target_arch = "wasm32"))]
+use quent_query_engine_analyzer::ui::{QuentViewer, ViewerEventStream};
 use quent_query_engine_analyzer::{
     EngineEntity, OperatorEntity, PlanEntity, PortEntity, QueryEntity, QueryGroupEntity,
     WorkerEntity,
 };
 use quent_query_engine_ui::{
-    DataFlowTimelineBinned, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
+    DataFlowTimelineBinned, EntityRef, OperatorFilter, QueryBundle, QueryEntities, QueryFilter,
 };
 use quent_ui::{
-    FiniteStateMachine, ResourceGroupNode, ResourceTree, convert_resource_tree,
+    FiniteStateMachine, Resource as UiResource, ResourceGroup as UiResourceGroup,
+    ResourceGroupNode, ResourceTree, convert_resource_tree,
+    fsm::FsmTypeDeclaration,
     quantity::{CapacityKind, QuantitySpec},
     timeline::{
         categorical::{
@@ -30,19 +34,21 @@ use quent_ui::{
     },
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use sirius_telemetry_store::Sirius;
+use sirius_telemetry_store::{self as schema, SiriusEvent};
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
 use tracing::debug;
 
+#[cfg(not(target_arch = "wasm32"))]
+use quent_analyzer::context::ContextInventory;
 use quent_analyzer::{
-    AnalyzerError, AnalyzerResult, Entity, Model, Span,
-    fsm::{
-        FsmTypeDeclaration, FsmUsages, Transition, collection::FsmCollection,
-        events::TransitionEvent,
-    },
+    AnalyzerError, AnalyzerResult, Entity, Span,
+    fsm::{FsmUsages, Transition, collection::FsmCollection, native::AnalyzedTransition},
+    ref_tree::RefTreeCollection,
     resource::{
-        ResourceGroup, ResourceTypeDecl, Usage, Using, collection::ResourceCollection,
-        tree::ResourceTreeNode,
+        ResourceTypeDecl, Usage, Using, collection::ResourceCollection, tree::ResourceTreeNode,
     },
     timeline::binned::{
         categorical::{CategoricalKey, CategoricalTimelineBuilder},
@@ -52,22 +58,21 @@ use quent_analyzer::{
         },
     },
 };
-use quent_simulator_ui::EntityRef;
+#[cfg(not(target_arch = "wasm32"))]
+use quent_store::event::{EntityEventStore, ModelEventStore, filesystem::Store};
 use quent_time::{SpanNanoSec, TimeNanoSec, TimeUnixNanoSec, Timestamp, to_nanosecs, to_secs};
 use uuid::Uuid;
 
+pub use crate::boilerplate::{
+    BatchPlacement, BatchPlacementExt, DataBatch, DataBatchExt, Task, TaskExt,
+};
 use crate::{
-    batch_placement::{BatchPlacement, BatchPlacementExt},
-    data_batch::{DataBatch, DataBatchExt},
     model::{MEMORY_TIER_TYPE_NAME, SiriusModel, SiriusModelBuilder},
-    task::{Task, TaskExt},
     view::SiriusModelQueryView,
 };
 
-pub mod batch_placement;
-pub mod data_batch;
+mod boilerplate;
 pub mod model;
-pub mod task;
 #[cfg(test)]
 mod tests;
 pub mod view;
@@ -84,6 +89,62 @@ const TASK_WORKING_SPACE_STATE: &str = "task_working_space";
 const MEASURE_COUNT: &str = "count";
 /// Data-flow measure summing batch bytes held in each (state, tier) cell.
 const MEASURE_BYTES: &str = "bytes";
+const QUANTITY_BYTES: &str = "bytes";
+const QUANTITY_SECONDS: &str = "seconds";
+const BYTE_OPERATOR_STATISTICS: &[&str] = &[
+    "average_partition_size_bytes",
+    "avg_key_length_bytes",
+    "bloom_filter_size_bytes",
+    "build_side_bytes",
+    "bytes_read",
+    "bytes_written",
+    "hash_table_size_bytes",
+    "input_bytes",
+    "network_bytes_sent",
+    "output_bytes",
+    "peak_memory_bytes",
+    "per_file_bytes_read",
+    "probe_side_bytes",
+    "spill_bytes",
+];
+const SECOND_OPERATOR_STATISTICS: &[&str] = &[
+    "build_time_ns",
+    "cpu_time_ns",
+    "decompress_time_ns",
+    "flush_time_ns",
+    "hash_time_ns",
+    "io_wait_ns",
+    "merge_time_ns",
+    "network_time_ns",
+    "partition_time_ns",
+    "predicate_filter_time_ns",
+    "probe_time_ns",
+    "serialization_time_ns",
+    "wall_time_ns",
+];
+
+fn operator_statistic_quantity(name: &str) -> Option<&'static str> {
+    BYTE_OPERATOR_STATISTICS
+        .contains(&name)
+        .then_some(QUANTITY_BYTES)
+}
+
+fn scale_operator_statistic(name: &str, value: &Option<DynamicValue>) -> Option<DynamicValue> {
+    if !SECOND_OPERATOR_STATISTICS.contains(&name) {
+        return None;
+    }
+    match value {
+        Some(DynamicValue::U64(nanoseconds)) => {
+            let seconds = *nanoseconds as f64 / 1_000_000_000.0;
+            Some(DynamicValue::F64(seconds))
+        }
+        _ => None,
+    }
+}
+
+fn scaled_operator_statistic_name(name: String) -> String {
+    name.strip_suffix("_ns").unwrap_or(&name).to_owned()
+}
 
 /// Push one entity's per-state tier residency into the data-flow aggregation.
 /// `state_for` labels each transition span (`None` skips it); a tier-change
@@ -92,8 +153,8 @@ fn push_tier_state_spans<'a, T>(
     builder: &mut CategoricalTimelineBuilder<Uuid, &'a str, &'a str, &'a str>,
     tier_names: &HashMap<Uuid, &'a str>,
     operator_id: Uuid,
-    transitions: &'a [TransitionEvent<T>],
-    state_for: impl Fn(&'a TransitionEvent<T>) -> Option<&'a str>,
+    transitions: &'a [AnalyzedTransition<T>],
+    state_for: impl Fn(&'a AnalyzedTransition<T>) -> Option<&'a str>,
     want_count: bool,
     want_bytes: bool,
 ) -> AnalyzerResult<()> {
@@ -106,7 +167,7 @@ fn push_tier_state_spans<'a, T>(
             continue;
         };
         let Some(tier_usage) = from
-            .usages
+            .usages()
             .iter()
             .find(|u| tier_names.contains_key(&u.resource_id))
         else {
@@ -163,18 +224,75 @@ fn memory_tier_rank(name: &str) -> (u8, &str) {
 }
 
 /// `quent-open` viewer entry: renders Sirius events with [`SiriusUiAnalyzer`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Viewer;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl QuentViewer for Viewer {
     type Analyzer = SiriusUiAnalyzer;
 
+    fn context_inventory(dir: &std::path::Path) -> quent_io::ImporterResult<ContextInventory> {
+        let (context_id, root) = context_location(dir)?;
+        let store = Store::<Sirius>::new(root);
+        let engine_ids = store
+            .entity_events::<schema::Engine>(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .map(|event| event.map(|event| event.id))
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+        let worker_analysis_target_ids = store
+            .entity_events::<schema::Worker>(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .filter_map(|event| match event {
+                Ok(Event {
+                    data:
+                        schema::WorkerEvent::Init {
+                            parent_engine_id, ..
+                        },
+                    ..
+                }) => Some(Ok(parent_engine_id.target)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
+
+        Ok(ContextInventory {
+            analysis_target_ids: engine_ids
+                .into_iter()
+                .chain(worker_analysis_target_ids)
+                .collect(),
+        })
+    }
+
     fn import_events(
         dir: &std::path::Path,
-    ) -> quent_model::io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
-        let events =
-            Sirius::import_events(dir)?.collect::<quent_model::io::ImporterResult<Vec<_>>>()?;
+    ) -> quent_io::ImporterResult<ViewerEventStream<Self::Analyzer>> {
+        let (context_id, root) = context_location(dir)?;
+        let events = Store::<Sirius>::new(root)
+            .events(context_id)
+            .map_err(quent_io::ImporterError::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(quent_io::ImporterError::other)?;
         Ok(Box::new(events.into_iter()))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn context_location(dir: &std::path::Path) -> quent_io::ImporterResult<(Uuid, &std::path::Path)> {
+    let invalid_path = || {
+        quent_io::ImporterError::other(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("context directory must end in a UUID: {}", dir.display()),
+        ))
+    };
+    let context_id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .ok_or_else(invalid_path)?;
+    let root = dir.parent().ok_or_else(invalid_path)?;
+    Ok((context_id, root))
 }
 
 pub struct SiriusUiAnalyzer {
@@ -197,6 +315,21 @@ struct PerStateBuilderSlot<'a> {
     op_filter: OperatorFilter,
     entity_type_name: String,
 }
+
+type PlainBulkBuilder<'a> = (
+    String,
+    ResourceTimelineBuilder<'a>,
+    HashSet<Uuid>,
+    OperatorFilter,
+);
+
+type PerStateBulkBuilder<'a> = (
+    String,
+    ResourceTimelineByKeyBuilder<'a, &'a str>,
+    HashSet<Uuid>,
+    OperatorFilter,
+    String,
+);
 
 /// Adapts the model's task map to the [`FsmCollection`] contract that
 /// [`entities::list_entities`] ranks and pages over.
@@ -236,7 +369,32 @@ impl FsmCollection for BatchPlacementCollection<'_> {
 
 impl UiAnalyzer for SiriusUiAnalyzer {
     type Event = SiriusEvent;
-    type EntityRef = EntityRef;
+
+    fn extract_engine(
+        engine_id: Uuid,
+        events: impl Iterator<Item = Event<SiriusEvent>>,
+    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
+        for event in events {
+            if let SiriusEvent::Engine(schema::EngineEvent::Init {
+                implementation,
+                instance_name,
+            }) = event.data
+            {
+                return Ok(quent_query_engine_ui::Engine {
+                    id: engine_id,
+                    start_time_unix_ns: Some(event.timestamp),
+                    duration_s: None,
+                    instance_name,
+                    implementation: Some(quent_query_engine_ui::EngineImplementationAttributes {
+                        name: implementation.name,
+                        version: implementation.version,
+                        custom_attributes: implementation.custom_attributes.0,
+                    }),
+                });
+            }
+        }
+        Ok(quent_query_engine_ui::Engine::new(engine_id))
+    }
 
     fn try_new(
         engine_id: Uuid,
@@ -254,17 +412,16 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             builder.try_build()?
         };
 
-        let qe = &model.query_engine;
         tracing::info!(
-            workers = qe.workers.len(),
-            query_groups = qe.query_groups.len(),
-            queries = qe.queries.len(),
-            plans = qe.plans.len(),
-            operators = qe.operators.len(),
-            ports = qe.ports.len(),
-            resources = model.arbitrary_resources.resources.len(),
-            resource_groups = model.arbitrary_resources.resource_groups.len(),
-            resource_types = model.arbitrary_resources.resource_types.len(),
+            workers = model.workers.len(),
+            query_groups = model.query_groups.len(),
+            queries = model.queries.len(),
+            plans = model.plans.len(),
+            operators = model.operators.len(),
+            ports = model.ports.len(),
+            resources = model.resources().count(),
+            resource_groups = model.gpu_devices.len() + model.thread_groups.len(),
+            resource_types = model.resource_types.len(),
             resource_group_types = model.resource_group_types.len(),
             tasks = model.tasks.len(),
             data_batches = model.data_batches.len(),
@@ -274,30 +431,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         Ok(Self { model })
     }
 
-    fn extract_engine(
-        engine_id: Uuid,
-        events: impl Iterator<Item = Event<SiriusEvent>>,
-    ) -> AnalyzerResult<quent_query_engine_ui::Engine> {
-        use quent_query_engine_model::engine::EngineEvent;
-        for event in events {
-            if let SiriusEvent::Engine(EngineEvent::Init(init)) = event.data {
-                return Ok(quent_query_engine_ui::Engine {
-                    id: engine_id,
-                    start_time_unix_ns: Some(event.timestamp),
-                    duration_s: None,
-                    instance_name: init.instance_name,
-                    implementation: Some(
-                        quent_query_engine_ui::EngineImplementationAttributes::from(
-                            &init.implementation,
-                        ),
-                    ),
-                });
-            }
-        }
-        Ok(quent_query_engine_ui::Engine::new(engine_id))
-    }
-
-    fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle<EntityRef>> {
+    fn query_bundle(&self, query_id: Uuid) -> AnalyzerResult<QueryBundle> {
         debug!("constructing view");
         // TODO(johanpel): A query view could be cached in an analyzer so
         // subsequent calls into the analyzer for that query could benefit from
@@ -320,7 +454,33 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let query = query.to_ui()?;
         let workers = view.workers().map(|w| (w.id(), w.to_ui(epoch))).collect();
         let plans = view.plans().map(|p| (p.id(), p.to_ui())).collect();
-        let operators = view.operators().map(|o| (o.id(), o.to_ui(epoch))).collect();
+        let operators = view
+            .operators()
+            .map(|operator| {
+                let mut ui_operator = operator.to_ui(epoch);
+                if let Some(statistics) = &mut ui_operator.statistics {
+                    statistics.custom_statistics =
+                        std::mem::take(&mut statistics.custom_statistics)
+                            .into_iter()
+                            .map(|(name, mut statistic)| {
+                                let name = if let Some(value) =
+                                    scale_operator_statistic(&name, &statistic.value)
+                                {
+                                    statistic.value = Some(value);
+                                    statistic.quantity = Some(QUANTITY_SECONDS.to_owned());
+                                    scaled_operator_statistic_name(name)
+                                } else {
+                                    statistic.quantity =
+                                        operator_statistic_quantity(&name).map(str::to_owned);
+                                    name
+                                };
+                                (name, statistic)
+                            })
+                            .collect();
+                }
+                (operator.id(), ui_operator)
+            })
+            .collect();
         let ports = view.ports().map(|p| (p.id(), p.to_ui(epoch))).collect();
         let unique_operator_names = view
             .operators()
@@ -329,29 +489,55 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .into_iter()
             .collect();
 
-        debug!("converting Sirius runtime resource entities");
+        debug!("converting Sirius resource entities");
 
         let resources = view
-            .runtime_resources()
-            .map(|resource| (resource.id(), resource.into()))
-            .collect();
+            .sirius_resources()
+            .map(|resource| {
+                let parent_id = view
+                    .ref_tree_entity(resource.id())?
+                    .parent_id()
+                    .ok_or_else(|| {
+                        AnalyzerError::Validation(format!(
+                            "resource {} is the Reference Tree root",
+                            resource.id()
+                        ))
+                    })?;
+                Ok((
+                    resource.id(),
+                    UiResource::from_analyzed(
+                        resource,
+                        view.resource_instance_name(resource.id())
+                            .unwrap_or_default(),
+                        parent_id,
+                    ),
+                ))
+            })
+            .collect::<AnalyzerResult<_>>()?;
 
         let resource_groups = view
-            .runtime_resource_groups()
+            .sirius_resource_groups()
             .map(|group| {
-                let group: &dyn ResourceGroup = group;
-                (group.id(), group.into())
+                (
+                    group.id(),
+                    UiResourceGroup::from_analyzed(
+                        group,
+                        view.resource_group_instance_name(group.id())
+                            .unwrap_or_default(),
+                        group.parent_id(),
+                    ),
+                )
             })
             .collect();
 
         let resource_types = view
-            .runtime_resource_types()
+            .sirius_resource_types()
             .map(|(name, resource_type)| (name.to_string(), resource_type.into()))
             .collect();
 
         let resource_group_types = view
-            .runtime_resource_group_types()
-            .map(|(name, group_type)| (name.to_string(), group_type.into()))
+            .sirius_resource_group_types()
+            .map(|(name, group_type)| (name.to_string(), group_type.clone()))
             .collect();
 
         let task_decl = Task::fsm_type_declaration();
@@ -385,8 +571,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
 
         debug!("deriving resource tree");
         let engine = view.engine()?;
-        let resource_tree =
-            convert_resource_tree(view.resource_tree()?, &view)?.unwrap_or_else(|| {
+        let resource_tree = convert_resource_tree(ResourceTreeNode::try_new(&view)?, &view)?
+            .unwrap_or_else(|| {
                 ResourceTree::ResourceGroup(ResourceGroupNode {
                     id: EntityRef::Engine(engine.id()),
                     children: vec![],
@@ -408,7 +594,8 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         ..QuantitySpec::bytes()
                     },
                 ),
-                ("capacity_entries".into(), QuantitySpec::unit()),
+                (QUANTITY_SECONDS.into(), QuantitySpec::seconds()),
+                ("entries".into(), QuantitySpec::unit()),
                 ("unit".into(), QuantitySpec::unit()),
             ]
             .into(),
@@ -469,6 +656,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .is_some_and(|op| query_operators.contains(&op))
                         && data_batch.matches_filter(&operator_filter)
                 },
+                DataBatchExt::try_to_ui_fsm,
                 query,
             ),
             Some(BATCH_PLACEMENT_TYPE_NAME) => entities::list_entities(
@@ -479,6 +667,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                         .is_some_and(|op| query_operators.contains(&op))
                         && batch.matches_filter(&operator_filter)
                 },
+                BatchPlacementExt::try_to_ui_fsm,
                 query,
             ),
             _ => entities::list_entities(
@@ -487,6 +676,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                     task.pipeline_uuid()
                         .is_some_and(|op| query_operators.contains(&op))
                         && task.matches_filter(&operator_filter)
+                },
+                |task, epoch| {
+                    let pipeline_name = task
+                        .pipeline_uuid()
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
+                    task.try_to_ui_fsm(epoch, pipeline_name)
                 },
                 query,
             ),
@@ -632,11 +828,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
                 let long_entities_threshold = req.long_entities_threshold_s.map(to_nanosecs);
                 let fsm_filter = req.app_params;
 
-                // Build the resource tree for this group
-                let tree = ResourceTreeNode::try_new(&view, req.resource_group_id)?;
-                // Collect all leaf resource IDs of the requested type in the tree
+                let resource_tree = ResourceTreeNode::try_new(&view)?;
+                let tree = resource_tree
+                    .find(req.resource_group_id)
+                    .ok_or(AnalyzerError::InvalidId(req.resource_group_id))?;
+                // Collect all resource IDs of the requested type in the tree.
                 let resource_ids: HashSet<Uuid> = tree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -776,27 +974,16 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         let view = self.model.query_view(request.app_params.query_id)?;
         // Prepare resource tree, we'll reuse this as it is potentially
         // expensive to build for every entry.
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         // Prepare builders, resource id filters, and operator filters, one for
         // each bulk entry. After populating this, we'll build a reverse index,
         // that maps a resource_id to a list of indices in these vecs, for which
         // that resource's usages are relevant.
-        let mut plain_builders: Vec<(
-            String,
-            ResourceTimelineBuilder,
-            HashSet<Uuid>,
-            OperatorFilter,
-        )> = Vec::new();
+        let mut plain_builders: Vec<PlainBulkBuilder<'_>> = Vec::new();
 
         // Prepare them also for keyed builders (building by state).
-        let mut per_state_builders: Vec<(
-            String,
-            ResourceTimelineByKeyBuilder<&str>,
-            HashSet<Uuid>,
-            OperatorFilter,
-            String, // entity_type_name this slot breaks down by ("task" | "data_batch", etc.)
-        )> = Vec::new();
+        let mut per_state_builders: Vec<PerStateBulkBuilder<'_>> = Vec::new();
 
         for (entry_id, entry) in request.entries {
             let entry_config = entry.config().try_into_binned_span(epoch)?;
@@ -999,7 +1186,7 @@ impl UiAnalyzer for SiriusUiAnalyzer {
             .query_engine_model()
             .query_epoch(request.app_params.query_id)?;
         let view = self.model.query_view(request.app_params.query_id)?;
-        let resource_tree = view.resource_tree()?;
+        let resource_tree = ResourceTreeNode::try_new(&view)?;
 
         let n_configs = request.configs.len();
 
@@ -1245,10 +1432,13 @@ impl UiAnalyzer for SiriusUiAnalyzer {
         // when recording; without them the view is unsupported (HTTP 501).
         let tier_names: HashMap<Uuid, &str> = self
             .model
-            .arbitrary_resources
             .resources()
             .filter(|r| r.type_name() == MEMORY_TIER_TYPE_NAME)
-            .map(|r| (r.id(), r.instance_name()))
+            .filter_map(|resource| {
+                self.model
+                    .resource_instance_name(resource.id())
+                    .map(|name| (resource.id(), name))
+            })
             .collect();
         if tier_names.is_empty() {
             return Err(AnalyzerError::Unsupported);
@@ -1438,7 +1628,7 @@ impl SiriusUiAnalyzer {
                     .find(rg.resource_group_id)
                     .ok_or(AnalyzerError::InvalidId(rg.resource_group_id))?;
                 let resource_ids: HashSet<Uuid> = subtree
-                    .iter_leaf_ids()
+                    .iter_resource_ids()
                     .filter(|&id| {
                         view.resource(id)
                             .ok()
@@ -1493,8 +1683,8 @@ impl SiriusUiAnalyzer {
                 if let Some(task) = self.model.tasks.get(&id) {
                     let pipeline_name = task
                         .pipeline_uuid()
-                        .and_then(|id| self.model.query_engine.operators.get(&id))
-                        .map(|operator| operator.instance_name());
+                        .and_then(|id| self.model.operator(id).ok())
+                        .and_then(|operator| operator.data().instance_name.as_deref());
                     Some(task.try_to_ui_fsm(epoch, pipeline_name))
                 } else if let Some(db) = self.model.data_batches.get(&id) {
                     Some(db.try_to_ui_fsm(epoch))

@@ -27,7 +27,7 @@
 #include "pipeline/pipeline_build_context.hpp"
 #include "pipeline/pipeline_memory_history.hpp"
 #include "query_id.hpp"
-#include "telemetry-bridge/gen/uuid.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
 #include "telemetry/nvtx.hpp"
 
 #include <memory>
@@ -227,7 +227,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   //! empty-port / balanced-counter state while a task is mid-creation.
   [[nodiscard]] std::unique_lock<std::mutex> get_task_creation_lock();
 
-  [[nodiscard]] uuid::UUID pipeline_uuid() const { return _pipeline_uuid; }
+  [[nodiscard]] quent::Uuid pipeline_uuid() const { return _pipeline_uuid; }
 
   //! Completed-task memory and size history, owned here so upstream estimators can access it
   //! through `port::src_pipeline`.
@@ -322,7 +322,7 @@ class sirius_pipeline : public std::enable_shared_from_this<sirius_pipeline> {
   std::atomic<bool> _nvtx_range_started{false};
   nvtxRangeId_t _nvtx_pipeline_range_id{0};
 
-  uuid::UUID _pipeline_uuid{uuid::now_v7()};
+  quent::Uuid _pipeline_uuid{quent::now_v7()};
 };
 
 }  // namespace pipeline

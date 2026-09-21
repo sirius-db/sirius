@@ -448,13 +448,19 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // Best-effort: telemetry failure must not abort the remaining mandatory
   // steps or poison the runtime.
   try {
-    sirius::telemetry::batch_telemetry_registry::instance().on_query_end();
-  } catch (std::exception& e) {
+    sirius::telemetry::batch_telemetry_registry::instance().on_query_end(query_id);
+  } catch (const std::exception& e) {
     try {
-      SIRIUS_LOG_WARN("batch telemetry on_query_end failed (ignored): {}", e.what());
+      SIRIUS_LOG_WARN(
+        "Batch telemetry cleanup failed for query {} (ignored): {}", query_id, e.what());
     } catch (...) {
     }
   } catch (...) {
+    try {
+      SIRIUS_LOG_WARN("Batch telemetry cleanup failed for query {} (ignored): unknown exception",
+                      query_id);
+    } catch (...) {
+    }
   }
 
   // Drop THIS query's data repositories, leaving any other in-flight query's untouched.

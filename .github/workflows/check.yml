@@ -197,6 +197,24 @@ jobs:
           pixi run cargo clippy --manifest-path rust/Cargo.toml --package sirius --package sirius-sys --all-targets -- -D warnings
           pixi run cargo test --no-run --manifest-path rust/Cargo.toml --package sirius --package sirius-sys
 
+      - name: Rust telemetry checks
+        if: >-
+          matrix.build.arch == 'x64' && matrix.build.compiler == 'gcc'
+          && matrix.build.build-type == 'release' && matrix.build.environment == 'default'
+          && matrix.build.cudf-channel == 'stable'
+        run: |
+          set -euo pipefail
+          packages=(
+            --package sirius-telemetry-instrumentation
+            --package sirius-telemetry-store
+            --package telemetry-bridge
+            --package sirius-telemetry-analyzer
+            --package sirius-telemetry-server
+          )
+          pixi run cargo fmt --manifest-path rust/Cargo.toml "${packages[@]}" --check
+          pixi run cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets --features sirius-telemetry-server/ui "${packages[@]}" -- -D warnings
+          pixi run cargo test --manifest-path rust/Cargo.toml --locked --all-targets --features sirius-telemetry-server/ui "${packages[@]}"
+
       - name: Build (vcpkg)
         if: matrix.build.environment == 'vcpkg'
         run: |

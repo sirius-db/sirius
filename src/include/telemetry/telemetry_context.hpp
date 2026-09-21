@@ -19,16 +19,8 @@
 #include "duckdb/common/common.hpp"
 #include "log/logging.hpp"
 #include "query_id.hpp"
-#include "telemetry-bridge/gen/context.rs.h"
-#include "telemetry-bridge/gen/engine.rs.h"
-#include "telemetry-bridge/gen/executor_thread.rs.h"
-#include "telemetry-bridge/gen/gpu_device.rs.h"
-#include "telemetry-bridge/gen/query_group.rs.h"
-#include "telemetry-bridge/gen/task_manager_loop_thread.rs.h"
-#include "telemetry-bridge/gen/task_queue.rs.h"
-#include "telemetry-bridge/gen/thread_group.rs.h"
-#include "telemetry-bridge/gen/uuid.rs.h"
-#include "telemetry-bridge/gen/worker.rs.h"
+#include "telemetry-bridge/gen/quent.hpp"
+#include "telemetry-bridge/src/nvtx_capture.rs.h"
 #include "telemetry/memory_context.hpp"
 
 #include <cstdint>
@@ -37,6 +29,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sirius::pipeline {
@@ -49,60 +42,83 @@ struct telemetry_config;
 
 namespace sirius::telemetry {
 
-/// Creates the Quent context described by `config`. This also installs the
-/// process-global NVTX injection hook, so call it before anything else emits
-/// NVTX. Throws `std::invalid_argument` for an unrecognised `exporter` value.
-[[nodiscard]] rust::Box<quent::Context> make_quent_context(const sirius::telemetry_config& config);
+/// Owns Sirius's schema-generated Quent context and its non-schema integration pipelines.
+class quent_context {
+ public:
+  quent_context(const quent_context&)            = delete;
+  quent_context& operator=(const quent_context&) = delete;
+  quent_context(quent_context&&)                 = default;
+  quent_context& operator=(quent_context&&)      = default;
+
+ private:
+  friend quent_context make_quent_context(const sirius::telemetry_config& config);
+  friend class telemetry_context;
+
+  quent_context(quent::Context&& context, rust::Box<detail::NvtxCapture>&& nvtx_capture)
+    : context_(std::move(context)), nvtx_capture_(std::move(nvtx_capture))
+  {
+  }
+
+  quent::Context context_;
+  rust::Box<detail::NvtxCapture> nvtx_capture_;
+};
+
+/// Creates the Quent context described by `config`. The first enabled context
+/// also installs the process-global NVTX injection hook, so call it before
+/// anything else emits NVTX. Throws `std::invalid_argument` for an unrecognised
+/// `exporter` value.
+[[nodiscard]] quent_context make_quent_context(const sirius::telemetry_config& config);
 
 /// Owns the top-level telemetry states for a single SiriusContext.
 class telemetry_context {
  public:
   /// Takes ownership of an already-created Quent context. Building it is the
-  /// caller's job: `quent::create_context` is what installs the process-global
-  /// NVTX injection hook, and Quent drops every event dispatched before that hook
-  /// exists, so the caller must create it before anything else emits NVTX.
+  /// caller's job: constructing the first enabled context installs the
+  /// process-global NVTX injection hook, and Quent drops every event dispatched
+  /// before that hook exists, so the caller must construct it before anything
+  /// else emits NVTX.
   ///
   /// `gpu_device_ids` declares one per-GPU resource group (plus per-thread-type
   /// child buckets) under the engine, so thread telemetry can nest per device.
   [[nodiscard]] static std::shared_ptr<const telemetry_context> create(
-    rust::Box<quent::Context>&& context,
+    quent_context&& context,
     const sirius::telemetry_config& config,
     const cucascade::memory::memory_reservation_manager* manager = nullptr,
     const std::vector<int>& gpu_device_ids                       = {});
 
-  ~telemetry_context();
+  ~telemetry_context() noexcept;
 
-  // Non-copyable, non-movable (owns opaque Rust boxes)
+  // Non-copyable, non-movable (owns move-only Quent handles)
   telemetry_context(const telemetry_context&)            = delete;
   telemetry_context& operator=(const telemetry_context&) = delete;
   telemetry_context(telemetry_context&&)                 = delete;
   telemetry_context& operator=(telemetry_context&&)      = delete;
 
-  [[nodiscard]] const uuid::UUID& engine_id() const { return engine_uuid_; }
-  [[nodiscard]] const uuid::UUID& worker_id() const { return worker_uuid_; }
+  [[nodiscard]] const quent::Uuid& engine_id() const { return engine_uuid_; }
+  [[nodiscard]] const quent::Uuid& worker_id() const { return worker_uuid_; }
   /// The single, session-scoped query group that every query in this context is reported under.
-  [[nodiscard]] const uuid::UUID& query_group_id() const { return query_group_uuid_; }
+  [[nodiscard]] const quent::Uuid& query_group_id() const { return query_group_uuid_; }
   /// The `{engine}-{session_label}` query group, declared on first use; empty or
   /// nullopt falls back to the default session-scoped group. Thread-safe.
-  [[nodiscard]] uuid::UUID query_group_id_for(
+  [[nodiscard]] quent::Uuid query_group_id_for(
     const std::optional<std::string>& session_label) const;
   /// The `gpu-N` device group for `device_id`; falls back to the engine group
   /// (with a warning) when the device was not declared at creation time.
-  [[nodiscard]] const uuid::UUID& gpu_device_group_id(int device_id) const;
+  [[nodiscard]] const quent::Uuid& gpu_device_group_id(int device_id) const;
   /// The `executor_thread` bucket group under `gpu-N` (engine fallback as above).
-  [[nodiscard]] const uuid::UUID& executor_thread_group_id(int device_id) const;
+  [[nodiscard]] const quent::Uuid& executor_thread_group_id(int device_id) const;
   /// The `task_manager_loop_thread` bucket group under `gpu-N` (engine fallback as above).
-  [[nodiscard]] const uuid::UUID& manager_thread_group_id(int device_id) const;
+  [[nodiscard]] const quent::Uuid& manager_thread_group_id(int device_id) const;
   /// The `shared` group under the engine, for threads with no single GPU.
-  [[nodiscard]] const uuid::UUID& shared_group_id() const { return shared_group_uuid_; }
-  [[nodiscard]] const quent::Context& context() const { return *context_; }
+  [[nodiscard]] const quent::Uuid& shared_group_id() const { return shared_group_uuid_; }
+  [[nodiscard]] const quent::Context& context() const { return context_; }
   [[nodiscard]] const std::shared_ptr<const memory_context>& get_memory_context() const
   {
     return memory_context_;
   }
 
  private:
-  telemetry_context(rust::Box<quent::Context>&& context,
+  telemetry_context(quent_context&& context,
                     const sirius::telemetry_config& config,
                     const cucascade::memory::memory_reservation_manager* manager,
                     const std::vector<int>& gpu_device_ids);
@@ -110,31 +126,34 @@ class telemetry_context {
   /// Telemetry group ids for one GPU: the `gpu-N` group and its per-thread-type
   /// child buckets.
   struct gpu_device_group_ids {
-    uuid::UUID device;
-    uuid::UUID executor_threads;
-    uuid::UUID manager_threads;
+    quent::Uuid device;
+    quent::Uuid executor_threads;
+    quent::Uuid manager_threads;
   };
 
-  uuid::UUID engine_uuid_;
-  uuid::UUID worker_uuid_;
-  uuid::UUID query_group_uuid_;
-  uuid::UUID shared_group_uuid_;
+  quent::Uuid engine_uuid_;
+  quent::Uuid worker_uuid_;
+  quent::Uuid query_group_uuid_;
+  quent::Uuid shared_group_uuid_;
   std::string engine_name_;
   mutable std::mutex labeled_groups_mutex_;
-  mutable std::map<std::string, uuid::UUID> labeled_group_ids_;
+  mutable std::map<std::string, quent::Uuid> labeled_group_ids_;
   std::map<int, gpu_device_group_ids> gpu_group_ids_;
-  rust::Box<quent::Context> context_;
-  rust::Box<quent::engine::EngineObserver> engine_observer_;
-  rust::Box<quent::worker::WorkerObserver> worker_observer_;
-  rust::Box<quent::query_group::QueryGroupObserver> query_group_observer_;
+  quent::Context context_;
+  rust::Box<detail::NvtxCapture> nvtx_capture_;
+  std::shared_ptr<quent::engine::EngineObserver> engine_observer_;
+  std::shared_ptr<quent::worker::WorkerObserver> worker_observer_;
+  std::shared_ptr<quent::query_group::QueryGroupObserver> query_group_observer_;
+  quent::Handle<quent::Engine> engine_handle_;
+  quent::Handle<quent::Worker> worker_handle_;
   std::shared_ptr<const memory_context> memory_context_;
 };
 
 // A POD to hold common identifiers for useful telemetry.
 struct query_telemetry_info {
-  /// Quent's own UUID for this query (`QueryHandle::uuid()`), authoritative within telemetry.
-  uuid::UUID telemetry_query_id;
-  uuid::UUID worker_id;
+  /// Quent's own UUID for this query (`FsmHandle::id()`), authoritative within telemetry.
+  quent::Uuid telemetry_query_id;
+  quent::Uuid worker_id;
   /// The engine-wide numeric query id (the execution window's id).
   sirius::query_id_t query_id;
 };
@@ -143,20 +162,20 @@ struct query_telemetry_info {
 /// for the given set of pipelines. Called once during query construction.
 void emit_plan_telemetry(const quent::Context& context,
                          const std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& pipelines,
-                         uuid::UUID plan_id,
+                         quent::Uuid plan_id,
                          query_telemetry_info telemetry_info);
 
 struct ExecutorThreadHandleWrapper {
   ExecutorThreadHandleWrapper(const telemetry_context& context,
                               const std::string& thread_name,
-                              const uuid::UUID& parent_group_id)
-    : handle(quent::executor_thread::create(context.context(),
-                                            {
-                                              .instance_name   = thread_name,
-                                              .parent_group_id = parent_group_id,
-                                            }))
+                              const quent::Uuid& parent_group_id)
+    : handle(context.context().executor_thread_observer()->handle())
   {
-    handle->operating();
+    handle.declaration(quent::executor_thread::Declaration{
+      .instance_name   = thread_name,
+      .parent_group_id = parent_group_id,
+      .engine_id       = quent::engine::EngineId(context.engine_id()),
+    });
   }
 
   ExecutorThreadHandleWrapper(const ExecutorThreadHandleWrapper&)            = delete;
@@ -164,26 +183,22 @@ struct ExecutorThreadHandleWrapper {
   ExecutorThreadHandleWrapper(ExecutorThreadHandleWrapper&&)                 = delete;
   ExecutorThreadHandleWrapper& operator=(ExecutorThreadHandleWrapper&&)      = delete;
 
-  ~ExecutorThreadHandleWrapper()
-  {
-    handle->finalizing();
-    handle->exit();
-  }
+  ~ExecutorThreadHandleWrapper() = default;
 
-  rust::Box<quent::executor_thread::ExecutorThreadHandle> handle;
+  quent::Handle<quent::ExecutorThread> handle;
 };
 
 struct TaskManagerLoopThreadHandleWrapper {
   TaskManagerLoopThreadHandleWrapper(const telemetry_context& context,
                                      const std::string& thread_name,
-                                     const uuid::UUID& parent_group_id)
-    : handle(quent::task_manager_loop_thread::create(context.context(),
-                                                     {
-                                                       .instance_name   = thread_name,
-                                                       .parent_group_id = parent_group_id,
-                                                     }))
+                                     const quent::Uuid& parent_group_id)
+    : handle(context.context().task_manager_loop_thread_observer()->handle())
   {
-    handle->operating();
+    handle.declaration(quent::task_manager_loop_thread::Declaration{
+      .instance_name   = thread_name,
+      .parent_group_id = parent_group_id,
+      .engine_id       = quent::engine::EngineId(context.engine_id()),
+    });
   }
 
   TaskManagerLoopThreadHandleWrapper(const TaskManagerLoopThreadHandleWrapper&)            = delete;
@@ -191,27 +206,25 @@ struct TaskManagerLoopThreadHandleWrapper {
   TaskManagerLoopThreadHandleWrapper(TaskManagerLoopThreadHandleWrapper&&)                 = delete;
   TaskManagerLoopThreadHandleWrapper& operator=(TaskManagerLoopThreadHandleWrapper&&)      = delete;
 
-  ~TaskManagerLoopThreadHandleWrapper()
-  {
-    handle->finalizing();
-    handle->exit();
-  }
+  ~TaskManagerLoopThreadHandleWrapper() = default;
 
-  rust::Box<quent::task_manager_loop_thread::TaskManagerLoopThreadHandle> handle;
+  quent::Handle<quent::TaskManagerLoopThread> handle;
 };
 
 struct TaskQueueHandleWrapper {
   TaskQueueHandleWrapper(const telemetry_context& context,
                          const std::string& queue_name,
-                         const uuid::UUID& parent_group_id)
-    : handle(quent::task_queue::create(context.context(),
-                                       {
-                                         .instance_name   = queue_name,
-                                         .parent_group_id = parent_group_id,
-                                       }))
+                         const quent::Uuid& parent_group_id)
+    : handle(context.context().task_queue_observer()->handle())
   {
-    handle->operating({
-      .capacity_entries = std::numeric_limits<uint64_t>::max(),
+    handle.declaration(quent::task_queue::Declaration{
+      .instance_name   = queue_name,
+      .parent_group_id = parent_group_id,
+      .engine_id       = quent::engine::EngineId(context.engine_id()),
+      .bounds =
+        quent::records::TaskQueueBounds{
+          .entries = std::numeric_limits<uint64_t>::max(),
+        },
     });
   }
 
@@ -220,13 +233,9 @@ struct TaskQueueHandleWrapper {
   TaskQueueHandleWrapper(TaskQueueHandleWrapper&&)                 = delete;
   TaskQueueHandleWrapper& operator=(TaskQueueHandleWrapper&&)      = delete;
 
-  ~TaskQueueHandleWrapper()
-  {
-    handle->finalizing();
-    handle->exit();
-  }
+  ~TaskQueueHandleWrapper() = default;
 
-  rust::Box<quent::task_queue::TaskQueueHandle> handle;
+  quent::Handle<quent::TaskQueue> handle;
 };
 
 // header-only shared thread-local storage handle: one per thread, shared across translation units
@@ -236,7 +245,7 @@ inline thread_local std::optional<ExecutorThreadHandleWrapper> executor_thread_t
 // Initialize the thread local ExecutorThreadHandleWrapper for this worker thread.
 inline void thread_local_executor_thread_telemtry_init(const telemetry_context& context,
                                                        const std::string& thread_name,
-                                                       const uuid::UUID& parent_group_id)
+                                                       const quent::Uuid& parent_group_id)
 {
   if (executor_thread_telemetry_handle.has_value()) {
     SIRIUS_LOG_WARN("ExecutorThreadHandleWrapper was already initialized; overriding.");
