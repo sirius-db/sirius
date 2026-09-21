@@ -1441,6 +1441,25 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
 
+  // ioctxs are process/query-manager resources and remain alive across query
+  // boundaries. Build this set from the scans in *this* query so a context
+  // created for an earlier query (or for an object-store LIST) cannot lend its
+  // budget and strategy to unrelated work. A query may genuinely mix local
+  // and object-store scans, so inspect every advertised path and deduplicate
+  // the shared contexts.
+  std::vector<std::shared_ptr<io::ioctx>> query_io_ctxs;
+  std::unordered_set<io::ioctx const*> seen_query_io_ctxs;
+  for (auto const& scan_op : query.get_scan_operators()) {
+    if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
+    auto const& op = scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
+    for (auto const& path : op.get_ingestible().table_info().file_paths()) {
+      auto io_ctx = ioctx_for_path(path);
+      if (io_ctx && seen_query_io_ctxs.insert(io_ctx.get()).second) {
+        query_io_ctxs.push_back(std::move(io_ctx));
+      }
+    }
+  }
+
   // Settle the readahead's terms before building it: the budget rations device
   // IO between the readahead and the executor, so it has to be in place before
   // the manager is subscribed and can start being told about executor work.
@@ -1454,32 +1473,20 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // The serving backend is not necessarily the default `_io_ctx`: a path-routed
   // backend serves its own scans (an `s3://` query reads through the REST ioctx
   // while `_io_ctx` is the local uring one) and one readahead manager covers
-  // them all.  Take the one publishing the widest budget, since object-store
-  // reads are latency-bound rather than bandwidth-bound and need the deeper
-  // queue to keep the link busy — clamping them to the local disk's depth
-  // starves the link — and take its strategy preference with it, so budget and
-  // strategy describe the same backend.
+  // them all. Take the current query backend publishing the widest budget,
+  // since object-store reads are latency-bound rather than bandwidth-bound and
+  // need the deeper queue to keep the link busy — clamping them to the local
+  // disk's depth starves the link — and take its strategy preference with it,
+  // so budget and strategy describe the same backend.
   {
-    io::ioctx const* widest    = nullptr;
-    std::size_t backend_budget = 0;
-    auto consider              = [&](io::ioctx const* ctx) {
-      if (ctx == nullptr) { return; }
-      auto const budget = ctx->n_max_concurrent_scans();
-      if (widest == nullptr || budget > backend_budget) {
-        widest         = ctx;
-        backend_budget = budget;
-      }
-    };
-    consider(_io_ctx.get());
-    {
-      std::lock_guard lk{_routed_io_ctxs_mtx};
-      for (auto const& [_, ctx] : _routed_io_ctxs) {
-        consider(ctx.get());
-      }
+    std::vector<backend_readahead_policy> backend_policies;
+    backend_policies.reserve(query_io_ctxs.size());
+    for (auto const& io_ctx : query_io_ctxs) {
+      backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
+                                  .strategy = backend_prefetch_strategy(io_ctx->type())});
     }
-    auto const backend_strategy =
-      widest != nullptr ? backend_prefetch_strategy(widest->type()) : prefetch_strategy::eager;
-    auto const plan = _config.resolve_readahead(backend_budget, backend_strategy);
+    auto const backend = select_readahead_backend(backend_policies);
+    auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
 
     // Registers its mailbox for the query's lifetime; unregistered in reset().
     _readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher, plan.budget);

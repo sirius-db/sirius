@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -129,6 +130,33 @@ struct readahead_plan {
   std::size_t budget{0};
   prefetch_strategy strategy{prefetch_strategy::eager};
 };
+
+/// The scan depth and scheduling preference published by one IO backend.
+struct backend_readahead_policy {
+  std::size_t budget{0};
+  prefetch_strategy strategy{prefetch_strategy::eager};
+};
+
+/// Select the backend policy that can sustain the most concurrent scans.
+///
+/// Callers supply only backends that serve the current query. Keeping that
+/// boundary explicit prevents an ioctx retained from an earlier query from
+/// changing this query's readahead policy. The strategy travels with the
+/// winning budget so a mixed local/object-store query is not assigned one
+/// backend's queue depth and another backend's scheduling model.
+[[nodiscard]] inline backend_readahead_policy select_readahead_backend(
+  std::span<backend_readahead_policy const> backends) noexcept
+{
+  backend_readahead_policy selected{};
+  bool have_backend = false;
+  for (auto const& backend : backends) {
+    if (!have_backend || backend.budget > selected.budget) {
+      selected     = backend;
+      have_backend = true;
+    }
+  }
+  return selected;
+}
 
 /**
  * @brief Configuration for the background host->GPU memory prefetcher
