@@ -40,7 +40,7 @@ bool sirius_physical_passthrough_sink::is_source() const { return true; }
 bool sirius_physical_passthrough_sink::is_sink() const { return true; }
 
 std::unique_ptr<operator_data> sirius_physical_passthrough_sink::execute(
-  const operator_data& input_data, rmm::cuda_stream_view /*stream*/)
+  const operator_data& input_data, ::cuda::stream_ref /*stream*/)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_passthrough_sink::execute"};
   // Re-wrap as the base `pipelineable_operator_data`, not a `partitioned_operator_data`: the

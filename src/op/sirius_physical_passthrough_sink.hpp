@@ -53,7 +53,7 @@ class sirius_physical_passthrough_sink : public sirius_physical_operator {
 
   //! Identity forward, overridden only because the base returns an empty batch vector.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   //! Read by `sirius_physical_union::input_port_for`.
   [[nodiscard]] const std::string& union_port_label() const noexcept { return _union_port_label; }

@@ -99,7 +99,7 @@ sirius_physical_union::get_sources() const
 }
 
 std::unique_ptr<operator_data> sirius_physical_union::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view /*stream*/)
+                                                              ::cuda::stream_ref /*stream*/)
 {
   nvtx3::scoped_range nvtx_range{"sirius_physical_union::execute"};
   // get_next_task_input_data already popped the batch; forward it as the owned batch (idle at

@@ -62,7 +62,7 @@ class sirius_physical_union : public sirius_physical_operator {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const override;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   //! Distinct per arm, not cosmetic: `add_port` is last-writer-wins and repositories key by
   //! `(operator_id, port_id)`, so a shared name orphans an arm's repository. The returned view is
