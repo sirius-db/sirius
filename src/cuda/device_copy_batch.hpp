@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <cudf/detail/utilities/cuda_memcpy.hpp>
-
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
@@ -70,12 +68,7 @@ class device_copy_batch {
   device_copy_batch() = default;
 
   /// Pre-size the backing arrays for @p n copies.
-  void reserve(std::size_t n)
-  {
-    _dsts.reserve(n);
-    _srcs.reserve(n);
-    _sizes.reserve(n);
-  }
+  void reserve(std::size_t n);
 
   /// Append a copy of @p bytes from @p src to @p dst.
   ///
@@ -87,14 +80,7 @@ class device_copy_batch {
   /// (cudaErrorInvalidValue) — or, worse, would read across a boundary the
   /// driver happens to tolerate.  Establishing that two buffers share one
   /// allocation costs more than the copies it would save.
-  void add(void* dst, void const* src, std::size_t bytes)
-  {
-    if (bytes == 0 || dst == nullptr || src == nullptr) { return; }
-    _dsts.push_back(dst);
-    _srcs.push_back(src);
-    _sizes.push_back(bytes);
-    _bytes += bytes;
-  }
+  void add(void* dst, void const* src, std::size_t bytes);
 
   /// Number of copy descriptors that will be submitted.
   [[nodiscard]] std::size_t count() const noexcept { return _dsts.size(); }
@@ -108,20 +94,9 @@ class device_copy_batch {
   ///
   /// Does NOT clear — call @ref clear to reuse the instance.  Returns
   /// @c cudaSuccess for an empty batch.
-  [[nodiscard]] cudaError_t enqueue(::cuda::stream_ref stream) const
-  {
-    if (_dsts.empty()) { return cudaSuccess; }
-    return cudf::detail::memcpy_batch_async(
-      _dsts.data(), _srcs.data(), _sizes.data(), _dsts.size(), stream);
-  }
+  [[nodiscard]] cudaError_t enqueue(::cuda::stream_ref stream) const;
 
-  void clear() noexcept
-  {
-    _dsts.clear();
-    _srcs.clear();
-    _sizes.clear();
-    _bytes = 0;
-  }
+  void clear() noexcept;
 
  private:
   std::vector<void*> _dsts;

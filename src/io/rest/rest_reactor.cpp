@@ -470,7 +470,7 @@ constexpr std::size_t rest_max_segment_bytes = 16UL << 20;
     result.push_back(iovec{base + (io_rng.offset - slice.rng.offset), io_rng.size});
     return result;
   }
-  if (slice.is_staged()) return result;
+  if (slice.needs_staging()) return result;
 
   std::size_t covered = 0;
   for (auto* chunk : slice.h_buffer.fragments()) {
@@ -1272,7 +1272,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
       auto slice            = active_group->take_front();
       auto const slice_size = slice.size();
       try {
-        if (slice.is_staged() && !slice.has_device_request()) {
+        if (slice.needs_staging() && !slice.has_device_request()) {
           throw std::invalid_argument("rest_reactor: a staged read must have a device destination");
         }
         auto const* file = dynamic_cast<rest_io_object const*>(active_group->obj.get());
@@ -1336,7 +1336,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
 
           auto request           = std::make_unique<rest_io_op_request>();
           request->object        = file->get_object_ref();
-          request->needs_staging = slice.is_staged();
+          request->needs_staging = slice.needs_staging();
           request->logical_bytes = intersect(slice.rng, io_rng).size;
           logical_bytes += request->logical_bytes;
           request->op = std::move(op);

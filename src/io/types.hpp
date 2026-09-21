@@ -190,8 +190,6 @@ struct host_buffer {
     return std::holds_alternative<std::uint8_t*>(buffer);
   }
 
-  [[nodiscard]] bool is_staged() const noexcept { return needs_staging(); }
-
   [[nodiscard]] std::span<cache::cached_chunk* const> fragments() const noexcept
   {
     if (!is_fragmented()) return {};
@@ -255,7 +253,7 @@ struct prepared_io_slice {
   {
   }
 
-  [[nodiscard]] bool is_staged() const noexcept { return h_buffer.needs_staging(); }
+  [[nodiscard]] bool needs_staging() const noexcept { return h_buffer.needs_staging(); }
 
   [[nodiscard]] bool is_fragmented() const noexcept { return h_buffer.is_fragmented(); }
 

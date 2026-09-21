@@ -928,7 +928,12 @@ TEST_CASE("rest_ioctx terminates a repeated-token empty LIST loop", "[s3][integr
   range_http_server server(
     deterministic_payload(16), fault, {}, scripted_list_mode::repeated_empty_token);
 
-  auto const result = run_list_watchdog(server, 10s, 1s);
+  // This deadline starts when the server accepts the request, so it includes
+  // the injected delay, response handling, context shutdown, and child-process
+  // teardown. Keep it at least as long as the direct client's request timeout;
+  // the watchdog still bounds a pagination regression without becoming a CI
+  // scheduler-load test.
+  auto const result = run_list_watchdog(server, 10s, 5s);
   INFO("LIST requests=" << server.list_count());
   CHECK_FALSE(result.timed_out);
   CHECK(result.exited_normally);
@@ -944,7 +949,7 @@ TEST_CASE("rest_ioctx terminates an alternating-token empty LIST loop",
   range_http_server server(
     deterministic_payload(16), fault, {}, scripted_list_mode::alternating_empty_tokens);
 
-  auto const result = run_list_watchdog(server, 10s, 1s);
+  auto const result = run_list_watchdog(server, 10s, 5s);
   INFO("LIST requests=" << server.list_count());
   CHECK_FALSE(result.timed_out);
   CHECK(result.exited_normally);

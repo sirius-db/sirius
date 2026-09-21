@@ -341,11 +341,11 @@ next_task_result task_creator::get_operator_for_next_task(
   std::vector<std::shared_ptr<pipeline::sirius_pipeline>>& visited_pipelines)
 {
   // The only case with nobody to blame: there was no operator to ask.
-  if (node == nullptr) { return {nullptr, next_task_state::depleted}; }
+  if (node == nullptr) { return {nullptr, false}; }
   if (auto pipeline = node->get_pipeline()) { visited_pipelines.push_back(std::move(pipeline)); }
 
   auto hint = node->get_next_task_hint();
-  if (!hint.has_value()) { return {node, next_task_state::depleted}; }
+  if (!hint.has_value()) { return {node, false}; }
 
   if (hint.value().hint == op::TaskCreationHint::READY) {
     if (hint.value().producer == nullptr) {
@@ -353,7 +353,7 @@ next_task_result task_creator::get_operator_for_next_task(
         "During get_operator_for_next_task Producer is nullptr for operator " + node->get_name());
     }
     // WSM TODO: how do we handle other ports that are not default?
-    return {hint.value().producer, next_task_state::ready};
+    return {hint.value().producer, true};
   }
 
   if (hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
@@ -361,11 +361,11 @@ next_task_result task_creator::get_operator_for_next_task(
     // A null producer means the chain ran out below us, so this node is the last
     // one that was actually asked -- keep it rather than propagating the null,
     // or the failure loses its subject on the way back up.
-    if (deeper.op == nullptr) { return {node, next_task_state::depleted}; }
+    if (deeper.op == nullptr) { return {node, false}; }
     return deeper;
   }
 
-  return {node, next_task_state::depleted};
+  return {node, false};
 }
 
 void task_creator::stop()
@@ -557,7 +557,7 @@ void task_creator::manager_loop()
     auto* requested_node = node;
     auto const next      = get_operator_for_next_task(node, visited_pipelines);
 
-    if (next.state != next_task_state::ready) {
+    if (!next.is_ready) {
       // Same re-evaluation the creation path does on exit: get_next_task_hint()
       // can have drained ports (hash join's discard sweep) in ANY pipeline the
       // hint walk visited, making it finishable. A visited upstream pipeline

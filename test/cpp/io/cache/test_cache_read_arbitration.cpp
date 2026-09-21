@@ -365,7 +365,7 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
 
   auto bounced = fixture.context->reactor().take_next();
   REQUIRE(bounced != nullptr);
-  CHECK(bounced->front().is_staged());
+  CHECK(bounced->front().needs_staging());
   CHECK_FALSE(bounced->front().is_fragmented());
   CHECK(bounced->front().has_device_request());
 
