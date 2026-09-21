@@ -22,6 +22,68 @@
 
 namespace sirius::event {
 
+bool event_queue::push(std::shared_ptr<query_events> payload) noexcept
+{
+  auto const id = std::visit([](auto const& e) { return e.event_id; }, *payload);
+  std::lock_guard lock{_mutex};
+  if (_closed) { return false; }
+  try {
+    _pending.insert(id);
+    if (_queue.push(std::move(payload))) { return true; }
+  } catch (...) {
+  }
+  _pending.erase(id);
+  _failed = true;
+  _completed.notify_all();
+  return false;
+}
+
+void event_queue::complete(event_id_t id) noexcept
+{
+  std::lock_guard lock{_mutex};
+  _pending.erase(id);
+  _completed.notify_all();
+}
+
+void event_queue::delivery_failed() noexcept
+{
+  std::lock_guard lock{_mutex};
+  _failed = true;
+  _completed.notify_all();
+}
+
+void event_queue::interrupt()
+{
+  {
+    std::lock_guard lock{_mutex};
+    _closed = true;
+    _completed.notify_all();
+  }
+  _queue.interrupt();
+}
+
+bool event_queue::wait_before(event_id_t cutoff, std::chrono::milliseconds timeout)
+{
+  std::unique_lock lock{_mutex};
+  auto drained = [&] { return _pending.empty() || *_pending.begin() >= cutoff; };
+  return _completed.wait_for(lock, timeout, [&] { return _closed || _failed || drained(); }) &&
+         !_closed && !_failed && drained();
+}
+
+bool query_event_publisher::flush(std::shared_ptr<event_queue> const& queue,
+                                  std::chrono::milliseconds timeout)
+{
+  event_id_t cutoff;
+  {
+    // Finish every in-flight enqueue before capturing the boundary. Release
+    // the routing lock before waiting: a subscriber hook may publish events.
+    std::unique_lock lock{_queues_mtx};
+    if (_stopped) { return false; }
+    cutoff = _next_event_id.load(std::memory_order_relaxed);
+  }
+  return queue->wait_before(cutoff, timeout);
+}
+
 // ---------------------------------------------------------------------------
 // registration (private; only the subscriber base ever calls these)
 // ---------------------------------------------------------------------------
@@ -145,6 +207,12 @@ void query_event_publisher::publish_wait_for_memory_for_task(query_id_t query_id
                                                              std::size_t bytes_needed) noexcept
 {
   publish<wait_for_memory_for_task_event>(query_id, operator_id, gpu_id, bytes_needed);
+}
+
+void query_event_publisher::publish_compressed_materialization(
+  compressed_materialization_activity activity, std::uint64_t count) noexcept
+{
+  publish<compressed_materialization_event>(activity, count);
 }
 
 }  // namespace sirius::event

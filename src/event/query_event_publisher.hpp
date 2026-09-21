@@ -22,9 +22,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <span>
 #include <stop_token>
@@ -36,11 +38,25 @@ namespace sirius::event {
 
 class query_event_subscriber;
 
-/// A subscriber's mailbox.  @c interruptible_mpmc already is what this needs:
-/// a closable queue whose @c interrupt wakes a parked consumer at once and
-/// whose @c push becomes a no-op once closed --- so closing a mailbox both
-/// releases its worker and stops the publisher feeding a queue nobody drains.
-using event_queue = exec::interruptible_mpmc<std::shared_ptr<query_events>>;
+/// Tracks unfinished deliveries independently of queue order. Different producers
+/// can enqueue out of event-ID order, so a maximum processed ID is not a fence.
+class event_queue {
+ public:
+  bool push(std::shared_ptr<query_events> payload) noexcept;
+  std::shared_ptr<query_events> pop() { return _queue.pop(); }
+  void complete(event_id_t id) noexcept;
+  void interrupt();
+  void delivery_failed() noexcept;
+  bool wait_before(event_id_t cutoff, std::chrono::milliseconds timeout);
+
+ private:
+  exec::interruptible_mpmc<std::shared_ptr<query_events>> _queue;
+  std::mutex _mutex;
+  std::condition_variable _completed;
+  std::set<event_id_t> _pending;
+  bool _failed{false};
+  bool _closed{false};
+};
 
 /// One subscriber's mailbox plus the publisher-wide stop token.  The queue is
 /// what the publisher pushes into; the token is what tells a subscriber the
@@ -142,8 +158,13 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
                                         int gpu_id,
                                         std::size_t bytes_needed) noexcept;
 
+  void publish_compressed_materialization(compressed_materialization_activity activity,
+                                          std::uint64_t count = 1) noexcept;
+
  private:
   friend class query_event_subscriber;
+
+  bool flush(std::shared_ptr<event_queue> const& queue, std::chrono::milliseconds timeout);
 
   /// Mint a mailbox subscribed to @p events and nothing else, and add it to
   /// the routing table.  Called by the subscriber base in its constructor.
@@ -179,10 +200,10 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   template <typename Event, typename... Args>
   void publish(Args&&... args) noexcept
   {
+    std::shared_lock g{_queues_mtx};
+    auto const& subscribers = _by_event[event_index_v<Event>];
+    if (subscribers.empty()) { return; }
     try {
-      std::shared_lock g{_queues_mtx};
-      auto const& subscribers = _by_event[event_index_v<Event>];
-      if (subscribers.empty()) { return; }
       auto const event_id  = _next_event_id.fetch_add(1, std::memory_order_relaxed);
       auto const timestamp = std::chrono::system_clock::now();
       auto payload         = std::make_shared<query_events>(
@@ -190,8 +211,11 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
       for (auto* q : subscribers) {
         std::ignore = q->push(payload);
       }
-    } catch (...) {  // NOLINT(bugprone-empty-catch)
-      // Telemetry is not worth failing execution over.
+    } catch (...) {
+      // Execution remains best effort, but observers must not report an incomplete snapshot.
+      for (auto* q : subscribers) {
+        q->delivery_failed();
+      }
     }
   }
 

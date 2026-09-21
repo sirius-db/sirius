@@ -90,6 +90,13 @@ void query_event_subscriber::start()
   set_thread_name();
 }
 
+bool query_event_subscriber::flush(std::chrono::milliseconds timeout)
+{
+  if (!is_subscribed()) { return false; }
+  auto publisher = _publisher.lock();
+  return publisher && publisher->flush(_queue, timeout);
+}
+
 void query_event_subscriber::stop() noexcept
 {
   std::lock_guard g{_mtx};
@@ -158,12 +165,20 @@ void query_event_subscriber::on_wait_for_memory_for_task(
 // worker
 // ---------------------------------------------------------------------------
 
+void query_event_subscriber::on_compressed_materialization(event_id_t,
+                                                           timestamp_t,
+                                                           compressed_materialization_activity,
+                                                           std::uint64_t) noexcept
+{
+}
+
 void query_event_subscriber::run() noexcept
 {
   // pop() returns null exactly once the mailbox closes, which every teardown
   // path does -- so the loop needs no second exit condition of its own.
   while (auto event = _queue->pop()) {
     dispatch(*event);
+    _queue->complete(std::visit([](auto const& e) { return e.event_id; }, *event));
   }
   _worker_live.store(false, std::memory_order_release);
 }
@@ -191,6 +206,8 @@ void query_event_subscriber::dispatch(query_events const& event) noexcept
             on_memory_downgrade_for_task(e.event_id, e.timestamp, args...);
           } else if constexpr (type == event_type::wait_for_memory_for_task) {
             on_wait_for_memory_for_task(e.event_id, e.timestamp, args...);
+          } else if constexpr (type == event_type::compressed_materialization) {
+            on_compressed_materialization(e.event_id, e.timestamp, args...);
           } else {
             static_assert(unhandled_event_type<type>, "unhandled event_type");
           }

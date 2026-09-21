@@ -83,7 +83,7 @@ class sirius_gpu_scan_operator : public sirius_physical_operator {
    * @param types                  Output column types in plan order.
    * @param estimated_cardinality  Planner-estimated row count.
    * @param ingestible             Per-table source built by the plan generator.
-   * @param compressed_materialization_observer  Plan-time counter sink for
+   * @param compressed_materialization_observer  Context providing events for
    *                               narrowing observability; may be null.
    */
   sirius_gpu_scan_operator(duckdb::vector<sirius::logical_type> types,
