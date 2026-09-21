@@ -42,6 +42,21 @@ using namespace sirius;
 using namespace sirius::event;
 using namespace std::chrono_literals;
 
+namespace sirius::event {
+// Hold the same locks as an in-flight publisher so timeout tests do not depend
+// on scheduler luck or a large burst of publications.
+struct query_event_test_access {
+  static auto hold_routing(query_event_publisher& publisher)
+  {
+    return std::shared_lock{publisher._queues_mtx};
+  }
+  static auto hold_mailbox(query_event_publisher& publisher)
+  {
+    return std::unique_lock{publisher._queues.front()->_mutex};
+  }
+};
+}  // namespace sirius::event
+
 namespace {
 
 /// Records what it was told, in the order it was told.  Everything is under one
@@ -1015,6 +1030,27 @@ TEST_CASE("flush fails after shutdown or before worker start", "[event][query_ev
   CHECK_FALSE(subscriber.flush(1ms));
 }
 
+TEST_CASE("flush times out while a publisher holds a lock", "[event][query_event_flush]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  metadata_subscriber subscriber{*publisher};
+  subscriber.start();
+  REQUIRE(subscriber.flush());
+
+  auto check_timeout = [&](auto lock) {
+    auto result = std::async(std::launch::async, [&] { return subscriber.flush(10ms); });
+    // Keep the lock held well beyond the timeout. Release before assertions so
+    // an unbounded implementation fails cleanly instead of hanging teardown.
+    auto const status = result.wait_for(1s);
+    lock.unlock();
+    CHECK(status == std::future_status::ready);
+    CHECK_FALSE(result.get());
+    CHECK(subscriber.flush());
+  };
+  SECTION("routing lock") { check_timeout(query_event_test_access::hold_routing(*publisher)); }
+  SECTION("mailbox lock") { check_timeout(query_event_test_access::hold_mailbox(*publisher)); }
+}
+
 TEST_CASE("a delivery fence cannot skip an older unfinished event", "[event][query_event_flush]")
 {
   // Exercise out-of-order completion deterministically: a largest-seen-ID
@@ -1026,12 +1062,13 @@ TEST_CASE("a delivery fence cannot skip an older unfinished event", "[event][que
   REQUIRE(queue.push(payload(10)));
   REQUIRE(queue.push(payload(12)));
   queue.complete(12);
-  CHECK_FALSE(queue.wait_before(13, 1ms));
+  CHECK_FALSE(queue.wait_before(13, std::chrono::steady_clock::now() + 1ms));
   queue.complete(10);
-  REQUIRE(queue.wait_before(13, 1ms));
+  REQUIRE(queue.wait_before(13, std::chrono::steady_clock::now() + 1ms));
   REQUIRE(queue.push(payload(15)));
-  CHECK(queue.wait_before(13, 1ms));  // Publications beyond the fence do not hold it up.
+  // Publications beyond the fence do not hold it up.
+  CHECK(queue.wait_before(13, std::chrono::steady_clock::now() + 1ms));
   SECTION("delivery failure") { queue.delivery_failed(); }
   SECTION("shutdown") { queue.interrupt(); }
-  CHECK_FALSE(queue.wait_before(13, 1ms));
+  CHECK_FALSE(queue.wait_before(13, std::chrono::steady_clock::now() + 1ms));
 }
