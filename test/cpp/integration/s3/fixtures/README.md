@@ -1,6 +1,6 @@
 # S3 Perf Benchmark Fixture
 
-The hidden `[.][s3][bench]` Catch2 benchmark uses an SF=10 `lineitem`
+The hidden `[!benchmark][b1_bench]` Catch2 benchmark uses an SF=10 `lineitem`
 Parquet fixture. It is now generated and uploaded **by the test binary itself**
 (`test/cpp/utils/s3_container.*`) when `SIRIUS_TEST_S3_LARGE=1`, which:
 
@@ -13,13 +13,13 @@ The benchmark reads `SIRIUS_BENCH_S3_*` and falls back to the harness-published
 `SIRIUS_TEST_S3_*`, with `SIRIUS_BENCH_S3_KEY` defaulting to
 `tpch/lineitem_sf10.parquet`.
 
-For local MinIO, just run:
+For local MinIO, run the benchmark wrapper:
 
 ```sh
-make s3-bench
+test/cpp/integration/s3/run_b1_bench.sh
 ```
 
-`make s3-bench` sets `SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1
+The wrapper sets `SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1
 SIRIUS_TEST_S3_STRICT=1` for the default MinIO backend, so MinIO is
 auto-managed, the SF10 fixture is prepared in-process, and any bring-up failure
 is loud — no separate fixture/up step.
