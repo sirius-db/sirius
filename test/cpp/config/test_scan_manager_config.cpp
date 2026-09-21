@@ -364,6 +364,48 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
   CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 5);
 }
 
+TEST_CASE("uring scan budget distinguishes an omitted value from an explicit default",
+          "[scan_manager][config][readahead]")
+{
+  constexpr auto struct_default =
+    static_cast<std::size_t>(sirius::exec::default_gpu_pipeline_num_threads);
+  constexpr auto pipeline_width = struct_default + 3;
+  constexpr auto other_explicit = struct_default + 1;
+
+  auto yaml = [=](std::optional<std::size_t> uring_budget) {
+    auto text =
+      std::string{
+        "sirius:\n"
+        "  executor:\n"
+        "    pipeline:\n"
+        "      num_threads: "} +
+      std::to_string(pipeline_width) +
+      "\n"
+      "    scan_manager:\n";
+    if (uring_budget.has_value()) {
+      text +=
+        "      uring:\n"
+        "        n_max_concurrent_scans: " +
+        std::to_string(*uring_budget) + "\n";
+    }
+    return text;
+  };
+
+  auto const omitted = load_scan_manager("sirius_uring_budget_omitted.yaml", yaml(std::nullopt));
+  CHECK_FALSE(omitted.uring.n_max_concurrent_scans_explicit);
+  CHECK(omitted.uring.n_max_concurrent_scans == pipeline_width);
+
+  auto const explicit_default =
+    load_scan_manager("sirius_uring_budget_explicit_default.yaml", yaml(struct_default));
+  CHECK(explicit_default.uring.n_max_concurrent_scans_explicit);
+  CHECK(explicit_default.uring.n_max_concurrent_scans == struct_default);
+
+  auto const explicit_other =
+    load_scan_manager("sirius_uring_budget_explicit_other.yaml", yaml(other_explicit));
+  CHECK(explicit_other.uring.n_max_concurrent_scans_explicit);
+  CHECK(explicit_other.uring.n_max_concurrent_scans == other_explicit);
+}
+
 TEST_CASE("sirius_config reads max_readahead_scans", "[scan_manager][config][readahead]")
 {
   auto const unset = load_scan_manager("sirius_readahead_unset.yaml",
