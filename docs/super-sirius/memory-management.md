@@ -201,9 +201,10 @@ Three mechanisms carry it:
 
 1. **Writer-event wait before the downgrade reads.** `convertible_data_batch::convert` waits the
    batch's writer event on its conversion stream before `convert_to` reads a byte. Holding the
-   exclusive lock does not imply the producer's writes have landed. For legacy GPU batches
-   without a writer event, it synchronizes the device before rebinding the buffers' deallocation
-   stream and converting. Batches with a writer event retain the stream-local wait.
+   exclusive lock does not imply the producer's writes have landed. Sirius's GPU batch helpers
+   record missing writer events before publication, including for default-stream producers, on
+   the producing thread/device. A GPU batch without a writer event is rejected before rebinding
+   or converting; there is no device-wide synchronization fallback.
 2. **Reader events at intra-operator ownership handoffs.** The scan's `owning_table_view` records
    a reader event for zero-copy views whose owner can be replaced before control returns to the
    pipeline task (`record_reader_event`, cuCascade #184). `try_to_mutable()` then refuses, and

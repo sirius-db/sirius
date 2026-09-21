@@ -17,6 +17,7 @@
 #include "catch.hpp"
 
 // sirius
+#include "data/convertible_data_batch.hpp"
 #include "data/data_repository_manager_registry.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/multiple_blocks_allocation_accessor.hpp"
@@ -283,19 +284,42 @@ TEST_CASE("request_free_memory preserves pending producer writes",
   auto* gpu_space                = get_gpu_space(*mem_mgr);
   REQUIRE(gpu_space != nullptr);
   rmm::cuda_stream producer{rmm::cuda_stream::flags::non_blocking};
+  auto const use_default_stream = GENERATE(false, true);
+  ::cuda::stream_ref writer_stream =
+    use_default_stream ? ::cuda::stream_ref{cudaStream_t{nullptr}} : ::cuda::stream_ref{producer};
+  CAPTURE(use_default_stream);
   sirius::data::data_repository_manager_registry repo_registry;
   auto& repo_mgr = *repo_registry.create_for_query(kTestQueryId);
   auto repo      = std::make_unique<cucascade::shared_data_repository>();
-  auto table     = make_int32_table(*gpu_space, rows, 0x11, producer);
+  auto table     = make_int32_table(*gpu_space, rows, 0x11, writer_stream);
   auto* data     = table->mutable_view().column(0).data<int32_t>();
+  std::shared_ptr<cudf::table> table_owner;
   std::shared_ptr<cucascade::data_batch> batch;
   auto executor = make_test_executor(repo_registry, gpu_space, *mem_mgr);
-  producer_gate gate{producer};
+  producer_gate gate{writer_stream};
 
-  REQUIRE(cudaLaunchHostFunc(producer.value(), producer_gate::wait, &gate) == cudaSuccess);
-  REQUIRE(cudaMemsetAsync(data, 0x22, rows * sizeof(int32_t), producer.value()) == cudaSuccess);
-  batch = sirius::make_data_batch(
-    std::move(table), *gpu_space, producer, sirius::telemetry::batch_telemetry_info{});
+  REQUIRE(cudaLaunchHostFunc(writer_stream.get(), producer_gate::wait, &gate) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(data, 0x22, rows * sizeof(int32_t), writer_stream.get()) == cudaSuccess);
+  SECTION("unique_ptr table")
+  {
+    batch = sirius::make_data_batch(
+      std::move(table), *gpu_space, writer_stream, sirius::telemetry::batch_telemetry_info{});
+  }
+  SECTION("table rvalue")
+  {
+    batch = sirius::make_data_batch(
+      std::move(*table), *gpu_space, writer_stream, sirius::telemetry::batch_telemetry_info{});
+  }
+  SECTION("owned table view")
+  {
+    table_owner = std::move(table);
+    batch       = sirius::make_data_batch_from_view(table_owner->view(),
+                                              table_owner,
+                                              table_owner->alloc_size(),
+                                              *gpu_space,
+                                              writer_stream,
+                                              sirius::telemetry::batch_telemetry_info{});
+  }
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
   {
@@ -309,14 +333,14 @@ TEST_CASE("request_free_memory preserves pending producer writes",
   REQUIRE(freed.wait_for(100ms) == std::future_status::timeout);
   gate.released.store(true, std::memory_order_release);
   REQUIRE(freed.get() > 0);
-  producer.synchronize();
+  writer_stream.sync();
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::HOST);
   auto values = read_host_int32(*batch, rows);
   REQUIRE(std::count(values.begin(), values.end(), final_value) == rows);
   executor.stop();
 }
 
-TEST_CASE("request_free_memory_and_wait preserves a settled batch without a writer event",
+TEST_CASE("GPU downgrade rejects a missing writer event until the producer records one",
           "[downgrade_executor][producer_ordering]")
 {
   constexpr cudf::size_type rows   = 1024;
@@ -333,6 +357,18 @@ TEST_CASE("request_free_memory_and_wait preserves a settled batch without a writ
     std::move(table), *gpu_space, ::cuda::stream_ref{cudaStream_t{nullptr}});
   REQUIRE(representation->get_writer_event() == nullptr);
   auto batch = cucascade::data_batch::make(sirius::get_next_batch_id(), std::move(representation));
+  auto* host_space = mem_mgr->get_memory_space(cucascade::memory::Tier::HOST, 0);
+  REQUIRE(host_space != nullptr);
+  sirius::convertible_data_batch wrapper(batch);
+  REQUIRE_THROWS_WITH(wrapper.convert({host_space}, producer, *mem_mgr, true),
+                      "GPU batch must have a writer event before conversion");
+  REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::GPU);
+  REQUIRE(batch->get_state() == cucascade::batch_state::idle);
+  {
+    auto mut = batch->to_mutable();
+    mut.get_data()->record_writer_event(producer);
+    REQUIRE(mut.get_data()->get_writer_event() != nullptr);
+  }
   repo->add_data_batch(batch);
   repo_mgr.add_new_repository(1, "out", std::move(repo));
 

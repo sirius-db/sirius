@@ -21,8 +21,6 @@
 #include "log/logging.hpp"
 #include "telemetry/batch_telemetry.hpp"
 
-#include <rmm/detail/error.hpp>
-
 #include <cuda/stream>
 
 #include <cucascade/cuda/event.hpp>
@@ -40,6 +38,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {
@@ -119,9 +118,7 @@ class convertible_data_batch : public convertible_data {
           writer_event != nullptr) {
         cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
       } else if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
-        // Legacy batches have no producer event, so their allocation and writes must finish
-        // before another stream can read or free their buffers.
-        RMM_CUDA_TRY(cudaDeviceSynchronize());
+        throw std::logic_error("GPU batch must have a writer event before conversion");
       }
 
       // When downgrading off the GPU, rebind the source buffers' deallocation stream to this
