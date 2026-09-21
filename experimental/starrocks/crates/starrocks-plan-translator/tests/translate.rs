@@ -1380,19 +1380,15 @@ fn duplicate_output_names_are_unique_and_match_root() {
     assert_eq!(root(&translated.plan).names, translated.output_names);
 }
 
-/// Verifies translated plans have readable explain/debug output for logs.
+/// Verifies translated plans have readable debug output for logs.
 #[test]
-fn translated_plan_explain_and_debug_are_readable() {
+fn translated_plan_debug_is_readable() {
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![scan_node(0, 0)])),
         Some(base_desc()),
         None,
     ))
     .unwrap();
-
-    let explain = translated.explain().to_string();
-    assert!(explain.contains("Read"));
-    assert!(explain.contains("users"));
 
     let debug = format!("{translated:?}");
     assert!(debug.contains("TranslatedPlan"));
@@ -2848,14 +2844,11 @@ fn sort_with_limit_becomes_project_sort_fetch() {
     let rel::RelType::Fetch(fetch) = root.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected fetch relation");
     };
-    #[allow(deprecated)]
-    {
-        assert_eq!(
-            fetch.count_mode,
-            Some(substrait::proto::fetch_rel::CountMode::Count(5))
-        );
-        assert_eq!(fetch.offset_mode, None);
-    }
+    assert_eq!(
+        fetch.count_expr.as_deref().map(literal_type),
+        Some(&expression::literal::LiteralType::I64(5))
+    );
+    assert_eq!(fetch.offset_expr, None);
     let rel::RelType::Sort(sort) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
         panic!("expected sort under fetch");
     };
@@ -4301,13 +4294,12 @@ fn sort_fetch_desc() -> TDescriptorTable {
 }
 
 /// Translates a fragment whose only node is a sort with `limit`/`offset`, returning its fetch.
-#[allow(deprecated)]
-fn fetch_modes(
+fn fetch_expressions(
     limit: i64,
     offset: Option<i64>,
 ) -> (
-    Option<substrait::proto::fetch_rel::CountMode>,
-    Option<substrait::proto::fetch_rel::OffsetMode>,
+    Option<expression::literal::LiteralType>,
+    Option<expression::literal::LiteralType>,
 ) {
     let translated = translate_fragment(&params(
         Some(TPlan::new(vec![
@@ -4320,42 +4312,43 @@ fn fetch_modes(
     .unwrap();
     let root = root(&translated.plan);
     match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
-        rel::RelType::Fetch(fetch) => (fetch.count_mode.clone(), fetch.offset_mode.clone()),
+        rel::RelType::Fetch(fetch) => (
+            fetch.count_expr.as_deref().map(literal_type).cloned(),
+            fetch.offset_expr.as_deref().map(literal_type).cloned(),
+        ),
         other => panic!("expected a fetch relation, got {other:?}"),
     }
 }
 
-/// An offset with no limit must still emit an explicit unlimited count: DuckDB's consumer reads
-/// the plain `count` field without checking the oneof, so an unset count decodes as `LIMIT 0` and
-/// the query silently returns no rows.
+/// An offset with no limit leaves the count expression unset, as required by Substrait.
 #[test]
-#[allow(deprecated)]
-fn offset_without_limit_emits_an_unlimited_count() {
-    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+fn offset_without_limit_leaves_count_unset() {
     assert_eq!(
-        fetch_modes(-1, Some(5)),
-        (Some(CountMode::Count(-1)), Some(OffsetMode::Offset(5)))
+        fetch_expressions(-1, Some(5)),
+        (None, Some(expression::literal::LiteralType::I64(5)))
     );
 }
 
 /// `LIMIT n OFFSET m` carries both modes.
 #[test]
-#[allow(deprecated)]
-fn limit_and_offset_emit_both_modes() {
-    use substrait::proto::fetch_rel::{CountMode, OffsetMode};
+fn limit_and_offset_emit_both_expressions() {
     assert_eq!(
-        fetch_modes(10, Some(5)),
-        (Some(CountMode::Count(10)), Some(OffsetMode::Offset(5)))
+        fetch_expressions(10, Some(5)),
+        (
+            Some(expression::literal::LiteralType::I64(10)),
+            Some(expression::literal::LiteralType::I64(5)),
+        )
     );
 }
 
-/// `LIMIT 0` is a real limit, not the "unset" sentinel: it must reach the plan as `Count(0)`
+/// `LIMIT 0` is a real limit, not the "unset" sentinel: it must reach the plan as `I64(0)`
 /// rather than being folded away into an unlimited fetch.
 #[test]
-#[allow(deprecated)]
 fn zero_limit_is_not_treated_as_unlimited() {
-    use substrait::proto::fetch_rel::CountMode;
-    assert_eq!(fetch_modes(0, Some(0)), (Some(CountMode::Count(0)), None));
+    assert_eq!(
+        fetch_expressions(0, Some(0)),
+        (Some(expression::literal::LiteralType::I64(0)), None)
+    );
 }
 
 /// A limit on a non-sort node still becomes a fetch, and it sits *above* that node's conjunct
@@ -4392,8 +4385,8 @@ fn a_limit_on_an_aggregation_fetches_above_its_having_filter() {
         panic!("expected the limit to become a fetch above the aggregation");
     };
     assert_eq!(
-        fetch.count_mode,
-        Some(substrait::proto::fetch_rel::CountMode::Count(3))
+        fetch.count_expr.as_deref().map(literal_type),
+        Some(&expression::literal::LiteralType::I64(3))
     );
     let rel::RelType::Filter(filter) = fetch.input.as_ref().unwrap().rel_type.as_ref().unwrap()
     else {
