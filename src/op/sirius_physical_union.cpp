@@ -209,7 +209,7 @@ std::unique_ptr<operator_data> sirius_physical_union::get_next_task_input_data()
   popped.push_back(std::move(batch));
   auto input = std::make_unique<pipelineable_operator_data>(std::move(popped));
 
-  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline_to_schedule;
+  std::shared_ptr<pipeline::sirius_pipeline> pipeline_to_schedule;
   if (p->repo->total_size() == 0 && p->src_pipeline && p->src_pipeline->is_pipeline_finished()) {
     ++_active_arm;
     _active_arm_nominated = false;

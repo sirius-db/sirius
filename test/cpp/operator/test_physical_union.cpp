@@ -90,8 +90,7 @@ class union_fixture {
     : _memory_manager(sirius::test::operator_utils::initialize_memory_manager()),
       _creator(*_memory_manager, strategy),
       union_op({}, 0),
-      union_pipeline(
-        duckdb::make_shared_ptr<sirius_pipeline>(pipeline_build_context{nullptr, true}))
+      union_pipeline(std::make_shared<sirius_pipeline>(pipeline_build_context{nullptr, true}))
   {
     union_op.set_pipeline(union_pipeline);
     union_pipeline->set_task_creator(&_creator);
@@ -105,7 +104,7 @@ class union_fixture {
       producers.push_back(producer_ptr);
 
       auto pipeline =
-        duckdb::make_shared_ptr<controllable_pipeline>(pipeline_build_context{nullptr, true});
+        std::make_shared<controllable_pipeline>(pipeline_build_context{nullptr, true});
       duckdb::vector<std::reference_wrapper<sirius_physical_operator>> operators;
       operators.emplace_back(*producer_ptr);
       build_state.set_pipeline_operators(*pipeline, std::move(operators));
@@ -141,9 +140,9 @@ class union_fixture {
   }
 
   sirius_physical_union union_op;
-  duckdb::shared_ptr<sirius_pipeline> union_pipeline;
+  std::shared_ptr<sirius_pipeline> union_pipeline;
   std::vector<sirius_physical_operator*> producers;
-  std::vector<duckdb::shared_ptr<controllable_pipeline>> source_pipelines;
+  std::vector<std::shared_ptr<controllable_pipeline>> source_pipelines;
   std::vector<std::unique_ptr<cucascade::shared_data_repository>> repositories;
 };
 
