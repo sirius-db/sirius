@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "io/cache/types.hpp"
 #include "io/templated_ioctx.hpp"
 
 #include <algorithm>
@@ -177,4 +178,35 @@ TEST_CASE("mixed dispatch with no reactors fails and releases prepared cache sli
   CHECK_FALSE(callback_success.load(std::memory_order_acquire));
   CHECK(future.is_ready());
   CHECK_THROWS_WITH(std::move(future).get(), "mixed_readv_async_io: no available reactors");
+}
+
+TEST_CASE("mixed dispatch reports failure for a dropped fragmented slice past EOF", "[io][ioctx]")
+{
+  std::vector<std::unique_ptr<fake_reactor>> reactors;
+  reactors.push_back(std::make_unique<fake_reactor>());
+  fake_context context{std::move(reactors)};
+  auto object = std::make_shared<fake_object>("fake", 4096);
+
+  std::atomic<bool> callback_success{true};
+  std::atomic<int> callback_count{0};
+  auto completion = std::make_shared<sirius::io::prepared_io_completion>(
+    [&](std::span<sirius::io::cache::cached_chunk* const>, bool success) noexcept {
+      callback_success.store(success, std::memory_order_release);
+      callback_count.fetch_add(1, std::memory_order_acq_rel);
+    });
+
+  sirius::io::cache::cached_chunk chunk{object->size()};
+  sirius::io::prepared_io_slice slice{
+    sirius::io::range{object->size(), 64},
+    sirius::io::host_buffer{std::vector<sirius::io::cache::cached_chunk*>{&chunk}}};
+  slice.on_complete = completion;
+  std::vector<sirius::io::prepared_io_slice> slices;
+  slices.push_back(std::move(slice));
+
+  auto future = context.mixed_readv_async_io(*object, std::move(slices));
+
+  CHECK_FALSE(callback_success.load(std::memory_order_acquire));
+  CHECK(callback_count.load(std::memory_order_acquire) == 1);
+  REQUIRE(future.is_ready());
+  CHECK(std::move(future).get() == 0);
 }
