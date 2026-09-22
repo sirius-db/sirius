@@ -197,6 +197,15 @@ class ioctx : public std::enable_shared_from_this<ioctx> {
   /// opted in is never scheduled against.
   [[nodiscard]] virtual std::size_t n_max_concurrent_scans() const noexcept { return 0; }
 
+  /// Size of one staging block on this backend's reactors, in bytes.  A reactor
+  /// that fills cache chunks computes each fragmented fill's extent with
+  /// @c cache::fill_span(fill, chunk->offset, staging_block_size), so this MUST
+  /// equal @c prefetching_cache::chunk_size() — @ref initialize_cache checks it.
+  ///
+  /// Conservatively 0 — a backend that has not opted in does not stage through
+  /// cache chunks and is not checked.
+  [[nodiscard]] virtual std::size_t staging_block_size() const noexcept { return 0; }
+
   /// Build the prefetching cache.  One-shot — calling twice is a no-op
   /// after the first successful build.  The cache holds a raw
   /// back-pointer to this ioctx and stays alive until @ref

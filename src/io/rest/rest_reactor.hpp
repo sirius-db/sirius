@@ -255,6 +255,22 @@ class rest_reactor {
   /// in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
+  /// Staging block size, taken from the context's host resource (0 when the
+  /// context has none).  INVARIANT: when a prefetching cache is present this
+  /// MUST equal its chunk size — the worker plans a fragmented fill's extent as
+  /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
+  /// block writes past the end of the pinned chunk and a smaller one marks a
+  /// chunk cached while only part of it was fetched.  Checked once in
+  /// @c ioctx::initialize_cache, which is the only place both sizes are known
+  /// (the reactor is built, and may already be started, before the cache
+  /// exists).
+  [[nodiscard]] std::size_t staging_block_size() const noexcept
+  {
+    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
+             ? std::size_t{0}
+             : _ctx->host_memory_resource()->get_block_size();
+  }
+
   // -- dispatch / lifecycle ------------------------------------------------
 
   /// Launch the worker thread. Split out of the constructor so a reactor can be
