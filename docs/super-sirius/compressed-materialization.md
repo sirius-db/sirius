@@ -584,6 +584,13 @@ Draining needs no per-event completion tracking; the publisher already enqueues 
 A stopped observer or delivery failure rejects the snapshot. Query completion alone does not imply
 subscriber completion.
 
+The publisher exposes an advisory atomic subscriber-interest check. Hash partitions use it
+before inspecting batch column types for these observations; without a subscriber, that
+inspection is skipped. Publishing also checks interest before acquiring the routing lock, then
+rechecks the subscriber list under the lock before delivery. Register observers before starting
+the measured operation: a concurrent registration may miss an event whose interest check has
+already returned false.
+
 Among these observations, beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time
 `scan_sidecars_installed` counter, counting table scans that received a narrow physical sidecar

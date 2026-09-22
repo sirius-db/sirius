@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,11 @@ using namespace std::chrono_literals;
 
 namespace sirius::event {
 struct query_event_test_access {
+  static auto hold_routing(query_event_publisher& publisher)
+  {
+    return std::unique_lock{publisher._queues_mtx};
+  }
+
   static bool has_subscribers(query_event_publisher& publisher)
   {
     std::shared_lock lock{publisher._queues_mtx};
@@ -678,6 +684,108 @@ TEST_CASE("reporters publishing concurrently all get through", "[event][query_ev
 // The tag doubles as the routing index, so a reordered enum or variant would
 // misroute every event; the header static_asserts the ends of that mapping.
 static_assert(n_query_events == all_query_events.size());
+
+TEST_CASE("subscriber interest lasts until the last registration is removed",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  for (auto type : all_query_events) {
+    INFO("event " << static_cast<std::size_t>(type));
+    CHECK_FALSE(publisher->has_subscribers(type));
+    {
+      // Registration, not worker start, decides interest. Duplicate event types
+      // must not keep interest alive after the subscriber goes away.
+      selective_subscriber first{*publisher, {type, type}};
+      CHECK(publisher->has_subscribers(type));
+      for (auto other : all_query_events) {
+        CHECK(publisher->has_subscribers(other) == (other == type));
+      }
+      selective_subscriber second{*publisher, {type}};
+      second.stop();
+      CHECK(publisher->has_subscribers(type));
+    }
+    CHECK_FALSE(publisher->has_subscribers(type));
+    selective_subscriber replacement{*publisher, {type}};
+    CHECK(publisher->has_subscribers(type));
+    replacement.stop();
+    CHECK_FALSE(publisher->has_subscribers(type));
+  }
+  CHECK_FALSE(publisher->has_subscribers(static_cast<event_type>(n_query_events)));
+}
+
+TEST_CASE("publisher shutdown clears interest and prevents new interest",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  std::vector<std::unique_ptr<selective_subscriber>> subscribers;
+  for (auto type : all_query_events) {
+    subscribers.push_back(
+      std::make_unique<selective_subscriber>(*publisher, std::initializer_list<event_type>{type}));
+    CHECK(publisher->has_subscribers(type));
+  }
+  publisher->stop();
+  subscribers.clear();
+  for (auto type : all_query_events) {
+    CHECK_FALSE(publisher->has_subscribers(type));
+    selective_subscriber late{*publisher, {type}};
+    CHECK_FALSE(publisher->has_subscribers(type));
+  }
+}
+
+TEST_CASE("unsubscribed publications bypass the routing lock", "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  // A registered mailbox with no interests must not defeat the per-event check.
+  selective_subscriber empty{*publisher, {}};
+  auto lock         = query_event_test_access::hold_routing(*publisher);
+  auto published    = std::async(std::launch::async, [&] {
+    bool interested = false;
+    for (auto type : all_query_events) {
+      interested |= publisher->has_subscribers(type);
+    }
+    publish_one_of_each(*publisher);
+    return interested;
+  });
+  auto const status = published.wait_for(2s);
+  // Release before assertions so a regression fails rather than hanging teardown.
+  lock.unlock();
+  CHECK(status == std::future_status::ready);
+  CHECK_FALSE(published.get());
+}
+
+TEST_CASE("changing other subscriptions does not drop a live subscriber's events",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  selective_subscriber stable{*publisher, {event_type::task_queue_empty}};
+  stable.start();
+  std::barrier ready{5};
+  std::vector<std::jthread> threads;
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&] {
+      ready.arrive_and_wait();
+      for (int j = 0; j < 500; ++j) {
+        publisher->publish_task_queue_empty();
+        publisher->publish_pipeline_closed(make_query_id(1), 2, 3);
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    ready.arrive_and_wait();
+    for (int i = 0; i < 100; ++i) {
+      // queue-empty retains its stable listener; pipeline-closed alternates
+      // between having a listener and having none while reporters are active.
+      selective_subscriber transient{*publisher,
+                                     {event_type::task_queue_empty, event_type::pipeline_closed}};
+    }
+  });
+  threads.clear();
+  stable.stop();
+  CHECK(stable.count() == 2000);
+  CHECK(stable.unsubscribed_count() == 0);
+  CHECK_FALSE(publisher->has_subscribers(event_type::task_queue_empty));
+  CHECK_FALSE(publisher->has_subscribers(event_type::pipeline_closed));
+}
 
 TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publisher]")
 {
