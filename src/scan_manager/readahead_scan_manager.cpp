@@ -433,8 +433,11 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
 
 void readahead_scan_manager::arm_prefetching()
 {
-  // Once: reloading a live gatekeeper would forget how much the executor is
-  // currently competing and hand the readahead a budget it has already spent.
+  // Once: reload() adds the budget to the count, so a second arming would
+  // double it.  Adding rather than assigning is what keeps the tickets the
+  // executor borrowed before this point on the books -- those reads are still
+  // in flight and will return them, so the readahead must not be handed a full
+  // allowance on top.
   //
   // This is also the only arming there is -- the gatekeeper starts with no
   // tickets, so the worker's acquire simply times out until this runs.
