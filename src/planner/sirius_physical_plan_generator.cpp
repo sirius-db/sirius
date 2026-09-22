@@ -1329,8 +1329,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
       // plan = create_plan(op.Cast<duckdb::LogicalExplain>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_DISTINCT:
-      throw duckdb::NotImplementedException("Distinct not supported");
-      // plan = create_plan(op.Cast<duckdb::LogicalDistinct>());
+      plan = create_plan(op.Cast<duckdb::LogicalDistinct>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_PREPARE:
       throw duckdb::NotImplementedException("Prepare not supported");

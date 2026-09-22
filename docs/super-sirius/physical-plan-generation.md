@@ -21,6 +21,7 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_PROJECTION` | `PROJECTION` | `src/planner/sirius_plan_projection.cpp` |
 | `LOGICAL_FILTER` | `FILTER` | `src/planner/sirius_plan_filter.cpp` |
 | `LOGICAL_AGGREGATE_AND_GROUP_BY` | `HASH_GROUP_BY` / `UNGROUPED_AGGREGATE` | `src/planner/sirius_plan_aggregate.cpp` |
+| `LOGICAL_DISTINCT` | `HASH_GROUP_BY` (zero aggregates) | `src/planner/sirius_plan_distinct.cpp` (some shapes fall back to CPU) |
 | `LOGICAL_COMPARISON_JOIN` | `HASH_JOIN` / `NESTED_LOOP_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_DELIM_JOIN` | `LEFT_DELIM_JOIN` / `RIGHT_DELIM_JOIN` | `src/planner/sirius_plan_comparison_join.cpp` |
 | `LOGICAL_ORDER_BY` | `ORDER_BY` | `src/planner/sirius_plan_order.cpp` |
@@ -62,6 +63,16 @@ Before either is chosen, `materialize_expression_join_keys()` pushes a projectio
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
 - **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
+
+### Distinct Planning
+
+**File:** `src/planner/sirius_plan_distinct.cpp`
+
+`LOGICAL_DISTINCT` becomes a single `sirius_physical_grouped_aggregate` with an empty aggregate list. The distinct targets are the group keys, so deduplication is grouping with nothing to compute per group, and `insert_gpu_pipeline_operators` wraps the result exactly as it wraps a GROUP BY.
+
+- **Reorder projection** — pushed above the aggregate only when a key sits at an output position other than its own (`SELECT DISTINCT ON (b, a) a, b`). Plain `SELECT DISTINCT a, b` never needs one: the binder synthesizes one target per select-list entry, so every output column is already a key at its own position
+- **Unsupported shapes** — refused during `create_plan`, so each is a plan-time CPU fallback: an output column that no distinct target covers (it would need a grouped `FIRST`, which Sirius cannot lower yet), `DISTINCT ON` under an `ORDER BY`, a VARCHAR key under a non-binary `default_collation`, a nested key (`reject_nested_column_operation()`), and a child whose output schema disagrees with the types the node declares
+- **The ordered guard tests `LogicalDistinct::order_by`, not `distinct_type`** — the binder sets `order_by` only for `DISTINCT ON`, so a plain `SELECT DISTINCT a, b FROM t ORDER BY a` runs on the GPU with its `ORDER BY` as a separate `LOGICAL_ORDER` above the node. Turning that guard into a `distinct_type` check would send every ordered `DISTINCT` to the CPU
 
 ### Filter Pushdown
 

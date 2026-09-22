@@ -64,6 +64,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -1025,6 +1026,210 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     REQUIRE(local->get_types().size() == 2);
     CHECK(local->get_types()[0] == sirius::logical_type::make_decimal(15, 2));
     CHECK(local->get_types()[1].id() == sirius::type_id::BIGINT);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - DISTINCT lowers to a zero-aggregate grouped aggregate",
+                 "[plan_tree_shape][isolated_context]")
+{
+  // The chain every supported DISTINCT shape shares: one HASH_GROUP_BY with an empty aggregate
+  // list, wrapped as insert_gpu_pipeline_operators wraps a GROUP BY. Returns the HASH_GROUP_BY so
+  // each section can assert its own key layout.
+  auto require_distinct_wrap_chain = [](sirius_physical_operator* plan) {
+    auto* merge = find_first(plan, SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+    REQUIRE(merge != nullptr);
+    REQUIRE(merge->children.size() == 1);
+
+    auto* partition = merge->children[0].get();
+    REQUIRE(partition->type == SiriusPhysicalOperatorType::PARTITION);
+    CHECK_FALSE(partition->Cast<sirius::op::sirius_physical_partition>().is_build_partition());
+    REQUIRE(partition->children.size() == 1);
+
+    auto* hgb = partition->children[0].get();
+    REQUIRE(hgb->type == SiriusPhysicalOperatorType::HASH_GROUP_BY);
+    auto& aggregate = hgb->Cast<sirius::op::sirius_physical_grouped_aggregate>();
+    CHECK(aggregate.aggregate_slots.empty());
+    CHECK(aggregate.cudf_aggregates.empty());
+    CHECK(aggregate.cudf_aggregate_idx.empty());
+    CHECK_FALSE(aggregate.has_avg);
+    CHECK_FALSE(aggregate.has_count_distinct);
+    CHECK(aggregate.grouping_sets.empty());
+    return &aggregate;
+  };
+
+  SECTION("plain DISTINCT keys the whole row in order and needs no projection")
+  {
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(aggregate->get_output_grouping_indices() == std::vector<int>{0, 1});
+
+    // Every distinct target is a bare reference at its own output index, so the builder emits no
+    // reorder projection.
+    CHECK(collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION).empty());
+  }
+
+  SECTION("plain DISTINCT with ORDER BY still lowers to the GPU")
+  {
+    // LogicalDistinct::order_by is populated only for DISTINCT ON, so this query reaches the
+    // builder with order_by == nullptr and its ORDER BY becomes a separate LOGICAL_ORDER above the
+    // distinct. Turning that guard into a distinct_type check would fail here.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT id, val FROM big_left ORDER BY id");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+    CHECK(find_first(plan.get(), SiriusPhysicalOperatorType::MERGE_SORT) != nullptr);
+  }
+
+  SECTION("DISTINCT ON keys the targets in target order and reorders above the merge")
+  {
+    // The targets are (val, id) but the output columns are (id, val), so group position 0 reads
+    // child column 1 and the builder's trailing push_projection restores the order.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (val, id) id, val FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{1, 0});
+
+    auto projections = collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projections.size() == 1);
+    REQUIRE(projections[0]->children.size() == 1);
+    CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+
+    auto const& select_list =
+      projections[0]->Cast<sirius::op::sirius_physical_projection>().select_list;
+    REQUIRE(select_list.size() == 2);
+    REQUIRE(select_list[0]->holds<sirius::ast::reference>());
+    REQUIRE(select_list[1]->holds<sirius::ast::reference>());
+    CHECK(select_list[0]->get<sirius::ast::reference>().column_index == 1);
+    CHECK(select_list[1]->get<sirius::ast::reference>().column_index == 0);
+  }
+
+  SECTION(
+    "DISTINCT ON with a key that is not an output column keeps the binder's prune "
+    "projection")
+  {
+    // `val` is not in the select list, so the binder appends it to the projection under the
+    // distinct and prunes it again above. Both columns are still distinct targets, so the builder
+    // emits no projection of its own.
+    auto plan = generate_sirius_plan(*con, "SELECT DISTINCT ON (id, val) id FROM big_left");
+    INFO(tree_to_string(plan.get()));
+
+    auto* aggregate = require_distinct_wrap_chain(plan.get());
+    CHECK(aggregate->group_idx == std::vector<int>{0, 1});
+
+    auto projections = collect(plan.get(), SiriusPhysicalOperatorType::PROJECTION);
+    REQUIRE(projections.size() == 1);
+    CHECK(projections[0]->get_types().size() == 1);
+    REQUIRE(projections[0]->children.size() == 1);
+    CHECK(projections[0]->children[0]->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - unsupported DISTINCT shapes are rejected at plan time",
+                 "[plan_tree_shape][isolated_context]")
+{
+  // The builder's own guards throw duckdb::NotImplementedException specifically: SiriusContext
+  // reports that type as an unsupported shape and logs the message, where a plain std::exception
+  // would still fall back but be reported as a plan failure.
+  auto require_rejected = [&](std::string const& query, std::string const& message_fragment) {
+    INFO(query);
+    try {
+      generate_sirius_plan(*con, query);
+    } catch (NotImplementedException const& e) {
+      REQUIRE_THAT(std::string(e.what()), Catch::Contains(message_fragment));
+      return;
+    }
+    FAIL("expected a NotImplementedException containing: " << message_fragment);
+  };
+
+  // The shared reject_nested_column_operation() throws std::runtime_error, so this one asserts the
+  // message only.
+  auto require_rejected_any = [&](std::string const& query, std::string const& message_fragment) {
+    INFO(query);
+    try {
+      generate_sirius_plan(*con, query);
+    } catch (std::exception const& e) {
+      REQUIRE_THAT(std::string(e.what()), Catch::Contains(message_fragment));
+      return;
+    }
+    FAIL("expected an exception containing: " << message_fragment);
+  };
+
+  SECTION("DISTINCT ON with carried columns needs a grouped FIRST")
+  {
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left",
+                     "DISTINCT ON with carried (non-key) columns");
+  }
+
+  SECTION("DISTINCT ON under an ORDER BY names a specific row per group")
+  {
+    require_rejected("SELECT DISTINCT ON (id) id, val FROM big_left ORDER BY val",
+                     "DISTINCT ON with ORDER BY");
+  }
+
+  SECTION("plain DISTINCT ordered by a column outside the select list has an uncovered output")
+  {
+    // The binder synthesizes one distinct target per select-list entry, then hoists `val` into the
+    // select list so the ORDER BY can reference it. The node arrives two columns wide with one
+    // target, so output column 1 has no target at all: a different cause, and a different message,
+    // from a target that is not a column reference.
+    require_rejected("SELECT DISTINCT id FROM big_left ORDER BY val",
+                     "output column 1 has no distinct target");
+  }
+
+  SECTION("a collated distinct target is not a plain reference to any output column")
+  {
+    // Binder::BindModifiers pushes the default collation over every distinct target, so a VARCHAR
+    // key under a non-binary default_collation arrives as a call rather than as a bare reference:
+    // the only route ordinary SQL has into the not-a-bare-reference arm. The integration suite's
+    // collation case runs the same shape but can only watch the fallback counter, which both
+    // uncovered-output arms move, so this is where that arm's message is pinned.
+    //
+    // default_collation is GLOBAL_DEFAULT-scoped, but Catch2 rebuilds the fixture -- and with it
+    // the DuckDB instance -- for every leaf section, so the setting dies with this section.
+    auto collate = con->Query("SET default_collation = 'nocase'");
+    REQUIRE(collate);
+    REQUIRE_FALSE(collate->HasError());
+
+    require_rejected("SELECT DISTINCT pname FROM parts",
+                     "no distinct target is a plain reference to output column 0");
+  }
+
+  SECTION("a nested distinct key is rejected before the child is planned")
+  {
+    auto create = con->Query("CREATE TABLE nested_keys (id INTEGER, s STRUCT(x INTEGER))");
+    REQUIRE(create);
+    REQUIRE_FALSE(create->HasError());
+
+    // The check runs before create_plan(*op.children[0]), so the message names the column rather
+    // than the scan failing first.
+    require_rejected_any("SELECT DISTINCT * FROM nested_keys", "is unsupported in DISTINCT");
+  }
+
+  SECTION("an expression DISTINCT ON target is hoisted, and its outputs are still carried")
+  {
+    // The order binder appends `id + val` to the select list, so the distinct target itself arrives
+    // as a bare reference to that appended column. It is unsupported for the same reason as above:
+    // `id` and `val` are output columns that no target covers.
+    require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
+                     "DISTINCT ON with carried (non-key) columns");
+  }
+
+  SECTION("a DISTINCT node that disagrees with its planned child's schema is rejected")
+  {
+    // create_plan(LogicalAggregate&) rewrites sum()'s HUGEINT return type to BIGINT in its own
+    // logical operator and leaves the parents that already resolved against HUGEINT alone. The
+    // projection above the aggregate is an identity, so create_plan(LogicalProjection&) omits it
+    // and the DISTINCT node's [INTEGER, HUGEINT] meets a child declaring [INTEGER, BIGINT].
+    // Match the per-column half of the message: both guard arms open with "the planned child
+    // produces", and only the element-type arm names a column.
+    require_rejected("SELECT DISTINCT val, sum(id) FROM big_left GROUP BY val", "for column 1");
   }
 }
 

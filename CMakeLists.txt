@@ -470,6 +470,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_cte.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
+    src/planner/sirius_plan_distinct.cpp
     src/planner/sirius_plan_dummy_scan.cpp
     src/planner/sirius_plan_empty_result.cpp
     src/planner/sirius_plan_expression_get.cpp
@@ -896,6 +897,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_cast_date_predicates.cpp
     test/cpp/integration/test_gpu_execution_dense_count_join.cpp
+    test/cpp/integration/test_gpu_execution_distinct.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_sip.cpp
     test/cpp/integration/test_gpu_execution_filter_nulls.cpp

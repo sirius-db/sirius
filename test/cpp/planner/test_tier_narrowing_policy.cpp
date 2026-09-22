@@ -463,6 +463,20 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
             std::vector<cudf::data_type>{k_int8, k_int32});
   }
 
+  SECTION("a zero-aggregate DISTINCT gives every key transport")
+  {
+    // The mirror of the propagation ladder's DISTINCT section. Group keys earn `transport` and the
+    // keep rule short-circuits on it, so the plan root's boundary_restore mark cannot retract them,
+    // and under DISTINCT the keys are the whole payload.
+    auto plan = make_grouped_aggregate({0, 1}, {}, make_integer_scan(2, {k_int8, k_int8}));
+
+    auto const retracted = sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(retracted == 0);
+    REQUIRE(plan->children[0]->get_physical_types() ==
+            std::vector<cudf::data_type>{k_int8, k_int8});
+  }
+
   SECTION("COUNT_VALID does not constrain a counted group key")
   {
     auto plan = make_grouped_aggregate(
