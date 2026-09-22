@@ -195,8 +195,15 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           pixi run -e duckdb-python build-duckdb-python
-          pixi run -e duckdb-python python -c \
-            "import duckdb; assert duckdb.sql('SELECT 42').fetchone() == (42,)"
+          pixi run -e duckdb-python python - <<'PY'
+          import subprocess
+          import duckdb
+
+          expected = subprocess.check_output(["build/release/duckdb", "--version"], text=True).split()[0]
+          actual = duckdb.sql("SELECT version()").fetchone()[0]
+          assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
+          assert duckdb.sql("SELECT 42").fetchone() == (42,)
+          PY
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

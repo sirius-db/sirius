@@ -128,7 +128,7 @@ scikit-build-core = "*"
 setuptools-scm = "*"
 
 [feature.duckdb-python.tasks]
-build-duckdb-python = "OVERRIDE_GIT_DESCRIBE=v1.5.5 CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
+build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb -DOVERRIDE_GIT_DESCRIBE=v1.5.5\" pip install --no-build-isolation ./duckdb-python"
 
 [feature.nightly-runner]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
