@@ -23,6 +23,7 @@
 
 #include <cuda/stream>
 
+#include <cucascade/cuda/event.hpp>
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -37,6 +38,7 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {
@@ -111,6 +113,13 @@ class convertible_data_batch : public convertible_data {
       // Non-blocking reservation
       auto reservation = mem_space->make_reservation_or_null(data_size);
       if (!reservation) { continue; }
+
+      if (cudaEvent_t const writer_event = mut.get_data()->get_writer_event();
+          writer_event != nullptr) {
+        cucascade::cuda::cuda_event_view{writer_event}.wait(stream);
+      } else if (cur_space != nullptr && cur_space->get_tier() == cucascade::memory::Tier::GPU) {
+        throw std::logic_error("GPU batch must have a writer event before conversion");
+      }
 
       // When downgrading off the GPU, rebind the source buffers' deallocation stream to this
       // downgrade stream so that when the conversion below frees the GPU representation, the
