@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -124,6 +126,16 @@ struct prefetch_request {
   }
 };
 
+/// How an attempt to attach staging buffers to a prefetch request resolved.
+/// Allocation pressure is deliberately non-terminal: the request stays queued
+/// so a caller can evict and retry it later.
+enum class prepare_result : std::uint8_t {
+  prepared,
+  allocation_failed,
+  fallen_behind,
+  unavailable,
+};
+
 /// A standing demand on the evictor: free at least @p bytes_to_free bytes of
 /// staging memory, whether or not the pool has crossed its own pressure
 /// threshold.
@@ -134,11 +146,15 @@ struct prefetch_request {
 /// allocation just failed, or because it is about to make a large one -- knows a
 /// number the cache cannot derive.  This carries that number.
 ///
-/// A demand, not a guarantee: the evictor frees what it can reclaim and does not
-/// report back.  Chunks a reader has pinned stay put, so a request for more than
-/// is reclaimable simply frees everything reclaimable.
+/// A demand, not a guarantee: the evictor frees what it can reclaim. A
+/// synchronous caller learns that the pass finished, not how much it freed.
+/// Chunks a reader has pinned stay put, so a request for more than is reclaimable
+/// simply frees everything reclaimable.
 struct eviction_request {
   std::size_t bytes_to_free{0};
+  /// Present for a synchronous request. The evictor counts this down after the
+  /// request's eviction pass, even when nothing was reclaimable.
+  std::shared_ptr<std::latch> processed;
 };
 
 /// What the evictor's queue carries.  Two things reach it: prefetch requests,
@@ -189,8 +205,9 @@ class cache_handle {
 
   /// Block until staging buffers have been allocated for every chunk in this
   /// request (producer state >= prepared).  Returns true iff preparation
-  /// succeeded; false means the request was abandoned (e.g. the pool ran out of
-  /// memory).  No-op and returns false on an empty handle.
+  /// succeeded; false means the request was abandoned because the consumer
+  /// overtook it or the cache shut down.  No-op and returns false on an empty
+  /// handle.
   [[nodiscard]] bool wait_until_prepared() noexcept;
 
   /// The chunks of the underlying request.  Null when the handle is empty.
@@ -300,6 +317,11 @@ class prefetching_cache {
   /// already shutting down.
   void evict(std::size_t bytes_to_free);
 
+  /// Ask the evictor to free at least @p bytes_to_free and wait until that
+  /// request has been processed. This acknowledges an eviction pass, not that
+  /// the requested number of bytes could necessarily be reclaimed.
+  void evict_sync(std::size_t bytes_to_free);
+
   [[nodiscard]] std::string summary() const;
 
   void prepare_for_query() noexcept;
@@ -330,13 +352,12 @@ class prefetching_cache {
   /// drives via @c scan_info::prepare_for_prefetching): preparing is part of the
   /// fadvise-owned request lifecycle, not something an arbitrary caller starts.
   ///
-  /// @return false when the request could not be prepared -- the pool could not
-  ///         satisfy it, the consumer has already moved past it, or somebody
-  ///         else has already taken it past @c queued.  Only the first two leave
-  ///         it @c abandoned.
-  bool prepare(cache_handle& handle, bool wait_for_eviction);
+  /// @return why the request was or was not prepared. Allocation failure leaves
+  ///         the request queued and retryable; falling behind abandons it.
+  prepare_result prepare(cache_handle& handle, bool wait_for_eviction);
 
-  [[nodiscard]] bool prepare_request(prefetch_request& req, bool wait_for_eviction = false);
+  [[nodiscard]] prepare_result prepare_request(prefetch_request& req,
+                                               bool wait_for_eviction = false);
 
   /// Resolve cache positions handle-first, then against the file-wide entry.
   /// A partial lookup preserves every materialised position so the read planner

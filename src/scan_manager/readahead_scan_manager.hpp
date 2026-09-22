@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -369,10 +370,16 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   std::atomic<bool> _prefetching_started{false};
   std::atomic<size_t> _cursor{0};
 
-  /// Waits for a scan to report progress, then tops the in-flight scan set back
-  /// up from the scheduler.  Sleeps rather than polls: the only thing that can
-  /// change what should be prefetched next is an @ref update_scan_state, so the loop is
-  /// driven by those instead of a timer.
+  /// Generation of fully-published `disposed` scan transitions. A preparation
+  /// retry snapshots this before synchronous eviction and waits for it to move
+  /// (or for its bounded timer) when the pool is still short afterwards.
+  std::mutex _disposable_mutex;
+  std::condition_variable _disposable_cv;
+  std::uint64_t _disposable_generation{0};
+
+  /// Tops the in-flight scan set back up from the scheduler. Under memory
+  /// pressure it waits for a disposed scan notification, bounded by 25 ms so a
+  /// missed/coalesced notification cannot strand the worker.
   void worker_loop(const std::stop_token& st);
 
   prefetch_strategy _strategy{prefetch_strategy::eager};

@@ -115,6 +115,7 @@ void readahead_scan_manager::stop() noexcept
   // prefetching we are about to tear down -- while the rest of teardown runs.
   event::query_event_subscriber::stop();
   _stop_source.request_stop();
+  _disposable_cv.notify_all();
   // Cuts short the worker's wait for a ticket, which is otherwise the one place
   // teardown can sit for a full timeout -- and a ticket handed out now would
   // only buy a prefetch that is about to be abandoned.
@@ -225,6 +226,11 @@ void readahead_scan_manager::update_scan_state(std::size_t,
   if (stage == io::cache::scan_stage::disposed) {
     // The read is over, so give the ticket back -- paying down any debt first.
     if (split->give_back_readahead_ticket()) { _gatekeeper.release(); }
+    {
+      std::lock_guard lock(_disposable_mutex);
+      ++_disposable_generation;
+    }
+    _disposable_cv.notify_all();
   }
 }
 
@@ -301,15 +307,28 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
   constexpr auto k_slot_wait = std::chrono::milliseconds{100};
   // Back-off when the order has nothing to prefetch right now.
   constexpr auto k_idle_wait = std::chrono::milliseconds{10};
-  // How long to let the evictor work before asking the pool again.
-  constexpr auto k_memory_retry = std::chrono::milliseconds{20};
+  // Bound the wait for a disposal notification. The timeout is also a recovery
+  // path for a coalesced or missed notification.
+  constexpr auto k_memory_retry = std::chrono::milliseconds{25};
 
   // Prepare a candidate and, if that succeeds, issue its IO.  Returns whether
   // the prefetch was issued -- which is also whether the completion has taken
   // ownership of the slot.
   auto try_issue = [&](prefetch_candidate const& candidate) {
+    bool evict_on_failure = false;
     while (!st.stop_requested()) {
-      auto const prep = candidate.task->prepare_for_prefetching(/*wait_for_eviction=*/true);
+      if (candidate.task->has_fallen_behind()) {
+        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+        return false;
+      }
+
+      std::uint64_t disposal_generation = 0;
+      {
+        std::lock_guard lock(_disposable_mutex);
+        disposal_generation = _disposable_generation;
+      }
+      bool const attempted_eviction = evict_on_failure;
+      auto const prep               = candidate.task->prepare_for_prefetching(evict_on_failure);
       if (prep.ready()) {
         candidate.task->prefetch([weak  = weak_from_this(),
                                   op_id = candidate.operator_id,
@@ -324,6 +343,10 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         });
         return true;
       }
+      if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
+        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
+        return false;
+      }
       // Nothing was refused for want of memory, so there is nothing to wait for:
       // this split has no request to prepare at all.
       if (prep.failed == 0) {
@@ -334,11 +357,17 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
       // unless the consumer reached the split meanwhile, in which case a
       // prefetch would only duplicate the read it is already doing.
       _counters.memory_retries.fetch_add(1, std::memory_order_relaxed);
-      std::this_thread::sleep_for(k_memory_retry);
-      if (candidate.task->has_fallen_behind()) {
-        _counters.record(prefetch_outcome_kind::skipped_fell_behind);
-        return false;
-      }
+      evict_on_failure = true;
+      // The first failure immediately advances to a synchronous-eviction
+      // attempt. Only a failed attempt that already processed eviction waits
+      // for another scan to become disposable (or the bounded timer).
+      if (!attempted_eviction) { continue; }
+
+      std::unique_lock lock(_disposable_mutex);
+      _disposable_cv.wait_for(lock, k_memory_retry, [&] {
+        return st.stop_requested() || candidate.task->has_fallen_behind() ||
+               _disposable_generation != disposal_generation;
+      });
     }
     // Stopped mid-preparation: the pool never satisfied it.
     _counters.record(prefetch_outcome_kind::skipped_memory_pressure);

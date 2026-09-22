@@ -70,8 +70,8 @@ enum class prefetch_refusal : std::uint8_t {
   /// The executor had already started reading this split: prefetching now would
   /// issue the same IO a second time and race the reader for its chunks.
   consumer_ahead,
-  /// The cache could not attach staging buffers -- its pool had nothing to give
-  /// -- so the request was abandoned before any IO could be claimed.
+  /// The cache could not retain staging buffers through the point where IO was
+  /// issued.  Normal allocation pressure is reported earlier by prepare().
   memory_pressure,
   /// The cache refused for a reason of its own (already loading, request
   /// cancelled, backend cannot serve vectored host reads).
@@ -84,8 +84,10 @@ enum class prefetch_refusal : std::uint8_t {
 enum class prepare_result : std::uint8_t {
   /// The request owns staging buffers and its chunks can now be claimed.
   prepared,
-  /// The pool could not satisfy the request, which was abandoned.
+  /// The pool could not satisfy the request. It remains queued for a retry.
   allocation_failed,
+  /// The consumer reached this split before preparation completed.
+  fallen_behind,
   /// No request on this datasource: no prefetching cache, or no fadvise.
   nothing_to_prepare,
 };

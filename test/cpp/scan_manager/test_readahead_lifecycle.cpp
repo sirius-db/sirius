@@ -83,6 +83,17 @@ TEST_CASE("the readahead budget follows the cache mode when unset", "[scan_manag
   CHECK(budget_for(cache_mode::sirius) == backend_budget);
 }
 
+TEST_CASE("a partially prepared split retries before issuing prefetch",
+          "[scan_manager][readahead][prepare]")
+{
+  using outcome = sirius::op::scan::scan_info::prepare_outcome;
+
+  CHECK_FALSE(outcome{}.ready());
+  CHECK(outcome{.prepared = 1}.ready());
+  CHECK_FALSE(outcome{.prepared = 1, .failed = 1}.ready());
+  CHECK_FALSE(outcome{.prepared = 1, .fell_behind = 1}.ready());
+}
+
 TEST_CASE("readahead backend selection considers only the supplied query contexts",
           "[scan_manager][readahead]")
 {

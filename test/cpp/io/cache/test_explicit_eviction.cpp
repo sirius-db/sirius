@@ -68,8 +68,10 @@ struct temp_data_file {
            ("sirius_explicit_evict_" + std::to_string(::getpid()) + "_" +
             std::to_string(reinterpret_cast<std::uintptr_t>(this)));
     std::ofstream out(path, std::ios::binary);
-    std::vector<char> data(bytes, 'z');
-    out.write(data.data(), static_cast<std::streamsize>(bytes));
+    if (bytes != 0) {
+      out.seekp(static_cast<std::streamoff>(bytes - 1));
+      out.put('z');
+    }
   }
 
   ~temp_data_file()
@@ -105,6 +107,37 @@ scan_manager_config lru_config()
   cfg.cache.eviction          = sirius::io::cache::eviction_policy::lru;
   cfg.apply_cache_mode();
   return cfg;
+}
+
+scan_manager_config constrained_lru_config()
+{
+  auto cfg = lru_config();
+  // Keep automatic pressure eviction disabled while the fixture deliberately
+  // fills the small host tier. Only prepare(true)'s explicit request may free
+  // the disposable requests below.
+  cfg.cache.min_prefetching_budget_fraction = 0.25;
+  cfg.cache.eviction_threshold_fraction     = 1.0;
+  return cfg;
+}
+
+std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> constrained_memory_manager()
+{
+  sirius::converter_registry::reset_for_testing();
+
+  reservation_manager_configurator builder;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    // Large enough for the allocator's baseline pools, but small enough that a
+    // handful of cache requests deterministically exhaust it.
+    .set_per_numa_region_capacity(256ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(1.0);
+
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+  return manager;
 }
 
 }  // namespace
@@ -174,6 +207,72 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   CHECK(claimed_drops_below(*cache, claimed, std::chrono::milliseconds(2000)));
 }
 
+TEST_CASE("synchronous eviction is processed before prepare retries allocation",
+          "[cache][eviction][explicit][prepare]")
+{
+  constexpr std::size_t request_bytes = 32ull << 20;
+  temp_data_file file(1ull << 30);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+
+  // Fill whatever portion of the constrained tier remains after ioctx's own
+  // baseline allocations. Every successful request is immediately disposable,
+  // but LRU retains its buffers because the automatic threshold is disabled.
+  std::size_t offset = 0;
+  bool exhausted     = false;
+  for (std::size_t attempt = 0; attempt < 32; ++attempt) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(static_cast<std::int64_t>(offset),
+                        static_cast<std::int64_t>(request_bytes));
+    auto filler = manager.create_datasource(file.path.string());
+    REQUIRE(filler != nullptr);
+    filler->fadvise(ranges, 0);
+    if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
+      exhausted = true;
+      offset += request_bytes;
+      break;
+    }
+    offset += request_bytes;
+  }
+  REQUIRE(exhausted);
+
+  std::vector<cudf::io::text::byte_range_info> target_ranges;
+  target_ranges.emplace_back(static_cast<std::int64_t>(offset),
+                             static_cast<std::int64_t>(request_bytes));
+  auto target = manager.create_datasource(file.path.string());
+  REQUIRE(target != nullptr);
+  target->fadvise(target_ranges, 0);
+
+  // Memory pressure is non-terminal: the request remains queued for the
+  // eviction-enabled retry below.
+  REQUIRE(target->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed);
+  REQUIRE(target->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
+}
+
+TEST_CASE("prepare abandons immediately after the consumer reaches the split",
+          "[cache][eviction][explicit][prepare]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_evict();
+
+  sirius_scan_manager manager{lru_config(), *memory, topology};
+  auto ds = manager.create_datasource(file.path.string());
+  REQUIRE(ds != nullptr);
+
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.emplace_back(0, 4ll << 20);
+  ds->fadvise(ranges, 0);
+  ds->update(sirius::io::cache::scan_stage::preparing);
+
+  CHECK(ds->prepare_prefetch(true) == sirius::io::prepare_result::fallen_behind);
+  CHECK(manager.io_ctx()->cache()->claimed_bytes() == 0);
+}
+
 TEST_CASE("an explicit evict frees at least what was asked for", "[cache][eviction][explicit]")
 {
   temp_data_file file(8ull << 20);  // 8 MiB
@@ -199,8 +298,8 @@ TEST_CASE("an explicit evict frees at least what was asked for", "[cache][evicti
   // Ask for a single byte.  Chunks are the only granularity there is, so this
   // frees exactly one -- the assertion is that the demand is a floor and not a
   // suggestion, not that the arithmetic is byte-exact.
-  cache->evict(1);
-  CHECK(claimed_drops_below(*cache, claimed, std::chrono::milliseconds(2000)));
+  cache->evict_sync(1);
+  CHECK(cache->claimed_bytes() < claimed);
 }
 
 TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")

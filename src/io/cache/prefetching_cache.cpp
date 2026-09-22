@@ -344,6 +344,9 @@ prefetching_cache::~prefetching_cache()
   // to have run before any of it is torn down.
   drain_inflight_io();
   _evictor_thread.join();
+  // A synchronous eviction request queued behind the stop sentinel must not
+  // leave its caller parked after the worker exits.
+  drain_and_abandon(_eviction_queue);
 
   // Every retirement has drained. Detach so the poll destructor never reaches
   // for caller-owned stream handles that may be destroyed before the cache.
@@ -489,7 +492,7 @@ cache_handle prefetching_cache::initiate_prefetching_request(const io_object& ob
   return cache_handle(std::move(req));
 }
 
-bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
+prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_eviction)
 {
   // Never allocate for a request the consumer has already moved past.  A request
   // is handed to the evictor when it is created, and once its consumer disposes
@@ -499,10 +502,14 @@ bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_evi
   // no waiter is stranded on the transient `preparing` stage.
   if (!req.chunks || req.has_fallen_behind()) {
     req.producer->mark_abandoned();
-    return false;
+    return prepare_result::fallen_behind;
   }
 
-  if (!req.producer->mark_preparing()) { return false; }
+  auto const producer_state = req.producer->get();
+  if (producer_state >= producer_stage::prepared && producer_state != producer_stage::abandoned) {
+    return prepare_result::prepared;
+  }
+  if (producer_state != producer_stage::queued) { return prepare_result::unavailable; }
 
   std::ignore        = _completion_poll.drain_all();
   auto const& chunks = *req.chunks;
@@ -513,9 +520,44 @@ bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_evi
   int numa_allocated = req.preferred_numa;
   auto buffers       = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
   if (buffers.size() != n_chunks_needed) {
+    auto const shortage = n_chunks_needed - buffers.size();
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+    if (!wait_for_eviction) { return prepare_result::allocation_failed; }
+
+    // Wait until the evictor has completed a pass for this shortfall before
+    // retrying. The producer stays queued throughout, so memory pressure never
+    // makes the request terminal.
+    if (req.has_fallen_behind()) {
+      req.producer->mark_abandoned();
+      return prepare_result::fallen_behind;
+    }
+    evict_sync(shortage * _chunk_size);
+    if (req.has_fallen_behind()) {
+      req.producer->mark_abandoned();
+      return prepare_result::fallen_behind;
+    }
+
+    numa_allocated = req.preferred_numa;
+    buffers        = _pool->allocate_bulk(n_chunks_needed, numa_allocated);
+    if (buffers.size() != n_chunks_needed) {
+      if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+      return prepare_result::allocation_failed;
+    }
+  }
+
+  // Allocation and synchronous eviction can take long enough for the consumer
+  // to reach this split. Recheck immediately before publishing `preparing`.
+  if (req.has_fallen_behind()) {
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     req.producer->mark_abandoned();
-    return false;
+    return prepare_result::fallen_behind;
+  }
+  if (!req.producer->mark_preparing()) {
+    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+    auto const state = req.producer->get();
+    return state >= producer_stage::prepared && state != producer_stage::abandoned
+             ? prepare_result::prepared
+             : prepare_result::unavailable;
   }
 
   for (auto* c : chunks) {
@@ -532,7 +574,7 @@ bool prefetching_cache::prepare_request(prefetch_request& req, bool wait_for_evi
   if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
 
   std::ignore = req.producer->mark_prepared();
-  return true;
+  return prepare_result::prepared;
 }
 
 std::vector<cached_chunk*> prefetching_cache::ranges_in_cache(const io_object& obj,
@@ -1040,25 +1082,36 @@ void prefetching_cache::evict(std::size_t bytes_to_free)
   // the last case the evictor is already reclaiming everything it can, and a
   // demand queued behind the stop sentinel would never be looked at.
   if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_relaxed)) { return; }
-  _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free}});
+  _eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, nullptr}});
+}
+
+void prefetching_cache::evict_sync(std::size_t bytes_to_free)
+{
+  if (bytes_to_free == 0 || !_armed || _shutting_down.load(std::memory_order_acquire)) { return; }
+  auto processed = std::make_shared<std::latch>(1);
+  if (!_eviction_queue.enqueue(cache_request{eviction_request{bytes_to_free, processed}})) {
+    return;
+  }
+  processed->wait();
 }
 
 void prefetching_cache::drain_and_abandon(request_queue_type& queue) noexcept
 {
   cache_request entry;
   while (queue.try_dequeue(entry)) {
-    // Only prefetch requests have anything to abandon: an eviction request owns
-    // no stage machine and no waiter, so dropping it strands nobody.
     if (auto* req = std::get_if<prefetch_request>(&entry); req != nullptr && *req) {
       req->producer->mark_abandoned();
+    } else if (auto* eviction = std::get_if<eviction_request>(&entry);
+               eviction != nullptr && eviction->processed != nullptr) {
+      eviction->processed->count_down();
     }
     entry = {};
   }
 }
 
-bool prefetching_cache::prepare(cache_handle& handle, bool wait_for_eviction)
+prepare_result prefetching_cache::prepare(cache_handle& handle, bool wait_for_eviction)
 {
-  if (!handle) { return false; }
+  if (!handle) { return prepare_result::unavailable; }
   return prepare_request(handle._req, wait_for_eviction);
 }
 
@@ -1175,7 +1228,14 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // leaves the other one still waiting.
     std::size_t requested_bytes = 0;
     bool eviction_requested     = false;
-    auto absorb                 = [&](cache_request&& e) {
+    std::vector<std::shared_ptr<std::latch>> processed;
+    auto acknowledge_evictions = [&processed] {
+      for (auto const& completion : processed) {
+        completion->count_down();
+      }
+      processed.clear();
+    };
+    auto absorb = [&](cache_request&& e) {
       std::visit(
         [&](auto&& r) {
           using T = std::decay_t<decltype(r)>;
@@ -1190,6 +1250,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
             // does nothing and the pool never recovers.
             eviction_requested = true;
             requested_bytes += r.bytes_to_free;
+            if (r.processed != nullptr) { processed.push_back(std::move(r.processed)); }
           }
         },
         std::move(e));
@@ -1204,7 +1265,10 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       absorb(std::move(entry));
     }
 
-    if (_shutting_down || st.stop_requested()) { break; }
+    if (_shutting_down || st.stop_requested()) {
+      acknowledge_evictions();
+      break;
+    }
 
     std::ignore = _completion_poll.drain_all();
 
@@ -1227,7 +1291,10 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // aggregate reserved capacity.
     bool const should_evict =
       _cfg.dispose_on_idle || eviction_requested || _pool->should_start_evicting();
-    if (!should_evict) { continue; }
+    if (!should_evict) {
+      acknowledge_evictions();
+      continue;
+    }
 
     // Under pressure the target is a fraction of what the pool holds; an
     // explicit demand raises it to at least what was asked for.  A floor rather
@@ -1282,6 +1349,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     for (auto& [numa, buffers] : reclaim_by_numa) {
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
     }
+    acknowledge_evictions();
 
     // Retire a request once it has released its references and every chunk it
     // named is either reclaimed or now owned by somebody else.  Counting our
