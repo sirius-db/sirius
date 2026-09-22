@@ -284,7 +284,11 @@ std::chrono::seconds presign_ttl(const config& cfg) noexcept
 }
 
 /// Apply per-request TLS + timeout options on top of configure_easy_handle.
-void apply_request_opts(CURL* h, const config& cfg)
+/// @p data_transfer selects the time bound: a data GET can be as large as the
+/// cache block size, so it is bounded by the stall detector (a GET that keeps
+/// delivering bytes is never cut off, however long it takes); everything else is
+/// bounded by the whole-request timeout.
+void apply_request_opts(CURL* h, const config& cfg, bool data_transfer = false)
 {
   if (!cfg.ca_bundle_path.empty()) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_CAINFO, cfg.ca_bundle_path.c_str()));
@@ -293,7 +297,12 @@ void apply_request_opts(CURL* h, const config& cfg)
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L));
   }
-  if (cfg.request_timeout_s > 0) {
+  if (data_transfer) {
+    // Clears the whole-transfer default configure_easy_handle set.
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, 0L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, cfg.stall_speed_limit_bytes));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, cfg.stall_time_s));
+  } else if (cfg.request_timeout_s > 0) {
     SIRIUS_CURL_CHECK(curl_easy_setopt(h, CURLOPT_TIMEOUT, cfg.request_timeout_s));
   }
 }
@@ -1082,7 +1091,7 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
                             worker_share.get(),
                             upkeep_ms,
                             static_cast<long>(_config.conn_max_age.count()));
-      apply_request_opts(handle.get(), _config);
+      apply_request_opts(handle.get(), _config, /*data_transfer=*/true);
       SIRIUS_CURL_CHECK(curl_easy_setopt(
         handle.get(), CURLOPT_PRIVATE, reinterpret_cast<void*>(static_cast<std::intptr_t>(i))));
       slots[i].easy = std::move(handle);
