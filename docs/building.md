@@ -30,3 +30,11 @@ pixi run cmake -S test/cmake/nvtx_injection -B build/nvtx-test -G Ninja
 pixi run cmake --build build/nvtx-test
 pixi run ctest --test-dir build/nvtx-test --output-on-failure
 ```
+
+## DuckDB dependency
+
+`cmake/sirius-duckdb-provider.cmake` owns the temporary source dependency. Its
+`sirius::duckdb_dependency` target carries DuckDB headers, compile definitions,
+and the core and Parquet libraries. `SIRIUS_DUCKDB_SOURCE_DIR` selects the source
+tree; use the revision pinned by this repository. This is a build-only contract,
+not an installed Sirius target or a stable DuckDB ABI.
