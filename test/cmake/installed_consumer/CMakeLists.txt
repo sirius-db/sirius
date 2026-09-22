@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.30.4)
+project(sirius_installed_consumer LANGUAGES CXX)
+find_package(sirius REQUIRED CONFIG)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE sirius::sirius)

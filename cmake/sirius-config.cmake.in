@@ -2,4 +2,6 @@
 
 include("${CMAKE_CURRENT_LIST_DIR}/sirius-targets.cmake")
 
+include("${CMAKE_CURRENT_LIST_DIR}/sirius-duckdb-compatibility.cmake")
+set(sirius_shared_FOUND TRUE)
 check_required_components(sirius)

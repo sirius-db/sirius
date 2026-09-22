@@ -1,0 +1,26 @@
+set(SIRIUS_DUCKDB_REVISION "@SIRIUS_DUCKDB_REVISION@")
+set(SIRIUS_CXX_COMPILER_ID "@CMAKE_CXX_COMPILER_ID@")
+set(SIRIUS_CXX_COMPILER_VERSION "@CMAKE_CXX_COMPILER_VERSION@")
+set(SIRIUS_BUILD_TYPE "@CMAKE_BUILD_TYPE@")
+
+# DuckDB's C++ extension ABI is tied to the source revision and toolchain.
+function(sirius_check_duckdb_compatibility source_dir)
+  find_package(Git REQUIRED)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${source_dir}" rev-parse HEAD
+    OUTPUT_VARIABLE revision OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  if(NOT revision STREQUAL SIRIUS_DUCKDB_REVISION)
+    message(FATAL_ERROR
+      "Sirius requires DuckDB ${SIRIUS_DUCKDB_REVISION}; found ${revision}")
+  endif()
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL SIRIUS_CXX_COMPILER_ID OR
+     NOT CMAKE_CXX_COMPILER_VERSION STREQUAL SIRIUS_CXX_COMPILER_VERSION)
+    message(FATAL_ERROR
+      "Build sirius-duckdb with ${SIRIUS_CXX_COMPILER_ID} ${SIRIUS_CXX_COMPILER_VERSION}, matching Sirius")
+  endif()
+  if((CMAKE_BUILD_TYPE STREQUAL "Debug" AND NOT SIRIUS_BUILD_TYPE STREQUAL "Debug") OR
+     (SIRIUS_BUILD_TYPE STREQUAL "Debug" AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug"))
+    message(FATAL_ERROR "Sirius and sirius-duckdb must agree on Debug mode")
+  endif()
+endfunction()

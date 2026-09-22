@@ -25,3 +25,9 @@ set_target_properties(
     INTERFACE_COMPILE_DEFINITIONS "${_duckdb_definitions}"
     INTERFACE_LINK_LIBRARIES
     "duckdb_static;core_functions_extension;parquet_extension")
+
+find_package(Git REQUIRED)
+execute_process(
+  COMMAND "${GIT_EXECUTABLE}" -C "${SIRIUS_DUCKDB_SOURCE_DIR}" rev-parse HEAD
+  OUTPUT_VARIABLE SIRIUS_DUCKDB_REVISION
+  OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)

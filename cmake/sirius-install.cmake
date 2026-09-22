@@ -21,6 +21,9 @@ install(
   COMPONENT sirius_library)
 
 include(CMakePackageConfigHelpers)
+configure_file(
+  cmake/sirius-duckdb-compatibility.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/sirius-duckdb-compatibility.cmake" @ONLY)
 configure_package_config_file(
   cmake/sirius-config.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
   INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius")
@@ -44,5 +47,6 @@ install(
 install(
   FILES "${CMAKE_CURRENT_BINARY_DIR}/sirius-config.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/sirius-config-version.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/sirius-duckdb-compatibility.cmake"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/sirius"
   COMPONENT sirius_library)
