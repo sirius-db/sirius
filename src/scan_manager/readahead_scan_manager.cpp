@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <format>
 #include <memory>
 #include <optional>
@@ -333,20 +334,39 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
         disposal_generation = _disposable_generation;
       }
       bool const attempted_eviction = evict_on_failure;
-      auto const prep               = candidate.task->prepare_for_prefetching(evict_on_failure);
-      if (prep.ready()) {
-        candidate.task->prefetch([weak  = weak_from_this(),
-                                  op_id = candidate.operator_id,
-                                  split = std::weak_ptr{candidate.task}](
-                                   op::scan::scan_info::prefetch_outcome out) noexcept {
-          // weak, not shared: a completion firing after the query tore the
-          // manager down must not resurrect it.
-          if (auto self = weak.lock()) {
-            self->on_prefetch_complete(
-              op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
-          }
-        });
-        return true;
+      op::scan::scan_info::prepare_outcome prep;
+      // This runs on a jthread, so an escaping exception is std::terminate for
+      // the whole process -- far too much for a best-effort prefetcher.  Both
+      // calls allocate (the fan-in completion here, the evictor's latch inside
+      // prepare), so bad_alloc is reachable exactly when the readahead is
+      // earning its keep.  A throw is treated as "not issued": prefetch can only
+      // throw before its prefetch_completion exists, because everything from
+      // there on is noexcept and the report is what hands the slot over, so the
+      // slot is still the worker's and returning false releases it exactly once.
+      try {
+        prep = candidate.task->prepare_for_prefetching(evict_on_failure);
+        if (prep.ready()) {
+          candidate.task->prefetch([weak  = weak_from_this(),
+                                    op_id = candidate.operator_id,
+                                    split = std::weak_ptr{candidate.task}](
+                                     op::scan::scan_info::prefetch_outcome out) noexcept {
+            // weak, not shared: a completion firing after the query tore the
+            // manager down must not resurrect it.
+            if (auto self = weak.lock()) {
+              self->on_prefetch_complete(
+                op_id, split, out.issued > 0, out.declined_memory_pressure > 0);
+            }
+          });
+          return true;
+        }
+      } catch (std::exception const& e) {
+        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: {}", e.what());
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+        return false;
+      } catch (...) {
+        SIRIUS_LOG_WARN("[readahead] prefetch attempt abandoned: unknown exception");
+        _counters.record(prefetch_outcome_kind::skipped_memory_pressure);
+        return false;
       }
       if (prep.fell_behind > 0 || candidate.task->has_fallen_behind()) {
         _counters.record(prefetch_outcome_kind::skipped_fell_behind);
