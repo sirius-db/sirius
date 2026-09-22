@@ -573,11 +573,13 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
   plan.partition_row_groups.assign(plan.n_row_groups, nullptr);
   plan.row_group_pruned_by_stats.assign(plan.n_row_groups, false);
   plan.pruned_decoded_bytes_by_row_group.assign(plan.n_row_groups, 0);
-  // PartitionStatistics is expected to carry one entry per row group; a larger
-  // count means the DuckDB layout assumption below (index i == row group i) has
-  // drifted and trailing entries would be silently dropped.
-  assert(partition_stats.size() <= plan.n_row_groups &&
-         "partition_stats count exceeds row group count — DuckDB layout drift");
+  // Transaction-local partitions can appear in GetPartitionStats without a
+  // corresponding persisted row group. Their index cannot be mapped safely to
+  // this scan's block-backed row groups, so defer to DuckDB.
+  if (partition_stats.size() > plan.n_row_groups) {
+    refuse("partition stats include transaction-local partitions");
+    return plan;
+  }
   for (std::size_t i = 0; i < partition_stats.size(); ++i) {
     auto const& ps = partition_stats[i];
     if (!ps.row_start.IsValid()) {
@@ -587,11 +589,9 @@ duckdb_native_walk_plan prepare_duckdb_native_walk(
     }
     // PartitionStatistics order matches `RowGroupCollection::SegmentNodes()`
     // iteration order at v1.5.2.
-    if (i < plan.n_row_groups) {
-      plan.row_group_start[i]      = ps.row_start.GetIndex();
-      plan.row_count[i]            = ps.count;
-      plan.partition_row_groups[i] = ps.partition_row_group;
-    }
+    plan.row_group_start[i]      = ps.row_start.GetIndex();
+    plan.row_count[i]            = ps.count;
+    plan.partition_row_groups[i] = ps.partition_row_group;
   }
 
   mark_row_groups_pruned_by_filter_stats(plan);
