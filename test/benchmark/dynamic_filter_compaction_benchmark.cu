@@ -30,6 +30,7 @@
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/per_device_resource.hpp>
@@ -48,6 +49,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -64,15 +66,16 @@ using sirius::op::sirius_mask_applicable;
 enum class filter_kind { in_list, bloom };
 
 struct options {
-  cudf::size_type rows       = 32 * 1024 * 1024;
-  cudf::size_type build_keys = 1024 * 1024;
-  cudf::size_type domain     = 4 * 1024 * 1024;
-  int payload_columns        = 8;
-  int iterations             = 8;
-  int warmup                 = 2;
-  std::string strategy       = "all";
-  filter_kind kind           = filter_kind::in_list;
-  bool profile               = false;
+  cudf::size_type rows         = 32 * 1024 * 1024;
+  cudf::size_type build_keys   = 1024 * 1024;
+  cudf::size_type domain       = 4 * 1024 * 1024;
+  int payload_columns          = 8;
+  int string_bytes             = 0;  // 0: all INT64 payloads; >0: append one STRING payload
+  int iterations               = 8;
+  int warmup                   = 2;
+  std::string strategy         = "all";
+  filter_kind kind             = filter_kind::in_list;
+  bool profile                 = false;
 };
 
 struct strategy_result {
@@ -107,6 +110,25 @@ __global__ void fill_probe_columns(std::int64_t* a,
       payloads[col][i] =
         static_cast<std::int64_t>(mix64(x + static_cast<std::uint64_t>(col + 1) *
                                              0x9e3779b97f4a7c15ULL));
+    }
+  }
+}
+
+// Fixed-length printable payload, one row = `nchars` bytes. Cheap stand-in for a comment
+// column: gather copies chars+offsets, not 8-byte INT64s.
+__global__ void fill_string_chars(char* chars, int nchars, cudf::size_type rows)
+{
+  auto const tid    = static_cast<cudf::size_type>(blockIdx.x * blockDim.x + threadIdx.x);
+  auto const stride = static_cast<cudf::size_type>(blockDim.x * gridDim.x);
+  for (auto i = tid; i < rows; i += stride) {
+    auto const base = static_cast<std::uint64_t>(i) * static_cast<std::uint64_t>(nchars);
+    auto word       = mix64(static_cast<std::uint64_t>(i) + 0xa5a5a5a5a5a5a5a5ULL);
+    for (int c = 0; c < nchars; ++c) {
+      if ((c & 7) == 0 && c != 0) {
+        word = mix64(word + static_cast<std::uint64_t>(c));
+      }
+      chars[base + static_cast<std::uint64_t>(c)] =
+        static_cast<char>('a' + ((word >> ((c & 7) * 8)) % 26));
     }
   }
 }
@@ -153,6 +175,30 @@ std::unique_ptr<cudf::table> make_probe_table(options const& opts,
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string{"fill_probe_columns failed: "} +
                              cudaGetErrorString(status));
+  }
+
+  if (opts.string_bytes > 0) {
+    auto const nchars = static_cast<std::int64_t>(opts.rows) * opts.string_bytes;
+    if (nchars > std::numeric_limits<cudf::size_type>::max()) {
+      throw std::invalid_argument("rows * --string-bytes exceeds INT32 string offsets");
+    }
+    auto offsets = cudf::sequence(
+      opts.rows + 1,
+      cudf::numeric_scalar<cudf::size_type>{0, true, stream, mr},
+      cudf::numeric_scalar<cudf::size_type>{
+        static_cast<cudf::size_type>(opts.string_bytes), true, stream, mr},
+      stream,
+      mr);
+    rmm::device_buffer chars(static_cast<std::size_t>(nchars), stream, mr);
+    fill_string_chars<<<blocks, block_size, 0, stream.value()>>>(
+      static_cast<char*>(chars.data()), opts.string_bytes, opts.rows);
+    auto const str_status = cudaGetLastError();
+    if (str_status != cudaSuccess) {
+      throw std::runtime_error(std::string{"fill_string_chars failed: "} +
+                               cudaGetErrorString(str_status));
+    }
+    columns.push_back(cudf::make_strings_column(
+      opts.rows, std::move(offsets), std::move(chars), 0, rmm::device_buffer{0, stream, mr}));
   }
   stream.synchronize();
   return std::make_unique<cudf::table>(std::move(columns));
@@ -305,6 +351,9 @@ options parse_options(int argc, char** argv)
     } else if (arg == "--payload-columns") {
       result.payload_columns =
         static_cast<int>(parse_integer(next("--payload-columns"), "--payload-columns"));
+    } else if (arg == "--string-bytes") {
+      result.string_bytes =
+        static_cast<int>(parse_integer(next("--string-bytes"), "--string-bytes"));
     } else if (arg == "--iterations") {
       result.iterations = static_cast<int>(parse_integer(next("--iterations"), "--iterations"));
     } else if (arg == "--warmup") {
@@ -335,10 +384,15 @@ options parse_options(int argc, char** argv)
 void print_header(options const& opts)
 {
   auto const selectivity = static_cast<double>(opts.build_keys) / opts.domain;
-  auto const row_bytes   = static_cast<std::size_t>(opts.payload_columns + 2) * sizeof(int64_t);
+  auto const row_bytes =
+    static_cast<std::size_t>(opts.payload_columns + 2) * sizeof(int64_t) +
+    (opts.string_bytes > 0
+       ? static_cast<std::size_t>(opts.string_bytes) + sizeof(cudf::size_type)
+       : 0);
   std::cerr << "rows=" << opts.rows << " build_keys=" << opts.build_keys
             << " domain=" << opts.domain << " expected_selectivity=" << selectivity
-            << " payload_columns=" << opts.payload_columns << " row_bytes=" << row_bytes
+            << " payload_columns=" << opts.payload_columns << " string_bytes=" << opts.string_bytes
+            << " row_bytes=" << row_bytes
             << " filter_kind=" << (opts.kind == filter_kind::bloom ? "bloom" : "in-list") << '\n';
   std::cout << "strategy,iteration,gpu_ms,wall_ms,after_a_rows,final_rows\n";
 }

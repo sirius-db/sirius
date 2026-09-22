@@ -64,6 +64,8 @@ namespace {
  *  - otherwise, use gather_once strategy.
  *
  * See evaluate_compaction_policy() for the implementation.
+ * @note These are empirically chosen parameters from experiments on a GB300 machine. They may not
+ *       extrapolate perfectly to all architectures.
  */
 constexpr std::size_t k_deferred_minimum_row_width       = 64;
 constexpr double k_deferred_selective_keep_ratio         = 0.35;
