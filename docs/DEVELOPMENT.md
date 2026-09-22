@@ -14,17 +14,26 @@ Build the C++ reference for `include/sirius/` with:
 pixi run -e docs docs
 ```
 
-Open `build/docs/html/index.html`, or serve it locally:
-
-```bash
-pixi run -e docs python -m http.server 8000 --directory build/docs/html
-```
+Open `build/docs/html/index.html` in your browser.
 
 The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
 Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
-submodules. The theme includes the Sirius logos,
-system light/dark preference, and a manual theme toggle. Doxygen configuration
+submodules. The task runs Doxygen directly; no Python or helper script is needed.
+The theme includes the Sirius logos, system light/dark preference, and a manual
+theme toggle. Doxygen configuration
 and styling live in `docs/api/`; generated output stays under `build/docs/`.
+
+`docs/api/header.html` is Doxygen's HTML header template with the theme toggle and
+both logo variants added. When upgrading Doxygen, compare it against a fresh
+template generated with `doxygen -w html header.html footer.html doxygen.css` and
+retain these customizations.
+
+Standard-library symbols link to [cppreference](https://en.cppreference.com/).
+The `docs-cppreference` dependency task downloads its Doxygen tag file from the
+pinned 2025-02-09 archive and caches it under `build/docs/`. The first build needs
+network access, `tar`, and `sed`; subsequent builds reuse the index. The download
+task normalizes malformed experimental `erase` overload names so Doxygen can
+keep treating documentation warnings as errors.
 
 The **API docs** workflow builds pull requests and merge-queue entries, uploading
 the HTML as a `github-pages` artifact. Pushes to the default branch (`dev`) also

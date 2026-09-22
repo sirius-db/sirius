@@ -21,13 +21,14 @@ MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
 PREDEFINED            = SIRIUS_FFI_EXPORT=
 SEARCH_INCLUDES        = NO
+TAGFILES               = build/docs/cppreference-doxygen-web.tag.xml=https://en.cppreference.com/w/
 GENERATE_HTML          = YES
 GENERATE_LATEX         = NO
 GENERATE_TREEVIEW      = YES
 DISABLE_INDEX          = NO
 FULL_SIDEBAR           = NO
 HTML_COLORSTYLE        = LIGHT
-HTML_HEADER            = build/docs/header.html
+HTML_HEADER            = docs/api/header.html
 HTML_EXTRA_STYLESHEET  = docs/api/theme/doxygen-awesome.css \
                          docs/api/sirius.css
 HTML_EXTRA_FILES       = docs/api/theme/doxygen-awesome-darkmode-toggle.js \
