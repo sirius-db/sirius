@@ -31,7 +31,7 @@ builds reuse the cached assets. The license is included in the generated site.
 To upgrade the theme, update the commit, version, and checksum in `pixi.toml`,
 then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
 
-The **API docs** workflow builds pull requests and merge-queue entries, uploading
+The **Docs** workflow builds pull requests and merge-queue entries, uploading
 the HTML as a `github-pages` artifact. Pushes to the default branch (`dev`) also
 deploy the site. Manual runs deploy only when run on the default branch.
 For the first deployment, set **Settings → Pages → Build and deployment → Source**
