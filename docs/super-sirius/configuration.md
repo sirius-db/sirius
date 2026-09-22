@@ -326,7 +326,7 @@ The `sirius.executor.scan_manager` block configures the scan-metadata thread poo
 | `uring_n_reactors` | int (**> 0**) | 1 | Number of io_uring reactor threads for local-disk reads. |
 | `rest_n_reactors` | int (**> 0**) | 2 | Number of REST reactor threads for object-store (`s3://`) reads. |
 | `max_readahead_scans` | int | — (unset) | Scans the readahead may keep in flight, and the switch that runs it at all. See below. |
-| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local ones (uring, kvikIO). Values are lowercase. |
+| `readahead_strategy` | enum: `eager`, `opportunistic` | — (unset) | When the readahead issues. Unset takes the serving backend's own preference: `eager` for object-store (REST) reads, `opportunistic` for local (uring) ones. Values are lowercase. |
 
 Caching itself is configured in the [`cache`](#scan_managercache--read-path-caching-iocacheconfighpp)
 sub-config below.
@@ -343,7 +343,7 @@ sub-config below.
 
 | Value | Effect |
 |-------|--------|
-| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring and kvikIO. |
+| unset (default) | The serving backend's preference — `eager` for REST, `opportunistic` for uring. |
 | `eager` | Every wake-up fills every free slot in the budget. An object-store round trip is dead time no matter what else is running, so only queue depth hides it. |
 | `opportunistic` | One prefetch each time the executor deploys a task that is *not* a scan, i.e. only while the device is not already busy with the executor's own reads. A local device read competes with those, so issuing one mid-scan reorders the queue rather than adding throughput. |
 
@@ -414,6 +414,10 @@ kvikIO's `defaults` singleton, so the last context constructed wins and the
 setting is shared with every other kvikIO user in the process. Treat it as
 startup configuration. `compat_mode` is the exception: it rides the file-handle
 constructor, so it scopes to files this backend opens.
+
+This backend runs without the prefetching cache and therefore without the
+readahead, so `scan_manager.cache.*`, `max_readahead_scans` and
+`readahead_strategy` have no effect on it.
 
 | Key | Type | Env default | Description |
 |-----|------|-------------|-------------|

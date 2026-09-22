@@ -198,10 +198,9 @@ class kvikio_context final : public ioctx {
   /// straight to device per read rather than assembling a batch first.
   [[nodiscard]] bool prefers_bulk_io() const noexcept override { return false; }
 
-  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override
-  {
-    return _config.n_max_concurrent_scans;
-  }
+  /// Always zero: no prefetching cache on this backend, so nothing to read
+  /// ahead into.
+  [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept override { return 0; }
 
   /// kvikIO applies no physical block alignment of its own, so ranges pass
   /// through unchanged.

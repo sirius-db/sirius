@@ -228,7 +228,7 @@ struct scan_manager_config {
 
   /// When the readahead issues.  Unset (the default) takes the serving
   /// backend's own preference — @c eager for an object store, @c opportunistic
-  /// for a local device (see @ref prefetch_strategy).  Set it to pin one
+  /// for a local (uring) device (see @ref prefetch_strategy).  Set it to pin one
   /// strategy whatever the backend.
   std::optional<prefetch_strategy> readahead_strategy{};
 
