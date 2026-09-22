@@ -16,15 +16,14 @@
 
 #pragma once
 
-#include "sirius_registration.hpp"
-
 namespace duckdb {
+class ExtensionLoader;
+}
 
-class SiriusExtension : public Extension {
- public:
-  void Load(ExtensionLoader& loader) override;
-  std::string Name() override;
-  std::string Version() const override;
-};
+namespace sirius {
 
-}  // namespace duckdb
+/// Register Sirius on a DuckDB instance built with the matching DuckDB revision.
+__attribute__((visibility("default"))) void register_duckdb_extension(
+  duckdb::ExtensionLoader& loader);
+
+}  // namespace sirius
