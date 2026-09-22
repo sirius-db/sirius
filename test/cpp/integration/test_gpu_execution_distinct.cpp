@@ -24,6 +24,9 @@
  * results match whenever the query is answered at all, and a query that silently fell back to CPU
  * would still compare equal.
  *
+ * The floating-point cases use `compare_gpu_vs_cpu_on_keys` instead: a group holding both 0.0 and
+ * -0.0, or NaN and -NaN, prints as whichever member each engine keeps.
+ *
  * Every DISTINCT guard throws during `create_plan`, before any GPU work is scheduled, so the
  * guarded shapes use `expect_plan_fallback_matches_cpu` and assert the plan-time fallback counter
  * rather than the runtime one.
@@ -34,7 +37,9 @@
 #include <utils/gpu_execution_fixture.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -67,6 +72,58 @@ class scoped_setting {
   sirius::test::GpuExecutionFixture& fixture_;
   std::string name_;
 };
+
+/// NaN and -NaN, and 0.0 and -0.0, are one group to both engines and print differently, so either
+/// engine may report either member. Maps each pair to one spelling.
+std::string canonical_key(std::string cell)
+{
+  if (cell == "-nan") { return "nan"; }
+  if (cell.size() > 1 && cell.front() == '-' &&
+      cell.find_first_not_of("0.", 1) == std::string::npos) {
+    cell.erase(0, 1);
+  }
+  return cell;
+}
+
+/// Runs @p query on the GPU and on the CPU and compares the row count and the @p key_columns of
+/// each row, after asserting one GPU execution with no fallback.
+void compare_gpu_vs_cpu_on_keys(sirius::test::GpuExecutionFixture& fixture,
+                                std::string const& query,
+                                std::vector<std::size_t> const& key_columns)
+{
+  fixture.run_ok("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*fixture.con);
+  auto gpu_result   = fixture.con->Query(query);
+  auto const after  = sirius::test::get_transparent_execution_stats(*fixture.con);
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) { UNSCOPED_INFO("GPU execution error: " << gpu_result->GetError()); }
+  REQUIRE_FALSE(gpu_result->HasError());
+  sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+
+  fixture.run_ok("SET gpu_execution = false;");
+  auto cpu_result = fixture.con->Query(query);
+  fixture.run_ok("SET gpu_execution = true;");
+  REQUIRE(cpu_result);
+  REQUIRE_FALSE(cpu_result->HasError());
+
+  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+  auto const keys_of = [&key_columns](duckdb::MaterializedQueryResult& result) {
+    std::vector<std::vector<std::string>> keys;
+    for (auto const& row : sirius::test::collect_rows(result)) {
+      std::vector<std::string> key;
+      for (auto const column : key_columns) {
+        REQUIRE(column < row.size());
+        key.push_back(canonical_key(row[column]));
+      }
+      keys.push_back(std::move(key));
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+  };
+  REQUIRE(keys_of(gpu_result->Cast<duckdb::MaterializedQueryResult>()) ==
+          keys_of(cpu_result->Cast<duckdb::MaterializedQueryResult>()));
+}
 
 /// Duplicate `(a, b)` pairs, NULLs in either key column, two rows sharing the composite key
 /// `(NULL, 1)`, a wholly-NULL column, and a fully-NULL row.
@@ -333,13 +390,27 @@ class DistinctFloatFixture : public sirius::test::GpuExecutionFixture {
       "('NaN'::DOUBLE,       'NaN'::REAL),"     // duplicate NaN: must collapse
       "(-('NaN'::DOUBLE),    -('NaN'::REAL)),"  // sign bit set: same group as NaN
       "(0.0,                 0.0),"
-      "(-0.0,                -0.0),"  // same group as +0.0
+      "(-(0.0::DOUBLE),      -(0.0::REAL)),"  // same group as +0.0
       "('Infinity'::DOUBLE,  'Infinity'::REAL),"
       "('-Infinity'::DOUBLE, '-Infinity'::REAL),"
       "(1.5,                 1.5),"
       "(1.5,                 1.5),"
       "(NULL,                NULL);");
     run_ok("CHECKPOINT;");
+
+    // A `-0.0` literal parses as DECIMAL, whose zero has no sign, so prove each column stored a
+    // negative zero. Read on the CPU so the check does not depend on the code under test, and
+    // restore GPU execution before asserting: the connection is shared, so a failed REQUIRE must
+    // not leave it off for every later case.
+    run_ok("SET gpu_execution = false;");
+    auto const d_zeros = con->Query("SELECT count(*) FROM dist_fp WHERE d = 0 AND signbit(d)");
+    auto const f_zeros = con->Query("SELECT count(*) FROM dist_fp WHERE f = 0 AND signbit(f)");
+    run_ok("SET gpu_execution = true;");
+    for (auto const* zeros : {d_zeros.get(), f_zeros.get()}) {
+      REQUIRE(zeros);
+      REQUIRE_FALSE(zeros->HasError());
+      REQUIRE(zeros->GetValue(0, 0).GetValue<int64_t>() == 1);
+    }
   }
 };
 
@@ -349,13 +420,17 @@ TEST_CASE_METHOD(DistinctFloatFixture,
                  "[integration][gpu_execution][distinct]")
 {
   // cudf::groupby's row comparator decides NaN == NaN and -0.0 == 0.0 on its own terms; DuckDB
-  // groups both pairs. A disagreement is a wrong answer, not a fallback, so it is asserted on the
-  // row set rather than on a count.
-  SECTION("DOUBLE") { compare_gpu_vs_cpu("SELECT DISTINCT d FROM dist_fp"); }
+  // groups both pairs. A disagreement is a wrong answer, not a fallback: the exact row count
+  // catches a pair that fails to collapse, and the keys are compared with each pair's two spellings
+  // treated as one, because either engine may keep either member.
+  SECTION("DOUBLE") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d FROM dist_fp", {0}); }
 
-  SECTION("REAL") { compare_gpu_vs_cpu("SELECT DISTINCT f FROM dist_fp"); }
+  SECTION("REAL") { compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT f FROM dist_fp", {0}); }
 
   // A composite key runs the same comparator over a two-column row, which is the shape the
   // single-column cases cannot reach.
-  SECTION("both columns") { compare_gpu_vs_cpu("SELECT DISTINCT d, f FROM dist_fp"); }
+  SECTION("both columns")
+  {
+    compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d, f FROM dist_fp", {0, 1});
+  }
 }
