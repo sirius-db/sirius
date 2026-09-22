@@ -22,6 +22,16 @@
 
 namespace sirius::event {
 
+bool event_queue::push(std::shared_ptr<query_events> payload) noexcept
+{
+  try {
+    if (_queue.push(std::move(payload))) { return true; }
+  } catch (...) {
+  }
+  delivery_failed();
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // registration (private; only the subscriber base ever calls these)
 // ---------------------------------------------------------------------------
@@ -42,6 +52,7 @@ subscriber_registration query_event_publisher::register_subscriber(
         // list from overlapping sets should not have to care.
         if (std::ranges::find(bucket, queue.get()) == bucket.end()) {
           bucket.push_back(queue.get());
+          _has_subscribers[index].store(true, std::memory_order_release);
         }
       }
     }
@@ -58,8 +69,10 @@ void query_event_publisher::unregister_subscriber(
   // cleared in the same critical section: a pointer left behind would outlive
   // the queue it names.
   auto* raw = queue.get();
-  for (auto& bucket : _by_event) {
+  for (std::size_t index = 0; index < n_query_events; ++index) {
+    auto& bucket = _by_event[index];
     std::erase(bucket, raw);
+    _has_subscribers[index].store(!bucket.empty(), std::memory_order_release);
   }
 }
 
@@ -71,8 +84,9 @@ void query_event_publisher::stop() noexcept
     std::unique_lock g{_queues_mtx};
     _stopped = true;
     queues.swap(_queues);
-    for (auto& bucket : _by_event) {
-      bucket.clear();
+    for (std::size_t index = 0; index < n_query_events; ++index) {
+      _by_event[index].clear();
+      _has_subscribers[index].store(false, std::memory_order_release);
     }
   }
   for (auto const& q : queues) {
@@ -145,6 +159,12 @@ void query_event_publisher::publish_wait_for_memory_for_task(query_id_t query_id
                                                              std::size_t bytes_needed) noexcept
 {
   publish<wait_for_memory_for_task_event>(query_id, operator_id, gpu_id, bytes_needed);
+}
+
+void query_event_publisher::publish_compressed_materialization(
+  compressed_materialization_activity activity, std::uint64_t count) noexcept
+{
+  publish<compressed_materialization_event>(activity, count);
 }
 
 }  // namespace sirius::event

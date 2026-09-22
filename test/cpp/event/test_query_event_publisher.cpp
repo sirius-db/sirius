@@ -16,6 +16,9 @@
 
 #include "catch.hpp"
 #include "event/query_event_subscriber.hpp"
+#include "utils/compressed_materialization_recorder.hpp"
+
+#include <future>
 
 // Query lifecycle producers and consumers live on different threads and most
 // subscribers care about only a subset of events. This suite documents why the
@@ -24,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +42,21 @@
 using namespace sirius;
 using namespace sirius::event;
 using namespace std::chrono_literals;
+
+namespace sirius::event {
+struct query_event_test_access {
+  static auto hold_routing(query_event_publisher& publisher)
+  {
+    return std::unique_lock{publisher._queues_mtx};
+  }
+
+  static bool has_subscribers(query_event_publisher& publisher)
+  {
+    std::shared_lock lock{publisher._queues_mtx};
+    return !publisher._queues.empty();
+  }
+};
+}  // namespace sirius::event
 
 namespace {
 
@@ -147,7 +166,7 @@ class selective_subscriber : public query_event_subscriber {
  public:
   explicit selective_subscriber(query_event_publisher& publisher,
                                 std::initializer_list<event_type> events)
-    : query_event_subscriber(publisher, events), _subscribed(events)
+    : query_event_subscriber(publisher, events, /*drain_on_stop=*/true), _subscribed(events)
   {
   }
 
@@ -209,6 +228,14 @@ class selective_subscriber : public query_event_subscriber {
     record(event_type::wait_for_memory_for_task, "wait_for_memory_for_task");
   }
 
+  void on_compressed_materialization(event_id_t,
+                                     timestamp_t,
+                                     compressed_materialization_activity,
+                                     std::uint64_t) noexcept override
+  {
+    record(event_type::compressed_materialization, "compressed_materialization");
+  }
+
   [[nodiscard]] std::vector<std::string> seen() const
   {
     std::lock_guard g{_mtx};
@@ -256,6 +283,8 @@ void publish_one_of_each(query_event_publisher& publisher)
   publisher.publish_executor_awaiting_task(0);
   publisher.publish_memory_downgrade_for_task(make_query_id(1), 2, 0, 4096);
   publisher.publish_wait_for_memory_for_task(make_query_id(1), 2, 0, 4096);
+  publisher.publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 3);
 }
 
 constexpr auto some_op_type                     = op::SiriusPhysicalOperatorType::GPU_SCAN;
@@ -656,14 +685,116 @@ TEST_CASE("reporters publishing concurrently all get through", "[event][query_ev
 // misroute every event; the header static_asserts the ends of that mapping.
 static_assert(n_query_events == all_query_events.size());
 
+TEST_CASE("subscriber interest lasts until the last registration is removed",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  for (auto type : all_query_events) {
+    INFO("event " << static_cast<std::size_t>(type));
+    CHECK_FALSE(publisher->has_subscribers(type));
+    {
+      // Registration, not worker start, decides interest. Duplicate event types
+      // must not keep interest alive after the subscriber goes away.
+      selective_subscriber first{*publisher, {type, type}};
+      CHECK(publisher->has_subscribers(type));
+      for (auto other : all_query_events) {
+        CHECK(publisher->has_subscribers(other) == (other == type));
+      }
+      selective_subscriber second{*publisher, {type}};
+      second.stop();
+      CHECK(publisher->has_subscribers(type));
+    }
+    CHECK_FALSE(publisher->has_subscribers(type));
+    selective_subscriber replacement{*publisher, {type}};
+    CHECK(publisher->has_subscribers(type));
+    replacement.stop();
+    CHECK_FALSE(publisher->has_subscribers(type));
+  }
+  CHECK_FALSE(publisher->has_subscribers(static_cast<event_type>(n_query_events)));
+}
+
+TEST_CASE("publisher shutdown clears interest and prevents new interest",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  std::vector<std::unique_ptr<selective_subscriber>> subscribers;
+  for (auto type : all_query_events) {
+    subscribers.push_back(
+      std::make_unique<selective_subscriber>(*publisher, std::initializer_list<event_type>{type}));
+    CHECK(publisher->has_subscribers(type));
+  }
+  publisher->stop();
+  subscribers.clear();
+  for (auto type : all_query_events) {
+    CHECK_FALSE(publisher->has_subscribers(type));
+    selective_subscriber late{*publisher, {type}};
+    CHECK_FALSE(publisher->has_subscribers(type));
+  }
+}
+
+TEST_CASE("unsubscribed publications bypass the routing lock", "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  // A registered mailbox with no interests must not defeat the per-event check.
+  selective_subscriber empty{*publisher, {}};
+  auto lock         = query_event_test_access::hold_routing(*publisher);
+  auto published    = std::async(std::launch::async, [&] {
+    bool interested = false;
+    for (auto type : all_query_events) {
+      interested |= publisher->has_subscribers(type);
+    }
+    publish_one_of_each(*publisher);
+    return interested;
+  });
+  auto const status = published.wait_for(2s);
+  // Release before assertions so a regression fails rather than hanging teardown.
+  lock.unlock();
+  CHECK(status == std::future_status::ready);
+  CHECK_FALSE(published.get());
+}
+
+TEST_CASE("changing other subscriptions does not drop a live subscriber's events",
+          "[event][query_event_interest]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  selective_subscriber stable{*publisher, {event_type::task_queue_empty}};
+  stable.start();
+  std::barrier ready{5};
+  std::vector<std::jthread> threads;
+  for (int i = 0; i < 4; ++i) {
+    threads.emplace_back([&] {
+      ready.arrive_and_wait();
+      for (int j = 0; j < 500; ++j) {
+        publisher->publish_task_queue_empty();
+        publisher->publish_pipeline_closed(make_query_id(1), 2, 3);
+      }
+    });
+  }
+  threads.emplace_back([&] {
+    ready.arrive_and_wait();
+    for (int i = 0; i < 100; ++i) {
+      // queue-empty retains its stable listener; pipeline-closed alternates
+      // between having a listener and having none while reporters are active.
+      selective_subscriber transient{*publisher,
+                                     {event_type::task_queue_empty, event_type::pipeline_closed}};
+    }
+  });
+  threads.clear();
+  stable.stop();
+  CHECK(stable.count() == 2000);
+  CHECK(stable.unsubscribed_count() == 0);
+  CHECK_FALSE(publisher->has_subscribers(event_type::task_queue_empty));
+  CHECK_FALSE(publisher->has_subscribers(event_type::pipeline_closed));
+}
+
 TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publisher]")
 {
   auto publisher = std::make_shared<query_event_publisher>();
-  // Records all eight, subscribed to one. Anything but "task_queue_empty" in
+  // Records all events, subscribed to one. Anything but "task_queue_empty" in
   // the result means the routing delivered something nobody asked for.
   selective_subscriber subscriber{*publisher, {event_type::task_queue_empty}};
-  // A subscriber subscribed to everything, purely as the sync point: once it has
-  // all eight, every delivery this round has been made.
+  // A subscriber subscribed to everything verifies all publications were made.
+  // Each subscriber drains its own mailbox before assertions.
   selective_subscriber witness{*publisher,
                                {event_type::task_created,
                                 event_type::task_deployed,
@@ -672,16 +803,19 @@ TEST_CASE("an unsubscribed event is never delivered", "[event][query_event_publi
                                 event_type::pipeline_closed,
                                 event_type::executor_awaiting_task,
                                 event_type::memory_downgrade_for_task,
-                                event_type::wait_for_memory_for_task}};
+                                event_type::wait_for_memory_for_task,
+                                event_type::compressed_materialization}};
   subscriber.start();
   witness.start();
 
   publish_one_of_each(*publisher);
 
-  REQUIRE(wait_for(witness, 8));
+  witness.stop();
+  REQUIRE(witness.count() == n_query_events);
+  subscriber.stop();
   CHECK(subscriber.unsubscribed_count() == 0);
   CHECK(subscriber.seen() == std::vector<std::string>{"task_queue_empty"});
-  // The witness subscribed to all eight, so nothing it got was unsubscribed
+  // The witness subscribed to all events, so nothing it got was unsubscribed
   // either -- otherwise the counter would be measuring the wrong thing.
   CHECK(witness.unsubscribed_count() == 0);
 }
@@ -690,7 +824,8 @@ TEST_CASE("a subscriber subscribed to nothing receives nothing", "[event][query_
 {
   auto publisher = std::make_shared<query_event_publisher>();
   selective_subscriber subscriber{*publisher, {}};
-  selective_subscriber witness{*publisher, {event_type::wait_for_memory_for_task}};
+  selective_subscriber witness{
+    *publisher, {event_type::wait_for_memory_for_task, event_type::compressed_materialization}};
   subscriber.start();
   witness.start();
 
@@ -703,7 +838,7 @@ TEST_CASE("a subscriber subscribed to nothing receives nothing", "[event][query_
 
 TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_publisher]")
 {
-  // One subscriber per event, each recording all eight: a payload routed to the
+  // One subscriber per event, each recording all events: a payload routed to the
   // wrong bucket shows up as a second entry on somebody.
   auto publisher = std::make_shared<query_event_publisher>();
   std::vector<std::unique_ptr<selective_subscriber>> subscribers;
@@ -714,7 +849,8 @@ TEST_CASE("each event reaches exactly its own subscriber", "[event][query_event_
                                        "pipeline_closed",
                                        "executor_awaiting_task",
                                        "memory_downgrade_for_task",
-                                       "wait_for_memory_for_task"};
+                                       "wait_for_memory_for_task",
+                                       "compressed_materialization"};
   for (std::size_t i = 0; i < n_query_events; ++i) {
     subscribers.push_back(std::make_unique<selective_subscriber>(
       *publisher, std::initializer_list<event_type>{static_cast<event_type>(i)}));
@@ -823,7 +959,7 @@ TEST_CASE("every event is published and no unsubscribed one is delivered",
 {
   // Each subscriber subscribes to one event; every event is then published. The
   // counter is the assertion: it counts callbacks that fired for an event the
-  // subscriber never asked for, so zero across all eight means the routing
+  // subscriber never asked for, so zero across all events means the routing
   // delivered nothing it should not have.
   auto publisher = std::make_shared<query_event_publisher>();
   std::vector<std::unique_ptr<selective_subscriber>> subscribers;
@@ -840,8 +976,9 @@ TEST_CASE("every event is published and no unsubscribed one is delivered",
   for (auto const& l : subscribers) {
     REQUIRE(wait_for(*l, 2));
   }
-  // Settle: a wrongly-routed payload would arrive around now, not before.
-  std::this_thread::sleep_for(100ms);
+  for (auto const& subscriber : subscribers) {
+    subscriber->stop();
+  }
   for (std::size_t i = 0; i < subscribers.size(); ++i) {
     INFO("subscriber " << i);
     CHECK(subscribers[i]->unsubscribed_count() == 0);
@@ -861,19 +998,198 @@ TEST_CASE("registration alone decides delivery", "[event][query_event_publisher]
   empties.start();
   closes.start();
 
+  SECTION("only queue-empty is published")
+  {
+    publisher->publish_task_queue_empty();
+    empties.stop();
+    closes.stop();
+    CHECK(empties.count() == 1);
+    CHECK(closes.count() == 0);
+  }
+  SECTION("only pipeline-closed is published")
+  {
+    publisher->publish_pipeline_closed(make_query_id(1), 2, 3);
+    empties.stop();
+    closes.stop();
+    CHECK(closes.count() == 1);
+    CHECK(empties.count() == 0);
+  }
+}
+
+TEST_CASE("compressed materialization snapshots consume every activity and preserve counts",
+          "[event][compressed_materialization]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  sirius::test::compressed_materialization_recorder recorder{*publisher};
+  auto const before = recorder.snapshot();
+  CHECK(before.scan_columns_narrowed == 0);
+  using enum compressed_materialization_activity;
+  publisher->publish_compressed_materialization(scan_columns_narrowed, 2);
+  publisher->publish_compressed_materialization(scan_columns_restored, 3);
+  publisher->publish_compressed_materialization(pin_columns_narrowed, 5);
+  publisher->publish_compressed_materialization(scan_sidecar_installed);
+  publisher->publish_compressed_materialization(partition_narrow_columns, 7);
+  publisher->publish_compressed_materialization(scan_narrow_targets_retracted, 11);
+  auto const after = recorder.snapshot();
+  CHECK(after.scan_columns_narrowed == 2);
+  CHECK(after.scan_columns_restored == 3);
+  CHECK(after.pin_columns_narrowed == 5);
+  CHECK(after.scan_sidecars_installed == 1);
+  CHECK(after.partition_narrow_columns == 7);
+  CHECK(after.scan_narrow_targets_retracted == 11);
+  // No new publication is still a complete, meaningful observation.
+  CHECK(recorder.snapshot().pin_columns_narrowed == 5);
+}
+
+TEST_CASE("compressed materialization observations are scoped to their publisher",
+          "[event][compressed_materialization]")
+{
+  auto first  = std::make_shared<query_event_publisher>();
+  auto second = std::make_shared<query_event_publisher>();
+  first->publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 99);
+  sirius::test::compressed_materialization_recorder one{*first};
+  sirius::test::compressed_materialization_recorder two{*second};
+  first->publish_compressed_materialization(
+    compressed_materialization_activity::pin_columns_narrowed, 3);
+  CHECK(one.snapshot().pin_columns_narrowed == 3);
+  CHECK(two.snapshot().pin_columns_narrowed == 0);
+}
+
+TEST_CASE("drained snapshots include every concurrent reporter and can be reused",
+          "[event][compressed_materialization]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  sirius::test::compressed_materialization_recorder recorder{*publisher};
+  for (std::uint64_t round = 1; round <= 3; ++round) {
+    std::vector<std::jthread> reporters;
+    for (int thread = 0; thread < 4; ++thread) {
+      reporters.emplace_back([&] {
+        for (int i = 0; i < 500; ++i) {
+          publisher->publish_compressed_materialization(
+            compressed_materialization_activity::partition_narrow_columns, 2);
+        }
+      });
+    }
+    reporters.clear();  // Join before capturing the observation boundary.
+    CHECK(recorder.snapshot().partition_narrow_columns == round * 4000);
+  }
+}
+
+namespace {
+class blocked_subscriber : public query_event_subscriber {
+ public:
+  explicit blocked_subscriber(query_event_publisher& publisher,
+                              bool drain_on_stop  = false,
+                              bool stop_from_hook = false)
+    : query_event_subscriber(publisher, {event_type::task_queue_empty}, drain_on_stop),
+      release_future(release.get_future().share()),
+      _stop_from_hook(stop_from_hook)
+  {
+    start();
+  }
+  ~blocked_subscriber() override
+  {
+    unblock();
+    stop();
+  }
+  std::string_view name() const noexcept override { return "blocked"; }
+  void on_task_queue_empty(event_id_t, timestamp_t) noexcept override
+  {
+    if (count == 0) {
+      entered.set_value();
+      release_future.wait();
+    }
+    ++count;
+    if (_stop_from_hook) { stop(); }
+  }
+  void unblock()
+  {
+    std::call_once(released, [&] { release.set_value(); });
+  }
+  std::promise<void> entered;
+  std::size_t count{0};  // Read only after stop() joins the worker.
+
+ private:
+  std::once_flag released;
+  std::promise<void> release;
+  std::shared_future<void> release_future;
+  bool const _stop_from_hook;
+};
+}  // namespace
+
+TEST_CASE("shutdown drains queued callbacks only when opted in", "[event][query_event_drain]")
+{
+  bool const drain_on_stop  = GENERATE(false, true);
+  bool const stop_from_hook = GENERATE(false, true);
+  auto publisher            = std::make_shared<query_event_publisher>();
+  blocked_subscriber subscriber{*publisher, drain_on_stop, stop_from_hook};
   publisher->publish_task_queue_empty();
+  REQUIRE(subscriber.entered.get_future().wait_for(2s) == std::future_status::ready);
 
-  REQUIRE(wait_for(empties, 1));
-  std::this_thread::sleep_for(100ms);  // a misroute would land about now
-  CHECK(empties.count() == 1);
-  CHECK(closes.count() == 0);
+  // Leave a backlog in several producer queues while the first hook is blocked.
+  // Shutdown sentinels must not hide any of it from the final drain.
+  std::vector<std::jthread> reporters;
+  for (int thread = 0; thread < 4; ++thread) {
+    reporters.emplace_back([&] {
+      for (int i = 0; i < 25; ++i) {
+        publisher->publish_task_queue_empty();
+      }
+    });
+  }
+  reporters.clear();
 
-  // And the mirror, so the result cannot be an artefact of which subscriber was
-  // registered first or which event happens to be published.
-  publisher->publish_pipeline_closed(make_query_id(1), 2, 3);
+  SECTION("subscriber stops") {}
+  SECTION("publisher stops") { publisher->stop(); }
 
-  REQUIRE(wait_for(closes, 1));
-  std::this_thread::sleep_for(100ms);
-  CHECK(closes.count() == 1);
-  CHECK(empties.count() == 1);
+  auto stopped        = std::async(std::launch::async, [&] { subscriber.stop(); });
+  auto const deadline = std::chrono::steady_clock::now() + 2s;
+  while (query_event_test_access::has_subscribers(*publisher) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  bool const detached = !query_event_test_access::has_subscribers(*publisher);
+  auto const status   = stopped.wait_for(10ms);
+  // This must not reach the detached subscriber, even during its drain.
+  publisher->publish_task_queue_empty();
+  subscriber.unblock();
+  stopped.get();
+
+  CHECK(detached);
+  CHECK(status == std::future_status::timeout);
+  CHECK(subscriber.count == (drain_on_stop ? 101 : 1));
+  CHECK_FALSE(subscriber.is_subscribed());
+  subscriber.stop();
+  subscriber.start();
+  CHECK_FALSE(subscriber.is_subscribed());
+}
+
+TEST_CASE("drain handles an empty mailbox and an unstarted subscriber",
+          "[event][query_event_drain]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  selective_subscriber subscriber{*publisher, {event_type::task_queue_empty}};
+  SECTION("started with no events") { subscriber.start(); }
+  SECTION("never started") { publisher->publish_task_queue_empty(); }
+  subscriber.stop();
+  CHECK_FALSE(subscriber.is_subscribed());
+  CHECK(subscriber.count() == 0);
+}
+
+TEST_CASE("mailbox delivery failures stay visible after draining", "[event][query_event_drain]")
+{
+  event_queue queue;
+  CHECK_FALSE(queue.failed());
+  queue.delivery_failed();
+  queue.interrupt();
+  CHECK(queue.try_pop() == nullptr);
+  CHECK(queue.failed());
+}
+
+TEST_CASE("snapshots reject a stopped publisher", "[event][compressed_materialization]")
+{
+  auto publisher = std::make_shared<query_event_publisher>();
+  sirius::test::compressed_materialization_recorder recorder{*publisher};
+  publisher->stop();
+  CHECK_THROWS_AS(recorder.snapshot(), std::runtime_error);
 }

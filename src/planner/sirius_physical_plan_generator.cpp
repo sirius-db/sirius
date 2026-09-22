@@ -1187,7 +1187,9 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
                           ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                           : nullptr;
       if (sirius_ctx) {
-        sirius_ctx->record_compressed_materialization_scan_narrow_targets_retracted(retracted);
+        sirius_ctx->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_narrow_targets_retracted,
+          retracted);
       }
     }
   }

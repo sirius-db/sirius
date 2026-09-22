@@ -285,9 +285,11 @@ void record_carrier_conversions(const std::vector<carrier_conversion_plan>& plan
     auto const narrowing = conversion.kind == carrier_conversion_kind::NARROW;
     if (observer != nullptr) {
       if (narrowing) {
-        observer->record_compressed_materialization_scan_columns_narrowed();
+        observer->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_columns_narrowed);
       } else {
-        observer->record_compressed_materialization_scan_columns_restored();
+        observer->get_event_publisher().publish_compressed_materialization(
+          sirius::event::compressed_materialization_activity::scan_columns_restored);
       }
     }
     SIRIUS_LOG_DEBUG("[compressed_materialization] scan column {} {}: {} -> {}",

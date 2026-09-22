@@ -193,8 +193,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// num_gpus partitions. Build side deposits its batch into every slot; probe side deposits each
   /// batch into the slot matching its current GPU. See get_next_task_input_data / sink.
   bool _broadcast{false};
-  /// Non-owning observer for the narrow-passthrough counter. Registered state owns the context
-  /// for the plan's lifetime; unit-test operators may leave it null.
+  /// Non-owning context providing narrow-passthrough events. The registered-state shared_ptr owns
+  /// the context for at least as long as the query plan; unit-test operators may leave it null.
   duckdb::SiriusContext* _compressed_materialization_observer = nullptr;
   /// Enabled only for grouped-aggregation partitions.
   bool _enable_size_estimation{false};
