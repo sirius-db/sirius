@@ -7,12 +7,6 @@ html {
   --border-radius-large: 14px;
 }
 
-html.dark-mode {
-  --primary-color: #8cbfff;
-  --primary-dark-color: #bfdcff;
-  --primary-light-color: #23364d;
-}
-
 #projectlogo img {
   width: 190px;
   height: auto;
@@ -23,27 +17,14 @@ html.dark-mode {
   font-size: 0.9rem;
 }
 
-.sirius-logo-dark,
-html.dark-mode .sirius-logo-light {
-  display: none;
-}
-
-html.dark-mode .sirius-logo-dark {
-  display: inline;
-}
-
 @media (prefers-color-scheme: dark) {
-  html:not(.light-mode) {
+  html {
     --primary-color: #8cbfff;
     --primary-dark-color: #bfdcff;
     --primary-light-color: #23364d;
   }
 
-  html:not(.light-mode) .sirius-logo-light {
-    display: none;
-  }
-
-  html:not(.light-mode) .sirius-logo-dark {
-    display: inline;
+  #projectlogo img {
+    content: url("sirius_dark_full.svg");
   }
 }
