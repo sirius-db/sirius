@@ -61,6 +61,23 @@ void ioctx::initialize_cache(
     SIRIUS_LOG_ERROR("prefetching_cache construction failed: unknown error");
     _cache.reset();
   }
+  // The reactors plan a fragmented fill's extent with
+  // cache::fill_span(fill, chunk->offset, their own staging block size).  A
+  // cache whose chunks are a different size makes every partial fill compute
+  // the wrong extent -- with the larger staging block that is an out-of-bounds
+  // write past the end of a pinned chunk.  The two are equal today only because
+  // both read the same front HOST arena; refuse the cache rather than let a
+  // future split of those resources corrupt the heap silently.
+  if (_cache && staging_block_size() != 0 && staging_block_size() != _cache->chunk_size()) {
+    SIRIUS_LOG_ERROR(
+      "ioctx::initialize_cache: backend {} stages in {}-byte blocks but the prefetching cache "
+      "chunk is {} bytes; the two must match because fragmented fills are planned with the "
+      "staging block size -- running without a cache",
+      static_cast<int>(type()),
+      staging_block_size(),
+      _cache->chunk_size());
+    _cache.reset();
+  }
 }
 
 void ioctx::shutdown_cache() noexcept { _cache.reset(); }

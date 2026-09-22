@@ -69,6 +69,8 @@ class fake_reactor {
 
   [[nodiscard]] std::size_t queued_bytes() const noexcept { return backlog; }
 
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return 0; }
+
   std::size_t host_read(fake_object const&, std::size_t, std::size_t size, std::uint8_t*) const
   {
     return size;
