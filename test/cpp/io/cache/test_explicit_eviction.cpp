@@ -253,6 +253,70 @@ TEST_CASE("synchronous eviction is processed before prepare retries allocation",
   REQUIRE(target->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
 }
 
+TEST_CASE("prepare does not publish a request the retry's eviction left short of buffers",
+          "[cache][eviction][explicit][prepare]")
+{
+  constexpr std::size_t mib = 1ull << 20;  // also the pool's chunk size
+  temp_data_file file(2ull << 30);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+
+  // Buffered, then disposed: the only chunks in the tier the evictor may take.
+  // Its last 4 MiB are named by nothing else below, so the request stays an
+  // eviction candidate instead of being retired the moment it is released.
+  {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(0, static_cast<std::int64_t>(36 * mib));
+    auto victim = manager.create_datasource(file.path.string());
+    REQUIRE(victim != nullptr);
+    victim->fadvise(ranges, 0);
+    REQUIRE(victim->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  }
+
+  // The target names 32 MiB of the victim's chunks -- still buffered, so the
+  // shortfall count skips them -- plus 32 MiB of empty ones past the gap.
+  std::vector<cudf::io::text::byte_range_info> target_ranges;
+  target_ranges.emplace_back(0, static_cast<std::int64_t>(32 * mib));
+  target_ranges.emplace_back(static_cast<std::int64_t>(36 * mib),
+                             static_cast<std::int64_t>(32 * mib));
+  auto target = manager.create_datasource(file.path.string());
+  REQUIRE(target != nullptr);
+  target->fadvise(target_ranges, 0);
+
+  // Fill the rest of the tier with requests that stay alive, so the victim's
+  // chunks remain the only reclaimable ones.
+  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> fillers;
+  std::size_t offset = 68 * mib;
+  bool exhausted     = false;
+  for (std::size_t attempt = 0; attempt < 32; ++attempt) {
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(static_cast<std::int64_t>(offset), static_cast<std::int64_t>(32 * mib));
+    auto filler = manager.create_datasource(file.path.string());
+    REQUIRE(filler != nullptr);
+    filler->fadvise(ranges, 0);
+    if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
+      exhausted = true;
+      break;
+    }
+    fillers.push_back(std::move(filler));
+    offset += 32 * mib;
+  }
+  REQUIRE(exhausted);
+
+  // The synchronous eviction the shortfall triggers cannot meet its target from
+  // the victim's unsubscribed tail alone, so the subscriber-ignoring pass takes
+  // the target's own prefix chunks as well.  The attach loop then walks those
+  // first and spends the buffers on them, leaving the empty tail with none --
+  // and a request whose chunks cannot all be claimed for loading is not
+  // `prepared`.
+  INFO("cache: " << cache->summary());
+  CHECK(target->prepare_prefetch(true) == sirius::io::prepare_result::allocation_failed);
+}
+
 TEST_CASE("prepare abandons immediately after the consumer reaches the split",
           "[cache][eviction][explicit][prepare]")
 {

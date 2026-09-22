@@ -546,18 +546,11 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   }
 
   // Allocation and synchronous eviction can take long enough for the consumer
-  // to reach this split. Recheck immediately before publishing `preparing`.
+  // to reach this split. Recheck immediately before attaching.
   if (req.has_fallen_behind()) {
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
     req.producer->mark_abandoned();
     return prepare_result::fallen_behind;
-  }
-  if (!req.producer->mark_preparing()) {
-    if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-    auto const state = req.producer->get();
-    return state >= producer_stage::prepared && state != producer_stage::abandoned
-             ? prepare_result::prepared
-             : prepare_result::unavailable;
   }
 
   for (auto* c : chunks) {
@@ -567,11 +560,36 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
       buffers.pop_back();
       c->data      = reinterpret_cast<uint8_t*>(buffer);
       c->numa_node = numa_allocated;
-      if (!c->state.mark_allocated()) { buffers.push_back(buffer); }
+      if (!c->state.mark_allocated()) {
+        // Hand the buffer back with the chunk describing itself as holding
+        // nothing: `data` is only ever written under `queued`, so a chunk left
+        // there pointing at a freed buffer would never be corrected.
+        c->data      = nullptr;
+        c->numa_node = -1;
+        buffers.push_back(buffer);
+      }
     }
   }
 
   if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
+
+  // The count above and this walk are not atomic against the evictor: a chunk
+  // still `evicting` when the shortfall was sized is `empty` by the time the
+  // loop reaches it and takes a buffer meant for another, so the request can
+  // come out of the loop short.  Publishing it anyway would promise buffers
+  // this request does not have -- the prefetch would claim nothing, settle
+  // `ready`, and the consumer would pay for every chunk as a miss.
+  if (!all_chunks_have_buffers(chunks)) { return prepare_result::allocation_failed; }
+
+  // Only now is there something to publish, so only now does the producer enter
+  // the `preparing` window: every path above leaves it `queued` and retryable,
+  // which is what `allocation_failed` promises its caller.
+  if (!req.producer->mark_preparing()) {
+    auto const state = req.producer->get();
+    return state >= producer_stage::prepared && state != producer_stage::abandoned
+             ? prepare_result::prepared
+             : prepare_result::unavailable;
+  }
 
   std::ignore = req.producer->mark_prepared();
   return prepare_result::prepared;
