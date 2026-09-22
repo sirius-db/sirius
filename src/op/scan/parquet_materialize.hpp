@@ -76,12 +76,9 @@ struct parquet_source {
 ///   general - otherwise.  cudf::io::read_parquet over the datasources and
 ///             their pre-parsed footers, which reads as it decodes.
 ///
-/// The bulk route cannot apply a row filter.  cudf's hybrid scan evaluates a
-/// predicate through a different sequence entirely -- build a row mask,
-/// materialize the filter columns to narrow it, then materialize the payload
-/// columns under it -- and @c materialize_all_columns is the shortcut that skips
-/// all of that.  Handing it filtered options would silently return unfiltered
-/// rows, so a filter on @p options forces the general route.
+/// Both routes honor @p options' row filter: @c materialize_all_columns applies
+/// it at row level exactly as @c read_parquet does, so the route never changes
+/// which rows come back.
 ///
 /// @param ranges  column-chunk ranges, one vector per entry of @p sources and in
 ///                the same order.  Only read on the bulk route; any source whose
@@ -96,7 +93,7 @@ struct parquet_source {
 
 /// Whether @c materialize_parquet would take the bulk route for @p sources and
 /// @p options.  Exposed so a caller can decide *before* paying to build the
-/// ranges.  Answers false for filtered options -- see @c materialize_parquet.
+/// ranges.
 [[nodiscard]] bool prefers_bulk_materialize(
   std::span<parquet_source const> sources,
   cudf::io::parquet_reader_options const& options) noexcept;

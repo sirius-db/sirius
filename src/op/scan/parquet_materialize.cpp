@@ -48,11 +48,6 @@ std::vector<cudf::io::text::byte_range_info> column_chunk_ranges(
 bool prefers_bulk_materialize(std::span<parquet_source const> sources,
                               cudf::io::parquet_reader_options const& options) noexcept
 {
-  // A filter is disqualifying, not merely unsupported: materialize_all_columns
-  // ignores one rather than rejecting it, so taking this route with filtered
-  // options would hand back every row and claim it was filtered.  Enforced here
-  // rather than left to each caller to remember.
-  if (options.get_filter().has_value()) { return false; }
   if (sources.empty()) { return false; }
   // Every source has to qualify: the decode consumes one flattened chunk-data
   // span covering all of them, so a single file that cannot be read this way
