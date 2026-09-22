@@ -317,3 +317,45 @@ TEST_CASE_METHOD(DistinctFixture,
 {
   expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
 }
+
+/// Floating-point keys carrying every value whose equality is decided by something other than
+/// bit equality: NaN against -NaN (different bit patterns, one DuckDB group) and +0.0 against
+/// -0.0 (different bit patterns, one DuckDB group). Separate from DistinctFixture so the
+/// integer-keyed cases keep a table whose every column is exactly comparable.
+class DistinctFloatFixture : public sirius::test::GpuExecutionFixture {
+ public:
+  DistinctFloatFixture()
+  {
+    run_ok("CREATE TABLE dist_fp (d DOUBLE, f REAL);");
+    run_ok(
+      "INSERT INTO dist_fp VALUES "
+      "('NaN'::DOUBLE,       'NaN'::REAL),"
+      "('NaN'::DOUBLE,       'NaN'::REAL),"     // duplicate NaN: must collapse
+      "(-('NaN'::DOUBLE),    -('NaN'::REAL)),"  // sign bit set: same group as NaN
+      "(0.0,                 0.0),"
+      "(-0.0,                -0.0),"  // same group as +0.0
+      "('Infinity'::DOUBLE,  'Infinity'::REAL),"
+      "('-Infinity'::DOUBLE, '-Infinity'::REAL),"
+      "(1.5,                 1.5),"
+      "(1.5,                 1.5),"
+      "(NULL,                NULL);");
+    run_ok("CHECKPOINT;");
+  }
+};
+
+TEST_CASE_METHOD(DistinctFloatFixture,
+                 "gpu_execution DISTINCT over a floating-point key groups NaN and signed zero as "
+                 "DuckDB does",
+                 "[integration][gpu_execution][distinct]")
+{
+  // cudf::groupby's row comparator decides NaN == NaN and -0.0 == 0.0 on its own terms; DuckDB
+  // groups both pairs. A disagreement is a wrong answer, not a fallback, so it is asserted on the
+  // row set rather than on a count.
+  SECTION("DOUBLE") { compare_gpu_vs_cpu("SELECT DISTINCT d FROM dist_fp"); }
+
+  SECTION("REAL") { compare_gpu_vs_cpu("SELECT DISTINCT f FROM dist_fp"); }
+
+  // A composite key runs the same comparator over a two-column row, which is the shape the
+  // single-column cases cannot reach.
+  SECTION("both columns") { compare_gpu_vs_cpu("SELECT DISTINCT d, f FROM dist_fp"); }
+}
