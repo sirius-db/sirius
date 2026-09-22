@@ -22,11 +22,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <shared_mutex>
 #include <span>
 #include <stop_token>
@@ -38,27 +36,20 @@ namespace sirius::event {
 
 class query_event_subscriber;
 
-/// Tracks unfinished deliveries independently of queue order. Different producers
-/// can enqueue out of event-ID order, so a maximum processed ID is not a fence.
+/// A mailbox with sticky failure reporting. Successful deliveries need no
+/// completion bookkeeping; an opted-in subscriber drains it after routing stops.
 class event_queue {
  public:
   bool push(std::shared_ptr<query_events> payload) noexcept;
   std::shared_ptr<query_events> pop() { return _queue.pop(); }
-  void complete(event_id_t id) noexcept;
-  void interrupt();
-  void delivery_failed() noexcept;
-  bool wait_before(event_id_t cutoff, std::chrono::steady_clock::time_point deadline);
+  std::shared_ptr<query_events> try_pop() { return _queue.try_pop(); }
+  void interrupt() { _queue.interrupt(); }
+  void delivery_failed() noexcept { _failed.store(true, std::memory_order_relaxed); }
+  bool failed() const noexcept { return _failed.load(std::memory_order_relaxed); }
 
  private:
-  friend struct query_event_test_access;
-
   exec::interruptible_mpmc<std::shared_ptr<query_events>> _queue;
-  std::timed_mutex _mutex;
-  std::condition_variable_any _completed;
-  std::set<event_id_t> _pending;
-  // Failure must be recordable even when acquiring the mailbox mutex throws.
   std::atomic<bool> _failed{false};
-  bool _closed{false};
 };
 
 /// One subscriber's mailbox plus the publisher-wide stop token.  The queue is
@@ -168,8 +159,6 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   friend class query_event_subscriber;
   friend struct query_event_test_access;
 
-  bool flush(std::shared_ptr<event_queue> const& queue, std::chrono::milliseconds timeout);
-
   /// Mint a mailbox subscribed to @p events and nothing else, and add it to
   /// the routing table.  Called by the subscriber base in its constructor.
   ///
@@ -233,7 +222,7 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// Shared by every subscriber: one request_stop takes them all down together.
   std::stop_source _stop_source;
 
-  mutable std::shared_timed_mutex _queues_mtx;
+  mutable std::shared_mutex _queues_mtx;
   /// Owns the registered queues; the buckets below only point into it.
   std::vector<std::shared_ptr<event_queue>> _queues;
   /// One subscriber list per event, indexed by @ref event_index_v.  This is
