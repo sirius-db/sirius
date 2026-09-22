@@ -52,6 +52,7 @@ subscriber_registration query_event_publisher::register_subscriber(
         // list from overlapping sets should not have to care.
         if (std::ranges::find(bucket, queue.get()) == bucket.end()) {
           bucket.push_back(queue.get());
+          _has_subscribers[index].store(true, std::memory_order_release);
         }
       }
     }
@@ -68,8 +69,10 @@ void query_event_publisher::unregister_subscriber(
   // cleared in the same critical section: a pointer left behind would outlive
   // the queue it names.
   auto* raw = queue.get();
-  for (auto& bucket : _by_event) {
+  for (std::size_t index = 0; index < n_query_events; ++index) {
+    auto& bucket = _by_event[index];
     std::erase(bucket, raw);
+    _has_subscribers[index].store(!bucket.empty(), std::memory_order_release);
   }
 }
 
@@ -81,8 +84,9 @@ void query_event_publisher::stop() noexcept
     std::unique_lock g{_queues_mtx};
     _stopped = true;
     queues.swap(_queues);
-    for (auto& bucket : _by_event) {
-      bucket.clear();
+    for (std::size_t index = 0; index < n_query_events; ++index) {
+      _by_event[index].clear();
+      _has_subscribers[index].store(false, std::memory_order_release);
     }
   }
   for (auto const& q : queues) {

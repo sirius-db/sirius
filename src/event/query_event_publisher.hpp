@@ -96,9 +96,10 @@ struct subscriber_registration {
  * their subscribers and only referenced here, so the publisher never keeps a
  * subscriber alive.
  *
- * Thread safety: the queue set is guarded by a shared mutex.  Publishing takes
- * it shared, so the reporting threads do not serialise against each other;
- * registration and deregistration take it exclusively.
+ * Thread safety: the queue set is guarded by a shared mutex. Publishing skips
+ * that lock when the event's atomic interest flag is false; otherwise it takes
+ * it shared and rechecks the bucket. Registration and deregistration take it
+ * exclusively and update the interest flags.
  */
 class query_event_publisher : public std::enable_shared_from_this<query_event_publisher> {
  public:
@@ -112,6 +113,16 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// Does not join subscriber threads; each subscriber owns and joins its own
   /// worker.
   void stop() noexcept;
+
+  /// Advisory, lock-free check before preparing an event's payload. A true
+  /// result does not reserve delivery; publish rechecks routing under the lock.
+  /// Registration racing a false result may miss that event. Register before
+  /// starting the measured operation when complete observations are required.
+  [[nodiscard]] bool has_subscribers(event_type type) const noexcept
+  {
+    auto const index = static_cast<std::size_t>(type);
+    return index < n_query_events && _has_subscribers[index].load(std::memory_order_acquire);
+  }
 
   // -- reporting -------------------------------------------------------------
   //
@@ -181,8 +192,8 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// Build the event once and fan a reference to it out to every mailbox.
   ///
   /// Everything is behind the empty check, including the event ID and the
-  /// timestamp: with nobody listening these entry points sit on hot paths and
-  /// should cost a lock and a branch, not a contended RMW and a clock read.
+  /// timestamp: with nobody listening these entry points cost an atomic load
+  /// and a branch, without taking the routing lock.
   /// The ID therefore skips over events nobody was there to see.  Publishing is
   /// @c noexcept, so a failed allocation drops the event rather than
   /// propagating out into a reporter that has no way to handle it.
@@ -193,6 +204,7 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   template <typename Event, typename... Args>
   void publish(Args&&... args) noexcept
   {
+    if (!has_subscribers(Event::type)) { return; }
     try {
       std::shared_lock g{_queues_mtx};
       auto const& subscribers = _by_event[event_index_v<Event>];
@@ -228,6 +240,10 @@ class query_event_publisher : public std::enable_shared_from_this<query_event_pu
   /// One subscriber list per event, indexed by @ref event_index_v.  This is
   /// what makes a publish cost only the subscribers that asked for that event.
   std::array<std::vector<event_queue*>, n_query_events> _by_event;
+  /// Updated only under _queues_mtx, after changing the corresponding bucket.
+  /// Readers use these only to skip work; the locked bucket governs delivery.
+  static_assert(std::atomic<bool>::is_always_lock_free);
+  std::array<std::atomic<bool>, n_query_events> _has_subscribers{};
   bool _stopped{false};
 };
 
