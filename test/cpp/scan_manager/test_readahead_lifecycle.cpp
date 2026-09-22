@@ -233,20 +233,34 @@ TEST_CASE("an executor read borrows rather than waits", "[scan_manager][gatekeep
   CHECK(g.acquire_for(INSTANT));
 }
 
-TEST_CASE("reload clears outstanding debt", "[scan_manager][gatekeeper]")
+TEST_CASE("arming preserves the debt of reads already in flight", "[scan_manager][gatekeeper]")
 {
-  // Debt describes how the executor WAS competing; a re-arm says that is no
-  // longer the question.
+  // Under the opportunistic strategy the executor reads before the readahead is
+  // armed.  Each such read borrowed a ticket it will give back on disposal, so
+  // the debt is live and arming must add the budget on top of it rather than
+  // wipe it -- otherwise those returns lift the count past the budget for good.
   gatekeeper g{2};
-  g.reload();
-  REQUIRE_FALSE(g.acquire_or_borrow());  // covered by the budget
-  REQUIRE_FALSE(g.acquire_or_borrow());
-  REQUIRE(g.acquire_or_borrow());  // budget spent -- this one is debt
-  REQUIRE(g.deficit() == 1);
+  REQUIRE(g.acquire_or_borrow());  // nothing armed yet: every one is a borrow
+  REQUIRE(g.acquire_or_borrow());
+  REQUIRE(g.acquire_or_borrow());
+  REQUIRE(g.available() == -3);
 
   g.reload();
+  CHECK(g.available() == -1);
+  CHECK(g.deficit() == 1);
+  // Still over-subscribed: the readahead may not issue until a read returns.
+  CHECK_FALSE(g.acquire_for(BRIEF));
+
+  g.release();
+  CHECK(g.available() == 0);
+  CHECK_FALSE(g.acquire_for(INSTANT));
+
+  g.release();
+  CHECK(g.acquire_for(INSTANT));  // one ticket free, one read still out
+  g.release();                    // the readahead's own ticket comes back
+  g.release();                    // the last foreground read disposes
+  CHECK(g.available() == 2);      // exactly the budget, never more
   CHECK(g.deficit() == 0);
-  CHECK(g.available() == 2);
 }
 
 TEST_CASE("stop interrupts a waiting acquire", "[scan_manager][gatekeeper]")

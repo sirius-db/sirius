@@ -58,16 +58,26 @@ class gatekeeper {
   gatekeeper(gatekeeper const&)            = delete;
   gatekeeper& operator=(gatekeeper const&) = delete;
 
-  /// Hand out the full budget, and undo any earlier @ref stop.
+  /// Hand out the budget, and undo any earlier @ref stop.
   ///
-  /// Outstanding debt is cleared with it: it describes how the executor was
-  /// competing before, which says nothing about now.
+  /// The budget is ADDED to the count, not assigned to it.  Under the
+  /// opportunistic strategy the executor reads before the readahead is armed,
+  /// and every one of those reads has borrowed a ticket it will give back on
+  /// disposal.  A negative count here is that live debt, not history: assigning
+  /// the budget over it would hand the readahead a full allowance while those
+  /// reads are still in flight, and their later releases would then lift the
+  /// count past the budget for good.  Adding keeps the debt on the books, so
+  /// the readahead stays blocked until enough reads return and the count
+  /// settles at exactly the budget once they all have.
+  ///
+  /// Called once per gatekeeper (arming is one-shot); a second call would
+  /// double the budget.
   void reload()
   {
     {
       std::lock_guard lock{_mutex};
-      _available = _budget;
-      _stopped   = false;
+      _available += _budget;
+      _stopped = false;
     }
     _cv.notify_all();
   }
