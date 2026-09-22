@@ -250,8 +250,13 @@ prepare_result sirius_datasource::prepare_prefetch(bool wait_for_eviction)
   if (!_cache_handle || !uses_prefetching_cache()) { return prepare_result::nothing_to_prepare; }
   auto* cache = _io_ctx->cache();
   if (cache == nullptr) { return prepare_result::nothing_to_prepare; }
-  return cache->prepare(_cache_handle, wait_for_eviction) ? prepare_result::prepared
-                                                          : prepare_result::allocation_failed;
+  switch (cache->prepare(_cache_handle, wait_for_eviction)) {
+    case cache::prepare_result::prepared: return prepare_result::prepared;
+    case cache::prepare_result::allocation_failed: return prepare_result::allocation_failed;
+    case cache::prepare_result::fallen_behind: return prepare_result::fallen_behind;
+    case cache::prepare_result::unavailable: return prepare_result::nothing_to_prepare;
+  }
+  return prepare_result::nothing_to_prepare;
 }
 
 prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) noexcept> on_done)
@@ -269,7 +274,10 @@ prefetch_refusal sirius_datasource::prefetch_async(exec::invocable<void(bool) no
   auto const producer = _cache_handle.producer_state();
   if (producer == cache::producer_stage::abandoned) {
     on_done(false);
-    return prefetch_refusal::memory_pressure;
+    // Allocation pressure no longer abandons a request: prepare() leaves it
+    // queued so readahead can evict and retry.  An abandoned request therefore
+    // lost the race with its consumer (or was cancelled), not its buffers.
+    return prefetch_refusal::other;
   }
   if (producer < cache::producer_stage::prepared) {
     on_done(false);
