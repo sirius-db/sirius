@@ -23,6 +23,14 @@ The theme includes the Sirius logos, system light/dark preference, and a manual
 theme toggle. Doxygen configuration
 and styling live in `docs/api/`; generated output stays under `build/docs/`.
 
+The `docs-theme` dependency task downloads [Doxygen Awesome](https://github.com/jothepro/doxygen-awesome-css)
+v2.5.0 at commit `46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da`, verifies the archive's
+SHA-256 checksum, and caches its CSS, JavaScript, and MIT license under
+`build/docs/theme/`. The first build needs network access and `tar`; subsequent
+builds reuse the cached assets. The license is included in the generated site.
+To upgrade the theme, update the commit, version, and checksum in `pixi.toml`,
+then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
+
 `docs/api/header.html` is Doxygen's HTML header template with the theme toggle and
 both logo variants added. When upgrading Doxygen, compare it against a fresh
 template generated with `doxygen -w html header.html footer.html doxygen.css` and

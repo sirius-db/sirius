@@ -156,8 +156,22 @@ docs = { features = ["docs"], no-default-feature = true }
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [feature.docs.dependencies]
+coreutils = "9.*"
+curl = "8.*"
 doxygen = "1.13.*"
+
+[feature.docs.tasks.docs-theme]
+description = "Download and verify Doxygen Awesome v2.5.0."
+cmd = '''
+mkdir -p build/docs/theme &&
+curl --fail --location --silent --show-error --retry 3 --max-time 120 https://codeload.github.com/jothepro/doxygen-awesome-css/tar.gz/46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da --output build/docs/theme.tar.gz &&
+echo '65abe1d85bc2adf9d1a1b6ef90ae5e63f72425024196f89ec27b7bdc52d94267  build/docs/theme.tar.gz' | sha256sum --check &&
+tar -xzf build/docs/theme.tar.gz --strip-components=1 -C build/docs/theme doxygen-awesome-css-46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da/doxygen-awesome.css doxygen-awesome-css-46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da/doxygen-awesome-darkmode-toggle.js doxygen-awesome-css-46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da/LICENSE
+'''
+inputs = ["pixi.toml"]
+outputs = ["build/docs/theme/doxygen-awesome.css", "build/docs/theme/doxygen-awesome-darkmode-toggle.js", "build/docs/theme/LICENSE"]
 
 [feature.docs.tasks.docs]
 description = "Build the Sirius public C++ API reference in build/docs/html."
 cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
+depends-on = ["docs-theme"]

@@ -28,9 +28,10 @@ DISABLE_INDEX          = NO
 FULL_SIDEBAR           = NO
 HTML_COLORSTYLE        = LIGHT
 HTML_HEADER            = docs/api/header.html
-HTML_EXTRA_STYLESHEET  = docs/api/theme/doxygen-awesome.css \
+HTML_EXTRA_STYLESHEET  = build/docs/theme/doxygen-awesome.css \
                          docs/api/sirius.css
-HTML_EXTRA_FILES       = docs/api/theme/doxygen-awesome-darkmode-toggle.js \
+HTML_EXTRA_FILES       = build/docs/theme/doxygen-awesome-darkmode-toggle.js \
+                         build/docs/theme/LICENSE \
                          docs/logo/sirius_dark_full.svg
 HAVE_DOT               = NO
 QUIET                  = YES
