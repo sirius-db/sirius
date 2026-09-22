@@ -77,24 +77,50 @@ void advance_to(consumer_stage& stage, consumer_stage::value target)
   stage.mark_disposed();
 }
 
-// Runs `park` on a helper thread and requires that it finishes within
-// WAIT_TIMEOUT once `release` has run, so a missed notify fails instead of
-// hanging the suite.  Returns what `park` returned.
+struct release_outcome {
+  bool reached;                 ///< what the wait returned
+  producer_stage::value final;  ///< the stage's state once the waiter returned
+};
+
+// Drives a wait/release pair until the waiter is known to have parked.
+//
+// Builds a fresh stage at `blocking`, runs `park` on it from a helper thread
+// and `release` from this one, and requires the waiter to return within
+// WAIT_TIMEOUT so a missed notify fails instead of hanging the suite.
+//
+// Nothing can observe "parked inside std::atomic::wait" from outside, so the
+// waiter records the state it saw on entry instead.  If that was `blocking` it
+// parked and `release` is what woke it, so its answer is meaningful.  If it saw
+// a later state, `release` ran first -- under CPU starvation the helper thread
+// can be descheduled between signalling `started` and calling `park` -- and the
+// wait's answer is the documented late-arrival one, which says nothing about
+// the notify.  That attempt is discarded and the scenario runs again on a fresh
+// stage; only a run where every attempt arrives late fails.
 template <class Park, class Release>
-bool wait_is_released_by(Park&& park, Release&& release)
+release_outcome wait_is_released_by(producer_stage::value blocking, Park&& park, Release&& release)
 {
-  auto started = std::make_shared<std::promise<void>>();
-  auto entered = started->get_future();
+  constexpr int max_attempts = 20;
+  for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+    auto stage = std::make_shared<producer_stage>();
+    advance_to(*stage, blocking);
 
-  auto done = std::async(std::launch::async, [park = std::forward<Park>(park), started]() mutable {
-    started->set_value();
-    return park();
-  });
+    auto started = std::make_shared<std::promise<void>>();
+    auto entered = started->get_future();
+    auto done    = std::async(std::launch::async, [stage, &park, started, blocking]() {
+      bool const parked = stage->get() == blocking;
+      started->set_value();
+      return std::pair{parked, park(*stage)};
+    });
 
-  REQUIRE(entered.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
-  release();
-  REQUIRE(done.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
-  return done.get();
+    REQUIRE(entered.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
+    release(*stage);
+    REQUIRE(done.wait_for(WAIT_TIMEOUT) == std::future_status::ready);
+    auto const [parked, reached] = done.get();
+    if (parked) { return {reached, stage->get()}; }
+    WARN("waiter arrived after release on attempt " << attempt << "; retrying on a fresh stage");
+  }
+  FAIL("waiter never parked before release in " << max_attempts << " attempts");
+  return {false, producer_stage::initialized};
 }
 
 }  // namespace
@@ -189,62 +215,57 @@ TEST_CASE("producer_stage load failure reverts to prepared and can retry", "[sta
 
 TEST_CASE("producer_stage wait_for_prepared is released by mark_prepared", "[stage]")
 {
-  auto stage = std::make_shared<producer_stage>();
-  advance_to(*stage, producer_stage::preparing);
+  auto const out = wait_is_released_by(
+    producer_stage::preparing,
+    [](producer_stage& s) { return s.wait_for_prepared(); },
+    [](producer_stage& s) { CHECK(s.mark_prepared()); });
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_for_prepared(); },
-                                           [stage] { CHECK(stage->mark_prepared()); });
-
-  CHECK(reached);
-  CHECK(stage->get() == producer_stage::prepared);
+  CHECK(out.reached);
+  CHECK(out.final == producer_stage::prepared);
 }
 
 TEST_CASE("producer_stage wait_for_prepared is released by mark_abandoned", "[stage]")
 {
-  auto stage = std::make_shared<producer_stage>();
-  advance_to(*stage, producer_stage::preparing);
+  auto const out = wait_is_released_by(
+    producer_stage::preparing,
+    [](producer_stage& s) { return s.wait_for_prepared(); },
+    [](producer_stage& s) { s.mark_abandoned(); });
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_for_prepared(); },
-                                           [stage] { stage->mark_abandoned(); });
-
-  CHECK_FALSE(reached);
-  CHECK(stage->get() == producer_stage::abandoned);
+  CHECK_FALSE(out.reached);
+  CHECK(out.final == producer_stage::abandoned);
 }
 
 TEST_CASE("producer_stage wait_till_not_loading is released by mark_ready", "[stage]")
 {
-  auto stage = std::make_shared<producer_stage>();
-  advance_to(*stage, producer_stage::loading);
+  auto const out = wait_is_released_by(
+    producer_stage::loading,
+    [](producer_stage& s) { return s.wait_till_not_loading(); },
+    [](producer_stage& s) { CHECK(s.mark_ready()); });
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
-                                           [stage] { CHECK(stage->mark_ready()); });
-
-  CHECK(reached);
-  CHECK(stage->get() == producer_stage::ready);
+  CHECK(out.reached);
+  CHECK(out.final == producer_stage::ready);
 }
 
 TEST_CASE("producer_stage wait_till_not_loading is released by mark_load_failed", "[stage]")
 {
-  auto stage = std::make_shared<producer_stage>();
-  advance_to(*stage, producer_stage::loading);
+  auto const out = wait_is_released_by(
+    producer_stage::loading,
+    [](producer_stage& s) { return s.wait_till_not_loading(); },
+    [](producer_stage& s) { CHECK(s.mark_load_failed()); });
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
-                                           [stage] { CHECK(stage->mark_load_failed()); });
-
-  CHECK_FALSE(reached);
-  CHECK(stage->get() == producer_stage::prepared);
+  CHECK_FALSE(out.reached);
+  CHECK(out.final == producer_stage::prepared);
 }
 
 TEST_CASE("producer_stage wait_till_not_loading is released by mark_abandoned", "[stage]")
 {
-  auto stage = std::make_shared<producer_stage>();
-  advance_to(*stage, producer_stage::loading);
+  auto const out = wait_is_released_by(
+    producer_stage::loading,
+    [](producer_stage& s) { return s.wait_till_not_loading(); },
+    [](producer_stage& s) { s.mark_abandoned(); });
 
-  bool const reached = wait_is_released_by([stage] { return stage->wait_till_not_loading(); },
-                                           [stage] { stage->mark_abandoned(); });
-
-  CHECK_FALSE(reached);
-  CHECK(stage->get() == producer_stage::abandoned);
+  CHECK_FALSE(out.reached);
+  CHECK(out.final == producer_stage::abandoned);
 }
 
 TEST_CASE("producer_stage waits return immediately when the state already moved on", "[stage]")
