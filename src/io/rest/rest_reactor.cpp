@@ -1477,8 +1477,8 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
           // allocator's own text names neither the reactor nor the object.  It
           // stays an rmm::out_of_memory: the engine retries those, and treats a
           // runtime_error as fatal.
-          auto const what = "rest_reactor: pinned staging exhausted for " + slot.req->object.bucket +
-                            "/" + slot.req->object.key + " (" +
+          auto const what = "rest_reactor: pinned staging exhausted for " +
+                            slot.req->object.bucket + "/" + slot.req->object.key + " (" +
                             std::to_string(slot.req->op->io_rng.size) + " bytes): " + e.what();
           SIRIUS_LOG_ERROR("{}", what);
           slot.req->op->finish_error(std::make_exception_ptr(rmm::out_of_memory(what.c_str())));
