@@ -288,9 +288,20 @@ class templated_ioctx : public ioctx {
       int device_id           = -1;
 
       for (auto& slice : input_slices) {
+        // A dropped slice reads nothing, so its completion always reports failure: reporting
+        // success would publish never-filled cache chunks as `cached`.
         if (slice.rng.size == 0 || slice.rng.offset >= typed.size()) {
+          if (slice.is_fragmented()) {
+            SIRIUS_LOG_WARN(
+              "templated_ioctx: dropping fragmented slice [{}, +{}) outside object '{}' of {} "
+              "bytes; caller must clamp to EOF",
+              slice.rng.offset,
+              slice.rng.size,
+              typed.object_path(),
+              typed.size());
+          }
           if (slice.on_complete != nullptr) {
-            (*slice.on_complete)(slice.h_buffer.fragments(), true);
+            (*slice.on_complete)(slice.h_buffer.fragments(), false);
             slice.on_complete.reset();
           }
           continue;
