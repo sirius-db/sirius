@@ -6,6 +6,32 @@ this project), which then pulls in SiriusDB as an extension. We use
 - symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
 - [pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
+## Public API documentation
+
+Build the C++ reference for `include/sirius/` with:
+
+```bash
+pixi run -e docs docs
+```
+
+Open `build/docs/html/index.html`, or serve it locally:
+
+```bash
+pixi run -e docs python -m http.server 8000 --directory build/docs/html
+```
+
+The isolated `docs` environment supports Linux x86_64 and aarch64 and needs no GPU,
+engine build, or initialized submodules. The theme includes the Sirius logos,
+system light/dark preference, and a manual theme toggle. Doxygen configuration
+and styling live in `docs/api/`; generated output stays under `build/docs/`.
+
+The **API docs** workflow builds pull requests and merge-queue entries, uploading
+the HTML as a `github-pages` artifact. Pushes to the default branch (`dev`) also
+deploy the site. Manual runs deploy only when run on the default branch.
+For the first deployment, set **Settings → Pages → Build and deployment → Source**
+to **GitHub Actions**, and allow `dev` in the `github-pages` environment's deployment
+rules. The published URL appears on the deployment job.
+
 ## Building Sirius
 
 Clone the repository with all submodules:
