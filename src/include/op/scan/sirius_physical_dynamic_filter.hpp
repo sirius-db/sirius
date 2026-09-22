@@ -45,12 +45,6 @@ class sirius_physical_dynamic_filter : public sirius_physical_operator {
 
   void on_finalize_operator() override;
 
-  /// Filtering never expands its input, so the peak estimate is the input footprint.
-  [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
-  {
-    return stats.bytes;
-  }
-
  private:
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> _filters;
   dynamic_filter_gate _gate;

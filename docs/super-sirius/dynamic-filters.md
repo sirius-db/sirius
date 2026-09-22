@@ -100,6 +100,10 @@ DuckDB static filters remain on their existing, authoritative path. Dynamic filt
 
 Membership filtering reduces downstream work but does not avoid scan I/O or decoding. The post-decode `dynamic_filter_gate` measures combined usefulness and can disable ineffective filtering; it also stops individual membership filters whose marginal keep ratio is weak.
 
+Post-decode application uses three internal compaction strategies. Cascade applies each mask to the surviving full table. Deferred keys carries stable original-row IDs and one aligned probe key through same-column or cross-column filter sequences, then gathers the remaining columns once. Gather once computes every mask against the original input, folds the masks with logical AND, and materializes the full table once. Every strategy preserves row and column order, nullable and nested values, sliced inputs, and the null pass-through signal when no mask contributes.
+
+The production policy requires at least two candidate mask steps and valid exact input-byte accounting. Rows at least 64 bytes wide use deferred keys while any membership marginal is unknown or stale, or while any current marginal keeps at most 35% of its input; otherwise they use gather once. Narrower rows use gather once only when every current membership marginal keeps at least 40%; they use cascade for unknown, stale, or more selective marginals. One-step, zero-row, and invalid-width cases use cascade. Gather once never fabricates or refreshes per-filter marginals: it becomes eligible only after cascade or deferred keys has trained every applicable membership filter for the current channel generation. The scan-level gate still records the original-to-final keep ratio for every materialized result.
+
 ## Filter selection
 
 The publisher emits at most one membership representation per admitted key and may additionally emit a zone map:

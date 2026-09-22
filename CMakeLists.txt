@@ -1185,3 +1185,27 @@ set_target_properties(
   PROPERTIES CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test/io")
+
+# -----------------------------------------------------------------------------
+# Dynamic-filter compaction strategy microbenchmark
+# -----------------------------------------------------------------------------
+add_executable(dynamic_filter_compaction_benchmark
+               test/benchmark/dynamic_filter_compaction_benchmark.cu)
+target_compile_definitions(dynamic_filter_compaction_benchmark
+                           PRIVATE CCCL_IGNORE_DEPRECATED_STREAM_REF_HEADER)
+target_include_directories(
+  dynamic_filter_compaction_benchmark
+  PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>)
+target_link_libraries(dynamic_filter_compaction_benchmark sirius_extension
+                      duckdb_static cudf::cudf rmm::rmm)
+link_extension_libraries(dynamic_filter_compaction_benchmark "")
+target_link_options(dynamic_filter_compaction_benchmark PRIVATE
+                    "LINKER:--allow-multiple-definition")
+set_target_properties(
+  dynamic_filter_compaction_benchmark
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON
+             RUNTIME_OUTPUT_DIRECTORY
+             "${CMAKE_CURRENT_BINARY_DIR}/test/benchmark")
