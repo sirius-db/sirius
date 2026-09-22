@@ -174,6 +174,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_cte.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
+    src/planner/sirius_plan_distinct.cpp
     src/planner/sirius_plan_dummy_scan.cpp
     src/planner/sirius_plan_empty_result.cpp
     src/planner/sirius_plan_expression_get.cpp
