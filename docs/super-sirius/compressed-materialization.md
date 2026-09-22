@@ -576,10 +576,13 @@ projection and in arithmetic, and discriminate the residency-gate states through
 test-side event counts. Producers publish `compressed_materialization` events through the context's
 `query_event_publisher`; the activity and count preserve the column/scan-node units below.
 `SiriusContext` owns no compressed-materialization counters or test snapshot methods. Test helpers
-subscribe before the measured operation and call the subscriber's `flush()` before each snapshot.
-The flush waits for every pending event preceding its captured boundary, including out-of-order
-publications from different threads, and reports timeout, shutdown, or delivery failure instead of
-returning a partial snapshot. Query completion alone does not imply subscriber completion.
+subscribe before the measured operation with `drain_on_stop` enabled. Between operations, once
+all measured reporters have finished publishing, each snapshot stops and joins the subscriber,
+processing every queued event before reading the cumulative counters. It then installs a fresh
+subscription for the next operation. Snapshot calls must not overlap measured publications.
+Draining needs no per-event completion tracking; the publisher already enqueues synchronously.
+A stopped observer or delivery failure rejects the snapshot. Query completion alone does not imply
+subscriber completion.
 
 Among these observations, beside
 the serve-time scan-downcast and scan-restore counters there is a plan-time

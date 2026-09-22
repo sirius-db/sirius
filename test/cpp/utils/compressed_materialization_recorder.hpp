@@ -19,7 +19,7 @@
 #include "event/query_event_subscriber.hpp"
 
 #include <cstdint>
-#include <mutex>
+#include <memory>
 #include <stdexcept>
 
 namespace sirius::test {
@@ -43,45 +43,77 @@ struct compressed_materialization_stats {
 };
 
 /// Only tests aggregate these events. Construct before the operation being measured.
-class compressed_materialization_recorder : public event::query_event_subscriber {
+/// snapshot() must run between operations, with all measured reporters quiescent:
+/// it drains the old subscription and installs a fresh one for the next operation.
+class compressed_materialization_recorder {
  public:
   explicit compressed_materialization_recorder(event::query_event_publisher& publisher)
-    : query_event_subscriber(publisher, {event::event_type::compressed_materialization})
+    : _publisher(publisher.weak_from_this()),
+      _subscriber(std::make_unique<subscriber>(publisher, _stats))
   {
-    start();
   }
-  ~compressed_materialization_recorder() override { stop(); }
-  std::string_view name() const noexcept override { return "compressed-materialization-test"; }
+
+  compressed_materialization_recorder(compressed_materialization_recorder const&) = delete;
+  compressed_materialization_recorder& operator=(compressed_materialization_recorder const&) =
+    delete;
 
   compressed_materialization_stats snapshot()
   {
-    if (!flush()) {
+    auto publisher = _publisher.lock();
+    if (!publisher || !_subscriber->is_subscribed()) {
+      throw std::runtime_error("Compressed-materialization observer is stopped");
+    }
+    _subscriber->stop();
+    if (_subscriber->failed()) {
       throw std::runtime_error("Compressed-materialization event delivery incomplete");
     }
-    std::lock_guard lock{_mutex};
-    return _stats;
-  }
-
-  void on_compressed_materialization(event::event_id_t,
-                                     event::timestamp_t,
-                                     event::compressed_materialization_activity activity,
-                                     std::uint64_t count) noexcept override
-  {
-    std::lock_guard lock{_mutex};
-    using enum event::compressed_materialization_activity;
-    switch (activity) {
-      case scan_columns_narrowed: _stats.scan_columns_narrowed += count; break;
-      case scan_columns_restored: _stats.scan_columns_restored += count; break;
-      case pin_columns_narrowed: _stats.pin_columns_narrowed += count; break;
-      case scan_sidecar_installed: _stats.scan_sidecars_installed += count; break;
-      case partition_narrow_columns: _stats.partition_narrow_columns += count; break;
-      case scan_narrow_targets_retracted: _stats.scan_narrow_targets_retracted += count; break;
+    auto const result = _stats;
+    _subscriber       = std::make_unique<subscriber>(*publisher, _stats);
+    if (!_subscriber->is_subscribed()) {
+      throw std::runtime_error("Compressed-materialization observer is stopped");
     }
+    return result;
   }
 
  private:
-  std::mutex _mutex;
+  class subscriber : public event::query_event_subscriber {
+   public:
+    subscriber(event::query_event_publisher& publisher, compressed_materialization_stats& stats)
+      : query_event_subscriber(publisher,
+                               {event::event_type::compressed_materialization},
+                               /*drain_on_stop=*/true),
+        _stats(stats)
+    {
+      start();
+    }
+    ~subscriber() override { stop(); }
+    std::string_view name() const noexcept override { return "compressed-materialization-test"; }
+    bool failed() const noexcept { return delivery_failed(); }
+
+    void on_compressed_materialization(event::event_id_t,
+                                       event::timestamp_t,
+                                       event::compressed_materialization_activity activity,
+                                       std::uint64_t count) noexcept override
+    {
+      using enum event::compressed_materialization_activity;
+      switch (activity) {
+        case scan_columns_narrowed: _stats.scan_columns_narrowed += count; break;
+        case scan_columns_restored: _stats.scan_columns_restored += count; break;
+        case pin_columns_narrowed: _stats.pin_columns_narrowed += count; break;
+        case scan_sidecar_installed: _stats.scan_sidecars_installed += count; break;
+        case partition_narrow_columns: _stats.partition_narrow_columns += count; break;
+        case scan_narrow_targets_retracted: _stats.scan_narrow_targets_retracted += count; break;
+      }
+    }
+
+   private:
+    compressed_materialization_stats& _stats;
+  };
+
+  std::weak_ptr<event::query_event_publisher> _publisher;
   compressed_materialization_stats _stats;
+  // Destroyed first, so its worker joins before the counters go away.
+  std::unique_ptr<subscriber> _subscriber;
 };
 
 }  // namespace sirius::test
