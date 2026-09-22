@@ -421,6 +421,8 @@ void propagate_compressed_schema(duckdb::unique_ptr<sirius::op::sirius_physical_
       // partial column, so the partial batch layout deviates from the declared `types` shape a
       // sidecar describes; those shapes keep the native boundary.
       if (aggregate.has_avg || aggregate.has_count_distinct) { break; }
+      // FIRST copies its carried columns out of the chosen row rather than aggregating them.
+      if (aggregate.has_first) { break; }
       // Grouping functions append output columns the operator does not compute through group_idx /
       // aggregate_slots; the arity check rejects that shape along with any other layout drift.
       if (slot->types.size() != aggregate.group_idx.size() + aggregate.aggregate_slots.size()) {

@@ -16,6 +16,9 @@
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "expression/ast/from_duckdb.hpp"
@@ -30,9 +33,9 @@
 #include <unordered_map>
 #include <utility>
 
-// Lowering for `SELECT DISTINCT`: a LogicalDistinct becomes one grouped aggregate whose groups
-// are the distinct targets and whose aggregate list is empty. An output column no target covers
-// would need a grouped FIRST, which Sirius cannot execute, so those shapes throw and run on CPU.
+// Lowering for `SELECT DISTINCT`: a LogicalDistinct becomes one grouped aggregate whose groups are
+// the distinct targets. An output column no target covers is carried by a FIRST over that column,
+// as DuckDB's own builder does, and the operator runs an all-FIRST list as a whole-row distinct.
 
 namespace sirius::planner {
 
@@ -109,7 +112,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> projections;
-  // With zero aggregates this holds exactly the group key types.
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
+  // The group key types, then one FIRST return type per carried column.
   duckdb::vector<duckdb::LogicalType> aggregate_types;
   // Child column index -> the group position that reads it, for bare BOUND_REF targets only.
   std::unordered_map<duckdb::idx_t, duckdb::idx_t> group_by_references;
@@ -128,8 +132,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     groups.push_back(std::move(target));
   }
 
-  // Fewer targets than output columns always throws below, so what actually reaches the
-  // projection is the reorder the loop finds, as in `SELECT DISTINCT ON (b, a) a, b`.
+  // A carried column lands after the keys in the operator's output, so a node wider than its
+  // targets needs the projection unless that layout is already the output order.
   bool requires_projection = op.types.size() != group_count;
 
   for (duckdb::idx_t i = 0; i < op.types.size(); i++) {
@@ -143,8 +147,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
       continue;
     }
 
-    // Output column i has no bare-reference target. Two unrelated causes reach here under either
-    // distinct_type, so branch on the cause and let distinct_type choose only the wording.
+    // Output column i has no bare-reference target, for one of two unrelated causes.
     //
     // Cause 1: some target is not a bare reference, so it maps to no output column. `groups[i]` is
     // in range because columns 0..i-1 were all found, and is context rather than the named cause.
@@ -156,20 +159,21 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
     }
 
     // Cause 2: every target is a bare reference but none reads column i, so it has to be carried
-    // out of each group.
-    if (op.distinct_type == duckdb::DistinctType::DISTINCT_ON) {
-      throw duckdb::NotImplementedException(
-        "DISTINCT ON with carried (non-key) columns is not supported on the GPU (falling back to "
-        "CPU): output column " +
-        std::to_string(i) + " would need a grouped FIRST aggregate");
-    }
-    throw duckdb::NotImplementedException(
-      "DISTINCT: output column " + std::to_string(i) +
-      " has no distinct target (falling back to CPU): the node has " +
-      std::to_string(groups.size()) + (groups.size() == 1 ? " target for " : " targets for ") +
-      std::to_string(op.types.size()) +
-      (op.types.size() == 1 ? " output column" : " output columns") +
-      ", and an output column without one would need a grouped FIRST aggregate");
+    // out of each group by a FIRST. The reference builder also attaches op.order_by and runs
+    // OrderedAggregateOptimizer here; the order_by guard above makes both no-ops.
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> first_children;
+    first_children.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(logical_type, i));
+    auto first_aggregate = duckdb::FunctionBinder(context).BindAggregateFunction(
+      duckdb::FirstFunctionGetter::GetFunction(logical_type),
+      std::move(first_children),
+      nullptr,
+      duckdb::AggregateType::NON_DISTINCT);
+    // This FIRST's position in the operator's output, so it must be taken before the push below.
+    projections.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+      logical_type, group_count + aggregates.size()));
+    aggregate_types.push_back(logical_type);
+    aggregates.push_back(std::move(first_aggregate));
+    requires_projection = true;
   }
 
   // The operator requires every group to be a bare reference to a column the child has. Checked
@@ -196,15 +200,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
                                          sirius::op::sirius_physical_grouped_aggregate>(
     sirius::from_duckdb_vec(aggregate_types),
-    duckdb::vector<std::unique_ptr<sirius::ast::node>>{},
+    translate_expressions(std::move(aggregates)),
     translate_expressions(std::move(groups)),
     op.estimated_cardinality);
   group_by->children.push_back(std::move(plan));
 
   if (!requires_projection) { return group_by; }
 
-  // Restore the output order op.types declares; the select list is a permutation, not an
-  // identity, so this is never elided.
+  // Restore the output order op.types declares. push_projection drops the select list when it is
+  // the identity, as for `SELECT DISTINCT ON (k) k, v`.
   auto const estimated_cardinality = group_by->estimated_cardinality;
   return push_projection(std::move(group_by),
                          std::move(declared_types),

@@ -18,9 +18,12 @@
 
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
+#include "duckdb/common/exception.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "telemetry/nvtx.hpp"
+
+#include <string>
 
 namespace sirius {
 namespace op {
@@ -69,6 +72,21 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  has_first                         = cudf_defs.has_first;
+  // Grouping functions add output columns no slot covers, which fails the cover. Several grouping
+  // sets add none, so they are refused by name: cudf::distinct would dedup on every key at once and
+  // drop the other sets' rows.
+  if (has_first && (grouping_sets.size() > 1 || !is_whole_row_distinct())) {
+    throw duckdb::NotImplementedException(
+      "grouped FIRST is only supported as a whole-row DISTINCT over one grouping set: the group "
+      "keys and FIRST inputs must cover the operator's " +
+      std::to_string(types.size()) + " output columns exactly once (falling back to CPU)");
+  }
+}
+
+bool sirius_physical_grouped_aggregate::is_whole_row_distinct() const
+{
+  return whole_row_distinct_select(group_idx, aggregate_slots, types.size()).has_value();
 }
 
 duckdb::vector<sirius::logical_type>
@@ -96,17 +114,22 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);
   const auto& input_batches = input.get_read_only_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  auto const whole_row_select = whole_row_distinct_select(group_idx, aggregate_slots, types.size());
   for (auto const& input_batch : input_batches) {
     auto* space = input_batch.get_memory_space();
     if (!space) { continue; }
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
-                                                              group_idx,
-                                                              cudf_aggregates,
-                                                              cudf_aggregate_idx,
-                                                              cudf_aggregate_struct_col_indices,
-                                                              stream,
-                                                              *space,
-                                                              batch_telemetry());
+    auto result =
+      whole_row_select
+        ? gpu_aggregate_impl::local_whole_row_distinct(
+            input_batch, group_idx, *whole_row_select, stream, *space, batch_telemetry())
+        : gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+                                                      group_idx,
+                                                      cudf_aggregates,
+                                                      cudf_aggregate_idx,
+                                                      cudf_aggregate_struct_col_indices,
+                                                      stream,
+                                                      *space,
+                                                      batch_telemetry());
     results.push_back(std::move(result));
   }
   return std::make_unique<pipelineable_operator_data>(results);

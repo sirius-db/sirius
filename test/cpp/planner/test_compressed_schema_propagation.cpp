@@ -466,6 +466,25 @@ TEST_CASE("compressed_schema_propagation - grouped aggregation keeps narrow grou
     REQUIRE(plan->get_physical_types() == std::vector<cudf::data_type>{k_int16, k_int8});
   }
 
+  SECTION("a FIRST keeps the native boundary even where SUM would narrow")
+  {
+    // Same shape as the first section with FIRST in place of SUM. cudf_aggregates is empty for a
+    // FIRST, so without the has_first break the pass would see no value-sensitive input and leave
+    // the carried column narrow while cudf::distinct copies it out at whatever carrier it has.
+    duckdb::unique_ptr<sirius_physical_operator> plan = make_grouped_aggregate(
+      {0}, {1}, make_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::propagate_compressed_schema(plan);
+
+    auto const& restored = *plan->children[0];
+    REQUIRE(restored.type == SiriusPhysicalOperatorType::PROJECTION);
+    auto const& projection = restored.Cast<sirius::op::sirius_physical_projection>();
+    REQUIRE(projection.select_list[0]->holds<sirius::ast::cast>());
+    REQUIRE(projection.select_list[1]->holds<sirius::ast::cast>());
+    REQUIRE(!restored.has_physical_overrides());
+    REQUIRE(!plan->has_physical_overrides());
+  }
+
   SECTION("unused payload columns remain narrow")
   {
     duckdb::unique_ptr<sirius_physical_operator> plan =

@@ -75,6 +75,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->aggregate_slots,
                                             grouped_aggregate->has_avg,
                                             grouped_aggregate->has_count_distinct,
+                                            grouped_aggregate->has_first,
                                             grouped_aggregate->estimated_cardinality)
 {
   child_op              = grouped_aggregate;
@@ -90,6 +91,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<AggregateSlot> aggregate_slots,
   bool has_avg,
   bool has_count_distinct,
+  bool has_first,
   std::size_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
@@ -99,7 +101,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     cudf_aggregate_struct_col_indices(std::move(cudf_aggregate_struct_col_indices)),
     aggregate_slots(std::move(aggregate_slots)),
     has_avg(has_avg),
-    has_count_distinct(has_count_distinct)
+    has_count_distinct(has_count_distinct),
+    has_first(has_first)
 {
 }
 
@@ -148,6 +151,12 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+  has_first                         = cudf_defs.has_first;
+}
+
+bool sirius_physical_grouped_aggregate_merge::is_whole_row_distinct() const
+{
+  return whole_row_distinct_select(group_idx, aggregate_slots, types.size()).has_value();
 }
 
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
@@ -222,6 +231,12 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       clone_batch_id,
       stream,
       telemetry::quent_data_batch_probe::create(batch_telemetry(), clone_batch_id));
+  } else if (is_whole_row_distinct()) {
+    merged = gpu_merge_impl::merge_whole_row_distinct(input_batches,
+                                                      group_idx.size(),
+                                                      stream,
+                                                      *input_batches[0].get_memory_space(),
+                                                      batch_telemetry());
   } else {
     merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                      group_idx.size(),

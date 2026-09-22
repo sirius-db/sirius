@@ -692,6 +692,20 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     reject_nested_column_operation(*group, "GROUP BY");
   }
 
+  // The Sirius aggregate node cannot carry a FILTER or an ORDER BY, and an all-FIRST list runs as a
+  // whole-row distinct that would silently ignore either one.
+  for (auto const& expression : op.expressions) {
+    auto const& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
+    if ((aggregate.filter || aggregate.order_bys) &&
+        sirius::from_duckdb_aggregate_name(aggregate.function.name) ==
+          sirius::aggregate_id::first) {
+      throw duckdb::NotImplementedException(
+        "first() with a FILTER or ORDER BY clause is not supported on the GPU (falling back to "
+        "CPU): " +
+        aggregate.ToString());
+    }
+  }
+
   if (auto fused = try_plan_dense_count_join(op)) { return fused; }
 
   auto plan = create_plan(*op.children[0]);

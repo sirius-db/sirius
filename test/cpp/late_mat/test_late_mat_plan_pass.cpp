@@ -188,6 +188,7 @@ std::unique_ptr<test_aggregate_merge> make_merge(std::size_t columns,
                                                 std::vector<sirius::op::AggregateSlot>{},
                                                 /*has_avg=*/false,
                                                 /*has_count_distinct=*/false,
+                                                /*has_first=*/false,
                                                 /*estimated_cardinality=*/0);
 }
 

@@ -477,6 +477,18 @@ TEST_CASE("tier_narrowing_policy - grouped-aggregate keys keep narrow only when 
             std::vector<cudf::data_type>{k_int8, k_int8});
   }
 
+  SECTION("FIRST makes the aggregate ineligible")
+  {
+    // The mirror of the propagation ladder's FIRST section: no transport for the key, so both
+    // columns retract.
+    auto plan = make_grouped_aggregate(
+      {0}, {1}, make_integer_scan(2, {k_int8, k_int8}), {}, sirius::aggregate_id::first);
+
+    sirius::planner::apply_tier_narrowing_policy(*plan);
+
+    REQUIRE(!plan->children[0]->has_physical_overrides());
+  }
+
   SECTION("COUNT_VALID does not constrain a counted group key")
   {
     auto plan = make_grouped_aggregate(

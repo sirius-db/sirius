@@ -37,23 +37,27 @@ namespace op {
  * intercepted by the caller (COLLECT_SET path) before this helper runs — so there is no
  * count_distinct case to add here.
  *
- * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg`
- * (decomposes into SUM + COUNT_VALID) and `first` (NTH_ELEMENT, handled by the caller).
+ * Returns std::nullopt for ids that do not map to a single merge-able cuDF kind: `avg` (decomposes
+ * into SUM + COUNT_VALID) and `first` (a whole-row distinct in the grouped aggregate, NTH_ELEMENT
+ * in the ungrouped one).
  */
 std::optional<cudf::aggregation::Kind> to_cudf_aggregation_kind(sirius::aggregate_id id);
 
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
- * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
- * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
+ * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), FIRST uses none,
+ * all others use one. COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then
+ * counts list elements.
  */
 struct AggregateSlot {
   bool is_avg            = false;
   bool is_count_distinct = false;  ///< True if this is a COUNT(DISTINCT col) aggregate
+  bool is_first          = false;  ///< True if this is a FIRST, which emits no cuDF aggregation
   size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
-                    ///< COUNT_VALID.
+                    ///< COUNT_VALID. Unused, and 0, for FIRST.
   cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
                                                       ///< (FLOAT64 or DECIMAL).
+  int first_input_idx = -1;  ///< For FIRST: the child column whose value this slot carries
 };
 
 /**
@@ -74,6 +78,9 @@ struct CudfAggregateDefinitions {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;  ///< True if any aggregate is AVG
   bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
+  /// True if any aggregate is FIRST. Presence only: whole_row_distinct_select() decides whether
+  /// cudf::distinct can run the list, so a second FIRST implementation can sit beside it.
+  bool has_first = false;
 };
 
 /**
@@ -92,6 +99,30 @@ struct CudfAggregateDefinitions {
 CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+
+/**
+ * @brief Child columns a whole-row distinct keeps, in output order
+ *
+ * A grouped aggregate is a whole-row distinct when every slot is a FIRST and `group_idx` together
+ * with the slots' `first_input_idx` values name each of `0 .. output_width - 1` once.
+ * `cudf::distinct` on the `group_idx` keys then computes the whole operator: it keeps one row per
+ * group, and the returned list selects `group_idx` followed by each slot's `first_input_idx` out of
+ * that row. `sirius_physical_grouped_aggregate` and `sirius_physical_grouped_aggregate_merge` both
+ * route on this function, so they cannot disagree about the shape.
+ *
+ * An empty `aggregate_slots` returns nullopt, which keeps a zero-aggregate `SELECT DISTINCT` on the
+ * ordinary groupby path.
+ *
+ * @param group_idx Child column read by each group key
+ * @param aggregate_slots One entry per aggregate expression
+ * @param output_width Number of output columns the operator declares
+ * @return Child column for each output column, or nullopt when the request list is not a whole-row
+ * distinct
+ */
+std::optional<std::vector<int>> whole_row_distinct_select(
+  std::vector<int> const& group_idx,
+  std::vector<AggregateSlot> const& aggregate_slots,
+  std::size_t output_width);
 
 }  // namespace op
 }  // namespace sirius

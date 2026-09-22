@@ -85,6 +85,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;
   bool has_count_distinct = false;
+  bool has_first          = false;
 
  public:
   std::vector<int> get_output_grouping_indices() const
@@ -97,6 +98,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
   //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
   [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
+  //! Whether whole_row_distinct_select() accepts this operator, so execute() runs cudf::distinct.
+  [[nodiscard]] bool is_whole_row_distinct() const;
 
   // Source interface
   bool is_source() const override { return true; }

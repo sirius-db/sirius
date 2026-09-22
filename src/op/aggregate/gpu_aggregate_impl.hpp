@@ -41,6 +41,7 @@ namespace op {
  * Provide functionalities including:
  * - Local ungrouped aggregation;
  * - Local grouped aggregation
+ * - Local whole-row distinct
  *
  * Require caller to have already upgraded input data batches into `gpu_table_representation`.
  */
@@ -88,6 +89,34 @@ class gpu_aggregate_impl {
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
+    ::cuda::stream_ref stream,
+    cucascade::memory::memory_space& memory_space,
+    const telemetry::batch_telemetry_info& telemetry_info = {});
+
+  /**
+   * @brief Perform a local whole-row distinct: keep one arbitrary row per distinct key.
+   *
+   * Runs `cudf::distinct` over the whole input keyed on `group_idx`, with `KEEP_ANY`, NULL keys
+   * equal to each other and every NaN equal to every other NaN, then emits the columns `select`
+   * names in that order. `select` comes from `whole_row_distinct_select`, so the output is the
+   * group keys followed by the carried columns, the layout `PARTITION` and
+   * `gpu_merge_impl::merge_whole_row_distinct` expect.
+   *
+   * @throw std::runtime_error if an entry of `group_idx` or `select` is outside the input's columns
+   *
+   * @param input The input data batch.
+   * @param group_idx The key columns, addressing the input.
+   * @param select The input columns to emit, in output order. Each column may appear at most once,
+   * because its data is moved into the output.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param memory_space The memory space used to allocate memory for the output data batch.
+   *
+   * @return The output data batch.
+   */
+  static std::shared_ptr<cucascade::data_batch> local_whole_row_distinct(
+    const cucascade::read_only_data_batch& input,
+    const std::vector<int>& group_idx,
+    const std::vector<int>& select,
     ::cuda::stream_ref stream,
     cucascade::memory::memory_space& memory_space,
     const telemetry::batch_telemetry_info& telemetry_info = {});

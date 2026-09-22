@@ -21,6 +21,7 @@
 #include "expression/aggregate_id.hpp"
 #include "expression/ast/node.hpp"
 
+#include <algorithm>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -93,7 +94,9 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       result.cudf_aggregate_idx.push_back(col_idx);
       result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
-        AggregateSlot{true, false, sum_position, sirius::get_cudf_type(aggr.return_type())});
+        AggregateSlot{.is_avg      = true,
+                      .cudf_idx    = sum_position,
+                      .output_type = sirius::get_cudf_type(aggr.return_type())});
       result.has_avg = true;
       continue;
     }
@@ -125,8 +128,23 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
         result.cudf_aggregate_struct_col_indices.push_back(std::move(struct_indices));
       }
 
-      result.aggregate_slots.push_back(AggregateSlot{false, true, position});
+      result.aggregate_slots.push_back(
+        AggregateSlot{.is_count_distinct = true, .cudf_idx = position});
       result.has_count_distinct = true;
+      continue;
+    }
+
+    // FIRST adds no cuDF aggregation: the list is only runnable as a whole-row distinct, which
+    // reads first_input_idx instead of the three parallel cudf_* vectors.
+    if (fid == sirius::aggregate_id::first) {
+      if (children.size() != 1 || !children[0]->is_reference()) {
+        throw_unsupported_aggregate(fid, "over anything but a single column reference");
+      }
+      result.aggregate_slots.push_back(AggregateSlot{
+        .is_first        = true,
+        .cudf_idx        = 0,
+        .first_input_idx = static_cast<int>(children[0]->as_reference().column_index)});
+      result.has_first = true;
       continue;
     }
 
@@ -154,10 +172,47 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       }
     }
     result.cudf_aggregate_struct_col_indices.push_back({});
-    result.aggregate_slots.push_back(AggregateSlot{false, false, current_position});
+    result.aggregate_slots.push_back(AggregateSlot{.cudf_idx = current_position});
+  }
+
+  // A FIRST beside a real aggregate would reach the ordinary groupby, which emits nothing for the
+  // FIRST and so returns one column fewer than the operator declares.
+  if (result.has_first && std::any_of(result.aggregate_slots.begin(),
+                                      result.aggregate_slots.end(),
+                                      [](AggregateSlot const& slot) { return !slot.is_first; })) {
+    throw_unsupported_aggregate(sirius::aggregate_id::first, "mixed with other aggregates");
   }
 
   return result;
+}
+
+std::optional<std::vector<int>> whole_row_distinct_select(
+  std::vector<int> const& group_idx,
+  std::vector<AggregateSlot> const& aggregate_slots,
+  std::size_t output_width)
+{
+  if (aggregate_slots.empty() || group_idx.empty()) { return std::nullopt; }
+  if (group_idx.size() + aggregate_slots.size() != output_width) { return std::nullopt; }
+
+  // output_width distinct values in [0, output_width) are a permutation of it.
+  std::vector<bool> seen(output_width, false);
+  std::vector<int> select;
+  select.reserve(output_width);
+  auto const take = [&](int idx) {
+    if (idx < 0) { return false; }
+    auto const pos = static_cast<std::size_t>(idx);
+    if (pos >= output_width || seen[pos]) { return false; }
+    seen[pos] = true;
+    select.push_back(idx);
+    return true;
+  };
+  for (int const idx : group_idx) {
+    if (!take(idx)) { return std::nullopt; }
+  }
+  for (auto const& slot : aggregate_slots) {
+    if (!slot.is_first || !take(slot.first_input_idx)) { return std::nullopt; }
+  }
+  return select;
 }
 
 }  // namespace op
