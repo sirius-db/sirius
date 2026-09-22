@@ -1284,6 +1284,45 @@ TEST_CASE("rest reactor dynamically splits one logical read below the physical G
   require_bytes_equal(destination, payload);
 }
 
+TEST_CASE("rest reactor keeps serving when run balancing leaves a partition empty",
+          "[s3][integration][rest]")
+{
+  // Balancing whole contiguous runs routes a single run to one partition, so with
+  // more reactors than runs the others are handed nothing. A reactor must not be
+  // stranded on an empty group: it would spin, stall every later request routed to
+  // it, and leave shutdown unable to join.
+  constexpr std::size_t chunk = 4096;
+  auto payload                = deterministic_payload(3 * chunk);
+  range_http_server server(payload);
+  auto ioctx = make_direct_rest_ioctx(server.endpoint(), direct_rest_test_config(), 2);
+  auto datasource =
+    ioctx->open_datasource("s3://empty-partition-bucket/object.bin", payload.size());
+
+  // Adjacent slices, so they form exactly one run.
+  std::vector<std::uint8_t> first(payload.size());
+  std::vector<sirius::io::slice> run;
+  for (std::size_t i = 0; i < 3; ++i) {
+    run.emplace_back(i * chunk, chunk, first.data() + i * chunk);
+  }
+  auto first_read = ioctx->host_readv_async_io(datasource->get_io_object(), run);
+  REQUIRE(std::move(first_read).get(10s) == payload.size());
+  require_bytes_equal(first, payload);
+
+  // The rows coming back proves only that the loaded reactor finished. A following
+  // request is what exercises the one that received the empty group.
+  std::vector<std::uint8_t> second(payload.size());
+  std::vector<sirius::io::slice> follow;
+  follow.emplace_back(0, payload.size(), second.data());
+  auto second_read = ioctx->host_readv_async_io(datasource->get_io_object(), follow);
+  REQUIRE(std::move(second_read).get(10s) == payload.size());
+  require_bytes_equal(second, payload);
+
+  // A spinning worker never joins, so shutdown has to be checked explicitly.
+  auto stopped = std::async(std::launch::async, [&] { ioctx->shutdown(); });
+  REQUIRE(stopped.wait_for(30s) == std::future_status::ready);
+  stopped.get();
+}
+
 TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest][cache]")
 {
   constexpr std::size_t page_size = 4096;

@@ -20,10 +20,12 @@
 #include "io/rest/authorizer.hpp"
 #include "io/types.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace sirius::io::rest {
 
@@ -80,13 +82,32 @@ struct rest_io_op_request {
 
   [[nodiscard]] bool is_device() const noexcept
   {
-    return op != nullptr && op->device_copy != nullptr;
+    if (op == nullptr) return false;
+    if (op->device_copy != nullptr) return true;
+    return std::ranges::any_of(op->fused_extra,
+                               [](auto const& part) { return part.device_copy != nullptr; });
   }
 
+  /// Copy every constituent's window out of the shared read buffers. The event is
+  /// recorded on the last copy only: recording it earlier would let the staging be
+  /// reused while copies are still live.
   [[nodiscard]] cudaError_t copy_h2d_async(cudaEvent_t event = nullptr) const noexcept
   {
     if (!is_device()) return cudaSuccess;
-    return op->device_copy->copy_async(op->io_rng, op->iovecs, event);
+
+    std::vector<device_cpy_request const*> copies;
+    copies.reserve(op->logical_slices());
+    if (op->device_copy != nullptr) copies.push_back(op->device_copy.get());
+    for (auto const& part : op->fused_extra) {
+      if (part.device_copy != nullptr) copies.push_back(part.device_copy.get());
+    }
+    if (copies.empty()) return cudaSuccess;
+
+    for (std::size_t i = 0; i + 1 < copies.size(); ++i) {
+      auto const status = copies[i]->copy_async(op->io_rng, op->iovecs, nullptr);
+      if (status != cudaSuccess) return status;
+    }
+    return copies.back()->copy_async(op->io_rng, op->iovecs, event);
   }
 };
 
