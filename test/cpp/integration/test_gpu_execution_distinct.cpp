@@ -294,9 +294,8 @@ TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT with an ORDER BY outside the select list falls back",
                  "[integration][gpu_execution][distinct]")
 {
-  // The binder synthesizes one distinct target per select-list entry and only then hoists `v` into
-  // the select list to order by it, so the node is two columns wide with a single target and `v`
-  // would need a grouped FIRST.
+  // `v` is added to the select list after the targets were synthesized from it, so the node is
+  // two columns wide with a single target and `v` would need a grouped FIRST.
   expect_plan_fallback_matches_cpu("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
 }
 

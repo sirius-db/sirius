@@ -1175,10 +1175,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
   SECTION("plain DISTINCT ordered by a column outside the select list has an uncovered output")
   {
-    // The binder synthesizes one distinct target per select-list entry, then hoists `val` into the
-    // select list so the ORDER BY can reference it. The node arrives two columns wide with one
-    // target, so output column 1 has no target at all: a different cause, and a different message,
-    // from a target that is not a column reference.
+    // `val` is added to the select list after the targets were synthesized from it, so the node
+    // is two columns wide with one target. Output column 1 has no target: a different cause, and
+    // a different message, from a target that is not a column reference.
     require_rejected("SELECT DISTINCT id FROM big_left ORDER BY val",
                      "output column 1 has no distinct target");
   }
@@ -1212,11 +1211,11 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     require_rejected_any("SELECT DISTINCT * FROM nested_keys", "is unsupported in DISTINCT");
   }
 
-  SECTION("an expression DISTINCT ON target is hoisted, and its outputs are still carried")
+  SECTION("an expression DISTINCT ON target still leaves its own columns carried")
   {
-    // The order binder appends `id + val` to the select list, so the distinct target itself arrives
-    // as a bare reference to that appended column. It is unsupported for the same reason as above:
-    // `id` and `val` are output columns that no target covers.
+    // `id + val` is appended to the select list, so the target arrives as a bare reference to that
+    // appended column. Unsupported for the same reason as above: `id` and `val` are output columns
+    // no target covers.
     require_rejected("SELECT DISTINCT ON (id + val) id, val FROM big_left",
                      "DISTINCT ON with carried (non-key) columns");
   }
