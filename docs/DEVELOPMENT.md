@@ -20,8 +20,9 @@ Open `build/docs/html/index.html`, or serve it locally:
 pixi run -e docs python -m http.server 8000 --directory build/docs/html
 ```
 
-The isolated `docs` environment supports Linux x86_64 and aarch64 and needs no GPU,
-engine build, or initialized submodules. The theme includes the Sirius logos,
+The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
+Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
+submodules. The theme includes the Sirius logos,
 system light/dark preference, and a manual theme toggle. Doxygen configuration
 and styling live in `docs/api/`; generated output stays under `build/docs/`.
 

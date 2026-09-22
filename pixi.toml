@@ -4,6 +4,7 @@ name = "sirius"
 platforms = [
   "linux-64",
   "linux-aarch64",
+  "osx-arm64",
   { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
   { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
@@ -152,7 +153,7 @@ nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
 docs = { features = ["docs"], no-default-feature = true }
 
 [feature.docs]
-platforms = ["linux-64", "linux-aarch64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [feature.docs.dependencies]
 doxygen = "1.13.*"
