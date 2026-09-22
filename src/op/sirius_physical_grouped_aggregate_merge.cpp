@@ -244,9 +244,11 @@ int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   candidate.num_admitted_gpus   = _num_gpus;
   candidate.upstream_complete   = meta.upstream_complete;
   // A single admitted GPU must also mean the input really is on one device.
-  candidate.single_gpu_resident = meta.single_gpu_resident && meta.distinct_memory_spaces == 1;
-  candidate.headroom_fraction   = meta.headroom_fraction;
-  candidate.total_rows          = meta.total_rows;
+  candidate.single_gpu_resident = meta.single_gpu_resident;
+  if (auto pipeline = get_pipeline()) {
+    candidate.headroom_fraction = pipeline->get_operator_params().group_by_bypass_headroom_fraction;
+  }
+  candidate.total_rows                   = meta.total_rows;
   candidate.admissible_additional_budget = meta.admissible_additional_budget;
 
   auto const shape                       = classify_bypass_downstream(*this);
@@ -291,12 +293,12 @@ int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   }
 
   auto const decision = group_by_bypass::decide(candidate);
-  // Only a bypass this policy actually selected gets a reservation floor. `already_one` is the
-  // pre-existing automatic choice and must not acquire new reservation behaviour.
-  _bypass_reservation_floor.store((decision.prototype_activated && decision.model_evaluated)
-                                    ? static_cast<std::size_t>(decision.model.additional_needed)
-                                    : 0,
-                                  std::memory_order_release);
+  // Feed the same model into the existing cold-start hook. Rejected candidates and the
+  // pre-existing automatic P=1 path keep the default estimate.
+  _bypass_peak_memory_estimate.store((decision.prototype_activated && decision.model_evaluated)
+                                       ? static_cast<std::size_t>(decision.model.additional_needed)
+                                       : 0,
+                                     std::memory_order_release);
 
   SIRIUS_LOG_INFO(
     "group_by_bypass: operator_id={} device={} reason={} auto_p={} chosen_p={} "
@@ -316,12 +318,12 @@ int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   return decision.num_partitions;
 }
 
-std::size_t sirius_physical_grouped_aggregate_merge::mandatory_peak_memory_floor(
+std::size_t sirius_physical_grouped_aggregate_merge::no_history_peak_memory_estimate(
   const op::input_stats& stats) const
 {
-  // A task with no input has nothing to merge; do not hold a reservation open for it.
   if (stats.bytes == 0) { return 0; }
-  return _bypass_reservation_floor.load(std::memory_order_acquire);
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  _bypass_peak_memory_estimate.load(std::memory_order_acquire));
 }
 
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(

@@ -205,6 +205,16 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 }
 
 bool sirius_physical_partition::is_build_partition() const { return _is_build; }
+
+bool sirius_physical_partition::is_memory_aware_bypass_enabled() const
+{
+  auto const* parent = get_parent_op();
+  auto pipeline      = get_pipeline();
+  return parent != nullptr && parent->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY &&
+         parent->owning_delim_join() == nullptr && pipeline != nullptr &&
+         pipeline->get_operator_params().enable_group_by_memory_aware_bypass;
+}
+
 MemoryBarrierType sirius_physical_partition::input_barrier_for(
   sirius_physical_operator const& producer) const
 {
@@ -420,11 +430,10 @@ std::optional<uint64_t> sirius_physical_partition::estimated_total_input_bytes()
 
 std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypass_metadata()
 {
-  if (!_enable_memory_aware_bypass) { return std::nullopt; }
+  if (!is_memory_aware_bypass_enabled()) { return std::nullopt; }
   if (ports.size() != 1) { return std::nullopt; }
 
   group_by_bypass_metadata meta;
-  meta.headroom_fraction = _bypass_headroom_fraction;
 
   auto* port = ports.begin()->second;
   // "Complete" means every partial batch has physically arrived, which is what makes the row and
@@ -432,37 +441,35 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
   // says the byte total is known, not that the batches are here.
   meta.upstream_complete =
     port->src_pipeline != nullptr && port->src_pipeline->is_pipeline_finished();
+  // A projection can fix the partition count before the producer finishes. It cannot establish
+  // complete residency or schema; let the consumer reject bypass without walking those batches.
+  if (!meta.upstream_complete) { return meta; }
 
   auto* repo = port->repo;
   // No repository means no batches to read; every metadata optional stays absent and the policy
   // rejects the candidate rather than treating "nothing observed" as "nothing there".
   if (repo == nullptr) { return meta; }
-  auto batch_ids   = repo->get_batch_ids(0);
-  meta.num_batches = batch_ids.size();
+  auto batch_ids = repo->get_batch_ids(0);
 
-  std::uint64_t total_rows  = 0;
-  std::uint64_t total_bytes = 0;
+  std::uint64_t total_rows = 0;
   std::vector<bypass_column_meta> columns;
-  bool schema_known   = true;
-  bool schema_latched = false;
-  std::vector<const cucascade::memory::memory_space*> spaces;
+  bool schema_known                                  = true;
+  bool schema_latched                                = false;
+  const cucascade::memory::memory_space* input_space = nullptr;
 
   bool first_batch = true;
   for (auto batch_id : batch_ids) {
     auto batch = repo->get_data_batch_by_id(batch_id, 0);
-    if (!batch) { continue; }
+    if (!batch) { return meta; }
     auto ro    = batch->to_read_only();
     auto* data = ro.get_data();
     if (data == nullptr) {
       schema_known = false;
       break;
     }
-    total_bytes += data->get_size_in_bytes();
-
     if (auto* space = ro.get_memory_space(); space != nullptr) {
-      if (std::find(spaces.begin(), spaces.end(), space) == spaces.end()) {
-        spaces.push_back(space);
-      }
+      if (input_space != nullptr && input_space != space) { return meta; }
+      input_space = space;
     } else {
       schema_known = false;
       break;
@@ -478,7 +485,7 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
     }
 
     auto const view = get_cudf_table_view(ro);
-    total_rows += static_cast<std::uint64_t>(view.num_rows());
+    total_rows = memory::saturating_add(total_rows, static_cast<std::uint64_t>(view.num_rows()));
 
     if (!schema_latched) {
       columns.resize(static_cast<std::size_t>(view.num_columns()));
@@ -510,9 +517,7 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
     if (!schema_known) { break; }
   }
 
-  meta.distinct_memory_spaces = spaces.size();
-  meta.total_bytes            = total_bytes;
-  meta.single_gpu_resident    = schema_known && spaces.size() == 1;
+  meta.single_gpu_resident = schema_known && input_space != nullptr;
 
   if (schema_known && schema_latched && !columns.empty()) {
     meta.columns    = std::move(columns);
@@ -522,9 +527,8 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
   // The budget must come from the space the input actually lives in. Reading it from the batches
   // is what keeps this off physical GPU 0 on a multi-GPU box.
   if (meta.single_gpu_resident) {
-    auto const* space     = spaces.front();
+    auto const* space     = input_space;
     meta.target_device_id = space->get_device_id();
-    meta.space_capacity   = space->get_max_memory();
     // Use the reservation cap, not the larger allocation capacity. The charged counter
     // includes both live allocations and outstanding reservations; subtract it only once.
     // This is a snapshot for candidate selection, not a reservation guarantee.
@@ -533,7 +537,6 @@ std::optional<group_by_bypass_metadata> sirius_physical_partition::collect_bypas
       auto const charged                = adaptor->get_total_allocated_bytes();
       auto const limit                  = space->get_max_memory();
       meta.admissible_additional_budget = limit > charged ? limit - charged : 0;
-      meta.charged_bytes                = charged;
     }
     // Leaving the budget absent when the adaptor is not the GPU reservation adaptor is
     // deliberate: the policy rejects on unknown metadata rather than guessing a budget.

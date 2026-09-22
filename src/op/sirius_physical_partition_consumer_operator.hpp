@@ -78,20 +78,8 @@ struct group_by_bypass_metadata {
   /// larger allocation capacity and over-states what a reservation can obtain. See
   /// docs/super-sirius/group-by-bypass.md.
   std::optional<uint64_t> admissible_additional_budget;
-  /// The target space's reservation limit (`get_max_memory()`), for the decision record.
-  std::optional<uint64_t> space_capacity;
-  /// Bytes already charged against that limit, for the decision record.
-  std::optional<uint64_t> charged_bytes;
-
   /// Device the input actually lives on. -1 when unknown; never assumed to be 0.
   int target_device_id = -1;
-  /// Distinct GPU memory spaces the batches were found in. Anything but 1 rejects the candidate.
-  std::size_t distinct_memory_spaces = 0;
-  std::size_t num_batches            = 0;
-  uint64_t total_bytes               = 0;
-
-  /// Declared empirical margin, from operator_params.
-  double headroom_fraction = 0.25;
 };
 
 /// What the upstream PARTITION operator measures/knows and forwards to its downstream consumer so
@@ -108,7 +96,8 @@ struct partition_sizing_input {
 
   /// Group-by bypass prototype metadata, or nullptr when the prototype is off / not applicable.
   /// Non-owning; valid only for the duration of the get_partition_strategy call, which runs under
-  /// the partition's lock with the batches pinned in its repository.
+  /// the partition's lock. Individual batches are read-locked only while being inspected;
+  /// residency and the budget can change after that snapshot.
   const group_by_bypass_metadata* bypass_metadata = nullptr;
 };
 

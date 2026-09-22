@@ -513,10 +513,6 @@ void wrap_hash_group_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
       compressed_materialization_observer,
       op_params.enable_runtime_size_estimation);
     auto* partition_ptr = partition.get();
-    // Experiment (issue #1746 point 2), default off. Scoped to the aggregate-fanout partition,
-    // excluding the delim-join DISTINCT partition, which also sits under a MERGE_GROUP_BY.
-    partition->set_memory_aware_bypass(op_params.enable_group_by_memory_aware_bypass,
-                                       op_params.group_by_bypass_headroom_fraction);
     if (hgb_ptr->has_physical_overrides()) {
       partition->set_physical_types(hgb_ptr->get_physical_types());
     }

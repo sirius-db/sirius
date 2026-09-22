@@ -1,7 +1,9 @@
 # Memory-aware group-by bypass
 
 An opt-in implementation of point 2 of [issue #1746](https://github.com/sirius-db/sirius/issues/1746).
-It is independent of projected partition sizing (#1765) and preserves the full-input barrier.
+It is independent of projected partition sizing (#1765). With runtime size estimation disabled,
+the existing full-input barrier is preserved. If estimation fixes the partition count before the
+producer finishes, bypass is declined and that count remains fixed.
 
 ## Behavior
 
@@ -27,15 +29,27 @@ The budget is the memory space's **reservation cap minus charged bytes**, clampe
 Charged bytes already include resident input and outstanding reservations, so they are not
 subtracted again or added to the model. Physical free VRAM is not the reservation budget.
 
-Selection requires the model plus a configurable margin to fit. A selected merge supplies its
-additional-allocation estimate, before that margin, as a minimum memory request. That floor
-applies even when previous executions supplied a smaller learned estimate. Larger historical
-estimates and OOM retry requests still win.
+Selection requires the model plus a configurable margin to fit. A selected merge reuses its
+additional-allocation estimate, before that margin, through `no_history_peak_memory_estimate()`.
+The cold-start request is at least the existing 2× input estimate. The executor adds input
+materialization costs and records the request through its existing reservation telemetry.
+
+Memory history belongs to the current query's pipeline. The partition count is chosen before
+merge tasks run, and a bypassed single partition produces one merge task; its first attempt has
+no prior partitioned-merge history. After an OOM, the existing history and task-local retry floor
+size subsequent requests, including resumes after the merge in a fused pipeline. No additional
+executor-wide floor or separate history is introduced.
+
+The partition reads the enable flag and the merge reads headroom from the existing immutable
+query policy snapshot. A transient input summary carries only the observed rows, column layout,
+residency, target device, and reservation-budget snapshot. It is not a repository cache: batch
+placement can change after each read handle is released. No persistent row metrics are needed
+for this complete-input decision.
 
 This remains an estimate: the allocator assumptions need verification against the pinned cuDF
 implementation. Selection does not reserve memory, and the executor can grant a partial
-reservation. A grant below the floor is logged; automatic repartitioning after OOM is not
-implemented. The partition count stays fixed once chosen.
+reservation. Existing executor diagnostics report reservation shortfalls; automatic
+repartitioning after OOM is not implemented. The partition count stays fixed once chosen.
 
 ## Settings and validation
 

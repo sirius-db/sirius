@@ -145,14 +145,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
-  /// Bytes the reservation for this merge's task must not fall below.
-  ///
-  /// Nonzero only when the group-by bypass prototype actually selected P=1 for this operator: the
-  /// unpartitioned merge is then the whole aggregation, and a warm pipeline's history — recorded
-  /// from *partitioned* merges that each saw a fraction of the input — predicts far less memory
-  /// than it needs. Unlike no_history_peak_memory_estimate, which the task consults only on a
-  /// cold pipeline, this floor is applied whether or not history exists.
-  [[nodiscard]] std::size_t mandatory_peak_memory_floor(
+  /// Reuse the bypass decision's model for the first merge task's reservation. History belongs
+  /// to this query's pipeline; P=1 creates one merge task, so its first attempt has no history.
+  /// Subsequent OOM attempts use the executor's existing history and retry reservation floor.
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const op::input_stats& stats) const override;
 
  private:
@@ -171,8 +167,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool _fuse_into_parent = false;
 
-  /// Published during sizing and read by the executor without taking the operator lock.
-  std::atomic<std::size_t> _bypass_reservation_floor{0};
+  /// Query-local cold-start estimate, published during sizing. Zero means bypass was not chosen.
+  std::atomic<std::size_t> _bypass_peak_memory_estimate{0};
 };
 
 }  // namespace op

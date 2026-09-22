@@ -282,20 +282,6 @@ void gpu_pipeline_executor::manager_loop()
         gpu_task->get_task_id(),
         reservation->size());
     }
-    // A truncated reservation is never evidence that a policy-derived requirement fits. The task
-    // still runs — the OOM/reschedule/retry path is the safety net — but the shortfall is recorded
-    // so a decision that was admitted on less memory than it modelled is visible in the logs
-    // rather than being inferred from a later OOM.
-    if (reservation_info.mandatory_floor > 0 &&
-        reservation->size() < reservation_info.mandatory_floor) {
-      SIRIUS_LOG_WARN(
-        "GPU Pipeline Executor: pipeline {} task {} was admitted with {} bytes but asserted a "
-        "mandatory floor of {} bytes; the modelled requirement was NOT granted",
-        gpu_task->get_pipeline_id(),
-        gpu_task->get_task_id(),
-        reservation->size(),
-        reservation_info.mandatory_floor);
-    }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation), reservation_info);
