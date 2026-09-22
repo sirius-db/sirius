@@ -1355,13 +1355,11 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   } else {
     // materialize_parquet picks the route: a bulk hybrid scan (hybrid_scan_reader
     // for one file, hybrid_scan_multifile for several) when every slice's backend
-    // prefers it, otherwise read_parquet.  It refuses the bulk route for filtered
-    // options on its own -- materialize_all_columns ignores a filter rather than
-    // rejecting one, so taking it here would hand back every row while
-    // `reader_applied_full_filter` below claims the reader discharged the
-    // predicate.  The all-pruned split is left to read_parquet too: it has no row
-    // groups to enumerate, and set_num_rows(0) already builds the schema-correct
-    // empty table without touching a data page.
+    // prefers it, otherwise read_parquet.  Both routes apply `opts`' row filter
+    // identically, so `reader_applied_full_filter` below stays route-independent.
+    // The all-pruned split is left to read_parquet: it has no row groups to
+    // enumerate, and set_num_rows(0) already builds the schema-correct empty
+    // table without touching a data page.
     std::vector<parquet_source> sources;
     sources.reserve(split.rg_slices.size());
     for (auto const& slice : split.rg_slices) {
