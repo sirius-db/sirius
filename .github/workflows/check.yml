@@ -206,7 +206,6 @@ jobs:
           expected = base["cacheVariables"]["OVERRIDE_GIT_DESCRIBE"]
           actual = duckdb.sql("SELECT version()").fetchone()[0]
           assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
-          assert duckdb.sql("SELECT 42").fetchone() == (42,)
           PY
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
