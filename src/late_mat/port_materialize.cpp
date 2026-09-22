@@ -57,7 +57,7 @@ void restore_bundle(std::vector<std::size_t> const& output_positions,
                     std::vector<cudf::data_type> const& restored_types,
                     cudf::table_view const& batch,
                     std::map<std::size_t, std::unique_ptr<cudf::column>>& restored_by_position,
-                    rmm::cuda_stream_view stream,
+                    ::cuda::stream_ref stream,
                     rmm::device_async_resource_ref mr)
 {
   auto const rowids = batch.column(static_cast<cudf::size_type>(rowid_at));
@@ -123,7 +123,7 @@ bool port_directive_matches(port_materialize_directive const& directive,
 
 std::unique_ptr<cudf::table> materialize_at_port(port_materialize_directive const& directive,
                                                  cudf::table_view const& batch,
-                                                 rmm::cuda_stream_view stream,
+                                                 ::cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
   nvtx_scoped_range nvtx_range{"sirius::late_mat::materialize_at_port"};

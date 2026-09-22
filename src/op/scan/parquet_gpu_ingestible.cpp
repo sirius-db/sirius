@@ -663,7 +663,7 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::string const& file_path, std::shared_ptr<io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -1059,7 +1059,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
@@ -1231,7 +1231,7 @@ std::vector<std::size_t> kept_positions(std::size_t width, std::span<std::size_t
 std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
   filtered_table&& input,
   ::cucascade::memory::memory_space const& mem_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache,
   std::unique_ptr<cudf::column>* survivors,

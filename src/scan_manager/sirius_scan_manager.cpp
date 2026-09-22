@@ -399,7 +399,7 @@ struct cached_databatch_provider : public databatch_provider {
       cudf::table_view view(column_views);
       auto* chunk_space = chunk.memory_space ? chunk.memory_space : _entry.memory_space;
       auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-        view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+        view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
       const auto batch_id = ::sirius::get_next_batch_id();
       return ::cucascade::data_batch::make(
         batch_id,
@@ -421,7 +421,7 @@ struct cached_databatch_provider : public databatch_provider {
     auto* chunk_space = !_entry.chunk_memory_spaces.empty() ? _entry.chunk_memory_spaces.at(index)
                                                             : _entry.memory_space;
     auto gpu_repr     = std::make_unique<::cucascade::gpu_table_representation>(
-      view, std::move(columns), alloc_size, *chunk_space, rmm::cuda_stream_view{});
+      view, std::move(columns), alloc_size, *chunk_space, ::cuda::stream_ref{cudaStream_t{}});
     const auto batch_id = ::sirius::get_next_batch_id();
     return ::cucascade::data_batch::make(
       batch_id,
@@ -1441,8 +1441,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     // query thread: GetPartitionStats touches ClientContext/LocalStorage.
     op->get_ingestible().ensure_metadata_prepared();
     auto provider = std::make_unique<split_provider>(
-      op->get_ingestible(),
-      [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
+      op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
         if (!io_ctx) {
           throw std::runtime_error("scan_manager: no backend supports path: " +
@@ -1813,7 +1812,7 @@ std::size_t sirius_scan_manager::s3_list_max_matches(std::string const& s3_uri)
   return rest->list_max_matches();
 }
 
-std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
+std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::string_view path)
 {
   // Normalize here so every caller (incl. the scan resolver, which forwards raw
   // ingestible paths) routes `file://` the same way create_datasource does.

@@ -7,5 +7,4 @@ edition = "2024"
 prost.workspace = true
 starrocks-thrift = { path = "../starrocks-thrift" }
 substrait.workspace = true
-substrait-explain.workspace = true
 thiserror.workspace = true

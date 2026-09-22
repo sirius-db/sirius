@@ -239,10 +239,10 @@ void dynamic_filter_publication_session::observe_whole_build(
     }
 
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
-    rmm::cuda_stream_view stream = space->acquire_stream();
+    ::cuda::stream_ref stream = space->acquire_stream();
     auto const writer            = source.get_writer_event();
     auto const ready =
-      writer ? cudaStreamWaitEvent(stream.value(), writer, 0) : cudaDeviceSynchronize();
+      writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
     if (ready != cudaSuccess) {
       throw std::runtime_error(
         std::string(
@@ -265,7 +265,7 @@ void dynamic_filter_publication_session::observe_whole_build(
     } catch (...) {
       // The source pin must outlive every accepted read, including a partially built filter.
       auto error = std::current_exception();
-      stream.synchronize();
+      stream.sync();
       std::rethrow_exception(error);
     }
 
@@ -323,7 +323,7 @@ std::size_t device_l2_cache_bytes(
 dynamic_filter_publication_outcome publish_dynamic_filters(
   dynamic_filter_publish_plan const& plan,
   cudf::table_view const& build_view,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   std::span<sirius_dynamic_filter_set::producer const> producers,
   std::function<bool()> const& before_fanout)
 {
@@ -513,7 +513,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
     auto const built = [](auto const& f) { return static_cast<bool>(f); };
     if (std::any_of(per_key_membership.begin(), per_key_membership.end(), built) ||
         std::any_of(per_key_zone_map.begin(), per_key_zone_map.end(), built)) {
-      stream.synchronize();
+      stream.sync();
 
       nvtx_scoped_range replicate_range{"dynfilter::replicate_devices"};
       auto replicate = [&plan](std::shared_ptr<sirius_dynamic_filter> const& filter) {
@@ -577,7 +577,7 @@ dynamic_filter_publication_outcome publish_dynamic_filters(
   } catch (...) {
     // Retire accepted work before the outer filter owners are destroyed during unwinding.
     auto error = std::current_exception();
-    stream.synchronize();
+    stream.sync();
     std::rethrow_exception(error);
   }
 }

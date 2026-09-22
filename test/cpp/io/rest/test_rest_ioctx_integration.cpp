@@ -15,9 +15,9 @@
  */
 
 #include "catch.hpp"
+#include "io/rest/authorizer.hpp"
 #include "io/rest/rest_ioctx.hpp"
-#include "io/s3/s3_list_parser.hpp"
-#include "io/s3/s3_request_authorizer.hpp"
+#include "io/rest/s3/list_parser.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/types.hpp"
 #include "memory/topology_index.hpp"
@@ -202,13 +202,12 @@ void require_bytes_equal(std::span<std::uint8_t const> got, std::span<std::uint8
 
 std::vector<std::uint8_t> copy_device_to_host(rmm::device_buffer const& device,
                                               std::size_t size,
-                                              rmm::cuda_stream_view stream)
+                                              ::cuda::stream_ref stream)
 {
   std::vector<std::uint8_t> out(size);
-  REQUIRE(
-    cudaMemcpyAsync(out.data(), device.data(), size, cudaMemcpyDeviceToHost, stream.value()) ==
-    cudaSuccess);
-  stream.synchronize();
+  REQUIRE(cudaMemcpyAsync(out.data(), device.data(), size, cudaMemcpyDeviceToHost, stream.get()) ==
+          cudaSuccess);
+  stream.sync();
   return out;
 }
 
@@ -1097,7 +1096,7 @@ TEST_CASE("rest perf snapshot attributes blocking host reads separately from chu
 
     auto const before = ioctx->perf_snapshot();
     auto got =
-      std::move(ioctx->host_read_ranges_async_io(datasource->io_object(), segments)).get(5s);
+      std::move(ioctx->host_read_ranges_async_io(datasource->get_io_object(), segments)).get(5s);
     auto const after = ioctx->perf_snapshot();
 
     REQUIRE(got == a.size() + b.size());
@@ -1464,7 +1463,7 @@ TEST_CASE("rest_ioctx opens LIST-sized objects without a HEAD round trip",
   auto datasource =
     ctx->open_datasource("s3://bucket/list-sized.bin", static_cast<std::uint64_t>(payload.size()));
   REQUIRE(datasource != nullptr);
-  CHECK(datasource->io_object().size() == payload.size());
+  CHECK(datasource->get_io_object().size() == payload.size());
   CHECK(server.head_count() == 0);
 
   std::vector<std::uint8_t> out(payload.size());
@@ -1559,7 +1558,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1587,7 +1586,7 @@ TEST_CASE("footer probe open uses the configured suffix window",
     auto datasource        = ioctx->open_datasource("s3://footer-bucket/nation.parquet",
                                              sirius::io::open_hint::parquet_footer_probe);
     auto const* rest_object =
-      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->io_object());
+      dynamic_cast<sirius::io::rest::rest_io_object const*>(&datasource->get_io_object());
 
     REQUIRE(rest_object != nullptr);
     CHECK(rest_object->stash_window_lo() == parquet.size() - suffix_bytes);
@@ -1724,7 +1723,7 @@ TEST_CASE("footer suffix probe falls back safely on unusable suffix responses",
                                              sirius::io::open_hint::parquet_footer_probe);
     REQUIRE(datasource != nullptr);
     CHECK(datasource->size() == parquet.size());
-    CHECK(datasource->io_object().validation_etag().empty());
+    CHECK(datasource->get_io_object().validation_tag().empty());
     CHECK(server.head_count() == 1);
     CHECK(server.get_count() == 1);
   }
@@ -2222,7 +2221,7 @@ TEST_CASE("rest_ioctx fans out host_read_ranges against the MinIO medium fixture
 
   auto got =
     std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+                datasource->get_io_object(), std::span<sirius::io::io_object_segment>(segments)))
       .get(5s);
   REQUIRE(got == total);
   for (std::size_t i = 0; i < ranges.size(); ++i) {
@@ -2351,7 +2350,7 @@ TEST_CASE("rest_ioctx honors max_connections under concurrent fake range reads",
 
   auto got =
     std::move(datasource->io_ctx()->host_read_ranges_async_io(
-                datasource->io_object(), std::span<sirius::io::io_object_segment>(segments)))
+                datasource->get_io_object(), std::span<sirius::io::io_object_segment>(segments)))
       .get(10s);
   REQUIRE(got == 8 * 512);
   CHECK(server.peak_active_gets() <= 2);

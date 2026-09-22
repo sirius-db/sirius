@@ -85,7 +85,7 @@ struct filter_application_result {
 
 class exceptional_stream_retirement {
  public:
-  explicit exceptional_stream_retirement(rmm::cuda_stream_view stream)
+  explicit exceptional_stream_retirement(::cuda::stream_ref stream)
     : _stream(stream), _uncaught_on_entry(std::uncaught_exceptions())
   {
   }
@@ -93,7 +93,7 @@ class exceptional_stream_retirement {
   ~exceptional_stream_retirement() noexcept
   {
     if (_submitted && std::uncaught_exceptions() > _uncaught_on_entry) {
-      _stream.synchronize_no_throw();
+      (void)cudaStreamSynchronize(_stream.get());
     }
   }
 
@@ -103,7 +103,7 @@ class exceptional_stream_retirement {
   void mark_submitted() noexcept { _submitted = true; }
 
  private:
-  rmm::cuda_stream_view _stream;
+  ::cuda::stream_ref _stream;
   int _uncaught_on_entry;
   bool _submitted = false;
 };
@@ -175,7 +175,7 @@ struct compaction_policy_decision {
 
 void validate_selection_state(deferred_selection_state const& state,
                               cudf::size_type original_rows,
-                              rmm::cuda_stream_view stream,
+                              ::cuda::stream_ref stream,
                               bool enabled)
 {
   if (!enabled) { return; }
@@ -190,9 +190,9 @@ void validate_selection_state(deferred_selection_state const& state,
                                         state.row_ids->view().data<cudf::size_type>(),
                                         host_ids.size() * sizeof(cudf::size_type),
                                         cudaMemcpyDeviceToHost,
-                                        stream.value());
+                                        stream.get());
     if (status != cudaSuccess) { throw std::runtime_error(cudaGetErrorString(status)); }
-    stream.synchronize();
+    stream.sync();
   }
   for (std::size_t index = 0; index < host_ids.size(); ++index) {
     if (host_ids[index] < 0 || host_ids[index] >= original_rows ||
@@ -218,7 +218,7 @@ void record_marginal_keep(dynamic_filter_gate* gate,
 filter_application_result apply_cascade(cudf::table_view const& input,
                                         std::unique_ptr<cudf::column> ast_mask,
                                         std::span<membership_step const> steps,
-                                        rmm::cuda_stream_view stream,
+                                        ::cuda::stream_ref stream,
                                         rmm::device_async_resource_ref mr,
                                         dynamic_filter_gate* gate,
                                         std::size_t observed_generation,
@@ -255,7 +255,7 @@ filter_application_result apply_cascade(cudf::table_view const& input,
 
 //===----------deferred_keys compaction strategy----------===//
 std::unique_ptr<cudf::column> make_identity_row_ids(cudf::size_type rows,
-                                                    rmm::cuda_stream_view stream,
+                                                    ::cuda::stream_ref stream,
                                                     rmm::device_async_resource_ref mr)
 {
   cudf::numeric_scalar<cudf::size_type> zero{0, true, stream, mr};
@@ -264,7 +264,7 @@ std::unique_ptr<cudf::column> make_identity_row_ids(cudf::size_type rows,
 
 std::unique_ptr<cudf::column> gather_one(cudf::column_view const& source,
                                          cudf::column_view const& row_ids,
-                                         rmm::cuda_stream_view stream,
+                                         ::cuda::stream_ref stream,
                                          rmm::device_async_resource_ref mr)
 {
   auto gathered = cudf::gather(
@@ -276,7 +276,7 @@ std::unique_ptr<cudf::column> gather_one(cudf::column_view const& source,
 
 std::unique_ptr<cudf::table> materialize_deferred_result(cudf::table_view const& input,
                                                          deferred_selection_state& state,
-                                                         rmm::cuda_stream_view stream,
+                                                         ::cuda::stream_ref stream,
                                                          rmm::device_async_resource_ref mr)
 {
   if (!state.aligned_key) {
@@ -316,7 +316,7 @@ std::unique_ptr<cudf::table> materialize_deferred_result(cudf::table_view const&
 filter_application_result apply_deferred_keys(cudf::table_view const& input,
                                               std::unique_ptr<cudf::column> ast_mask,
                                               std::span<membership_step const> steps,
-                                              rmm::cuda_stream_view stream,
+                                              ::cuda::stream_ref stream,
                                               rmm::device_async_resource_ref mr,
                                               dynamic_filter_gate* gate,
                                               std::size_t observed_generation,
@@ -390,7 +390,7 @@ filter_application_result apply_deferred_keys(cudf::table_view const& input,
 filter_application_result apply_gather_once(cudf::table_view const& input,
                                             std::unique_ptr<cudf::column> ast_mask,
                                             std::span<membership_step const> steps,
-                                            rmm::cuda_stream_view stream,
+                                            ::cuda::stream_ref stream,
                                             rmm::device_async_resource_ref mr,
                                             int device_id)
 {
@@ -471,7 +471,7 @@ namespace {
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
   int device_id,
@@ -602,7 +602,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
 std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
   int device_id,
@@ -615,7 +615,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view(
 std::unique_ptr<cudf::table> detail::apply_dynamic_filters_to_view_for_testing(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   compaction_strategy strategy,
   dynamic_filter_apply_mode mode,
   dynamic_filter_gate* gate,
@@ -694,7 +694,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_gated_view(
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& snapshot,
   dynamic_filter_gate& gate,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   dynamic_filter_apply_mode mode,
   int device_id,
   std::optional<std::size_t> input_bytes)

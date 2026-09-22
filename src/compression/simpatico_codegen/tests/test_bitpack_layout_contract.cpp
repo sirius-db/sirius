@@ -220,9 +220,9 @@ void test_compact_persistence_and_decode()
   }
 
   simpatico::payload_fetch_fn fetch =
-    [&](std::uint64_t offset, std::size_t size, void* dst, rmm::cuda_stream_view fetch_stream) {
+    [&](std::uint64_t offset, std::size_t size, void* dst, ::cuda::stream_ref fetch_stream) {
       auto const rc = cudaMemcpyAsync(
-        dst, payload.data() + offset, size, cudaMemcpyHostToDevice, fetch_stream.value());
+        dst, payload.data() + offset, size, cudaMemcpyHostToDevice, fetch_stream.get());
       if (rc != cudaSuccess) throw std::runtime_error("payload HtoD fetch failed");
     };
   std::string read_error;

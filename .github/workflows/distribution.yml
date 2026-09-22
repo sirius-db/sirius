@@ -38,6 +38,7 @@ jobs:
       vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
+      save_cache: ${{ github.ref == 'refs/heads/dev' }}
       reduced_ci_mode: "disabled"
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release
@@ -62,6 +63,7 @@ jobs:
       vcpkg_commit: "ffc071e0c08432c60c9b64f00334c0227667931b"
       vcpkg_binary_cache_enabled: true
       skip_tests: true
+      save_cache: ${{ github.ref == 'refs/heads/dev' }}
       reduced_ci_mode: "disabled"
       override_ci_tools_repository: "sirius-db/extension-ci-tools"
       build_type: ci-release

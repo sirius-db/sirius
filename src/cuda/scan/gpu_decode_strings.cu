@@ -66,7 +66,7 @@ namespace {
 
 /// Overlays an UNCOMPRESSED validity run onto the null mask (sibling to
 /// `dispatch_validity_run` in gpu_native_decode.cu).
-void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_stream_view stream)
+void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, ::cuda::stream_ref stream)
 {
   if (run.codec != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
     throw std::runtime_error(
@@ -87,8 +87,8 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
                                std::to_string(seg.bytes_size) + ") < required " +
                                std::to_string(bytes));
     }
-    RMM_CUDA_TRY(cudaMemcpyAsync(
-      d_mask + offset, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.value()));
+    RMM_CUDA_TRY(
+      cudaMemcpyAsync(d_mask + offset, seg.d_bytes, bytes, cudaMemcpyDeviceToDevice, stream.get()));
   }
 }
 
@@ -98,7 +98,7 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
 /// aggregate per-codec prepared state, write per-row lengths, scan to offsets,
 /// gather bytes, then build the cudf strings column.
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
-                                                        rmm::cuda_stream_view stream,
+                                                        ::cuda::stream_ref stream,
                                                         rmm::device_async_resource_ref mr)
 {
   uint32_t const total_rows = col.total_rows;
@@ -119,7 +119,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   for (auto const& run : col.data) {
     switch (run.codec) {
       case duckdb::CompressionType::COMPRESSION_DICTIONARY: {
-        auto p = prepare_dict(run);
+        auto p = prepare_dict(run, stream);
         prep_dict.descs_short.insert(
           prep_dict.descs_short.end(), p.descs_short.begin(), p.descs_short.end());
         prep_dict.descs_long.insert(
@@ -127,7 +127,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
         break;
       }
       case duckdb::CompressionType::COMPRESSION_FSST: {
-        auto p = prepare_fsst(run);
+        auto p = prepare_fsst(run, stream);
         // Rebase row_starts + decoder indices into the merged FSST set.
         auto const row_count_base     = prep_fsst.total_fsst_row_count;
         auto const decoder_count_base = static_cast<uint32_t>(prep_fsst.decoders.size());
@@ -206,7 +206,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   auto upload = [&](void const* src, size_t bytes) {
     rmm::device_buffer buf(bytes, stream, mr);
     if (bytes > 0) {
-      RMM_CUDA_TRY(cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value()));
+      RMM_CUDA_TRY(cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.get()));
     }
     return buf;
   };
@@ -237,7 +237,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
            prep_dict_fsst.decoded_offsets.size() * sizeof(uint32_t));
 
   // Pageable host sources — sync before kernels consume to avoid free-mid-copy.
-  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
 
   auto* d_comp_offsets_p     = static_cast<uint32_t*>(d_comp_offsets.data());
   auto* d_uncomp_chunks_p    = static_cast<string_chunk_desc*>(d_uncomp_chunks_buf.data());
@@ -299,14 +299,14 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
                                 d_lengths.data(),
                                 reinterpret_cast<uint32_t*>(d_offsets.data()),
                                 scan_n,
-                                stream.value());
+                                stream.get());
   rmm::device_buffer cub_temp_buf(cub_bytes, stream, mr);
   cub::DeviceScan::ExclusiveSum(cub_temp_buf.data(),
                                 cub_bytes,
                                 d_lengths.data(),
                                 reinterpret_cast<uint32_t*>(d_offsets.data()),
                                 scan_n,
-                                stream.value());
+                                stream.get());
 
   // cudf strings offsets are int32; reject up front if the upper bound exceeds it.
   constexpr auto INT32_MAX_SIZE = static_cast<size_t>(std::numeric_limits<int32_t>::max());
@@ -318,7 +318,7 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   if (!needs_exact_total && cum_chars_upper <= HOST_UPPER_BOUND_LIMIT) {
     alloc_chars = cum_chars_upper;
   } else {
-    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
     uint32_t total_chars_u = 0;
     RMM_CUDA_TRY(cudaMemcpy(
       &total_chars_u, d_offsets.data() + total_rows, sizeof(uint32_t), cudaMemcpyDeviceToHost));

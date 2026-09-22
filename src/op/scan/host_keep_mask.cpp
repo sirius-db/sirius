@@ -39,7 +39,7 @@ static_assert(sizeof(std::uint32_t) == sizeof(cudf::bitmask_type),
 
 std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
                                                   std::span<std::uint8_t const> keep,
-                                                  rmm::cuda_stream_view stream,
+                                                  ::cuda::stream_ref stream,
                                                   rmm::device_async_resource_ref mr)
 {
   auto const num_rows = view.num_rows();
@@ -55,7 +55,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
                                keep.data(),
                                keep.size() * sizeof(std::uint8_t),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
 
   return sirius::ApplyRetentionMask(view, bool_col->view(), stream, mr);
 }
@@ -63,7 +63,7 @@ std::unique_ptr<cudf::table> apply_host_keep_mask(cudf::table_view const& view,
 std::unique_ptr<cudf::table> apply_host_keep_bitmask(cudf::table_view const& view,
                                                      std::span<std::uint32_t const> keep_words,
                                                      std::size_t row_count,
-                                                     rmm::cuda_stream_view stream,
+                                                     ::cuda::stream_ref stream,
                                                      rmm::device_async_resource_ref mr)
 {
   auto const num_rows = view.num_rows();
@@ -85,7 +85,7 @@ std::unique_ptr<cudf::table> apply_host_keep_bitmask(cudf::table_view const& vie
                                keep_words.data(),
                                keep_words.size_bytes(),
                                cudaMemcpyHostToDevice,
-                               stream.value()));
+                               stream.get()));
   auto bool_col = cudf::mask_to_bools(static_cast<cudf::bitmask_type const*>(mask_dev.data()),
                                       0,
                                       static_cast<cudf::size_type>(row_count),

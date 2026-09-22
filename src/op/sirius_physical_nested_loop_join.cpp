@@ -418,7 +418,7 @@ static std::unique_ptr<cudf::column> scatter_bool(
   std::unique_ptr<cudf::column> column,
   const rmm::device_uvector<cudf::size_type>& indices,
   bool value,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   if (indices.size() == 0) { return column; }
   cudf::numeric_scalar<bool> scalar(value, true, stream);
@@ -448,7 +448,7 @@ static std::unique_ptr<operator_data> resolve_mark_join_result(
   const rmm::device_uvector<cudf::size_type>& maybe_indices,
   const cudf::table_view& left_view,
   cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
   std::vector<std::unique_ptr<cudf::column>> out_cols;
@@ -485,7 +485,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
   const cudf::table_view& right,
   bool left_side_empty,
   cucascade::memory::memory_space& space,
-  rmm::cuda_stream_view stream)
+  ::cuda::stream_ref stream)
 {
   auto mr                       = space.get_default_allocator();
   auto const num_surviving_rows = left_side_empty ? right.num_rows() : left.num_rows();
@@ -582,7 +582,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::emit_one_side_e
 }
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream)
 {
   nvtx_scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
   auto& input               = dynamic_cast<const pipelineable_operator_data&>(input_data);

@@ -39,9 +39,10 @@
 
 // rmm
 #include <rmm/cuda_device.hpp>
-#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/resource_ref.hpp>
+
+#include <cuda/stream>
 
 // cuda
 #include <cuda_runtime_api.h>
@@ -142,7 +143,7 @@ bool sirius_dynamic_small_in_list_filter::supports(cudf::column_view const& keys
 }
 
 sirius_dynamic_small_in_list_filter::sirius_dynamic_small_in_list_filter(
-  cudf::column_view const& keys, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+  cudf::column_view const& keys, ::cuda::stream_ref stream, rmm::device_async_resource_ref mr)
   : _key_type(keys.type()), _num_keys(static_cast<std::size_t>(keys.size()))
 {
   if (!supports(keys)) {
@@ -170,7 +171,7 @@ sirius_dynamic_small_in_list_filter::~sirius_dynamic_small_in_list_filter() = de
 std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
   cudf::column_view const& probe,
   int device_id,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr) const
 {
   // A pinned chunk may store this key narrowed while the filter was published at
@@ -194,7 +195,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
       CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
         n,
         small_in_list_scan<std::int32_t>{keys.data<std::int32_t>(), needles, m, outp},
-        stream.value()));
+        stream.get()));
       break;
     }
     case cudf::type_id::INT64: {
@@ -202,7 +203,7 @@ std::unique_ptr<cudf::column> sirius_dynamic_small_in_list_filter::compute_mask(
       CUCASCADE_CUDA_TRY(cub::DeviceFor::Bulk(
         n,
         small_in_list_scan<std::int64_t>{keys.data<std::int64_t>(), needles, m, outp},
-        stream.value()));
+        stream.get()));
       break;
     }
     default: return nullptr;
@@ -237,8 +238,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
 
   // Retain every destination and pooled stream while direct peer copies are submitted. Waiting
   // only after this loop lets different destination GPUs transfer concurrently.
-  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>, rmm::cuda_stream_view>>
-    pending;
+  std::vector<std::pair<std::unique_ptr<needle_store::needle_replica>, ::cuda::stream_ref>> pending;
   pending.reserve(spaces.size());
   _store->replicas.reserve(_store->replicas.size() + spaces.size());
   for (auto const& target : spaces) {
@@ -291,7 +291,7 @@ void sirius_dynamic_small_in_list_filter::replicate_to_devices(
     auto const device_id = replica->device_id;
     try {
       rmm::cuda_set_device_raii guard{rmm::cuda_device_id{device_id}};
-      stream.synchronize();
+      stream.sync();
       _store->replicas.push_back(std::move(replica));
     } catch (std::exception const& e) {
       SIRIUS_LOG_WARN(

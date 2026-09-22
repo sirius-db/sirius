@@ -275,7 +275,7 @@ std::unique_ptr<batch_coalescer> iceberg_gpu_ingestible::create_batch_coalescer(
 filtered_table iceberg_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   bool like_swar_fastpath,
   std::shared_ptr<const sirius::like_multiliteral_cache> like_cache)
 {

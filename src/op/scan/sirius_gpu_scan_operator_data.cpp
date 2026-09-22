@@ -97,20 +97,20 @@ membership_snapshot snapshot_membership_probes(sirius::op::dynamic_filter_snapsh
     // here; pass -1 so compute_mask resolves it from the CURRENT CUDA
     // device at probe time, which the task scheduler has already set to
     // the chunk's assigned GPU by then.
-    snap.probes[i].push_back({[f = filter, applicable](cudf::column_view const& keys,
-                                                       rmm::cuda_stream_view s,
-                                                       rmm::device_async_resource_ref mr) {
-                                return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
-                              },
-                              kind_rank,
-                              num_keys});
+    snap.probes[i].push_back(
+      {[f = filter, applicable](
+         cudf::column_view const& keys, ::cuda::stream_ref s, rmm::device_async_resource_ref mr) {
+         return applicable->compute_mask(keys, /*device_id=*/-1, s, mr);
+       },
+       kind_rank,
+       num_keys});
     ++snap.attached_probes;
   }
   return snap;
 }
 
 void scan_operator_input::prepare_for_processing(
-  const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
+  const ::cucascade::memory::memory_space* requested_memory_space, ::cuda::stream_ref stream)
 {
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
@@ -264,7 +264,7 @@ void scan_operator_input::prepare_for_processing(
             // The batch cannot hold null data and its size/view queries dereference the table, so
             // leave a valid empty placeholder.
             mut.set_data(std::make_unique<::cucascade::gpu_table_representation>(
-              std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{}));
+              std::make_unique<cudf::table>(), space, ::cuda::stream_ref{cudaStream_t{}}));
           }
         }
       }
@@ -278,9 +278,7 @@ void scan_operator_input::prepare_for_processing(
 }
 
 std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converted_table(
-  std::size_t output_width,
-  const converted_table_builder& builder,
-  rmm::cuda_stream_view stream) const
+  std::size_t output_width, const converted_table_builder& builder, ::cuda::stream_ref stream) const
 {
   // This gate is deliberately narrower than the generic resident path. Only prepare's own fresh
   // conversion may set pending; raw GPU pins and splits with filtering still ahead of them stay
@@ -314,7 +312,7 @@ std::unique_ptr<cudf::table> scan_operator_input::transactionally_steal_converte
 
   auto& space    = gpu_rep->get_memory_space();
   auto empty_rep = std::make_unique<::cucascade::gpu_table_representation>(
-    std::make_unique<cudf::table>(), space, rmm::cuda_stream_view{});
+    std::make_unique<cudf::table>(), space, ::cuda::stream_ref{cudaStream_t{}});
   auto replacements = builder(source_view);
   if (replacements.size() != output_width) {
     throw std::runtime_error(

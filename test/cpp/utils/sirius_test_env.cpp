@@ -20,6 +20,29 @@
 
 namespace sirius::test {
 
+namespace {
+
+void trim_cuda_memory_pools()
+{
+  int original_device{};
+  int device_count{};
+  if (cudaGetDevice(&original_device) != cudaSuccess ||
+      cudaGetDeviceCount(&device_count) != cudaSuccess) {
+    return;
+  }
+
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaSetDevice(device) != cudaSuccess) { continue; }
+    cudaMemPool_t pool{};
+    if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+      (void)cudaMemPoolTrimTo(pool, /*minBytesToKeep=*/0);
+    }
+  }
+  (void)cudaSetDevice(original_device);
+}
+
+}  // namespace
+
 shared_test_env* g_shared_env           = nullptr;
 shared_test_env* g_integration_env      = nullptr;
 shared_test_env* g_integration_env_2gpu = nullptr;
@@ -74,6 +97,7 @@ void shared_test_env::pause()
   // Destroy DuckDB — releases SiriusContext so isolated tests
   // can create their own DuckDB with a different config.
   db_.reset();
+  trim_cuda_memory_pools();
 }
 
 void shared_test_env::resume()

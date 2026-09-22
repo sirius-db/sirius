@@ -48,8 +48,6 @@ mysql-client = "*"
 client = {cmd = "mysql --host 127.0.0.1 --port 9030 --user root",description = "Open a MySQL client against the local FE (run `cluster` in another terminal first)"}
 
 [feature.cn.dependencies]
-# Provides protoc for prost-build in the Substrait crates on fresh CN envs.
-libprotobuf = ">=7.35,<8"
 rust = "*"
 thrift-compiler = "*"
 
@@ -74,13 +72,15 @@ platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.engine.dependencies]
 cxx-compiler = "*"
+croaring = "*"
 cuda-version = "13.2.*"
-libcudf = "26.06.*"
+libcudf = "==26.08.01"
+libcuvs = "==26.08.01"
 librmm = "*"
 libcurand-dev = "*"
 yaml-cpp = "*"
 libabseil = "*"
-duckdb = "=1.5.3"
+duckdb = "=1.5.5"
 spdlog = "1.8.*"
 sqlite = "3.*"
 liburing = "*"
