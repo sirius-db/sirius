@@ -1468,7 +1468,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   // explicit `max_readahead_scans` / `readahead_strategy`, or what the serving
   // backend wants.  A budget of zero means "do not read ahead" — either
   // configured off, or a backend that publishes no depth (kvikIO by default) —
-  // and start() is then a no-op.
+  // and then no manager is built at all: merely not starting its worker would
+  // still leave it subscribed to the publisher, buffering one event per
+  // deployed task in a mailbox nothing drains, and still collecting a deque
+  // entry per split, for the whole query.  Every consumer takes a null manager,
+  // so leaving `_readahead` unset is what "do not read ahead" costs.
   //
   // The serving backend is not necessarily the default `_io_ctx`: a path-routed
   // backend serves its own scans (an `s3://` query reads through the REST ioctx
@@ -1488,10 +1492,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     auto const backend = select_readahead_backend(backend_policies);
     auto const plan    = _config.resolve_readahead(backend.budget, backend.strategy);
 
-    // Registers its mailbox for the query's lifetime; unregistered in reset().
-    _readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher, plan.budget);
-    _readahead->prepare_for_query(query);
-    _readahead->start(plan.strategy);
+    if (plan.budget > 0) {
+      // Registers its mailbox for the query's lifetime; unregistered in reset().
+      _readahead = std::make_shared<readahead_scan_manager>(*_query_event_publisher, plan.budget);
+      _readahead->prepare_for_query(query);
+      _readahead->start(plan.strategy);
+    }
   }
 
   std::vector<cached_assignment> cached_assignments;
@@ -1969,6 +1975,25 @@ void sirius_scan_manager::reset()
 
 void sirius_scan_manager::reset_caches()
 {
+  // A tier='parquet' pin is nothing but these retained datasources and the
+  // chunks they hold in the cache we are about to destroy, and the teardown
+  // reclaims those chunks whether or not a handle still points at them.  So
+  // drop them here, while the cache is still alive: the handles die against a
+  // live cache and the registry stops claiming a residency that is gone.
+  if (!_pinned_parquet_sources.empty()) {
+    std::string names;
+    for (auto const& pin : _pinned_parquet_sources) {
+      if (!names.empty()) { names += ", "; }
+      names += pin.first;
+    }
+    SIRIUS_LOG_WARN(
+      "[sirius_scan_manager] resetting the caches drops {} parquet-tier pin(s) ({}); their "
+      "chunks go with the cache, so re-pin after the reset",
+      _pinned_parquet_sources.size(),
+      names);
+    _pinned_parquet_sources.clear();
+  }
+
   // Rebuild one context's cache.  shutdown_cache drains the evictor and every
   // in-flight IO before releasing the chunks, so by the time it returns nothing
   // is left pointing into what we are about to replace.
@@ -2692,10 +2717,10 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
       _config.cache.eviction_threshold_fraction);
   }
 
-  // Replace rather than accumulate: a re-pin under the same name should leave
-  // one set of handles, not two covering the same chunks.
-  _pinned_parquet_sources.erase(name);
-  auto& retained = _pinned_parquet_sources[name];
+  // Built locally and published only once every file is pinned: a throw part
+  // way through destroys the handles taken so far, which is the rollback --
+  // and leaves whatever was already pinned under @p name untouched.
+  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> retained;
   retained.reserve(file_paths.size());
 
   std::size_t total_bytes = 0;
@@ -2777,6 +2802,9 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
                   retained.size(),
                   name,
                   total_bytes);
+  // Replace rather than accumulate: a re-pin under the same name should leave
+  // one set of handles, not two covering the same chunks.
+  _pinned_parquet_sources[name] = std::move(retained);
   return total_bytes;
 }
 

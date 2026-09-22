@@ -143,11 +143,12 @@ class uring_reactor {
   using reactor_config_type  = config;
   using reactor_context_type = reactor_context;
 
-  /// Bounce slots are allocated from the context's host_memory_resource (which
-  /// must be non-null); their size is taken from its @c get_block_size().  The
-  /// reactor keeps the @c multiple_blocks_allocation alive for its lifetime —
-  /// blocks return to the resource on destruction — and holds the shared
-  /// @p ctx so it (and the resource) outlive the reactor.
+  /// Bounce slots are allocated by @c start() from the context's
+  /// host_memory_resource (which must be non-null); their size is taken from its
+  /// @c get_block_size() and their count from a fixed 64 MiB staging budget.  The
+  /// reactor keeps the @c multiple_blocks_allocation alive until it is destroyed —
+  /// blocks return to the resource then — and holds the shared @p ctx so it (and
+  /// the resource) outlive the reactor.
   explicit uring_reactor(std::shared_ptr<reactor_context> ctx,
                          std::string_view tname = "uring_reactor");
 
@@ -217,12 +218,12 @@ class uring_reactor {
   // reactor's lifetime (so the bounce-staging resource outlives _bounce_storage).
   std::shared_ptr<reactor_context> _ctx;
 
-  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
-  // multiple_blocks_allocation destructor returns the blocks to the upstream
-  // resource when the reactor is destroyed.
   reactor_config_type _config;
   // Thread name prefix captured at construction; applied to the worker in start().
   std::string _tname;
+  // Keeps the bounce-slot blocks alive for the reactor's lifetime.  The
+  // multiple_blocks_allocation destructor returns the blocks to the upstream
+  // resource when the reactor is destroyed.
   cucascade::memory::fixed_multiple_blocks_allocation _bounce_storage;
   std::size_t _bounce_slot_size;
   std::stop_source _stop_source;
