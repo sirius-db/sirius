@@ -511,7 +511,8 @@ class chunk_state {
 
   /// (allocated | cached) with no reader → evicting.  When @p only_unsubscribed
   /// the chunk must also have no live subscriber; the evictor clears that flag
-  /// only for its last-resort pass, when nothing else can be freed.
+  /// only for its last-resort pass under memory pressure or an explicit demand,
+  /// when nothing else can be freed — never under dispose_on_idle.
   [[nodiscard]] bool mark_evicting(bool only_unsubscribed = true) noexcept
   {
     std::uint64_t cur = _w.load(std::memory_order_acquire);

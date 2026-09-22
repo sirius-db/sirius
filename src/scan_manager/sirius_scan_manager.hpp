@@ -508,6 +508,10 @@ class sirius_scan_manager {
   /// live @c cache_handle instances point at.  The caller is responsible
   /// for excluding execution -- through the extension this runs under a
   /// @c SiriusContext::SlotGuard, which is what makes it safe there.
+  ///
+  /// Drops every @ref pin_parquet_ranges pin, with a warning naming them: those
+  /// pins ARE chunks in the cache being destroyed, so none of them can survive
+  /// this and a registry still listing them would be lying.  Re-pin afterwards.
   void reset_caches();
 
   /// \brief Start the worker thread pool. Idempotent.
@@ -694,6 +698,18 @@ class sirius_scan_manager {
   /// microsecond-wide race that a single-threaded test cannot schedule).
   void bump_pin_registry_epoch_for_testing() noexcept { bump_pin_registry_epoch(); }
 
+  /// TEST-ONLY: how many names currently hold retained parquet-tier datasources. Nothing else
+  /// records such a pin, so this is the only way to observe that @ref reset_caches dropped one.
+  [[nodiscard]] std::size_t pinned_parquet_count_for_testing() const noexcept
+  {
+    return _pinned_parquet_sources.size();
+  }
+
+  /// TEST-ONLY: whether @ref prepare_for_query built a readahead for the current query.  The
+  /// manager is otherwise only reachable through the pipelines it was handed to, so this is the
+  /// only way to observe that a zero budget left it unbuilt rather than built and idle.
+  [[nodiscard]] bool has_readahead_for_testing() const noexcept { return _readahead != nullptr; }
+
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
 
@@ -734,6 +750,10 @@ class sirius_scan_manager {
   /// drops it. That is load-bearing rather than incidental: the evictor only
   /// considers a request's chunks once its consumer is disposed, so a live
   /// handle is what keeps them out of the reclaim sweep entirely.
+  ///
+  /// Does not survive @ref reset_caches: that destroys the cache holding the
+  /// chunks, so it drops these datasources (and warns) rather than leave a pin
+  /// on the books with nothing behind it.
   ///
   /// @param cols  columns to pin, or all of them when unset.
   /// @return bytes of column-chunk data requested across every file.

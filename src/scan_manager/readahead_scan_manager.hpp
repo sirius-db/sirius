@@ -177,8 +177,10 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   void prepare_for_query(const sirius::planner::query& query);
 
   /// Start the worker that drives the readahead.  Idempotent: a second call
-  /// while the worker is running does nothing.  A no-op when the budget this was
-  /// built with is zero.
+  /// while the worker is running does nothing.  A no-op once @ref stop has run
+  /// --- the readahead's lifecycle is start-once, stop-once, so once torn down
+  /// it stays that way --- and a no-op when the budget this was built with is
+  /// zero.
   void start(prefetch_strategy strategy = prefetch_strategy::eager);
 
   /// A task reached an executor.  Under @c prefetch_strategy::opportunistic a
@@ -247,10 +249,9 @@ class readahead_scan_manager : public std::enable_shared_from_this<readahead_sca
   void register_scan_task(std::shared_ptr<op::scan::scan_info> const& task,
                           std::size_t operator_id);
 
-  /// Request the worker to stop and join it.  Safe to call when not started.
+  /// Request the worker to stop and join it.  Terminal: subsequent @ref start
+  /// calls are no-ops.  Safe to call when not started, and safe to call twice.
   void stop() noexcept;
-
-  void reset();
 
   /// The rule behind @ref prefetch_outcome_kind, a pure function so it can be
   /// read -- and tested -- without a live manager.  @p stage is the consumer's

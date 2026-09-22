@@ -682,6 +682,8 @@ void sirius_config::apply_defaults()
   disk_cfg.setup_configurator(builder);
   _memory_space_configs = builder.build(_hw_topology);
   _operator_params      = operator_params{};
+
+  finalize_derived_config();
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -816,18 +818,23 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     if (operator_node) { sirius::from_yaml(*operator_node, resolved_operator_params); }
     _operator_params = std::move(resolved_operator_params);
 
-    derive_uring_scan_budget();
-    // The opportunistic strategy schedules against what the executor can run,
-    // not what the device can queue, so it needs the pipeline pool's width.
-    _scan_manager_config.pipeline_width =
-      static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
-    derive_rest_scan_budget();
-    enforce_sirius_backend_for_multi_gpu();
+    finalize_derived_config();
 
   } catch (const std::exception& e) {
     throw std::runtime_error("Failed to load config from " + config_path.string() + ": " +
                              e.what());
   }
+}
+
+void sirius_config::finalize_derived_config()
+{
+  derive_uring_scan_budget();
+  // The opportunistic strategy schedules against what the executor can run,
+  // not what the device can queue, so it needs the pipeline pool's width.
+  _scan_manager_config.pipeline_width =
+    static_cast<std::size_t>(std::max(1, _gpu_pipeline_executor_config.num_threads));
+  derive_rest_scan_budget();
+  enforce_sirius_backend_for_multi_gpu();
 }
 
 void sirius_config::derive_uring_scan_budget()

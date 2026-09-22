@@ -328,3 +328,46 @@ TEST_CASE("a zero-byte evict is a no-op", "[cache][eviction][explicit]")
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(cache->claimed_bytes() == claimed);
 }
+
+TEST_CASE("the evictor retires disposed requests while the pool is under its threshold",
+          "[cache][eviction][explicit]")
+{
+  temp_data_file file(8ull << 20);  // 8 MiB
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index_for_evict();
+
+  sirius_scan_manager manager{lru_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+
+  // Requests that fall behind: fadvise registers the chunks, nothing ever
+  // prepares them, so they stay `empty` and the pool never approaches the
+  // pressure threshold.  Each fadvise is also what wakes the evictor for a
+  // round, and every round must retire the requests disposed before it --
+  // otherwise the batch is one entry per request for the life of the cache.
+  constexpr int n_requests = 64;
+  std::vector<cudf::io::text::byte_range_info> ranges;
+  ranges.emplace_back(0, 4ll << 20);
+  for (int i = 0; i < n_requests; ++i) {
+    auto ds = manager.create_datasource(file.path.string());
+    REQUIRE(ds != nullptr);
+    ds->fadvise(ranges, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }  // ~sirius_datasource -> the consumer is disposed before the next round
+
+  // The batch is a background thread's state, so give it a deadline rather than
+  // a single read.  Steady state is the round's own arrivals plus the previous
+  // round's last request; the bound is loose enough to absorb a round that
+  // absorbed two of them at once and tight enough that "one entry per request
+  // ever issued" cannot pass.
+  constexpr std::size_t max_tracked = 8;
+  auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+  std::size_t tracked = cache->eviction_batch_size_for_testing();
+  while (tracked > max_tracked && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    tracked = cache->eviction_batch_size_for_testing();
+  }
+  INFO("cache: " << cache->summary());
+  CHECK(tracked <= max_tracked);
+}

@@ -95,8 +95,13 @@ void readahead_scan_manager::start(prefetch_strategy strategy)
   // A backend that publishes a zero budget has opted out; running a worker that
   // can never issue anything would just be a thread parked on a condvar.
   if (_budget == 0) { return; }
-  _strategy    = strategy;
-  _stop_source = std::stop_source{};
+  // Start-once.  A second call while the worker runs would move a fresh jthread
+  // over the live one, and that move joins a worker whose stop token nothing
+  // ever requests -- the worker watches @c _stop_source, not the jthread's own
+  // source.  After @ref stop the gate is shut for good and the event subscriber
+  // is torn down, so a second worker could only spin without issuing anything.
+  if (is_running() || _stop_source.stop_requested()) { return; }
+  _strategy = strategy;
   _prefetch_worker =
     std::jthread([this](const std::stop_token& st) { worker_loop(st); }, _stop_source.get_token());
   // Only now start draining the event-publisher mailbox: the hooks below arm
@@ -405,8 +410,6 @@ void readahead_scan_manager::worker_loop(const std::stop_token& st)
     if (!try_issue(candidate)) { _gatekeeper.release(); }
   }
 }
-
-void readahead_scan_manager::reset() { stop(); }
 
 void readahead_scan_manager::arm_prefetching()
 {

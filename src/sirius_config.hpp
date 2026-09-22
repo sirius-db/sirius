@@ -333,24 +333,31 @@ struct sirius_config {
   [[nodiscard]] int gpus_per_query() const noexcept { return _gpus_per_query; }
 
  private:
+  /// Apply the knobs derived from the rest of the configuration: the readahead
+  /// scan budgets, the @c pipeline_width stamp and the multi-GPU backend
+  /// override, in that order. Called from the end of both @ref load_from_file
+  /// and @ref apply_defaults so a missing config file derives the same values
+  /// an empty one does; each step is idempotent.
+  void finalize_derived_config();
+
   /// When @c _memory_space_configs contains more than one GPU memory space,
   /// force @c _scan_manager_config.backend to @c io_backend::sirius (the
   /// sirius backend is required for multi-GPU IO routing). Emits a WARNING when
-  /// the override takes effect. Called from the end of @ref load_from_file.
+  /// the override takes effect. Called from @ref finalize_derived_config.
   void enforce_sirius_backend_for_multi_gpu();
 
   /// Re-default @c _scan_manager_config.uring.n_max_concurrent_scans to the
   /// CONFIGURED pipeline pool size. The struct default can only use the
   /// compile-time thread count, so resizing the pipeline in config would
-  /// otherwise leave the readahead budget behind. Called from the end of
-  /// @ref load_from_file; an explicit config value is left alone.
+  /// otherwise leave the readahead budget behind. Called from
+  /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_uring_scan_budget();
 
   /// Re-default @c _scan_manager_config.rest.n_max_concurrent_scans to a
   /// multiple of the configured pipeline pool size. Object-store reads are
   /// latency-bound, so the readahead needs several splits in flight per pipeline
-  /// thread to stay ahead of demand. Called from the end of @ref load_from_file;
-  /// an explicit config value is left alone.
+  /// thread to stay ahead of demand. Called from
+  /// @ref finalize_derived_config; an explicit config value is left alone.
   void derive_rest_scan_budget();
 
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};

@@ -15,9 +15,12 @@
  */
 
 #include <catch.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
 #include <io/cache/types.hpp>
 #include <io/io_request.hpp>
 #include <io/types.hpp>
+#include <io/uring/config.hpp>
 #include <io/uring/types.hpp>
 #include <io/uring/uring_reactor.hpp>
 #include <sys/uio.h>
@@ -266,4 +269,41 @@ TEST_CASE("io_uring alignment widens and coalesces safely", "[uring_readv]")
   REQUIRE(merged.size() == 1);
   CHECK(merged[0].offset() == 0);
   CHECK(merged[0].size() == 12'288);
+}
+
+TEST_CASE("io_uring staging reservation follows the byte budget, not the slot cap", "[uring_readv]")
+{
+  // 4 MiB blocks: the pre-budget sizing asked for 64 x 4 MiB = 256 MiB, which does not
+  // fit in this resource; the 64 MiB budget asks for 16 blocks, which does.
+  constexpr std::size_t block_size = 4UL << 20;
+  constexpr std::size_t capacity   = 128UL << 20;
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, capacity, capacity, block_size, 4, 0};
+
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+  uring_reactor reactor{ctx, ""};
+
+  REQUIRE_NOTHROW(reactor.start());
+  CHECK(mr.get_total_allocated_bytes() == (64UL << 20));
+  reactor.shutdown();
+}
+
+TEST_CASE("io_uring staging failure names the reactor and the requested bytes", "[uring_readv]")
+{
+  // A block larger than the budget clamps the slot count to one; the resource cannot
+  // serve even that single block.
+  constexpr std::size_t block_size = 128UL << 20;
+
+  cucascade::memory::numa_region_pinned_host_memory_resource upstream{0};
+  cucascade::memory::fixed_size_host_memory_resource mr{
+    0, upstream, 1UL << 20, 1UL << 20, block_size, 1, 0};
+
+  auto ctx = std::make_shared<uring_reactor::reactor_context>(sirius::io::uring::config{}, &mr);
+  uring_reactor reactor{ctx, ""};
+
+  REQUIRE_THROWS_WITH(reactor.start(),
+                      Catch::Contains("uring_reactor: cannot reserve 134217728 bytes of "
+                                      "pinned staging (1 x 134217728)"));
 }

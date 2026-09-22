@@ -21,8 +21,11 @@
 #include <io/rest/rest_reactor.hpp>
 
 #include <array>
+#include <chrono>
+#include <future>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
 using cudf::io::text::byte_range_info;
@@ -43,12 +46,13 @@ std::vector<byte_range_info> coalesce(std::vector<byte_range_info> ranges,
   return rest_reactor::align_and_coalesce(ranges, alignment);
 }
 
-std::unique_ptr<rest_reactor> make_reactor()
+std::unique_ptr<rest_reactor> make_reactor(std::size_t max_retry_attempts = 10)
 {
   auto authorizer = std::make_shared<mock_authorizer>(
     sirius::io::rest::authorized_request{"http://127.0.0.1/unused", {}});
   sirius::io::rest::config config;
-  config.max_connections = 1;
+  config.max_connections    = 1;
+  config.max_retry_attempts = max_retry_attempts;
   auto context =
     std::make_shared<rest_reactor::reactor_context>(config, std::move(authorizer), nullptr);
   return std::make_unique<rest_reactor>(std::move(context), "rest_lifecycle_test");
@@ -144,4 +148,32 @@ TEST_CASE("rest_reactor rejects work outside its running lifetime", "[rest]")
     CHECK_THROWS(std::move(future).get());
     CHECK(reactor->queued_bytes() == 0);
   }
+}
+
+TEST_CASE("rest_reactor drops an empty grouped request without live-locking", "[rest]")
+{
+  // A group with no slices carries no coordinator credits, so its future is
+  // already resolved when it is handed out: dropping the group strands nobody.
+  auto empty_coordinator = std::make_shared<grouped_coordinator>(0, 0);
+  auto empty_future      = empty_coordinator->get_future();
+  CHECK(empty_future.is_ready());
+
+  auto destination = std::make_shared<std::array<std::uint8_t, 1>>();
+  auto finished    = std::make_shared<std::promise<void>>();
+  auto watchdog    = finished->get_future();
+
+  // Detached so that a regression fails the watchdog instead of deadlocking the
+  // whole test binary on the worker join inside shutdown().
+  std::thread([destination, empty_coordinator, finished] {
+    auto reactor = make_reactor(/*max_retry_attempts=*/1);
+    reactor->start();
+    auto object = std::make_shared<rest_io_object>("s3://bucket/object", "bucket", "object", 1);
+    reactor->enqueue(grouped_io_request::create(std::move(object), {}, empty_coordinator));
+    auto future = enqueue_one(*reactor, destination->data());
+    static_cast<void>(std::move(future).get_try());
+    reactor->shutdown();
+    finished->set_value();
+  }).detach();
+
+  REQUIRE(watchdog.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
 }

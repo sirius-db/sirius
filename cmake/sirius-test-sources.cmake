@@ -125,6 +125,7 @@ set(TEST_SOURCES
     test/cpp/scan_manager/test_readahead_lifecycle.cpp
     test/cpp/scan_manager/test_reset_caches.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
+    test/cpp/scan_manager/test_pin_parquet.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
     test/cpp/scan_manager/test_insert_delta_job.cpp
     test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp

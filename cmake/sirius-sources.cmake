@@ -4,6 +4,7 @@ set(EXTENSION_SOURCES
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp
     src/compression/plan_register.cpp
+    src/cuda/device_copy_batch.cpp
     src/late_mat/prepared_selection.cpp
     src/late_mat/materialize.cpp
     src/late_mat/defer_policy.cpp
@@ -249,7 +250,6 @@ set(CUDA_SOURCES
     src/cuda/vss/cudf_raft_interop.cu
     src/cuda/vss/brute_force_search.cu
     src/cuda/vss/ivf_flat_index.cu)
-    src/cuda/device_copy_batch.cpp
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}

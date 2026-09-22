@@ -235,8 +235,9 @@ struct scan_manager_config {
   /// Scans the executor can have running at once — the pipeline pool's width.
   /// The budget @c opportunistic schedules against, since one prefetch per
   /// non-scan deployment is only useful while the executor could still take
-  /// another scan.  Stamped by @c sirius_config from the pipeline config; zero
-  /// means "not stamped", and the backend's own budget is used instead.
+  /// another scan.  Stamped by @c sirius_config from the pipeline config on
+  /// both the config-file and the defaults path; zero means "not stamped", and
+  /// the backend's own budget is used instead.
   std::size_t pipeline_width{0};
 
   /// Local (uring) reactor configuration. @c use_odirect is derived from

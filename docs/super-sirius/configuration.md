@@ -931,7 +931,10 @@ sirius:
 Attribution: host `block_size` 1 Mi → 64 Mi removes per-segment submission
 overhead in batched host→GPU copies (~11 ms of every 39 ms five-GB
 conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
-concern. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+concern.  Each uring reactor stages through whole host blocks under a fixed
+64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
+and even a small device miss occupies that whole block for the duration of
+its I/O. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
 include the cuCascade all-valid null-mask conversion fix; without it,

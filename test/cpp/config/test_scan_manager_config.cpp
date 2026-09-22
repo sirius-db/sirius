@@ -18,6 +18,7 @@
 #include "scan_manager/config.hpp"
 #include "sirius_config.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -362,6 +363,22 @@ TEST_CASE("an opportunistic readahead schedules against the pipeline width",
   // An explicit budget wins over the pipeline-width substitution.
   cfg.max_readahead_scans = 5;
   CHECK(cfg.resolve_readahead(backend_budget, prefetch_strategy::eager).budget == 5);
+}
+
+TEST_CASE("apply_defaults derives the readahead budgets like the file path does",
+          "[scan_manager][config][readahead]")
+{
+  constexpr auto pipeline_threads =
+    static_cast<std::size_t>(std::max(1, sirius::exec::default_gpu_pipeline_num_threads));
+
+  sirius::sirius_config cfg;
+  cfg.apply_defaults();
+  auto const& scan_manager = cfg.get_scan_manager_config();
+
+  // Having no sirius.yaml must size the readahead exactly like an empty one.
+  CHECK(scan_manager.pipeline_width == pipeline_threads);
+  CHECK(scan_manager.uring.n_max_concurrent_scans == pipeline_threads);
+  CHECK(scan_manager.rest.n_max_concurrent_scans == 4 * pipeline_threads);
 }
 
 TEST_CASE("uring scan budget distinguishes an omitted value from an explicit default",

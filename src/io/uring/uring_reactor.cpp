@@ -25,6 +25,7 @@
 #include "io/uring/types.hpp"
 
 #include <rmm/cuda_device.hpp>
+#include <rmm/error.hpp>
 
 #include <fcntl.h>
 #include <log/logging.hpp>
@@ -45,6 +46,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <tuple>
@@ -55,8 +57,12 @@ namespace sirius::io::uring {
 
 namespace {
 
-constexpr std::size_t NUM_SLOTS           = 64;
-constexpr std::size_t MAX_PLAIN_READ_SIZE = 1UL << 30;
+// Staging geometry: the reactor stages through whole host-resource blocks, so the slot
+// count is derived from a fixed 64 MiB pinned budget per reactor (the footprint before
+// the slot size was tied to the resource's block size) and clamped to [1, MAX_NUM_SLOTS].
+constexpr std::size_t STAGING_BUDGET_BYTES = 64UL << 20;
+constexpr std::size_t MAX_NUM_SLOTS        = 64;
+constexpr std::size_t MAX_PLAIN_READ_SIZE  = 1UL << 30;
 constexpr std::chrono::milliseconds POLL_INTERVAL{20};
 constexpr auto POLL_INTERVAL_US =
   std::chrono::duration_cast<std::chrono::microseconds>(POLL_INTERVAL).count();
@@ -468,9 +474,17 @@ void uring_reactor::start()
     throw std::invalid_argument("uring_reactor: staging block size must be non-zero");
   }
 
-  _bounce_storage =
-    _ctx->host_memory_resource()->allocate_multiple_blocks(NUM_SLOTS * _bounce_slot_size);
-  if (_bounce_storage == nullptr || _bounce_storage->get_blocks().size() < NUM_SLOTS) {
+  auto const slot_count =
+    std::clamp(STAGING_BUDGET_BYTES / _bounce_slot_size, std::size_t{1}, MAX_NUM_SLOTS);
+  auto const staging_bytes = slot_count * _bounce_slot_size;
+  try {
+    _bounce_storage = _ctx->host_memory_resource()->allocate_multiple_blocks(staging_bytes);
+  } catch (rmm::out_of_memory const& e) {
+    throw std::runtime_error("uring_reactor: cannot reserve " + std::to_string(staging_bytes) +
+                             " bytes of pinned staging (" + std::to_string(slot_count) + " x " +
+                             std::to_string(_bounce_slot_size) + "): " + e.what());
+  }
+  if (_bounce_storage->get_blocks().size() < slot_count) {
     _bounce_storage.reset();
     throw std::runtime_error("uring_reactor: failed to allocate all staging slots");
   }
@@ -677,8 +691,9 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
   };
 
   try {
-    unique_ring ring{2 * NUM_SLOTS};
-    auto const blocks = _bounce_storage->get_blocks();
+    auto const blocks     = _bounce_storage->get_blocks();
+    auto const slot_count = blocks.size();
+    unique_ring ring{2 * slot_count};
 
     std::vector<iovec> registered_buffers;
     registered_buffers.reserve(blocks.size());
@@ -687,18 +702,18 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     }
     bool const fixed_supported = ring.register_buffers(registered_buffers);
 
-    slot_pool available_slots{NUM_SLOTS};
+    slot_pool available_slots{slot_count};
     std::vector<io_slot> slots;
-    slots.reserve(NUM_SLOTS);
-    for (std::size_t index = 0; index < NUM_SLOTS; ++index) {
+    slots.reserve(slot_count);
+    for (std::size_t index = 0; index < slot_count; ++index) {
       slots.emplace_back(static_cast<int>(index), fixed_supported);
     }
 
-    std::array<io_uring_cqe*, NUM_SLOTS> cqes{};
+    std::array<io_uring_cqe*, MAX_NUM_SLOTS> cqes{};
     std::vector<int> incomplete;
-    incomplete.reserve(NUM_SLOTS);
+    incomplete.reserve(slot_count);
     std::vector<int> copying;
-    copying.reserve(NUM_SLOTS);
+    copying.reserve(slot_count);
     std::vector<std::unique_ptr<uring_io_op>> pending;
     std::unique_ptr<grouped_io_request> active;
     std::size_t inflight = 0;
@@ -754,7 +769,11 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
     auto poll_copy_completions = [&]() noexcept {
       auto output = copying.begin();
       for (auto it = copying.begin(); it != copying.end(); ++it) {
-        auto& slot        = slots[*it];
+        auto& slot = slots[*it];
+        // An index is in `copying` only while its slot still owns the copying op.  Drop any
+        // entry that was already settled elsewhere instead of completing a foreign op.
+        assert(slot.state == slot_state::copying && slot.op != nullptr);
+        if (slot.state != slot_state::copying || slot.op == nullptr) continue;
         auto const status = cudaEventQuery(slot.copy_event->get());
         if (status == cudaErrorNotReady) {
           *output++ = *it;
@@ -887,7 +906,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
 
     auto dispatch_pending = [&]() {
       std::vector<int> submitted;
-      submitted.reserve(NUM_SLOTS);
+      submitted.reserve(slot_count);
       while (!pending.empty()) {
         auto& candidate = pending.back();
         if (!candidate->request.coordinator->should_continue()) {
@@ -1038,9 +1057,16 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
           }
           reap_completions();
         } else if (!copying.empty() && pending.empty() && active == nullptr) {
-          auto& slot        = slots[copying.back()];
+          auto const index = copying.back();
+          copying.pop_back();
+          auto& slot        = slots[index];
           auto const status = slot.copy_event->synchronize_no_throw();
-          if (status != cudaSuccess) settle_slot_error(slot, status, true);
+          if (status == cudaSuccess) {
+            slot.op->request.finish_success();
+            reset_slot(slot);
+          } else {
+            settle_slot_error(slot, status, true);
+          }
           poll_copy_completions();
         } else if (pending.empty() && active == nullptr) {
           std::unique_ptr<grouped_io_request> next;
