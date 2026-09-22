@@ -1394,6 +1394,12 @@ void rest_reactor::worker_loop(std::stop_token const& stop_token)
             return std::unique_ptr<rest_io_op_request>{};
           }
           if (active_group == nullptr) continue;
+          // A group that arrives with no slices owes no completions; leaving it
+          // in place would spin here forever because expand_active is a no-op.
+          if (active_group->empty()) {
+            active_group.reset();
+            continue;
+          }
         }
         expand_active(free_connections);
       }

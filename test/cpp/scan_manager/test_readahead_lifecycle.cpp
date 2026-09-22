@@ -19,18 +19,29 @@
 #include "io/kvikio/config.hpp"
 #include "io/rest/config.hpp"
 #include "io/uring/config.hpp"
+#include "memory/topology_index.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "pipeline/pipeline_build_context.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "planner/query.hpp"
+#include "query_id.hpp"
+#include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/gatekeeper.hpp"
 #include "scan_manager/readahead_scan_manager.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
+#include "utils/telemetry_utils.hpp"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 using sirius::io::cache::cache_mode;
 using sirius::io::cache::eviction_policy;
@@ -313,6 +324,47 @@ TEST_CASE("a returning ticket wakes a waiter", "[scan_manager][gatekeeper]")
 // worker lifecycle
 // ===========================================================================
 
+namespace {
+/// Minimal concrete scan carrying only the operator id the readahead keys its
+/// work queue on.
+struct test_scan : sirius::op::sirius_physical_operator {
+  test_scan()
+    : sirius::op::sirius_physical_operator(sirius::op::SiriusPhysicalOperatorType::GPU_SCAN, {}, 0)
+  {
+    operator_id = 1;
+  }
+};
+
+/// A query with one GPU_SCAN operator, which is what it takes to park the
+/// worker: with no work queues at all it runs out of order and exits on its
+/// own, and a worker that is already gone hides everything a second start does.
+class single_scan_query {
+ public:
+  single_scan_query()
+  {
+    auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(_ctx);
+    _build.set_pipeline_source(*pipeline, *_scan);
+    auto const id = sirius::make_query_id(1);
+    _query        = std::make_unique<sirius::planner::query>(
+      std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{pipeline},
+      _telemetry->context(),
+      id,
+      sirius::telemetry::query_telemetry_info{
+        _telemetry->engine_id(), _telemetry->worker_id(), id});
+  }
+
+  [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
+
+ private:
+  std::shared_ptr<const sirius::telemetry::telemetry_context> _telemetry =
+    sirius::test::make_test_telemetry_context();
+  sirius::pipeline::pipeline_build_context _ctx{nullptr, true};
+  sirius::pipeline::sirius_pipeline_build_state _build;
+  std::unique_ptr<test_scan> _scan = std::make_unique<test_scan>();
+  std::unique_ptr<sirius::planner::query> _query;
+};
+}  // namespace
+
 TEST_CASE("a zero budget means the backend opted out and no worker runs",
           "[scan_manager][readahead]")
 {
@@ -339,17 +391,27 @@ TEST_CASE("start runs a worker and stop joins it", "[scan_manager][readahead]")
   CHECK_FALSE(m.is_running());
 }
 
-TEST_CASE("start and stop are idempotent", "[scan_manager][readahead]")
+TEST_CASE("a second start on a parked worker does not join it", "[scan_manager][readahead]")
 {
+  // The failure here is a hang, not a wrong value: a second start that moves a
+  // fresh jthread over the live one joins a worker whose stop token nothing
+  // will ever request, and the caller never comes back.
+  single_scan_query query;
   auto sm = make_event_publisher();
   readahead_scan_manager m{*sm, 4};
+  m.prepare_for_query(query.get());
 
-  m.start();
-  m.start();  // already running -- must not spawn a second worker
-  CHECK(m.is_running());
+  std::promise<void> done;
+  auto finished = done.get_future();
+  std::jthread caller{[&] {
+    m.start();
+    m.start();  // already running -- must not spawn a second worker
+    m.stop();
+    m.stop();  // already stopped
+    done.set_value();
+  }};
 
-  m.stop();
-  m.stop();  // already stopped
+  REQUIRE(finished.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK_FALSE(m.is_running());
 }
 
@@ -408,7 +470,7 @@ TEST_CASE("update tolerates a null split", "[scan_manager][readahead]")
   CHECK_FALSE(m.is_running());
 }
 
-TEST_CASE("a stopped manager can be restarted", "[scan_manager][readahead]")
+TEST_CASE("a stopped manager stays stopped", "[scan_manager][readahead]")
 {
   auto sm = make_event_publisher();
   readahead_scan_manager m{*sm, 4};
@@ -416,14 +478,13 @@ TEST_CASE("a stopped manager can be restarted", "[scan_manager][readahead]")
   m.stop();
   REQUIRE_FALSE(m.is_running());
 
-  // The stop_source is replaced on start, so the second worker is not born
-  // already-stopped -- and the gate is re-armed rather than left shut by the
-  // first stop().
+  // Start-once, stop-once: stop() shuts the gate for good and tears the event
+  // subscriber down, so a restarted worker could only spin on gate timeouts
+  // issuing nothing.  No worker is born instead.
   m.start();
-  CHECK(m.is_running());
-  m.update_scan_state(1, nullptr, scan_stage::reading);
-  m.stop();
   CHECK_FALSE(m.is_running());
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  CHECK(m.counters().gate_timeouts.load() == 0);
 }
 
 // ===========================================================================
@@ -515,4 +576,82 @@ TEST_CASE("a fresh manager reports an all-zero readahead summary",
   CHECK(line.find("skipped=0[memory_pressure=0 fell_behind=0 nothing_to_issue=0]") !=
         std::string::npos);
   CHECK(line.find("executor_reads=0[borrowed=0]") != std::string::npos);
+}
+
+// ===========================================================================
+// a zero budget is not built at all
+// ===========================================================================
+
+namespace {
+std::shared_ptr<const sirius::memory::topology_index> single_gpu_index()
+{
+  cucascade::memory::system_topology_info topology;
+  topology.num_gpus = 1;
+  cucascade::memory::gpu_topology_info gpu;
+  gpu.id        = 0;
+  gpu.numa_node = 0;
+  topology.gpus.push_back(std::move(gpu));
+  return std::make_shared<sirius::memory::topology_index>(topology, std::vector<int>{0});
+}
+
+/// A query with no operators at all.  prepare_for_query settles the readahead
+/// before it looks for scan operators, so this exercises that decision on its
+/// own without needing a real parquet file behind a scan.
+class empty_query {
+ public:
+  empty_query()
+  {
+    auto const id = sirius::make_query_id(2);
+    _query        = std::make_unique<sirius::planner::query>(
+      std::vector<std::shared_ptr<sirius::pipeline::sirius_pipeline>>{},
+      _telemetry->context(),
+      id,
+      sirius::telemetry::query_telemetry_info{
+        _telemetry->engine_id(), _telemetry->worker_id(), id});
+  }
+
+  [[nodiscard]] const sirius::planner::query& get() const { return *_query; }
+
+ private:
+  std::shared_ptr<const sirius::telemetry::telemetry_context> _telemetry =
+    sirius::test::make_test_telemetry_context();
+  std::unique_ptr<sirius::planner::query> _query;
+};
+
+scan_manager_config config_with_readahead_budget(std::size_t budget)
+{
+  scan_manager_config cfg;
+  cfg.thread_pool.num_threads = 2;
+  cfg.uring_n_reactors        = 1;
+  cfg.cache.mode              = cache_mode::sirius;
+  cfg.max_readahead_scans     = budget;
+  cfg.apply_cache_mode();
+  return cfg;
+}
+}  // namespace
+
+TEST_CASE("a zero readahead budget builds no manager for the query", "[scan_manager][readahead]")
+{
+  auto memory   = initialize_memory_manager(1);
+  auto topology = single_gpu_index();
+  empty_query query;
+
+  // Control: a usable budget does build one, so the check below is about the
+  // budget rather than about the query having nothing to scan.
+  {
+    sirius::scan_manager::sirius_scan_manager manager{
+      config_with_readahead_budget(4), *memory, topology};
+    manager.prepare_for_query(query.get(), false, std::vector<int>{0});
+    CHECK(manager.has_readahead_for_testing());
+  }
+
+  // A zero budget must leave it unbuilt.  Building one and merely not starting
+  // its worker still subscribes it to the publisher, which then buffers one
+  // event per deployed task in a mailbox nothing drains -- for the whole query.
+  {
+    sirius::scan_manager::sirius_scan_manager manager{
+      config_with_readahead_budget(0), *memory, topology};
+    manager.prepare_for_query(query.get(), false, std::vector<int>{0});
+    CHECK_FALSE(manager.has_readahead_for_testing());
+  }
 }

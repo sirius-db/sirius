@@ -331,6 +331,13 @@ class prefetching_cache {
     return _ticker.load(std::memory_order_relaxed);
   }
 
+  /// Test-only: how many prefetch requests @ref evict_loop was tracking at the
+  /// start of its last round, once that round's new arrivals were absorbed.
+  [[nodiscard]] std::size_t eviction_batch_size_for_testing() const noexcept
+  {
+    return _eviction_batch_size.load(std::memory_order_relaxed);
+  }
+
  private:
   struct cached_copy_retirement;
 
@@ -500,6 +507,9 @@ class prefetching_cache {
 
   std::jthread _evictor_thread;
   request_queue_type _eviction_queue;
+  /// Size of @ref evict_loop's tracked-request batch at the start of its last
+  /// round.  Written only by the evictor thread; read only by tests.
+  std::atomic<std::size_t> _eviction_batch_size{0};
   std::stop_source _evictor_stop_source;
   bool _dispose_on_idle{false};
 

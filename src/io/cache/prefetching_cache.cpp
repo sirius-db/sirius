@@ -1264,6 +1264,7 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     while (_eviction_queue.try_dequeue(entry)) {
       absorb(std::move(entry));
     }
+    _eviction_batch_size.store(eviction_batch.size(), std::memory_order_relaxed);
 
     if (_shutting_down || st.stop_requested()) {
       acknowledge_evictions();
@@ -1284,6 +1285,19 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       }
       er.released = true;
     }
+
+    // Retire a request once it has released its references and every chunk it
+    // named is either reclaimed or now owned by somebody else.  Counting our
+    // own evictions instead would strand every request that shares a chunk:
+    // whoever loses the race to reclaim it could never reach its own count.
+    std::erase_if(eviction_batch, [](tracked_request const& er) {
+      if (!er.req || !er.req.chunks) { return true; }
+      if (!er.released) { return false; }
+      return std::ranges::all_of(*er.req.chunks, [](cached_chunk const* c) {
+        auto const snap = c->state.load();
+        return snap.state() == chunk_state::empty || snap.subscribers() != 0;
+      });
+    });
 
     // When disposing on idle we reclaim everything; otherwise we only evict
     // under memory pressure and stop once enough chunks are free again.  Memory
@@ -1322,9 +1336,14 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
     // cannot meet the target, pass 1 sweeps again ignoring subscriptions: a
     // starved allocator is worse than a cache miss, and mark_evicting still
     // refuses any chunk a reader has pinned, so the fallback can never pull a
-    // buffer out from under a live read — it only costs a future hit.
-    size_t reclaimed = 0;
-    for (int pass = 0; pass < 2 && reclaimed < need; ++pass) {
+    // buffer out from under a live read — it only costs a future hit.  That
+    // fallback belongs to the pressure and explicit-demand paths only: under
+    // dispose_on_idle the target is unbounded, so pass 1 would run every round
+    // and strip chunks another live request still names — and a chunk somebody
+    // is still subscribed to is not idle.
+    size_t reclaimed   = 0;
+    int const n_passes = _cfg.dispose_on_idle ? 1 : 2;
+    for (int pass = 0; pass < n_passes && reclaimed < need; ++pass) {
       bool const respect_subscribers = (pass == 0);
       for (auto& er : eviction_batch) {
         if (!er.released || !er.req || !er.req.chunks) { continue; }
@@ -1350,19 +1369,6 @@ void prefetching_cache::evict_loop(const std::stop_token& st)
       if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa); }
     }
     acknowledge_evictions();
-
-    // Retire a request once it has released its references and every chunk it
-    // named is either reclaimed or now owned by somebody else.  Counting our
-    // own evictions instead would strand every request that shares a chunk:
-    // whoever loses the race to reclaim it could never reach its own count.
-    std::erase_if(eviction_batch, [](tracked_request const& er) {
-      if (!er.req || !er.req.chunks) { return true; }
-      if (!er.released) { return false; }
-      return std::ranges::all_of(*er.req.chunks, [](cached_chunk const* c) {
-        auto const snap = c->state.load();
-        return snap.state() == chunk_state::empty || snap.subscribers() != 0;
-      });
-    });
   }
 }
 
