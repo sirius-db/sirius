@@ -532,25 +532,27 @@ void uring_reactor::enqueue(std::unique_ptr<grouped_io_request> request) noexcep
 {
   if (request == nullptr) return;
 
-  std::lock_guard lock(_enqueue_mutex);
-  if (!_accepting.load(std::memory_order_acquire)) {
-    request->cancel_remaining(canceled_error());
-    return;
-  }
-
   auto const bytes = request->remaining_bytes();
-  _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
-  try {
-    if (!_requests.enqueue(std::move(request))) {
-      _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-      if (request != nullptr) {
-        request->cancel_remaining(std::make_error_code(std::errc::no_buffer_space));
+
+  bool enqueued = false;
+  grouped_coordinator::error_type error{canceled_error()};
+  {
+    std::lock_guard lock(_enqueue_mutex);
+    if (_accepting.load(std::memory_order_acquire)) {
+      _queued_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      try {
+        enqueued = _requests.enqueue(std::move(request));
+        if (!enqueued) { error = std::make_error_code(std::errc::no_buffer_space); }
+      } catch (...) {
+        enqueued = false;
+        error    = std::current_exception();
       }
+      if (!enqueued) { _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed); }
     }
-  } catch (...) {
-    _queued_bytes.fetch_sub(bytes, std::memory_order_relaxed);
-    if (request != nullptr) request->cancel_remaining(std::current_exception());
   }
+  // Cancellation runs outside the lock: it invokes user callbacks and settles
+  // promises inline, which may re-enter enqueue() on this reactor.
+  if (!enqueued && request != nullptr) { request->cancel_remaining(error); }
 }
 
 bool uring_reactor::supports(std::string_view path)
@@ -693,7 +695,7 @@ void uring_reactor::worker_loop(std::stop_token const& stop_token)
   try {
     auto const blocks     = _bounce_storage->get_blocks();
     auto const slot_count = blocks.size();
-    unique_ring ring{2 * slot_count};
+    unique_ring ring{static_cast<unsigned>(2 * slot_count)};
 
     std::vector<iovec> registered_buffers;
     registered_buffers.reserve(blocks.size());
