@@ -82,6 +82,7 @@ concept io_reactor_c = requires(R reactor,
   { reactor.get_config() } -> std::same_as<typename R::reactor_config_type const&>;
   { reactor.enqueue(std::move(request)) } noexcept;
   { reactor.queued_bytes() } noexcept -> std::convertible_to<std::size_t>;
+  { reactor.staging_block_size() } noexcept -> std::convertible_to<std::size_t>;
   { reactor.host_read(object, offset, size, destination) } -> std::same_as<std::size_t>;
   { reactor.start() };
   { reactor.shutdown() };
@@ -216,6 +217,13 @@ class templated_ioctx : public ioctx {
   [[nodiscard]] std::size_t n_max_concurrent_scans() const noexcept final
   {
     return _config.n_max_concurrent_scans;
+  }
+
+  /// Every reactor in the pool shares one reactor_context, so the first one's
+  /// staging block size is the pool's.
+  [[nodiscard]] std::size_t staging_block_size() const noexcept final
+  {
+    return _reactors.empty() ? 0 : _reactors.front()->staging_block_size();
   }
 
   [[nodiscard]] std::vector<cudf::io::text::byte_range_info> align_and_coalesce(

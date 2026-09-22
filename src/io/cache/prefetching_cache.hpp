@@ -255,6 +255,12 @@ class prefetching_cache {
 
   [[nodiscard]] bool is_armed() const noexcept { return _armed; }
 
+  /// Bytes per cached chunk, taken from the buffer pool at construction.  A
+  /// reactor that fills chunks must plan its physical ranges with exactly this
+  /// value (see @c ioctx::staging_block_size), so it has to be readable from
+  /// outside the cache.
+  [[nodiscard]] std::size_t chunk_size() const noexcept { return _chunk_size; }
+
   [[nodiscard]] std::size_t host_read(
     const io_object& obj, size_t offset, size_t size, uint8_t* dst, cache_handle* handle = nullptr);
 

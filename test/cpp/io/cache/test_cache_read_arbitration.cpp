@@ -28,6 +28,7 @@
 
 #include "catch.hpp"
 #include "io/cache/config.hpp"
+#include "io/cache/prefetching_cache.hpp"
 #include "io/io_request.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/templated_ioctx.hpp"
@@ -89,7 +90,17 @@ class controlled_reactor {
   using reactor_config_type             = controlled_config;
   static constexpr bool prefers_bulk_io = false;
 
+  /// @p staging_block_size mirrors what a real reactor takes from its host
+  /// resource; 0 means "no staging", which opts the reactor out of the
+  /// chunk-size check in ioctx::initialize_cache.
+  explicit controlled_reactor(std::size_t staging_block_size = 0)
+    : _staging_block_size(staging_block_size)
+  {
+  }
+
   [[nodiscard]] controlled_config const& get_config() const noexcept { return _config; }
+
+  [[nodiscard]] std::size_t staging_block_size() const noexcept { return _staging_block_size; }
 
   void enqueue(std::unique_ptr<sirius::io::grouped_io_request> request) noexcept
   {
@@ -145,6 +156,7 @@ class controlled_reactor {
 
  private:
   controlled_config _config;
+  std::size_t _staging_block_size{0};
   mutable std::mutex _mutex;
   std::condition_variable _ready;
   std::deque<std::unique_ptr<sirius::io::grouped_io_request>> _requests;
@@ -376,4 +388,36 @@ TEST_CASE("a demand-owned loading chunk uses reactor bounce staging",
   REQUIRE(second.wait_for(2s) == std::future_status::ready);
   CHECK(first.get() == read_size);
   CHECK(second.get() == read_size);
+}
+
+TEST_CASE("a cache whose chunk size differs from the reactor staging block is refused", "[cache]")
+{
+  // The reactors plan a fragmented fill as fill_span(fill, chunk->offset,
+  // staging block size).  If that size is not the cache's chunk size the extent
+  // is wrong -- a larger staging block writes past the end of the pinned chunk.
+  auto memory = initialize_memory_manager(1);
+
+  sirius::io::cache::config config;
+  config.mode = sirius::io::cache::cache_mode::sirius;
+  config.apply_mode();
+
+  // A reactor that opts out of staging (0) reports what the pool actually chose.
+  auto probe =
+    std::make_shared<controlled_context>(1, [] { return std::make_unique<controlled_reactor>(); });
+  probe->initialize_cache(*memory, config, single_gpu_topology());
+  REQUIRE(probe->cache() != nullptr);
+  auto const chunk_size = probe->cache()->chunk_size();
+  REQUIRE(chunk_size > 1);
+  probe->shutdown_cache();
+
+  auto mismatched = std::make_shared<controlled_context>(
+    1, [chunk_size] { return std::make_unique<controlled_reactor>(chunk_size / 2); });
+  mismatched->initialize_cache(*memory, config, single_gpu_topology());
+  CHECK(mismatched->cache() == nullptr);
+
+  auto matched = std::make_shared<controlled_context>(
+    1, [chunk_size] { return std::make_unique<controlled_reactor>(chunk_size); });
+  matched->initialize_cache(*memory, config, single_gpu_topology());
+  CHECK(matched->cache() != nullptr);
+  matched->shutdown_cache();
 }

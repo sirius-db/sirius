@@ -162,6 +162,23 @@ class uring_reactor {
   /// place — the context — rather than being passed in separately.
   [[nodiscard]] const reactor_config_type& get_config() const noexcept { return _config; }
 
+  /// Bounce-slot size, read from the context's host resource (0 when the
+  /// context has none) rather than from @c _bounce_slot_size, which start()
+  /// derives from the same resource: the default ioctx initializes its cache
+  /// before it starts its reactors, so the check below must not depend on
+  /// start() having run.  INVARIANT: when a prefetching cache is present this
+  /// MUST equal its chunk size — a fragmented fill's extent is computed as
+  /// @c cache::fill_span(fill, chunk->offset, this value), so a larger staging
+  /// block writes past the end of the pinned chunk and a smaller one marks a
+  /// chunk cached while only part of it was read.  Checked once in
+  /// @c ioctx::initialize_cache, which is the only place both sizes are known.
+  [[nodiscard]] std::size_t staging_block_size() const noexcept
+  {
+    return _ctx == nullptr || _ctx->host_memory_resource() == nullptr
+             ? std::size_t{0}
+             : _ctx->host_memory_resource()->get_block_size();
+  }
+
   /// Allocate the pinned bounce slots and launch the worker thread.  Split out
   /// of the constructor so a reactor can be built cheaply (it only copies its
   /// config) and parked until it is actually needed — see @c ioctx::start.
