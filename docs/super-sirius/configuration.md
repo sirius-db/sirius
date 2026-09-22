@@ -370,7 +370,9 @@ and transport use one trust policy; there are no separate REST YAML controls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout and presigned-URL TTL (0 = no limit). |
+| `request_timeout_s` | int (seconds) | 30 | Whole-request timeout for control-plane requests (HEAD / LIST / footer probe / warmup) and presigned-URL TTL (0 = no limit). Data GETs use the stall detector below instead. |
+| `stall_speed_limit_bytes` | int (bytes/s) | 65536 | Stall detector for data GETs: a transfer below this rate for `stall_time_s` consecutive seconds fails and is retried (0 disables). |
+| `stall_time_s` | int (seconds) | 30 | How long a data GET may stay below `stall_speed_limit_bytes` before it is cut loose (0 disables). |
 | `merge_max_gap` | bytes | 512Ki | Largest gap between two segments still fetched by a single GET. The bridged bytes are read and discarded, trading them for a saved round trip. 0 fuses only adjacent segments. |
 | `upkeep_interval_ms` | int (ms) | 15000 | Idle-connection keepalive interval (`curl_easy_upkeep`; 0 disables). |
 | `conn_max_age_s` | int (seconds) | 20 | Max age curl may reuse a pooled connection (`CURLOPT_MAXAGE_CONN`; 0 = curl default). |
@@ -934,7 +936,11 @@ conversion); sweep 16-64 Mi if small-host-allocation fragmentation is a
 concern.  Each uring reactor stages through whole host blocks under a fixed
 64 MiB budget, so at `block_size: 64Mi` it pins exactly one block per reactor
 and even a small device miss occupies that whole block for the duration of
-its I/O. `pipeline.num_threads` 4 → 8 helps task-parallel aggregation
+its I/O. On the REST backend one cache fill is one GET of up to `block_size`,
+so data GETs are bounded by a stall detector (`stall_speed_limit_bytes` /
+`stall_time_s`) rather than by a whole-transfer deadline: a large block does
+not time out on a slow link as long as bytes keep arriving.
+`pipeline.num_threads` 4 → 8 helps task-parallel aggregation
 queries (q1 -16%, q12 -14%). The prefetcher block overlaps pinned-cache
 uploads with compute (see `scan_manager.memory_prefetcher` above). Numbers
 include the cuCascade all-valid null-mask conversion fix; without it,

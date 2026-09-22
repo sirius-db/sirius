@@ -197,6 +197,8 @@ static void from_yaml(const YAML::Node& node, sirius::io::rest::config& opt)
     }
   }
   r.optional("request_timeout_s", opt.request_timeout_s);
+  r.optional("stall_speed_limit_bytes", opt.stall_speed_limit_bytes);
+  r.optional("stall_time_s", opt.stall_time_s);
   r.optional("merge_max_gap", yaml::bytes(opt.merge_max_gap));
   r.optional("upkeep_interval_ms", opt.upkeep_interval);
   r.optional("conn_max_age_s", opt.conn_max_age);

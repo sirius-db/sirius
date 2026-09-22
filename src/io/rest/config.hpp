@@ -51,7 +51,20 @@ struct config {
   bool n_max_concurrent_scans_explicit{false};
 
   /// Whole-request timeout (seconds, 0 = no limit) and presigned-URL TTL.
+  /// Bounds control-plane requests only (HEAD / LIST / footer probe / connection
+  /// warmup): one data GET may be as large as the cache block size, so a fixed
+  /// whole-transfer deadline would fail a large but perfectly healthy transfer on
+  /// a slow link — data GETs are bounded by the stall detector below instead.
   long request_timeout_s{30};
+
+  /// Stall detector for data GETs (CURLOPT_LOW_SPEED_LIMIT / CURLOPT_LOW_SPEED_TIME):
+  /// a transfer that stays below @c stall_speed_limit_bytes bytes/s for
+  /// @c stall_time_s consecutive seconds fails with CURLE_OPERATION_TIMEDOUT and is
+  /// retried like any other transient transport error.  This bounds a dead or
+  /// crawling connection without bounding a big transfer that is making progress.
+  /// Either value at 0 disables the detector (the transfer then has no time bound).
+  long stall_speed_limit_bytes{64 << 10};  // 64 KiB/s
+  long stall_time_s{30};
 
   /// TLS: optional CA bundle path; when @c tls_verify is false, peer/host
   /// verification is disabled (self-signed dev endpoints / MinIO).
