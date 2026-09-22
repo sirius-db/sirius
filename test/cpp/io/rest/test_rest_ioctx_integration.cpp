@@ -259,6 +259,12 @@ struct range_fault_policy {
   int fail_head_status{503};
   int fail_list_status{503};
   std::chrono::milliseconds response_delay{0};
+  /// Throttled body: send at most @c body_chunk_bytes per write, pausing
+  /// @c body_chunk_delay between writes (0 sends the body in one go).
+  std::size_t body_chunk_bytes{0};
+  std::chrono::milliseconds body_chunk_delay{0};
+  /// Answer with headers and then send no body at all (a stalled connection).
+  bool stall_after_headers{false};
   bool omit_content_range{false};
   bool unknown_content_range_total{false};
   bool ignore_range_with_200{false};
@@ -706,7 +712,28 @@ class range_http_server {
 
   void send_body(int fd, std::uint8_t const* bytes, std::size_t size)
   {
-    _body_bytes_sent.fetch_add(send_all(fd, bytes, size), std::memory_order_relaxed);
+    if (_fault.stall_after_headers) {
+      // Hold the connection open without sending anything until the client
+      // gives up (or the server shuts down), bounded so a worker never leaks.
+      auto const deadline = std::chrono::steady_clock::now() + 30s;
+      while (!_stop.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(20ms);
+      }
+      return;
+    }
+    if (_fault.body_chunk_bytes == 0) {
+      _body_bytes_sent.fetch_add(send_all(fd, bytes, size), std::memory_order_relaxed);
+      return;
+    }
+    std::size_t sent = 0;
+    while (sent < size && !_stop.load()) {
+      auto const chunk = std::min(_fault.body_chunk_bytes, size - sent);
+      auto const wrote = send_all(fd, bytes + sent, chunk);
+      _body_bytes_sent.fetch_add(wrote, std::memory_order_relaxed);
+      sent += wrote;
+      if (wrote < chunk) { return; }
+      std::this_thread::sleep_for(_fault.body_chunk_delay);
+    }
   }
 
   static void send_all(int fd, std::string_view bytes)
@@ -1287,6 +1314,62 @@ TEST_CASE("rest reactor dynamically splits one logical read below the physical G
   CHECK(server.get_count() > 1);
   CHECK(server.max_requested_range() <= max_rest_segment);
   require_bytes_equal(destination, payload);
+}
+
+// A data GET may be as large as the cache block size, so it is bounded by a
+// stall detector (CURLOPT_LOW_SPEED_*) instead of the whole-request timeout that
+// control-plane requests use: a slow link must not fail a healthy transfer, but
+// a connection that stops delivering bytes must still be cut loose.
+TEST_CASE("rest data GET outlives request_timeout_s on a slow but healthy link",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(2UL << 20);
+  range_fault_policy fault{};
+  fault.body_chunk_bytes = 128UL << 10;
+  fault.body_chunk_delay = 100ms;  // ~1.3 MB/s: slow, never stalled
+  range_http_server server(payload, fault);
+  auto config                    = direct_rest_test_config();
+  config.max_connections         = 1;
+  config.request_timeout_s       = 1;  // a whole-transfer deadline would kill this GET
+  config.stall_speed_limit_bytes = 1024;
+  config.stall_time_s            = 5;
+  auto ioctx                     = make_direct_rest_ioctx(server.endpoint(), config);
+  auto datasource = ioctx->open_datasource("s3://slow-link-bucket/object.bin", payload.size());
+  std::vector<std::uint8_t> destination(payload.size());
+  std::vector<sirius::io::slice> slices;
+  slices.emplace_back(0, destination.size(), destination.data());
+
+  auto const started = std::chrono::steady_clock::now();
+  auto future        = ioctx->host_readv_async_io(datasource->get_io_object(), slices);
+  REQUIRE(std::move(future).get(60s) == payload.size());
+  CHECK(std::chrono::steady_clock::now() - started > 1s);
+  CHECK(server.get_count() == 1);  // completed on the first attempt, no timeout retry
+  require_bytes_equal(destination, payload);
+}
+
+TEST_CASE("rest data GET on a stalled connection fails under the stall detector",
+          "[s3][integration][rest]")
+{
+  auto payload = deterministic_payload(2UL << 20);
+  range_fault_policy fault{};
+  fault.stall_after_headers = true;
+  range_http_server server(payload, fault);
+  auto config                    = direct_rest_test_config();
+  config.max_connections         = 1;
+  config.request_timeout_s       = 0;  // only the stall detector may end this transfer
+  config.stall_speed_limit_bytes = 1024;
+  config.stall_time_s            = 1;
+  auto ioctx                     = make_direct_rest_ioctx(server.endpoint(), config);
+  auto datasource = ioctx->open_datasource("s3://stalled-bucket/object.bin", payload.size());
+  std::vector<std::uint8_t> destination(payload.size());
+  std::vector<sirius::io::slice> slices;
+  slices.emplace_back(0, destination.size(), destination.data());
+
+  auto const started = std::chrono::steady_clock::now();
+  auto future        = ioctx->host_readv_async_io(datasource->get_io_object(), slices);
+  CHECK_THROWS(std::move(future).get(60s));
+  CHECK(std::chrono::steady_clock::now() - started < 15s);
+  CHECK(server.get_count() >= 1);
 }
 
 TEST_CASE("rest cache fill at the object tail is clipped to EOF", "[s3][integration][rest][cache]")
