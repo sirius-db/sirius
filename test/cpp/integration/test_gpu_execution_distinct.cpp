@@ -121,34 +121,6 @@ class DistinctBulkFixture : public sirius::test::GpuExecutionFixture {
   }
 };
 
-/// Run @p query with gpu_execution on: it must succeed via a plan-time CPU fallback, moving the
-/// fallback counter but not the execution counter, and return exactly the CPU results.
-void expect_plan_fallback_matches_cpu(sirius::test::GpuExecutionFixture& fx,
-                                      std::string const& query)
-{
-  fx.run_ok("SET gpu_execution = true;");
-  auto const before = sirius::test::get_transparent_execution_stats(*fx.con);
-  auto result       = fx.con->Query(query);
-  auto const after  = sirius::test::get_transparent_execution_stats(*fx.con);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO("query error: " << result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-  REQUIRE(after.fallbacks == before.fallbacks + 1);
-  REQUIRE(after.executions == before.executions);
-
-  fx.run_ok("SET gpu_execution = false;");
-  auto cpu_result = fx.con->Query(query);
-  fx.run_ok("SET gpu_execution = true;");
-  REQUIRE(cpu_result);
-  REQUIRE_FALSE(cpu_result->HasError());
-
-  auto rows = sirius::test::GpuExecutionFixture::collect_rows(
-    result->Cast<duckdb::MaterializedQueryResult>());
-  auto cpu_rows = sirius::test::GpuExecutionFixture::collect_rows(
-    cpu_result->Cast<duckdb::MaterializedQueryResult>());
-  REQUIRE(rows == cpu_rows);
-}
-
 }  // namespace
 
 //===----------------------------------------------------------------------===//
@@ -307,7 +279,7 @@ TEST_CASE_METHOD(DistinctFixture,
   // This names a specific row per group, and a hash-partitioned dedup would return an arbitrary
   // one: a plausible wrong answer rather than an error.
   expect_plan_fallback_matches_cpu(
-    *this, "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
+    "SELECT DISTINCT ON (k) k, v FROM dist_fd ORDER BY v NULLS LAST");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -315,7 +287,7 @@ TEST_CASE_METHOD(DistinctFixture,
                  "[integration][gpu_execution][distinct]")
 {
   // Carrying `v` out of each `k` group needs a grouped FIRST, which Sirius cannot lower yet.
-  expect_plan_fallback_matches_cpu(*this, "SELECT DISTINCT ON (k) k, v FROM dist_fd");
+  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k) k, v FROM dist_fd");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -325,7 +297,7 @@ TEST_CASE_METHOD(DistinctFixture,
   // The binder synthesizes one distinct target per select-list entry and only then hoists `v` into
   // the select list to order by it, so the node is two columns wide with a single target and `v`
   // would need a grouped FIRST.
-  expect_plan_fallback_matches_cpu(*this, "SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
+  expect_plan_fallback_matches_cpu("SELECT DISTINCT k FROM dist_fd ORDER BY v NULLS LAST");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
@@ -337,12 +309,12 @@ TEST_CASE_METHOD(DistinctFixture,
   // uncovered-output guard refuses it. Every `s_short` value is already lower case, so each nocase
   // group holds one original value and the two CPU runs cannot disagree about which row it is.
   scoped_setting collation(*this, "default_collation", "'nocase'");
-  expect_plan_fallback_matches_cpu(*this, "SELECT DISTINCT s_short FROM dist_t");
+  expect_plan_fallback_matches_cpu("SELECT DISTINCT s_short FROM dist_t");
 }
 
 TEST_CASE_METHOD(DistinctFixture,
                  "gpu_execution DISTINCT ON an expression key falls back at plan time",
                  "[integration][gpu_execution][distinct]")
 {
-  expect_plan_fallback_matches_cpu(*this, "SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
+  expect_plan_fallback_matches_cpu("SELECT DISTINCT ON (k + v) k, v FROM dist_fd");
 }
