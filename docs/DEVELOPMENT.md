@@ -28,13 +28,6 @@ both logo variants added. When upgrading Doxygen, compare it against a fresh
 template generated with `doxygen -w html header.html footer.html doxygen.css` and
 retain these customizations.
 
-Standard-library symbols link to [cppreference](https://en.cppreference.com/).
-The `docs-cppreference` dependency task downloads its Doxygen tag file from the
-pinned 2025-02-09 archive and caches it under `build/docs/`. The first build needs
-network access, `tar`, and `sed`; subsequent builds reuse the index. The download
-task normalizes malformed experimental `erase` overload names so Doxygen can
-keep treating documentation warnings as errors.
-
 The **API docs** workflow builds pull requests and merge-queue entries, uploading
 the HTML as a `github-pages` artifact. Pushes to the default branch (`dev`) also
 deploy the site. Manual runs deploy only when run on the default branch.

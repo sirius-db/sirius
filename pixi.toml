@@ -156,22 +156,8 @@ docs = { features = ["docs"], no-default-feature = true }
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [feature.docs.dependencies]
-curl = "8.*"
 doxygen = "1.13.*"
-
-[feature.docs.tasks.docs-cppreference]
-description = "Download the cppreference Doxygen link index."
-# Normalize overload labels that Doxygen otherwise reads as invalid function names.
-cmd = '''
-mkdir -p build/docs &&
-curl --fail --location --silent --show-error --retry 3 --max-time 120 https://github.com/PeterFeicht/cppreference-doc/releases/download/v20250209/html-book-20250209.tar.xz --output build/docs/cppreference.tar.xz &&
-tar -xOf build/docs/cppreference.tar.xz cppreference-doxygen-web.tag.xml > build/docs/cppreference-original.tag.xml &&
-sed -E 's@<name>(erase(_if)?)\(std::[^<]*\)</name>@<name>\1</name>@' build/docs/cppreference-original.tag.xml > build/docs/cppreference-doxygen-web.tag.xml
-'''
-inputs = ["pixi.toml"]
-outputs = ["build/docs/cppreference-doxygen-web.tag.xml"]
 
 [feature.docs.tasks.docs]
 description = "Build the Sirius public C++ API reference in build/docs/html."
 cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
-depends-on = ["docs-cppreference"]

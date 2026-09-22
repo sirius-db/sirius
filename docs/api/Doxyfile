@@ -21,7 +21,6 @@ MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = YES
 PREDEFINED            = SIRIUS_FFI_EXPORT=
 SEARCH_INCLUDES        = NO
-TAGFILES               = build/docs/cppreference-doxygen-web.tag.xml=https://en.cppreference.com/w/
 GENERATE_HTML          = YES
 GENERATE_LATEX         = NO
 GENERATE_TREEVIEW      = YES
