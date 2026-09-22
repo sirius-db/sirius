@@ -101,8 +101,11 @@ class kvikio_io_object final : public kvikio_object {
  *
  * The handle performs a HEAD at construction to learn the object size, then
  * serves ranged GETs over libcurl.  Device destinations are supported, but
- * kvikIO bounces them through a host buffer internally — there is no
- * stream-ordered read on a remote handle.
+ * kvikIO bounces them through a host buffer internally on a private per-thread
+ * stream — there is no stream-ordered read on a remote handle.  @ref
+ * kvikio_context therefore synchronizes the destination stream before issuing
+ * the GET, so the read observes all work previously queued on that stream and
+ * the bytes are visible to it once the read returns.
  */
 class kvikio_remote_io_object final : public kvikio_object {
  public:
