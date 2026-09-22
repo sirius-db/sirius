@@ -232,7 +232,6 @@ static void from_yaml(const YAML::Node& node, sirius::io::uring::config& opt)
 static void from_yaml(const YAML::Node& node, sirius::io::kvikio_config& opt)
 {
   yaml::reader r(node, "kvikio");
-  r.optional("n_max_concurrent_scans", opt.n_max_concurrent_scans);
   r.optional("nthreads", opt.nthreads);
   r.optional("task_size", yaml::bytes(opt.task_size));
   r.optional("gds_threshold", yaml::bytes(opt.gds_threshold));

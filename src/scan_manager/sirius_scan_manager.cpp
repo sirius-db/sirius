@@ -129,8 +129,10 @@ prefetch_strategy backend_prefetch_strategy(io::io_context_type type) noexcept
 {
   switch (type) {
     case io::io_context_type::restful: return prefetch_strategy::eager;
-    case io::io_context_type::uring:
-    case io::io_context_type::kvikio: return prefetch_strategy::opportunistic;
+    case io::io_context_type::uring: return prefetch_strategy::opportunistic;
+    // kvikio never reaches here: it cannot use the prefetching cache, so
+    // prepare_for_query excludes it before backend selection.
+    case io::io_context_type::kvikio: break;
   }
   return prefetch_strategy::eager;
 }
@@ -1466,9 +1468,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   //
   // Order scans ahead of demand, on the terms resolve_readahead settles: an
   // explicit `max_readahead_scans` / `readahead_strategy`, or what the serving
-  // backend wants.  A budget of zero means "do not read ahead" — either
-  // configured off, or a backend that publishes no depth (kvikIO by default) —
-  // and then no manager is built at all: merely not starting its worker would
+  // backend wants.  A backend that cannot use the prefetching cache is
+  // excluded from selection; a budget of zero means "do not read ahead" — and
+  // then no manager is built at all: merely not starting its worker would
   // still leave it subscribed to the publisher, buffering one event per
   // deployed task in a mailbox nothing drains, and still collecting a deque
   // entry per split, for the whole query.  Every consumer takes a null manager,
@@ -1486,6 +1488,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     std::vector<backend_readahead_policy> backend_policies;
     backend_policies.reserve(query_io_ctxs.size());
     for (auto const& io_ctx : query_io_ctxs) {
+      // Nowhere to read ahead into on this backend, so it has no say in the
+      // readahead's terms.
+      if (!io_ctx->can_use_prefetching_cache()) { continue; }
       backend_policies.push_back({.budget   = io_ctx->n_max_concurrent_scans(),
                                   .strategy = backend_prefetch_strategy(io_ctx->type())});
     }
