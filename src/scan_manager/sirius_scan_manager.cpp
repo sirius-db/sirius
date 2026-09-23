@@ -2769,7 +2769,7 @@ std::size_t sirius_scan_manager::pin_parquet_ranges(
     // The column selection rides on the reader options, which is what narrows
     // the enumerated chunks to the pinned columns.
     auto builder = cudf::io::parquet_reader_options::builder();
-    if (cols && !cols->empty()) { builder.columns(*cols); }
+    if (cols && !cols->empty()) { builder.column_names(*cols); }
     auto reader_options = builder.build();
 
     auto ranges = op::scan::column_chunk_ranges(*file_metadata, reader_options, row_groups);
