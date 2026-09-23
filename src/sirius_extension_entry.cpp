@@ -23,7 +23,7 @@ namespace duckdb {
 
 void SiriusExtension::Load(ExtensionLoader& loader) { sirius::register_duckdb_extension(loader); }
 
-std::string SiriusExtension::Name() { return "Sirius\tExtension"; }
+std::string SiriusExtension::Name() { return "sirius"; }
 
 std::string SiriusExtension::Version() const
 {
