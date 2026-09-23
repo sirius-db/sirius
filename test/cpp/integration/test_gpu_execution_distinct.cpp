@@ -355,6 +355,29 @@ TEST_CASE_METHOD(DistinctFixture,
   compare_gpu_vs_cpu("SELECT count(*) FROM (SELECT DISTINCT a, b FROM dist_t)");
 }
 
+TEST_CASE_METHOD(DistinctFixture,
+                 "gpu_execution DISTINCT inside a correlated subquery",
+                 "[integration][gpu_execution][distinct][join]")
+{
+  // Decorrelation appends the correlated column to the distinct targets, so the builder sees a
+  // target list no uncorrelated query produces. `b = 1` occurs under both `a = 1` and `a = 2`, so a
+  // dedup that dropped the appended key would lose a row.
+  SECTION("lateral join")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT r.a, s.b FROM dist_r r, LATERAL (SELECT DISTINCT t.b FROM dist_t t WHERE t.a = r.a) "
+      "s");
+  }
+
+  // A second correlated predicate keeps the delim join, so the DISTINCT reads a DELIM_GET.
+  SECTION("delim join")
+  {
+    compare_gpu_vs_cpu(
+      "SELECT r.a, r.x, s.b FROM dist_r r, "
+      "LATERAL (SELECT DISTINCT t.b FROM dist_t t WHERE t.a = r.a AND t.b < r.x) s");
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Volume: the paths a nine-row table cannot reach
 //===----------------------------------------------------------------------===//
@@ -374,7 +397,14 @@ TEST_CASE_METHOD(DistinctBulkFixture,
 {
   // A million rows over ten groups, so the local dedup shrinks each batch to at most ten rows
   // before the hash shuffle.
-  compare_gpu_vs_cpu("SELECT DISTINCT k FROM dist_dup");
+  SECTION("default batch size") { compare_gpu_vs_cpu("SELECT DISTINCT k FROM dist_dup"); }
+
+  // The default batch size scans dist_dup in one batch, leaving the merge nothing to combine.
+  SECTION("many scan batches")
+  {
+    scoped_setting batch_size(*this, "scan_task_batch_size", "1048576");
+    compare_gpu_vs_cpu("SELECT DISTINCT k FROM dist_dup");
+  }
 }
 
 TEST_CASE_METHOD(DistinctBulkFixture,
