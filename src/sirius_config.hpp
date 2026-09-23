@@ -86,6 +86,20 @@ struct valid_domain_coverage_threshold {
   }
 };
 
+/// Bounds the group-by bypass headroom so the one empirical knob cannot silently disable the margin
+/// (negative) or inflate the requirement past any plausible budget. Written positively so NaN is
+/// rejected too.
+struct valid_group_by_bypass_headroom_fraction {
+  [[nodiscard]] bool operator()(double value) const noexcept
+  {
+    return value >= 0.0 && value <= 4.0;
+  }
+  [[nodiscard]] static constexpr char const* description() noexcept
+  {
+    return "must be between 0.0 and 4.0";
+  }
+};
+
 /// Test build-key uniqueness at runtime when the planner could not prove it statically.
 ///
 /// cudf's general hash join probes twice — a count pass to size the output, then a retrieve pass —
@@ -187,6 +201,18 @@ struct operator_params {
 
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
+
+  /// EXPERIMENT (issue #1746 point 2), off by default. Let a grouped aggregation whose automatic
+  /// partition count is above 1 fall back to a single unpartitioned merge when a conservative
+  /// model says that merge fits the admitted GPU's remaining budget. Single admitted GPU,
+  /// fixed-width integral keys and SUM/COUNT/MIN/MAX partial states only; every other plan keeps
+  /// the automatic count. See docs/super-sirius/group-by-bypass.md.
+  bool enable_group_by_memory_aware_bypass = false;
+
+  /// Declared empirical margin the bypass model adds on top of its modelled requirement, as a
+  /// finite fraction in [0.0, 4.0]. Included in the required bytes logged for each decision.
+  /// Only read when enable_group_by_memory_aware_bypass is true.
+  double group_by_bypass_headroom_fraction = 0.25;
 
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the

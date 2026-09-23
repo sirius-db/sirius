@@ -19,6 +19,7 @@
 #include "log/sink.hpp"
 #include "sirius_context.hpp"
 #include "utils/log_test_utils.hpp"
+#include "utils/sirius_test_env.hpp"
 
 #include <cudf/contiguous_split.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -246,6 +247,28 @@ TEST_CASE("like_swar_fastpath is isolated between connections",
   REQUIRE(reset_result != nullptr);
   REQUIRE_FALSE(reset_result->HasError());
   REQUIRE(duckdb::like_swar_fastpath_enabled(*con_a.context));
+}
+
+TEST_CASE("SQL group-by bypass headroom rejects invalid values without changing the setting",
+          "[integration][config][group_by_bypass]")
+{
+  auto con     = sirius::test::g_integration_env->make_connection();
+  auto initial = con.Query("SET group_by_bypass_headroom_fraction = 0.25");
+  REQUIRE_FALSE(initial->HasError());
+  for (auto const* value :
+       {"'NaN'::DOUBLE", "'Infinity'::DOUBLE", "'-Infinity'::DOUBLE", "-0.1", "4.5"}) {
+    INFO("headroom = " << value);
+    auto result = con.Query(std::string("SET group_by_bypass_headroom_fraction = ") + value);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("must be between 0.0 and 4.0") != std::string::npos);
+    auto unchanged = con.Query("SELECT current_setting('group_by_bypass_headroom_fraction')");
+    REQUIRE_FALSE(unchanged->HasError());
+    CHECK(unchanged->GetValue(0, 0).GetValue<double>() == 0.25);
+  }
+  for (auto const* value : {"0.0", "4.0"}) {
+    auto result = con.Query(std::string("SET group_by_bypass_headroom_fraction = ") + value);
+    REQUIRE_FALSE(result->HasError());
+  }
 }
 
 TEST_CASE("Test-only settings require explicit process opt-in",
