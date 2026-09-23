@@ -211,6 +211,13 @@ impl SiriusComputeNodeService {
         &self,
         frame: crate::nixl_chunk::PackedExchangeFrame,
     ) -> std::result::Result<Option<ReadyFragment>, String> {
+        if frame.fragment_instance_id == crate::bench_a2a::BENCH_FRAGMENT_INSTANCE {
+            if frame.length > 0 {
+                self.lease_handler().release(frame.offset)?;
+            }
+            crate::bench_a2a::record_received(frame.length, frame.eos);
+            return Ok(None);
+        }
         self.exchanges.push_remote_frame(
             ExchangeKey {
                 fragment_instance_id: frame.fragment_instance_id,
