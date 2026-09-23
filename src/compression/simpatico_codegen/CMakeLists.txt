@@ -109,6 +109,7 @@ add_library(
   src/jit/nvrtc_compiler.cpp
   src/jit/compiler_identity.cpp
   src/jit/cache_identity.cpp
+  src/jit/disk_cache.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp

@@ -1,6 +1,8 @@
 """Production cache regressions. Every worker receives its environment before exec."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -164,6 +166,63 @@ class CacheProcesses(unittest.TestCase):
             (self.root / "file").write_text("not a directory")
             self.assertEqual(self.worker(SIMPATICO_JIT_CACHE_DIR=value), (1, 1, 0))
         self.assertFalse(self.cache.exists())
+
+    def test_corrupt_truncated_and_unloadable_records_are_repaired(self):
+        self.assertEqual(self.worker(), (1, 1, 0))
+        path = next(self.cache.glob("v2/*/*.cubin"))
+        original = path.read_bytes()
+        self.assertTrue(original.startswith(b"SIMPJIT2"))
+        changed = bytearray(original)
+        changed[-1] ^= 1
+        # Valid storage record containing an invalid CUDA image: tests the
+        # driver's rejection path independently of the storage checksum.
+        invalid_image = bytes(4096)
+        unloadable = (
+            b"SIMPJIT2"
+            + len(invalid_image).to_bytes(8, "big")
+            + hashlib.sha256(invalid_image).digest()
+            + invalid_image
+        )
+        for damaged in (b"", original[:100], changed, unloadable):
+            path.write_bytes(damaged)
+            self.assertEqual(self.worker(), (1, 1, 0))
+            self.assertEqual(self.worker(), (0, 1, 1))
+
+    def test_simultaneous_processes_and_threads(self):
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            results = list(workers.map(lambda _: self.worker(mode="threads"), range(4)))
+        self.assertGreaterEqual(sum(compiles for compiles, _, _ in results), 1)
+        self.assertEqual(self.worker(), (0, 1, 1))
+        self.assertEqual(len(list(self.cache.glob("v2/*/*.cubin"))), 1)
+        self.assertEqual(list(self.cache.rglob("*.tmp.*")), [])
+
+    def test_legacy_ignored_and_explicit_cleanup(self):
+        self.cache.mkdir()
+        legacy = self.cache / "0123456789abcdef_a120_c13030_d13030.cubin"
+        legacy.write_bytes(b"not a valid old cubin")
+        unrelated = self.cache / "unrelated.cubin"
+        unrelated.write_text("preserve me")
+        self.assertEqual(self.worker(), (1, 1, 0))
+        self.assertTrue(legacy.exists())
+        self.assertEqual(self.worker("project", expected=2), (1, 1, 0))
+        paths = list(self.cache.glob("v2/*/*.cubin"))
+        self.assertEqual(len(paths), 2)
+        abandoned = Path(str(paths[0]) + ".tmp.Abc123")
+        abandoned.write_text("interrupted publication")
+        result = subprocess.run(
+            [WORKERS["normal"], "clear"],
+            env=self.environment,
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(legacy.exists())
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(list(self.cache.glob("v2/*/*.cubin")), [])
+        self.assertEqual(unrelated.read_text(), "preserve me")
+        self.assertEqual(self.worker(), (1, 1, 0))
 
 
 if __name__ == "__main__":

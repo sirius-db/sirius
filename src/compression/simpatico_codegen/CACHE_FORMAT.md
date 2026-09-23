@@ -44,6 +44,44 @@ Physical installation paths are absent. Search-path reordering matters only when
 it changes the selected contents. Directory dependencies also track previously
 unsuccessful searches so a new earlier header invalidates the generated table.
 
+## Storage and maintenance
+
+Each `.cubin` file is a checked record, not a raw ELF image: eight ASCII bytes
+`SIMPJIT2`, an unsigned 64-bit big-endian payload length, 32 bytes of payload
+SHA-256, then that many cubin bytes. A zero-length payload, length/file-size
+mismatch, checksum mismatch, non-regular file, or cubin over 256 MiB is a miss.
+The cap bounds allocation on corrupt input; larger kernels still compile and
+reuse memory normally. CUDA loading remains the final compatibility check.
+Raw legacy/intermediate records are never accepted by this reader.
+
+Writers use `mkostemp` in the destination directory, handle short writes and
+`EINTR`, check close, and atomically rename the complete record into place.
+Each writer owns only its unique temporary file. Failure removes that temporary,
+not the destination: another writer may already have repaired it. Redundant
+compilation is allowed. No `fsync` or power-failure durability is promised;
+damaged records are rebuilt. Checksums are not authentication: the configured
+cache directory must be trusted.
+
+There is no automatic eviction, startup cleanup, or retention bound. With all
+writers stopped, `clear_jit_disk_cache()` best-effort removes these regular files
+under the configured root:
+
+- Legacy `<16 lowercase hex>_a<digits>_c<digits>_d<digits>.cubin`, and their
+  `.tmp.<digits>` remnants.
+- `v2/<64 lowercase hex>/<64 lowercase hex>.cubin`, and their
+  `.tmp.<six alphanumeric characters>` remnants.
+
+It prunes empty recognized directories but never removes the configured root,
+follows symlinks, traverses arbitrary nested directories, or removes unknown
+versions/unrelated names. Explicit cleanup removes other environments' recognized
+entries too; ordinary cache use never does. Cleanup is not a concurrent maintenance
+or security boundary against a process actively replacing directories.
+
+The host storage suite links the same implementation as production. Linker-level
+syscall fault injection tests partial/zero/interrupted writes, close and rename
+failures without adding production test hooks. Threads and child processes stress
+same-key publication; cleanup tests operate only in owned temporary directories.
+
 ## Running host coverage
 
 ```sh
@@ -69,6 +107,14 @@ Shared-library cases relocate the actual NVRTC and builtins, then change their
 bytes without changing their reported version. Static archive identity is also
 covered by host generator fixtures.
 
+Local validation covers shared and static NVRTC on CUDA 12.9/13.3. Static runs
+use the real checksum-pinned NVIDIA archives from the repository's vcpkg overlay
+and the toolkit PTX compiler (not a complete vcpkg rebuild). A negative control
+replaced the private project-header fixture's identity with the baseline identity,
+leaving its changed header contents intact: the production regression failed
+because it loaded result 1 instead of the required result 2. Restoring the identity
+restores the passing regression.
+
 The optional `simpatico_cache_benchmark` measures 5,000 warm lookups of rendered
 Bitpack encode/decode source. It counts C++ `new`/`new[]` calls during lookup,
 not allocations inside the CUDA driver or the C allocator. There are no timing
@@ -83,6 +129,9 @@ renderers and embedded headers.
 | --- | ---: | --- | --- | --- |
 | Encode | 5,515 | 4,056 / 4,282 ns | 1,338 / 1,412 ns | 3 (16,564 bytes) → 0 |
 | Decode | 3,234 | 2,437 / 2,572 ns | 907 / 928 ns | 3 (9,721 bytes) → 0 |
+
+The same disk-disabled sample's cold encode/decode calls were 461/344 ms before
+and 460/349 ms after; these include kernel compilation and loading.
 
 In a separate disk-enabled sample under build load, compiler discovery took
 46–50 ms once per process. A second process performed zero requested-kernel

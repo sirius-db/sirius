@@ -7,12 +7,16 @@
 #include <dlfcn.h>
 #include <nvrtc.h>
 
+#include <barrier>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace jit = codegen::jit;
 
@@ -50,6 +54,11 @@ int main(int argc, char** argv)
 {
   try {
     const std::string mode = argc > 1 ? argv[1] : "embedded";
+    if (mode == "clear") {
+      jit::clear_jit_disk_cache();
+      std::puts("RESULT cleared");
+      return 0;
+    }
     if (mode == "compiler-path") {
       Dl_info library{};
       if (!dladdr(reinterpret_cast<const void*>(&nvrtcVersion), &library) || !library.dli_fname)
@@ -60,6 +69,37 @@ int main(int argc, char** argv)
     if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("cudaSetDevice failed");
     jit::CompileOptions options{jit::arch_cc_for_current_device()};
     auto& cache = jit::KernelCache::instance();
+    if (mode == "threads") {
+      constexpr int count = 6;
+      std::barrier start(count);
+      std::vector<const jit::CompiledKernel*> kernels(count);
+      std::vector<std::exception_ptr> errors(count);
+      std::vector<std::thread> workers;
+      for (int i = 0; i < count; ++i) {
+        workers.emplace_back([&, i] {
+          // Every thread must reach the barrier, including error paths.
+          const auto status = cudaSetDevice(0);
+          start.arrive_and_wait();
+          try {
+            if (status != cudaSuccess) throw std::runtime_error("thread cudaSetDevice failed");
+            kernels[i] = cache.get_or_compile_plain(embedded_source, "cache_test", options);
+            if (launch(kernels[i]) != 1) throw std::runtime_error("thread kernel result");
+          } catch (...) {
+            errors[i] = std::current_exception();
+          }
+        });
+      }
+      for (auto& worker : workers)
+        worker.join();
+      for (int i = 0; i < count; ++i) {
+        if (errors[i]) std::rethrow_exception(errors[i]);
+        if (kernels[i] != kernels[0]) throw std::runtime_error("thread deduplication failed");
+      }
+      if (kernels[0] != cache.get_or_compile_plain(embedded_source, "cache_test", options))
+        throw std::runtime_error("post-thread memory lookup failed");
+      std::puts("RESULT value=1");
+      return 0;
+    }
     if (mode == "cycle") {
       const char* path = std::getenv("SIMPATICO_JIT_CCCL_INCLUDE");
       if (!path) throw std::runtime_error("cycle needs an isolated override directory");
