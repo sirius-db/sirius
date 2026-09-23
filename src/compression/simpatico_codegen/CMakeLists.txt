@@ -17,6 +17,7 @@ if(NOT TARGET cudf::cudf)
   find_package(cudf REQUIRED CONFIG)
 endif()
 find_package(CUDAToolkit REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 if(NOT TARGET nvcomp::nvcomp)
   find_package(nvcomp REQUIRED CONFIG)
 endif()
@@ -106,6 +107,8 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/compiler_identity.cpp
+  src/jit/cache_identity.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
@@ -157,9 +160,32 @@ if(VCPKG_BUILD AND NOT TARGET nvrtc::nvrtc_static)
 endif()
 if(TARGET nvrtc::nvrtc_static)
   set(SIMPATICO_NVRTC_LIB nvrtc::nvrtc_static)
+  set(_compiler_identity_args
+      "-DNVRTC=$<TARGET_FILE:nvrtc::nvrtc_static>"
+      "-DBUILTINS=$<TARGET_FILE:nvrtc::nvrtc_builtins_static>"
+      "-DPTX=$<TARGET_FILE:CUDA::nvptxcompiler_static>")
+  set(_compiler_identity_dependencies
+      "$<TARGET_FILE:nvrtc::nvrtc_static>"
+      "$<TARGET_FILE:nvrtc::nvrtc_builtins_static>"
+      "$<TARGET_FILE:CUDA::nvptxcompiler_static>")
 else()
   set(SIMPATICO_NVRTC_LIB CUDA::nvrtc)
 endif()
+
+set(EMBED_COMPILER_IDENTITY_OUT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/compiler_identity.h")
+add_custom_command(
+  OUTPUT "${EMBED_COMPILER_IDENTITY_OUT}"
+  COMMAND
+    ${CMAKE_COMMAND} ${_compiler_identity_args}
+    "-DOUT=${EMBED_COMPILER_IDENTITY_OUT}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_identity.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_identity.cmake"
+          ${_compiler_identity_dependencies}
+  VERBATIM)
+add_custom_target(simpatico_compiler_identity
+                  DEPENDS "${EMBED_COMPILER_IDENTITY_OUT}")
+add_dependencies(simpatico simpatico_compiler_identity)
 
 if(VCPKG_BUILD)
   set(SIMPATICO_CUDART_LIB CUDA::cudart_static)
@@ -175,6 +201,7 @@ target_link_libraries(
          ${SIMPATICO_NVRTC_LIB}
          CUDA::cuda_driver
          ${CMAKE_DL_LIBS})
+target_link_libraries(simpatico PRIVATE OpenSSL::Crypto)
 
 function(add_codegen_host_test name)
   add_executable(${name} tests/${name}.cpp)

@@ -1,5 +1,7 @@
 #include "codegen/jit/nvrtc_compiler.hpp"
 
+#include "compilation_request.hpp"
+
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -26,18 +28,29 @@
 
 namespace codegen::jit {
 
-namespace {
-
-// Optional escape hatch: if the embedded CCCL closure ever lacks a header a
-// future renderer needs, SIMPATICO_JIT_CCCL_INCLUDE may point NVRTC at a real
-// CCCL dir as an extra -I. Unset by default; not required for correctness.
-const char* cccl_include_override()
+detail::CompilationRequest::CompilationRequest(const std::string& source,
+                                               const std::string& entry,
+                                               const CompileOptions& opts)
+  : source(source), entry(entry)
 {
-  const char* e = std::getenv("SIMPATICO_JIT_CCCL_INCLUDE");
-  return (e != nullptr && *e != '\0') ? e : nullptr;
+  if (opts.arch_cc <= 0) throw std::invalid_argument("NVRTC architecture must be positive");
+  std::snprintf(architecture.data(), architecture.size(), "-arch=sm_%d", opts.arch_cc);
+  options[option_count++] = "-std=c++20";
+  options[option_count++] = architecture.data();
+  options[option_count++] = "-default-device";
+  options[option_count++] = "--no-source-include";
+  if (const char* path = std::getenv("SIMPATICO_JIT_CCCL_INCLUDE"); path && *path) {
+    include_option          = std::string("-I") + path;
+    options[option_count++] = include_option.c_str();
+  }
+  for (int i = 0; i < option_count; ++i)
+    option_views[i] = options[i];
 }
 
-}  // namespace
+detail::RequestView detail::CompilationRequest::identity_view() const
+{
+  return {source, entry, program_name, std::span(option_views.data(), option_count)};
+}
 
 int arch_cc_for_current_device()
 {
@@ -155,6 +168,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
                                     const std::string& entry_symbol,
                                     const CompileOptions& opts)
 {
+  return detail::compile_request(detail::CompilationRequest(source, entry_symbol, opts));
+}
+
+CompiledKernel detail::compile_request(const CompilationRequest& request)
+{
+  const auto& source       = request.source;
+  const auto& entry_symbol = request.entry;
   if (source.empty()) { throw std::runtime_error("compile_plain_kernel: empty source"); }
   if (entry_symbol.empty()) {
     throw std::runtime_error("compile_plain_kernel: empty entry_symbol");
@@ -181,28 +201,13 @@ CompiledKernel compile_plain_kernel(const std::string& source,
   nvrtcProgram prog = nullptr;
   NVRTC_OR_THROW(nvrtcCreateProgram(&prog,
                                     source.c_str(),
-                                    "codegen_jit.cu",
+                                    CompilationRequest::program_name,
                                     static_cast<int>(hdr_names.size()),
                                     hdr_sources.data(),
                                     hdr_names.data()));
 
-  const std::string arch_opt = "-arch=sm_" + std::to_string(opts.arch_cc);
-
-  std::vector<const char*> nvrtc_opts = {
-    "-std=c++20",
-    arch_opt.c_str(),
-  };
-  // No -I is required (headers are embedded); the env override, when set, adds
-  // one as a fallback for a hypothetical embedded-closure gap.
-  std::string cccl_inc;
-  if (const char* ov = cccl_include_override()) {
-    cccl_inc = std::string("-I") + ov;
-    nvrtc_opts.push_back(cccl_inc.c_str());
-  }
-  nvrtc_opts.push_back("-default-device");
-
   nvrtcResult compile_result =
-    nvrtcCompileProgram(prog, static_cast<int>(nvrtc_opts.size()), nvrtc_opts.data());
+    nvrtcCompileProgram(prog, request.option_count, request.options.data());
 
   // Capture the log unconditionally so warnings on success and errors
   // on failure surface to callers symmetrically.
