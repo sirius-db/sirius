@@ -1158,10 +1158,10 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       auto result =
         cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
       // The reader AST borrows scalars owned by this checkpoint's snapshot.
-      if (dynamic_reader_filter) { stream.synchronize(); }
+      if (dynamic_reader_filter) { stream.sync(); }
       return result;
     } catch (...) {
-      if (dynamic_reader_filter) { stream.synchronize(); }
+      if (dynamic_reader_filter) { stream.sync(); }
       throw;
     }
   }();

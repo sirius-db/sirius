@@ -1343,7 +1343,7 @@ TEST_CASE("dynamic_filter_gate is not applicable before any filter publishes",
 TEST_CASE("dynamic filter application keeps one captured generation across later publications",
           "[dynamic_filter][scan_merge][snapshot]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto input        = make_int64_sequence_table(10, stream);
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0});
@@ -1369,7 +1369,7 @@ TEST_CASE("dynamic filter application keeps one captured generation across later
 TEST_CASE("captured dynamic filter owners survive channel destruction through GPU application",
           "[dynamic_filter][scan_merge][snapshot]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto input        = make_int64_sequence_table(10, stream);
   sirius::op::dynamic_filter_snapshot snapshot;
   std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
@@ -1391,7 +1391,7 @@ TEST_CASE("captured dynamic filter owners survive channel destruction through GP
 TEST_CASE("decode probes retain exactly the captured snapshot after channel growth and destruction",
           "[dynamic_filter][scan_merge][snapshot]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto input        = make_int64_sequence_table(10, stream);
   sirius::op::scan::membership_snapshot probes;
   std::weak_ptr<sirius_dynamic_filter const> filter_lifetime;
@@ -1485,7 +1485,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
     result.wait_for(std::chrono::milliseconds{100}) == std::future_status::ready;
   work.unblock();
   worker.join();
-  stream.sync();
+  stream.synchronize();
 
   REQUIRE(callback_started);
   REQUIRE_FALSE(returned_while_blocked);
@@ -1714,7 +1714,7 @@ TEST_CASE("cascaded membership filters produce the conjunction of all filters",
 TEST_CASE("deferred keys support arbitrary repeated membership filters",
           "[dynamic_filter][scan_merge][deferred_keys]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto table        = make_int64_sequence_table(10, stream);
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0});
@@ -1740,7 +1740,7 @@ TEST_CASE("deferred keys support arbitrary repeated membership filters",
 TEST_CASE("deferred keys equal cascade for AST and INT32 membership",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::column>> columns;
   for (int32_t start : {0, 0, 100}) {
     columns.push_back(cudf::sequence(10,
@@ -1761,7 +1761,7 @@ TEST_CASE("deferred keys equal cascade for AST and INT32 membership",
 TEST_CASE("forced compaction strategies agree for an AST-only mask",
           "[dynamic_filter][scan_merge][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto table        = make_sequence_table(10, stream);
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0});
@@ -1774,7 +1774,7 @@ TEST_CASE("forced compaction strategies agree for an AST-only mask",
 TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(cudf::sequence(10,
                                    cudf::numeric_scalar<int64_t>(0, true, stream),
@@ -1800,7 +1800,7 @@ TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
 TEST_CASE("deferred keys equal cascade for all-true and empty results",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
 
   SECTION("all contributing masks retain every row")
   {
@@ -1845,7 +1845,7 @@ TEST_CASE("deferred keys equal cascade for all-true and empty results",
 TEST_CASE("deferred keys equal cascade for Bloom membership filters",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto build_five   = cudf::sequence(5,
                                    cudf::numeric_scalar<int64_t>(0, true, stream),
                                    cudf::numeric_scalar<int64_t>(1, true, stream),
@@ -1873,7 +1873,7 @@ TEST_CASE("deferred keys equal cascade for Bloom membership filters",
 TEST_CASE("deferred keys preserve null pass-through when every mask declines",
           "[dynamic_filter][scan_merge][deferred_keys][equivalence]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto input        = make_int64_sequence_table(10, stream);
   sirius_dynamic_filter_set filters;
   auto producer = filters.register_producer({0});
@@ -1887,7 +1887,7 @@ TEST_CASE("deferred keys preserve null pass-through when every mask declines",
 TEST_CASE("gather once declines null masks without training their marginals",
           "[dynamic_filter][scan_merge][gather_once][gate]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto input        = make_int64_sequence_table(10, stream);
   auto declining    = std::make_shared<nullable_declining_filter>();
   sirius_dynamic_filter_set filters;
@@ -1914,7 +1914,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
   // 32-byte narrow rows and 80-byte wide rows both reach gather-once once every marginal is
   // current, so the two width branches of the policy are exercised against the same filters.
   auto const input_bytes = GENERATE(std::size_t{640}, std::size_t{1600});
-  auto const stream      = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(cudf::sequence(20,
                                    cudf::numeric_scalar<int64_t>(0, true, stream),
@@ -2002,7 +2002,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
 TEST_CASE("deferred keys preserve alignment across repeated and different columns",
           "[dynamic_filter][scan_merge][deferred_keys]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(cudf::sequence(10,
                                    cudf::numeric_scalar<int64_t>(0, true, stream),
@@ -2049,7 +2049,7 @@ TEST_CASE("deferred keys preserve alignment across repeated and different column
 TEST_CASE("deferred keys realign after nullable mask decline without training it",
           "[dynamic_filter][scan_merge][deferred_keys]")
 {
-  auto const stream = cudf::get_default_stream();
+  ::cuda::stream_ref stream = cudf::get_default_stream();
   auto nullable_key = cudf::sequence(10,
                                      cudf::numeric_scalar<int64_t>(0, true, stream),
                                      cudf::numeric_scalar<int64_t>(1, true, stream),
