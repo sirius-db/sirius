@@ -10,8 +10,15 @@
 # headers, so the include NAMES below must match the `#include "..."` strings
 # used by the rendered kernel sources exactly.
 
+include("${CMAKE_CURRENT_LIST_DIR}/jit_header_manifest.cmake")
 file(READ "${IN_STDINT}" STDINT_SRC)
 file(READ "${IN_RLE}" RLE_SRC)
+jit_normalize_header("${STDINT_SRC}" STDINT_SRC)
+jit_normalize_header("${RLE_SRC}" RLE_SRC)
+jit_manifest_record("codegen/decode/rle_block.cuh" "${RLE_SRC}" rle_record)
+jit_manifest_record("codegen/stdint_shim.hpp" "${STDINT_SRC}" stdint_record)
+string(SHA256 manifest_digest
+              "simpatico-headers-v1\n${rle_record}${stdint_record}")
 
 # Raw-string delimiter chosen so it cannot appear in the embedded C++ source.
 set(D "SIMPATICO_EMBED")
@@ -34,4 +41,5 @@ file(
   "  {\"codegen/decode/rle_block.cuh\", kEmbeddedJitHeaderRleBlock},\n"
   "};\n"
   "inline constexpr int kEmbeddedJitHeaderCount = 2;\n"
+  "inline constexpr char kEmbeddedJitHeadersIdentity[] = \"${manifest_digest}\";\n"
   "}  // namespace codegen::jit\n")

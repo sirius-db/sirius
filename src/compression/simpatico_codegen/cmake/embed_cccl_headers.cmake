@@ -15,6 +15,7 @@
 # CCCL version in use.
 
 cmake_minimum_required(VERSION 3.24)
+include("${CMAKE_CURRENT_LIST_DIR}/jit_header_manifest.cmake")
 
 file(STRINGS "${INCLUDE_DIRS_FILE}" cccl_include_dirs)
 
@@ -30,6 +31,18 @@ function(find_cccl_header name output)
   endif()
   foreach(include_dir IN LISTS cccl_include_dirs)
     cmake_path(SET candidate NORMALIZE "${include_dir}/${relative_name}")
+    # A new header in an earlier search root can shadow a previously selected
+    # file. Track the nearest existing parent even for unsuccessful searches.
+    get_filename_component(search_parent "${candidate}" DIRECTORY)
+    while(NOT IS_DIRECTORY "${search_parent}")
+      get_filename_component(next_parent "${search_parent}" DIRECTORY)
+      if(next_parent STREQUAL search_parent)
+        break()
+      endif()
+      set(search_parent "${next_parent}")
+    endwhile()
+    set_property(GLOBAL APPEND PROPERTY simpatico_search_parents
+                                        "${search_parent}")
     if(EXISTS "${candidate}" AND NOT IS_DIRECTORY "${candidate}")
       set(${output}
           "${candidate}"
@@ -145,10 +158,14 @@ string(APPEND body "namespace codegen::jit {\n")
 
 set(idx 0)
 set(header_dependencies "")
+set(manifest "simpatico-headers-v1\n")
 foreach(rel IN LISTS found)
   find_cccl_header("${rel}" header)
   list(APPEND header_dependencies "${header}")
   file(READ "${header}" hsrc)
+  jit_normalize_header("${hsrc}" hsrc)
+  jit_manifest_record("${rel}" "${hsrc}" record)
+  string(APPEND manifest "${record}")
   string(APPEND body "static const char* kCcclName${idx} = \"${rel}\";\n")
   string(APPEND body
          "static const char* kCcclSrc${idx} =\nR\"${D}(${hsrc})${D}\";\n")
@@ -163,6 +180,9 @@ foreach(rel IN LISTS found)
 endforeach()
 string(APPEND body "};\n")
 string(APPEND body "const int kCcclEmbeddedHeaderCount = ${n};\n")
+string(SHA256 manifest_digest "${manifest}")
+string(APPEND body
+       "const char kCcclEmbeddedHeadersIdentity[] = \"${manifest_digest}\";\n")
 string(APPEND body "}  // namespace codegen::jit\n")
 
 file(WRITE "${OUT}" "${body}")
@@ -186,6 +206,9 @@ if(DEFINED DEPFILE AND NOT DEPFILE STREQUAL "")
 
   escape_depfile_path("${OUT}" depfile_out)
   set(_depfile_body "${depfile_out}:")
+  get_property(search_parents GLOBAL PROPERTY simpatico_search_parents)
+  list(APPEND header_dependencies ${search_parents})
+  list(REMOVE_DUPLICATES header_dependencies)
   foreach(header IN LISTS header_dependencies)
     escape_depfile_path("${header}" depfile_header)
     string(APPEND _depfile_body " \\\n  ${depfile_header}")

@@ -42,6 +42,7 @@ add_custom_command(
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/stdint_shim.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/codegen/decode/rle_block.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_jit_headers.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
   COMMENT "Embedding JIT project headers into ${EMBED_JIT_HEADERS_OUT}"
   VERBATIM)
 add_custom_target(simpatico_embedded_headers DEPENDS "${EMBED_JIT_HEADERS_OUT}")
@@ -74,6 +75,7 @@ add_custom_command(
     "-DOUT=${EMBED_CCCL_HEADERS_OUT}" "-DDEPFILE=${EMBED_CCCL_HEADERS_DEPFILE}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_cccl_headers.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
           "${EMBED_CCCL_INCLUDE_DIRS}"
   DEPFILE "${EMBED_CCCL_HEADERS_DEPFILE}"
   COMMENT
@@ -209,6 +211,7 @@ target_include_directories(simpatico_cli
 target_link_libraries(simpatico_cli PRIVATE simpatico)
 
 enable_testing()
+add_subdirectory(tests/cache)
 add_test(NAME compress_with_plan_roundtrip
          COMMAND test_compress_with_plan_roundtrip)
 add_test(NAME compressed_table_io COMMAND test_compressed_table_io)
