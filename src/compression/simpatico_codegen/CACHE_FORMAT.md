@@ -64,3 +64,19 @@ The Test workflow invokes this project on its CPU runners for both supported CUD
 environments according to the existing matrix. These tests do not load the CUDA
 driver. They exercise the production generators, content-sensitive manifests,
 relocated prefixes, include ordering, and incremental content/shadowing updates.
+
+## Production coverage
+
+Build `simpatico_cache_gpu_tests`, then run CTest with `-L cache_gpu` in the
+Simpatico build directory. The Test workflow explicitly builds the workers and
+runs their Python harness on GPU runners, independently of Sirius's Catch2 suite.
+Each case uses a temporary cache and fresh processes; CUDA's own cache is disabled.
+Header variants use the production embedders and cache/compiler implementation,
+keep kernel source identical, and check both executed results and cache statistics.
+Shared-library cases relocate the actual NVRTC and builtins, then change their
+bytes without changing their reported version. Static archive identity is also
+covered by host generator fixtures.
+
+In shared builds, compiler discovery runs an NVRTC preprocessor-error probe (to
+load lazy builtins) and hashes the compiler artifacts once, so a disk hit skips
+kernel compilation but the first lookup in a process may still do some NVRTC work.
