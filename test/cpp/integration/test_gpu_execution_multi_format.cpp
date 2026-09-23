@@ -2576,9 +2576,11 @@ TEST_CASE_METHOD(MultiFormatFixtureBase,
                      " = s.k GROUP BY p.filename, p.file_index";
 
   // Keep the join shape fixed and prevent bind-time statistics pruning. Only the
-  // runtime join-filter switch should change CPU file numbering. This deliberately
-  // records an unresolved compatibility difference, not a CPU/GPU equality claim.
-  // Discussion: https://github.com/sirius-db/sirius/pull/1846#issuecomment-5777809768
+  // runtime join-filter switch should change CPU file numbering. Sirius keeps the
+  // index in the original bound file list; this pins the known upstream difference.
+  // Upstream: https://github.com/duckdb/duckdb/issues/26044
+  // If DuckDB adopts stable numbering, require CPU/GPU equality and remove the
+  // known-difference expectation below instead of treating the fix as a regression.
   for (bool pushdown : {true, false}) {
     sirius::test::disabled_optimizers_guard shape(
       *con,
