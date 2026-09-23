@@ -209,7 +209,10 @@ struct device_buffer {
   }
 
   std::uint8_t* data{nullptr};
-  ::cuda::stream_ref stream;
+  // Default to the null stream explicitly: cuda::stream_ref's default
+  // constructor is deprecated by CCCL, so initialize from cudaStream_t{nullptr}
+  // to preserve the same null-stream semantics without the warning.
+  ::cuda::stream_ref stream{cudaStream_t{nullptr}};
   int device_id{-1};
 };
 

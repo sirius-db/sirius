@@ -46,12 +46,12 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
-# `--execution` names a cache state to measure. Each profile fixes what Sirius
+# `--profile` names a cache state to measure. Each profile fixes what Sirius
 # caches, what retires it, the iteration ordering, and what is flushed between
 # runs -- setting those independently is how a "cold" number ends up measured
 # over a warm page cache. The OS page cache is dropped once at startup either
 # way; the *_between flags are about doing it again between runs.
-EXECUTION_PROFILES = {
+PROFILES = {
     # The connection is deliberately NOT renewed: dropping the context would
     # also throw away the GPU context and compiled plans, which is not what
     # this is measuring.
@@ -98,9 +98,42 @@ EXECUTION_PROFILES = {
         ),
     },
 }
-EXECUTION_CHOICES = tuple(EXECUTION_PROFILES)
+PROFILE_CHOICES = tuple(PROFILES)
 
-# Used when --execution is absent. Inert by design: None cache settings mean
+# `--mode` is an orthogonal knob that fixes BOTH the iteration ordering and the
+# granularity at which the cache is flushed. Unlike `--profile` (which chooses
+# a cache mode/eviction profile), `--mode` always drops the OS page cache and
+# resets the Sirius cache -- its whole purpose is to place that drop -- so the
+# only thing that varies is WHERE the drop happens relative to the query loop:
+#
+#   isolated:   drop q1  drop q2  drop q3 ...      (flush before every query run)
+#   sequential: drop q1 q2 ... q22  drop q1 q2 ...  (flush once per iteration)
+#   grouped:    drop q1 q1 q1 ...  drop q2 q2 q2 ... (flush once per query group)
+#
+# `drop_scope` is read by the runners; `ordering` picks the runner.
+MODE_PROFILES = {
+    "isolated": {
+        "ordering": "grouped",
+        "drop_scope": "run",
+        "summary": "cache dropped before every single query run",
+    },
+    "sequential": {
+        "ordering": "sequential",
+        "drop_scope": "iteration",
+        "summary": "round-robin; cache dropped once at the start of each iteration",
+    },
+    "grouped": {
+        "ordering": "grouped",
+        "drop_scope": "group",
+        "summary": (
+            "iterations back-to-back per query; cache dropped once before each "
+            "per-query group"
+        ),
+    },
+}
+MODE_CHOICES = tuple(MODE_PROFILES)
+
+# Used when --profile is absent. Inert by design: None cache settings mean
 # "override nothing", so the run measures what the user's own YAML asks for.
 DEFAULT_PROFILE = {
     "ordering": "grouped",
@@ -109,7 +142,7 @@ DEFAULT_PROFILE = {
     "drop_os_cache_between": False,
     "reset_cache_between": False,
     "summary": (
-        "no execution profile: the Sirius config is used as given, iterations "
+        "no profile: the Sirius config is used as given, iterations "
         "back-to-back per query"
     ),
 }
@@ -180,7 +213,7 @@ def get_git_info():
 
 def setup_benchmark_dir(
     output_root,
-    execution,
+    profile_label,
     iterations,
     engine,
     queries,
@@ -203,12 +236,12 @@ def setup_benchmark_dir(
           <engine>/q<N>/result.txt  (one repr(row) per line)
           sirius/q<N>/sirius.log    (post-run split of combined log)
 
-    The benchmark dir is `<output_root>/tpch_<ts>_<execution>_<engine>_iter<N>`,
+    The benchmark dir is `<output_root>/tpch_<ts>_<profile>_<engine>_iter<N>`,
     with `name` appended when given -- a label narrows the directory down within
     a run's other output rather than replacing the parameters that identify it.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    benchmark_name = f"tpch_{ts}_{execution}_{engine}_iter{iterations}"
+    benchmark_name = f"tpch_{ts}_{profile_label}_{engine}_iter{iterations}"
     if name:
         benchmark_name = f"{benchmark_name}_{name}"
     benchmark_dir = os.path.join(output_root, benchmark_name)
@@ -227,7 +260,7 @@ def setup_benchmark_dir(
         "commit": commit,
         "branch_name": branch,
         "date": datetime.now().isoformat(timespec="seconds"),
-        "execution": execution,
+        "profile": profile_label,
         "iterations": iterations,
         "engine": engine,
         "data_source": data_source,
@@ -326,7 +359,7 @@ def _load_yaml(path):
         import yaml
     except ImportError as exc:  # pragma: no cover - environment problem
         raise SystemExit(
-            "--execution needs PyYAML to derive the effective Sirius config from "
+            "--profile needs PyYAML to derive the effective Sirius config from "
             f"{path!r}. Run this script from the repo root via "
             "`pixi run python test/tpch_performance/performance_test.py ...`."
         ) from exc
@@ -364,16 +397,16 @@ def _plant(doc, keys, values):
     return node
 
 
-def check_execution_sanity(execution, overrides, config_path, engine, pin):
+def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
     """Validate the run's inputs before anything runs.
 
     Every check here catches a mistake that would otherwise yield a plausible
     number rather than an error.
     """
     profile = (
-        EXECUTION_PROFILES[execution] if execution is not None else DEFAULT_PROFILE
+        PROFILES[profile_name] if profile_name is not None else DEFAULT_PROFILE
     )
-    label = f"--execution {execution}" if execution is not None else f"--pin {pin}"
+    label = f"--profile {profile_name}" if profile_name is not None else f"--pin {pin}"
     problems = []
     warnings = []
 
@@ -417,7 +450,7 @@ def check_execution_sanity(execution, overrides, config_path, engine, pin):
         )
         if profile["drop_os_cache_between"]:
             problems.append(
-                f"--execution {execution} requires a cold page cache: {detail}"
+                f"--profile {profile_name} requires a cold page cache: {detail}"
             )
         else:
             warnings.append(
@@ -427,17 +460,17 @@ def check_execution_sanity(execution, overrides, config_path, engine, pin):
 
     if profile["reset_cache_between"] and engine == "cpu":
         warnings.append(
-            f"--execution {execution} resets Sirius's cache between runs, which "
+            f"--profile {profile_name} resets Sirius's cache between runs, which "
             "does nothing for --engine cpu"
         )
 
     if pin == "parquet" and engine == "cpu":
         problems.append("--pin parquet is Sirius-only; it cannot serve --engine cpu")
 
-    if pin != "none" and pin != "parquet" and execution == "cold":
+    if pin != "none" and pin != "parquet" and profile_name == "cold":
         warnings.append(
             "--pin keeps table data resident on the GPU, which is not something "
-            "--execution cold flushes; the scan is cold but the pinned columns "
+            "--profile cold flushes; the scan is cold but the pinned columns "
             "are not"
         )
 
@@ -445,27 +478,27 @@ def check_execution_sanity(execution, overrides, config_path, engine, pin):
         log(f"  WARNING: {w}")
     if problems:
         raise SystemExit(
-            "execution sanity check failed:\n  - " + "\n  - ".join(problems)
+            "profile sanity check failed:\n  - " + "\n  - ".join(problems)
         )
 
 
-def cache_overrides_for(execution, pin):
+def cache_overrides_for(profile_name, pin):
     """The cache settings this run needs, or {} to leave the config alone.
 
     Both inputs can ask for settings and --pin parquet wins where they disagree:
-    a pin the evictor immediately undoes is not a pin, whereas an execution
-    profile whose eviction policy shifted still measures something coherent.
+    a pin the evictor immediately undoes is not a pin, whereas a profile
+    whose eviction policy shifted still measures something coherent.
     """
     overrides = {}
-    if execution is not None:
-        profile = EXECUTION_PROFILES[execution]
+    if profile_name is not None:
+        profile = PROFILES[profile_name]
         overrides["mode"] = profile["cache_mode"]
         overrides["eviction"] = profile["eviction"]
     if pin == "parquet":
         for key, value in PARQUET_PIN_CACHE.items():
             if key in overrides and overrides[key] != value:
                 log(
-                    f"  WARNING: --execution {execution} wants cache.{key}="
+                    f"  WARNING: --profile {profile_name} wants cache.{key}="
                     f"{overrides[key]!r}, but --pin parquet requires {value!r}; "
                     "using the pin's value"
                 )
@@ -473,7 +506,7 @@ def cache_overrides_for(execution, pin):
     return overrides
 
 
-def derive_execution_config(overrides, config_path, benchmark_dir):
+def derive_profile_config(overrides, config_path, benchmark_dir):
     """Write the config this run will actually use and return its path.
 
     The user's file is the base and only the profile's cache settings are
@@ -760,10 +793,16 @@ def run_grouped(
     """Per-query iterations back-to-back; one connection per engine. Pin per query.
 
     pin_after_iteration leading iterations run unpinned before pinning starts.
+
+    profile['drop_scope'] places the cache flush: 'run' flushes before every
+    query run (isolated), 'group' flushes once before each query's iteration
+    block (grouped). Defaults to 'run' so existing profiles are
+    unchanged.
     """
+    drop_scope = profile.get("drop_scope", "run")
     log(
         "Ordering 'grouped': single connection per engine, "
-        "iterations back-to-back per query"
+        f"iterations back-to-back per query (drop_scope={drop_scope})"
     )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
@@ -771,6 +810,9 @@ def run_grouped(
         try:
             for qnum in queries:
                 pinned = False
+                if drop_scope == "group":
+                    log(f"--- q{qnum} group flush engine={name} ---")
+                    _flush_between_runs(con, profile, use_gpu, source, data_source)
                 try:
                     for it in range(iterations):
                         if (
@@ -783,7 +825,10 @@ def run_grouped(
                             _execute_multi(con, emit_pin(qnum, source, data_source))
                             pinned = True
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _flush_between_runs(con, profile, use_gpu, source, data_source)
+                        if drop_scope == "run":
+                            _flush_between_runs(
+                                con, profile, use_gpu, source, data_source
+                            )
                         _run_one(
                             writer,
                             con,
@@ -817,8 +862,17 @@ def run_sequential(
     duckdb_profiling=False,
     pin_after_iteration=0,
 ):
-    """Round-robin iterations; one connection per engine. Single union-pin at session start."""
-    log("Ordering 'sequential': single connection per engine, round-robin iterations")
+    """Round-robin iterations; one connection per engine. Single union-pin at session start.
+
+    profile['drop_scope'] places the cache flush: 'iteration' flushes once at
+    the start of each round-robin pass (sequential), 'run' flushes before every
+    query run. Defaults to 'run' so existing profiles are unchanged.
+    """
+    drop_scope = profile.get("drop_scope", "run")
+    log(
+        "Ordering 'sequential': single connection per engine, round-robin "
+        f"iterations (drop_scope={drop_scope})"
+    )
     pin_enabled = pin != "none"
     for name, use_gpu in engine_modes:
         con = open_connection(source, gpu_execution=use_gpu, data_source=data_source)
@@ -837,9 +891,15 @@ def run_sequential(
                         )
                         _execute_multi(con, emit_pin_all(source, data_source))
                         pinned = True
+                    if drop_scope == "iteration":
+                        log(f"--- iter{it} flush engine={name} ---")
+                        _flush_between_runs(con, profile, use_gpu, source, data_source)
                     for qnum in queries:
                         log(f"--- q{qnum} iter{it} engine={name} ---")
-                        _flush_between_runs(con, profile, use_gpu, source, data_source)
+                        if drop_scope == "run":
+                            _flush_between_runs(
+                                con, profile, use_gpu, source, data_source
+                            )
                         _run_one(
                             writer,
                             con,
@@ -859,8 +919,8 @@ def run_sequential(
             con.close()
 
 
-# Keyed by an execution profile's "ordering", not by a user-facing choice --
-# `--execution` picks the profile and the profile picks the in-process runner.
+# Keyed by a profile's "ordering", not by a user-facing choice --
+# `--profile` picks the profile and the profile picks the in-process runner.
 RUNNERS = {
     "grouped": run_grouped,
     "sequential": run_sequential,
@@ -1303,7 +1363,7 @@ def split_sirius_log(log_dir, benchmark_dir, queries, iterations):
     (whitespace-normalized) SQL against the known QUERIES text, so interleaved control
     statements (`SET gpu_execution`, `CALL pin_table`/`unpin_table`, `CREATE VIEW`,
     `LOAD`) are ignored and segments are grouped by query content. This is robust
-    across data sources (parquet/duckdb), pinning on/off, and every execution profile --
+    across data sources (parquet/duckdb), pinning on/off, and every profile --
     it keys on query text, not on statement counts or run ordering.
     """
     log_files = sorted(glob.glob(os.path.join(log_dir, "sirius*.log")))
@@ -1470,8 +1530,8 @@ def parse_args():
         ),
     )
     p.add_argument(
-        "--execution",
-        choices=EXECUTION_CHOICES,
+        "--profile",
+        choices=PROFILE_CHOICES,
         default=None,
         help=(
             "Cache state to measure. Each value fixes the Sirius cache mode, the "
@@ -1487,6 +1547,23 @@ def parse_args():
         ),
     )
     p.add_argument(
+        "--mode",
+        choices=MODE_CHOICES,
+        default=None,
+        help=(
+            "Runner mode fixing BOTH the query-execution order and where the "
+            "cache is dropped. Unlike --profile, --mode always drops the OS "
+            "page cache (and resets the Sirius cache on GPU) -- it only chooses "
+            "where. isolated: drop before every query run (grouped order, "
+            "'drop q1 drop q2 ...'). sequential: round-robin, drop once at the "
+            "start of each iteration ('drop q1 q2 ... q22  drop q1 q2 ...'). "
+            "grouped: iterations back-to-back per query, drop once before each "
+            "query group ('drop q1 q1 ...  drop q2 q2 ...'). Requires "
+            "passwordless sudo for the OS cache drop. Overrides the ordering and "
+            "drop placement implied by --profile. (default: unset)"
+        ),
+    )
+    p.add_argument(
         "--precmd",
         choices=PRECMD_CHOICES,
         default="none",
@@ -1495,7 +1572,7 @@ def parse_args():
             "'nsys' runs one Nsight Systems-wrapped DuckDB CLI per query; "
             "'gdb' runs one batch-mode GDB DuckDB CLI per query and saves an "
             "all-thread backtrace. Non-none pre-commands require --engine gpu and "
-            "do not accept --execution, --validation, or --duckdb-profiling. "
+            "do not accept --profile, --validation, or --duckdb-profiling. "
             "(default: none)"
         ),
     )
@@ -1601,7 +1678,7 @@ def parse_args():
         default=None,
         help=(
             "Label appended to the benchmark output subdirectory under "
-            "--output: 'tpch_<ts>_<execution-or-precmd>_<engine>_iter<N>_<NAME>'. The "
+            "--output: 'tpch_<ts>_<profile-or-precmd>_<engine>_iter<N>_<NAME>'. The "
             "run's parameters stay in the name, so two labelled runs remain "
             "distinguishable; the timestamp keeps them from colliding."
         ),
@@ -1755,42 +1832,71 @@ def main():
                 f"--precmd {precmd} is incompatible with --duckdb-profiling"
             )
         # External runners drive subprocesses with their own cache behaviour, so
-        # silently applying an execution profile would be a lie in the metadata.
-        if args.execution is not None:
+        # silently applying a profile would be a lie in the metadata.
+        if args.profile is not None:
             raise SystemExit(
-                f"--precmd {precmd} has its own execution model; --execution "
+                f"--precmd {precmd} has its own execution model; --profile "
+                "does not apply to it"
+            )
+        if args.mode is not None:
+            raise SystemExit(
+                f"--precmd {precmd} has its own execution model; --mode "
                 "does not apply to it"
             )
 
     config_path = (args.config or "").strip()
 
-    # No --execution means change nothing: the profile is inert and the config
+    # No --profile means change nothing: the profile is inert and the config
     # below is left exactly as the user wrote it.
     profile = (
-        EXECUTION_PROFILES[args.execution]
-        if args.execution is not None
+        PROFILES[args.profile]
+        if args.profile is not None
         else DEFAULT_PROFILE
     )
+    # --mode overrides ordering and the drop placement, and forces a cache drop
+    # at that placement (its defining property). Any cache mode/eviction the
+    # profile asked for is kept.
+    if args.mode is not None:
+        mode_props = MODE_PROFILES[args.mode]
+        if not can_drop_os_cache():
+            raise SystemExit(
+                f"--mode {args.mode} drops the OS page cache: passwordless sudo "
+                "for /usr/bin/tee /proc/sys/vm/drop_caches is not available "
+                "(see test/tpch_performance/CLAUDE.md)"
+            )
+        profile = {
+            **profile,
+            "ordering": mode_props["ordering"],
+            "drop_scope": mode_props["drop_scope"],
+            "drop_os_cache_between": True,
+            "reset_cache_between": True,
+            "summary": f"mode={args.mode}: {mode_props['summary']}",
+        }
     cache_overrides = (
-        {} if uses_precmd else cache_overrides_for(args.execution, args.pin)
+        {} if uses_precmd else cache_overrides_for(args.profile, args.pin)
     )
     if not uses_precmd:
-        log(f"Execution:     {args.execution or '(unset)'} — {profile['summary']}")
+        label = args.mode or args.profile or "(unset)"
+        log(f"Profile:       {label} — {profile['summary']}")
         if cache_overrides:
-            log("Checking execution sanity")
-            check_execution_sanity(
-                args.execution, cache_overrides, config_path, args.engine, args.pin
+            log("Checking profile sanity")
+            check_profile_sanity(
+                args.profile, cache_overrides, config_path, args.engine, args.pin
             )
 
     if args.pin != "none":
         os.environ["SIRIUS_PIN_TIER"] = args.pin
 
-    # External runners do not apply an execution profile, so label the run with
+    # External runners do not apply a profile, so label the run with
     # the wrapper rather than misattributing it to a cache profile.
-    execution_label = precmd if uses_precmd else (args.execution or "default")
+    profile_label = (
+        precmd
+        if uses_precmd
+        else ("_".join(filter(None, (args.profile, args.mode))) or "default")
+    )
     benchmark_dir, runtime_csv, log_dir = setup_benchmark_dir(
         output_root,
-        execution_label,
+        profile_label,
         args.iterations,
         args.engine,
         queries,
@@ -1814,14 +1920,15 @@ def main():
             )
     else:
         log("Deriving effective Sirius config")
-        config_path = derive_execution_config(
+        config_path = derive_profile_config(
             cache_overrides, config_path, benchmark_dir
         )
         os.environ["SIRIUS_CONFIG_FILE"] = config_path
 
     log(f"Source:        {source}")
     log(f"Data source:   {args.data_source}")
-    log(f"Execution:     {execution_label}")
+    log(f"Profile:       {profile_label}")
+    log(f"Mode:          {args.mode or '(unset)'}")
     log(f"Iterations:    {args.iterations}")
     log(f"Engine:        {args.engine}")
     log(f"Queries:       {queries}")
