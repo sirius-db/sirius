@@ -28,7 +28,7 @@ pub(crate) struct FragmentInstanceId(Uuid);
 
 impl FragmentInstanceId {
     /// Packs the `hi`/`lo` 64-bit halves of a StarRocks unique id into a [`Uuid`].
-    pub(crate) fn from_halves(hi: i64, lo: i64) -> Self {
+    pub(crate) const fn from_halves(hi: i64, lo: i64) -> Self {
         Self(Uuid::from_u64_pair(hi as u64, lo as u64))
     }
 

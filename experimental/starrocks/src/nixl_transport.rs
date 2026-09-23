@@ -470,6 +470,9 @@ mod agent_tier {
         ) -> Result<(), String> {
             use crate::nixl_chunk::{PackedExchangeFrame, exchange_md, request_staging_lease};
 
+            let hop_start_us = crate::timing::unix_us();
+            let hop_started = Instant::now();
+            let mut hop = HopTiming::default();
             let peer_md = exchange_md(spec.peer, &self.local_md)?;
             let remote_agent = self.load_peer_md(&peer_md)?;
             if remote_agent != spec.peer_agent_name {
@@ -482,30 +485,43 @@ mod agent_tier {
             if self.canaried.insert(remote_agent.clone()) {
                 self.first_contact_canary(spec, executor, &remote_agent)?;
             }
+            hop.md_us = crate::timing::us(hop_started.elapsed());
 
             let mut seq = 0i64;
             let mut frames: u64 = 0;
             let mut bytes: u64 = 0;
             let mut rows: u64 = 0;
             loop {
-                match executor.export_packed_next(spec.slot)? {
+                let pack_started = Instant::now();
+                let next = executor.export_packed_next(spec.slot)?;
+                hop.pack_us += crate::timing::us(pack_started.elapsed());
+                match next {
                     Some(mut batch) => {
                         let metadata = std::mem::take(&mut batch.metadata);
                         let sent = (|| {
                             let (offset, length) = if batch.len > 0 {
+                                let lease_started = Instant::now();
                                 let lease = request_staging_lease(spec.peer, batch.len)?;
-                                write_and_wait(
+                                hop.lease_us += crate::timing::us(lease_started.elapsed());
+                                let write_start = crate::timing::unix_us();
+                                let elapsed = write_and_wait(
                                     &self.agent,
                                     &remote_agent,
                                     self.staging_base + batch.offset,
                                     lease.remote_addr,
                                     batch.len,
                                 )?;
+                                hop.write_us += crate::timing::us(elapsed);
+                                hop.write_max_us = hop.write_max_us.max(crate::timing::us(elapsed));
+                                hop.writes += 1;
+                                hop.write_intervals
+                                    .push((write_start, write_start + crate::timing::us(elapsed)));
                                 (lease.offset, batch.len)
                             } else {
                                 (0, 0)
                             };
-                            PackedExchangeFrame {
+                            let announce_started = Instant::now();
+                            let announced = PackedExchangeFrame {
                                 fragment_instance_id: spec.slot.fragment_instance_id,
                                 dest_stream: spec.dest_stream,
                                 sender_id: spec.sender_id,
@@ -517,7 +533,9 @@ mod agent_tier {
                                 rows: batch.rows,
                                 metadata,
                             }
-                            .transmit_blocking(spec.peer)?;
+                            .transmit_blocking(spec.peer);
+                            hop.announce_us += crate::timing::us(announce_started.elapsed());
+                            announced?;
                             Ok::<_, String>((offset, length))
                         })();
                         if batch.len > 0
@@ -559,6 +577,9 @@ mod agent_tier {
                             rows,
                             "shipping packed exchange hop"
                         );
+                        if crate::timing::enabled() {
+                            hop.log(spec, hop_start_us, hop_started.elapsed(), bytes);
+                        }
                         return Ok(());
                     }
                 }
@@ -594,6 +615,45 @@ mod agent_tier {
                 tracing::warn!(error = %err, "failed to release the local canary lease");
             }
             result
+        }
+    }
+
+    /// Per-hop phase totals for the `SIRIUS_CN_TIMING` "packed hop timing" line.
+    #[derive(Default)]
+    struct HopTiming {
+        md_us: u64,
+        pack_us: u64,
+        lease_us: u64,
+        write_us: u64,
+        write_max_us: u64,
+        announce_us: u64,
+        writes: u64,
+        write_intervals: Vec<(u64, u64)>,
+    }
+
+    impl HopTiming {
+        fn log(&mut self, spec: &RemoteSendSpec, start_us: u64, span: Duration, bytes: u64) {
+            let span_us = crate::timing::us(span).max(1);
+            let wire_busy_us = crate::timing::busy_us(&mut self.write_intervals);
+            info!(
+                peer = %spec.peer,
+                dest_stream = spec.dest_stream,
+                sender_id = spec.sender_id,
+                start_us,
+                span_us,
+                md_us = self.md_us,
+                pack_us = self.pack_us,
+                lease_us = self.lease_us,
+                write_us = self.write_us,
+                write_max_us = self.write_max_us,
+                announce_us = self.announce_us,
+                writes = self.writes,
+                bytes,
+                wire_busy_us,
+                wire_busy_pct = wire_busy_us * 100 / span_us,
+                write_gbs = bytes as f64 / (self.write_us.max(1) as f64 * 1e3),
+                "packed hop timing"
+            );
         }
     }
 
