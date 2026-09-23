@@ -109,9 +109,19 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search_ann(
   auto const& req   = c.req;
   auto const metric = ann_distance_type_from_metric(req.metric);
 
-  auto index_entry = c.ctx.get_cuvs_index_cache().find_by_column(
-    req.catalog, req.schema, req.table_name, req.column_name, metric);
+  auto& index_cache = c.ctx.get_cuvs_index_cache();
+  auto index_entry  = index_cache.find_by_column(
+    req.catalog, req.schema, req.table_name, req.table_oid, req.column_name, metric);
   if (index_entry == nullptr || !index_entry->index) {
+    // Name a stale index rather than reporting it as a missing one.
+    if (index_cache.has_superseded_index_for_column(
+          req.catalog, req.schema, req.table_name, req.table_oid, req.column_name, metric)) {
+      throw duckdb::InvalidInputException(
+        "sirius_knn_search: the ANN index on '" + req.table_name + "." + req.column_name +
+        "' was built on a previous incarnation of the table (dropped and recreated, or altered, "
+        "since the index was built), so it cannot serve this search; rebuild it with "
+        "sirius_create_ann_index or pass use_index => false");
+    }
     throw duckdb::InvalidInputException(
       "sirius_knn_search: no ANN index for '" + req.table_name + "." + req.column_name +
       "' under the requested metric; create one with sirius_create_ann_index or pass "
