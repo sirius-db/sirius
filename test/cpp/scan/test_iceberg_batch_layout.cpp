@@ -22,11 +22,13 @@
 //
 // Pure metadata arithmetic over footer row counts: no GPU, no IO.
 
-#include "op/scan/iceberg_gpu_ingestible.hpp"
+#include "op/scan/parquet_batch_layout.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
 
 #include <catch.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,7 +53,8 @@ std::shared_ptr<cudf::io::parquet::FileMetaData const> footer_with(
 
 row_group_slice slice_of(std::string path,
                          std::vector<int64_t> const& row_counts,
-                         std::vector<cudf::size_type> selected)
+                         std::vector<cudf::size_type> selected,
+                         std::size_t file_index = 0)
 {
   return row_group_slice{footer_with(row_counts),
                          std::move(path),
@@ -59,7 +62,8 @@ row_group_slice slice_of(std::string path,
                          /*estimated_output_bytes=*/0,
                          /*estimated_decode_working_bytes=*/0,
                          /*reserved_compressed_bytes=*/0,
-                         /*datasource=*/nullptr};
+                         /*datasource=*/nullptr,
+                         file_index};
 }
 
 parquet_split_info split_of(std::vector<row_group_slice> slices)
@@ -148,4 +152,74 @@ TEST_CASE("build_batch_layout rejects a row group index outside the footer", "[s
   // Better to fail than to read past the row-group list and compute a nonsense file offset.
   auto const split = split_of({slice_of("a.parquet", {4}, {3})});
   CHECK_THROWS(build_batch_layout(split));
+}
+
+TEST_CASE("build_batch_layout preserves bound file indexes independently of slice order",
+          "[scan][parquet][virtual_columns][batch_layout]")
+{
+  auto const split =
+    split_of({slice_of("b.parquet", {2}, {0}, 5), slice_of("a.parquet", {2, 3, 2}, {1}, 2)});
+  auto const layout = build_batch_layout(split);
+
+  REQUIRE(layout.size() == 2);
+  CHECK(layout[0].data_file_path == "b.parquet");
+  CHECK(layout[0].file_index == 5);
+  CHECK(layout[0].file_row_offset == 0);
+  CHECK(layout[0].batch_row_offset == 0);
+  CHECK(layout[1].data_file_path == "a.parquet");
+  CHECK(layout[1].file_index == 2);
+  CHECK(layout[1].file_row_offset == 2);
+  CHECK(layout[1].batch_row_offset == 2);
+}
+
+TEST_CASE("build_batch_layout retains file offsets when one file spans multiple splits",
+          "[scan][parquet][virtual_columns][batch_layout]")
+{
+  auto const footer   = footer_with({2, 3, 4});
+  auto first          = slice_of("a.parquet", {2, 3, 4}, {0}, 7);
+  auto last           = slice_of("a.parquet", {2, 3, 4}, {2}, 7);
+  first.file_metadata = footer;
+  last.file_metadata  = footer;
+
+  auto const first_layout = build_batch_layout(split_of({std::move(first)}));
+  auto const last_layout  = build_batch_layout(split_of({std::move(last)}));
+  REQUIRE(first_layout.size() == 1);
+  REQUIRE(last_layout.size() == 1);
+  CHECK(first_layout.front().file_index == 7);
+  CHECK(first_layout.front().file_row_offset == 0);
+  CHECK(first_layout.front().batch_row_offset == 0);
+  CHECK(last_layout.front().file_index == 7);
+  CHECK(last_layout.front().file_row_offset == 5);
+  CHECK(last_layout.front().batch_row_offset == 0);
+}
+
+TEST_CASE("build_batch_layout rejects incomplete or inconsistent provenance metadata",
+          "[scan][parquet][virtual_columns][batch_layout]")
+{
+  SECTION("missing bound file index")
+  {
+    auto split                    = split_of({slice_of("a.parquet", {1}, {0})});
+    split.rg_slices[0].file_index = invalid_parquet_file_index;
+    CHECK_THROWS(build_batch_layout(split));
+  }
+  SECTION("missing footer")
+  {
+    auto split = split_of({slice_of("a.parquet", {1}, {0})});
+    split.rg_slices[0].file_metadata.reset();
+    CHECK_THROWS(build_batch_layout(split));
+  }
+  SECTION("negative row count")
+  {
+    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {-1}, {0})})));
+  }
+  SECTION("file offset overflow")
+  {
+    auto const max = std::numeric_limits<int64_t>::max();
+    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {max, 1}, {0, 1})})));
+  }
+  SECTION("duplicate or reversed row groups")
+  {
+    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {0, 0})})));
+    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {1, 0})})));
+  }
 }

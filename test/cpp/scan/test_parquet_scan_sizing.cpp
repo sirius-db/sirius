@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+#include <cudf/strings/utilities.hpp>
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/constants.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -217,6 +220,8 @@ struct carrier_file_fixture {
           scratch.file_literal("part=2024/" + std::string{name} + ".parquet") +
           " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
     }
+    run("COPY (SELECT * FROM rows) TO " + scratch.file_literal("part=2024/路径-非常长.parquet") +
+        " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
   }
 
   std::string path(std::string const& name) const
@@ -384,6 +389,76 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
   masked.mvcc_keep_mask = sirius::scan_manager::mvcc_chunk_mask{{words, words->data()}, rows};
   CHECK(masked.get_estimated_working_set_size_in_bytes() ==
         2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
+}
+
+TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
+          "[scan][parquet][sizing][virtual_columns]")
+{
+  auto make_reader = [](std::size_t cap) {
+    auto info            = std::make_unique<scan::parquet_ingestible_table_info>();
+    info->names          = {"x"};
+    info->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+    info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
+    info->scan_output_arity      = 1;
+    info->approximate_batch_size = cap;
+    info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                                     "filename",
+                                     sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                     scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+    return scan::make_ingestible(std::move(info));
+  };
+  auto make_file = [] {
+    auto file = std::make_unique<scan::parquet_file_scan_info>();
+    file->row_groups.push_back({0, 20, 60, 10, 1});
+    file->row_groups.push_back({1, 20, 60, 10, 1});
+    return file;
+  };
+
+  SECTION("reservation includes inputs and concatenated result")
+  {
+    auto reader    = make_reader(std::numeric_limits<std::size_t>::max());
+    auto coalescer = reader->create_batch_coalescer();
+    CHECK(coalescer->push(make_file()).empty());
+    auto splits = coalescer->flush();
+    REQUIRE(splits.size() == 1);
+    CHECK(splits.front()->estimated_working_set_bytes() == 240);
+  }
+
+  SECTION("coalescer applies the concatenation peak to its byte cap")
+  {
+    auto reader    = make_reader(200);
+    auto coalescer = reader->create_batch_coalescer();
+    auto splits    = coalescer->push(make_file());
+    auto tail      = coalescer->flush();
+    for (auto& split : tail) {
+      splits.push_back(std::move(split));
+    }
+    REQUIRE(splits.size() == 2);
+    for (auto const& split : splits) {
+      CHECK(split->estimated_working_set_bytes() == 60);
+    }
+  }
+
+  SECTION("separate files share the peak budget and flush resets the run count")
+  {
+    auto reader    = make_reader(240);
+    auto coalescer = reader->create_batch_coalescer();
+    auto push_one  = [&] {
+      auto file = make_file();
+      file->row_groups.resize(1);
+      return coalescer->push(std::move(file));
+    };
+    CHECK(push_one().empty());
+    CHECK(push_one().empty());
+    auto full = push_one();
+    REQUIRE(full.size() == 1);
+    CHECK(full.front()->estimated_working_set_bytes() == 240);
+    CHECK(full.front()->estimated_bytes() == 40);
+    auto tail = coalescer->flush();
+    REQUIRE(tail.size() == 1);
+    CHECK(tail.front()->estimated_working_set_bytes() == 60);
+    CHECK(tail.front()->estimated_bytes() == 20);
+  }
 }
 
 TEST_CASE("parquet synthetic filter-only columns only increase the decode working set",
@@ -971,6 +1046,90 @@ TEST_CASE_METHOD(carrier_file_fixture,
   CHECK(split->plan->partition_primary_indices.count(carrier_names().size()) == 1);
   CHECK(split->plan->output_layout.empty());
   CHECK(split->plan->carrier_batch_index.has_value());
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet filename virtual sizing charges UTF-8 paths offsets and scratch",
+                 "[scan][parquet][sizing][virtual_columns]")
+{
+  // A one-byte cap forces one row group per split: no concatenation allowance can hide
+  // missing filename-construction scratch in the admission estimate.
+  auto info        = make_info({"路径-非常长"}, 1);
+  info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
+  info->scan_output_arity = 1;
+  info->virtual_columns   = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                              "filename",
+                              sirius::logical_type::make(sirius::type_id::VARCHAR),
+                              scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+  auto reader             = scan::make_ingestible(std::move(info));
+  auto baseline_reader    = scan::make_ingestible(make_info({"路径-非常长"}));
+  auto file               = read_file(*reader);
+  auto baseline           = read_file(*baseline_reader);
+  REQUIRE(file->row_groups.size() == baseline->row_groups.size());
+  for (std::size_t i = 0; i < file->row_groups.size(); ++i) {
+    auto const rows  = static_cast<std::size_t>(file->row_groups[i].num_rows);
+    auto const chars = rows * file->file_path.size();
+    auto const offset_width =
+      cudf::strings::is_large_strings_enabled() &&
+          chars >= static_cast<std::size_t>(cudf::strings::get_offset64_threshold())
+        ? 8
+        : 4;
+    auto const filename_bytes = chars + (rows + 1) * offset_width;
+    CHECK(file->row_groups[i].output_bytes ==
+          baseline->row_groups[i].output_bytes + filename_bytes);
+    CHECK(file->row_groups[i].decode_working_bytes ==
+          baseline->row_groups[i].decode_working_bytes + filename_bytes + rows * 16);
+  }
+  auto const groups = file->row_groups;
+  std::vector<std::unique_ptr<scan::parquet_file_scan_info>> files;
+  files.push_back(std::move(file));
+  auto splits = coalesce_files(*reader, std::move(files));
+  REQUIRE(splits.size() == groups.size());
+  for (std::size_t i = 0; i < splits.size(); ++i) {
+    CHECK(splits[i]->estimated_working_set_bytes() == groups[i].decode_working_bytes);
+  }
+}
+
+TEST_CASE("parquet filename sizing handles offset thresholds and overflow",
+          "[scan][parquet][sizing][virtual_columns]")
+{
+  auto const threshold = static_cast<std::size_t>(cudf::strings::get_offset64_threshold());
+  auto const wide      = cudf::strings::is_large_strings_enabled();
+  SECTION("offset width changes at the threshold, including the terminal offset")
+  {
+    auto const below = scan::estimate_filename_column_size(1, threshold - 1);
+    CHECK(below.output_bytes == threshold - 1 + 2 * 4);
+    CHECK(below.working_bytes == below.output_bytes + 16);
+    for (auto const chars : {threshold, threshold + 1}) {
+      auto const at_or_above = scan::estimate_filename_column_size(1, chars);
+      CHECK(at_or_above.output_bytes == chars + 2 * (wide ? 8 : 4));
+      CHECK(at_or_above.working_bytes == at_or_above.output_bytes + 16);
+    }
+  }
+  SECTION("empty column has no buffers")
+  {
+    auto const empty = scan::estimate_filename_column_size(0, threshold);
+    CHECK(empty.output_bytes == 0);
+    CHECK(empty.working_bytes == 0);
+  }
+  SECTION("individual products and sums saturate rather than wrapping")
+  {
+    auto const max = std::numeric_limits<std::size_t>::max();
+    // Character multiplication, terminal offset count, and character/offset addition.
+    for (auto const [rows, path_bytes] : {std::pair{std::size_t{2}, max},
+                                          std::pair{max, std::size_t{0}},
+                                          std::pair{std::size_t{1}, max - 4}}) {
+      auto const size = scan::estimate_filename_column_size(rows, path_bytes);
+      CHECK(size.output_bytes == max);
+      CHECK(size.working_bytes == max);
+    }
+    // Pair multiplication and output-plus-pairs addition can overflow independently.
+    for (auto const rows : {max / 16 + 1, max / 20 + 1}) {
+      auto const size = scan::estimate_filename_column_size(rows, 0);
+      CHECK(size.output_bytes < max);
+      CHECK(size.working_bytes == max);
+    }
+  }
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,
