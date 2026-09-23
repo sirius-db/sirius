@@ -378,7 +378,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     std::string const& file_path,
     std::size_t file_index,
     std::int64_t file_row_offset,
-    rmm::cuda_stream_view stream,
+    ::cuda::stream_ref stream,
     rmm::device_async_resource_ref mr) const;
 
   [[nodiscard]] bool can_project_during_filter() const noexcept;
