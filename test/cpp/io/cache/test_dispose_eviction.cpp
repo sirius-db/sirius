@@ -23,6 +23,7 @@
 #include "io/io_context.hpp"
 #include "io/sirius_datasource.hpp"
 #include "memory/topology_index.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "scan/test_utils.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -73,7 +74,16 @@ struct temp_data_file {
   }
 };
 
-/// Pull `global[... evictions=N ...]` out of prefetching_cache::summary().
+/// Pull a counter out of `global[...]` in prefetching_cache::summary().
+std::uint64_t global_counter(std::string const& summary, std::string const& name)
+{
+  std::smatch m;
+  auto const re = std::regex("global\\[[^\\]]*" + name + "=(\\d+)");
+  if (!std::regex_search(summary, m, re)) { return 0; }
+  return std::stoull(m[1].str());
+}
+
+/// Pull the eviction count out of prefetching_cache::summary().
 std::uint64_t evictions_from(std::string const& summary)
 {
   std::smatch m;
@@ -227,4 +237,43 @@ TEST_CASE("dispose_on_idle keeps a chunk a live request still shares", "[cache][
   // a chunk when it is idle -- not when one of several subscribers lets go.
   INFO("cache: " << cache->summary());
   CHECK(claimed_after_sweep(*cache, 4 * chunk, std::chrono::milliseconds(2000)) == 3 * chunk);
+}
+
+TEST_CASE("scan inputs populate the cache without a readahead manager",
+          "[cache][scan][no_readahead]")
+{
+  temp_data_file file(8ull << 20);
+  auto memory             = initialize_memory_manager(1);
+  auto topology           = single_gpu_index_for_dispose();
+  auto cfg                = dispose_on_idle_config();
+  cfg.cache.eviction      = sirius::io::cache::eviction_policy::lru;
+  cfg.max_readahead_scans = 0;
+  cfg.apply_cache_mode();
+  sirius_scan_manager manager{cfg, *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+  REQUIRE(cache->is_armed());
+
+  auto make_input = [&]() {
+    auto ds = manager.create_datasource(file.path.string());
+    std::vector<sirius::op::scan::scan_info::fadvise_entry> hints;
+    hints.push_back({ds, {cudf::io::text::byte_range_info{0, 4096}}});
+    auto info = std::make_shared<sirius::op::scan::scan_info>(std::move(hints));
+    return std::pair{ds, std::make_unique<sirius::op::scan::scan_operator_input>(info)};
+  };
+
+  auto [first_ds, first_input] = make_input();
+  // A later readahead preparation of the same handle is idempotent.
+  REQUIRE(first_ds->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  std::vector<std::uint8_t> bytes(4096);
+  REQUIRE(first_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  CHECK(bytes.front() == static_cast<std::uint8_t>('z'));
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "h2d") > 0);
+
+  first_input.reset();
+  auto [second_ds, second_input] = make_input();
+  REQUIRE(second_ds->host_read(0, bytes.size(), bytes.data()) == bytes.size());
+  INFO(cache->summary());
+  CHECK(global_counter(cache->summary(), "hits") > 0);
 }
