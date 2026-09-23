@@ -1,0 +1,17 @@
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -1523,10 +1523,11 @@
+     target_link_libraries(cuvs_objs PUBLIC $<BUILD_LOCAL_INTERFACE:NCCL::NCCL>)
+   endif()
+ 
+-  set(CUVS_CUSOLVER_DEPENDENCY CUDA::cusolver${_ctk_static_suffix})
+-  set(CUVS_CUBLAS_DEPENDENCY CUDA::cublas${_ctk_static_suffix})
++  find_package(cusolver CONFIG REQUIRED)
++  set(CUVS_CUSOLVER_DEPENDENCY cusolver::cusolver_static)
++  set(CUVS_CUBLAS_DEPENDENCY cublas::cublas_static)
+   set(CUVS_CURAND_DEPENDENCY CUDA::curand${_ctk_static_suffix})
+-  set(CUVS_CUSPARSE_DEPENDENCY CUDA::cusparse${_ctk_static_suffix})
++  set(CUVS_CUSPARSE_DEPENDENCY cusparse::cusparse_static)
+ 
+   set(CUVS_CTK_MATH_DEPENDENCIES ${CUVS_CUBLAS_DEPENDENCY} ${CUVS_CUSOLVER_DEPENDENCY}
+                                  ${CUVS_CUSPARSE_DEPENDENCY} ${CUVS_CURAND_DEPENDENCY}

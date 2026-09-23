@@ -1,0 +1,22 @@
+{
+  "12": {
+    "component": "cuda_cudart",
+    "linux-sbsa": {
+      "sha512": "21b67838460973f14ecc425b42c89256444a5c8a0a657d30e4bb0dc82a1a679b805bb92e3f6b181f85d4b7e3f18375881fadc687d2dfc5e21da79af2bc572881"
+    },
+    "linux-x86_64": {
+      "sha512": "8960154566ae5c4f0abb5059d504d672a51814b1746cc9d4bf7d338a4a8ff57158e1f0d22c238f288995466659bce53a65180eda21b258fc1e2e7167f68c9427"
+    },
+    "version": "12.9.79"
+  },
+  "13": {
+    "component": "cuda_culibos",
+    "linux-sbsa": {
+      "sha512": "e6315b8a1d6378ff7bf2e07e69da8b8017feae3496da88d76a691162afdf8df4823e0b6c426336af055690725ca9f858d045008e02b1f2391a2215c4ab7741c4"
+    },
+    "linux-x86_64": {
+      "sha512": "ef2f452324c30a6ffa699c725611bdbf45e1834c3519b0650f022cbedf9fb35cb32205ee108008658b63b04d903b5fb8dc94b249506b6920292937d66c37b27e"
+    },
+    "version": "13.3.33"
+  }
+}
