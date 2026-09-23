@@ -194,8 +194,8 @@ candidate shapes, so this cache is what makes runtime codegen practical.
 
 There are two levels, both keyed by the same tuple: a 64-bit FNV-1a digest of the rendered
 source (plus the kernel entry symbol), the GPU architecture (`sm_XX`), the CUDA runtime
-version, and the driver version. Keying on all four means a renderer change, a different
-GPU, or a toolchain upgrade can never produce a false hit.
+version, and the driver version. Header contents are not currently part of the key; after
+changing JIT headers, restart with an empty or disabled disk cache.
 
 1. **In-memory** (per process, thread-safe): `shape → compiled kernel`. A shape compiled
    during `compress` is reused by `decompress` in the same process.
@@ -219,8 +219,14 @@ headers (`nvrtcCreateProgram`):
   by `cmake/embed_jit_headers.cmake`;
 - the CCCL closure (`<cuda/std/...>`, `<cub/...>`, and `<thrust/...>`) — the transitive
   `#include` set reachable from the kernel preludes, scanned at build time and embedded by
-  `cmake/embed_cccl_headers.cmake` (so it tracks the CCCL version the extension is built
-  against).
+  `cmake/embed_cccl_headers.cmake`.
+
+Simpatico links to `cudf::cudf`, inheriting libcudf's CCCL headers and namespace/feature
+definitions through its exported CMake targets. CMake also supplies the embedding script
+with the evaluated include directories from `CCCL::CCCL`. This supports both installed
+packages and source checkouts with separate CUB, Thrust, and libcudacxx include directories.
+For nonstandard installations, use the usual CMake package discovery settings such as
+`CMAKE_PREFIX_PATH` or `cudf_DIR`.
 
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).
