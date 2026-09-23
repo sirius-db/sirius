@@ -184,8 +184,10 @@ impl Drop for NixlTransport {
 
 #[cfg(feature = "nixl-transport")]
 impl crate::nixl_chunk::NixlMdHandler for NixlTransport {
-    fn on_peer_md(&self, peer_metadata: &[u8]) -> Result<Vec<u8>, String> {
-        self.load_peer_md(peer_metadata)?;
+    /// Replies with the cached local blob without touching the agent thread. Only the WRITE
+    /// initiator needs the target's metadata; loading the caller's here would block on this
+    /// CN's transport thread, which deadlocks when both CNs open a hop to each other at once.
+    fn on_peer_md(&self, _peer_metadata: &[u8]) -> Result<Vec<u8>, String> {
         Ok((*self.local_md()?).to_vec())
     }
 }
@@ -376,6 +378,8 @@ mod agent_tier {
         staging_base: u64,
         /// Peers that have already run the log-only first-contact canary.
         canaried: std::collections::HashSet<String>,
+        /// Remote agent name per peer brpc address, once its metadata is loaded.
+        peer_agents: std::collections::HashMap<SocketAddr, String>,
         /// Keeps the arena registered with the agent for the thread's lifetime.
         _arena_registration: RegistrationHandle,
         /// Kept so the `cudaMalloc` region cannot be freed while registered.
@@ -451,6 +455,7 @@ mod agent_tier {
                 local_md,
                 staging_base,
                 canaried: std::collections::HashSet::new(),
+                peer_agents: std::collections::HashMap::new(),
                 _arena_registration: arena_registration,
                 _arena: arena,
             })
@@ -473,15 +478,22 @@ mod agent_tier {
             let hop_start_us = crate::timing::unix_us();
             let hop_started = Instant::now();
             let mut hop = HopTiming::default();
-            let peer_md = exchange_md(spec.peer, &self.local_md)?;
-            let remote_agent = self.load_peer_md(&peer_md)?;
-            if remote_agent != spec.peer_agent_name {
-                tracing::warn!(
-                    expected = %spec.peer_agent_name,
-                    loaded = %remote_agent,
-                    "nixl peer agent name differs from the advertised brpc identity"
-                );
-            }
+            let remote_agent = match self.peer_agents.get(&spec.peer) {
+                Some(agent) => agent.clone(),
+                None => {
+                    let peer_md = exchange_md(spec.peer, &self.local_md)?;
+                    let agent = self.load_peer_md(&peer_md)?;
+                    if agent != spec.peer_agent_name {
+                        tracing::warn!(
+                            expected = %spec.peer_agent_name,
+                            loaded = %agent,
+                            "nixl peer agent name differs from the advertised brpc identity"
+                        );
+                    }
+                    self.peer_agents.insert(spec.peer, agent.clone());
+                    agent
+                }
+            };
             if self.canaried.insert(remote_agent.clone()) {
                 self.first_contact_canary(spec, executor, &remote_agent)?;
             }
