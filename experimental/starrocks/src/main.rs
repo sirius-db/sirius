@@ -44,6 +44,28 @@ struct Args {
     /// Sirius engine bring-up settings.
     #[command(flatten, next_help_heading = "Engine")]
     engine: EngineConfig,
+
+    /// All-to-all NIXL bandwidth benchmark (no FE).
+    #[command(flatten, next_help_heading = "Bench")]
+    bench: BenchConfig,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+/// All-to-all NIXL bandwidth benchmark against one peer CN, without an FE. When
+/// `--bench-a2a-bytes` is set, the CN serves brpc, runs the benchmark, prints the result, exits.
+struct BenchConfig {
+    /// Bytes per GPU per round (split across the two workers), e.g. 2048000000.
+    #[arg(long)]
+    bench_a2a_bytes: Option<u64>,
+    /// Peer brpc endpoint `host:port`.
+    #[arg(long)]
+    bench_peer: Option<String>,
+    /// Bytes per packed frame (one NIXL WRITE).
+    #[arg(long, default_value_t = 15 << 20)]
+    bench_chunk_bytes: u64,
+    /// Timed rounds after one warm-up.
+    #[arg(long, default_value_t = 4)]
+    bench_rounds: u32,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -125,6 +147,18 @@ impl Args {
         let leases: Option<Arc<dyn StagingLeaseHandler>> = Some(Arc::new(executor.clone()));
         let service = service.with_nixl_control(md, leases);
 
+        if let Some(bytes) = self.bench.bench_a2a_bytes {
+            return run_bench_a2a(
+                &self.bench,
+                bytes,
+                &self.compute_node,
+                service,
+                transport,
+                executor,
+            )
+            .await;
+        }
+
         let state = SharedHeartbeatState::new();
 
         // HeartbeatService tells FE this process is alive and captures FE identity. The configured
@@ -172,6 +206,49 @@ impl Args {
         drop(executor);
         result
     }
+}
+
+/// Serves brpc (Md, Lease, Packed from the peer), runs the all-to-all bench, prints one line.
+async fn run_bench_a2a(
+    bench: &BenchConfig,
+    bytes: u64,
+    compute_node: &ComputeNodeConfig,
+    service: SiriusComputeNodeService,
+    transport: Option<Arc<sirius_starrocks_cn::NixlTransport>>,
+    executor: Arc<dyn FragmentExecutor>,
+) -> Result<()> {
+    let peer_text = bench
+        .bench_peer
+        .clone()
+        .ok_or_else(|| anyhow!("--bench-a2a-bytes needs --bench-peer host:port"))?;
+    let peer = std::net::ToSocketAddrs::to_socket_addrs(peer_text.as_str())?
+        .next()
+        .ok_or_else(|| anyhow!("cannot resolve --bench-peer {peer_text}"))?;
+    let transport =
+        transport.ok_or_else(|| anyhow!("--bench-a2a-bytes needs the nixl-transport feature"))?;
+    let brpc_runtime = BrpcRuntime::start(compute_node, service)?;
+    let config = sirius_starrocks_cn::BenchA2a {
+        peer,
+        peer_agent_name: peer_text,
+        bytes,
+        chunk: bench.bench_chunk_bytes,
+        rounds: bench.bench_rounds,
+    };
+    #[cfg(feature = "nixl-transport")]
+    let outcome = tokio::task::spawn_blocking(move || config.run(transport, executor))
+        .await
+        .map_err(|err| anyhow!("bench task failed: {err}"))?;
+    #[cfg(not(feature = "nixl-transport"))]
+    let outcome: std::result::Result<String, String> = {
+        let _ = (config, transport, executor);
+        Err("built without nixl-transport".to_string())
+    };
+    brpc_runtime.shutdown.cancel();
+    let _ = brpc_runtime.join.await;
+    let line = outcome.map_err(|err| anyhow!(err))?;
+    println!("{line}");
+    info!("{line}");
+    Ok(())
 }
 
 /// Warns when an engine config is supplied but the engine was compiled out, so the flag is

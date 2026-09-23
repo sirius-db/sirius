@@ -199,6 +199,8 @@ fn run_fragment<'ctx>(
     registry: &mut ParkedRegistry<sirius::Fragment<'ctx>>,
     request: &ExecuteRequest,
 ) -> Result<Option<FragmentResult>, String> {
+    let start_us = crate::timing::unix_us();
+    let started = std::time::Instant::now();
     let mut fragment = context
         .fragment()
         .map_err(|err| format!("failed to create fragment: {err}"))?;
@@ -268,6 +270,7 @@ fn run_fragment<'ctx>(
     fragment
         .build(&request.plan)
         .map_err(|err| format!("failed to plan fragment: {err}"))?;
+    let built = started.elapsed();
 
     for schema in &request.stream_inputs {
         let stream_id = stream_id_of(schema.node_id)?;
@@ -320,18 +323,48 @@ fn run_fragment<'ctx>(
         );
     }
 
+    let inputs_done = started.elapsed();
     fragment
         .run()
         .map_err(|err| format!("failed to execute fragment: {err}"))?;
+    let ran = started.elapsed();
 
-    if !request.outputs.is_empty() {
+    let result = if !request.outputs.is_empty() {
         registry.park(&request.outputs, fragment)?;
-        return Ok(None);
+        None
+    } else {
+        Some(
+            fragment
+                .result_to_arrow()
+                .map(|result| FragmentResult::new(result.batches))
+                .map_err(|err| err.to_string())?,
+        )
+    };
+    if crate::timing::enabled() {
+        let remote_batches: usize = request
+            .remote_inputs
+            .iter()
+            .map(|(_, _, batches)| batches.len())
+            .sum();
+        let remote_bytes: u64 = request
+            .remote_inputs
+            .iter()
+            .flat_map(|(_, _, batches)| batches.iter().map(|batch| batch.len))
+            .sum();
+        info!(
+            start_us,
+            end_us = crate::timing::unix_us(),
+            build_us = crate::timing::us(built),
+            inputs_us = crate::timing::us(inputs_done - built),
+            run_us = crate::timing::us(ran - inputs_done),
+            total_us = crate::timing::us(started.elapsed()),
+            outputs = request.outputs.len(),
+            remote_batches,
+            remote_bytes,
+            "fragment timing"
+        );
     }
-    fragment
-        .result_to_arrow()
-        .map(|result| Some(FragmentResult::new(result.batches)))
-        .map_err(|err| err.to_string())
+    Ok(result)
 }
 
 fn stream_id_of(node_id: i32) -> Result<u64, String> {

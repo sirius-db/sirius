@@ -44,6 +44,7 @@ use thrift::{
 };
 use tracing::{debug, info, instrument, warn};
 
+mod bench_a2a;
 mod brpc;
 mod compute_node_service;
 #[cfg(feature = "sirius-engine")]
@@ -59,7 +60,10 @@ mod proto;
 mod prpc;
 mod result_encoder;
 mod result_store;
+#[cfg_attr(not(feature = "sirius-engine"), allow(dead_code))]
+mod timing;
 
+pub use bench_a2a::BenchA2a;
 pub use brpc::BrpcServer;
 pub use compute_node_service::{ExchangeIdentity, SiriusComputeNodeService};
 #[cfg(feature = "sirius-engine")]
