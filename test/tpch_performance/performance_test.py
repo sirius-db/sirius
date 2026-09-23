@@ -403,9 +403,7 @@ def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
     Every check here catches a mistake that would otherwise yield a plausible
     number rather than an error.
     """
-    profile = (
-        PROFILES[profile_name] if profile_name is not None else DEFAULT_PROFILE
-    )
+    profile = PROFILES[profile_name] if profile_name is not None else DEFAULT_PROFILE
     label = f"--profile {profile_name}" if profile_name is not None else f"--pin {pin}"
     problems = []
     warnings = []
@@ -477,9 +475,7 @@ def check_profile_sanity(profile_name, overrides, config_path, engine, pin):
     for w in warnings:
         log(f"  WARNING: {w}")
     if problems:
-        raise SystemExit(
-            "profile sanity check failed:\n  - " + "\n  - ".join(problems)
-        )
+        raise SystemExit("profile sanity check failed:\n  - " + "\n  - ".join(problems))
 
 
 def cache_overrides_for(profile_name, pin):
@@ -1848,11 +1844,7 @@ def main():
 
     # No --profile means change nothing: the profile is inert and the config
     # below is left exactly as the user wrote it.
-    profile = (
-        PROFILES[args.profile]
-        if args.profile is not None
-        else DEFAULT_PROFILE
-    )
+    profile = PROFILES[args.profile] if args.profile is not None else DEFAULT_PROFILE
     # --mode overrides ordering and the drop placement, and forces a cache drop
     # at that placement (its defining property). Any cache mode/eviction the
     # profile asked for is kept.
@@ -1872,9 +1864,7 @@ def main():
             "reset_cache_between": True,
             "summary": f"mode={args.mode}: {mode_props['summary']}",
         }
-    cache_overrides = (
-        {} if uses_precmd else cache_overrides_for(args.profile, args.pin)
-    )
+    cache_overrides = {} if uses_precmd else cache_overrides_for(args.profile, args.pin)
     if not uses_precmd:
         label = args.mode or args.profile or "(unset)"
         log(f"Profile:       {label} — {profile['summary']}")
@@ -1920,9 +1910,7 @@ def main():
             )
     else:
         log("Deriving effective Sirius config")
-        config_path = derive_profile_config(
-            cache_overrides, config_path, benchmark_dir
-        )
+        config_path = derive_profile_config(cache_overrides, config_path, benchmark_dir)
         os.environ["SIRIUS_CONFIG_FILE"] = config_path
 
     log(f"Source:        {source}")
