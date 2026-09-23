@@ -6,6 +6,38 @@ this project), which then pulls in SiriusDB as an extension. We use
 - symlinked sirius-specific `CMakePresets.json` (at `cmake/CMakePresets.json`) to version control the build config.
 - [pixi](https://pixi.prefix.dev/) to manage build dependencies.
 
+## Public API documentation
+
+Build the C++ reference for `include/sirius/` with:
+
+```bash
+pixi run -e docs docs
+```
+
+Open `build/docs/html/index.html` in your browser.
+
+The isolated `docs` environment supports Linux x86_64 and aarch64, plus macOS on
+Apple Silicon (`osx-arm64`). It needs no GPU, engine build, or initialized
+submodules. The task runs Doxygen directly; no Python or helper script is needed.
+The theme and Sirius logo follow the system light/dark preference using CSS and
+Doxygen's default header. Doxygen configuration and styling live in `docs/api/`;
+generated output stays under `build/docs/`.
+
+The `docs-theme` dependency task downloads [Doxygen Awesome](https://github.com/jothepro/doxygen-awesome-css)
+v2.5.0 at commit `46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da`, verifies the archive's
+SHA-256 checksum, and caches its CSS and MIT license under
+`build/docs/theme/`. The first build needs network access and `tar`; subsequent
+builds reuse the cached assets. The license is included in the generated site.
+To upgrade the theme, update the commit, version, and checksum in `pixi.toml`,
+then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
+
+The **Docs** workflow builds pull requests and merge-queue entries, uploading
+the HTML as a `github-pages` artifact. Pushes to `dev` build and deploy the site;
+deployment runs only for those pushes.
+For the first deployment, set **Settings → Pages → Build and deployment → Source**
+to **GitHub Actions**, and allow `dev` in the `github-pages` environment's deployment
+rules. The published URL appears on the deployment job.
+
 ## Building Sirius
 
 Clone the repository with all submodules:

@@ -1,0 +1,37 @@
+PROJECT_NAME           = Sirius
+PROJECT_BRIEF          = "GPU-native analytics · C++ API reference"
+PROJECT_LOGO           = docs/logo/sirius_light_full.svg
+OUTPUT_DIRECTORY       = build/docs
+INPUT                  = include/sirius docs/api/index.md
+FILE_PATTERNS          = *.hpp *.h *.cuh *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE  = docs/api/index.md
+STRIP_FROM_PATH        = .
+STRIP_FROM_INC_PATH    = include
+EXTRACT_ALL            = YES
+JAVADOC_AUTOBRIEF      = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+HIDE_FRIEND_COMPOUNDS   = YES
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+VERBATIM_HEADERS       = YES
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED            = SIRIUS_FFI_EXPORT=
+SEARCH_INCLUDES        = NO
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT
+HTML_EXTRA_STYLESHEET  = build/docs/theme/doxygen-awesome.css \
+                         docs/api/sirius.css
+HTML_EXTRA_FILES       = build/docs/theme/LICENSE \
+                         docs/logo/sirius_dark_full.svg
+HAVE_DOT               = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
