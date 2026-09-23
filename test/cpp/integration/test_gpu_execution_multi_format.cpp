@@ -2125,3 +2125,28 @@ TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
   compare_gpu_vs_cpu("SELECT SUM(amount) as total FROM read_parquet('" + hive_path +
                      "', hive_partitioning=true)");
 }
+
+TEST_CASE_METHOD(MultiFormatFixtureBase,
+                 "gpu_execution parquet virtual columns preserve source identity",
+                 "[.][integration][gpu_execution][scan][virtual_columns]")
+{
+  auto const path =
+    (get_project_root() / "test/cpp/integration/data/parquet/nation.parquet").string();
+  compare_gpu_vs_cpu(
+    "SELECT filename, file_index, file_row_number, n_nationkey, filename "
+    "FROM read_parquet('" +
+    path + "') ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT file_index, file_row_number, n_nationkey FROM read_parquet(['" + path +
+                     "', '" + path + "']) ORDER BY file_index, file_row_number");
+}
+
+TEST_CASE_METHOD(MultiFormatFixtureBase,
+                 "gpu_execution parquet virtual columns participate in residual filters",
+                 "[.][integration][gpu_execution][scan][virtual_columns]")
+{
+  auto const path =
+    (get_project_root() / "test/cpp/integration/data/parquet/nation.parquet").string();
+  compare_gpu_vs_cpu("SELECT n_nationkey, file_row_number FROM read_parquet('" + path +
+                     "') WHERE file_row_number BETWEEN 3 AND 7 "
+                     "AND n_nationkey >= 4 ORDER BY file_row_number");
+}

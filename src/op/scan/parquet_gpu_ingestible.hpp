@@ -42,6 +42,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -72,6 +73,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  std::vector<bound_virtual_column> virtual_columns;
   /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
   /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
   /// dynamic-filter operator applies membership filters post-decode.
@@ -95,6 +97,19 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   [[nodiscard]] std::string display_name() const override
   {
     return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
+  }
+
+  [[nodiscard]] bool has_requested_user_virtual_columns() const
+  {
+    for (auto const& column : column_ids) {
+      if (!column.HasPrimaryIndex()) { continue; }
+      auto const id = column.GetPrimaryIndex();
+      if (column.IsVirtualColumn() && id != duckdb::COLUMN_IDENTIFIER_ROW_ID &&
+          id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
+        return true;
+      }
+    }
+    return false;
   }
 };
 
@@ -213,6 +228,8 @@ class parquet_file_scan_info : public scan_info {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   /// File path (also the datasource cache key).
   std::string file_path;
+  /// Stable position in DuckDB's bound file list.
+  std::size_t file_index = 0;
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
   std::shared_ptr<io::sirius_datasource> datasource;
@@ -344,6 +361,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+                                                  std::size_t file_index,
                                                   std::shared_ptr<io::ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
@@ -359,6 +377,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+  std::unordered_map<duckdb::column_t, sirius::logical_type> _virtual_types;
+  bool _has_virtual_filter = false;
 
   // This scan's pushed-down filter digested once at bind — what filter_analysis()
   // advertises. Empty when the scan has no pushed-down filter.

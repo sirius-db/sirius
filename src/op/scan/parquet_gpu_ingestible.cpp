@@ -34,6 +34,7 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
+#include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -67,6 +68,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -183,6 +185,9 @@ std::vector<null_prune_predicate> collect_null_prune_predicates(
   };
 
   for (auto const& [column_index, filter] : filters.filters) {
+    if (column_index >= column_ids.size() || column_ids[column_index].IsVirtualColumn()) {
+      continue;
+    }
     // A partition column has no statistics in the file to prune on, and a
     // column that is not in the batch cannot be pruned by — both are simply
     // skipped here, unlike a conjunct that has to be evaluated.
@@ -267,7 +272,8 @@ class parquet_batch_coalescer : public batch_coalescer {
                          : std::shared_ptr<io::sirius_datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
-        file->reader_options};
+        file->reader_options,
+        file->file_index};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
@@ -299,7 +305,8 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_output,
                            cur_working,
                            cur_comp,
-                           std::move(slice_ds));
+                           std::move(slice_ds),
+                           file->file_index);
       _produced_any = true;
       _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
@@ -349,7 +356,8 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_output_bytes=*/0,
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
-                           _empty_split_fallback->datasource);
+                           _empty_split_fallback->datasource,
+                           _empty_split_fallback->file_index);
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
@@ -399,6 +407,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+    std::size_t file_index;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -504,12 +513,23 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                             bind.names,
                                                             bind.returned_types,
                                                             bind.scan_output_arity,
-                                                            bind.partition_indices));
+                                                            bind.partition_indices,
+                                                            bind.virtual_columns));
+  for (auto const& column : bind.virtual_columns) {
+    _virtual_types.emplace(column.column_id, column.type);
+  }
 
   // AST translation deferred to materialize_table so a task-local stream is used.
   // Filters on hive-partition columns are dropped — those columns aren't in the
   // parquet file (DuckDB prunes them at the file-list level already).
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
+    for (auto const& [column_index, filter] : bind.table_filters->filters) {
+      if (column_index < bind.column_ids.size() &&
+          bind.column_ids[column_index].IsVirtualColumn() &&
+          _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
+        _has_virtual_filter = true;
+      }
+    }
     // Collected from the filters themselves, not the expression built below --
     // see collect_null_prune_predicates. Independent of whether any part of the
     // predicate survives into reader-side pushdown.
@@ -523,7 +543,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       bind.column_ids,
                                                       bind.returned_types,
                                                       _plan->batch_position_by_column_id,
-                                                      _plan->partition_primary_indices);
+                                                      _plan->partition_primary_indices,
+                                                      _virtual_types,
+                                                      _plan->has_user_virtual_columns());
     if (duckdb_expression) {
       // Validate before scan tasks retranslate and dereference the predicate.
       if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
@@ -587,7 +609,9 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                             bind.column_ids,
                                             bind.returned_types,
                                             _plan->batch_position_by_column_id,
-                                            _plan->partition_primary_indices),
+                                            _plan->partition_primary_indices,
+                                            _virtual_types,
+                                            _plan->has_user_virtual_columns()),
         answerable_positions);
     }
   }
@@ -654,8 +678,8 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   auto const& file_path = _file_paths[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, io_ctx);
+  return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, idx, io_ctx);
   };
 }
 
@@ -663,7 +687,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::size_t file_index,
+  std::shared_ptr<io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -730,7 +756,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     auto const names = _plan->data_column_names();
     scanned_column_names.insert(names.begin(), names.end());
   }
-  bool disable_filter_pushdown = false;
+  bool stats_filter_unsafe = false;
   for (auto const& elem : metadata.schema) {
     if (restrict_to_scanned && !scanned_column_names.contains(elem.name)) { continue; }
     bool const is_decimal = (elem.converted_type.has_value() &&
@@ -740,16 +766,17 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     if (!is_decimal) { continue; }
     if (elem.type == cudf::io::parquet::Type::FIXED_LEN_BYTE_ARRAY ||
         elem.type == cudf::io::parquet::Type::BYTE_ARRAY) {
-      disable_filter_pushdown = true;
+      stats_filter_unsafe = true;
       break;
     }
   }
+  bool const disable_filter_pushdown = _plan->has_user_virtual_columns() || stats_filter_unsafe;
 
   // Translate the filter for reader-side row-group pruning unless disabled. The
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
   // Pushes _static_pushdown_expression, not the full predicate.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_static_pushdown_expression && !disable_filter_pushdown) {
+  if (_static_pushdown_expression && !stats_filter_unsafe && !_has_virtual_filter) {
     auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
       return _plan->batch_column_name(ref_index);
     };
@@ -791,7 +818,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     auto const pure_filter_positions = _plan->pure_filter_batch_positions();
     bool has_data_output             = false;
     for (auto const& output : _plan->output_layout) {
-      if (output.source == scan_plan::output_entry::DATA) {
+      if (output.source == scan_plan::output_entry::DATA &&
+          output.idx < _plan->data_columns.size()) {
         has_data_output = true;
         break;
       }
@@ -1028,12 +1056,28 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     auto const partition_bytes = row_count * partition_row_bytes;
     estimate.output_bytes += partition_bytes;
     estimate.decode_working_bytes += partition_bytes;
+    for (auto const& virtual_column : _plan->virtual_columns) {
+      std::size_t bytes = 0;
+      if (virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILENAME) {
+        bytes = row_count * (file_path.size() + sizeof(cudf::size_type));
+      } else {
+        bytes = row_count * sizeof(std::uint64_t);
+      }
+      estimate.decode_working_bytes += bytes;
+      bool const appears_in_output = std::any_of(
+        _plan->output_layout.begin(), _plan->output_layout.end(), [&](auto const& entry) {
+          return entry.source == scan_plan::output_entry::DATA &&
+                 entry.idx == virtual_column.materialized_idx;
+        });
+      if (appears_in_output) { estimate.output_bytes += bytes; }
+    }
     return estimate;
   };
 
   auto out                     = std::make_unique<parquet_file_scan_info>();
   out->file_metadata           = file_metadata;
   out->file_path               = file_path;
+  out->file_index              = file_index;
   out->datasource              = std::move(sirius_ds);
   out->reader_options          = carrier_unavailable ? _natural_reader_options : _reader_options;
   out->carrier_unavailable     = carrier_unavailable;
@@ -1149,8 +1193,78 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   if (reader_filter_root) { opts.set_filter(*reader_filter_root); }
 
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
-  auto [table, _] =
-    cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+  std::unique_ptr<cudf::table> table;
+  if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
+    // Correctness baseline: decode one selected row group at a time in explicit
+    // split order. This avoids depending on an undocumented multi-source output
+    // ordering contract while provenance columns are being synthesized.
+    std::vector<std::unique_ptr<cudf::table>> pieces;
+    for (auto const& slice : split.rg_slices) {
+      if (!slice.file_metadata) {
+        throw sirius::internal_exception(
+          "parquet virtual scan: row-group slice has no footer metadata");
+      }
+      auto const& row_groups   = slice.file_metadata->row_groups;
+      std::int64_t file_offset = 0;
+      std::vector<std::int64_t> offsets(row_groups.size() + 1, 0);
+      for (std::size_t i = 0; i < row_groups.size(); ++i) {
+        if (row_groups[i].num_rows < 0 ||
+            file_offset > std::numeric_limits<std::int64_t>::max() - row_groups[i].num_rows) {
+          throw sirius::internal_exception("parquet virtual scan: invalid row-group prefix sum");
+        }
+        file_offset += row_groups[i].num_rows;
+        offsets[i + 1] = file_offset;
+      }
+      for (auto const rg_index : slice.row_group_indices) {
+        if (rg_index < 0 || static_cast<std::size_t>(rg_index) >= row_groups.size()) {
+          throw sirius::internal_exception("parquet virtual scan: row-group index outside footer");
+        }
+        std::vector<std::unique_ptr<cudf::io::datasource>> one_source;
+        one_source.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
+                                              : cudf::io::datasource::create(slice.file_path));
+        std::vector<cudf::io::parquet::FileMetaData> one_metadata{*slice.file_metadata};
+        auto one_opts = *split.reader_options;
+        one_opts.set_row_groups({{rg_index}});
+        auto [decoded, metadata] = cudf::io::read_parquet(
+          std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
+        auto const expected = row_groups[static_cast<std::size_t>(rg_index)].num_rows;
+        if (decoded->num_rows() != expected) {
+          throw sirius::internal_exception(
+            "parquet virtual scan: decoded row count does not match footer");
+        }
+        pieces.push_back(append_parquet_virtual_columns(std::move(decoded),
+                                                        *_plan,
+                                                        slice.file_path,
+                                                        slice.file_index,
+                                                        offsets[static_cast<std::size_t>(rg_index)],
+                                                        stream,
+                                                        mr_ref));
+      }
+    }
+    if (pieces.empty()) {
+      throw sirius::internal_exception(
+        "parquet virtual scan: non-pruned split produced no row-group pieces");
+    }
+    if (pieces.size() == 1) {
+      table = std::move(pieces.front());
+    } else {
+      std::vector<cudf::table_view> views;
+      views.reserve(pieces.size());
+      for (auto const& piece : pieces) {
+        views.push_back(piece->view());
+      }
+      table = cudf::concatenate(views, stream, mr_ref);
+    }
+  } else {
+    auto [decoded, metadata] =
+      cudf::io::read_parquet(std::move(sources), std::move(metadatas), opts, stream, mr_ref);
+    table = std::move(decoded);
+    if (_plan->has_user_virtual_columns()) {
+      auto const& slice = split.rg_slices.front();
+      table             = append_parquet_virtual_columns(
+        std::move(table), *_plan, slice.file_path, slice.file_index, 0, stream, mr_ref);
+    }
+  }
 
   // Hive-partition scans assemble inline here: partition_values are per-split
   // (carried on parquet_split_info) and do not travel to the pipeline-shared
@@ -1175,9 +1289,7 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
                                         sirius::expression_evaluator::default_min_ast_size,
                                         like_swar_fastpath,
                                         like_cache);
-      auto const data_positions = output_data_positions(*_plan);
-      view = data_positions.empty() ? owning_table_view{exec.select(view.view())}
-                                    : owning_table_view{exec.select(view.view(), data_positions)};
+      view = owning_table_view{exec.select(view.view())};
     }
     auto assembled = assemble_scan_output(*_plan, std::move(view), split.partition_values, stream);
     return op::scan::filtered_table{std::move(assembled),
@@ -1247,16 +1359,17 @@ std::unique_ptr<cudf::table> parquet_gpu_ingestible::post_filter_and_project(
                                         sirius::expression_evaluator::default_min_ast_size,
                                         like_swar_fastpath,
                                         std::move(like_cache));
-      auto const data_positions = output_data_positions(*_plan);
       std::unique_ptr<cudf::table> filtered;
-      if (survivors != nullptr && !data_positions.empty()) {
+      if (survivors != nullptr && input.table.view().num_columns() > 0) {
         // A deferral rides on this batch: it needs to know WHICH rows survived,
         // because its rowid addresses the pinned chunk and the batch no longer
         // holds that chunk's rows in order.
-        filtered = exec.select_with_survivors(input.table.view(), data_positions, *survivors);
+        std::vector<cudf::size_type> identity(
+          static_cast<std::size_t>(input.table.view().num_columns()));
+        std::iota(identity.begin(), identity.end(), cudf::size_type{0});
+        filtered = exec.select_with_survivors(input.table.view(), identity, *survivors);
       } else {
-        filtered = data_positions.empty() ? exec.select(input.table.view())
-                                          : exec.select(input.table.view(), data_positions);
+        filtered = exec.select(input.table.view());
       }
       // The select only enqueued its reads; record before the reassignment drops the read lock.
       input.table.record_reader_event(stream);
@@ -1313,6 +1426,9 @@ std::vector<std::size_t> parquet_gpu_ingestible::materialized_column_order() con
   order.reserve(_plan->data_columns.size());
   for (auto const& dc : _plan->data_columns) {
     order.push_back(dc.primary_idx);
+  }
+  for (auto const& vc : _plan->virtual_columns) {
+    order.push_back(static_cast<std::size_t>(vc.column_id));
   }
   return order;
 }

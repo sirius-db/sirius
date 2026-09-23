@@ -33,6 +33,7 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -149,12 +150,17 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
                                  sirius::op::sirius_physical_table_scan& scan_op,
                                  const sirius::operator_params& op_params)
 {
-  auto* info               = &out;
-  info->returned_types     = scan_op.returned_types;
-  info->column_ids         = scan_op.column_ids;
-  info->projection_ids     = scan_op.projection_ids;
-  info->names              = scan_op.names;
-  info->table_filters      = std::move(scan_op.table_filters);
+  auto* info           = &out;
+  info->returned_types = scan_op.returned_types;
+  info->column_ids     = scan_op.column_ids;
+  info->projection_ids = scan_op.projection_ids;
+  info->names          = scan_op.names;
+  info->table_filters  = std::move(scan_op.table_filters);
+  info->virtual_columns.reserve(scan_op.virtual_columns.size());
+  for (auto const& [column_id, column] : scan_op.virtual_columns) {
+    info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
+      column_id, column.name, sirius::from_duckdb(column.type)});
+  }
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
   if (scan_op.function.name == "sirius_read_parquet") {

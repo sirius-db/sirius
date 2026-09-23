@@ -229,6 +229,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_scan_filter_cast_ranges.cpp
     test/cpp/scan/test_scan_filter_ranges.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
+    test/cpp/scan/test_parquet_virtual_column_plan.cpp
     test/cpp/scan/test_scan_schema_normalization.cpp
     test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
