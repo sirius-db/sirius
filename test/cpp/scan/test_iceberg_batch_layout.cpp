@@ -159,7 +159,7 @@ TEST_CASE("build_batch_layout preserves bound file indexes independently of slic
 {
   auto const split =
     split_of({slice_of("b.parquet", {2}, {0}, 5), slice_of("a.parquet", {2, 3, 2}, {1}, 2)});
-  auto const layout = build_batch_layout(split);
+  auto const layout = build_batch_layout(*split);
 
   REQUIRE(layout.size() == 2);
   CHECK(layout[0].data_file_path == "b.parquet");
@@ -181,8 +181,8 @@ TEST_CASE("build_batch_layout retains file offsets when one file spans multiple 
   first.file_metadata = footer;
   last.file_metadata  = footer;
 
-  auto const first_layout = build_batch_layout(split_of({std::move(first)}));
-  auto const last_layout  = build_batch_layout(split_of({std::move(last)}));
+  auto const first_layout = build_batch_layout(*split_of({std::move(first)}));
+  auto const last_layout  = build_batch_layout(*split_of({std::move(last)}));
   REQUIRE(first_layout.size() == 1);
   REQUIRE(last_layout.size() == 1);
   CHECK(first_layout.front().file_index == 7);
@@ -198,28 +198,28 @@ TEST_CASE("build_batch_layout rejects incomplete or inconsistent provenance meta
 {
   SECTION("missing bound file index")
   {
-    auto split                    = split_of({slice_of("a.parquet", {1}, {0})});
-    split.rg_slices[0].file_index = invalid_parquet_file_index;
-    CHECK_THROWS(build_batch_layout(split));
+    auto split                     = split_of({slice_of("a.parquet", {1}, {0})});
+    split->rg_slices[0].file_index = invalid_parquet_file_index;
+    CHECK_THROWS(build_batch_layout(*split));
   }
   SECTION("missing footer")
   {
     auto split = split_of({slice_of("a.parquet", {1}, {0})});
-    split.rg_slices[0].file_metadata.reset();
-    CHECK_THROWS(build_batch_layout(split));
+    split->rg_slices[0].file_metadata.reset();
+    CHECK_THROWS(build_batch_layout(*split));
   }
   SECTION("negative row count")
   {
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {-1}, {0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {-1}, {0})})));
   }
   SECTION("file offset overflow")
   {
     auto const max = std::numeric_limits<int64_t>::max();
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {max, 1}, {0, 1})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {max, 1}, {0, 1})})));
   }
   SECTION("duplicate or reversed row groups")
   {
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {0, 0})})));
-    CHECK_THROWS(build_batch_layout(split_of({slice_of("a.parquet", {1, 1}, {1, 0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {1, 1}, {0, 0})})));
+    CHECK_THROWS(build_batch_layout(*split_of({slice_of("a.parquet", {1, 1}, {1, 0})})));
   }
 }
