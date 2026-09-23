@@ -18,7 +18,9 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
+#include "op/aggregate/group_by_bypass_analysis.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -27,6 +29,9 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
+
+#include <string>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -150,23 +155,98 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
+int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
+  const partition_sizing_input& in, int natural)
+{
+  // With bypass disabled the PARTITION passes no metadata source, so there is nothing to do and
+  // the automatic count is returned without any extra work on this path.
+  if (!in.bypass_metadata_source) { return natural; }
+  // Only an automatic count above 1 on a single admitted GPU can be overturned. Decide those
+  // cases before walking the partition's batches for metadata; decide() would reject them anyway.
+  if (natural <= 1 || _num_gpus > 1) { return natural; }
+  auto const collected = in.bypass_metadata_source();
+  if (!collected.has_value()) { return natural; }
+  auto const& meta = *collected;
+
+  auto const pipeline = get_pipeline();
+  auto const headroom = pipeline ? pipeline->get_operator_params().group_by_bypass_headroom_fraction
+                                 : group_by_bypass::candidate_input{}.headroom_fraction;
+  auto const candidate = group_by_bypass::make_candidate(*this, meta, natural, _num_gpus, headroom);
+
+  auto const decision = group_by_bypass::decide(candidate);
+  bool const selected = decision.reason == group_by_bypass::decision_reason::bypass_selected;
+  // Feed the same model into the existing cold-start hook. Rejected candidates and the
+  // pre-existing automatic P=1 path keep the default estimate.
+  // Headroom is selection slack, not part of the predicted allocation peak: keep it out of
+  // the cold-start estimate, which the executor later replaces with measured history.
+  // This does not reserve the slack or guarantee that the full request will be granted.
+  _bypass_peak_memory_estimate.store(
+    selected ? static_cast<std::size_t>(decision.model.additional_needed) : 0,
+    std::memory_order_release);
+
+  // Selections change the plan and are logged at INFO; rejections are routine and stay at DEBUG.
+  auto const budget = candidate.admissible_additional_budget.has_value()
+                        ? std::to_string(*candidate.admissible_additional_budget)
+                        : std::string{"unknown"};
+  if (selected) {
+    SIRIUS_LOG_INFO(
+      "group_by_bypass: operator_id={} device={} reason={} auto_p={} chosen_p={} "
+      "additional_needed={} required={} budget={}",
+      get_operator_id(),
+      meta.target_device_id,
+      group_by_bypass::reason_name(decision.reason),
+      natural,
+      decision.num_partitions,
+      decision.model.additional_needed,
+      decision.model.required_bytes,
+      budget);
+  } else {
+    SIRIUS_LOG_DEBUG(
+      "group_by_bypass: operator_id={} device={} reason={} auto_p={} chosen_p={} "
+      "model_evaluated={} additional_needed={} required={} budget={}",
+      get_operator_id(),
+      meta.target_device_id,
+      group_by_bypass::reason_name(decision.reason),
+      natural,
+      decision.num_partitions,
+      decision.model_evaluated,
+      decision.model.additional_needed,
+      decision.model.required_bytes,
+      budget);
+  }
+
+  return decision.num_partitions;
+}
+
+std::size_t sirius_physical_grouped_aggregate_merge::no_history_peak_memory_estimate(
+  const op::input_stats& stats) const
+{
+  if (stats.bytes == 0) { return 0; }
+  return std::max(sirius_physical_operator::no_history_peak_memory_estimate(stats),
+                  _bypass_peak_memory_estimate.load(std::memory_order_acquire));
+}
+
 partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strategy(
   const partition_sizing_input& in)
 {
+  // Preserve automatic sizing unless the opt-in policy accepts the whole merge.
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
+  // The bypass policy may turn AUTO > 1 into 1. It returns `natural` unchanged in every other
+  // case, including when it is disabled.
+  int const chosen = apply_memory_aware_bypass(in, natural);
   // Pre-size this merge's single input repository so every partition slot exists before batches
   // arrive (grouping is never broadcast / build-probe). Guarded on strictly-greater to respect the
   // repository's set_num_partitions contract.
-  if (natural > 1) {
+  if (chosen > 1) {
     std::lock_guard<std::mutex> lg(lock);
     if (!ports.empty()) {
       auto& repo = ports.begin()->second->repo;
-      if (repo != nullptr && static_cast<std::size_t>(natural) > repo->num_partitions()) {
-        repo->set_num_partitions(static_cast<std::size_t>(natural));
+      if (repo != nullptr && static_cast<std::size_t>(chosen) > repo->num_partitions()) {
+        repo->set_num_partitions(static_cast<std::size_t>(chosen));
       }
     }
   }
-  return {natural, /*broadcast=*/false, /*build_probe=*/false};
+  return {chosen, /*broadcast=*/false, /*build_probe=*/false};
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()

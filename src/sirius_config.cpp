@@ -311,6 +311,10 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
       "'operator_params.avg_variable_column_bytes': must be greater than zero");
   }
   r.optional("enable_runtime_size_estimation", opt.enable_runtime_size_estimation);
+  r.optional("enable_group_by_memory_aware_bypass", opt.enable_group_by_memory_aware_bypass);
+  r.optional("group_by_bypass_headroom_fraction",
+             opt.group_by_bypass_headroom_fraction,
+             config::valid_group_by_bypass_headroom_fraction{});
   r.reject_unknown();
 }
 

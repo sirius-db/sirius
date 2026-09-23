@@ -3150,6 +3150,37 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
+static void SetEnableGroupByMemoryAwareBypass(ClientContext& context,
+                                              SetScope scope,
+                                              Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto slot                                   = lock_operator_params_slot(context);
+  params->enable_group_by_memory_aware_bypass = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config ENABLE_GROUP_BY_MEMORY_AWARE_BYPASS to {}",
+                   params->enable_group_by_memory_aware_bypass);
+}
+
+static void SetGroupByBypassHeadroomFraction(ClientContext& context,
+                                             SetScope scope,
+                                             Value& parameter)
+{
+  auto* params = get_operator_params(context);
+  if (!params) { return; }
+  auto const value = DoubleValue::Get(parameter);
+  if (!sirius::config::valid_group_by_bypass_headroom_fraction{}(value)) {
+    throw duckdb::InvalidInputException(
+      "group_by_bypass_headroom_fraction %s, got %f",
+      sirius::config::valid_group_by_bypass_headroom_fraction::description(),
+      value);
+  }
+  auto slot                                 = lock_operator_params_slot(context);
+  params->group_by_bypass_headroom_fraction = value;
+  SIRIUS_LOG_DEBUG("Updated config GROUP_BY_BYPASS_HEADROOM_FRACTION to {}",
+                   params->group_by_bypass_headroom_fraction);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
   auto const& operator_defaults    = defaults.get_operator_params();
@@ -3540,6 +3571,28 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     LogicalType::BOOLEAN,
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
+
+  // Internal visibility: selection uses a budget snapshot,
+  // not a secured reservation, and automatic repartitioning after OOM is not implemented.
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "enable_group_by_memory_aware_bypass",
+    "let a grouped aggregation skip hash partitioning (P=1) when a conservative memory model says "
+    "the unpartitioned merge fits the admitted GPU's remaining budget; single GPU, fixed-width "
+    "integral keys and SUM/COUNT/MIN/MAX states only",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.enable_group_by_memory_aware_bypass),
+    SetEnableGroupByMemoryAwareBypass);
+  add_sirius_option(
+    config,
+    option_visibility::internal,
+    "group_by_bypass_headroom_fraction",
+    "declared empirical margin the group-by bypass model adds on top of its modelled requirement, "
+    "as a fraction of it (0.0-4.0)",
+    LogicalType::DOUBLE,
+    Value::DOUBLE(operator_defaults.group_by_bypass_headroom_fraction),
+    SetGroupByBypassHeadroomFraction);
 }
 
 // Publish the transparent optimizer mask once at extension load, unioned

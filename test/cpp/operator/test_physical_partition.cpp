@@ -24,9 +24,11 @@
 #include "utils/data_utils.hpp"
 
 #include <catch.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>
+#include <op/sirius_physical_delim_join.hpp>
 #include <op/sirius_physical_hash_join.hpp>
 #include <op/sirius_physical_partition.hpp>
 
@@ -485,6 +487,12 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   partition_strategy get_partition_strategy(const partition_sizing_input& in) override
   {
     inputs.push_back(in.total_bytes);
+    // Collected eagerly here so the tests can inspect the snapshot the partition would provide.
+    if (in.bypass_metadata_source) {
+      bypass_metadata = in.bypass_metadata_source();
+    } else {
+      saw_null_bypass_metadata = true;
+    }
     count = natural_num_partitions(in.total_bytes, target_bytes, 1);
     return {count, false, false};
   }
@@ -492,6 +500,8 @@ struct sizing_consumer : sirius_physical_partition_consumer_operator {
   uint64_t target_bytes = 1;
   int count             = 0;
   std::vector<uint64_t> inputs;
+  std::optional<group_by_bypass_metadata> bypass_metadata;
+  bool saw_null_bypass_metadata = false;
 };
 
 struct partition_sizing_fixture {
@@ -545,6 +555,20 @@ struct partition_sizing_fixture {
   sizing_consumer consumer;
   sirius_physical_partition partition;
   std::size_t received_bytes = 0;
+};
+
+struct bypass_metadata_fixture : partition_sizing_fixture {
+  explicit bypass_metadata_fixture(bool enabled = true, bool estimate = false)
+    : partition_sizing_fixture(estimate)
+  {
+    auto params                                 = std::make_shared<sirius::operator_params>();
+    params->enable_group_by_memory_aware_bypass = enabled;
+    sirius::pipeline::pipeline_build_context ctx{nullptr, true, 1, params};
+    partition.set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
+    sirius::planner::sirius_physical_plan_generator::set_parent_ops(partition, &merge_parent);
+  }
+
+  sirius_physical_operator merge_parent{SiriusPhysicalOperatorType::MERGE_GROUP_BY, {}, 0};
 };
 
 }  // namespace
@@ -641,4 +665,128 @@ TEST_CASE("partition sizing preserves integer bytes above double precision",
   REQUIRE(f.partition.get_next_task_input_data());
   REQUIRE(f.consumer.inputs == std::vector<uint64_t>{bytes});
   CHECK(f.consumer.count == 1);
+}
+
+TEST_CASE("bypass metadata is only collected when bypass is enabled",
+          "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f(false);
+  REQUIRE_FALSE(f.partition.is_memory_aware_bypass_enabled());
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  // With the setting off the PARTITION must not walk its batches at all, so the consumer sees no
+  // metadata and the existing sizing path is unchanged.
+  CHECK(f.consumer.saw_null_bypass_metadata);
+  CHECK_FALSE(f.consumer.bypass_metadata.has_value());
+}
+
+TEST_CASE("bypass metadata reports the real rows, schema and target device",
+          "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  REQUIRE(f.partition.is_memory_aware_bypass_enabled());
+  f.finish(f.received_bytes);
+  // Keep the returned task input alive while checking the budget. It owns the batch popped from
+  // the repository; destroying it here would release the batch's aligned GPU allocation after
+  // collect_bypass_metadata() took its snapshot and make the later charged-byte sample 512 bytes
+  // smaller than the state represented by the metadata.
+  auto task_input = f.partition.get_next_task_input_data();
+  REQUIRE(task_input);
+
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  auto const& meta = *f.consumer.bypass_metadata;
+  CHECK(meta.upstream_complete);
+  CHECK(meta.single_gpu_resident);
+  REQUIRE(meta.total_rows.has_value());
+  CHECK(*meta.total_rows == 100);  // the fixture deposits one 100-row INT32 column
+
+  REQUIRE(meta.columns.has_value());
+  REQUIRE(meta.columns->size() == 1);
+  CHECK((*meta.columns)[0].type_id == static_cast<int>(cudf::type_id::INT32));
+  CHECK((*meta.columns)[0].fixed_width_bytes == sizeof(int32_t));
+  CHECK_FALSE((*meta.columns)[0].nullable);
+
+  // The budget and device come from the space the input actually lives in, never from a
+  // hardcoded device 0 lookup.
+  auto* space = f.memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  CHECK(meta.target_device_id == space->get_device_id());
+  REQUIRE(meta.admissible_additional_budget.has_value());
+
+  // The budget must be what the executor could actually *reserve*, which is the space's
+  // reservation limit minus everything already charged against it — not device memory that merely
+  // happens to be unallocated. get_available_memory() measures the latter, against the larger
+  // allocation capacity, and can exceed get_max_memory() outright when the reservation limit is
+  // below capacity; a budget taken from it would over-admit by the bytes already in use.
+  auto const limit   = space->get_max_memory();
+  auto const charged = space->get_memory_resource_of<Tier::GPU>()->get_total_allocated_bytes();
+  CHECK(*meta.admissible_additional_budget == (limit > charged ? limit - charged : 0));
+}
+
+TEST_CASE("bypass metadata marks a still-running upstream as incomplete",
+          "[physical_partition][group_by_bypass]")
+{
+  // Production scheduling waits at the FULL barrier. Call the input hook directly to verify
+  // that the metadata still identifies incomplete input defensively.
+  bypass_metadata_fixture f;
+  REQUIRE(f.partition.get_next_task_input_data());
+
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  CHECK_FALSE(f.consumer.bypass_metadata->upstream_complete);
+  CHECK_FALSE(f.consumer.bypass_metadata->columns.has_value());
+  CHECK(f.consumer.inputs == std::vector<uint64_t>{f.received_bytes});
+}
+
+TEST_CASE("bypass preserves the full-input barrier", "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  auto hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::WAITING_FOR_INPUT_DATA);
+  CHECK_FALSE(f.consumer.bypass_metadata.has_value());
+  f.finish(f.received_bytes);
+  hint = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  CHECK(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  CHECK(f.consumer.bypass_metadata->upstream_complete);
+}
+
+TEST_CASE("bypass does not turn projected input into complete metadata",
+          "[physical_partition][group_by_bypass][size_estimation]")
+{
+  bypass_metadata_fixture f(true, true);
+  f.source.projected_bytes = 4 * f.received_bytes;
+  auto hint                = f.partition.get_next_task_hint();
+  REQUIRE(hint.has_value());
+  REQUIRE(hint->hint == TaskCreationHint::READY);
+  REQUIRE(f.partition.get_next_task_input_data());
+  REQUIRE(f.consumer.bypass_metadata.has_value());
+  CHECK_FALSE(f.consumer.bypass_metadata->upstream_complete);
+  CHECK_FALSE(f.consumer.bypass_metadata->columns.has_value());
+  CHECK(f.consumer.inputs == std::vector<uint64_t>{4 * f.received_bytes});
+  // The first sizing decision remains fixed after the producer completes.
+  f.finish(4 * f.received_bytes);
+  CHECK_FALSE(f.partition.get_next_task_input_data());
+  CHECK(f.consumer.inputs.size() == 1);
+}
+
+TEST_CASE("bypass query option only enables eligible group-by partitions",
+          "[physical_partition][group_by_bypass]")
+{
+  bypass_metadata_fixture f;
+  REQUIRE(f.partition.is_memory_aware_bypass_enabled());
+  sirius_physical_delim_join delim(
+    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN, {}, nullptr, {}, 0, {});
+  SECTION("unrelated consumer")
+  {
+    sirius::planner::sirius_physical_plan_generator::set_parent_ops(f.partition, &f.consumer);
+  }
+  SECTION("delimiter-owned merge") { f.merge_parent.set_owning_delim_join(&delim); }
+  SECTION("missing query context") { f.partition.set_pipeline(nullptr); }
+  CHECK_FALSE(f.partition.is_memory_aware_bypass_enabled());
+  f.finish(f.received_bytes);
+  REQUIRE(f.partition.get_next_task_input_data());
+  CHECK(f.consumer.saw_null_bypass_metadata);
 }
