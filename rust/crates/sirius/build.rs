@@ -9,6 +9,11 @@
 //! that triggers the link is built.
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    if std::env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     if std::env::var_os("CARGO_FEATURE_STATIC").is_some() {
         println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
     }

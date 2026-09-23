@@ -33,6 +33,28 @@ LD_LIBRARY_PATH="$PWD/build/release/extension/sirius:$LD_LIBRARY_PATH" \
   pixi run cargo test --manifest-path rust/Cargo.toml -p sirius -p sirius-sys
 ```
 
+## Documentation
+
+Build with the isolated Pixi docs environment:
+
+```bash
+pixi run -e docs docs-rust
+```
+
+Open `build/docs/rust-target/doc/sirius/index.html`. This task installs the Rust
+and C++ toolchains and sets `DOCS_RS` for the documentation build.
+
+Generate the `sirius` API reference without building or linking `libsirius`:
+
+```bash
+DOCS_RS=1 cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps
+```
+
+Open `rust/target/doc/sirius/index.html`. This requires a Rust toolchain and a C++
+compiler for the `cxx` dependency, but no Sirius build, CUDA toolkit, or GPU.
+`DOCS_RS` skips Sirius's native bridge compilation and library lookup; use it
+only for documentation, leaving it unset for normal builds and tests.
+
 ## Linkage
 
 `build.rs` discovers the Sirius artifact under `$SIRIUS_BUILD_DIR` (default
@@ -53,6 +75,7 @@ symlink stopgap is no longer used).
 
 ## Environment
 
+- `DOCS_RS` — when set, skip Sirius's native build and link steps for documentation.
 - `SIRIUS_BUILD_DIR` — Sirius build tree (default `build/release`).
 - `CONDA_PREFIX` — set by `pixi`; used to find the headers and the shared lib's deps.
 - `CARGO_NET_GIT_FETCH_WITH_CLI=true` — only on machines whose git config rewrites
