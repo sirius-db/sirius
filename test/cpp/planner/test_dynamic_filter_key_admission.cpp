@@ -44,8 +44,10 @@ using sirius::planner::admit_dynamic_filter_keys;
 using sirius::planner::classify_join_key_shapes;
 using sirius::planner::direct_route_admissible;
 
-constexpr auto kInt32 = cudf::data_type{cudf::type_id::INT32};
-constexpr auto kInt64 = cudf::data_type{cudf::type_id::INT64};
+constexpr auto kInt32  = cudf::data_type{cudf::type_id::INT32};
+constexpr auto kInt64  = cudf::data_type{cudf::type_id::INT64};
+auto const kDecimal64  = cudf::data_type{cudf::type_id::DECIMAL64, -2};
+auto const kDecimal128 = cudf::data_type{cudf::type_id::DECIMAL128, -2};
 
 constexpr dynamic_filter_condition_shape kDirectDirect{.probe = dynamic_filter_key_shape::direct,
                                                        .build = dynamic_filter_key_shape::direct};
@@ -138,19 +140,29 @@ TEST_CASE("admission records each side's own storage type", "[dynamic_filter][ke
                                make_ref(1, duckdb::LogicalType::BIGINT)));
   raw.push_back(
     make_condition(make_ref(2, duckdb::LogicalType::DATE), make_ref(2, duckdb::LogicalType::DATE)));
+  // TPC-H q2's ps_supplycost is DECIMAL(15,2): DECIMAL64 at cudf scale -2. A wider precision
+  // maps to DECIMAL128 at the same negative scale.
+  raw.push_back(make_condition(make_ref(3, duckdb::LogicalType::DECIMAL(15, 2)),
+                               make_ref(3, duckdb::LogicalType::DECIMAL(15, 2))));
+  raw.push_back(make_condition(make_ref(4, duckdb::LogicalType::DECIMAL(25, 2)),
+                               make_ref(4, duckdb::LogicalType::DECIMAL(25, 2))));
   auto const conditions = sirius::wrap_join_conditions(std::move(raw));
-  std::vector<dynamic_filter_condition_shape> const shapes(3, kDirectDirect);
+  std::vector<dynamic_filter_condition_shape> const shapes(5, kDirectDirect);
 
   auto const admitted = admit_dynamic_filter_keys(conditions, shapes, {});
 
-  REQUIRE(admitted.size() == 3);
+  REQUIRE(admitted.size() == 5);
   REQUIRE(admitted[0].storage_type == kInt32);
   REQUIRE(admitted[1].storage_type == kInt64);
   REQUIRE(admitted[2].storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+  REQUIRE(admitted[3].storage_type == kDecimal64);
+  REQUIRE(admitted[4].storage_type == kDecimal128);
   // Each side records its own type; `direct_route_admissible` compares the two.
   REQUIRE(admitted[0].probe_storage_type == kInt32);
   REQUIRE(admitted[1].probe_storage_type == kInt64);
   REQUIRE(admitted[2].probe_storage_type == cudf::data_type{cudf::type_id::TIMESTAMP_DAYS});
+  REQUIRE(admitted[3].probe_storage_type == kDecimal64);
+  REQUIRE(admitted[4].probe_storage_type == kDecimal128);
 }
 
 TEST_CASE("admission requires a probe-side bound reference", "[dynamic_filter][key_admission]")
@@ -366,7 +378,7 @@ TEST_CASE("admission rejects inconsistent caller input", "[dynamic_filter][key_a
 // direct_route_admissible
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality keys",
+TEST_CASE("join-edge route accepts only direct matching membership-supported equality keys",
           "[dynamic_filter][key_admission]")
 {
   auto const equal = sirius::comparison_type::equal;
@@ -375,6 +387,22 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
   {
     REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt32, kInt32));
     REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, kInt64, kInt64));
+    // Any membership-supported integer type qualifies, not just INT32/INT64.
+    auto const int16  = cudf::data_type{cudf::type_id::INT16};
+    auto const uint64 = cudf::data_type{cudf::type_id::UINT64};
+    REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, int16, int16));
+    REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, uint64, uint64));
+    // DATE and same-unit TIMESTAMP keys are membership-supported as well.
+    auto const days   = cudf::data_type{cudf::type_id::TIMESTAMP_DAYS};
+    auto const micros = cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS};
+    REQUIRE(direct_route_admissible(duckdb::JoinType::SEMI, equal, kDirectDirect, days, days));
+    REQUIRE(direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, micros, micros));
+    // Decimal keys at an identical scale, including the DECIMAL128 join-edge key of TPC-H q15
+    // (whether its build values fit the int64 rep is decided at publish time, per build).
+    REQUIRE(direct_route_admissible(
+      duckdb::JoinType::INNER, equal, kDirectDirect, kDecimal64, kDecimal64));
+    REQUIRE(direct_route_admissible(
+      duckdb::JoinType::SEMI, equal, kDirectDirect, kDecimal128, kDecimal128));
   }
   SECTION("computed keys are rejected on either side, though the scan route admits them")
   {
@@ -412,11 +440,54 @@ TEST_CASE("join-edge route accepts only direct matching INT32/INT64 equality key
       direct_route_admissible(duckdb::JoinType::INNER, equal, cast_build, kInt32, kInt32));
     REQUIRE_FALSE(
       direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt32, kInt64));
+    // Same width, different signedness: the types are not identical.
     REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
                                           equal,
                                           kDirectDirect,
-                                          cudf::data_type{cudf::type_id::INT16},
-                                          cudf::data_type{cudf::type_id::INT16}));
+                                          cudf::data_type{cudf::type_id::UINT32},
+                                          kInt32));
+    // Mixed temporal units are different types (the planner would have cast one side).
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_DAYS},
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}));
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS},
+                                          cudf::data_type{cudf::type_id::TIMESTAMP_MICROSECONDS}));
+    // Identical but membership-unsupported types.
+    for (auto const id : {cudf::type_id::FLOAT64, cudf::type_id::DURATION_DAYS}) {
+      REQUIRE_FALSE(direct_route_admissible(
+        duckdb::JoinType::INNER, equal, kDirectDirect, cudf::data_type{id}, cudf::data_type{id}));
+    }
+    // Same fixed-point width at different scales, or a decimal against its storage integer: the
+    // types are not identical (DuckDB would have inserted a cast, which the shape gate rejects).
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::DECIMAL64, -3},
+                                          kDecimal64));
+    REQUIRE_FALSE(
+      direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt64, kDecimal64));
+  }
+  SECTION("STRING keys ride the join-edge route as fingerprints")
+  {
+    auto const string_type = cudf::data_type{cudf::type_id::STRING};
+    REQUIRE(direct_route_admissible(
+      duckdb::JoinType::INNER, equal, kDirectDirect, string_type, string_type));
+    REQUIRE(direct_route_admissible(
+      duckdb::JoinType::SEMI, equal, kDirectDirect, string_type, string_type));
+    // The probe must be a materialized STRING operator output, never a dictionary carrier, and
+    // a string never pairs with an integer side.
+    REQUIRE_FALSE(direct_route_admissible(duckdb::JoinType::INNER,
+                                          equal,
+                                          kDirectDirect,
+                                          cudf::data_type{cudf::type_id::DICTIONARY32},
+                                          string_type));
+    REQUIRE_FALSE(
+      direct_route_admissible(duckdb::JoinType::INNER, equal, kDirectDirect, kInt64, string_type));
   }
 }
 
