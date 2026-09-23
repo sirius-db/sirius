@@ -168,8 +168,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   /// @pre `lock` is held.
   std::optional<uint64_t> estimated_total_input_bytes();
 
-  /// Read the complete-input metadata the group-by bypass prototype needs from the batches
-  /// waiting on this partition's input port. Returns nullopt when the prototype is off.
+  /// Read the complete-input metadata the group-by bypass policy needs from the batches
+  /// waiting on this partition's input port. Returns nullopt when bypass is disabled.
   ///
   /// Reads batch metadata only — no key scan, no host copy, no extra aggregation — under the
   /// repository's existing read-only handle, and never blocks on memory.

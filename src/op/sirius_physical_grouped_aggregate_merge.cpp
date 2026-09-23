@@ -18,14 +18,10 @@
 #include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression/ast/reference.hpp"
 #include "log/logging.hpp"
-#include "memory/size_arithmetic.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
-#include "op/aggregate/group_by_bypass_policy.hpp"
+#include "op/aggregate/group_by_bypass_analysis.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
-#include "op/sirius_physical_filter.hpp"
-#include "op/sirius_physical_projection.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "telemetry/nvtx.hpp"
@@ -33,7 +29,6 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/unary.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <string>
 #include <vector>
@@ -160,146 +155,10 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
-namespace {
-
-/// Fixed-width integral types the v1 bypass model covers. Floats and decimals are excluded
-/// deliberately: their merge-time partial states are not modelled here (see
-/// docs/super-sirius/group-by-bypass.md).
-[[nodiscard]] bool bypass_supported_column_type(int type_id) noexcept
-{
-  switch (static_cast<cudf::type_id>(type_id)) {
-    case cudf::type_id::BOOL8:
-    case cudf::type_id::INT8:
-    case cudf::type_id::INT16:
-    case cudf::type_id::INT32:
-    case cudf::type_id::INT64:
-    case cudf::type_id::UINT8:
-    case cudf::type_id::UINT16:
-    case cudf::type_id::UINT32:
-    case cudf::type_id::UINT64: return true;
-    default: return false;
-  }
-}
-
-/// Whether the path from @p merge to the first downstream sink is a bounded result-collection
-/// path: unary, non-expanding, and terminating at a RESULT_COLLECTOR.
-///
-/// Anything that buffers or reshapes — TOP_N, ORDER_BY, a second GROUP BY, a join, a further
-/// PARTITION — makes the merge's output feed work this model does not account for, so v1 declines
-/// rather than guessing. Along an accepted path, `row_bytes`/`columns` total the columns every
-/// step materializes while the merge output is still live.
-struct downstream_shape {
-  bool supported          = false;
-  std::uint64_t row_bytes = 0;
-  std::size_t columns     = 0;
-};
-
-/// Walk from @p merge to its collector. @p row holds the fixed width of each merge output column;
-/// it is empty when the merge's own schema is unknown, in which case the candidate is rejected on
-/// its state before these sizes matter.
-[[nodiscard]] downstream_shape classify_bypass_downstream(const sirius_physical_operator& merge,
-                                                          std::vector<std::uint64_t> row)
-{
-  using T = SiriusPhysicalOperatorType;
-  downstream_shape shape;
-  downstream_shape const rejected;
-  if (merge.owning_delim_join() != nullptr) { return rejected; }
-  // Charge the columns a FILTER or LIMIT actually copies into its output row.
-  auto charge_row = [&] {
-    for (auto const width : row) {
-      shape.row_bytes = memory::saturating_add(shape.row_bytes, width);
-    }
-    shape.columns += row.size();
-  };
-  for (auto* cur = merge.get_parent_op(); cur != nullptr; cur = cur->get_parent_op()) {
-    if (cur->type == T::RESULT_COLLECTOR) {
-      shape.supported = true;
-      return shape;
-    }
-    if (cur->children.size() != 1) { return rejected; }
-    switch (cur->type) {
-      case T::FILTER: {
-        auto const* filter = dynamic_cast<const sirius_physical_filter*>(cur);
-        if (filter == nullptr) { return rejected; }
-        if (auto const* indices =
-              std::get_if<std::vector<cudf::size_type>>(&filter->output_columns)) {
-          // Filters can gather a subset or reorder columns. Later references index this output,
-          // not the original merge row; preserve physical widths rather than logical types.
-          if (indices->empty()) { return rejected; }
-          std::vector<std::uint64_t> next;
-          next.reserve(indices->size());
-          for (auto const index : *indices) {
-            if (index < 0 || static_cast<std::size_t>(index) >= row.size()) { return rejected; }
-            next.push_back(row[static_cast<std::size_t>(index)]);
-          }
-          row = std::move(next);
-        }
-        charge_row();
-        break;
-      }
-      case T::LIMIT:
-      case T::STREAMING_LIMIT: charge_row(); break;
-      case T::PROJECTION: {
-        // Pure references are zero-copy views of the input. Every evaluated expression allocates
-        // a new column of its result type, so only fixed-width results can be sized; any other
-        // result (a string from CASE or a function, say) has no bound here and is rejected.
-        // Temporaries inside a nested expression are not sized and fall under the headroom.
-        auto const* projection = dynamic_cast<const sirius_physical_projection*>(cur);
-        if (projection == nullptr || projection->select_list.size() != cur->types.size()) {
-          return rejected;
-        }
-        std::vector<std::uint64_t> next;
-        next.reserve(projection->select_list.size());
-        for (std::size_t i = 0; i < projection->select_list.size(); ++i) {
-          auto const& expr = *projection->select_list[i];
-          if (expr.holds<sirius::ast::reference>()) {
-            auto const index = expr.get<sirius::ast::reference>().column_index;
-            if (index >= row.size()) { return rejected; }
-            next.push_back(row[index]);
-            continue;
-          }
-          auto const dtype = try_get_cudf_type(cur->types[i]);
-          if (!dtype.has_value() || !cudf::is_fixed_width(*dtype)) { return rejected; }
-          auto const width = static_cast<std::uint64_t>(cudf::size_of(*dtype));
-          shape.row_bytes  = memory::saturating_add(shape.row_bytes, width);
-          shape.columns += 1;
-          next.push_back(width);
-        }
-        row = std::move(next);
-        break;
-      }
-      default: return rejected;
-    }
-  }
-  return rejected;
-}
-
-}  // namespace
-
-bool sirius_physical_grouped_aggregate_merge::bypass_supported_aggregates() const
-{
-  // AVG and COUNT(DISTINCT) need post-merge projection (a cast/divide, or list element counting)
-  // whose allocations are outside the model.
-  if (has_avg || has_count_distinct) { return false; }
-  if (cudf_aggregates.empty()) { return false; }
-  for (auto kind : cudf_aggregates) {
-    switch (kind) {
-      case cudf::aggregation::Kind::SUM:
-      case cudf::aggregation::Kind::MIN:
-      case cudf::aggregation::Kind::MAX:
-      case cudf::aggregation::Kind::COUNT_ALL:
-      case cudf::aggregation::Kind::COUNT_VALID: break;
-      // COLLECT_SET arrives as a LIST and re-merges with MERGE_SETS; not modelled.
-      default: return false;
-    }
-  }
-  return true;
-}
-
 int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   const partition_sizing_input& in, int natural)
 {
-  // With the prototype off the PARTITION passes no metadata source, so there is nothing to do and
+  // With bypass disabled the PARTITION passes no metadata source, so there is nothing to do and
   // the automatic count is returned without any extra work on this path.
   if (!in.bypass_metadata_source) { return natural; }
   // Only an automatic count above 1 on a single admitted GPU can be overturned. Decide those
@@ -309,73 +168,18 @@ int sirius_physical_grouped_aggregate_merge::apply_memory_aware_bypass(
   if (!collected.has_value()) { return natural; }
   auto const& meta = *collected;
 
-  group_by_bypass::candidate_input candidate;
-  candidate.auto_num_partitions = natural;
-  candidate.num_admitted_gpus   = _num_gpus;
-  candidate.upstream_complete   = meta.upstream_complete;
-  // A single admitted GPU must also mean the input really is on one device.
-  candidate.single_gpu_resident = meta.single_gpu_resident;
-  if (auto pipeline = get_pipeline()) {
-    candidate.headroom_fraction = pipeline->get_operator_params().group_by_bypass_headroom_fraction;
-  }
-  candidate.total_rows                   = meta.total_rows;
-  candidate.admissible_additional_budget = meta.admissible_additional_budget;
-
-  // Split the observed physical columns at the grouping-key boundary — the same boundary
-  // merge_grouped_aggregate itself uses — and check each side against the whitelist.
-  auto const num_group_cols = group_idx.size();
-  std::vector<std::uint64_t> output_widths;
-  if (meta.columns.has_value() && meta.columns->size() == num_group_cols + cudf_aggregates.size()) {
-    auto const& cols        = *meta.columns;
-    bool types_ok           = bypass_supported_aggregates();
-    std::uint64_t key_width = 0;
-    std::uint64_t agg_width = 0;
-    std::size_t null_keys   = 0;
-    std::size_t null_aggs   = 0;
-    for (std::size_t c = 0; c < cols.size(); ++c) {
-      auto const& col = cols[c];
-      if (col.fixed_width_bytes == 0 || !bypass_supported_column_type(col.type_id)) {
-        types_ok = false;
-        break;
-      }
-      if (c < num_group_cols) {
-        key_width += col.fixed_width_bytes;
-        null_keys += col.nullable ? 1 : 0;
-      } else {
-        agg_width += col.fixed_width_bytes;
-        null_aggs += col.nullable ? 1 : 0;
-      }
-    }
-    candidate.supported_state = types_ok;
-    if (types_ok) {
-      candidate.key_width_bytes      = key_width;
-      candidate.agg_width_bytes      = agg_width;
-      candidate.key_columns          = num_group_cols;
-      candidate.agg_columns          = cols.size() - num_group_cols;
-      candidate.nullable_key_columns = null_keys;
-      candidate.nullable_agg_columns = null_aggs;
-      // The whitelisted states merge into columns of the same physical type, so the merge output
-      // row has the partial input's widths.
-      output_widths.reserve(cols.size());
-      for (auto const& col : cols) {
-        output_widths.push_back(col.fixed_width_bytes);
-      }
-    }
-  } else {
-    // Either the schema could not be read, or it does not match this merge's own column layout.
-    // Both are "unknown", not "zero".
-    candidate.supported_state = false;
-  }
-
-  auto const shape               = classify_bypass_downstream(*this, std::move(output_widths));
-  candidate.supported_downstream = shape.supported;
-  candidate.downstream_row_bytes = shape.row_bytes;
-  candidate.downstream_columns   = shape.columns;
+  auto const pipeline = get_pipeline();
+  auto const headroom = pipeline ? pipeline->get_operator_params().group_by_bypass_headroom_fraction
+                                 : group_by_bypass::candidate_input{}.headroom_fraction;
+  auto const candidate = group_by_bypass::make_candidate(*this, meta, natural, _num_gpus, headroom);
 
   auto const decision = group_by_bypass::decide(candidate);
   bool const selected = decision.reason == group_by_bypass::decision_reason::bypass_selected;
   // Feed the same model into the existing cold-start hook. Rejected candidates and the
   // pre-existing automatic P=1 path keep the default estimate.
+  // Headroom is selection slack, not part of the predicted allocation peak: keep it out of
+  // the cold-start estimate, which the executor later replaces with measured history.
+  // This does not reserve the slack or guarantee that the full request will be granted.
   _bypass_peak_memory_estimate.store(
     selected ? static_cast<std::size_t>(decision.model.additional_needed) : 0,
     std::memory_order_release);
@@ -427,7 +231,7 @@ partition_strategy sirius_physical_grouped_aggregate_merge::get_partition_strate
 {
   // Preserve automatic sizing unless the opt-in policy accepts the whole merge.
   int const natural = natural_num_partitions(in.total_bytes, _hash_partition_bytes, _num_gpus);
-  // The prototype may turn AUTO > 1 into 1. It returns `natural` unchanged in every other
+  // The bypass policy may turn AUTO > 1 into 1. It returns `natural` unchanged in every other
   // case, including when it is disabled.
   int const chosen = apply_memory_aware_bypass(in, natural);
   // Pre-size this merge's single input repository so every partition slot exists before batches

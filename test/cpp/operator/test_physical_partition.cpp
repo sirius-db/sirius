@@ -667,7 +667,7 @@ TEST_CASE("partition sizing preserves integer bytes above double precision",
   CHECK(f.consumer.count == 1);
 }
 
-TEST_CASE("bypass metadata is only collected when the prototype is enabled",
+TEST_CASE("bypass metadata is only collected when bypass is enabled",
           "[physical_partition][group_by_bypass]")
 {
   bypass_metadata_fixture f(false);

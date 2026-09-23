@@ -3572,7 +3572,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
     Value::BOOLEAN(operator_defaults.enable_runtime_size_estimation),
     SetEnableRuntimeSizeEstimation);
 
-  // Experiment (issue #1746 point 2). Internal visibility: selection uses a budget snapshot,
+  // Internal visibility: selection uses a budget snapshot,
   // not a secured reservation, and automatic repartitioning after OOM is not implemented.
   add_sirius_option(
     config,

@@ -156,14 +156,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
   /// Run the bypass policy against @p in. Returns the automatic count untouched whenever the
-  /// prototype is off or any gate rejects the candidate. @pre `lock` is NOT held.
+  /// bypass is disabled or any gate rejects the candidate. @pre `lock` is NOT held.
   [[nodiscard]] int apply_memory_aware_bypass(const partition_sizing_input& in, int natural);
-
-  /// Whether every physical aggregate partial state this merge will re-merge is inside the v1
-  /// fixed-width whitelist. Checks `cudf_aggregates` (the merge-time kinds) rather than the SQL
-  /// output types: a logical COUNT arrives as a COUNT_ALL/COUNT_VALID state re-merged with SUM,
-  /// and a COUNT(DISTINCT) arrives as a LIST.
-  [[nodiscard]] bool bypass_supported_aggregates() const;
 
   bool _fuse_into_parent = false;
 

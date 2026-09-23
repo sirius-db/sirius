@@ -382,6 +382,7 @@ set(EXTENSION_SOURCES
     src/op/aggregate/group_key_labels.cpp
     src/op/aggregate/gpu_aggregate_impl.cpp
     src/op/aggregate/group_by_bypass_policy.cpp
+    src/op/aggregate/group_by_bypass_analysis.cpp
     src/op/merge/gpu_merge_impl.cpp
     src/op/order/gpu_order_impl.cpp
     src/op/partition/gpu_partition_impl.cpp

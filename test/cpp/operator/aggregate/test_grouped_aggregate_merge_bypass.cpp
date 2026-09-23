@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! Consumer-side tests for the group-by memory-aware bypass prototype (issue #1746 point 2).
+//! Consumer-side tests for the group-by memory-aware bypass policy.
 //!
 //! These drive the real sirius_physical_grouped_aggregate_merge::get_partition_strategy, so they
 //! cover the operator's own classification — aggregate partial-state kinds, the key/aggregate
@@ -54,7 +54,7 @@ namespace {
 using namespace sirius::test::operator_utils;
 
 /// AUTO is ceil(total_bytes / hash_partition_bytes); this is comfortably above 1 partition at the
-/// merge's default target, so every test starts from an AUTO > 1 the prototype could overturn.
+/// merge's default target, so every test starts from an AUTO > 1 the bypass policy could change.
 constexpr uint64_t kBigInputBytes = 8ULL * 1024 * 1024 * 1024;
 
 group_by_bypass_metadata ample_metadata(std::vector<bypass_column_meta> columns)
@@ -69,7 +69,7 @@ group_by_bypass_metadata ample_metadata(std::vector<bypass_column_meta> columns)
   return meta;
 }
 
-/// The PARTITION's lazy metadata source, backed by @p meta; empty (prototype off) when null.
+/// The PARTITION's lazy metadata source, backed by @p meta; empty (bypass disabled) when null.
 std::function<std::optional<group_by_bypass_metadata>()> metadata_source(
   const group_by_bypass_metadata* meta)
 {
@@ -426,6 +426,12 @@ TEST_CASE("bypass uses the query policy snapshot for headroom",
   sirius::pipeline::pipeline_build_context ctx{nullptr, true, 1, params};
   custom.merge->set_pipeline(std::make_shared<sirius::pipeline::sirius_pipeline>(ctx));
   CHECK(custom.merge->get_partition_strategy(sizing_input(&meta)).num_partitions > 1);
+
+  // Headroom changes eligibility, not the cold-start allocation estimate. Once the budget
+  // includes the configured slack, selection still publishes the same unpadded model.
+  meta.admissible_additional_budget = needed * 5;
+  REQUIRE(custom.merge->get_partition_strategy(sizing_input(&meta)).num_partitions == 1);
+  CHECK(custom.merge->no_history_peak_memory_estimate({8, kBigInputBytes}) == needed);
 }
 
 TEST_CASE("bypass reservation uses cold estimation and existing OOM retry state",

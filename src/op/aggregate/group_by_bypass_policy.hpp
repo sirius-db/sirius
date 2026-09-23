@@ -27,7 +27,7 @@ namespace sirius::op::group_by_bypass {
 enum class decision_reason : std::uint8_t {
   disabled,                ///< Default before decide() runs; decide() itself never returns it.
   multi_gpu,               ///< More than one admitted GPU; existing behaviour retained.
-  already_one,             ///< The automatic policy already chose 1. Not a prototype activation.
+  already_one,             ///< The automatic policy already chose 1. No bypass needed.
   projected_input,         ///< Upstream is still running; only a projection is available.
   unknown_metadata,        ///< Row/type/batch metadata could not be read reliably.
   unsupported_residency,   ///< Input is not all GPU-resident in one memory space.
@@ -35,7 +35,7 @@ enum class decision_reason : std::uint8_t {
   unsupported_downstream,  ///< Downstream is not a bounded result-collection path.
   size_overflow,           ///< Checked arithmetic saturated, or cuDF's row limit was exceeded.
   insufficient_budget,     ///< The modelled requirement does not fit the admissible budget.
-  bypass_selected,         ///< The prototype selected P=1.
+  bypass_selected,         ///< The bypass policy selected P=1.
 };
 
 [[nodiscard]] const char* reason_name(decision_reason reason) noexcept;
