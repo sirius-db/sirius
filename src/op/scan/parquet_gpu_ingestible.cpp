@@ -44,10 +44,13 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/utilities.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+
+#include <cuda/std/utility>
 
 // cucascade
 #include <cucascade/memory/memory_space.hpp>
@@ -342,9 +345,9 @@ class parquet_batch_coalescer : public batch_coalescer {
         seal_file();
         emitted.push_back(emit_current());
       }
-      cur_output += rg.output_bytes;
-      cur_working += rg.decode_working_bytes;
-      cur_comp += rg.compressed_bytes;
+      cur_output  = memory::saturating_add(cur_output, rg.output_bytes);
+      cur_working = memory::saturating_add(cur_working, rg.decode_working_bytes);
+      cur_comp    = memory::saturating_add(cur_comp, rg.compressed_bytes);
       cur_rgs.push_back(rg.index);
       cur_rows += rg.num_rows;
     }
@@ -459,6 +462,25 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
   for (auto& p : paths) {
     p = canonical_scan_file_path(p);
   }
+}
+
+filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
+                                                            std::size_t path_bytes)
+{
+  if (rows == 0) { return {0, 0}; }
+  auto const chars = memory::saturating_mul(rows, path_bytes);
+  auto const large_offsets =
+    cudf::strings::is_large_strings_enabled() &&
+    chars >= static_cast<std::size_t>(cudf::strings::get_offset64_threshold());
+  auto const offset_width = large_offsets ? sizeof(std::int64_t) : sizeof(std::int32_t);
+  auto const offsets      = memory::saturating_mul(memory::saturating_add(rows, 1), offset_width);
+  auto const output       = memory::saturating_add(chars, offsets);
+  // make_column_from_scalar keeps string_index_pair (pointer + size_type) entries alive
+  // while constructing the offsets and character buffer. Match cuDF's pair type without
+  // including its CUDA-only strings_column_factories.cuh in this host translation unit.
+  auto const pairs =
+    memory::saturating_mul(rows, sizeof(cuda::std::pair<char const*, cudf::size_type>));
+  return {output, memory::saturating_add(output, pairs)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -1105,19 +1127,26 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
     estimate.output_bytes += partition_bytes;
     estimate.decode_working_bytes += partition_bytes;
     for (auto const& virtual_column : _plan->virtual_columns) {
-      std::size_t bytes = 0;
+      std::size_t bytes         = 0;
+      std::size_t working_bytes = 0;
       if (virtual_column.kind == scan_plan::parquet_virtual_column_kind::FILENAME) {
-        bytes = row_count * (file_path.size() + sizeof(cudf::size_type));
+        auto const filename = estimate_filename_column_size(row_count, file_path.size());
+        bytes               = filename.output_bytes;
+        working_bytes       = filename.working_bytes;
       } else {
-        bytes = row_count * sizeof(std::uint64_t);
+        bytes         = memory::saturating_mul(row_count, sizeof(std::uint64_t));
+        working_bytes = bytes;
       }
-      estimate.decode_working_bytes += bytes;
+      estimate.decode_working_bytes =
+        memory::saturating_add(estimate.decode_working_bytes, working_bytes);
       bool const appears_in_output = std::any_of(
         _plan->output_layout.begin(), _plan->output_layout.end(), [&](auto const& entry) {
           return entry.source == scan_plan::output_entry::DATA &&
                  entry.idx == virtual_column.materialized_idx;
         });
-      if (appears_in_output) { estimate.output_bytes += bytes; }
+      if (appears_in_output) {
+        estimate.output_bytes = memory::saturating_add(estimate.output_bytes, bytes);
+      }
     }
     return estimate;
   };

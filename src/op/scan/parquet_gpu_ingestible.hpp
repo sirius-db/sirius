@@ -116,6 +116,16 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 /// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
 void canonicalize_scan_file_paths(std::vector<std::string>& paths);
 
+struct filename_column_size_estimate {
+  std::size_t output_bytes;
+  std::size_t working_bytes;
+};
+
+/// Size the repeated filename column and cuDF's temporary pointer/length pairs.
+/// Uses the active cuDF large-string settings and saturates on overflow.
+[[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
+                                                                          std::size_t path_bytes);
+
 //===----------------------------------------------------------------------===//
 // parquet_split_info
 //===----------------------------------------------------------------------===//
@@ -159,7 +169,7 @@ class parquet_split_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& s : rg_slices) {
-      total += s.estimated_output_bytes;
+      total = memory::saturating_add(total, s.estimated_output_bytes);
     }
     return total;
   }
@@ -253,7 +263,7 @@ class parquet_file_scan_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& rg : row_groups) {
-      total += rg.output_bytes;
+      total = memory::saturating_add(total, rg.output_bytes);
     }
     return total;
   }
@@ -262,7 +272,7 @@ class parquet_file_scan_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& rg : row_groups) {
-      total += rg.decode_working_bytes;
+      total = memory::saturating_add(total, rg.decode_working_bytes);
     }
     return total;
   }

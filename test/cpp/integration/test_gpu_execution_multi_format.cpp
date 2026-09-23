@@ -2211,7 +2211,7 @@ TEST_CASE_METHOD(GPUExecutionHivePartitionFixture,
 
 TEST_CASE_METHOD(MultiFormatFixtureBase,
                  "gpu_execution parquet virtual columns preserve source identity",
-                 "[.][integration][gpu_execution][scan][virtual_columns]")
+                 "[integration][gpu_execution][scan][virtual_columns]")
 {
   auto const path =
     (get_project_root() / "test/cpp/integration/data/parquet/nation.parquet").string();
@@ -2225,7 +2225,7 @@ TEST_CASE_METHOD(MultiFormatFixtureBase,
 
 TEST_CASE_METHOD(MultiFormatFixtureBase,
                  "gpu_execution parquet virtual columns participate in residual filters",
-                 "[.][integration][gpu_execution][scan][virtual_columns]")
+                 "[integration][gpu_execution][scan][virtual_columns]")
 {
   auto const path =
     (get_project_root() / "test/cpp/integration/data/parquet/nation.parquet").string();
@@ -2329,7 +2329,7 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns preserve bound file and row provenance",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]")
 {
   compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + files() +
                      " ORDER BY file_index, file_row_number");
@@ -2361,7 +2361,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns participate in complete residual predicates",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]")
 {
   compare_gpu_vs_cpu("SELECT sentinel, x FROM " + files() +
                      " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
@@ -2381,7 +2381,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual-only carriers and physical name collisions remain distinct",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]")
 {
   compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
                      file("strings.parquet") + " ORDER BY file_row_number");
@@ -2394,7 +2394,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns support downstream expressions and legacy star options",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]")
 {
   compare_gpu_vs_cpu("SELECT filename, count(*) FROM " + files() +
                      " GROUP BY filename ORDER BY filename");
@@ -2416,7 +2416,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns normalize a missing per-file carrier",
-                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
   compare_gpu_vs_cpu("SELECT file_row_number FROM read_parquet([" +
@@ -2440,7 +2440,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet legacy virtual-only scans use a physical carrier",
-                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
   auto const scan = "read_parquet(" + scratch.file_literal("two_strings.parquet") +
@@ -2452,7 +2452,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet legacy virtual columns support output and filter-only predicates",
-                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
   auto const scan = "read_parquet(" + scratch.file_literal("a.parquet") +
@@ -2467,7 +2467,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet nested-only virtual scans decline before GPU execution",
-                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
 {
   sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", true);
   compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"),
@@ -2477,7 +2477,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet legacy virtual options preserve binder collision errors",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]")
 {
   for (auto const& [option, expected_error] : std::vector<std::pair<std::string, std::string>>{
          {"filename=true", "Option filename adds column \"filename\""},
@@ -2502,7 +2502,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns compose with hive partition injection and pruning",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][hive]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance][hive]")
 {
   compare_gpu_vs_cpu(
     "SELECT part, sentinel, file_row_number, filename, file_index, filename FROM " + hive_files() +
@@ -2513,7 +2513,7 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                  "parquet virtual columns survive a published dynamic join filter",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]"
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance]"
                  "[dynamic_filter]")
 {
   con->Query("SET gpu_execution = false");
@@ -2533,6 +2533,76 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
   CHECK(after.publications_finished > before.publications_finished);
   CHECK(after.membership_filters_built > before.membership_filters_built);
   CHECK(after.filters_pushed > before.filters_pushed);
+}
+
+TEST_CASE_METHOD(MultiFormatFixtureBase,
+                 "parquet file_index records the runtime file-pruning compatibility difference",
+                 "[integration][gpu_execution][scan][virtual_columns][runtime_file_pruning]")
+{
+  sirius::test::scratch_dir scratch{"parquet_runtime_file_pruning"};
+  sirius::test::scoped_setting cpu_setup(*con, "gpu_execution", false);
+  sirius::test::coverage_gate_disable_guard coverage_guard(*con);
+  auto checked_query = [&](std::string const& sql) {
+    auto result = con->Query(sql);
+    REQUIRE(result);
+    INFO(sql);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    return result;
+  };
+  for (int part = 0; part < 2; ++part) {
+    auto const path = "part=" + std::to_string(part) + "/data.parquet";
+    fs::create_directories((scratch.path() / path).parent_path());
+    checked_query("COPY (SELECT i::INTEGER AS x FROM range(10000) t(i)) TO " +
+                  scratch.file_literal(path) + " (FORMAT PARQUET)");
+  }
+
+  bool legacy_filename = false;
+  SECTION("runtime filter on a Hive partition") {}
+  SECTION("runtime filter on the legacy filename column") { legacy_filename = true; }
+  auto const second_path = (scratch.path() / "part=1/data.parquet").string();
+  auto const selected_key =
+    legacy_filename ? scratch.file_literal("part=1/data.parquet") : "1::BIGINT";
+  checked_query("COPY (SELECT " + selected_key + " AS k) TO " +
+                scratch.file_literal("selected_key.parquet") + " (FORMAT PARQUET)");
+  auto const scan =
+    "read_parquet([" + scratch.file_literal("part=0/data.parquet") + ", " +
+    scratch.file_literal("part=1/data.parquet") +
+    (legacy_filename ? "], hive_partitioning=false, filename=true)" : "], hive_partitioning=true)");
+  auto const query = "SELECT p.filename, p.file_index, count(*), min(p.x), max(p.x) FROM " + scan +
+                     " p JOIN read_parquet(" + scratch.file_literal("selected_key.parquet") +
+                     ", hive_partitioning=false) s ON p." +
+                     (legacy_filename ? "filename" : "part") +
+                     " = s.k GROUP BY p.filename, p.file_index";
+
+  // Keep the join shape fixed and prevent bind-time statistics pruning. Only the
+  // runtime join-filter switch should change CPU file numbering. This deliberately
+  // records an unresolved compatibility difference, not a CPU/GPU equality claim.
+  // Discussion: https://github.com/sirius-db/sirius/pull/1846#issuecomment-5777809768
+  for (bool pushdown : {true, false}) {
+    sirius::test::disabled_optimizers_guard shape(
+      *con,
+      std::string{"statistics_propagation,join_order,build_side_probe_side"} +
+        (pushdown ? "" : ",join_filter_pushdown"));
+    for (bool gpu : {false, true}) {
+      CAPTURE(legacy_filename, pushdown, gpu);
+      sirius::test::scoped_setting execution(*con, "gpu_execution", gpu);
+      auto const before = sirius::test::get_transparent_execution_stats(*con);
+      auto result       = checked_query(query);
+      auto const after  = sirius::test::get_transparent_execution_stats(*con);
+      if (gpu) {
+        require_route(before, after, gpu_route::gpu);
+      } else {
+        sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+      }
+      REQUIRE(result->RowCount() == 1);
+      CHECK(result->GetValue(0, 0).ToString() == second_path);
+      CHECK(result->GetValue(1, 0).GetValue<uint64_t>() == (gpu || !pushdown ? 1 : 0));
+      CHECK(result->GetValue(2, 0).GetValue<int64_t>() == 10000);
+      CHECK(result->GetValue(3, 0).GetValue<int32_t>() == 0);
+      CHECK(result->GetValue(4, 0).GetValue<int32_t>() == 9999);
+    }
+  }
 }
 
 class ParquetVirtualMultiRowGroupFixture : public MultiFormatFixtureBase {
@@ -2570,7 +2640,7 @@ class ParquetVirtualMultiRowGroupFixture : public MultiFormatFixtureBase {
 
 TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
                  "parquet virtual row numbers retain offsets across pruned row groups",
-                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][pruning]")
+                 "[integration][gpu_execution][scan][virtual_columns][acceptance][pruning]")
 {
   con->Query("SET gpu_execution = false");
   sirius::test::scoped_setting force_one_rg_per_split(*con, "scan_task_batch_size", 1024);
