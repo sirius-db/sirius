@@ -1986,8 +1986,7 @@ std::vector<std::size_t> cache_entry_info::can_serve_with_columns(
     if (ice->delete_data && !ice->delete_data->empty()) { return {}; }
   }
   if (auto const* p = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&other)) {
-    // Pinned parquet batches do not retain per-row file provenance, so they
-    // cannot synthesize filename/file_index/file_row_number correctly.
+    // Cached parquet batches have no per-row file provenance.
     if (p->has_requested_user_virtual_columns()) { return {}; }
     if (!matches_parquet_files(p->resolved_file_paths)) { return {}; }
     return column_projection_for(p->column_ids);

@@ -18,6 +18,7 @@
 
 // sirius
 #include <io/sirius_datasource.hpp>
+#include <op/scan/parquet_batch_layout.hpp>
 // cudf
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -52,7 +53,7 @@ struct row_group_slice {
                   std::size_t estimated_decode_working_bytes,
                   std::size_t reserved_compressed_bytes,
                   std::shared_ptr<io::sirius_datasource> datasource,
-                  std::size_t file_index = 0)
+                  std::size_t file_index = invalid_parquet_file_index)
     : file_metadata(file_metadata),
       file_path(file_path),
       row_group_indices(std::move(row_group_indices)),

@@ -26,6 +26,7 @@
 #include <log/logging.hpp>
 #include <op/dynamic_filter/sirius_dynamic_filter.hpp>
 #include <op/scan/dynamic_filter_merge.hpp>
+#include <op/scan/parquet_batch_layout.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/parquet_metadata.hpp>
 #include <op/scan/parquet_schema_mapping.hpp>
@@ -34,12 +35,14 @@
 #include <scan_manager/sirius_scan_manager.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/text/byte_range_info.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -478,6 +481,23 @@ std::vector<scan_info::fadvise_entry> parquet_split_info::fadvise_entries() cons
   return entries;
 }
 
+bool parquet_ingestible_table_info::has_requested_user_virtual_columns() const
+{
+  for (auto const& column : column_ids) {
+    if (!column.HasPrimaryIndex()) { continue; }
+    auto const id = column.GetPrimaryIndex();
+    if ((column.IsVirtualColumn() || std::any_of(virtual_columns.begin(),
+                                                 virtual_columns.end(),
+                                                 [id](auto const& virtual_column) {
+                                                   return virtual_column.column_id == id;
+                                                 })) &&
+        id != duckdb::COLUMN_IDENTIFIER_ROW_ID && id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
+      return true;
+    }
+  }
+  return false;
+}
+
 //===----------------------------------------------------------------------===//
 // parquet_ingestible_table_info::make_ingestible
 //===----------------------------------------------------------------------===//
@@ -525,7 +545,6 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   if (bind.table_filters && !bind.table_filters->filters.empty()) {
     for (auto const& [column_index, filter] : bind.table_filters->filters) {
       if (column_index < bind.column_ids.size() &&
-          bind.column_ids[column_index].IsVirtualColumn() &&
           _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
         _has_virtual_filter = true;
       }
@@ -555,13 +574,31 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
       }
       _duckdb_filter_expression = std::move(duckdb_expression);
 
-      if (!is_unsafe_for_stats_filter(*_duckdb_filter_expression)) {
-        // Nothing to strip — push the whole predicate, sharing it rather than
-        // copying.
-        _static_pushdown_expression = _duckdb_filter_expression;
-      } else {
+      // Keep virtual predicates for the residual; prune only on physical conjuncts.
+      std::shared_ptr<duckdb::Expression> stats_candidate = _duckdb_filter_expression;
+      if (_has_virtual_filter) {
+        duckdb::TableFilterSet physical_filters;
+        for (auto const& [column_index, filter] : bind.table_filters->filters) {
+          if (column_index >= bind.column_ids.size() ||
+              _virtual_types.contains(bind.column_ids[column_index].GetPrimaryIndex())) {
+            continue;
+          }
+          physical_filters.filters.emplace(column_index, filter->Copy());
+        }
+        stats_candidate =
+          sirius::op::convert_table_filters_to_expression(physical_filters,
+                                                          bind.column_ids,
+                                                          bind.returned_types,
+                                                          _plan->batch_position_by_column_id,
+                                                          _plan->partition_primary_indices);
         _static_pushdown_is_complete = false;
-        _static_pushdown_expression  = stats_safe_conjuncts(*_duckdb_filter_expression);
+      }
+
+      if (stats_candidate && !is_unsafe_for_stats_filter(*stats_candidate)) {
+        _static_pushdown_expression = std::move(stats_candidate);
+      } else if (stats_candidate) {
+        _static_pushdown_is_complete = false;
+        _static_pushdown_expression  = stats_safe_conjuncts(*stats_candidate);
         // Whatever survives must itself be safe, or the crash returns.
         D_ASSERT(!_static_pushdown_expression ||
                  !is_unsafe_for_stats_filter(*_static_pushdown_expression));
@@ -687,9 +724,7 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path,
-  std::size_t file_index,
-  std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -776,7 +811,7 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // translated cuDF AST must outlive filter_row_groups_with_stats below.
   // Pushes _static_pushdown_expression, not the full predicate.
   std::optional<gpu_expression_translator::translated_expression> ast_expression = std::nullopt;
-  if (_static_pushdown_expression && !stats_filter_unsafe && !_has_virtual_filter) {
+  if (_static_pushdown_expression && !stats_filter_unsafe) {
     auto name_resolver = [this](duckdb::idx_t ref_index) -> std::string {
       return _plan->batch_column_name(ref_index);
     };
@@ -860,7 +895,8 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   auto row_group_indices = reader.all_row_groups(opts);
-  if (ast_expression && !disable_filter_pushdown) {
+  // Virtual columns are not available to the reader, but physical footer pruning is.
+  if (ast_expression) {
     auto const rgs_before = row_group_indices.size();
     row_group_indices     = reader.filter_row_groups_with_stats(row_group_indices, opts, stream);
     SIRIUS_LOG_DEBUG("[parquet_gpu_ingestible] Row group pruning {}: {} -> {} row group(s)",
@@ -1100,6 +1136,27 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
 //===----------------------------------------------------------------------===//
 // materialize_table — ports read_table_from_metadata
 //===----------------------------------------------------------------------===//
+std::unique_ptr<cudf::table> parquet_gpu_ingestible::append_virtual_columns(
+  std::unique_ptr<cudf::table> decoded,
+  cudf::io::parquet_reader_options const& reader_options,
+  std::string const& file_path,
+  std::size_t file_index,
+  std::int64_t file_row_offset,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr) const
+{
+  if (_plan->carrier_batch_index && !reader_options.get_column_names().has_value()) {
+    auto const rows = decoded->num_rows();
+    decoded.reset();
+    cudf::numeric_scalar<int8_t> value(0, true, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+    decoded = std::make_unique<cudf::table>(std::move(columns));
+  }
+  return append_parquet_virtual_columns(
+    std::move(decoded), *_plan, file_path, file_index, file_row_offset, stream, mr);
+}
+
 filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   op::scan::scan_info const& info,
   const cucascade::memory::memory_space& mem_space,
@@ -1195,30 +1252,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
   rmm::device_async_resource_ref mr_ref(mem_space.get_default_allocator());
   std::unique_ptr<cudf::table> table;
   if (_plan->has_user_virtual_columns() && !all_slices_pruned) {
-    // Correctness baseline: decode one selected row group at a time in explicit
-    // split order. This avoids depending on an undocumented multi-source output
-    // ordering contract while provenance columns are being synthesized.
+    // Preserve provenance without relying on multi-source output order.
+    auto const layout     = build_batch_layout(split);
+    std::size_t run_index = 0;
     std::vector<std::unique_ptr<cudf::table>> pieces;
     for (auto const& slice : split.rg_slices) {
-      if (!slice.file_metadata) {
-        throw sirius::internal_exception(
-          "parquet virtual scan: row-group slice has no footer metadata");
-      }
-      auto const& row_groups   = slice.file_metadata->row_groups;
-      std::int64_t file_offset = 0;
-      std::vector<std::int64_t> offsets(row_groups.size() + 1, 0);
-      for (std::size_t i = 0; i < row_groups.size(); ++i) {
-        if (row_groups[i].num_rows < 0 ||
-            file_offset > std::numeric_limits<std::int64_t>::max() - row_groups[i].num_rows) {
-          throw sirius::internal_exception("parquet virtual scan: invalid row-group prefix sum");
-        }
-        file_offset += row_groups[i].num_rows;
-        offsets[i + 1] = file_offset;
-      }
       for (auto const rg_index : slice.row_group_indices) {
-        if (rg_index < 0 || static_cast<std::size_t>(rg_index) >= row_groups.size()) {
-          throw sirius::internal_exception("parquet virtual scan: row-group index outside footer");
-        }
+        auto const& run = layout.at(run_index++);
         std::vector<std::unique_ptr<cudf::io::datasource>> one_source;
         one_source.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
                                               : cudf::io::datasource::create(slice.file_path));
@@ -1227,19 +1267,22 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
         one_opts.set_row_groups({{rg_index}});
         auto [decoded, metadata] = cudf::io::read_parquet(
           std::move(one_source), std::move(one_metadata), one_opts, stream, mr_ref);
-        auto const expected = row_groups[static_cast<std::size_t>(rg_index)].num_rows;
-        if (decoded->num_rows() != expected) {
+        if (decoded->num_rows() != run.num_rows) {
           throw sirius::internal_exception(
             "parquet virtual scan: decoded row count does not match footer");
         }
-        pieces.push_back(append_parquet_virtual_columns(std::move(decoded),
-                                                        *_plan,
-                                                        slice.file_path,
-                                                        slice.file_index,
-                                                        offsets[static_cast<std::size_t>(rg_index)],
-                                                        stream,
-                                                        mr_ref));
+        pieces.push_back(append_virtual_columns(std::move(decoded),
+                                                *split.reader_options,
+                                                run.data_file_path,
+                                                run.file_index,
+                                                run.file_row_offset,
+                                                stream,
+                                                mr_ref));
       }
+    }
+    if (run_index != layout.size()) {
+      throw sirius::internal_exception(
+        "parquet virtual scan: provenance layout does not match selected row groups");
     }
     if (pieces.empty()) {
       throw sirius::internal_exception(
@@ -1261,8 +1304,13 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
     table = std::move(decoded);
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();
-      table             = append_parquet_virtual_columns(
-        std::move(table), *_plan, slice.file_path, slice.file_index, 0, stream, mr_ref);
+      table             = append_virtual_columns(std::move(table),
+                                     *split.reader_options,
+                                     slice.file_path,
+                                     slice.file_index,
+                                     0,
+                                     stream,
+                                     mr_ref);
     }
   }
 

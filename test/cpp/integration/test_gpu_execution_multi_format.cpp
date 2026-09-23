@@ -179,6 +179,11 @@ class MultiFormatFixtureBase {
 
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+    REQUIRE(gpu_result->names == cpu_result->names);
+    REQUIRE(gpu_result->types.size() == cpu_result->types.size());
+    for (duckdb::idx_t c = 0; c < gpu_result->types.size(); ++c) {
+      CHECK(gpu_result->types[c] == cpu_result->types[c]);
+    }
 
     // Build a per-column flag for which columns are floating-point.
     std::vector<bool> col_is_float(gpu_result->ColumnCount());
@@ -986,7 +991,7 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - conformance append-only matches pyiceberg",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // The baseline. No evolution, no deletes — so if this ever declines, the gate has begun
   // over-refusing. It is also the case that proves the delete-gate probe can read a table
@@ -999,6 +1004,41 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
     "SELECT id, name FROM " + pinned_scan(conf_append_only_path) + " ORDER BY id;",
     gpu_route::gpu,
     {{"1", "a"}, {"2", "b"}, {"3", "c"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - append-only virtual columns preserve source positions",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  require_session_can_read(conf_append_only_path);
+  REQUIRE(delete_file_count(conf_append_only_path) == 0);
+  auto const filename =
+    "test/cpp/integration/data/iceberg_conformance/append_only/conf/append_only/data/"
+    "00000-0-b4630554-9751-49f1-b362-c0c9ea9535b3.parquet";
+  expect_iceberg_rows(
+    "SELECT id, name, filename, file_row_number FROM " + pinned_scan(conf_append_only_path) +
+      " ORDER BY id;",
+    gpu_route::gpu,
+    {{"1", "a", filename, "0"}, {"2", "b", filename, "1"}, {"3", "c", filename, "2"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - file_index follows the binder support boundary",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  auto const query = "SELECT file_index FROM " + pinned_scan(v1_path) + ";";
+  std::string gpu_error;
+  std::string cpu_error;
+  for (auto const gpu_enabled : {true, false}) {
+    con->Query(std::string{"SET gpu_execution = "} + (gpu_enabled ? "true;" : "false;"));
+    auto result = con->Query(query);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    CHECK(error.find("Referenced column \"file_index\" not found") != std::string::npos);
+    (gpu_enabled ? gpu_error : cpu_error) = error;
+  }
+  CHECK(gpu_error == cpu_error);
 }
 
 // `y` was dropped and re-added under the same name, so it is a NEW field id (4). The one
@@ -1192,12 +1232,28 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - V2 positional deletes basic scan",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   require_delete_files(v2_path, 1);
   expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(v2_path) + " ORDER BY count;",
                       kPositionalDeleteRoute,
                       {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "gpu_execution iceberg - positional deletes retain original row positions",
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
+{
+  require_delete_files(v2_path, 1);
+  auto const filename =
+    "test/cpp/integration/data/iceberg_v2_delete/data/"
+    "00000-0-b2c3d4e5-0002-0002-0002-000000000001-00001.parquet";
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(v2_path) + " ORDER BY count;",
+                      kPositionalDeleteRoute,
+                      {{"apple", "1", filename, "0"},
+                       {"cherry", "3", filename, "2"},
+                       {"elderberry", "5", filename, "4"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
@@ -1260,13 +1316,22 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqualityDeleteFixture,
                  "gpu_execution iceberg - V2 equality deletes filter on surviving rows",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   require_delete_files(eq_path, 1);
-  expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
-    kEqualityDeleteRoute,
-    {{"cherry", "3"}, {"elderberry", "5"}});
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(eq_path) + " WHERE count > 2 ORDER BY count;",
+                      kEqualityDeleteRoute,
+                      {{"cherry",
+                        "3",
+                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                        "2"},
+                       {"elderberry",
+                        "5",
+                        "test/cpp/integration/data/iceberg_v2_equality_delete/data/"
+                        "00000-0-c3d4e5f6-0003-0003-0003-000000000001-00001.parquet",
+                        "4"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -1320,27 +1385,36 @@ TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality deletes all rows deleted",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // The delete file covers every data row — an all-false mask, which is where an
   // A retention-mask implementation that mishandles the empty result shows up.
   require_delete_files(all_del_path, 1);
   expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(all_del_path) + ";", kEqualityDeleteRoute, {});
+    "SELECT fruit, count, filename, file_row_number FROM " + pinned_scan(all_del_path) + ";",
+    kEqualityDeleteRoute,
+    {});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
                  "gpu_execution iceberg - V2 equality and positional deletes combined",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // Both delete kinds against one table. The positional delete removes row 0 (apple/1). The
   // equality delete sits at the same sequence number as the data, so per the Iceberg spec it
   // does NOT apply — deletes only affect data files with strictly lower sequence numbers.
   // banana/2 surviving is the assertion that the sequence-number rule is honoured.
   require_delete_files(combined_path, 2);
-  expect_iceberg_rows("SELECT fruit, count FROM " + pinned_scan(combined_path) + " ORDER BY count;",
+  auto const filename =
+    "test/cpp/integration/data/iceberg_v2_eq_pos_combined/data/"
+    "00000-0-a7b8c9d0-0007-0007-0007-000000000001-00001.parquet";
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(combined_path) + " ORDER BY count;",
                       kEqualityDeleteRoute,
-                      {{"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}});
+                      {{"banana", "2", filename, "1"},
+                       {"cherry", "3", filename, "2"},
+                       {"date", "4", filename, "3"},
+                       {"elderberry", "5", filename, "4"}});
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergEqEdgeCaseFixture,
@@ -1396,15 +1470,24 @@ TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
 
 TEST_CASE_METHOD(GPUExecutionIcebergDVFixture,
                  "gpu_execution iceberg - V3 deletion vector filter",
-                 "[integration][gpu_execution][iceberg]")
+                 "[integration][gpu_execution][iceberg][virtual_columns]")
 {
   // A filter over the surviving rows: a deleted row must not reappear because a predicate
   // happens to select it.
   require_delete_files(dv_path, 1);
-  expect_iceberg_rows(
-    "SELECT fruit, count FROM " + pinned_scan(dv_path) + " WHERE count > 2 ORDER BY count;",
-    kDeletionVectorRoute,
-    {{"cherry", "3"}, {"elderberry", "5"}});
+  expect_iceberg_rows("SELECT fruit, count, filename, file_row_number FROM " +
+                        pinned_scan(dv_path) + " WHERE count > 2 ORDER BY count;",
+                      kDeletionVectorRoute,
+                      {{"cherry",
+                        "3",
+                        "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+                        "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet",
+                        "2"},
+                       {"elderberry",
+                        "5",
+                        "test/cpp/integration/data/iceberg_v3_deletion_vector/data/"
+                        "00000-0-d7e8f9a0-0007-0007-0007-000000000001-00001.parquet",
+                        "4"}});
 }
 
 //===----------------------------------------------------------------------===//
@@ -2149,4 +2232,319 @@ TEST_CASE_METHOD(MultiFormatFixtureBase,
   compare_gpu_vs_cpu("SELECT n_nationkey, file_row_number FROM read_parquet('" + path +
                      "') WHERE file_row_number BETWEEN 3 AND 7 "
                      "AND n_nationkey >= 4 ORDER BY file_row_number");
+}
+
+class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
+ public:
+  ParquetVirtualColumnFixture() : scratch{"parquet_virtual_columns"}
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+
+    write(writer,
+          "a.parquet",
+          "SELECT * FROM (VALUES (10::INTEGER, 'A0'), (NULL, 'A1'), (30, 'A2'), "
+          "(40, 'A3')) t(x, sentinel)");
+    write(writer,
+          "b.parquet",
+          "SELECT * FROM (VALUES (50::INTEGER, 'B0'), (60, 'B1'), (NULL, 'B2')) "
+          "t(x, sentinel)");
+    write(
+      writer, "strings.parquet", "SELECT * FROM (VALUES ('alpha'), (NULL), ('你好')) t(payload)");
+    write(writer, "two_strings.parquet", "SELECT 'alpha' AS a, '777' AS b");
+    write(writer, "carrier_a.parquet", "SELECT 1::TINYINT AS a, 10::BIGINT AS b, 100::BIGINT AS c");
+    write(writer, "carrier_b.parquet", "SELECT 20::BIGINT AS b, 200::BIGINT AS c");
+    write(writer, "carrier_c.parquet", "SELECT 'text' AS d, '888' AS e");
+    write(writer, "carrier_empty.parquet", "SELECT 20::BIGINT AS b, 200::BIGINT AS c WHERE false");
+    write(writer,
+          "nested_only.parquet",
+          "SELECT [1,2]::BIGINT[] AS payload, [3,4]::BIGINT[] AS payload2");
+    write(writer,
+          "physical_names.parquet",
+          "SELECT * FROM (VALUES ('physical-a', 7::UBIGINT, 9::BIGINT), "
+          "('physical-b', 8::UBIGINT, 10::BIGINT)) "
+          "t(filename, file_index, file_row_number)");
+    write(
+      writer, "empty.parquet", "SELECT 1::INTEGER AS x, 'none'::VARCHAR AS sentinel WHERE false");
+    write(writer,
+          "utf8/数据.parquet",
+          "SELECT * FROM (VALUES (70::INTEGER, 'U0'), (80, 'U1')) t(x, sentinel)");
+    write(writer,
+          "hive/part=A/a.parquet",
+          "SELECT * FROM (VALUES (10::INTEGER, 'HA0'), (30, 'HA1')) t(x, sentinel)");
+    write(writer,
+          "hive/part=B/b.parquet",
+          "SELECT * FROM (VALUES (50::INTEGER, 'HB0'), (60, 'HB1')) t(x, sentinel)");
+    write(writer,
+          "keys.parquet",
+          "SELECT * FROM (VALUES (30::INTEGER, true), (60::INTEGER, true), "
+          "(999::INTEGER, false)) t(x, keep)");
+  }
+
+  std::string files(std::string const& first  = "a.parquet",
+                    std::string const& second = "b.parquet") const
+  {
+    return "read_parquet([" + scratch.file_literal(first) + ", " + scratch.file_literal(second) +
+           "], hive_partitioning=false)";
+  }
+
+  std::string file(std::string const& path) const
+  {
+    return "read_parquet(" + scratch.file_literal(path) + ", hive_partitioning=false)";
+  }
+
+  std::string hive_files() const
+  {
+    return "read_parquet(" + scratch.file_literal("hive/part=*/*.parquet") +
+           ", hive_partitioning=true)";
+  }
+
+  sirius::test::scratch_dir scratch;
+
+ private:
+  void write(duckdb::Connection& writer, std::string const& relative_path, std::string const& query)
+  {
+    fs::create_directories((scratch.path() / relative_path).parent_path());
+    auto result = writer.Query("COPY (" + query + ") TO " + scratch.file_literal(relative_path) +
+                               " (FORMAT PARQUET)");
+    INFO(relative_path);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+  }
+};
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns preserve bound file and row provenance",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + files() +
+                     " ORDER BY file_index, file_row_number");
+  compare_gpu_vs_cpu("SELECT file_row_number, x, filename, file_index, filename FROM " + files() +
+                     " ORDER BY file_index, file_row_number");
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + files() +
+                     " WHERE x >= 30 ORDER BY file_index, file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns participate in complete residual predicates",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT sentinel, x FROM " + files() +
+                     " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_index FROM " + files() +
+                     " WHERE file_index = 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, filename FROM " + files() +
+                     " WHERE filename LIKE '%b.parquet' ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
+                     " WHERE x IS NULL ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number FROM " + files() +
+                     " WHERE x IS NOT NULL ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, x, file_row_number FROM " + files() +
+                     " WHERE x >= 30 AND file_row_number >= 1 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT sentinel, x, file_row_number FROM " + files() +
+                     " WHERE x IS NULL OR file_row_number = 0 ORDER BY sentinel");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual-only carriers and physical name collisions remain distinct",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("strings.parquet") + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " +
+                     file("physical_names.parquet") + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + file("empty.parquet"));
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + files() +
+                     " WHERE false");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns support downstream expressions and legacy star options",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  compare_gpu_vs_cpu("SELECT filename, count(*) FROM " + files() +
+                     " GROUP BY filename ORDER BY filename");
+  compare_gpu_vs_cpu("SELECT sentinel, file_row_number + 10 AS shifted FROM " + files() +
+                     " ORDER BY shifted, sentinel LIMIT 4");
+  compare_gpu_vs_cpu("SELECT * FROM " + file("a.parquet") + " ORDER BY x NULLS LAST");
+  compare_gpu_vs_cpu(
+    "SELECT * FROM read_parquet(" + scratch.file_literal("a.parquet") +
+    ", hive_partitioning=false, filename=true, file_row_number=true) ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT source_path, sentinel FROM read_parquet(" +
+                     scratch.file_literal("a.parquet") +
+                     ", hive_partitioning=false, filename='source_path') ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT filename, source_path, file_row_number FROM read_parquet(" +
+                     scratch.file_literal("physical_names.parquet") +
+                     ", hive_partitioning=false, filename='source_path') ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number, sentinel FROM " +
+                     file("utf8/数据.parquet") + " ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns normalize a missing per-file carrier",
+                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  compare_gpu_vs_cpu("SELECT file_row_number FROM read_parquet([" +
+                     scratch.file_literal("carrier_a.parquet") + ", " +
+                     scratch.file_literal("carrier_b.parquet") +
+                     "], union_by_name=true, hive_partitioning=false) ORDER BY file_row_number");
+  auto const scan = "read_parquet([" + scratch.file_literal("carrier_a.parquet") + ", " +
+                    scratch.file_literal("carrier_b.parquet") + ", " +
+                    scratch.file_literal("carrier_c.parquet") +
+                    "], union_by_name=true, hive_partitioning=false)";
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + scan + " ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + scan +
+                     " ORDER BY file_index, file_row_number");
+  compare_gpu_vs_cpu("SELECT filename, file_row_number FROM " + scan +
+                     " WHERE file_row_number = 0 ORDER BY filename");
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM read_parquet([" +
+                     scratch.file_literal("carrier_a.parquet") + ", " +
+                     scratch.file_literal("carrier_empty.parquet") +
+                     "], union_by_name=true, hive_partitioning=false) WHERE file_index = 1");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet legacy virtual-only scans use a physical carrier",
+                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  auto const scan = "read_parquet(" + scratch.file_literal("two_strings.parquet") +
+                    ", file_row_number=true, filename=true, hive_partitioning=false)";
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + scan);
+  compare_gpu_vs_cpu("SELECT filename, file_index, file_row_number FROM " + scan);
+  compare_gpu_vs_cpu("SELECT file_index FROM " + scan);
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet legacy virtual columns support output and filter-only predicates",
+                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", false);
+  auto const scan = "read_parquet(" + scratch.file_literal("a.parquet") +
+                    ", file_row_number=true, filename='source_path', hive_partitioning=false)";
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + scan +
+                     " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY file_row_number");
+  compare_gpu_vs_cpu("SELECT sentinel FROM " + scan +
+                     " WHERE file_row_number BETWEEN 1 AND 2 ORDER BY sentinel");
+  compare_gpu_vs_cpu("SELECT source_path, file_row_number FROM " + scan +
+                     " WHERE file_row_number >= 1 AND x IS NOT NULL ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet nested-only virtual scans decline before GPU execution",
+                 "[.][integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  sirius::test::scoped_setting fallback(*con, "enable_duckdb_fallback", true);
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("nested_only.parquet"),
+                     std::nullopt,
+                     gpu_route::plan_fallback);
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet legacy virtual options preserve binder collision errors",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]")
+{
+  for (auto const& [option, expected_error] : std::vector<std::pair<std::string, std::string>>{
+         {"filename=true", "Option filename adds column \"filename\""},
+         {"file_row_number=true", "Using file_row_number option on file with column named"}}) {
+    auto const query = "SELECT * FROM read_parquet(" +
+                       scratch.file_literal("physical_names.parquet") +
+                       ", hive_partitioning=false, " + option + ");";
+    std::string gpu_error;
+    std::string cpu_error;
+    for (auto const gpu_enabled : {true, false}) {
+      con->Query(std::string{"SET gpu_execution = "} + (gpu_enabled ? "true;" : "false;"));
+      auto result = con->Query(query);
+      REQUIRE(result);
+      REQUIRE(result->HasError());
+      auto const error = result->GetError();
+      CHECK(error.find(expected_error) != std::string::npos);
+      (gpu_enabled ? gpu_error : cpu_error) = error;
+    }
+    CHECK(gpu_error == cpu_error);
+  }
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns compose with hive partition injection and pruning",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][hive]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT part, sentinel, file_row_number, filename, file_index, filename FROM " + hive_files() +
+    " WHERE x >= 30 ORDER BY part, sentinel");
+  compare_gpu_vs_cpu("SELECT file_index, part, sentinel, file_row_number FROM " + hive_files() +
+                     " WHERE part = 'B' ORDER BY sentinel");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet virtual columns survive a published dynamic join filter",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance]"
+                 "[dynamic_filter]")
+{
+  con->Query("SET gpu_execution = false");
+  sirius::test::disabled_optimizers_guard shape(
+    *con, "statistics_propagation,join_order,build_side_probe_side");
+  sirius::test::coverage_gate_disable_guard coverage_guard(*con);
+  con->Query("SET gpu_execution = true");
+  auto const before = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  compare_gpu_vs_cpu(
+    "SELECT p.filename, p.file_index, p.file_row_number, p.sentinel "
+    "FROM " +
+    files() + " p JOIN (SELECT x FROM " + file("keys.parquet") +
+    " WHERE keep) AS build ON p.x = build.x "
+    "ORDER BY p.sentinel");
+  auto const after = sirius::test::get_dynamic_filter_stats_snapshot(*con);
+  CHECK(after.producers_enabled > before.producers_enabled);
+  CHECK(after.publications_finished > before.publications_finished);
+  CHECK(after.membership_filters_built > before.membership_filters_built);
+  CHECK(after.filters_pushed > before.filters_pushed);
+}
+
+class ParquetVirtualMultiRowGroupFixture : public MultiFormatFixtureBase {
+ public:
+  ParquetVirtualMultiRowGroupFixture() : scratch{"parquet_virtual_multi_rg"}
+  {
+    sirius::test::scoped_sirius_disable disable;
+    duckdb::DuckDB writer_db(nullptr);
+    duckdb::Connection writer(writer_db);
+    auto const path = scratch.file_literal("multi.parquet");
+    auto result     = writer.Query(
+      "COPY (SELECT i::INTEGER AS x, ('R' || i)::VARCHAR AS sentinel FROM range(6144) t(i) "
+          "ORDER BY i) TO " +
+      path + " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+
+    auto layout = writer.Query("SELECT row_group_id, row_group_num_rows FROM parquet_metadata(" +
+                               path + ") WHERE path_in_schema = 'x' ORDER BY row_group_id");
+    REQUIRE(layout);
+    REQUIRE_FALSE(layout->HasError());
+    REQUIRE(layout->RowCount() == 3);
+    for (duckdb::idx_t i = 0; i < layout->RowCount(); ++i) {
+      REQUIRE(layout->GetValue(1, i).GetValue<std::int64_t>() == 2048);
+    }
+  }
+
+  std::string scan() const
+  {
+    return "read_parquet(" + scratch.file_literal("multi.parquet") + ", hive_partitioning=false)";
+  }
+
+  sirius::test::scratch_dir scratch;
+};
+
+TEST_CASE_METHOD(ParquetVirtualMultiRowGroupFixture,
+                 "parquet virtual row numbers retain offsets across pruned row groups",
+                 "[.][integration][gpu_execution][scan][virtual_columns][acceptance][pruning]")
+{
+  con->Query("SET gpu_execution = false");
+  sirius::test::scoped_setting force_one_rg_per_split(*con, "scan_task_batch_size", 1024);
+  con->Query("SET gpu_execution = true");
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + scan() +
+                     " WHERE x IN (0, 2048, 4096, 6143) ORDER BY x");
+  compare_gpu_vs_cpu("SELECT x, sentinel, file_row_number FROM " + scan() +
+                     " WHERE x >= 4096 ORDER BY x");
 }

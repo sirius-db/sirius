@@ -109,9 +109,7 @@ struct scan_plan {
   /// Final output layout. Length equals the scan operator's @c types.size().
   std::vector<output_entry> output_layout;
 
-  /// C → M map. @c nullopt when the column is a hive partition or is not
-  /// materialized. Physical columns retain their D position because D is the
-  /// leading prefix of M; virtual columns occupy D.size() + ordinal.
+  /// C → M map; partitions and unmaterialized columns have no entry.
   std::vector<std::optional<std::size_t>> batch_position_by_column_id;
 
   /// Primary indices of hive-partition columns. Supplied to
@@ -158,13 +156,13 @@ struct scan_plan {
   [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
 };
 
-/// Planner-bound virtual-column metadata converted to Sirius types at the
-/// DuckDB boundary. Keeping it separate from the physical schema prevents a
-/// virtual ID (2^63+) from ever indexing returned_types.
+/// Bound virtual-column metadata, kept separate from the physical schema.
 struct bound_virtual_column {
   duckdb::column_t column_id;
   std::string name;
   sirius::logical_type type;
+  /// Present for legacy options, whose columns use ordinary schema positions.
+  std::optional<scan_plan::parquet_virtual_column_kind> kind;
 };
 
 //===--------------------------------------------------------------------===//
@@ -215,9 +213,7 @@ struct bound_virtual_column {
 /// @param plan  The scan plan describing the layout.
 [[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
 
-/// Append one row group's parquet virtual columns to a decoded D-space table,
-/// producing M-space. Values are non-null and preserve the file-local original
-/// row positions supplied by the footer-derived offset.
+/// Append non-null virtual columns to a decoded row group.
 [[nodiscard]] std::unique_ptr<cudf::table> append_parquet_virtual_columns(
   std::unique_ptr<cudf::table> table,
   scan_plan const& plan,

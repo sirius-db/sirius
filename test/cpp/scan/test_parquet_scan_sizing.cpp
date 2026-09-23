@@ -17,6 +17,7 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/common/constants.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <op/scan/parquet_gpu_ingestible.hpp>
 #include <op/scan/scan_plan.hpp>
@@ -217,6 +218,8 @@ struct carrier_file_fixture {
           scratch.file_literal("part=2024/" + std::string{name} + ".parquet") +
           " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
     }
+    run("COPY (SELECT * FROM rows) TO " + scratch.file_literal("part=2024/路径-非常长.parquet") +
+        " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
   }
 
   std::string path(std::string const& name) const
@@ -971,6 +974,32 @@ TEST_CASE_METHOD(carrier_file_fixture,
   CHECK(split->plan->partition_primary_indices.count(carrier_names().size()) == 1);
   CHECK(split->plan->output_layout.empty());
   CHECK(split->plan->carrier_batch_index.has_value());
+}
+
+TEST_CASE_METHOD(carrier_file_fixture,
+                 "parquet filename virtual sizing charges UTF-8 path bytes and offsets",
+                 "[scan][parquet][sizing][virtual_columns]")
+{
+  auto info        = make_info({"路径-非常长"});
+  info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
+  info->scan_output_arity = 1;
+  info->virtual_columns   = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                              "filename",
+                              sirius::logical_type::make(sirius::type_id::VARCHAR),
+                              scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+  auto reader             = scan::make_ingestible(std::move(info));
+  auto baseline_reader    = scan::make_ingestible(make_info({"路径-非常长"}));
+  auto file               = read_file(*reader);
+  auto baseline           = read_file(*baseline_reader);
+  REQUIRE(file->row_groups.size() == baseline->row_groups.size());
+  for (std::size_t i = 0; i < file->row_groups.size(); ++i) {
+    auto const rows           = static_cast<std::size_t>(file->row_groups[i].num_rows);
+    auto const filename_bytes = rows * (file->file_path.size() + sizeof(cudf::size_type));
+    CHECK(file->row_groups[i].output_bytes ==
+          baseline->row_groups[i].output_bytes + filename_bytes);
+    CHECK(file->row_groups[i].decode_working_bytes ==
+          baseline->row_groups[i].decode_working_bytes + filename_bytes);
+  }
 }
 
 TEST_CASE_METHOD(carrier_file_fixture,

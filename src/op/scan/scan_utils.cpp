@@ -112,7 +112,7 @@ std::vector<table_filter_conjunct> decompose_table_filters(
     }
     sirius::logical_type col_type;
     auto const source_id = column_ids.at(column_index).GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(source_id)) {
+    if (duckdb::IsVirtualColumn(source_id) || virtual_types.contains(source_id)) {
       auto const type = virtual_types.find(source_id);
       if (type == virtual_types.end()) {
         throw std::runtime_error(

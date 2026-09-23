@@ -97,6 +97,7 @@ set(EXTENSION_SOURCES
     src/op/scan/sirius_physical_dynamic_filter.cpp
     src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
+    src/op/scan/parquet_batch_layout.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_filter_analysis.cpp

@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -158,8 +159,16 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   info->table_filters  = std::move(scan_op.table_filters);
   info->virtual_columns.reserve(scan_op.virtual_columns.size());
   for (auto const& [column_id, column] : scan_op.virtual_columns) {
+    std::optional<sirius::op::scan::scan_plan::parquet_virtual_column_kind> kind;
+    if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME;
+    } else if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_INDEX;
+    } else if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+    }
     info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
-      column_id, column.name, sirius::from_duckdb(column.type)});
+      column_id, column.name, sirius::from_duckdb(column.type), kind});
   }
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
@@ -178,6 +187,46 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
+    // Legacy options use ordinary schema positions; normalize them here.
+    auto add_legacy_virtual = [&](duckdb::idx_t primary_idx,
+                                  sirius::op::scan::scan_plan::parquet_virtual_column_kind kind) {
+      if (primary_idx >= scan_op.names.size() || primary_idx >= scan_op.returned_types.size()) {
+        return;
+      }
+      auto const id     = static_cast<duckdb::column_t>(primary_idx);
+      auto const exists = std::any_of(info->virtual_columns.begin(),
+                                      info->virtual_columns.end(),
+                                      [id](auto const& column) { return column.column_id == id; });
+      if (!exists) {
+        info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
+          id, scan_op.names[primary_idx], scan_op.returned_types[primary_idx], kind});
+      }
+    };
+    if (bind_data.reader_bind.filename_idx.IsValid()) {
+      add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
+                         sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
+    }
+    // Identify the row-number option from the initial reader, not by name alone.
+    bool legacy_file_row_number = false;
+    if (bind_data.initial_reader) {
+      legacy_file_row_number =
+        std::any_of(bind_data.initial_reader->GetColumns().begin(),
+                    bind_data.initial_reader->GetColumns().end(),
+                    [](auto const& column) {
+                      return column.name == "file_row_number" &&
+                             column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER &&
+                             column.identifier.template GetValue<int32_t>() ==
+                               duckdb::MultiFileReader::ORDINAL_FIELD_ID;
+                    });
+    }
+    if (legacy_file_row_number) {
+      auto const output = std::find(scan_op.names.begin(), scan_op.names.end(), "file_row_number");
+      if (output != scan_op.names.end()) {
+        add_legacy_virtual(
+          static_cast<duckdb::idx_t>(output - scan_op.names.begin()),
+          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER);
+      }
+    }
   }
   // `scan_output_arity` drives the provider's expected column count — without it the runtime
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.

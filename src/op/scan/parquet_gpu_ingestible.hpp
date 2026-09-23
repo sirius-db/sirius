@@ -99,18 +99,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
     return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
   }
 
-  [[nodiscard]] bool has_requested_user_virtual_columns() const
-  {
-    for (auto const& column : column_ids) {
-      if (!column.HasPrimaryIndex()) { continue; }
-      auto const id = column.GetPrimaryIndex();
-      if (column.IsVirtualColumn() && id != duckdb::COLUMN_IDENTIFIER_ROW_ID &&
-          id != duckdb::COLUMN_IDENTIFIER_EMPTY) {
-        return true;
-      }
-    }
-    return false;
-  }
+  [[nodiscard]] bool has_requested_user_virtual_columns() const;
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching
@@ -363,6 +352,16 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
                                                   std::size_t file_index,
                                                   std::shared_ptr<io::ioctx> const& io_ctx);
+
+  /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
+  [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(
+    std::unique_ptr<cudf::table> decoded,
+    cudf::io::parquet_reader_options const& reader_options,
+    std::string const& file_path,
+    std::size_t file_index,
+    std::int64_t file_row_offset,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 
