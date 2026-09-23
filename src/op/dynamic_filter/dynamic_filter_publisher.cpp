@@ -240,7 +240,7 @@ void dynamic_filter_publication_session::observe_whole_build(
 
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
     ::cuda::stream_ref stream = space->acquire_stream();
-    auto const writer            = source.get_writer_event();
+    auto const writer         = source.get_writer_event();
     auto const ready =
       writer ? cudaStreamWaitEvent(stream.get(), writer, 0) : cudaDeviceSynchronize();
     if (ready != cudaSuccess) {
