@@ -1,0 +1,31 @@
+target_sources(
+  sirius_objects
+  PRIVATE late_mat_plan_pass.cpp
+          dynamic_filter/build_filter_evidence.cpp
+          dynamic_filter/build_key_domain.cpp
+          dynamic_filter/dynamic_filter_key_admission.cpp
+          dynamic_filter/dynamic_filter_target_discovery.cpp
+          gpu_admission.cpp
+          query.cpp
+          query_index.cpp
+          sirius_physical_plan_generator.cpp
+          sirius_plan_aggregate.cpp
+          sirius_plan_column_data_get.cpp
+          sirius_plan_comparison_join.cpp
+          sirius_plan_compressed_schema.cpp
+          sirius_plan_cte.cpp
+          sirius_plan_delim_get.cpp
+          sirius_plan_delim_join.cpp
+          sirius_plan_dummy_scan.cpp
+          sirius_plan_empty_result.cpp
+          sirius_plan_expression_get.cpp
+          sirius_plan_filter.cpp
+          sirius_plan_get.cpp
+          sirius_plan_limit.cpp
+          sirius_plan_narrowing_policy.cpp
+          sirius_plan_order.cpp
+          sirius_plan_projection.cpp
+          sirius_plan_projection_utils.cpp
+          sirius_plan_recursive_cte.cpp
+          sirius_plan_set_operation.cpp
+          sirius_plan_top_n.cpp)

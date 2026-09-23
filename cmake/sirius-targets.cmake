@@ -1,4 +1,3 @@
-add_library(sirius_objects OBJECT ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 set_target_properties(sirius_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
                                                 CXX_VISIBILITY_PRESET hidden)
 add_library(sirius_core STATIC $<TARGET_OBJECTS:sirius_objects>)

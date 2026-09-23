@@ -96,7 +96,18 @@ endforeach()
 
 include(cmake/sirius-dependencies.cmake)
 
-include(cmake/sirius-sources.cmake)
+add_library(sirius_objects OBJECT)
+add_subdirectory(src)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
+  add_subdirectory(src/legacy)
+  target_sources(
+    sirius_objects
+    PRIVATE ${SIRIUS_LEGACY_SOURCES} ${SIRIUS_LEGACY_CONDITIONAL_SOURCES}
+            ${SIRIUS_LEGACY_CUDA_SOURCES})
+endif()
+
+include(cmake/sirius-substrait.cmake)
 
 include(cmake/sirius-targets.cmake)
 
