@@ -65,6 +65,14 @@ jobs:
           environments: ${{ matrix.cuda.pixi-environment }}
           activate-environment: ${{ matrix.cuda.pixi-environment }}
 
+      - name: Test Simpatico cache identity without a GPU
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake \
+            -S src/compression/simpatico_codegen/tests/cache -B build/cache-host -G Ninja
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/cache-host
+          pixi run -e ${{ matrix.cuda.pixi-environment }} ctest \
+            --test-dir build/cache-host -L cache_host --output-on-failure --no-tests=error
+
       - name: Configure sccache backend
         run: |
           if [[ -n "${SCCACHE_BUCKET}" ]]; then

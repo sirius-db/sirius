@@ -217,9 +217,8 @@ headers (`nvrtcCreateProgram`):
 
 - the two project headers (`codegen/decode/rle_block.cuh`, `codegen/stdint_shim.hpp`), embedded
   by `cmake/embed_jit_headers.cmake`;
-- the CCCL closure (`<cuda/std/...>`, `<cub/...>`, and `<thrust/...>`) — the transitive
-  `#include` set reachable from the kernel preludes, scanned at build time and embedded by
-  `cmake/embed_cccl_headers.cmake`.
+- the complete installed CCCL library trees (`cuda/`, `cub/`, `thrust/`, and `nv/`),
+  embedded by `cmake/embed_cccl_headers.cmake`, including internal and extensionless headers.
 
 Simpatico links to `cudf::cudf`, inheriting libcudf's CCCL headers and namespace/feature
 definitions through its exported CMake targets. CMake also supplies the embedding script
@@ -228,6 +227,16 @@ packages and source checkouts with separate CUB, Thrust, and libcudacxx include 
 For nonstandard installations, use the usual CMake package discovery settings such as
 `CMAKE_PREFIX_PATH` or `cudf_DIR`.
 
+Each bundle has one XXH3-128 identity over sorted logical names and normalized
+header contents (CRLF/CR become LF). CMake invokes the package-provided `xxhsum -H128`
+at build time; runtime identity code uses xxHash header-only, with no xxHash shared
+library dependency. Pixi supplies `xxhash`; vcpkg supplies the headers and a host
+`xxhash[xxhsum]` tool. Header edits, additions, removals, and renames rebuild the bundle.
+
+The embedded libraries are the approved runtime header inventory. No runtime include
+directory override is supported, and source-directory include lookup is disabled.
+To change the library headers, rebuild Sirius. This is not a compiler security sandbox.
+
 As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the driver and the
 `libnvrtc` runtime (which the Sirius vcpkg build links statically via the `nvrtc` overlay port).
 
@@ -235,7 +244,6 @@ As a result the runtime JIT needs **no CCCL/CUDA headers on disk** — only the 
 
 | Variable | Effect |
 | --- | --- |
-| `SIMPATICO_JIT_CCCL_INCLUDE` | Optional escape hatch. The CCCL headers are embedded in the binary, so this is normally unset. If a future renderer change needs a header the embedded closure lacks, set this to a CCCL dir (containing `cuda/std/cstdint`) and it is passed to NVRTC as an extra `-I`. |
 | `SIMPATICO_JIT_CACHE_DIR` | On-disk cache location. Default: `${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit`. Set to `off`, `0`, or empty to disable the on-disk cache (in-memory only). |
 | `SIMPATICO_JIT_STATS` | If set, prints `compiles / mem_hits / disk_hits / compile_ms` per process at exit. |
 | `CODEGEN_JIT_DUMP_CUBIN` | Debug: if set to a path, writes the compiled cubin there. |
