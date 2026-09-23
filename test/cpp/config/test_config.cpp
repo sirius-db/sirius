@@ -676,10 +676,10 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE(value == 0.9);
 }
 
-TEST_CASE("the group-by bypass experiment is off by default and bounds its one knob",
+TEST_CASE("group-by bypass is off by default and validates its headroom setting",
           "[config_opt][group_by_bypass]")
 {
-  // Default off matters: this is an opt-in experiment, so a config that does not mention it
+  // Default off matters: this is an opt-in optimization, so a config that does not mention it
   // must never turn it on.
   CHECK_FALSE(operator_params{}.enable_group_by_memory_aware_bypass);
   CHECK(operator_params{}.group_by_bypass_headroom_fraction == 0.25);

@@ -44,11 +44,11 @@ struct bypass_column_meta {
   bool nullable = false;
 };
 
-/// Complete-input metadata for the group-by memory-aware bypass prototype (issue #1746 point 2).
+/// Complete-input metadata for the group-by memory-aware bypass policy.
 ///
 /// Built by the PARTITION operator, which owns the input repository and its lock, and handed to
 /// the MERGE_GROUP_BY consumer through @ref partition_sizing_input. Populated **only** when the
-/// prototype setting is on: with the setting off the partition never walks its batches for this,
+/// bypass setting is on: with the setting off the partition never walks its batches for this,
 /// so the default sizing path does no extra work.
 ///
 /// Every quantity that can be genuinely unknown is an optional. A missing value and a real zero
@@ -95,7 +95,7 @@ struct partition_sizing_input {
   /// this rather than `total_bytes`; one whose task holds only the sizing side uses `total_bytes`.
   uint64_t combined_total_bytes;
 
-  /// Collects group-by bypass prototype metadata on demand; empty when the prototype is off / not
+  /// Collects group-by bypass metadata on demand; empty when bypass is disabled or not
   /// applicable. Lazy so a consumer can skip the batch walk when a cheap gate already rejects the
   /// bypass. Callable only during the get_partition_strategy call, which runs under the
   /// partition's lock. Individual batches are read-locked only while being inspected; residency

@@ -202,7 +202,7 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
-  /// EXPERIMENT (issue #1746 point 2), off by default. Let a grouped aggregation whose automatic
+  /// Off by default. Let a grouped aggregation whose automatic
   /// partition count is above 1 fall back to a single unpartitioned merge when a conservative
   /// model says that merge fits the admitted GPU's remaining budget. Single admitted GPU,
   /// fixed-width integral keys and SUM/COUNT/MIN/MAX partial states only; every other plan keeps

@@ -63,7 +63,7 @@ TEST_CASE("group-by bypass preserves the automatic count when a gate rejects",
           "[group_by_bypass][policy]")
 {
   // Each case breaks one precondition; every one must leave AUTO untouched and claim no
-  // activation. A rejection that quietly changed the count would be worse than no prototype.
+  // activation. Rejection must preserve the automatic count.
   auto expect_auto_preserved = [](candidate_input in, decision_reason expected) {
     auto const d = decide(in);
     INFO("expected reason: " << reason_name(expected) << ", got: " << reason_name(d.reason));
@@ -141,7 +141,7 @@ TEST_CASE("group-by bypass reports an existing one-partition choice as already_o
   auto const d           = decide(in);
   CHECK(d.reason == decision_reason::already_one);
   CHECK(d.num_partitions == 1);
-  // The pre-existing automatic choice must not be dressed up as a prototype activation, and must
+  // The pre-existing automatic choice must not be treated as a bypass selection, and must
   // not acquire the new reservation floor that a real activation gets.
   CHECK_FALSE(d.model_evaluated);
 }

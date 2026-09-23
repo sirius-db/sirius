@@ -39,6 +39,9 @@ Selection requires the model plus a configurable margin to fit. A selected merge
 additional-allocation estimate, before that margin, through `no_history_peak_memory_estimate()`.
 The cold-start request is at least the existing 2× input estimate. The executor adds input
 materialization costs and records the request through its existing reservation telemetry.
+Headroom is used as selection slack rather than part of the predicted allocation peak, keeping
+the cold-start estimate on the same basis as subsequent measured history. That slack is not
+reserved, and the selection check does not guarantee a full reservation grant.
 
 The first bypassed merge has no prior partitioned-merge history. Subsequent attempts reuse the
 query's existing pipeline memory history and task-local OOM retry floor, including resumes after
