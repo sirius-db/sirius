@@ -31,8 +31,11 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <optional>
 
 namespace sirius {
 namespace planner {
@@ -142,11 +145,30 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
 
+  /// Reuse the bypass decision's model for the first merge task's reservation. History belongs
+  /// to this query's pipeline; P=1 creates one merge task, so its first attempt has no history.
+  /// Subsequent OOM attempts use the executor's existing history and retry reservation floor.
+  [[nodiscard]] std::size_t no_history_peak_memory_estimate(
+    const op::input_stats& stats) const override;
+
  private:
   friend class sirius::planner::sirius_physical_plan_generator;
   void set_fuse_into_parent(bool fuse) noexcept { _fuse_into_parent = fuse; }
 
+  /// Run the bypass policy against @p in. Returns the automatic count untouched whenever the
+  /// prototype is off or any gate rejects the candidate. @pre `lock` is NOT held.
+  [[nodiscard]] int apply_memory_aware_bypass(const partition_sizing_input& in, int natural);
+
+  /// Whether every physical aggregate partial state this merge will re-merge is inside the v1
+  /// fixed-width whitelist. Checks `cudf_aggregates` (the merge-time kinds) rather than the SQL
+  /// output types: a logical COUNT arrives as a COUNT_ALL/COUNT_VALID state re-merged with SUM,
+  /// and a COUNT(DISTINCT) arrives as a LIST.
+  [[nodiscard]] bool bypass_supported_aggregates() const;
+
   bool _fuse_into_parent = false;
+
+  /// Query-local cold-start estimate, published during sizing. Zero means bypass was not chosen.
+  std::atomic<std::size_t> _bypass_peak_memory_estimate{0};
 };
 
 }  // namespace op

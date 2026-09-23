@@ -40,6 +40,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
 | [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, the cross-language `sirius::ffi::Fragment`/`Context` lifecycle |
 | [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |
+| [Memory-aware Group-by Bypass](group-by-bypass.md) | Opt-in unpartitioned merges, memory accounting, and eligibility |
 | [Configuration](configuration.md) | sirius_config, operator_params, SET variables |
 | [Optimizations](optimizations.md) | Performance optimizations with PRs, code paths, configs |
 | [Compressed Pinning](compressed-pinning.md) | Simpatico-compressed pin_table on host/GPU tiers — which tier to compress on, plan selection vs the H2D link, GB300 SF1000 results |

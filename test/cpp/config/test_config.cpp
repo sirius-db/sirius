@@ -676,6 +676,76 @@ TEST_CASE("the domain-coverage threshold is validated where it enters the engine
   REQUIRE(value == 0.9);
 }
 
+TEST_CASE("the group-by bypass experiment is off by default and bounds its one knob",
+          "[config_opt][group_by_bypass]")
+{
+  // Default off matters: this is an opt-in experiment, so a config that does not mention it
+  // must never turn it on.
+  CHECK_FALSE(operator_params{}.enable_group_by_memory_aware_bypass);
+  CHECK(operator_params{}.group_by_bypass_headroom_fraction == 0.25);
+
+  auto const path = std::filesystem::temp_directory_path() / "sirius_group_by_bypass.yaml";
+  auto write      = [&path](const char* body) {
+    std::ofstream out(path);
+    out << "sirius:\n  operator_params:\n" << body;
+  };
+
+  SECTION("both keys round-trip from YAML")
+  {
+    write(
+      "    enable_group_by_memory_aware_bypass: true\n"
+      "    group_by_bypass_headroom_fraction: 1.5\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().enable_group_by_memory_aware_bypass);
+    CHECK(cfg.get_operator_params().group_by_bypass_headroom_fraction == 1.5);
+  }
+
+  SECTION("a negative margin is rejected rather than silently disabling the margin")
+  {
+    write("    group_by_bypass_headroom_fraction: -0.1\n");
+    sirius_config cfg;
+    CHECK_THROWS_AS(cfg.load_from_file(path), std::runtime_error);
+  }
+
+  SECTION("an implausibly large margin is rejected")
+  {
+    write("    group_by_bypass_headroom_fraction: 4.5\n");
+    sirius_config cfg;
+    CHECK_THROWS_AS(cfg.load_from_file(path), std::runtime_error);
+  }
+
+  SECTION("zero margin is allowed — it is the no-margin reference for measurements")
+  {
+    write("    group_by_bypass_headroom_fraction: 0.0\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().group_by_bypass_headroom_fraction == 0.0);
+  }
+
+  SECTION("non-finite margins are rejected")
+  {
+    for (auto const* value : {".nan", ".inf", "-.inf"}) {
+      INFO("headroom = " << value);
+      auto const body = std::string("    group_by_bypass_headroom_fraction: ") + value + "\n";
+      write(body.c_str());
+      sirius_config cfg;
+      CHECK_THROWS_AS(cfg.load_from_file(path), std::runtime_error);
+    }
+  }
+
+  SECTION("the upper boundary is allowed")
+  {
+    write("    group_by_bypass_headroom_fraction: 4.0\n");
+    sirius_config cfg;
+    cfg.load_from_file(path);
+    CHECK(cfg.get_operator_params().group_by_bypass_headroom_fraction == 4.0);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
 TEST_CASE("the dynamic-filter switch is consumed from the operator_params YAML section",
           "[config_opt][dynamic_filter]")
 {
