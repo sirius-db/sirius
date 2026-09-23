@@ -53,7 +53,6 @@
 
 #include <cuda/std/utility>
 
-
 // rmm
 #include <rmm/device_buffer.hpp>
 
@@ -1377,17 +1376,18 @@ filtered_table parquet_gpu_ingestible::materialize_metadata_to_table(
       metadatas.reserve(split.rg_slices.size());
       rg_per_src.reserve(split.rg_slices.size());
       for (auto const& slice : split.rg_slices) {
-        cudf_sources.push_back(slice.datasource ? cudf::io::datasource::create(slice.datasource.get())
-                                                : cudf::io::datasource::create(slice.file_path));
+        cudf_sources.push_back(slice.datasource
+                                 ? cudf::io::datasource::create(slice.datasource.get())
+                                 : cudf::io::datasource::create(slice.file_path));
         metadatas.push_back(*slice.file_metadata);
         rg_per_src.push_back(slice.row_group_indices);
       }
       // The general route reads as it decodes, so it needs the row-group selection
       // on the options; the hybrid readers take it as a call argument instead.
       if (!all_slices_pruned) { opts.set_row_groups(std::move(rg_per_src)); }
-      table = std::move(cudf::io::read_parquet(
-                          std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
-                          .tbl);
+      table = std::move(
+        cudf::io::read_parquet(std::move(cudf_sources), std::move(metadatas), opts, stream, mr_ref)
+          .tbl);
     }
     if (_plan->has_user_virtual_columns()) {
       auto const& slice = split.rg_slices.front();

@@ -1693,9 +1693,9 @@ struct ResetSiriusCacheFunctionData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> SiriusRegistration::ResetSiriusCacheBind(ClientContext& context,
-                                                               TableFunctionBindInput& input,
-                                                               vector<LogicalType>& return_types,
-                                                               vector<string>& names)
+                                                                  TableFunctionBindInput& input,
+                                                                  vector<LogicalType>& return_types,
+                                                                  vector<string>& names)
 {
   return_types.emplace_back(LogicalType::BOOLEAN);
   names.emplace_back("Success");
@@ -1703,8 +1703,8 @@ unique_ptr<FunctionData> SiriusRegistration::ResetSiriusCacheBind(ClientContext&
 }
 
 void SiriusRegistration::ResetSiriusCacheFunction(ClientContext& context,
-                                               TableFunctionInput& data_p,
-                                               DataChunk& output)
+                                                  TableFunctionInput& data_p,
+                                                  DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<ResetSiriusCacheFunctionData>();
   if (data.finished) { return; }
