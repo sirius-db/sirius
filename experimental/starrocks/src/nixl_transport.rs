@@ -242,6 +242,14 @@ fn xfer_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(30))
 }
 
+/// Packed WRITEs in flight per hop. Tunable via `SIRIUS_CN_NIXL_WINDOW` (1 = stop-and-wait).
+/// Every in-flight batch holds a local and a receiver lease, so the arena must fit
+/// `window` batches on both sides.
+#[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
+fn write_window() -> usize {
+    parse_u64_env("SIRIUS_CN_NIXL_WINDOW").map_or(4, |n| n as usize)
+}
+
 #[cfg_attr(not(feature = "nixl-transport"), allow(dead_code))]
 fn parse_u64_env(name: &str) -> Option<u64> {
     std::env::var(name)
@@ -259,7 +267,7 @@ mod agent_tier {
 
     use nixl_sys::{
         Agent, MemType, MemoryRegion, NixlDescriptor, OptArgs, RegistrationHandle, XferDescList,
-        XferOp, XferStatus,
+        XferOp, XferRequest, XferStatus,
     };
     use tracing::info;
 
@@ -499,103 +507,162 @@ mod agent_tier {
             }
             hop.md_us = crate::timing::us(hop_started.elapsed());
 
-            let mut seq = 0i64;
-            let mut frames: u64 = 0;
-            let mut bytes: u64 = 0;
-            let mut rows: u64 = 0;
-            loop {
-                let pack_started = Instant::now();
-                let next = executor.export_packed_next(spec.slot)?;
-                hop.pack_us += crate::timing::us(pack_started.elapsed());
-                match next {
-                    Some(mut batch) => {
-                        let metadata = std::mem::take(&mut batch.metadata);
-                        let sent = (|| {
-                            let (offset, length) = if batch.len > 0 {
+            let window = write_window();
+            let peer = spec.peer;
+            let names = spec.names.clone();
+            let frame = |seq: i64, eos: bool| PackedExchangeFrame {
+                fragment_instance_id: spec.slot.fragment_instance_id,
+                dest_stream: spec.dest_stream,
+                sender_id: spec.sender_id,
+                seq,
+                eos,
+                names: names.clone(),
+                offset: 0,
+                length: 0,
+                rows: None,
+                metadata: Vec::new(),
+            };
+
+            // Announces leave in seq order on one FIFO thread, so a WRITE never waits on the
+            // previous batch's brpc round trip; the receiver requires seq order.
+            let (frames, bytes, rows) = std::thread::scope(|scope| {
+                let (announce_tx, announce_rx) = channel::<PackedExchangeFrame>();
+                let announcer = scope.spawn(move || {
+                    let mut announce_us = 0u64;
+                    let mut first_error: Option<String> = None;
+                    for frame in announce_rx {
+                        if first_error.is_some() {
+                            continue;
+                        }
+                        let started = Instant::now();
+                        if let Err(err) = frame.transmit_blocking(peer) {
+                            first_error = Some(err);
+                        }
+                        announce_us += crate::timing::us(started.elapsed());
+                    }
+                    (first_error, announce_us)
+                });
+
+                let mut inflight: std::collections::VecDeque<InFlightWrite> =
+                    std::collections::VecDeque::new();
+                let mut seq = 0i64;
+                let mut frames: u64 = 0;
+                let mut bytes: u64 = 0;
+                let mut rows: u64 = 0;
+                let mut drained = false;
+                let pumped = (|| -> Result<(), String> {
+                    loop {
+                        while !drained && inflight.len() < window {
+                            let pack_started = Instant::now();
+                            let next = executor.export_packed_next(spec.slot)?;
+                            hop.pack_us += crate::timing::us(pack_started.elapsed());
+                            let Some(mut batch) = next else {
+                                drained = true;
+                                break;
+                            };
+                            let mut announce = frame(seq, false);
+                            announce.rows = batch.rows;
+                            announce.metadata = std::mem::take(&mut batch.metadata);
+                            seq += 1;
+                            let mut write = InFlightWrite {
+                                request: None,
+                                local_offset: batch.offset,
+                                len: batch.len,
+                                posted: Instant::now(),
+                                posted_us: 0,
+                                frame: announce,
+                            };
+                            if batch.len > 0 {
                                 let lease_started = Instant::now();
-                                let lease = request_staging_lease(spec.peer, batch.len)?;
+                                let lease = request_staging_lease(peer, batch.len);
                                 hop.lease_us += crate::timing::us(lease_started.elapsed());
-                                let write_start = crate::timing::unix_us();
-                                let elapsed = write_and_wait(
+                                let lease = match lease {
+                                    Ok(lease) => lease,
+                                    Err(err) => {
+                                        release_local(executor, batch.offset);
+                                        return Err(err);
+                                    }
+                                };
+                                write.frame.offset = lease.offset;
+                                write.frame.length = batch.len;
+                                write.posted = Instant::now();
+                                write.posted_us = crate::timing::unix_us();
+                                match post_write(
                                     &self.agent,
                                     &remote_agent,
                                     self.staging_base + batch.offset,
                                     lease.remote_addr,
                                     batch.len,
-                                )?;
-                                hop.write_us += crate::timing::us(elapsed);
-                                hop.write_max_us = hop.write_max_us.max(crate::timing::us(elapsed));
-                                hop.writes += 1;
-                                hop.write_intervals
-                                    .push((write_start, write_start + crate::timing::us(elapsed)));
-                                (lease.offset, batch.len)
-                            } else {
-                                (0, 0)
-                            };
-                            let announce_started = Instant::now();
-                            let announced = PackedExchangeFrame {
-                                fragment_instance_id: spec.slot.fragment_instance_id,
-                                dest_stream: spec.dest_stream,
-                                sender_id: spec.sender_id,
-                                seq,
-                                eos: false,
-                                names: spec.names.clone(),
-                                offset,
-                                length,
-                                rows: batch.rows,
-                                metadata,
+                                ) {
+                                    Ok(request) => write.request = request,
+                                    Err(err) => {
+                                        release_local(executor, batch.offset);
+                                        return Err(err);
+                                    }
+                                }
                             }
-                            .transmit_blocking(spec.peer);
-                            hop.announce_us += crate::timing::us(announce_started.elapsed());
-                            announced?;
-                            Ok::<_, String>((offset, length))
-                        })();
-                        if batch.len > 0
-                            && let Err(err) = executor.staging_release(batch.offset)
-                        {
-                            tracing::warn!(
-                                error = %err,
-                                offset = batch.offset,
-                                "failed to release the local packed hop lease"
-                            );
+                            inflight.push_back(write);
                         }
-                        let (_offset, length) = sent?;
+                        let Some(mut front) = inflight.pop_front() else {
+                            return Ok(());
+                        };
+                        let waited = wait_write(&self.agent, &remote_agent, &mut front);
+                        if front.len > 0 {
+                            let elapsed = crate::timing::us(front.posted.elapsed());
+                            hop.write_us += elapsed;
+                            hop.write_max_us = hop.write_max_us.max(elapsed);
+                            hop.writes += 1;
+                            hop.write_intervals
+                                .push((front.posted_us, front.posted_us + elapsed));
+                            release_local(executor, front.local_offset);
+                        }
+                        waited?;
                         frames += 1;
-                        bytes += length;
-                        rows += batch.rows.unwrap_or(0);
-                        seq += 1;
+                        bytes += front.len;
+                        rows += front.frame.rows.unwrap_or(0);
+                        announce_tx
+                            .send(front.frame)
+                            .map_err(|_| "packed announce thread stopped".to_string())?;
                     }
-                    None => {
-                        PackedExchangeFrame {
-                            fragment_instance_id: spec.slot.fragment_instance_id,
-                            dest_stream: spec.dest_stream,
-                            sender_id: spec.sender_id,
-                            seq,
-                            eos: true,
-                            names: spec.names.clone(),
-                            offset: 0,
-                            length: 0,
-                            rows: None,
-                            metadata: Vec::new(),
-                        }
-                        .transmit_blocking(spec.peer)?;
-                        executor.drop_parked(spec.slot)?;
-                        info!(
-                            peer = %spec.peer,
-                            dest_stream = spec.dest_stream,
-                            sender_id = spec.sender_id,
-                            frames,
-                            bytes,
-                            rows,
-                            "shipping packed exchange hop"
-                        );
-                        if crate::timing::enabled() {
-                            hop.log(spec, hop_start_us, hop_started.elapsed(), bytes);
-                        }
-                        return Ok(());
+                })();
+                // A failed hop still has to let every posted WRITE finish before its local
+                // lease is reused.
+                for mut write in inflight.drain(..) {
+                    let _ = wait_write(&self.agent, &remote_agent, &mut write);
+                    if write.len > 0 {
+                        release_local(executor, write.local_offset);
                     }
                 }
+                if pumped.is_ok() {
+                    let _ = announce_tx.send(frame(seq, true));
+                }
+                drop(announce_tx);
+                let (announce_error, announce_us) = announcer
+                    .join()
+                    .unwrap_or_else(|_| (Some("packed announce thread panicked".to_string()), 0));
+                hop.announce_us = announce_us;
+                pumped?;
+                if let Some(err) = announce_error {
+                    return Err(err);
+                }
+                Ok::<_, String>((frames, bytes, rows))
+            })?;
+
+            executor.drop_parked(spec.slot)?;
+            info!(
+                peer = %spec.peer,
+                dest_stream = spec.dest_stream,
+                sender_id = spec.sender_id,
+                frames,
+                bytes,
+                rows,
+                window,
+                "shipping packed exchange hop"
+            );
+            if crate::timing::enabled() {
+                hop.log(spec, hop_start_us, hop_started.elapsed(), bytes);
             }
+            Ok(())
         }
 
         fn first_contact_canary(
@@ -664,23 +731,38 @@ mod agent_tier {
                 wire_busy_us,
                 wire_busy_pct = wire_busy_us * 100 / span_us,
                 write_gbs = bytes as f64 / (self.write_us.max(1) as f64 * 1e3),
+                wire_gbs = bytes as f64 / (wire_busy_us.max(1) as f64 * 1e3),
                 "packed hop timing"
             );
         }
     }
 
-    /// Posts one WRITE `[local_addr, +len)` → `[remote_addr, +len)` and polls it to DONE
-    /// within [`xfer_timeout`]. Returns the elapsed post-to-done time.
-    pub(super) fn write_and_wait(
+    /// One posted packed WRITE and the announce that follows it.
+    struct InFlightWrite {
+        /// `None` once DONE, or for a zero-length batch that never posted.
+        request: Option<XferRequest>,
+        local_offset: u64,
+        len: u64,
+        posted: Instant,
+        posted_us: u64,
+        frame: crate::nixl_chunk::PackedExchangeFrame,
+    }
+
+    fn release_local(executor: &dyn FragmentExecutor, offset: u64) {
+        if let Err(err) = executor.staging_release(offset) {
+            tracing::warn!(error = %err, offset, "failed to release the local packed hop lease");
+        }
+    }
+
+    /// Posts one WRITE `[local_addr, +len)` → `[remote_addr, +len)`. `None` when it completed
+    /// inside the post.
+    fn post_write(
         agent: &Agent,
         remote_agent: &str,
         local_addr: u64,
         remote_addr: u64,
         len: u64,
-    ) -> Result<Duration, String> {
-        if len == 0 {
-            return Ok(Duration::ZERO);
-        }
+    ) -> Result<Option<XferRequest>, String> {
         let mut local = XferDescList::new(MemType::Vram)
             .map_err(|err| format!("failed to create the local descriptor list: {err}"))?;
         local.add_desc(local_addr as usize, len as usize, 0);
@@ -692,27 +774,72 @@ mod agent_tier {
             .map_err(|err| {
                 format!("failed to create a {len}-byte WRITE to agent '{remote_agent}': {err}")
             })?;
-        let timeout = xfer_timeout();
-        let start = Instant::now();
-        let mut in_progress = agent
+        let in_progress = agent
             .post_xfer_req(&request, None)
             .map_err(|err| format!("failed to post a {len}-byte WRITE: {err}"))?;
-        while in_progress {
-            if start.elapsed() > timeout {
+        Ok(in_progress.then_some(request))
+    }
+
+    /// Polls `write` to DONE within [`xfer_timeout`] of its post.
+    fn wait_write(
+        agent: &Agent,
+        remote_agent: &str,
+        write: &mut InFlightWrite,
+    ) -> Result<(), String> {
+        let timeout = xfer_timeout();
+        while let Some(request) = &write.request {
+            if write.posted.elapsed() > timeout {
                 return Err(format!(
-                    "a {len}-byte nixl WRITE to agent '{remote_agent}' did not complete within \
-                     {timeout:?} (SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS)"
+                    "a {}-byte nixl WRITE to agent '{remote_agent}' did not complete within \
+                     {timeout:?} (SIRIUS_CN_NIXL_XFER_TIMEOUT_SECS)",
+                    write.len
                 ));
             }
             match agent
-                .get_xfer_status(&request)
+                .get_xfer_status(request)
                 .map_err(|err| format!("failed to poll a nixl WRITE: {err}"))?
             {
-                XferStatus::Success => in_progress = false,
+                XferStatus::Success => write.request = None,
                 XferStatus::InProgress => std::thread::yield_now(),
             }
         }
-        Ok(start.elapsed())
+        Ok(())
+    }
+
+    /// Posts one WRITE and polls it to DONE. Returns the elapsed post-to-done time.
+    pub(super) fn write_and_wait(
+        agent: &Agent,
+        remote_agent: &str,
+        local_addr: u64,
+        remote_addr: u64,
+        len: u64,
+    ) -> Result<Duration, String> {
+        if len == 0 {
+            return Ok(Duration::ZERO);
+        }
+        let posted = Instant::now();
+        let request = post_write(agent, remote_agent, local_addr, remote_addr, len)?;
+        let mut write = InFlightWrite {
+            request,
+            local_offset: 0,
+            len,
+            posted,
+            posted_us: 0,
+            frame: crate::nixl_chunk::PackedExchangeFrame {
+                fragment_instance_id: crate::bench_a2a::BENCH_FRAGMENT_INSTANCE,
+                dest_stream: 0,
+                sender_id: 0,
+                seq: 0,
+                eos: false,
+                names: Vec::new(),
+                offset: 0,
+                length: 0,
+                rows: None,
+                metadata: Vec::new(),
+            },
+        };
+        wait_write(agent, remote_agent, &mut write)?;
+        Ok(posted.elapsed())
     }
 
     /// Log-only first-contact WRITE. Returns observed GiB/s; the caller must not treat a
