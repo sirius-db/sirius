@@ -868,7 +868,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // so pointers are available for injection into gpu_pipeline_executors.
   // HOST->DISK downgrade is not yet implemented, so we skip HOST tier for now.
   //
-  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto dev PR #579 shape):
+  // Per-GPU NUMA-aware downgrade (re-authored from v1.0 dd86dd0 onto main PR #579 shape):
   // each GPU's downgrade_executor gets its own copy of downgrade_executor_config with
   // preferred_numa_node populated from hw_topology().gpus[device_id].numa_node. The config
   // copy flows into downgrade_task via processing_loop so GPU->HOST dispatch prefers the

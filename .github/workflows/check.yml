@@ -17,6 +17,7 @@ on:
   push:
     branches:
       - dev
+      - main
   pull_request:
   merge_group:
 
@@ -110,7 +111,7 @@ jobs:
             cudf-channel: nightly
             run-on-pr: false
         exclude:
-          # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop rows marked merge/main-only; on merge_group/main, match nothing.
           - build:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false

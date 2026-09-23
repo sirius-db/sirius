@@ -7,7 +7,9 @@ on the GPU — no special syntax needed.
 
 ## Contributions & PRs
 
-**The default/main branch is `dev`** (not `main`/`master`) — branch and open PRs against it.
+**The default branch is `main`** — branch and open PRs against it. If your local clone or a
+stack still references `dev`, see `CONTRIBUTING.md`'s "Migrating your local clone" section.
+
 Before opening a PR, read `CONTRIBUTING.md`'s "PR branching strategy" section to determine which
 of the three approved paths applies — most work is **Self-contained** (push to a personal fork,
 not `origin`); dependent changes use **Stacked PRs**; CI/critical changes that need same-repo

@@ -44,9 +44,9 @@ then rebuild. Sirius overrides remain in `docs/api/sirius.css`.
 
 The **Docs** workflow builds both references on pull requests and merge-queue
 entries, uploading the combined site as one `github-pages` artifact. Pushes to
-`dev` build and deploy the site; deployment runs only for those pushes.
+`main` build and deploy the site; deployment runs only for those pushes.
 For the first deployment, set **Settings → Pages → Build and deployment → Source**
-to **GitHub Actions**, and allow `dev` in the `github-pages` environment's deployment
+to **GitHub Actions**, and allow `main` in the `github-pages` environment's deployment
 rules. The published URL appears on the deployment job.
 
 ## Building Sirius
