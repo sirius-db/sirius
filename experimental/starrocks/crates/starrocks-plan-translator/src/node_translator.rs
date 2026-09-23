@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use starrocks_thrift::exprs::TExpr;
 use starrocks_thrift::opcodes::TExprOpcode;
@@ -44,6 +44,16 @@ pub(crate) struct TranslatedRel {
     /// that silently produced a wrong offset the moment an unknown relation
     /// appeared mid-tree. Every relation built here MUST set its true width.
     pub output_width: usize,
+    /// Common-expr columns past the descriptor row. Indices are into this relation's output.
+    pub carried_slots: Vec<CarriedSlot>,
+}
+
+/// A common-expr column a project emits because an ancestor reads it.
+#[derive(Clone)]
+pub(crate) struct CarriedSlot {
+    pub tuple_id: i32,
+    pub slot_id: i32,
+    pub column: usize,
 }
 
 /// One translated fragment: its relation tree plus the stream schemas the caller must declare.
@@ -68,6 +78,8 @@ struct PlanContext<'a> {
     registry: &'a mut ExtensionRegistry,
     /// Stream schemas recorded as exchanges are lowered, in translation order.
     stream_inputs: Vec<StreamInputSchema>,
+    /// Common-expr slots each project must emit because an ancestor consumes them.
+    consumed_above: HashMap<i32, Vec<i32>>,
 }
 
 impl<'a> PlanContext<'a> {
@@ -84,6 +96,7 @@ impl<'a> PlanContext<'a> {
             exchange_inputs,
             registry,
             stream_inputs: Vec::new(),
+            consumed_above: HashMap::new(),
         }
     }
 
@@ -114,6 +127,7 @@ impl TranslatePlan for TPlan {
         if self.nodes.is_empty() {
             return Err(TranslateError::malformed("TPlan.nodes is empty"));
         }
+        ctx.consumed_above = common_slots_consumed_above(self, ctx.desc)?;
         let mut cursor = PlanNodeCursor::new(&self.nodes);
         let translated = cursor.translate_next(ctx)?;
         cursor.ensure_consumed()?;
@@ -217,6 +231,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         rel,
         row_tuples,
         output_width,
+        carried_slots,
     } = input;
     TranslatedRel {
         rel: Rel {
@@ -229,6 +244,7 @@ fn apply_fetch(input: TranslatedRel, node: &TPlanNode) -> TranslatedRel {
         },
         row_tuples,
         output_width,
+        carried_slots,
     }
 }
 
@@ -286,6 +302,7 @@ fn translate_scan(
         rel: scan_rel(ctx.desc, tuple_id, file_paths)?,
         row_tuples: vec![tuple_id],
         output_width: ctx.desc.materialized_slot_ids(tuple_id)?.len(),
+        carried_slots: Vec::new(),
     };
     apply_conjuncts(input, node, ctx)
 }
@@ -367,7 +384,99 @@ pub(crate) fn translate_plan(
 /// (`sirius_stream_<node_id>`) the input stream is read through. The read's schema comes from
 /// the FE's `input_row_tuples`; its column names are the sender's, bound positionally.
 ///
-/// A merging exchange (`sort_info` present) is out of scope for this GROUP BY slice.
+/// Common-expr slots an ancestor reads even though the project's output tuple does not
+/// materialize them. Q14's aggregate reads such a slot.
+fn common_slots_consumed_above(
+    plan: &TPlan,
+    desc: &DescriptorTable,
+) -> Result<HashMap<i32, Vec<i32>>> {
+    let mut consumed = HashMap::new();
+    let mut stack: Vec<(usize, i32)> = Vec::new();
+    for (index, node) in plan.nodes.iter().enumerate() {
+        if node.node_type == TPlanNodeType::PROJECT_NODE
+            && let Some(common) = node
+                .project_node
+                .as_ref()
+                .and_then(|project| project.common_slot_map.as_ref())
+                .filter(|common| !common.is_empty())
+        {
+            let mut candidates = BTreeSet::new();
+            for &slot_id in common.keys() {
+                let mut materialized = false;
+                for &tuple_id in &node.row_tuples {
+                    if desc.materialized_slot_ids(tuple_id)?.contains(&slot_id) {
+                        materialized = true;
+                        break;
+                    }
+                }
+                if !materialized {
+                    candidates.insert(slot_id);
+                }
+            }
+            if !candidates.is_empty() {
+                let mut hits = BTreeSet::new();
+                for &(ancestor, _) in &stack {
+                    collect_slot_ref_hits(&plan.nodes[ancestor], &candidates, &mut hits);
+                }
+                if !hits.is_empty() {
+                    consumed.insert(node.node_id, hits.into_iter().collect());
+                }
+            }
+        }
+        if node.num_children > 0 {
+            stack.push((index, node.num_children));
+        } else {
+            while let Some(top) = stack.last_mut() {
+                top.1 -= 1;
+                if top.1 == 0 {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(consumed)
+}
+
+fn collect_slot_ref_hits(node: &TPlanNode, candidates: &BTreeSet<i32>, hits: &mut BTreeSet<i32>) {
+    let mut exprs: Vec<&TExpr> = Vec::new();
+    exprs.extend(node.conjuncts.as_deref().unwrap_or_default());
+    if let Some(agg) = node.agg_node.as_ref() {
+        exprs.extend(agg.grouping_exprs.as_deref().unwrap_or_default());
+        exprs.extend(&agg.aggregate_functions);
+    }
+    if let Some(project) = node.project_node.as_ref() {
+        exprs.extend(
+            project
+                .slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+        exprs.extend(
+            project
+                .common_slot_map
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|(_, expr)| expr),
+        );
+    }
+    for expr in exprs {
+        for expr_node in &expr.nodes {
+            if expr_node.node_type == starrocks_thrift::exprs::TExprNodeType::SLOT_REF
+                && let Some(slot_ref) = expr_node.slot_ref.as_ref()
+                && candidates.contains(&slot_ref.slot_id)
+            {
+                hits.insert(slot_ref.slot_id);
+            }
+        }
+    }
+}
+
+/// A merging exchange (`sort_info` present) is a stream read wrapped in a sort.
 fn translate_exchange(
     node: &TPlanNode,
     children: Vec<TranslatedRel>,
@@ -381,13 +490,6 @@ fn translate_exchange(
             context: "EXCHANGE_NODE",
             field: "exchange_node",
         })?;
-    if exchange.sort_info.is_some() {
-        return Err(TranslateError::UnsupportedPlanNode {
-            node_id: node.node_id,
-            node_type: node.node_type,
-            reason: "merging exchanges are not supported",
-        });
-    }
     if exchange.input_row_tuples.is_empty() {
         return Err(TranslateError::MissingField {
             context: "TExchangeNode",
@@ -451,11 +553,28 @@ fn translate_exchange(
         columns,
     });
 
-    let translated = TranslatedRel {
+    let mut translated = TranslatedRel {
         rel: stream_read_rel(schema, &input.stream_view),
         row_tuples: exchange.input_row_tuples.clone(),
         output_width,
+        carried_slots: Vec::new(),
     };
+    if let Some(sort_info) = &exchange.sort_info {
+        let sorts = sort_fields(sort_info, &translated, ctx)?;
+        let row_tuples = translated.row_tuples.clone();
+        translated = TranslatedRel {
+            rel: Rel {
+                rel_type: Some(rel::RelType::Sort(Box::new(SortRel {
+                    input: Some(Box::new(translated.rel)),
+                    sorts,
+                    ..Default::default()
+                }))),
+            },
+            row_tuples,
+            output_width,
+            carried_slots: Vec::new(),
+        };
+    }
     apply_conjuncts(translated, node, ctx)
 }
 
@@ -502,7 +621,9 @@ fn translate_aggregation(
     let grouping_exprs = agg.grouping_exprs.as_deref().unwrap_or_default();
     let mut grouping_expressions = Vec::with_capacity(grouping_exprs.len());
     for expr in grouping_exprs {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&child.row_tuples)
+            .with_carried(&child.carried_slots);
         grouping_expressions.push(expr.translate(&mut expr_ctx)?);
     }
 
@@ -552,7 +673,9 @@ fn translate_aggregation(
         .iter()
         .zip(&output_slots[grouping_expressions.len()..])
     {
-        let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&child.row_tuples)
+            .with_carried(&child.carried_slots);
         let call = expr_translator::aggregate_call(expr, &mut expr_ctx)?;
         // The GPU ungrouped-aggregate operator rejects every distinct aggregate, so a
         // grouping-free DISTINCT measure would translate fine and then fail at execution.
@@ -631,6 +754,7 @@ fn translate_aggregation(
         },
         row_tuples: vec![output_tuple],
         output_width,
+        carried_slots: Vec::new(),
     };
     // Node conjuncts evaluate over the aggregation output (HAVING predicates).
     apply_conjuncts(aggregated, node, ctx)
@@ -739,10 +863,12 @@ fn translate_sort(
         }
         let mut expressions = Vec::with_capacity(slot_exprs.len());
         for expr in slot_exprs {
-            let mut expr_ctx = ctx.expr_context(&child.row_tuples);
+            let mut expr_ctx = ctx
+                .expr_context(&child.row_tuples)
+                .with_carried(&child.carried_slots);
             expressions.push(expr.translate(&mut expr_ctx)?);
         }
-        project_rel(child, expressions, vec![sort_tuple])
+        project_rel(child, expressions, vec![sort_tuple], Vec::new())
     } else {
         child
     };
@@ -760,6 +886,7 @@ fn translate_sort(
         },
         row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     };
     apply_conjuncts(sorted, node, ctx)
 }
@@ -782,7 +909,9 @@ fn sort_fields(
         .iter()
         .zip(sort_info.is_asc_order.iter().zip(&sort_info.nulls_first))
         .map(|(expr, (asc, nulls_first))| {
-            let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+            let mut expr_ctx = ctx
+                .expr_context(&input.row_tuples)
+                .with_carried(&input.carried_slots);
             let expr = expr.translate(&mut expr_ctx)?;
             let direction = match (asc, nulls_first) {
                 (true, true) => sort_field::SortDirection::AscNullsFirst,
@@ -938,6 +1067,7 @@ fn translate_hash_join(
         },
         row_tuples,
         output_width,
+        carried_slots: Vec::new(),
     };
     let joined = match output {
         JoinOutput::LeftAnti => {
@@ -1073,6 +1203,7 @@ fn translate_nestloop_join(
                     rel,
                     row_tuples,
                     output_width,
+                    carried_slots,
                 } = cross;
                 TranslatedRel {
                     rel: Rel {
@@ -1084,6 +1215,7 @@ fn translate_nestloop_join(
                     },
                     row_tuples,
                     output_width,
+                    carried_slots,
                 }
             }
             None => cross,
@@ -1209,7 +1341,34 @@ fn translate_project_node(
         }
     }
 
-    Ok(project_rel(input, expressions, output_tuples))
+    let materialized_count = expressions.len();
+    let consumed = ctx
+        .consumed_above
+        .get(&node.node_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut carried = Vec::with_capacity(consumed.len());
+    for (position, &slot_id) in consumed.iter().enumerate() {
+        let expression = if let Some(expr) = slot_map.get(&slot_id) {
+            let mut expr_ctx = ctx.expr_context_with_slots(&input.row_tuples, &common_slots);
+            expr.translate(&mut expr_ctx)?
+        } else if let Some(&column) = common_slots.get(&(output_tuple, slot_id)) {
+            field_selection(column as i32)
+        } else {
+            return Err(TranslateError::descriptor(format!(
+                "PROJECT_NODE {} common slot {slot_id} is consumed above but has no slot_map entry",
+                node.node_id
+            )));
+        };
+        expressions.push(expression);
+        carried.push(CarriedSlot {
+            tuple_id: output_tuple,
+            slot_id,
+            column: materialized_count + position,
+        });
+    }
+
+    Ok(project_rel(input, expressions, output_tuples, carried))
 }
 
 /// Adds a root projection over explicit fragment output expressions.
@@ -1235,12 +1394,14 @@ fn project_exprs_with_context(
 ) -> Result<TranslatedRel> {
     let mut expressions = Vec::with_capacity(exprs.len());
     for expr in exprs {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         expressions.push(expr.translate(&mut expr_ctx)?);
     }
     // A root projection over fragment output expressions keeps the input layout.
     let row_tuples = input.row_tuples.clone();
-    Ok(project_rel(input, expressions, row_tuples))
+    Ok(project_rel(input, expressions, row_tuples, Vec::new()))
 }
 
 /// Builds a Substrait project that emits exactly `expressions`.
@@ -1253,6 +1414,7 @@ fn project_rel(
     input: TranslatedRel,
     expressions: Vec<Expression>,
     row_tuples: Vec<i32>,
+    carried_slots: Vec<CarriedSlot>,
 ) -> TranslatedRel {
     let base = input.output_width as i32;
     let output_mapping = (base..base + expressions.len() as i32).collect();
@@ -1273,6 +1435,7 @@ fn project_rel(
         },
         row_tuples,
         output_width,
+        carried_slots,
     }
 }
 
@@ -1295,6 +1458,7 @@ fn append_project(input: TranslatedRel, expression: Expression) -> TranslatedRel
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1316,6 +1480,7 @@ fn emit_columns(input: Rel, output_mapping: Vec<i32>, row_tuples: Vec<i32>) -> T
         },
         row_tuples,
         output_width,
+        carried_slots: Vec::new(),
     }
 }
 
@@ -1384,6 +1549,7 @@ fn filter_rel(input: TranslatedRel, condition: Expression) -> TranslatedRel {
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     }
 }
 
@@ -1435,7 +1601,9 @@ fn apply_conjuncts(
     let conjuncts = node.conjuncts.as_deref().unwrap_or_default();
     let mut conditions = Vec::with_capacity(conjuncts.len());
     for expr in conjuncts {
-        let mut expr_ctx = ctx.expr_context(&input.row_tuples);
+        let mut expr_ctx = ctx
+            .expr_context(&input.row_tuples)
+            .with_carried(&input.carried_slots);
         conditions.push(expr.translate(&mut expr_ctx)?);
     }
     let Some(condition) = and_conditions(conditions, ctx) else {
@@ -1454,6 +1622,7 @@ fn apply_conjuncts(
         },
         row_tuples: input.row_tuples,
         output_width,
+        carried_slots: input.carried_slots,
     })
 }
 

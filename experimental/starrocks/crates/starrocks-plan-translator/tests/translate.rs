@@ -3294,6 +3294,114 @@ fn exchange_translates_to_stream_read() {
     assert_eq!(table.names, vec!["sirius_stream_7"]);
 }
 
+/// A merging exchange is a stream read wrapped in the exchange's sort.
+#[test]
+fn merging_exchange_wraps_stream_read_in_sort() {
+    let sort_info = TSortInfo::new(
+        vec![slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT))],
+        vec![true],
+        vec![false],
+        None,
+    );
+    let mut exchange = exchange_node(7, vec![0]);
+    exchange.exchange_node.as_mut().unwrap().sort_info = Some(sort_info);
+    let translated = translate_with_streams(
+        TPlan::new(vec![exchange]),
+        base_desc(),
+        &[stream_input(7, &["id", "name"])],
+    )
+    .unwrap();
+    let rel::RelType::Sort(sort) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a sort over the stream read");
+    };
+    let rel::RelType::Read(_) = sort.input.as_ref().unwrap().rel_type.as_ref().unwrap() else {
+        panic!("expected the stream read under the sort");
+    };
+}
+
+/// `CLONE_EXPR` is the child expression: the FE uses it to duplicate a slot, not to change type.
+#[test]
+fn clone_expr_is_its_child() {
+    let clone = base_expr_node(
+        TExprNodeType::CLONE_EXPR,
+        scalar_type(TPrimitiveType::BIGINT),
+        1,
+    );
+    let mut nodes = vec![clone];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::BIGINT)).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(base_desc()),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a root projection");
+    };
+    assert!(matches!(
+        project.expressions[0].rex_type,
+        Some(expression::RexType::Selection(_))
+    ));
+}
+
+/// `year(date)` in a SMALLINT slot is a cast over the BIGINT function, not a bare BIGINT.
+#[test]
+fn year_call_casts_back_to_the_fe_slot_type() {
+    let mut year = base_expr_node(
+        TExprNodeType::FUNCTION_CALL,
+        scalar_type(TPrimitiveType::SMALLINT),
+        1,
+    );
+    year.fn_ = Some(builtin_function(
+        "year",
+        scalar_type(TPrimitiveType::SMALLINT),
+    ));
+    let mut nodes = vec![year];
+    nodes.extend(slot_ref(1, 0, scalar_type(TPrimitiveType::DATE)).nodes);
+    let translated = translate_fragment(&params(
+        Some(TPlan::new(vec![scan_node(0, 0)])),
+        Some(desc_table(
+            vec![(0, Some(100))],
+            vec![slot(1, 0, "d", scalar_type(TPrimitiveType::DATE))],
+        )),
+        Some(vec![TExpr::new(nodes)]),
+    ))
+    .unwrap();
+    let rel::RelType::Project(project) = root(&translated.plan)
+        .input
+        .as_ref()
+        .unwrap()
+        .rel_type
+        .as_ref()
+        .unwrap()
+    else {
+        panic!("expected a root projection");
+    };
+    let expression::RexType::Cast(cast) = project.expressions[0].rex_type.as_ref().unwrap() else {
+        panic!("expected year() to be cast to the FE slot type");
+    };
+    let expression::RexType::ScalarFunction(function) =
+        cast.input.as_ref().unwrap().rex_type.as_ref().unwrap()
+    else {
+        panic!("expected the cast input to be year()");
+    };
+    assert!(function.function_reference > 0);
+}
+
 /// Partial and merge SUM stay SUM: two-phase GROUP BY re-aggregates partial sums.
 #[test]
 fn two_phase_sum_stays_sum() {

@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,6 +40,10 @@ struct stream_input_binding {
 
   /// Back-pointer into the engine-owned plan; filled during planning for session registration.
   op::sirius_physical_streaming_source* built = nullptr;
+
+  /// Caller-declared row count. nullopt keeps the optimizer's default (cardinality 1).
+  /// Last member so existing positional brace-inits stay valid.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
@@ -65,6 +70,9 @@ class stream_bind_catalog : public duckdb::ClientContextState {
 
   /// @throws sirius::invalid_input_exception when `id` was never declared.
   [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
+
+  /// Declared row count, or nullopt when `id` was never declared or has no count.
+  [[nodiscard]] std::optional<std::uint64_t> estimated_rows(stream_id_t id) const;
 
   /// @throws sirius::invalid_input_exception when `id` was never declared, or when it already
   ///         has a built operator (the same declared stream read by more than one plan leaf —
