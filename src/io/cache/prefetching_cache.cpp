@@ -522,7 +522,20 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
   if (buffers.size() != n_chunks_needed) {
     auto const shortage = n_chunks_needed - buffers.size();
     if (!buffers.empty()) { _pool->deallocate_bulk(std::move(buffers), numa_allocated); }
-    if (!wait_for_eviction) { return prepare_result::allocation_failed; }
+    if (!wait_for_eviction) {
+      // Get reclamation moving without stalling the scan-input constructor.
+      // Keep the completion so a readahead retry can wait for this pass
+      // instead of enqueueing a duplicate demand for the same shortfall.
+      if ((!req.pending_eviction || req.pending_eviction->try_wait()) &&
+          !_shutting_down.load(std::memory_order_acquire)) {
+        auto processed = std::make_shared<std::latch>(1);
+        if (_eviction_queue.enqueue(
+              cache_request{eviction_request{shortage * _chunk_size, processed}})) {
+          req.pending_eviction = std::move(processed);
+        }
+      }
+      return prepare_result::allocation_failed;
+    }
 
     // Wait until the evictor has completed a pass for this shortfall before
     // retrying. The producer stays queued throughout, so memory pressure never
@@ -531,7 +544,12 @@ prepare_result prefetching_cache::prepare_request(prefetch_request& req, bool wa
       req.producer->mark_abandoned();
       return prepare_result::fallen_behind;
     }
-    evict_sync(shortage * _chunk_size);
+    if (req.pending_eviction) {
+      req.pending_eviction->wait();
+      req.pending_eviction.reset();
+    } else {
+      evict_sync(shortage * _chunk_size);
+    }
     if (req.has_fallen_behind()) {
       req.producer->mark_abandoned();
       return prepare_result::fallen_behind;
