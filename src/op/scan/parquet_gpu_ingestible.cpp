@@ -511,7 +511,7 @@ filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
   // while constructing the offsets and character buffer. Match cuDF's pair type without
   // including its CUDA-only strings_column_factories.cuh in this host translation unit.
   auto const pairs =
-    memory::saturating_mul(rows, sizeof(cuda::std::pair<char const*, cudf::size_type>));
+    memory::saturating_mul(rows, sizeof(::cuda::std::pair<char const*, cudf::size_type>));
   return {output, memory::saturating_add(output, pairs)};
 }
 
