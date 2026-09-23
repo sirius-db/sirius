@@ -137,6 +137,13 @@ scan_operator_input::scan_operator_input(
     }
   }
 
+  // fadvise only creates chunk entries; preparation attaches the buffers that
+  // demand reads can claim and fill even when there is no readahead worker.
+  // A readahead worker can prepare again later: already-prepared requests return
+  // immediately, and allocation failures remain queued for its eviction retry.
+  // Never wait for synchronous eviction while constructing a scan input.
+  static_cast<void>(stored->prepare_for_prefetching(false));
+
   // The publication barrier.  register_scan_task takes the readahead's mutex,
   // which the worker also takes to collect, so the hints above are ordered
   // before any read of them on the worker's side.  Keep this last.
