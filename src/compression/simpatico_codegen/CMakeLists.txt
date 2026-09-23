@@ -26,6 +26,7 @@ add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 add_link_options(-Wl,--enable-new-dtags)
 include(cmake/jit_header_manifest.cmake)
+include(cmake/cache_identity.cmake)
 
 # Embed the project headers the runtime NVRTC JIT #includes as raw-string
 # literals, so a binary distribution needs no simpatico source tree on disk.
@@ -105,6 +106,8 @@ add_library(
   src/operators/nvcomp_batched_codec.cu
   # Plain-CUDA JIT host
   src/jit/nvrtc_compiler.cpp
+  src/jit/compiler_identity.cpp
+  src/jit/cache_identity.cpp
   src/jit/kernel_cache.cpp
   src/encode/jit/renderer.cpp
   src/decode/jit/renderer.cpp
@@ -145,8 +148,10 @@ target_compile_definitions(
 # nvrtc_compiler.cpp #includes the generated embedded_headers.h from here.
 add_dependencies(simpatico simpatico_embedded_headers)
 target_include_directories(
-  simpatico PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-                    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  simpatico
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+          "${CMAKE_CURRENT_BINARY_DIR}/generated"
+          "${SIMPATICO_XXHASH_INCLUDE_DIR}")
 # In the Sirius vcpkg build the overlay nvrtc port provides a static NVRTC
 # (nvrtc::nvrtc_static) so the extension carries no libnvrtc.so runtime dep.
 # Standalone / pixi builds use the toolkit's shared NVRTC target.
@@ -156,9 +161,34 @@ if(VCPKG_BUILD AND NOT TARGET nvrtc::nvrtc_static)
 endif()
 if(TARGET nvrtc::nvrtc_static)
   set(SIMPATICO_NVRTC_LIB nvrtc::nvrtc_static)
+  set(_compiler_identity_args
+      "-DNVRTC=$<TARGET_FILE:nvrtc::nvrtc_static>"
+      "-DBUILTINS=$<TARGET_FILE:nvrtc::nvrtc_builtins_static>"
+      "-DPTX=$<TARGET_FILE:CUDA::nvptxcompiler_static>")
+  set(_compiler_identity_dependencies
+      "$<TARGET_FILE:nvrtc::nvrtc_static>"
+      "$<TARGET_FILE:nvrtc::nvrtc_builtins_static>"
+      "$<TARGET_FILE:CUDA::nvptxcompiler_static>")
 else()
   set(SIMPATICO_NVRTC_LIB CUDA::nvrtc)
 endif()
+
+set(EMBED_COMPILER_IDENTITY_OUT
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/codegen/jit/compiler_identity.h")
+add_custom_command(
+  OUTPUT "${EMBED_COMPILER_IDENTITY_OUT}"
+  COMMAND
+    ${CMAKE_COMMAND} ${_compiler_identity_args}
+    "-DOUT=${EMBED_COMPILER_IDENTITY_OUT}"
+    "-DXXHSUM_EXECUTABLE=${XXHSUM_EXECUTABLE}" -P
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_identity.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compiler_identity.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jit_header_manifest.cmake"
+          "${XXHSUM_EXECUTABLE}" ${_compiler_identity_dependencies}
+  VERBATIM)
+add_custom_target(simpatico_compiler_identity
+                  DEPENDS "${EMBED_COMPILER_IDENTITY_OUT}")
+add_dependencies(simpatico simpatico_compiler_identity)
 
 if(VCPKG_BUILD)
   set(SIMPATICO_CUDART_LIB CUDA::cudart_static)
