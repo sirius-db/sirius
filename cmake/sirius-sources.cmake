@@ -1,0 +1,278 @@
+# cmake-format: off
+set(EXTENSION_SOURCES
+    src/compression/compressed_representation.cpp
+    src/compression/compressed_scan.cpp
+    src/compression/compression_converters.cpp
+    src/compression/plan_register.cpp
+    src/late_mat/prepared_selection.cpp
+    src/late_mat/materialize.cpp
+    src/late_mat/defer_policy.cpp
+    src/late_mat/defer_directive.cpp
+    src/late_mat/port_materialize.cpp
+    src/late_mat/pin_uniqueness.cpp
+    src/planner/late_mat_plan_pass.cpp
+    src/scan_manager/late_mat_resolver.cpp
+    src/late_mat/multi_source_gather.cu
+    src/config.cpp
+    src/helper/numeric_narrowing.cpp
+    src/helper/type_conversions.cpp
+    src/debug_utils.cpp
+    src/creator/task_creator.cpp
+    src/data/spill_chunked_converters.cpp
+    src/downgrade/downgrade_executor.cpp
+    src/expression/aggregate_id.cpp
+    src/expression/ast/constant_range.cpp
+    src/expression/ast/node.cpp
+    src/expression/ast/utils.cpp
+    src/expression/from_duckdb.cpp
+    src/expression/function_id.cpp
+    src/expression/join_condition.cpp
+    src/expression/to_duckdb.cpp
+    src/expression/value.cpp
+    src/expression_evaluator/expression_evaluator_strategy.cpp
+    src/expression_evaluator/ast_op_counter.cpp
+    src/expression_evaluator/expression_evaluator.cpp
+    src/expression_evaluator/gpu_expression_translator.cpp
+    src/expression_evaluator/regex/regex_playground.cpp
+    src/expression_evaluator/specializations/between.cpp
+    src/expression_evaluator/specializations/case.cpp
+    src/expression_evaluator/specializations/cast.cpp
+    src/expression_evaluator/specializations/comparison.cpp
+    src/expression_evaluator/specializations/conjunction.cpp
+    src/expression_evaluator/specializations/constant.cpp
+    src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/narrow_domain.cpp
+    src/expression_evaluator/specializations/operator.cpp
+    src/expression_evaluator/specializations/reference.cpp
+    # Execution primitives (slot-based backpressure / completion tracking)
+    src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
+    src/exec/stream_session.cpp
+    src/exec/stream_bind_catalog.cpp
+    src/exec/stream_plan_bindings.cpp
+    src/exec/streaming_fragment.cpp
+    src/exec/thread_util.cpp
+    # Query lifecycle event bus (publisher + subscriber)
+    src/event/query_event_publisher.cpp
+    src/event/query_event_subscriber.cpp
+    # I/O adapters (Phase 19 — io_uring + sirius_datasource)
+    src/io/datasource_factory.cpp
+    src/io/io_context.cpp
+    src/io/parquet_helpers.cpp
+    src/io/sirius_datasource.cpp
+    src/io/uri_parser.cpp
+    src/io/cache/metadata_store.cpp
+    src/io/cache/prefetching_cache.cpp
+    src/io/cache/types.cpp
+    src/io/kvikio/kvikio_context.cpp
+    src/io/rest/curl_handle.cpp
+    src/io/rest/rest_ioctx.cpp
+    src/io/rest/rest_reactor.cpp
+    src/io/rest/s3/list_parser.cpp
+    src/io/rest/s3/sigv4.cpp
+    src/io/s3/sirius_httpfs.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
+    src/io/uring/uring_ioctx.cpp
+    src/io/uring/uring_reactor.cpp
+    src/log/duckdb_sink.cpp
+    src/log/level.cpp
+    src/log/logging.cpp
+    src/log/noop_sink.cpp
+    src/log/spdlog_owning_sink.cpp
+    src/memory/defragmenter_oom_policy.cpp
+    src/memory/sirius_memory_reservation_manager.cpp
+    src/op/aggregate/aggregate_op_util.cpp
+    src/op/aggregate/group_key_labels.cpp
+    src/op/aggregate/gpu_aggregate_impl.cpp
+    src/op/merge/gpu_merge_impl.cpp
+    src/op/order/gpu_order_impl.cpp
+    src/op/partition/gpu_partition_impl.cpp
+    src/op/result/host_table_chunk_reader.cpp
+    src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_insert_delta.cpp
+    src/op/scan/duckdb_mvcc_visibility.cpp
+    src/op/scan/duckdb_native_metadata.cpp
+    src/op/scan/duckdb_native_decoder.cpp
+    src/op/scan/dynamic_filter_merge.cpp
+    src/op/scan/sirius_physical_dynamic_filter.cpp
+    src/op/scan/host_keep_mask.cpp
+    src/op/scan/owning_table_view.cpp
+    src/op/scan/parquet_schema_mapping.cpp
+    src/op/scan/scan_plan.cpp
+    src/op/scan/scan_filter_analysis.cpp
+    src/op/scan/scan_utils.cpp
+    src/op/scan/sirius_gpu_scan_operator.cpp
+    src/op/scan/sirius_gpu_scan_operator_data.cpp
+    src/op/scan/gpu_ingestible.cpp
+    src/op/scan/parquet_gpu_ingestible.cpp
+    src/op/scan/duckdb_native_gpu_ingestible.cpp
+    src/op/scan/iceberg_metadata_reader.cpp
+    src/op/scan/puffin_reader.cpp
+    src/op/scan/positional_delete_filter.cpp
+    src/op/scan/equality_delete_filter.cpp
+    src/op/scan/iceberg_delete_pipeline.cpp
+    src/op/scan/iceberg_gpu_ingestible.cpp
+    src/op/dynamic_filter/dynamic_filter_publish_plan.cpp
+    src/op/dynamic_filter/dynamic_filter_publisher.cpp
+    src/op/dynamic_filter/sirius_dynamic_filter.cpp
+    src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_streaming_sink.cpp
+    src/op/sirius_physical_streaming_source.cpp
+    src/op/sirius_physical_concat.cpp
+    src/op/sirius_physical_cte.cpp
+    src/op/sirius_physical_delim_join.cpp
+    src/op/sirius_physical_dense_count_join.cpp
+    src/op/sirius_physical_dummy_scan.cpp
+    src/op/sirius_physical_empty_result.cpp
+    src/op/sirius_physical_filter.cpp
+    src/op/sirius_physical_gpu_values.cpp
+    src/op/sirius_physical_grouped_aggregate.cpp
+    src/op/sirius_physical_grouped_aggregate_merge.cpp
+    src/op/sirius_physical_hash_join.cpp
+    src/op/sirius_physical_limit.cpp
+    src/op/sirius_physical_merge_sort.cpp
+    src/op/sirius_physical_nested_loop_join.cpp
+    src/op/sirius_physical_operator.cpp
+    src/op/sirius_physical_operator_type.cpp
+    src/op/sirius_physical_order.cpp
+    src/op/sirius_physical_partition.cpp
+    src/op/sirius_physical_partition_consumer_operator.cpp
+    src/op/sirius_physical_passthrough_sink.cpp
+    src/op/sirius_physical_projection.cpp
+    src/op/sirius_physical_result_collector.cpp
+    src/op/sirius_physical_sort_partition.cpp
+    src/op/sirius_physical_sort_sample.cpp
+    src/op/sirius_physical_table_scan.cpp
+    src/op/sirius_physical_top_n.cpp
+    src/op/sirius_physical_ungrouped_aggregate.cpp
+    src/op/sirius_physical_union.cpp
+    src/parallel/task_executor.cpp
+    src/pipeline/gpu_pipeline_executor.cpp
+    src/pipeline/gpu_pipeline_task.cpp
+    src/pipeline/sirius_pipeline_itask.cpp
+    src/pipeline/task_scheduler.cpp
+    src/pipeline/sirius_meta_pipeline.cpp
+    src/pipeline/sirius_pipeline.cpp
+    src/pipeline/sirius_pipeline_converter.cpp
+    src/pipeline/data_size_estimator.cpp
+    src/pipeline/repository_wiring_materializer.cpp
+    src/pipeline/sirius_plan_printer.cpp
+    src/pipeline/task_request.cpp
+    src/planner/dynamic_filter/build_filter_evidence.cpp
+    src/planner/dynamic_filter/build_key_domain.cpp
+    src/planner/dynamic_filter/dynamic_filter_key_admission.cpp
+    src/planner/dynamic_filter/dynamic_filter_target_discovery.cpp
+    src/planner/gpu_admission.cpp
+    src/planner/query.cpp
+    src/planner/query_index.cpp
+    src/planner/sirius_physical_plan_generator.cpp
+    src/planner/sirius_plan_aggregate.cpp
+    src/planner/sirius_plan_column_data_get.cpp
+    src/planner/sirius_plan_comparison_join.cpp
+    src/planner/sirius_plan_compressed_schema.cpp
+    src/planner/sirius_plan_cte.cpp
+    src/planner/sirius_plan_delim_get.cpp
+    src/planner/sirius_plan_delim_join.cpp
+    src/planner/sirius_plan_dummy_scan.cpp
+    src/planner/sirius_plan_empty_result.cpp
+    src/planner/sirius_plan_expression_get.cpp
+    src/planner/sirius_plan_filter.cpp
+    src/planner/sirius_plan_get.cpp
+    src/planner/sirius_plan_limit.cpp
+    src/planner/sirius_plan_narrowing_policy.cpp
+    src/planner/sirius_plan_order.cpp
+    src/planner/sirius_plan_projection.cpp
+    src/planner/sirius_plan_projection_utils.cpp
+    src/planner/sirius_plan_recursive_cte.cpp
+    src/planner/sirius_plan_set_operation.cpp
+    src/planner/sirius_plan_top_n.cpp
+    src/pin_table.cpp
+    src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/insert_delta_job.cpp
+    src/scan_manager/mvcc_mask_job.cpp
+    src/scan_manager/pinned_chunk_stats.cpp
+    src/scan_manager/round_robin_strategy.cpp
+    src/scan_manager/memory_prefetcher.cpp
+    src/scan_manager/sirius_scan_manager.cpp
+    src/scan_manager/split_connector.cpp
+    src/scan_manager/split_provider.cpp
+    src/sirius_config.cpp
+    src/sirius_context.cpp
+    src/sirius_engine.cpp
+    src/sirius_extension.cpp
+    src/sirius_ffi.cpp
+    src/sirius_interface.cpp
+    src/sirius_sql_rewrite.cpp
+    src/telemetry/batch_telemetry.cpp
+    src/telemetry/telemetry_context.cpp
+    src/telemetry/memory_context.cpp
+    src/transparent/connection_provenance.cpp
+    src/transparent/physical_sirius_execution.cpp
+    src/transparent/sirius_optimizer_extension.cpp
+    src/util/stream_check_wrapper.cpp
+    src/util/segfault_backtrace_handler.cpp
+    src/vss/cuvs_index_cache.cpp
+    src/vss/distance_metric.cpp
+    src/vss/enn_top_k.cpp
+    src/vss/pinned_column.cpp
+    src/vss/vector_search.cpp
+    src/vss/vector_search_ann.cpp
+    src/vss/vector_search_enn.cpp)
+# cmake-format: on
+
+# Legacy Sirius — all legacy-specific config lives in src/legacy/CMakeLists.txt.
+
+# Deleting src/legacy/ cleanly removes legacy build support.
+set(CUDA_SOURCES
+    src/op/partition/crc32_partition_hash.cu
+    src/op/scan/equality_delete_mask.cu
+    src/cuda/dense_count_join_impl.cu
+    src/cuda/dynamic_filter_replica_transfer.cu
+    src/cuda/sirius_dynamic_bloom_filter.cu
+    src/cuda/sirius_dynamic_in_list_filter.cu
+    src/cuda/sirius_dynamic_small_in_list_filter.cu
+    src/cuda/sirius_like_multiliteral.cu
+    src/cuda/scan/gpu_decode_alp.cu
+    src/cuda/scan/gpu_decode_bitpacking.cu
+    src/cuda/scan/gpu_decode_rle.cu
+    src/cuda/scan/gpu_decode_strings.cu
+    src/cuda/scan/gpu_native_decode.cu
+    src/cuda/scan/strings/dict_fsst.cu
+    src/cuda/scan/strings/dictionary.cu
+    src/cuda/scan/strings/fsst.cu
+    src/cuda/scan/strings/uncompressed.cu
+    src/cuda/vss/cudf_raft_interop.cu
+    src/cuda/vss/brute_force_search.cu
+    src/cuda/vss/ivf_flat_index.cu)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
+  add_subdirectory(src/legacy)
+  list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
+       ${SIRIUS_LEGACY_CONDITIONAL_SOURCES})
+  list(APPEND CUDA_SOURCES ${SIRIUS_LEGACY_CUDA_SOURCES})
+endif()
+
+# Compile the DuckDB substrait extension's Substrait->DuckDB reader directly
+# into the sirius target so the FFI (src/sirius_ffi.cpp) can call
+# `duckdb::SubstraitToDuckDB`. Only the from-substrait direction plus its
+# bundled protobuf (renamespaced to `duckdb::google::protobuf`, no abseil) are
+# compiled in — NOT the substrait SQL functions, to_substrait, or a second
+# loadable extension — so there is no symbol collision with conda/system
+# protobuf or a duplicate extension.
+set(SIRIUS_SUBSTRAIT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/substrait")
+file(GLOB_RECURSE SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES
+     "${SIRIUS_SUBSTRAIT_DIR}/third_party/google/protobuf/*.cc")
+set(SIRIUS_SUBSTRAIT_SOURCES
+    ${SIRIUS_SUBSTRAIT_DIR}/src/from_substrait.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/src/custom_extensions_generated.cpp
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/algebra.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extended_expression.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/plan.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/type.pb.cc
+    ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait/substrait/extensions/extensions.pb.cc
+    ${SIRIUS_SUBSTRAIT_PROTOBUF_SOURCES})
+# The vendored/generated protobuf + substrait TUs are not warning-clean; never
+# fail the build on them.
+set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
+                            PROPERTIES COMPILE_OPTIONS "-w")
+list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
