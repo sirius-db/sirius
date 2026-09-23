@@ -1,14 +1,14 @@
 # Plan for Simpatico NVRTC caching — issue #1863
 
-Status: implementation in progress as an approved draft stack. The single squashed
+Status: implemented as an approved draft stack; readiness remains with the author. The single squashed
 commit `8a309bfb` from [PR #1799](https://github.com/sirius-db/sirius/pull/1799) is
 cherry-picked onto the bottom layer pending that PR's merge into `dev`.
 
-Planning snapshot: 2026-09-23; local `dev` is `d79d4f97`; the prerequisite PR head is
-`9e9d8c23693df525dbe5c02132adcf7d093929e4` and is still open. Its current diff changes
+Planning snapshot: 2026-09-23; local `dev` is `d79d4f97`; the squashed prerequisite PR head is
+`8a309bfb78789515a9621ccc6a3ed0f1f5786647` and is still open. Its current diff changes
 CCCL header sourcing and CMake dependencies. The existing runtime cache remains the
 starting point for [issue #1863](https://github.com/sirius-db/sirius/issues/1863).
-Recheck the merged version before implementing this plan.
+Recheck the merged version before reconciling the bottom layer with `dev`.
 
 ## Outcome
 

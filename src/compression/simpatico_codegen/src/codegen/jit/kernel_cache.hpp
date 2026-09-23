@@ -19,8 +19,9 @@ namespace codegen::jit {
 // ${XDG_CACHE_HOME:-$HOME/.cache}/simpatico/jit; set SIMPATICO_JIT_CACHE_DIR
 // to "off" (or empty) to disable and fall back to in-memory only.
 //
-// clear_jit_disk_cache() removes every cached cubin (best-effort); call it
-// before any compilation happens (e.g. from a test's main / orchestrator).
+// clear_jit_disk_cache() removes recognized legacy/v2 records and abandoned
+// temporaries (best-effort, without following symlinks). Stop writers first.
+// No automatic eviction: other-build namespaces persist until explicit cleanup.
 void clear_jit_disk_cache();
 
 class KernelCache {
