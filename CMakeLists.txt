@@ -121,9 +121,9 @@ endif()
 # Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
 # keeps libnvrtc.so out of the distributed extension's runtime dependencies.
 # Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
-# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
-# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
-# The pixi build has no such target and links the conda shared libnvrtc.so.
+# the nvrtc::nvrtc_static target, which simpatico links instead of CUDA::nvrtc
+# (see src/compression/simpatico_codegen/CMakeLists.txt). The pixi build uses
+# CUDA::nvrtc for the toolkit's shared library.
 if(VCPKG_BUILD)
   find_package(nvrtc CONFIG REQUIRED)
   find_package(nvjitlink CONFIG REQUIRED)

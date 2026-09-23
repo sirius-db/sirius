@@ -10,5 +10,6 @@ namespace codegen::jit {
 
 extern const EmbeddedJitHeader kCcclEmbeddedHeaders[];
 extern const int kCcclEmbeddedHeaderCount;
+extern const char kCcclEmbeddedHeadersIdentity[];
 
 }  // namespace codegen::jit
