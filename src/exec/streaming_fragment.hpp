@@ -50,6 +50,8 @@ struct stream_input_spec {
   duckdb::vector<sirius::logical_type> types;
   /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
+  /// Optional caller-declared row count forwarded to the bind catalog. nullopt = undeclared.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Bound, optimized DuckDB logical plan from Substrait bytes, SQL, or similar.
@@ -151,6 +153,11 @@ class streaming_fragment {
   /// @throws sirius::invalid_input_exception before build() or on an unknown id, including
   ///         any id on a result fragment.
   [[nodiscard]] std::size_t output_batch_count(stream_id_t id) const;
+
+  /// Total rows parked on output stream `id`, without draining it.
+  /// @throws sirius::invalid_input_exception before build(), on an unknown id, or on a parked
+  ///         batch that is not GPU-resident.
+  [[nodiscard]] std::uint64_t output_row_count(stream_id_t id) const;
 
   /// The declared spec of input `id`.
   /// @throws sirius::invalid_input_exception on an undeclared input.

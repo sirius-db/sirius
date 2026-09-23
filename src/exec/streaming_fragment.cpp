@@ -16,6 +16,7 @@
 
 #include "exec/streaming_fragment.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
@@ -260,7 +261,8 @@ void streaming_fragment::build()
                                             input.types,
                                             std::make_shared<cucascade::shared_data_repository>(),
                                             input.expected_senders,
-                                            nullptr});
+                                            nullptr,
+                                            input.estimated_rows});
     }
 
     auto bound = _spec.plan_source(_context);
@@ -506,6 +508,33 @@ std::size_t streaming_fragment::output_batch_count(stream_id_t id) const
                                           std::to_string(id));
   }
   return it->second->total_size();
+}
+
+std::uint64_t streaming_fragment::output_row_count(stream_id_t id) const
+{
+  require_built("output_row_count()");
+  auto it = _output_repos.find(id);
+  if (it == _output_repos.end()) {
+    throw sirius::invalid_input_exception("streaming_fragment: no output stream with id " +
+                                          std::to_string(id));
+  }
+  const auto& repository = *it->second;
+
+  std::uint64_t rows = 0;
+  for (std::size_t partition = 0; partition < repository.num_partitions(); ++partition) {
+    for (auto batch_id : repository.get_batch_ids(partition)) {
+      auto batch = repository.get_data_batch_by_id(batch_id, partition);
+      if (!batch) { continue; }
+      auto read_only = batch->to_read_only();
+      if (read_only.get_current_tier() != cucascade::memory::Tier::GPU) {
+        throw sirius::invalid_input_exception(
+          "streaming_fragment: batch on output stream " + std::to_string(id) +
+          " is not GPU-resident; counting a spilled batch's rows is not supported yet");
+      }
+      rows += static_cast<std::uint64_t>(sirius::get_cudf_table_view(read_only).num_rows());
+    }
+  }
+  return rows;
 }
 
 }  // namespace sirius::exec

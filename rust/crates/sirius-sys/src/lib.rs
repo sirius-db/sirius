@@ -142,6 +142,14 @@ mod ffi {
             sender_id: u32,
         ) -> Result<()>;
 
+        /// Declare the row count of an input stream so the optimizer can size joins.
+        /// Undeclared streams stay at cardinality 1. Last call wins.
+        fn declare_input_cardinality(
+            self: Pin<&mut Fragment>,
+            stream_id: u64,
+            rows: u64,
+        ) -> Result<()>;
+
         /// Declare an output stream. A fragment with none is a result fragment.
         fn declare_output(self: Pin<&mut Fragment>, stream_id: u64) -> Result<()>;
 
@@ -237,6 +245,9 @@ mod ffi {
         /// Batches currently parked on an output stream — the evidence that a
         /// fragment boundary carried native batches rather than nothing.
         fn output_batch_count(self: &Fragment, stream_id: u64) -> Result<usize>;
+
+        /// Total rows parked on an output stream, without draining it.
+        fn output_row_count(self: &Fragment, stream_id: u64) -> Result<u64>;
 
         /// DuckDB type names of a built fragment's output (sink) columns — the
         /// types every batch leaving the fragment actually carries, exactly

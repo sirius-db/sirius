@@ -23,6 +23,16 @@ pub(crate) fn bool_type() -> Type {
     }
 }
 
+/// Builds a BIGINT type. DuckDB's `year`/`month`/`day` return BIGINT.
+pub(crate) fn i64_type(nullable: bool) -> Type {
+    Type {
+        kind: Some(r#type::Kind::I64(r#type::I64 {
+            type_variation_reference: 0,
+            nullability: nullability(nullable),
+        })),
+    }
+}
+
 /// Builds an FP64 type used to lower arithmetic Sirius cannot execute on decimal columns.
 pub(crate) fn fp64_type(nullable: bool) -> Type {
     Type {

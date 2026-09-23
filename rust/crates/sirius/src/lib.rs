@@ -233,6 +233,18 @@ impl Fragment<'_> {
             .declare_input_sender(stream_id, sender_id)
     }
 
+    /// Declare the row count of input stream `stream_id`, summed over its senders.
+    /// Undeclared streams stay at cardinality 1. Last call wins.
+    pub fn declare_input_cardinality(
+        &mut self,
+        stream_id: u64,
+        rows: u64,
+    ) -> Result<(), Exception> {
+        self.inner
+            .pin_mut()
+            .declare_input_cardinality(stream_id, rows)
+    }
+
     /// Declare an output stream. A fragment with no output stream is a result fragment.
     pub fn declare_output(&mut self, stream_id: u64) -> Result<(), Exception> {
         self.inner.pin_mut().declare_output(stream_id)
@@ -385,6 +397,11 @@ impl Fragment<'_> {
     /// boundary carried native batches rather than nothing.
     pub fn output_batch_count(&self, stream_id: u64) -> Result<usize, Exception> {
         self.inner.output_batch_count(stream_id)
+    }
+
+    /// Total rows parked on output stream `stream_id`, without draining it.
+    pub fn output_row_count(&self, stream_id: u64) -> Result<u64, Exception> {
+        self.inner.output_row_count(stream_id)
     }
 
     /// DuckDB type names of this built fragment's output (sink) columns — the types every batch

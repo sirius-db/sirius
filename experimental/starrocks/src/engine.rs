@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use sirius::SiriusContext;
 use starrocks_plan_translator::StreamInputSchema;
 use starrocks_plan_translator::TranslatedPlan;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::fragment_executor::{
     FragmentExecutor, FragmentResult, FragmentRun, SenderSlot, StagedBatch,
@@ -247,6 +247,36 @@ fn run_fragment<'ctx>(
                 .declare_input_sender(stream_id, sender_id)
                 .map_err(|err| format!("failed to declare sender on stream {stream_id}: {err}"))?;
         }
+
+        // Exact row counts are already on this CN (parked local outputs and staged remote
+        // batches). Undeclared streams look like cardinality 1, so a hash join can build on a
+        // large stream while a tiny stream probes. Skip the declaration when any count is unknown.
+        let local_rows = sum_known(senders.iter().map(|slot| {
+            let (sender, sender_stream) = registry.claim(slot, "cardinality").ok()?;
+            sender.output_row_count(sender_stream).ok()
+        }));
+        let remote_rows = sum_known(
+            request
+                .remote_inputs
+                .iter()
+                .filter(|(node_id, _, _)| *node_id == schema.node_id)
+                .flat_map(|(_, _, batches)| batches.iter().map(|batch| batch.rows)),
+        );
+        match (local_rows, remote_rows) {
+            (Some(local), Some(remote)) => {
+                let rows = local + remote;
+                fragment
+                    .declare_input_cardinality(stream_id, rows)
+                    .map_err(|err| {
+                        format!("failed to declare cardinality of stream {stream_id}: {err}")
+                    })?;
+                info!(stream_id, rows, "declared input stream cardinality");
+            }
+            _ => warn!(
+                stream_id,
+                "input stream row count unknown; planning without a declared cardinality"
+            ),
+        }
     }
 
     for stream in 0..request.outputs.len() as u64 {
@@ -365,6 +395,18 @@ fn run_fragment<'ctx>(
         );
     }
     Ok(result)
+}
+
+/// Sums `Option` counts. `None` if any contributor is unknown. An empty iterator is 0.
+fn sum_known<I>(counts: I) -> Option<u64>
+where
+    I: IntoIterator<Item = Option<u64>>,
+{
+    let mut total = 0u64;
+    for count in counts {
+        total = total.checked_add(count?)?;
+    }
+    Some(total)
 }
 
 fn stream_id_of(node_id: i32) -> Result<u64, String> {

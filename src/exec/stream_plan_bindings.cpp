@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
@@ -56,6 +57,21 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   return duckdb::make_uniq<stream_source_bind_data>(stream_id);
 }
 
+/// Reports a declared stream row count to DuckDB's optimizer. nullptr keeps cardinality 1.
+duckdb::unique_ptr<duckdb::NodeStatistics> stream_source_cardinality(
+  duckdb::ClientContext& context, const duckdb::FunctionData* bind_data)
+{
+  if (bind_data == nullptr) { return nullptr; }
+  auto const* bind = dynamic_cast<const stream_source_bind_data*>(bind_data);
+  if (bind == nullptr) { return nullptr; }
+  if (!context.registered_state) { return nullptr; }
+  auto catalog = context.registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
+  if (!catalog) { return nullptr; }
+  auto const rows = catalog->estimated_rows(bind->stream_id);
+  if (!rows.has_value()) { return nullptr; }
+  return duckdb::make_uniq<duckdb::NodeStatistics>(static_cast<duckdb::idx_t>(*rows));
+}
+
 /// Never runs: plan generator replaces this scan with STREAMING_SOURCE.
 void stream_source_function(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&)
 {
@@ -75,6 +91,7 @@ void register_stream_source_function(duckdb::DatabaseInstance& instance)
                                       {duckdb::LogicalType::BIGINT},
                                       stream_source_function,
                                       stream_source_bind);
+  stream_source.cardinality = stream_source_cardinality;
 
   duckdb::CreateTableFunctionInfo info(stream_source);
   // Idempotent: extension callback and explicit callers may both register.
