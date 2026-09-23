@@ -14,17 +14,28 @@
  * limitations under the License.
  */
 
-#pragma once
+#define DUCKDB_EXTENSION_MAIN
 
-#include "sirius_registration.hpp"
+#include "sirius/duckdb.hpp"
+#include "sirius_extension.hpp"
 
 namespace duckdb {
 
-class SiriusExtension : public Extension {
- public:
-  void Load(ExtensionLoader& loader) override;
-  std::string Name() override;
-  std::string Version() const override;
-};
+void SiriusExtension::Load(ExtensionLoader& loader) { sirius::register_duckdb_extension(loader); }
+
+std::string SiriusExtension::Name() { return "sirius"; }
+
+std::string SiriusExtension::Version() const
+{
+#ifdef EXT_VERSION_SIRIUS
+  return EXT_VERSION_SIRIUS;
+#else
+  return "";
+#endif
+}
 
 }  // namespace duckdb
+
+extern "C" {
+DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { sirius::register_duckdb_extension(loader); }
+}

@@ -14,13 +14,11 @@
  * limitations under the License.
  */
 
-#include "duckdb/main/database.hpp"
-#define DUCKDB_EXTENSION_MAIN
-
 #include "config.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
+#include "duckdb/main/database.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
 #include "telemetry/nvtx.hpp"
 
@@ -105,9 +103,10 @@ extern "C" int cudaProfilerStop();
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius/duckdb.hpp"
 #include "sirius_context.hpp"
-#include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
+#include "sirius_registration.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
@@ -186,7 +185,7 @@ namespace duckdb {
 
 const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
 #ifdef SIRIUS_ENABLE_LEGACY
-bool SiriusExtension::buffer_is_initialized = false;
+bool SiriusRegistration::buffer_is_initialized = false;
 #endif
 
 constexpr std::string QUERY_LABEL_PARAM_KEY = "query_label";
@@ -502,10 +501,10 @@ static unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(
 // The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
 // This result of this function is used as an argument to the GPUProcessingFunction function (data_p
 // argument), which is called to execute the table function.
-unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& context,
-                                                            TableFunctionBindInput& input,
-                                                            vector<LogicalType>& return_types,
-                                                            vector<string>& names)
+unique_ptr<FunctionData> SiriusRegistration::GPUProcessingBind(ClientContext& context,
+                                                               TableFunctionBindInput& input,
+                                                               vector<LogicalType>& return_types,
+                                                               vector<string>& names)
 {
   auto result              = make_uniq<GPUTableFunctionData>();
   result->conn             = make_uniq<Connection>(*context.db);
@@ -557,9 +556,9 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& conte
   return std::move(result);
 }
 
-void SiriusExtension::GPUProcessingFunction(ClientContext& context,
-                                            TableFunctionInput& data_p,
-                                            DataChunk& output)
+void SiriusRegistration::GPUProcessingFunction(ClientContext& context,
+                                               TableFunctionInput& data_p,
+                                               DataChunk& output)
 {
   auto& data = (GPUTableFunctionData&)*data_p.bind_data;
   if (data.finished) { return; }
@@ -607,8 +606,8 @@ static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog&
 {
   TableFunction gpu_processing("gpu_processing",
                                {LogicalType::VARCHAR},
-                               SiriusExtension::GPUProcessingFunction,
-                               SiriusExtension::GPUProcessingBind);
+                               SiriusRegistration::GPUProcessingFunction,
+                               SiriusRegistration::GPUProcessingBind);
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
   catalog.CreateTableFunction(transaction, gpu_processing_info);
@@ -627,10 +626,10 @@ static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPl
 // The result of the GPUExecutionBind function is a unique pointer to a FunctionData object.
 // This result of this function is used as an argument to the GPUExecutionFunction function (data_p
 // argument), which is called to execute the table function.
-unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& context,
-                                                           TableFunctionBindInput& input,
-                                                           vector<LogicalType>& return_types,
-                                                           vector<string>& names)
+unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& context,
+                                                              TableFunctionBindInput& input,
+                                                              vector<LogicalType>& return_types,
+                                                              vector<string>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
@@ -703,7 +702,7 @@ struct SiriusExecutionGlobalState : public GlobalTableFunctionState {
   idx_t MaxThreads() const override { return 1; }
 };
 
-unique_ptr<GlobalTableFunctionState> SiriusExtension::GPUExecutionInitGlobal(
+unique_ptr<GlobalTableFunctionState> SiriusRegistration::GPUExecutionInitGlobal(
   ClientContext& context, TableFunctionInitInput& input)
 {
   auto gstate  = make_uniq<SiriusExecutionGlobalState>();
@@ -711,9 +710,9 @@ unique_ptr<GlobalTableFunctionState> SiriusExtension::GPUExecutionInitGlobal(
   return std::move(gstate);
 }
 
-void SiriusExtension::GPUExecutionFunction(ClientContext& context,
-                                           TableFunctionInput& data_p,
-                                           DataChunk& output)
+void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
+                                              TableFunctionInput& data_p,
+                                              DataChunk& output)
 {
   auto& data   = (SiriusTableFunctionData&)*data_p.bind_data;
   auto& gstate = data_p.global_state->Cast<SiriusExecutionGlobalState>();
@@ -845,10 +844,10 @@ struct GPUBufferInitFunctionData : public TableFunctionData {
   size_t pinned_memory_size;
 };
 
-unique_ptr<FunctionData> SiriusExtension::GPUBufferInitBind(ClientContext& context,
-                                                            TableFunctionBindInput& input,
-                                                            vector<LogicalType>& return_types,
-                                                            vector<string>& names)
+unique_ptr<FunctionData> SiriusRegistration::GPUBufferInitBind(ClientContext& context,
+                                                               TableFunctionBindInput& input,
+                                                               vector<LogicalType>& return_types,
+                                                               vector<string>& names)
 {
   auto result = make_uniq<GPUBufferInitFunctionData>();
 
@@ -921,9 +920,9 @@ unique_ptr<FunctionData> SiriusExtension::GPUBufferInitBind(ClientContext& conte
   return std::move(result);
 }
 
-void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
-                                            TableFunctionInput& data_p,
-                                            DataChunk& output)
+void SiriusRegistration::GPUBufferInitFunction(ClientContext& context,
+                                               TableFunctionInput& data_p,
+                                               DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<GPUBufferInitFunctionData>();
   if (data.finished) { return; }
@@ -1169,10 +1168,10 @@ std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> build_duc
 
 }  // namespace
 
-unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
-                                                       TableFunctionBindInput& input,
-                                                       vector<LogicalType>& return_types,
-                                                       vector<string>& names)
+unique_ptr<FunctionData> SiriusRegistration::PinTableBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names)
 {
   auto result = make_uniq<PinTableFunctionData>();
 
@@ -1265,9 +1264,9 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
   return std::move(result);
 }
 
-void SiriusExtension::PinTableFunction(ClientContext& context,
-                                       TableFunctionInput& data_p,
-                                       DataChunk& output)
+void SiriusRegistration::PinTableFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<PinTableFunctionData>();
   if (data.finished) { return; }
@@ -1625,10 +1624,10 @@ struct UnpinTableFunctionData : public TableFunctionData {
   bool finished = false;
 };
 
-unique_ptr<FunctionData> SiriusExtension::UnpinTableBind(ClientContext& context,
-                                                         TableFunctionBindInput& input,
-                                                         vector<LogicalType>& return_types,
-                                                         vector<string>& names)
+unique_ptr<FunctionData> SiriusRegistration::UnpinTableBind(ClientContext& context,
+                                                            TableFunctionBindInput& input,
+                                                            vector<LogicalType>& return_types,
+                                                            vector<string>& names)
 {
   auto result = make_uniq<UnpinTableFunctionData>();
 
@@ -1642,9 +1641,9 @@ unique_ptr<FunctionData> SiriusExtension::UnpinTableBind(ClientContext& context,
   return std::move(result);
 }
 
-void SiriusExtension::UnpinTableFunction(ClientContext& context,
-                                         TableFunctionInput& data_p,
-                                         DataChunk& output)
+void SiriusRegistration::UnpinTableFunction(ClientContext& context,
+                                            TableFunctionInput& data_p,
+                                            DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<UnpinTableFunctionData>();
   if (data.finished) { return; }
@@ -2428,7 +2427,7 @@ static void SiriusSetSessionLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
-void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
+void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   // A fragment plan reads each of its input streams through sirius_stream_source(id). Register
   // it wherever Sirius is loaded, not just on the FFI's embedded DuckDB, so a fragment plan binds
@@ -2453,8 +2452,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   TableFunction gpu_execution("gpu_execution",
                               {LogicalType::VARCHAR},
                               GPUExecutionFunction,
-                              SiriusExtension::GPUExecutionBind,
-                              SiriusExtension::GPUExecutionInitGlobal);
+                              SiriusRegistration::GPUExecutionBind,
+                              SiriusRegistration::GPUExecutionInitGlobal);
   gpu_execution.named_parameters["enable_optimizer"]    = LogicalType::BOOLEAN;
   gpu_execution.named_parameters[QUERY_LABEL_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
@@ -3150,7 +3149,7 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
-void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
+void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
   auto const& operator_defaults    = defaults.get_operator_params();
   auto const& compression_defaults = defaults.get_compression_config();
@@ -3660,8 +3659,8 @@ static void LoadInternal(ExtensionLoader& loader)
 
   // The callback constructor above already read sirius.yaml, so its params are the defaults the
   // per-connection options register with.
-  SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
-  SiriusExtension::RegisterGPUFunctions(db);
+  SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
+  SiriusRegistration::RegisterGPUFunctions(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes
@@ -3696,26 +3695,10 @@ static void LoadInternal(ExtensionLoader& loader)
   if (!sirius_disabled) { publish_transparent_optimizer_mask(config); }
 }
 
-void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
-
-std::string SiriusExtension::Name() { return "Sirius	Extension"; }
-
-std::string SiriusExtension::Version() const
-{
-#ifdef EXT_VERSION_SIRIUS
-  return EXT_VERSION_SIRIUS;
-#else
-  return "";
-#endif
-}
-
 }  // namespace duckdb
 
-extern "C" {
+namespace sirius {
 
-DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { duckdb::LoadInternal(loader); }
-}
+void register_duckdb_extension(duckdb::ExtensionLoader& loader) { duckdb::LoadInternal(loader); }
 
-#ifndef DUCKDB_EXTENSION_MAIN
-#error DUCKDB_EXTENSION_MAIN not defined
-#endif
+}  // namespace sirius
