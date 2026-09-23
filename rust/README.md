@@ -35,6 +35,15 @@ LD_LIBRARY_PATH="$PWD/build/release/extension/sirius:$LD_LIBRARY_PATH" \
 
 ## Documentation
 
+Build with the isolated Pixi docs environment:
+
+```bash
+pixi run -e docs docs-rust
+```
+
+Open `build/docs/rust-target/doc/sirius/index.html`. This task installs the Rust
+and C++ toolchains and sets `DOCS_RS` for the documentation build.
+
 Generate the `sirius` API reference without building or linking `libsirius`:
 
 ```bash
