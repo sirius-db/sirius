@@ -205,7 +205,7 @@ class sirius_physical_plan_generator {
     duckdb::LogicalAggregate& op);
 
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
-  // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
+  // on them yet: WHERE / GROUP BY / DISTINCT / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.
   // @p operation names the context, e.g. "a filter predicate".
   static void reject_nested_column_operation(duckdb::Expression const& expr,
