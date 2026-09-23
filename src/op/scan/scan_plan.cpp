@@ -123,7 +123,7 @@ std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf
                                                             std::string const& file_path,
                                                             std::size_t file_index,
                                                             std::int64_t file_row_offset,
-                                                            rmm::cuda_stream_view stream,
+                                                            ::cuda::stream_ref stream,
                                                             rmm::device_async_resource_ref mr)
 {
   if (!table || plan.virtual_columns.empty()) { return table; }

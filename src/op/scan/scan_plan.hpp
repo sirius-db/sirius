@@ -35,6 +35,8 @@
 
 #include <rmm/resource_ref.hpp>
 
+#include <cuda/stream_ref>
+
 // standard library
 #include <cstddef>
 #include <cstdint>
@@ -219,7 +221,7 @@ struct bound_virtual_column {
   std::string const& file_path,
   std::size_t file_index,
   std::int64_t file_row_offset,
-  rmm::cuda_stream_view stream,
+  ::cuda::stream_ref stream,
   rmm::device_async_resource_ref mr);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
