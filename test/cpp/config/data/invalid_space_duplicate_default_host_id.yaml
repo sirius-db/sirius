@@ -1,0 +1,6 @@
+sirius:
+  space:
+    host:
+      - memory_capacity: 1Gi
+      - numa_id: -1
+        memory_capacity: 2Gi
