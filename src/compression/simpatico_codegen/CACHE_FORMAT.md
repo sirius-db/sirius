@@ -103,6 +103,44 @@ Physical paths are excluded. Include-root reordering matters only when selected
 contents change. Directory dependencies track unsuccessful searches too, so newly
 shadowing headers regenerate the table.
 
+## Storage and maintenance
+
+Each `.cubin` file is a checked record, not a raw ELF image: eight ASCII bytes
+`SIMPJIT3`, an unsigned 64-bit big-endian payload length, 16 canonical bytes of
+payload XXH3-128, then that many cubin bytes. A zero-length payload, length/file-size
+mismatch, checksum mismatch, non-regular file, or cubin over 256 MiB is a miss.
+The cap bounds allocation on corrupt input; larger kernels still compile and
+reuse memory normally. CUDA loading remains the final compatibility check.
+Raw legacy/intermediate records are never accepted by this reader.
+
+Writers use `mkostemp` in the destination directory, handle short writes and
+`EINTR`, check close, and atomically rename the complete record into place.
+Each writer owns only its unique temporary file. Failure removes that temporary,
+not the destination: another writer may already have repaired it. Redundant
+compilation is allowed. No `fsync` or power-failure durability is promised;
+damaged records are rebuilt. Checksums are not authentication: the configured
+cache directory must be trusted.
+
+There is no automatic eviction, startup cleanup, or retention bound. With all
+writers stopped, `clear_jit_disk_cache()` best-effort removes these regular files
+under the configured root:
+
+- Legacy `<16 lowercase hex>_a<digits>_c<digits>_d<digits>.cubin`, and their
+  `.tmp.<digits>` remnants.
+- `v2/<32 lowercase hex>/<32 lowercase hex>.cubin`, and their
+  `.tmp.<six alphanumeric characters>` remnants.
+
+It prunes empty recognized directories but never removes the configured root,
+follows symlinks, traverses arbitrary nested directories, or removes unknown
+versions/unrelated names. Explicit cleanup removes other environments' recognized
+entries too; ordinary cache use never does. Cleanup is not a concurrent maintenance
+or security boundary against a process actively replacing directories.
+
+The host storage suite links the same implementation as production. Linker-level
+syscall fault injection tests partial/zero/interrupted writes, close and rename
+failures without adding production test hooks. Threads and child processes stress
+same-key publication; cleanup tests operate only in owned temporary directories.
+
 ## Coverage
 
 Host tests need no CUDA driver and exercise the production embedders, relocation,
