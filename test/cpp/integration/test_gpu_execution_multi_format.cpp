@@ -2265,6 +2265,14 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
           "SELECT * FROM (VALUES ('physical-a', 7::UBIGINT, 9::BIGINT), "
           "('physical-b', 8::UBIGINT, 10::BIGINT)) "
           "t(filename, file_index, file_row_number)");
+    write(writer,
+          "physical_reserved_row_number.parquet",
+          "SELECT * FROM (VALUES (41::BIGINT), (99::BIGINT)) t(file_row_number)",
+          "FIELD_IDS {file_row_number: 2147483645}");
+    write(writer,
+          "schema_row_number.parquet",
+          "SELECT * FROM (VALUES (10::INTEGER, 'S0'), (20, 'S1')) t(x, sentinel)",
+          "FIELD_IDS {x: 10, sentinel: 11}");
     write(
       writer, "empty.parquet", "SELECT 1::INTEGER AS x, 'none'::VARCHAR AS sentinel WHERE false");
     write(writer,
@@ -2303,11 +2311,15 @@ class ParquetVirtualColumnFixture : public MultiFormatFixtureBase {
   sirius::test::scratch_dir scratch;
 
  private:
-  void write(duckdb::Connection& writer, std::string const& relative_path, std::string const& query)
+  void write(duckdb::Connection& writer,
+             std::string const& relative_path,
+             std::string const& query,
+             std::string const& options = {})
   {
     fs::create_directories((scratch.path() / relative_path).parent_path());
-    auto result = writer.Query("COPY (" + query + ") TO " + scratch.file_literal(relative_path) +
-                               " (FORMAT PARQUET)");
+    auto result =
+      writer.Query("COPY (" + query + ") TO " + scratch.file_literal(relative_path) +
+                   " (FORMAT PARQUET" + (options.empty() ? std::string{} : ", " + options) + ")");
     INFO(relative_path);
     REQUIRE(result);
     if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
@@ -2325,6 +2337,26 @@ TEST_CASE_METHOD(ParquetVirtualColumnFixture,
                      " ORDER BY file_index, file_row_number");
   compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + files() +
                      " WHERE x >= 30 ORDER BY file_index, file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet physical ordinal field id is not a legacy row-number option",
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  compare_gpu_vs_cpu("SELECT file_row_number FROM " + file("physical_reserved_row_number.parquet") +
+                     " ORDER BY file_row_number");
+}
+
+TEST_CASE_METHOD(ParquetVirtualColumnFixture,
+                 "parquet schema bind preserves the legacy row-number option",
+                 "[integration][gpu_execution][scan][virtual_columns][virtual_review]")
+{
+  auto const scan = "read_parquet(" + scratch.file_literal("schema_row_number.parquet") +
+                    ", schema=map {"
+                    "10: {name: 'x', type: 'INTEGER', default_value: NULL}, "
+                    "11: {name: 'sentinel', type: 'VARCHAR', default_value: NULL}}, "
+                    "file_row_number=true, hive_partitioning=false)";
+  compare_gpu_vs_cpu("SELECT x, file_row_number FROM " + scan + " ORDER BY file_row_number");
 }
 
 TEST_CASE_METHOD(ParquetVirtualColumnFixture,

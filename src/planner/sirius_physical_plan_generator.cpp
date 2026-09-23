@@ -206,18 +206,14 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
       add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
                          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
     }
-    // Identify the row-number option from the initial reader, not by name alone.
+    // Read the option from the bind callback. Inferring it from initial_reader is ambiguous with a
+    // physical column carrying Iceberg's ordinal field id, and initial_reader is absent for
+    // explicit schema= binds.
     bool legacy_file_row_number = false;
-    if (bind_data.initial_reader) {
-      legacy_file_row_number =
-        std::any_of(bind_data.initial_reader->GetColumns().begin(),
-                    bind_data.initial_reader->GetColumns().end(),
-                    [](auto const& column) {
-                      return column.name == "file_row_number" &&
-                             column.identifier.type().id() == duckdb::LogicalTypeId::INTEGER &&
-                             column.identifier.template GetValue<int32_t>() ==
-                               duckdb::MultiFileReader::ORDINAL_FIELD_ID;
-                    });
+    if (scan_op.function.get_bind_info) {
+      auto bind_info         = scan_op.function.get_bind_info(scan_op.bind_data.get());
+      auto const option      = bind_info.options.find("file_row_number");
+      legacy_file_row_number = option != bind_info.options.end() && option->second.GetValue<bool>();
     }
     if (legacy_file_row_number) {
       auto const output = std::find(scan_op.names.begin(), scan_op.names.end(), "file_row_number");

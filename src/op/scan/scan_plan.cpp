@@ -169,12 +169,11 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
   // 0-column table would erase the row count downstream aggregations consume.
   if (plan.output_layout.empty()) { return std::move(table); }
 
-  // No partition columns: the output is a pure projection / reordering of the
-  // reader's data columns. Express it as a non-owning view selection — no GPU
-  // copy. Every output_entry is DATA here (PARTITION entries only exist when the
-  // plan has partition columns), and entry.idx is the column's position in the
-  // current (D-order) view. Pure-filter data columns are dropped by the
-  // selection and freed when the view is later materialized.
+  // No partition columns: unique outputs use a non-owning view selection, while
+  // repeated outputs need copies. Every output_entry is DATA here (including
+  // synthesized virtual columns), and entry.idx addresses the materialized
+  // M-order view. Pure-filter columns are dropped from the output and freed
+  // when the owning table is released.
   if (!plan.has_partitions()) {
     std::vector<std::size_t> positions;
     positions.reserve(plan.output_layout.size());

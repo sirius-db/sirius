@@ -180,15 +180,14 @@ struct bound_virtual_column {
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
 
-/// Reshape the reader's D-order batch to the plan's output layout.
+/// Reshape the materialized M-order batch to the plan's output layout.
 ///
-/// When the plan has no partition columns the output is a pure projection /
-/// reordering of the reader's data columns: it is expressed as a non-owning
-/// @ref owning_table_view selection (@c select_columns), so no device buffers
-/// are copied — pure-filter data columns are dropped from the view and freed
-/// when the result is later materialized. When the plan has partition columns
-/// the reader batch is materialized and rebuilt, moving DATA columns out and
-/// synthesizing constant PARTITION columns from @p partition_values.
+/// Input DATA indexes are materialized M-space positions: reader columns followed by synthesized
+/// parquet virtual columns. With no partitions, a unique projection/reordering is expressed as a
+/// non-owning @ref owning_table_view selection; duplicate output entries allocate copies after the
+/// first occurrence. With partitions, the reader batch is materialized and rebuilt, moving unique
+/// DATA columns out, copying duplicate DATA outputs, and synthesizing constant PARTITION columns
+/// from @p partition_values.
 ///
 /// Returns @p table unchanged when @c output_layout is empty (SELECT count(*) —
 /// emitting a 0-column table would erase the row count downstream aggregations
@@ -207,7 +206,7 @@ struct bound_virtual_column {
   std::vector<std::string> const& partition_values,
   ::cuda::stream_ref stream);
 
-/// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
+/// Materialized-batch (M-space) positions of the output DATA columns, in @c output_layout order.
 /// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
 /// which case the caller gathers all columns instead.
 /// @param plan  The scan plan describing the layout.

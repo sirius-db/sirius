@@ -389,6 +389,76 @@ TEST_CASE("parquet batches are capped by decode working set", "[scan][parquet][s
         2 * 60 + rows + masked.mvcc_keep_mask.view().size_bytes());
 }
 
+TEST_CASE("parquet virtual multi-run batches reserve concatenation peak",
+          "[scan][parquet][sizing][virtual_columns]")
+{
+  auto make_reader = [](std::size_t cap) {
+    auto info            = std::make_unique<scan::parquet_ingestible_table_info>();
+    info->names          = {"x"};
+    info->returned_types = {sirius::logical_type::make(sirius::type_id::INTEGER)};
+    info->column_ids = {duckdb::ColumnIndex(duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME)};
+    info->scan_output_arity      = 1;
+    info->approximate_batch_size = cap;
+    info->virtual_columns        = {{duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME,
+                                     "filename",
+                                     sirius::logical_type::make(sirius::type_id::VARCHAR),
+                                     scan::scan_plan::parquet_virtual_column_kind::FILENAME}};
+    return scan::make_ingestible(std::move(info));
+  };
+  auto make_file = [] {
+    auto file = std::make_unique<scan::parquet_file_scan_info>();
+    file->row_groups.push_back({0, 20, 60, 10, 1});
+    file->row_groups.push_back({1, 20, 60, 10, 1});
+    return file;
+  };
+
+  SECTION("reservation includes inputs and concatenated result")
+  {
+    auto reader    = make_reader(std::numeric_limits<std::size_t>::max());
+    auto coalescer = reader->create_batch_coalescer();
+    CHECK(coalescer->push(make_file()).empty());
+    auto splits = coalescer->flush();
+    REQUIRE(splits.size() == 1);
+    CHECK(splits.front()->estimated_working_set_bytes() == 240);
+  }
+
+  SECTION("coalescer applies the concatenation peak to its byte cap")
+  {
+    auto reader    = make_reader(200);
+    auto coalescer = reader->create_batch_coalescer();
+    auto splits    = coalescer->push(make_file());
+    auto tail      = coalescer->flush();
+    for (auto& split : tail) {
+      splits.push_back(std::move(split));
+    }
+    REQUIRE(splits.size() == 2);
+    for (auto const& split : splits) {
+      CHECK(split->estimated_working_set_bytes() == 60);
+    }
+  }
+
+  SECTION("separate files share the peak budget and flush resets the run count")
+  {
+    auto reader    = make_reader(240);
+    auto coalescer = reader->create_batch_coalescer();
+    auto push_one  = [&] {
+      auto file = make_file();
+      file->row_groups.resize(1);
+      return coalescer->push(std::move(file));
+    };
+    CHECK(push_one().empty());
+    CHECK(push_one().empty());
+    auto full = push_one();
+    REQUIRE(full.size() == 1);
+    CHECK(full.front()->estimated_working_set_bytes() == 240);
+    CHECK(full.front()->estimated_bytes() == 40);
+    auto tail = coalescer->flush();
+    REQUIRE(tail.size() == 1);
+    CHECK(tail.front()->estimated_working_set_bytes() == 60);
+    CHECK(tail.front()->estimated_bytes() == 20);
+  }
+}
+
 TEST_CASE("parquet synthetic filter-only columns only increase the decode working set",
           "[scan][parquet][sizing]")
 {

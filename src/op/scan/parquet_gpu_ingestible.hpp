@@ -18,6 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
+#include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
@@ -166,10 +167,17 @@ class parquet_split_info : public scan_info {
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
     std::size_t total = 0;
+    std::size_t runs  = 0;
     for (auto const& s : rg_slices) {
-      total += s.estimated_decode_working_bytes;
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+      runs  = memory::saturating_add(runs, s.row_group_indices.size());
     }
-    return total;
+    // The provenance-preserving virtual path decodes one table per selected row group. When
+    // several pieces are present they all remain alive while concatenate allocates an equally
+    // sized result, so reserve both sides of that peak.
+    return plan && plan->has_user_virtual_columns() && runs > 1
+             ? memory::saturating_mul(total, std::size_t{2})
+             : total;
   }
 
   /// One fadvise_entry per row-group slice: the slice's datasource paired with
@@ -362,6 +370,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
     std::int64_t file_row_offset,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const;
+
+  [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 
