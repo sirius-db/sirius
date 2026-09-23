@@ -1260,6 +1260,9 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     } catch (NotImplementedException const& e) {
       REQUIRE_THAT(std::string(e.what()), Catch::Contains(message_fragment));
       return;
+    } catch (std::exception const& e) {
+      FAIL("expected a NotImplementedException containing: " << message_fragment
+                                                             << ", got: " << e.what());
     }
     FAIL("expected a NotImplementedException containing: " << message_fragment);
   };
@@ -1299,6 +1302,18 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 
     require_rejected("SELECT DISTINCT pname FROM parts",
                      "no distinct target is a plain reference to output column 0");
+  }
+
+  SECTION("the not-a-bare-reference message names the offending target")
+  {
+    // Target 0 reads child column 1 and target 1 is the collated call, so the uncovered output
+    // column 0 shares an index with a target that is a plain reference.
+    auto collate = con->Query("SET default_collation = 'nocase'");
+    REQUIRE(collate);
+    REQUIRE_FALSE(collate->HasError());
+
+    require_rejected("SELECT DISTINCT ON (pk, pname) 1 AS c, pk, pname FROM parts",
+                     "output column 0 (falling back to CPU); target 1 is");
   }
 
   SECTION("a nested distinct key is rejected before the child is planned")

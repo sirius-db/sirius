@@ -29,6 +29,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -118,15 +119,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
   // Child column index -> the group position that reads it, for bare BOUND_REF targets only.
   std::unordered_map<duckdb::idx_t, duckdb::idx_t> group_by_references;
 
-  auto const group_count          = op.distinct_targets.size();
-  bool all_targets_are_references = true;
+  auto const group_count = op.distinct_targets.size();
+  std::optional<duckdb::idx_t> first_non_reference_target;
   for (duckdb::idx_t i = 0; i < group_count; i++) {
     auto& target = op.distinct_targets[i];
     if (target->GetExpressionType() == duckdb::ExpressionType::BOUND_REF) {
       auto& bound_ref                      = target->Cast<duckdb::BoundReferenceExpression>();
       group_by_references[bound_ref.index] = i;
-    } else {
-      all_targets_are_references = false;
+    } else if (!first_non_reference_target) {
+      first_non_reference_target = i;
     }
     aggregate_types.push_back(target->return_type);
     groups.push_back(std::move(target));
@@ -149,13 +150,13 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 
     // Output column i has no bare-reference target, for one of two unrelated causes.
     //
-    // Cause 1: some target is not a bare reference, so it maps to no output column. `groups[i]` is
-    // in range because columns 0..i-1 were all found, and is context rather than the named cause.
-    if (!all_targets_are_references) {
+    // Cause 1: some target is not a bare reference, so it maps to no output column.
+    if (first_non_reference_target) {
+      auto const target = *first_non_reference_target;
       throw duckdb::NotImplementedException(
         "DISTINCT: no distinct target is a plain reference to output column " + std::to_string(i) +
-        " (falling back to CPU); target " + std::to_string(i) + " is '" + groups[i]->ToString() +
-        "'");
+        " (falling back to CPU); target " + std::to_string(target) + " is '" +
+        groups[target]->ToString() + "'");
     }
 
     // Cause 2: every target is a bare reference but none reads column i, so it has to be carried
