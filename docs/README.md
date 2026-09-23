@@ -67,24 +67,22 @@ SELECT l_returnflag, sum(l_quantity)
 FROM lineitem
 GROUP BY l_returnflag
 ORDER BY l_returnflag;
+
+-- TPC-H data is exported as Parquet for use in later examples
+COPY lineitem TO '/path/to/lineitem.parquet' (FORMAT PARQUET);
+
+-- Disable transparent GPU execution for this connection
+SET gpu_execution = false;
+-- ... or for every connection of this database instance without a session value
+SET GLOBAL gpu_execution = false;
 ```
 
 Execution is out-of-core with tiered memory management (GPU/host/disk), automatic data partitioning, and spilling, and works with both **Parquet** and **DuckDB-native** storage. See [`gpu_execution`](gpu_execution.md) for build, configuration, and testing details.
-
-To export TPC-H data as Parquet for use in later examples:
-```sql
-COPY lineitem TO '/path/to/lineitem.parquet' (FORMAT PARQUET);
-```
 
 ## Python API
 
 Use Sirius through DuckDB's Python API: load the extension, execute SQL, and fetch results.
 Supported queries run on the GPU automatically, just as they do in the DuckDB shell.
-
-The simplest way to get started is with the system Python, as long as duckdb==1.5.5 is installed:
-```bash
-pip install duckdb==1.5.5
-```
 
 After building Sirius above, run these commands from the repository root to build the Python
 package against the same DuckDB source as the extension:
@@ -122,7 +120,7 @@ con.close()
 Run it from the repository root:
 
 ```bash
-python example.py
+pixi run -e duckdb-python python example.py
 ```
 
 For an example using TPC-H data from Parquet files or a DuckDB database, see the
