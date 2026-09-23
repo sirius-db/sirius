@@ -23,6 +23,7 @@
 #include <io/uri_parser.hpp>
 #include <log/logging.hpp>
 #include <op/scan/iceberg_gpu_ingestible.hpp>
+#include <op/scan/parquet_batch_layout.hpp>
 
 #include <cstdint>
 #include <numeric>
@@ -78,43 +79,6 @@ class iceberg_batch_coalescer : public batch_coalescer {
 };
 
 }  // namespace
-
-std::vector<batch_row_run> build_batch_layout(parquet_split_info const& split)
-{
-  std::vector<batch_row_run> runs;
-  int64_t batch_row_offset = 0;
-
-  for (auto const& slice : split.rg_slices) {
-    if (slice.row_group_indices.empty()) { continue; }  // fully-pruned file: contributes no rows
-    if (!slice.file_metadata) {
-      throw sirius::internal_exception(
-        "[iceberg_gpu_ingestible] row-group slice for '" + slice.file_path +
-        "' has no footer metadata; row positions for iceberg deletes cannot be derived");
-    }
-
-    // File-level first row of each row group, as a prefix sum over the file's row groups —
-    // including the ones pruning removed, since delete positions are relative to the file.
-    auto const& row_groups = slice.file_metadata->row_groups;
-    std::vector<int64_t> first_row_of(row_groups.size() + 1, 0);
-    for (std::size_t i = 0; i < row_groups.size(); ++i) {
-      first_row_of[i + 1] = first_row_of[i] + row_groups[i].num_rows;
-    }
-
-    for (auto const rg_index : slice.row_group_indices) {
-      auto const idx = static_cast<std::size_t>(rg_index);
-      if (rg_index < 0 || idx >= row_groups.size()) {
-        throw sirius::internal_exception("[iceberg_gpu_ingestible] row group index " +
-                                         std::to_string(rg_index) + " for '" + slice.file_path +
-                                         "' is outside its footer's row-group list");
-      }
-      auto const num_rows = static_cast<int64_t>(row_groups[idx].num_rows);
-      runs.push_back(batch_row_run{slice.file_path, first_row_of[idx], batch_row_offset, num_rows});
-      batch_row_offset += num_rows;
-    }
-  }
-
-  return runs;
-}
 
 std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
   std::unique_ptr<iceberg_ingestible_table_info> info)

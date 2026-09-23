@@ -23,6 +23,7 @@
 
 // duckdb
 #include <duckdb/common/column_index.hpp>
+#include <duckdb/common/constants.hpp>
 #include <duckdb/common/multi_file/multi_file_data.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/common/vector.hpp>
@@ -31,6 +32,8 @@
 
 // cudf
 #include <cudf/types.hpp>
+
+#include <rmm/resource_ref.hpp>
 
 // standard library
 #include <cstddef>
@@ -55,6 +58,7 @@ namespace sirius::op::scan {
  *   P = primary index       (position in DuckDB's full schema @c names / @c returned_types)
  *   C = column_ids position (position in the operator's @c column_ids list)
  *   D = batch position      (position in the reader's output table, after hive removal)
+ *   M = materialized pos.   (D followed by synthesized parquet virtual columns)
  *
  * Hive-partition columns live in P-space but are not in the parquet file, so
  * they never appear in D-space. They are injected post-read into the final
@@ -62,6 +66,17 @@ namespace sirius::op::scan {
  * but are not in the final output layout, so they are dropped after filter evaluation.
  */
 struct scan_plan {
+  enum class parquet_virtual_column_kind : std::uint8_t { FILENAME, FILE_INDEX, FILE_ROW_NUMBER };
+
+  /// A user-visible column synthesized from per-row parquet provenance.
+  struct virtual_column {
+    duckdb::column_t column_id;
+    std::string name;
+    sirius::logical_type type;
+    parquet_virtual_column_kind kind;
+    std::size_t materialized_idx;  ///< M = D.size() + virtual ordinal
+  };
+
   /// A column produced by the parquet reader, in batch order.
   struct data_column {
     std::size_t primary_idx;  ///< P — index into the DuckDB schema
@@ -79,8 +94,7 @@ struct scan_plan {
   struct output_entry {
     enum source_t : std::uint8_t { DATA, PARTITION };
     source_t source;
-    std::size_t
-      idx;  ///< index into @c data_columns (if DATA) or @c partition_columns (if PARTITION)
+    std::size_t idx;  ///< M position (if DATA) or partition_columns index (if PARTITION)
   };
 
   /// Columns read from parquet, in D order.
@@ -89,11 +103,13 @@ struct scan_plan {
   /// Partition columns injected post-read.
   std::vector<partition_column> partition_columns;
 
+  /// User-visible parquet virtual columns, in synthesis/M-space order.
+  std::vector<virtual_column> virtual_columns;
+
   /// Final output layout. Length equals the scan operator's @c types.size().
   std::vector<output_entry> output_layout;
 
-  /// C → D map. @c nullopt when the column is not in the data batch
-  /// (either a hive partition, a virtual column, or not projected).
+  /// C → M map; partitions and unmaterialized columns have no entry.
   std::vector<std::optional<std::size_t>> batch_position_by_column_id;
 
   /// Primary indices of hive-partition columns. Supplied to
@@ -121,6 +137,7 @@ struct scan_plan {
   //===--------------------------------------------------------------------===//
 
   [[nodiscard]] bool has_partitions() const { return !partition_columns.empty(); }
+  [[nodiscard]] bool has_user_virtual_columns() const { return !virtual_columns.empty(); }
 
   /// True iff the scan is producing a strict subset / reordering of the file's
   /// columns — i.e. the reader must be told which columns to read.
@@ -139,6 +156,15 @@ struct scan_plan {
   [[nodiscard]] std::unordered_set<std::size_t> pure_filter_batch_positions() const;
 };
 
+/// Bound virtual-column metadata, kept separate from the physical schema.
+struct bound_virtual_column {
+  duckdb::column_t column_id;
+  std::string name;
+  sirius::logical_type type;
+  /// Present for legacy options, whose columns use ordinary schema positions.
+  std::optional<scan_plan::parquet_virtual_column_kind> kind;
+};
+
 //===--------------------------------------------------------------------===//
 // Output assembly — free functions
 //===--------------------------------------------------------------------===//
@@ -154,15 +180,14 @@ struct scan_plan {
 ///      covers @c data_columns 1:1 in order.
 [[nodiscard]] bool needs_output_assembly(scan_plan const& plan);
 
-/// Reshape the reader's D-order batch to the plan's output layout.
+/// Reshape the materialized M-order batch to the plan's output layout.
 ///
-/// When the plan has no partition columns the output is a pure projection /
-/// reordering of the reader's data columns: it is expressed as a non-owning
-/// @ref owning_table_view selection (@c select_columns), so no device buffers
-/// are copied — pure-filter data columns are dropped from the view and freed
-/// when the result is later materialized. When the plan has partition columns
-/// the reader batch is materialized and rebuilt, moving DATA columns out and
-/// synthesizing constant PARTITION columns from @p partition_values.
+/// Input DATA indexes are materialized M-space positions: reader columns followed by synthesized
+/// parquet virtual columns. With no partitions, a unique projection/reordering is expressed as a
+/// non-owning @ref owning_table_view selection; duplicate output entries allocate copies after the
+/// first occurrence. With partitions, the reader batch is materialized and rebuilt, moving unique
+/// DATA columns out, copying duplicate DATA outputs, and synthesizing constant PARTITION columns
+/// from @p partition_values.
 ///
 /// Returns @p table unchanged when @c output_layout is empty (SELECT count(*) —
 /// emitting a 0-column table would erase the row count downstream aggregations
@@ -181,11 +206,21 @@ struct scan_plan {
   std::vector<std::string> const& partition_values,
   ::cuda::stream_ref stream);
 
-/// Batch (D-space) positions of the output DATA columns, in @c output_layout order.
+/// Materialized-batch (M-space) positions of the output DATA columns, in @c output_layout order.
 /// Empty when @c output_layout has no DATA entries (SELECT count(*) or a partition-only output), in
 /// which case the caller gathers all columns instead.
 /// @param plan  The scan plan describing the layout.
 [[nodiscard]] std::vector<cudf::size_type> output_data_positions(scan_plan const& plan);
+
+/// Append non-null virtual columns to a decoded row group.
+[[nodiscard]] std::unique_ptr<cudf::table> append_parquet_virtual_columns(
+  std::unique_ptr<cudf::table> table,
+  scan_plan const& plan,
+  std::string const& file_path,
+  std::size_t file_index,
+  std::int64_t file_row_offset,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /// Build a scan_plan from DuckDB planner inputs. See @c scan_plan for semantics.
 ///
@@ -207,7 +242,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
-                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices);
+                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+                          std::vector<bound_virtual_column> const& virtual_columns = {});
 
 /// True when @p column_ids is a pruned or reordered subset of the full schema (of
 /// size @p full_schema_size) — a non-identity projection the cuDF reader must

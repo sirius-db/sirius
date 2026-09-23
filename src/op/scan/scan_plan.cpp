@@ -22,10 +22,13 @@
 
 // duckdb
 #include <duckdb/common/hive_partitioning.hpp>
+#include <duckdb/common/multi_file/multi_file_reader.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 // standard library
 #include <unordered_map>
@@ -115,6 +118,46 @@ std::vector<cudf::size_type> output_data_positions(scan_plan const& plan)
   return positions;
 }
 
+std::unique_ptr<cudf::table> append_parquet_virtual_columns(std::unique_ptr<cudf::table> table,
+                                                            scan_plan const& plan,
+                                                            std::string const& file_path,
+                                                            std::size_t file_index,
+                                                            std::int64_t file_row_offset,
+                                                            rmm::cuda_stream_view stream,
+                                                            rmm::device_async_resource_ref mr)
+{
+  if (!table || plan.virtual_columns.empty()) { return table; }
+  if (static_cast<std::size_t>(table->num_columns()) != plan.data_columns.size()) {
+    throw sirius::internal_exception(
+      "parquet virtual scan: decoded column count does not match planned layout");
+  }
+  auto const rows                                    = table->num_rows();
+  std::vector<std::unique_ptr<cudf::column>> columns = table->release();
+  columns.reserve(columns.size() + plan.virtual_columns.size());
+  for (auto const& virtual_column : plan.virtual_columns) {
+    switch (virtual_column.kind) {
+      case scan_plan::parquet_virtual_column_kind::FILENAME: {
+        cudf::string_scalar value(file_path, true, stream, mr);
+        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+        break;
+      }
+      case scan_plan::parquet_virtual_column_kind::FILE_INDEX: {
+        cudf::numeric_scalar<std::uint64_t> value(
+          static_cast<std::uint64_t>(file_index), true, stream, mr);
+        columns.push_back(cudf::make_column_from_scalar(value, rows, stream, mr));
+        break;
+      }
+      case scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER: {
+        cudf::numeric_scalar<std::int64_t> initial(file_row_offset, true, stream, mr);
+        cudf::numeric_scalar<std::int64_t> step(1, true, stream, mr);
+        columns.push_back(cudf::sequence(rows, initial, step, stream, mr));
+        break;
+      }
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
+}
+
 owning_table_view assemble_scan_output(scan_plan const& plan,
                                        owning_table_view&& table,
                                        std::vector<std::string> const& partition_values,
@@ -126,20 +169,39 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
   // 0-column table would erase the row count downstream aggregations consume.
   if (plan.output_layout.empty()) { return std::move(table); }
 
-  // No partition columns: the output is a pure projection / reordering of the
-  // reader's data columns. Express it as a non-owning view selection — no GPU
-  // copy. Every output_entry is DATA here (PARTITION entries only exist when the
-  // plan has partition columns), and entry.idx is the column's position in the
-  // current (D-order) view. Pure-filter data columns are dropped by the
-  // selection and freed when the view is later materialized.
+  // No partition columns: unique outputs use a non-owning view selection, while
+  // repeated outputs need copies. Every output_entry is DATA here (including
+  // synthesized virtual columns), and entry.idx addresses the materialized
+  // M-order view. Pure-filter columns are dropped from the output and freed
+  // when the owning table is released.
   if (!plan.has_partitions()) {
     std::vector<std::size_t> positions;
     positions.reserve(plan.output_layout.size());
+    std::unordered_set<std::size_t> seen;
+    bool has_duplicates = false;
     for (auto const& entry : plan.output_layout) {
       positions.push_back(entry.idx);
+      has_duplicates = !seen.insert(entry.idx).second || has_duplicates;
     }
-    table.select_columns(positions);
-    return std::move(table);
+    if (!has_duplicates) {
+      table.select_columns(positions);
+      return std::move(table);
+    }
+
+    auto materialized = table.release(stream);
+    auto source       = materialized->release();
+    std::vector<std::unique_ptr<cudf::column>> output;
+    output.reserve(positions.size());
+    std::unordered_map<std::size_t, std::size_t> first_output;
+    for (auto const position : positions) {
+      auto [it, inserted] = first_output.emplace(position, output.size());
+      if (inserted) {
+        output.push_back(std::move(source.at(position)));
+      } else {
+        output.push_back(std::make_unique<cudf::column>(output.at(it->second)->view(), stream));
+      }
+    }
+    return owning_table_view{std::make_unique<cudf::table>(std::move(output))};
   }
 
   // Partition columns present: materialize the reader batch and rebuild, moving
@@ -150,10 +212,16 @@ owning_table_view assemble_scan_output(scan_plan const& plan,
 
   std::vector<std::unique_ptr<cudf::column>> out_cols;
   out_cols.reserve(plan.output_layout.size());
+  std::unordered_map<std::size_t, std::size_t> first_data_output;
 
   for (auto const& entry : plan.output_layout) {
     if (entry.source == scan_plan::output_entry::DATA) {
-      out_cols.push_back(std::move(data_cols.at(entry.idx)));
+      auto [it, inserted] = first_data_output.emplace(entry.idx, out_cols.size());
+      if (inserted) {
+        out_cols.push_back(std::move(data_cols.at(entry.idx)));
+      } else {
+        out_cols.push_back(std::make_unique<cudf::column>(out_cols.at(it->second)->view(), stream));
+      }
     } else {
       auto const& pcol = plan.partition_columns.at(entry.idx);
       auto const& pval = partition_values.at(entry.idx);
@@ -193,18 +261,18 @@ bool column_ids_need_reader_projection(duckdb::vector<duckdb::ColumnIndex> const
   // Virtual columns (e.g. count(*)'s row-id marker) are not physical file columns
   // and must never drive a by-name reader projection. Mirror the IsVirtualColumn
   // guard handle_position uses below.
-  bool any_real = false;
+  std::size_t real_count = 0;
   for (std::size_t i = 0; i < column_ids.size(); ++i) {
     auto const primary_idx = column_ids[i].GetPrimaryIndex();
     if (duckdb::IsVirtualColumn(primary_idx)) { continue; }
-    any_real = true;
+    auto const physical_position = real_count++;
     // A real column read out of its identity position ⇒ pruned / reordered.
-    if (primary_idx != i) { return true; }
+    if (primary_idx != physical_position) { return true; }
   }
-  if (!any_real) { return false; }  // only virtual columns (count(*))
+  if (real_count == 0) { return false; }  // only virtual columns (count(*) / metadata)
   // All real columns sit at identity positions: a projection only if the read is a
   // proper prefix (fewer columns than the file's full schema).
-  return column_ids.size() != full_schema_size;
+  return real_count != full_schema_size;
 }
 
 scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
@@ -212,7 +280,8 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
                           duckdb::vector<std::string> const& names,
                           duckdb::vector<sirius::logical_type> const& returned_types,
                           std::size_t output_types_size,
-                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices)
+                          duckdb::vector<duckdb::HivePartitioningIndex> const& partition_indices,
+                          std::vector<bound_virtual_column> const& virtual_columns)
 {
   scan_plan plan;
 
@@ -231,22 +300,77 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     !projection_ids.empty() || !partition_indices.empty() ||
     (!names.empty() && column_ids_need_reader_projection(column_ids, names.size()));
 
+  std::unordered_map<duckdb::column_t, bound_virtual_column const*> virtual_by_id;
+  for (auto const& column : virtual_columns) {
+    virtual_by_id.emplace(column.column_id, &column);
+  }
+
   // Walk positions in output-first order. When projection_ids is non-empty the
   // first output_types_size entries are the output columns in output order;
   // the remaining entries are pure-filter columns that must be read but not
   // emitted. When projection_ids is empty, column_ids is both the read list
   // and the output (no pure-filter columns).
   //
-  // In both cases we translate each walked position into either a data_column
-  // (copy-from-batch), a partition_column (inject-from-path), or nothing
-  // (virtual / duplicate / filter-only partition).
-  std::unordered_set<std::size_t> seen_primary_indices;
+  // Read once; preserve duplicate outputs.
   std::unordered_map<std::size_t, std::size_t> primary_to_batch;  // P → D
+  std::unordered_map<std::size_t, std::size_t> primary_to_partition;
+  std::unordered_map<duckdb::column_t, std::size_t> virtual_to_ordinal;
+  struct output_request {
+    enum class kind : std::uint8_t { DATA, PARTITION, VIRTUAL } source;
+    std::size_t key;
+  };
+  std::vector<output_request> output_requests;
 
   auto handle_position = [&](std::size_t column_ids_pos, bool is_output) {
     auto const primary_idx = column_ids.at(column_ids_pos).GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) { return; }
-    if (!seen_primary_indices.insert(primary_idx).second) { return; }
+    auto const definition  = virtual_by_id.find(primary_idx);
+    if (duckdb::IsVirtualColumn(primary_idx) || definition != virtual_by_id.end()) {
+      // Count and empty markers are execution sentinels, not user columns.
+      if (primary_idx == duckdb::COLUMN_IDENTIFIER_ROW_ID ||
+          primary_idx == duckdb::COLUMN_IDENTIFIER_EMPTY) {
+        return;
+      }
+      if (definition == virtual_by_id.end()) {
+        throw duckdb::NotImplementedException("parquet scan: unsupported virtual column id %llu",
+                                              static_cast<unsigned long long>(primary_idx));
+      }
+
+      auto [it, inserted] = virtual_to_ordinal.emplace(primary_idx, plan.virtual_columns.size());
+      if (inserted) {
+        scan_plan::parquet_virtual_column_kind kind;
+        if (definition->second->kind) {
+          kind = *definition->second->kind;
+        } else if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+          kind = scan_plan::parquet_virtual_column_kind::FILENAME;
+        } else if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+          kind = scan_plan::parquet_virtual_column_kind::FILE_INDEX;
+        } else if (primary_idx == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+          kind = scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+        } else {
+          throw duckdb::NotImplementedException("parquet scan: unsupported virtual column id %llu",
+                                                static_cast<unsigned long long>(primary_idx));
+        }
+        auto const* column       = definition->second;
+        auto const expected_type = kind == scan_plan::parquet_virtual_column_kind::FILENAME
+                                     ? sirius::type_id::VARCHAR
+                                     : (kind == scan_plan::parquet_virtual_column_kind::FILE_INDEX
+                                          ? sirius::type_id::UBIGINT
+                                          : sirius::type_id::BIGINT);
+        if (column->type.id() != expected_type) {
+          throw duckdb::NotImplementedException(
+            "parquet scan: virtual column '%s' has unsupported type %s",
+            column->name,
+            column->type.to_string());
+        }
+        plan.virtual_columns.push_back(
+          scan_plan::virtual_column{primary_idx, column->name, column->type, kind, 0});
+      }
+      if (is_output) {
+        output_requests.push_back(
+          {output_request::kind::VIRTUAL, static_cast<std::size_t>(primary_idx)});
+      }
+      return;
+    }
 
     bool const is_partition = plan.partition_primary_indices.count(primary_idx) > 0;
 
@@ -255,25 +379,25 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
       // level and our filter builder will skip them. We only materialize
       // partition metadata for output columns.
       if (!is_output) { return; }
-      auto const partition_cols_idx = plan.partition_columns.size();
-      plan.partition_columns.push_back(scan_plan::partition_column{
-        primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
-      plan.output_layout.push_back(
-        scan_plan::output_entry{scan_plan::output_entry::PARTITION, partition_cols_idx});
+      auto [it, inserted] =
+        primary_to_partition.emplace(primary_idx, plan.partition_columns.size());
+      if (inserted) {
+        plan.partition_columns.push_back(scan_plan::partition_column{
+          primary_idx, names.at(primary_idx), returned_types.at(primary_idx)});
+      }
+      output_requests.push_back({output_request::kind::PARTITION, primary_idx});
     } else {
       // Data column — always added to the batch (even if filter-only, we need
       // it for filter evaluation). Store an empty name when @c names is empty:
       // the caller's guard only forces non-empty names for name-dependent paths
       // (projection, filter, partitions), and the plain-read case populates
       // data_columns without ever consuming the name downstream.
-      auto const batch_idx = plan.data_columns.size();
-      std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
-      plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
-      primary_to_batch[primary_idx] = batch_idx;
-      if (is_output) {
-        plan.output_layout.push_back(
-          scan_plan::output_entry{scan_plan::output_entry::DATA, batch_idx});
+      auto [it, inserted] = primary_to_batch.emplace(primary_idx, plan.data_columns.size());
+      if (inserted) {
+        std::string col_name = names.empty() ? std::string{} : names.at(primary_idx);
+        plan.data_columns.push_back(scan_plan::data_column{primary_idx, std::move(col_name)});
       }
+      if (is_output) { output_requests.push_back({output_request::kind::DATA, primary_idx}); }
     }
   };
 
@@ -288,38 +412,72 @@ scan_plan build_scan_plan(duckdb::vector<duckdb::ColumnIndex> const& column_ids,
     }
   }
 
-  // Build the C → D map. An entry is nullopt when the column is a hive
-  // partition, virtual, or simply not referenced by projection_ids.
-  plan.batch_position_by_column_id.assign(column_ids.size(), std::nullopt);
-  for (std::size_t c = 0; c < column_ids.size(); ++c) {
-    auto const primary_idx = column_ids[c].GetPrimaryIndex();
-    if (duckdb::IsVirtualColumn(primary_idx)) { continue; }
-    auto it = primary_to_batch.find(primary_idx);
-    if (it == primary_to_batch.end()) { continue; }
-    plan.batch_position_by_column_id[c] = it->second;
-  }
+  // Legacy virtual columns use ordinary primary indices and still need projection.
+  plan.needs_reader_projection = plan.needs_reader_projection || !plan.virtual_columns.empty();
 
-  // Keep one fixed-width column to carry the row count when no data columns are
-  // requested: a zero-column cudf table has none, and the natural batch decodes
-  // every column to get it.
+  // Virtual-only scans need one physical column to establish row count.
   if (plan.data_columns.empty() && !names.empty() && returned_types.size() == names.size()) {
     std::optional<std::size_t> carrier;
     std::size_t carrier_width = 0;
     for (std::size_t p = 0; p < returned_types.size(); ++p) {
-      if (plan.partition_primary_indices.count(p) > 0) { continue; }
+      if (plan.partition_primary_indices.count(p) > 0 || virtual_by_id.contains(p)) { continue; }
       if (!returned_types[p].is_fixed_width()) { continue; }
       auto const width = returned_types[p].fixed_width_byte_size();
-      if (width == 0) { continue; }
-      if (!carrier || width < carrier_width) {
+      if (width > 0 && (!carrier || width < carrier_width)) {
         carrier       = p;
         carrier_width = width;
       }
     }
+    if (!carrier && !plan.virtual_columns.empty()) {
+      for (std::size_t p = 0; p < returned_types.size(); ++p) {
+        if (plan.partition_primary_indices.count(p) == 0 && !virtual_by_id.contains(p) &&
+            returned_types[p].id() == sirius::type_id::VARCHAR) {
+          carrier = p;
+          break;
+        }
+      }
+    }
     if (carrier) {
-      plan.carrier_batch_index = plan.data_columns.size();
+      plan.carrier_batch_index   = plan.data_columns.size();
+      primary_to_batch[*carrier] = plan.data_columns.size();
       plan.data_columns.push_back(scan_plan::data_column{*carrier, names.at(*carrier)});
       plan.needs_reader_projection = true;
     }
+  }
+
+  if (plan.has_user_virtual_columns() && plan.data_columns.empty()) {
+    throw duckdb::NotImplementedException(
+      "parquet virtual scan: no supported physical row-count carrier");
+  }
+
+  for (std::size_t v = 0; v < plan.virtual_columns.size(); ++v) {
+    plan.virtual_columns[v].materialized_idx = plan.data_columns.size() + v;
+  }
+
+  for (auto const& request : output_requests) {
+    if (request.source == output_request::kind::PARTITION) {
+      plan.output_layout.push_back(
+        {scan_plan::output_entry::PARTITION, primary_to_partition.at(request.key)});
+    } else if (request.source == output_request::kind::DATA) {
+      plan.output_layout.push_back(
+        {scan_plan::output_entry::DATA, primary_to_batch.at(request.key)});
+    } else {
+      auto const ordinal = virtual_to_ordinal.at(static_cast<duckdb::column_t>(request.key));
+      plan.output_layout.push_back(
+        {scan_plan::output_entry::DATA, plan.virtual_columns.at(ordinal).materialized_idx});
+    }
+  }
+
+  plan.batch_position_by_column_id.assign(column_ids.size(), std::nullopt);
+  for (std::size_t c = 0; c < column_ids.size(); ++c) {
+    auto const primary_idx = column_ids[c].GetPrimaryIndex();
+    if (auto it = virtual_to_ordinal.find(primary_idx); it != virtual_to_ordinal.end()) {
+      plan.batch_position_by_column_id[c] = plan.virtual_columns.at(it->second).materialized_idx;
+      continue;
+    }
+    auto it = primary_to_batch.find(primary_idx);
+    if (it == primary_to_batch.end()) { continue; }
+    plan.batch_position_by_column_id[c] = it->second;
   }
 
   // The gate: a column-less scan with no usable carrier must keep the natural

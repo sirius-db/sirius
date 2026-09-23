@@ -18,6 +18,7 @@
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -33,6 +34,7 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "helper/type_conversions.hpp"
 #include "io/uri_parser.hpp"
 #include "log/logging.hpp"
 #include "op/dynamic_filter/sirius_dynamic_filter.hpp"
@@ -149,12 +151,25 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
                                  sirius::op::sirius_physical_table_scan& scan_op,
                                  const sirius::operator_params& op_params)
 {
-  auto* info               = &out;
-  info->returned_types     = scan_op.returned_types;
-  info->column_ids         = scan_op.column_ids;
-  info->projection_ids     = scan_op.projection_ids;
-  info->names              = scan_op.names;
-  info->table_filters      = std::move(scan_op.table_filters);
+  auto* info           = &out;
+  info->returned_types = scan_op.returned_types;
+  info->column_ids     = scan_op.column_ids;
+  info->projection_ids = scan_op.projection_ids;
+  info->names          = scan_op.names;
+  info->table_filters  = std::move(scan_op.table_filters);
+  info->virtual_columns.reserve(scan_op.virtual_columns.size());
+  for (auto const& [column_id, column] : scan_op.virtual_columns) {
+    std::optional<sirius::op::scan::scan_plan::parquet_virtual_column_kind> kind;
+    if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILENAME) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME;
+    } else if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_INDEX;
+    } else if (column_id == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+      kind = sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER;
+    }
+    info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
+      column_id, column.name, sirius::from_duckdb(column.type), kind});
+  }
   auto resolved_file_paths = resolve_parquet_scan_file_paths(
     scan_op.function.name, scan_op.bind_data.get(), scan_op.parameters);
   if (scan_op.function.name == "sirius_read_parquet") {
@@ -172,6 +187,42 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
     info->resolved_file_paths = std::move(resolved_file_paths);
     auto const& bind_data     = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     info->partition_indices   = bind_data.reader_bind.hive_partitioning_indexes;
+    // Legacy options use ordinary schema positions; normalize them here.
+    auto add_legacy_virtual = [&](duckdb::idx_t primary_idx,
+                                  sirius::op::scan::scan_plan::parquet_virtual_column_kind kind) {
+      if (primary_idx >= scan_op.names.size() || primary_idx >= scan_op.returned_types.size()) {
+        return;
+      }
+      auto const id     = static_cast<duckdb::column_t>(primary_idx);
+      auto const exists = std::any_of(info->virtual_columns.begin(),
+                                      info->virtual_columns.end(),
+                                      [id](auto const& column) { return column.column_id == id; });
+      if (!exists) {
+        info->virtual_columns.push_back(sirius::op::scan::bound_virtual_column{
+          id, scan_op.names[primary_idx], scan_op.returned_types[primary_idx], kind});
+      }
+    };
+    if (bind_data.reader_bind.filename_idx.IsValid()) {
+      add_legacy_virtual(bind_data.reader_bind.filename_idx.GetIndex(),
+                         sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILENAME);
+    }
+    // Read the option from the bind callback. Inferring it from initial_reader is ambiguous with a
+    // physical column carrying Iceberg's ordinal field id, and initial_reader is absent for
+    // explicit schema= binds.
+    bool legacy_file_row_number = false;
+    if (scan_op.function.get_bind_info) {
+      auto bind_info         = scan_op.function.get_bind_info(scan_op.bind_data.get());
+      auto const option      = bind_info.options.find("file_row_number");
+      legacy_file_row_number = option != bind_info.options.end() && option->second.GetValue<bool>();
+    }
+    if (legacy_file_row_number) {
+      auto const output = std::find(scan_op.names.begin(), scan_op.names.end(), "file_row_number");
+      if (output != scan_op.names.end()) {
+        add_legacy_virtual(
+          static_cast<duckdb::idx_t>(output - scan_op.names.begin()),
+          sirius::op::scan::scan_plan::parquet_virtual_column_kind::FILE_ROW_NUMBER);
+      }
+    }
   }
   // `scan_output_arity` drives the provider's expected column count — without it the runtime
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.

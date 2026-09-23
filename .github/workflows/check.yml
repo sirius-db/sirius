@@ -195,8 +195,18 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           pixi run -e duckdb-python build-duckdb-python
-          pixi run -e duckdb-python python -c \
-            "import duckdb; assert duckdb.sql('SELECT 42').fetchone() == (42,)"
+          pixi run -e duckdb-python python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import duckdb
+
+          presets = json.loads(Path("cmake/CMakePresets.json").read_text())
+          base = next(preset for preset in presets["configurePresets"] if preset["name"] == "base")
+          expected = base["cacheVariables"]["OVERRIDE_GIT_DESCRIBE"]
+          actual = duckdb.sql("SELECT version()").fetchone()[0]
+          assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
+          PY
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

@@ -112,7 +112,9 @@ std::vector<table_filter_conjunct> decompose_table_filters(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices = {});
+  const std::unordered_set<std::size_t>& skip_primary_indices                     = {},
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {},
+  bool include_is_not_null                                                        = false);
 
 /**
  * @brief Convert a DuckDB TableFilterSet into a single bound DuckDB expression (conjunction of
@@ -134,7 +136,9 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
   const duckdb::vector<sirius::logical_type>& returned_types,
   const std::vector<std::optional<std::size_t>>& batch_position_by_column_id,
-  const std::unordered_set<std::size_t>& skip_primary_indices = {});
+  const std::unordered_set<std::size_t>& skip_primary_indices                     = {},
+  const std::unordered_map<duckdb::column_t, sirius::logical_type>& virtual_types = {},
+  bool include_is_not_null                                                        = false);
 
 /**
  * @brief Bridge a DuckDB filter expression through sirius::ast::from_duckdb into the
