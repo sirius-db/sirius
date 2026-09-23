@@ -87,6 +87,9 @@ struct prefetch_request {
   /// Preferred NUMA node for the staging buffers, derived from the requesting
   /// GPU's topology.  -1 means "no preference" (allocate from any arena).
   int preferred_numa{-1};
+  /// Eviction started by a failed nonblocking prepare. A later blocking retry
+  /// waits for this pass rather than requesting the same shortfall twice.
+  std::shared_ptr<std::latch> pending_eviction;
 
   /// False for the empty request the queues use as a wakeup sentinel.
   [[nodiscard]] explicit operator bool() const noexcept { return producer != nullptr; }
@@ -152,8 +155,8 @@ enum class prepare_result : std::uint8_t {
 /// simply frees everything reclaimable.
 struct eviction_request {
   std::size_t bytes_to_free{0};
-  /// Present for a synchronous request. The evictor counts this down after the
-  /// request's eviction pass, even when nothing was reclaimable.
+  /// Present when a caller may wait for this pass (including after an async
+  /// prepare failure). Counted down even when nothing was reclaimable.
   std::shared_ptr<std::latch> processed;
 };
 
@@ -366,7 +369,8 @@ class prefetching_cache {
   /// fadvise-owned request lifecycle, not something an arbitrary caller starts.
   ///
   /// @return why the request was or was not prepared. Allocation failure leaves
-  ///         the request queued and retryable; falling behind abandons it.
+  ///         the request queued and retryable; a nonblocking failure also
+  ///         requests asynchronous eviction. Falling behind abandons it.
   prepare_result prepare(cache_handle& handle, bool wait_for_eviction);
 
   [[nodiscard]] prepare_result prepare_request(prefetch_request& req,

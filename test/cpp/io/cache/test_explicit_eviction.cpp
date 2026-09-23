@@ -113,8 +113,8 @@ scan_manager_config constrained_lru_config()
 {
   auto cfg = lru_config();
   // Keep automatic pressure eviction disabled while the fixture deliberately
-  // fills the small host tier. Only prepare(true)'s explicit request may free
-  // the disposable requests below.
+  // fills the small host tier. Only failed preparations' explicit requests may
+  // free the disposable requests below.
   cfg.cache.min_prefetching_budget_fraction = 0.25;
   cfg.cache.eviction_threshold_fraction     = 1.0;
   return cfg;
@@ -207,7 +207,7 @@ TEST_CASE("an explicit evict reclaims a disposed request the pressure rule would
   CHECK(claimed_drops_below(*cache, claimed, std::chrono::milliseconds(2000)));
 }
 
-TEST_CASE("synchronous eviction is processed before prepare retries allocation",
+TEST_CASE("blocking prepare waits for earlier asynchronous eviction before retrying",
           "[cache][eviction][explicit][prepare]")
 {
   constexpr std::size_t request_bytes = 32ull << 20;
@@ -223,7 +223,7 @@ TEST_CASE("synchronous eviction is processed before prepare retries allocation",
   // baseline allocations. Every successful request is immediately disposable,
   // but LRU retains its buffers because the automatic threshold is disabled.
   std::size_t offset = 0;
-  bool exhausted     = false;
+  std::shared_ptr<sirius::io::sirius_datasource> target;
   for (std::size_t attempt = 0; attempt < 32; ++attempt) {
     std::vector<cudf::io::text::byte_range_info> ranges;
     ranges.emplace_back(static_cast<std::int64_t>(offset),
@@ -232,25 +232,61 @@ TEST_CASE("synchronous eviction is processed before prepare retries allocation",
     REQUIRE(filler != nullptr);
     filler->fadvise(ranges, 0);
     if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
-      exhausted = true;
-      offset += request_bytes;
+      target = std::move(filler);
       break;
     }
     offset += request_bytes;
   }
-  REQUIRE(exhausted);
-
-  std::vector<cudf::io::text::byte_range_info> target_ranges;
-  target_ranges.emplace_back(static_cast<std::int64_t>(offset),
-                             static_cast<std::int64_t>(request_bytes));
-  auto target = manager.create_datasource(file.path.string());
   REQUIRE(target != nullptr);
-  target->fadvise(target_ranges, 0);
 
-  // Memory pressure is non-terminal: the request remains queued for the
-  // eviction-enabled retry below.
-  REQUIRE(target->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed);
+  // The first attempt queued eviction without waiting. The blocking retry
+  // waits for that pass rather than doubling the requested shortfall.
   REQUIRE(target->prepare_prefetch(true) == sirius::io::prepare_result::prepared);
+}
+
+TEST_CASE("failed nonblocking preparation starts eviction without waiting",
+          "[cache][eviction][explicit][prepare]")
+{
+  constexpr std::size_t mib = 1ull << 20;
+  temp_data_file file(1ull << 30);
+  auto memory   = constrained_memory_manager();
+  auto topology = single_gpu_index_for_evict();
+
+  sirius_scan_manager manager{constrained_lru_config(), *memory, topology};
+  auto* cache = manager.io_ctx()->cache();
+  REQUIRE(cache != nullptr);
+
+  // Provide an unsubscribed victim, then fill the remaining capacity with
+  // live requests that cannot be reclaimed by the evictor's first pass.
+  {
+    auto victim = manager.create_datasource(file.path.string());
+    REQUIRE(victim != nullptr);
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(0, static_cast<std::int64_t>(16 * mib));
+    victim->fadvise(ranges, 0);
+    REQUIRE(victim->prepare_prefetch(false) == sirius::io::prepare_result::prepared);
+  }
+
+  std::vector<std::shared_ptr<sirius::io::sirius_datasource>> fillers;
+  bool exhausted = false;
+  for (std::size_t i = 0; i < 32; ++i) {
+    auto filler = manager.create_datasource(file.path.string());
+    REQUIRE(filler != nullptr);
+    std::vector<cudf::io::text::byte_range_info> ranges;
+    ranges.emplace_back(static_cast<std::int64_t>((16 + 32 * i) * mib),
+                        static_cast<std::int64_t>(32 * mib));
+    filler->fadvise(ranges, 0);
+    auto const before = cache->claimed_bytes();
+    if (filler->prepare_prefetch(false) == sirius::io::prepare_result::allocation_failed) {
+      exhausted = true;
+      // No explicit evict() or blocking prepare(true): the failed attempt
+      // itself must have woken the evictor.
+      CHECK(claimed_drops_below(*cache, before, std::chrono::milliseconds(2000)));
+      break;
+    }
+    fillers.push_back(std::move(filler));
+  }
+  REQUIRE(exhausted);
 }
 
 TEST_CASE("prepare does not publish a request the retry's eviction left short of buffers",
