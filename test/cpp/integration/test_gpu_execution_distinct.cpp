@@ -457,26 +457,27 @@ class DistinctFloatFixture : public sirius::test::GpuExecutionFixture {
       "('NaN'::DOUBLE,       'NaN'::REAL),"     // duplicate NaN: must collapse
       "(-('NaN'::DOUBLE),    -('NaN'::REAL)),"  // sign bit set: same group as NaN
       "(0.0,                 0.0),"
-      "(-(0.0::DOUBLE),      -(0.0::REAL)),"  // same group as +0.0
       "('Infinity'::DOUBLE,  'Infinity'::REAL),"
+      "(-(0.0::DOUBLE),      -(0.0::REAL)),"  // same group as +0.0; not beside it, see below
       "('-Infinity'::DOUBLE, '-Infinity'::REAL),"
       "(1.5,                 1.5),"
       "(1.5,                 1.5),"
       "(NULL,                NULL);");
     run_ok("CHECKPOINT;");
 
-    // A `-0.0` literal parses as DECIMAL, whose zero has no sign, so prove the negative zero
-    // survived into storage. Read on the CPU so the check does not depend on the code under test.
+    // A `-0.0` literal parses as DECIMAL, and RLE at CHECKPOINT folds a -0.0 into an adjacent
+    // equal 0.0, so prove each column stored a negative zero. Read on the CPU so the check does not
+    // depend on the code under test, and restore GPU execution before asserting: the connection is
+    // shared, so a failed REQUIRE must not leave it off for every later case.
     run_ok("SET gpu_execution = false;");
-    for (std::string const column : {"d", "f"}) {
-      auto result = con->Query("SELECT count(*) FROM dist_fp WHERE " + column +
-                               " = 0 AND signbit(" + column + ")");
-      REQUIRE(result);
-      REQUIRE_FALSE(result->HasError());
-      INFO("negative zeros stored in dist_fp." << column);
-      REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 1);
-    }
+    auto const d_zeros = con->Query("SELECT count(*) FROM dist_fp WHERE d = 0 AND signbit(d)");
+    auto const f_zeros = con->Query("SELECT count(*) FROM dist_fp WHERE f = 0 AND signbit(f)");
     run_ok("SET gpu_execution = true;");
+    for (auto* zeros : {d_zeros.get(), f_zeros.get()}) {
+      REQUIRE(zeros);
+      REQUIRE_FALSE(zeros->HasError());
+      REQUIRE(zeros->GetValue(0, 0).GetValue<int64_t>() == 1);
+    }
   }
 };
 
