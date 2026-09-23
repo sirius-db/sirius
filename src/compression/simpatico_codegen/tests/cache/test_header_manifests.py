@@ -170,6 +170,34 @@ add_custom_target(embed ALL DEPENDS "{self.output}")
         (earlier / ROOTS[0]).unlink()
         self.assertEqual(changed, rebuild())
 
+    def test_static_compiler_artifacts(self):
+        libraries = {}
+        for role in ("NVRTC", "BUILTINS", "PTX"):
+            libraries[role] = self.root / f"{role}.a"
+            libraries[role].write_bytes(b"archive 1")
+
+        def generate():
+            run(
+                CMAKE,
+                *(f"-D{role}={path}" for role, path in libraries.items()),
+                f"-DOUT={self.output}",
+                "-P",
+                str(SOURCE / "cmake/compiler_identity.cmake"),
+            )
+            return self.output.read_text()
+
+        original = generate()
+        for path in libraries.values():
+            path.write_bytes(b"archive 2")
+            self.assertNotEqual(original, generate())
+            path.write_bytes(b"archive 1")
+        relocated = self.root / "different-library-prefix"
+        relocated.mkdir()
+        for role, path in list(libraries.items()):
+            shutil.copyfile(path, relocated / path.name)
+            libraries[role] = relocated / path.name
+        self.assertEqual(original, generate())
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

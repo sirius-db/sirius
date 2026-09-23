@@ -104,6 +104,11 @@ jobs:
           grep -E '(FAILED:|: error:|: fatal error:)' /tmp/build.log | head -60 >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build Simpatico cache GPU regression workers
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} cmake --build build/release \
+            --target simpatico_cache_gpu_tests
+
       - name: Package build artifacts
         run: tar -cf build.tar build/release/
 
@@ -175,6 +180,14 @@ jobs:
           done
           echo "::error::Could not install the avro and iceberg extensions after 3 attempts." >&2
           exit 1
+
+      - name: Test Simpatico cache across processes
+        run: |
+          pixi run -e ${{ matrix.cuda.pixi-environment }} python \
+            src/compression/simpatico_codegen/tests/cache/test_cache_process.py \
+            --worker build/release/simpatico_codegen/tests/cache/test_cache_worker \
+            --project-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_project \
+            --cccl-worker build/release/simpatico_codegen/tests/cache/test_cache_worker_cccl
 
       - name: Run C++ unit tests
         run: |
