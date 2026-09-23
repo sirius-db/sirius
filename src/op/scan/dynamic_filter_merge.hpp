@@ -36,7 +36,7 @@ namespace sirius::op::scan {
  * @brief Selects membership-only application after scan-time AST filtering, or AST plus membership
  *        otherwise.
  */
-enum class dynamic_filter_apply_mode { membership_masks_only, include_ast_row_masks };
+enum class dynamic_filter_apply_mode { MEMBERSHIP_MASKS_ONLY, INCLUDE_AST_ROW_MASKS };
 
 namespace detail {
 
@@ -45,12 +45,12 @@ namespace detail {
 *
 * @details The compaction strategy is used to determine how and when payload columns are compacted
 *          during dynamic filter application.
-* - cascade: Payload columns are compacted after each filter application.
-* - deferred_keys: Compact only the next filter's key column and row ids,
+* - CASCADE: Payload columns are compacted after each filter application.
+* - DEFERRED_KEYS: Compact only the next filter's key column and row ids,
                    deferring compaction of payload until all filters have been applied.
-* - gather_once: AND all masks in original row space, then compact all columns once.
+* - GATHER_ONCE: AND all masks in original row space, then compact all columns once.
 */
-enum class compaction_strategy { cascade, deferred_keys, gather_once };
+enum class compaction_strategy { CASCADE, DEFERRED_KEYS, GATHER_ONCE };
 
 /**
  * @brief Input parameters for compaction strategy selection.
@@ -78,7 +78,7 @@ struct compaction_policy_input {
   sirius::op::dynamic_filter_snapshot const& filters,
   ::cuda::stream_ref stream,
   compaction_strategy strategy,
-  dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::include_ast_row_masks,
+  dynamic_filter_apply_mode mode = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
   dynamic_filter_gate* gate      = nullptr,
   int device_id                  = -1);
 
@@ -110,7 +110,7 @@ struct compaction_policy_input {
   cudf::table_view const& input,
   sirius::op::dynamic_filter_snapshot const& filters,
   ::cuda::stream_ref stream,
-  dynamic_filter_apply_mode mode         = dynamic_filter_apply_mode::include_ast_row_masks,
+  dynamic_filter_apply_mode mode         = dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
   dynamic_filter_gate* gate              = nullptr,
   int device_id                          = -1,
   std::optional<std::size_t> input_bytes = std::nullopt);

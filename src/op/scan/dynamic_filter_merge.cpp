@@ -136,12 +136,12 @@ struct compaction_policy_decision {
 {
   using detail::compaction_strategy;
   if (input.candidate_step_count < 2) {
-    return {compaction_strategy::cascade, "fewer_than_two_candidates"};
+    return {compaction_strategy::CASCADE, "fewer_than_two_candidates"};
   }
   if (input.rows == 0 || !input.input_bytes || *input.input_bytes == 0 ||
       *input.input_bytes == std::numeric_limits<std::size_t>::max() ||
       *input.input_bytes < input.rows) {
-    return {compaction_strategy::cascade, "invalid_width"};
+    return {compaction_strategy::CASCADE, "invalid_width"};
   }
 
   auto const row_width = *input.input_bytes / input.rows;
@@ -149,18 +149,18 @@ struct compaction_policy_decision {
     input.membership, [](auto const& keep) { return is_known_keep_ratio(keep); });
   if (!all_known) {
     return row_width >= k_deferred_minimum_row_width
-             ? compaction_policy_decision{compaction_strategy::deferred_keys,
+             ? compaction_policy_decision{compaction_strategy::DEFERRED_KEYS,
                                           "unknown_membership_wide"}
-             : compaction_policy_decision{compaction_strategy::cascade,
+             : compaction_policy_decision{compaction_strategy::CASCADE,
                                           "unknown_membership_narrow"};
   }
 
   if (row_width >= k_deferred_minimum_row_width) {
     auto const has_selective = std::ranges::any_of(
       input.membership, [](auto const& keep) { return *keep <= k_deferred_selective_keep_ratio; });
-    return has_selective ? compaction_policy_decision{compaction_strategy::deferred_keys,
+    return has_selective ? compaction_policy_decision{compaction_strategy::DEFERRED_KEYS,
                                                       "selective_membership_wide"}
-                         : compaction_policy_decision{compaction_strategy::gather_once,
+                         : compaction_policy_decision{compaction_strategy::GATHER_ONCE,
                                                       "weak_memberships_wide"};
   }
 
@@ -168,8 +168,8 @@ struct compaction_policy_decision {
     return *keep >= k_gather_once_minimum_narrow_keep_ratio;
   });
   return all_weak
-           ? compaction_policy_decision{compaction_strategy::gather_once, "weak_memberships_narrow"}
-           : compaction_policy_decision{compaction_strategy::cascade,
+           ? compaction_policy_decision{compaction_strategy::GATHER_ONCE, "weak_memberships_narrow"}
+           : compaction_policy_decision{compaction_strategy::CASCADE,
                                         "selective_membership_narrow"};
 }
 
@@ -486,7 +486,7 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   auto const num_cols = static_cast<std::size_t>(input.num_columns());
   auto const mr       = cudf::get_current_device_resource_ref();
 
-  auto const include_ast_masks = mode == dynamic_filter_apply_mode::include_ast_row_masks;
+  auto const include_ast_masks = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS;
 
   std::unique_ptr<cudf::column> ast_mask;
   exceptional_stream_retirement retirement{stream};
@@ -543,11 +543,11 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
   auto const strategy = strategy_override.value_or(decision.strategy);
   filter_application_result result;
   switch (strategy) {
-    case detail::compaction_strategy::cascade:
+    case detail::compaction_strategy::CASCADE:
       result = apply_cascade(
         input, std::move(ast_mask), entries, stream, mr, gate, observed_filter_count, device_id);
       break;
-    case detail::compaction_strategy::deferred_keys:
+    case detail::compaction_strategy::DEFERRED_KEYS:
       result = apply_deferred_keys(input,
                                    std::move(ast_mask),
                                    entries,
@@ -558,17 +558,17 @@ std::unique_ptr<cudf::table> apply_dynamic_filters_to_view_impl(
                                    device_id,
                                    validate_indices);
       break;
-    case detail::compaction_strategy::gather_once:
+    case detail::compaction_strategy::GATHER_ONCE:
       result = apply_gather_once(input, std::move(ast_mask), entries, stream, mr, device_id);
       break;
   }
 
   if (!result.table) { return nullptr; }
-  auto const* strategy_name = strategy == detail::compaction_strategy::cascade ? "cascade"
-                              : strategy == detail::compaction_strategy::deferred_keys
+  auto const* strategy_name = strategy == detail::compaction_strategy::CASCADE ? "cascade"
+                              : strategy == detail::compaction_strategy::DEFERRED_KEYS
                                 ? "deferred_keys"
                                 : "gather_once";
-  auto const* mode_name     = mode == dynamic_filter_apply_mode::include_ast_row_masks
+  auto const* mode_name     = mode == dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS
                                 ? "include_ast_row_masks"
                                 : "membership_masks_only";
   auto const row_width      = policy_input.rows != 0 && policy_input.input_bytes

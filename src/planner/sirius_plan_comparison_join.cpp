@@ -609,7 +609,7 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
               site.estimated_cardinality,
               channel,
               op_params.dynamic_filter_keep_threshold,
-              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only);
+              sirius::op::scan::dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
             site_channels.push_back(std::move(channel));
             return endpoint;
           });

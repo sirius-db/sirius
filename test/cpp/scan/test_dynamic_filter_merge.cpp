@@ -1073,11 +1073,11 @@ bool forced_strategies_equal(cudf::table_view const& input,
   using sirius::op::scan::detail::apply_dynamic_filters_to_view_for_testing;
   using sirius::op::scan::detail::compaction_strategy;
   auto cascade = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::cascade, mode);
+    input, snapshot, stream, compaction_strategy::CASCADE, mode);
   auto deferred = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::deferred_keys, mode);
+    input, snapshot, stream, compaction_strategy::DEFERRED_KEYS, mode);
   auto gather_once = apply_dynamic_filters_to_view_for_testing(
-    input, snapshot, stream, compaction_strategy::gather_once, mode);
+    input, snapshot, stream, compaction_strategy::GATHER_ONCE, mode);
   stream.sync();
   if (static_cast<bool>(cascade) != static_cast<bool>(deferred) ||
       static_cast<bool>(cascade) != static_cast<bool>(gather_once)) {
@@ -1250,33 +1250,33 @@ TEST_CASE("dynamic filter compaction policy selects the exact production strateg
   };
 
   std::vector<std::optional<double>> const unknown{std::nullopt, std::nullopt};
-  CHECK(choose(100, 8000, 0, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, 8000, 1, unknown) == compaction_strategy::cascade);
-  CHECK(choose(0, 8000, 2, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, std::nullopt, 2, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, 0, 2, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, 99, 2, unknown) == compaction_strategy::cascade);
+  CHECK(choose(100, 8000, 0, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 8000, 1, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(0, 8000, 2, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, std::nullopt, 2, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 0, 2, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 99, 2, unknown) == compaction_strategy::CASCADE);
   CHECK(choose(100, std::numeric_limits<std::size_t>::max(), 2, unknown) ==
-        compaction_strategy::cascade);
+        compaction_strategy::CASCADE);
 
-  CHECK(choose(100, 6300, 2, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, 6399, 2, unknown) == compaction_strategy::cascade);
-  CHECK(choose(100, 6400, 2, unknown) == compaction_strategy::deferred_keys);
-  CHECK(choose(100, 6499, 2, unknown) == compaction_strategy::deferred_keys);
-  CHECK(choose(100, 8000, 2, unknown) == compaction_strategy::deferred_keys);
-  CHECK(choose(100, 14400, 2, unknown) == compaction_strategy::deferred_keys);
+  CHECK(choose(100, 6300, 2, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 6399, 2, unknown) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 6400, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 6499, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 8000, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 14400, 2, unknown) == compaction_strategy::DEFERRED_KEYS);
 
   auto const above_wide_boundary = std::nextafter(0.35, 1.0);
   std::vector<std::optional<double>> const wide_boundary{0.35, 0.8};
   std::vector<std::optional<double>> const wide_weak{above_wide_boundary, 0.8};
-  CHECK(choose(100, 6400, 2, wide_boundary) == compaction_strategy::deferred_keys);
-  CHECK(choose(100, 6400, 2, wide_weak) == compaction_strategy::gather_once);
-  CHECK(choose(100, 8000, 3, {{0.5}, {0.8}, {0.9}}) == compaction_strategy::gather_once);
+  CHECK(choose(100, 6400, 2, wide_boundary) == compaction_strategy::DEFERRED_KEYS);
+  CHECK(choose(100, 6400, 2, wide_weak) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 8000, 3, {{0.5}, {0.8}, {0.9}}) == compaction_strategy::GATHER_ONCE);
 
   auto const below_narrow_boundary = std::nextafter(0.40, 0.0);
-  CHECK(choose(100, 3200, 2, {{0.40}, {0.8}}) == compaction_strategy::gather_once);
-  CHECK(choose(100, 3200, 2, {{below_narrow_boundary}, {0.8}}) == compaction_strategy::cascade);
-  CHECK(choose(100, 3200, 3, {{0.5}, {0.8}, {0.39}}) == compaction_strategy::cascade);
+  CHECK(choose(100, 3200, 2, {{0.40}, {0.8}}) == compaction_strategy::GATHER_ONCE);
+  CHECK(choose(100, 3200, 2, {{below_narrow_boundary}, {0.8}}) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 3200, 3, {{0.5}, {0.8}, {0.39}}) == compaction_strategy::CASCADE);
 
   std::vector<std::optional<double>> const invalid_estimates{
     std::nullopt,
@@ -1286,13 +1286,13 @@ TEST_CASE("dynamic filter compaction policy selects the exact production strateg
     1.01};
   for (auto const invalid : invalid_estimates) {
     std::vector<std::optional<double>> const estimates{0.8, invalid};
-    CHECK(choose(100, 6400, 2, estimates) == compaction_strategy::deferred_keys);
-    CHECK(choose(100, 6300, 2, estimates) == compaction_strategy::cascade);
+    CHECK(choose(100, 6400, 2, estimates) == compaction_strategy::DEFERRED_KEYS);
+    CHECK(choose(100, 6300, 2, estimates) == compaction_strategy::CASCADE);
   }
 
   std::vector<std::optional<double>> const no_memberships;
-  CHECK(choose(100, 8000, 1, no_memberships) == compaction_strategy::cascade);
-  CHECK(choose(100, 8000, 2, {{0.5}}) == compaction_strategy::gather_once);
+  CHECK(choose(100, 8000, 1, no_memberships) == compaction_strategy::CASCADE);
+  CHECK(choose(100, 8000, 2, {{0.5}}) == compaction_strategy::GATHER_ONCE);
 }
 
 TEST_CASE("apply_dynamic_filters_to_view returns nullptr when no filter contributes",
@@ -1421,9 +1421,9 @@ TEST_CASE("decode probes retain exactly the captured snapshot after channel grow
 TEST_CASE("dynamic filter application retires submitted work before propagating an exception",
           "[dynamic_filter][scan_merge][snapshot][compaction_lifetime]")
 {
-  auto const strategy = GENERATE(sirius::op::scan::detail::compaction_strategy::cascade,
-                                 sirius::op::scan::detail::compaction_strategy::deferred_keys,
-                                 sirius::op::scan::detail::compaction_strategy::gather_once);
+  auto const strategy = GENERATE(sirius::op::scan::detail::compaction_strategy::CASCADE,
+                                 sirius::op::scan::detail::compaction_strategy::DEFERRED_KEYS,
+                                 sirius::op::scan::detail::compaction_strategy::GATHER_ONCE);
   rmm::cuda_stream stream;
   std::vector<std::unique_ptr<cudf::column>> columns;
   columns.push_back(cudf::sequence(10,
@@ -1460,7 +1460,7 @@ TEST_CASE("dynamic filter application retires submitted work before propagating 
         snapshot,
         stream.view(),
         strategy,
-        dynamic_filter_apply_mode::membership_masks_only);
+        dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY);
       returned.set_value();
     } catch (...) {
       returned.set_exception(std::current_exception());
@@ -1512,7 +1512,7 @@ TEST_CASE("dynamic_filter_gate disables after an unselective first split",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
 
   REQUIRE(out != nullptr);                             // a mask was computed (keeps everything)
@@ -1524,7 +1524,7 @@ TEST_CASE("dynamic_filter_gate disables after an unselective first split",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   REQUIRE(second == nullptr);  // gated out — no work
 }
 
@@ -1546,7 +1546,7 @@ TEST_CASE("dynamic_filter_gate ignores a device with no local replica",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks,
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS,
     /*device_id=*/12345);
   REQUIRE(unavailable == nullptr);
   REQUIRE(gate.applicable(filters.snapshot()));
@@ -1556,7 +1556,7 @@ TEST_CASE("dynamic_filter_gate ignores a device with no local replica",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(local != nullptr);
   REQUIRE(local->num_rows() == 2);
@@ -1579,7 +1579,7 @@ TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE_FALSE(gate.applicable(filters.snapshot()));
 
@@ -1593,7 +1593,7 @@ TEST_CASE("dynamic_filter_gate re-arms when a filter publishes after the disable
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);
@@ -1615,7 +1615,7 @@ TEST_CASE("dynamic_filter_gate stays active once a selective split proves the fi
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(gate.applicable(filters.snapshot()));
 
@@ -1626,7 +1626,7 @@ TEST_CASE("dynamic_filter_gate stays active once a selective split proves the fi
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);                 // cascade of both filters == their conjunction
@@ -1726,7 +1726,7 @@ TEST_CASE("deferred keys support arbitrary repeated membership filters",
     table->view(),
     filters.snapshot(),
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     nullptr,
     -1,
     /*input_bytes=*/800);
@@ -1755,7 +1755,7 @@ TEST_CASE("deferred keys equal cascade for AST and INT32 membership",
   REQUIRE(producer.push_filter(1, make_int32_in_list_prefix(5, stream)));
 
   REQUIRE(forced_strategies_equal(
-    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::include_ast_row_masks));
+    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS));
 }
 
 TEST_CASE("forced compaction strategies agree for an AST-only mask",
@@ -1768,7 +1768,7 @@ TEST_CASE("forced compaction strategies agree for an AST-only mask",
   REQUIRE(producer.push_filter(0, make_zone_map(3, 7)));
 
   REQUIRE(forced_strategies_equal(
-    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::include_ast_row_masks));
+    table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS));
 }
 
 TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
@@ -1794,7 +1794,7 @@ TEST_CASE("deferred keys equal cascade for sliced nested nullable payloads",
   REQUIRE(producer.push_filter(1, make_in_list_prefix(5, stream)));
 
   REQUIRE(forced_strategies_equal(
-    sliced_input, filters.snapshot(), stream, dynamic_filter_apply_mode::membership_masks_only));
+    sliced_input, filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
 }
 
 TEST_CASE("deferred keys equal cascade for all-true and empty results",
@@ -1817,7 +1817,7 @@ TEST_CASE("deferred keys equal cascade for all-true and empty results",
     REQUIRE(producer.push_filter(0, make_in_list_prefix(10, stream)));
     REQUIRE(producer.push_filter(1, make_in_list_prefix(10, stream)));
     REQUIRE(forced_strategies_equal(
-      table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::membership_masks_only));
+      table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
   }
 
   SECTION("contributing masks produce an empty table with the original schema")
@@ -1838,7 +1838,7 @@ TEST_CASE("deferred keys equal cascade for all-true and empty results",
     REQUIRE(producer.push_filter(0, make_in_list_prefix(3, stream)));
     REQUIRE(producer.push_filter(1, make_in_list_prefix(3, stream)));
     REQUIRE(forced_strategies_equal(
-      table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::membership_masks_only));
+      table->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
   }
 }
 
@@ -1867,7 +1867,7 @@ TEST_CASE("deferred keys equal cascade for Bloom membership filters",
   auto input = make_int64_sequence_table(20, stream);
 
   REQUIRE(forced_strategies_equal(
-    input->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::membership_masks_only));
+    input->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
 }
 
 TEST_CASE("deferred keys preserve null pass-through when every mask declines",
@@ -1881,7 +1881,7 @@ TEST_CASE("deferred keys preserve null pass-through when every mask declines",
   REQUIRE(producer.push_filter(0, std::make_shared<nullable_declining_filter>()));
 
   REQUIRE(forced_strategies_equal(
-    input->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::membership_masks_only));
+    input->view(), filters.snapshot(), stream, dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY));
 }
 
 TEST_CASE("gather once declines null masks without training their marginals",
@@ -1899,8 +1899,8 @@ TEST_CASE("gather once declines null masks without training their marginals",
     input->view(),
     filters.snapshot(),
     stream,
-    sirius::op::scan::detail::compaction_strategy::gather_once,
-    dynamic_filter_apply_mode::membership_masks_only,
+    sirius::op::scan::detail::compaction_strategy::GATHER_ONCE,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     &gate);
 
   REQUIRE(output == nullptr);
@@ -1942,7 +1942,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     -1,
     input_bytes);
   stream.sync();
@@ -1960,7 +1960,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     -1,
     input_bytes);
   stream.sync();
@@ -1988,7 +1988,7 @@ TEST_CASE("production policy uses gather once after weak marginals become curren
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     -1,
     input_bytes);
   stream.sync();
@@ -2032,7 +2032,7 @@ TEST_CASE("deferred keys preserve alignment across repeated and different column
     table->view(),
     filters.snapshot(),
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     nullptr,
     -1,
     /*input_bytes=*/800);
@@ -2081,7 +2081,7 @@ TEST_CASE("deferred keys realign after nullable mask decline without training it
     table->view(),
     filters.snapshot(),
     stream,
-    dynamic_filter_apply_mode::membership_masks_only,
+    dynamic_filter_apply_mode::MEMBERSHIP_MASKS_ONLY,
     &gate,
     -1,
     /*input_bytes=*/800);
@@ -2116,7 +2116,7 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);
@@ -2136,7 +2136,7 @@ TEST_CASE("per-filter gate measures marginal keep and skips a useless filter on 
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
@@ -2159,7 +2159,7 @@ TEST_CASE("per-filter gate keeps a dead verdict when the channel grows",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
 
@@ -2194,7 +2194,7 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 10);
@@ -2212,7 +2212,7 @@ TEST_CASE("per-filter gate excludes a dead filter from the re-armed apply withou
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
@@ -2244,7 +2244,7 @@ TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out != nullptr);
   REQUIRE(out->num_rows() == 2);
@@ -2263,7 +2263,7 @@ TEST_CASE("per-filter gate stales a selective verdict when the channel grows",
     filters.snapshot(),
     gate,
     stream,
-    dynamic_filter_apply_mode::include_ast_row_masks);
+    dynamic_filter_apply_mode::INCLUDE_AST_ROW_MASKS);
   stream.sync();
   REQUIRE(out2 != nullptr);
   REQUIRE(out2->num_rows() == 2);
