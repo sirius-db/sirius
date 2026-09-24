@@ -96,9 +96,7 @@ namespace {
 /// null_count answers it — and handing one to filter_row_groups_with_stats
 /// faults rather than merely mis-pruning.
 ///
-/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST, and
-/// convert_table_filters_to_expression only drops it when it is a column's
-/// top-level filter, so one nested in a conjunction still reaches here.
+/// IS NOT NULL counts: it lowers to IS_NULL + NOT in the cuDF AST.
 bool expression_has_null_predicate(duckdb::Expression const& expr)
 {
   auto const expr_type = expr.GetExpressionType();
@@ -167,11 +165,9 @@ duckdb::unique_ptr<duckdb::Expression> stats_safe_conjuncts(duckdb::Expression c
 
 /// Every `<col> IS [NOT] NULL` filter usable for null_count row-group pruning.
 ///
-/// Read from the TableFilterSet rather than from the converted expression,
-/// because convert_table_filters_to_expression DROPS a column's top-level
-/// IS_NOT_NULL before building the expression. Collecting downstream of that
-/// would leave the ordinary `WHERE v IS NOT NULL` with no pruning at all, which
-/// is the common form of the predicate.
+/// Read from the TableFilterSet independently of min/max pruning. Null-count
+/// pruning only eliminates whole row groups; mixed groups still require the
+/// row-level predicate after decoding.
 ///
 /// Both a top-level filter and one nested in a conjunction qualify. A
 /// conjunction is an AND of per-column filters, so each null test in it must
@@ -597,8 +593,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                                       bind.returned_types,
                                                       _plan->batch_position_by_column_id,
                                                       _plan->partition_primary_indices,
-                                                      _virtual_types,
-                                                      _plan->has_user_virtual_columns());
+                                                      _virtual_types);
     if (duckdb_expression) {
       // Validate before scan tasks retranslate and dereference the predicate.
       if (sirius::ast::from_duckdb(*duckdb_expression) == nullptr) {
@@ -681,8 +676,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
                                             bind.returned_types,
                                             _plan->batch_position_by_column_id,
                                             _plan->partition_primary_indices,
-                                            _virtual_types,
-                                            _plan->has_user_virtual_columns()),
+                                            _virtual_types),
         answerable_positions);
     }
   }
