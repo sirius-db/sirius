@@ -1048,6 +1048,30 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
       "In sirius_physical_hash_join:get_next_task_hint: missing expected ports in operator " +
       std::to_string(this->get_operator_id()));
   }
+  // An empty build produces no PARTITION task, so it cannot negotiate BUILD_PROBE mode. It also
+  // leaves no batch for a BUILD_PROBE hash table if the probe partition sized the join first.
+  // Only take this path before any build task has been claimed: a consumed nonempty build batch
+  // also leaves the repository empty while its hash table is being built.
+  if (join_type == duckdb::JoinType::MARK && !_mark_build_empty.load(std::memory_order_acquire) &&
+      build_port->src_pipeline && build_port->src_pipeline->is_pipeline_finished() &&
+      build_port->repo->total_size() == 0 &&
+      std::all_of(
+        _partition_build_states.begin(), _partition_build_states.end(), [](auto const& slot) {
+          return slot.build_state.load(std::memory_order_acquire) ==
+                 BUILD_HASH_TABLE_STATE::NOT_BUILT;
+        })) {
+    _mark_build_empty.store(true, std::memory_order_release);
+  }
+  if (_mark_build_empty.load(std::memory_order_acquire)) {
+    if (probe_port->repo->total_size() > 0) {
+      return task_creation_hint{TaskCreationHint::READY, this};
+    }
+    if (probe_port->src_pipeline && !probe_port->src_pipeline->is_pipeline_finished()) {
+      auto* producer = &probe_port->src_pipeline->get_operators()[0].get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
+    return std::nullopt;
+  }
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     // Each partition owns one hash table and runs its own build-then-probe sequence; those
     // sequences interleave (a built partition probes on its GPU while another still builds on a
@@ -1080,6 +1104,13 @@ std::optional<task_creation_hint> sirius_physical_hash_join::get_next_task_hint(
         return std::nullopt;
     }
   } else {
+    // The first PARTITION task selects BUILD_PROBE for MARK. Until then, a downstream join may
+    // poll this join in STANDARD mode. Run the build producer so it can size the join; an empty
+    // build is handled above.
+    if (join_type == duckdb::JoinType::MARK) {
+      auto* producer = &build_port->src_pipeline->get_operators()[0].get();
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
     // STANDARD / MIXED_JOIN partial barrier: schedule per-partition build x probe pairs as batches
     // arrive on either side, rather than waiting (via the base FULL-barrier hint) for both upstream
     // pipelines to finish. refresh_cross_schedule also frees fully-consumed batches, so completion
@@ -1269,6 +1300,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
   // Hold the mutex for the entire operation to prevent concurrent pop/get races. A pop on one
   // thread must not remove a batch that another thread's get expects to find.
   std::lock_guard<std::mutex> lg(op_state_mutex);
+
+  if (_mark_build_empty.load(std::memory_order_acquire)) {
+    auto* probe_port = get_port("default");
+    for (std::size_t p = 0; p < probe_port->repo->num_partitions(); ++p) {
+      if (auto batch = probe_port->repo->pop_next_data_batch(p)) {
+        std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+        input_batch.push_back(std::move(batch));
+        return std::make_unique<partitioned_operator_data>(std::move(input_batch), p);
+      }
+    }
+    return nullptr;
+  }
 
   if (_join_mode == HASH_JOIN_MODE::BUILD_PROBE) {
     return get_next_task_input_data_for_build_probe();
@@ -1627,9 +1670,9 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 /// when the build/right side contains a NULL join key.
 ///
 /// The scattered values are already correct (true at matched rows, false elsewhere), so only a null
-/// mask is added. When @p marks_are_definite (an all-null-safe MARK, matched under EQUAL) no mask
-/// is added at all: a null-safe comparison is never UNKNOWN, so an unmatched row is a definite
-/// FALSE. Otherwise this is the IN/EXISTS three-valued rule under UNEQUAL matching. Because a
+/// mask is added. When @p marks_are_definite (an all-null-safe MARK, or an empty build) no mask is
+/// added at all: an unmatched row is a definite FALSE. Otherwise this is the IN/EXISTS
+/// three-valued rule under UNEQUAL matching. Because a
 /// NULL key never matches under UNEQUAL, a matched row always has a valid probe key, so the
 /// desired validity reduces to two cases:
 ///   - build_has_null == true : every unmatched row is NULL, so valid == matched. The mask is the
@@ -1648,8 +1691,8 @@ static void set_build_has_null(std::atomic<int>& atomic_flag, bool has_null)
 ///                      NULL mark when the build side has no NULL key.
 /// @param build_has_null  Whether the build/right side contains a NULL in any join key column.
 ///                        Ignored when @p marks_are_definite.
-/// @param marks_are_definite  Every key is null-safe, so the output column gets no null mask
-///                            (sirius_physical_hash_join::mark_is_null_safe()).
+/// @param marks_are_definite  Every key is null-safe, or the build is empty; the output column
+///                            gets no null mask.
 /// @param left_batch    The original left-side data batch; used to propagate memory space metadata
 ///                      to the returned operator_data.
 /// @param stream        CUDA stream on which all device operations are launched.
@@ -1741,6 +1784,28 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     throw std::runtime_error(
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
       duckdb::JoinTypeToString(join_type));
+  }
+
+  if (_mark_build_empty.load(std::memory_order_acquire)) {
+    // No build row can make a comparison TRUE or UNKNOWN, even for a NULL probe key. Avoid
+    // preparing keys or applying the normal probe-key null mask: every mark is valid FALSE.
+    if (input_batches.size() != 1) {
+      throw std::runtime_error("MARK join with empty build expects one probe batch");
+    }
+    if (auto const* probe_data = input_batches[0].get_data(); probe_data != nullptr) {
+      note_probe_bytes_counted(input_batches[0].get_batch_id(),
+                               probe_data->get_uncompressed_data_size_in_bytes());
+    }
+    rmm::device_uvector<cudf::size_type> no_matches(0, stream);
+    return resolve_mark_join_result(no_matches,
+                                    get_cudf_table_view(input_batches[0]),
+                                    lhs_output_columns.col_idxs,
+                                    cudf::table_view{},
+                                    /*build_has_null=*/false,
+                                    /*marks_are_definite=*/true,
+                                    input_batches[0],
+                                    stream,
+                                    batch_telemetry());
   }
 
   cudf::table_view left_full, right_full;
