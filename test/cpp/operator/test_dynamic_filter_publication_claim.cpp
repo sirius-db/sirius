@@ -239,7 +239,7 @@ TEST_CASE("hash join claims a whole build for publication in any join mode",
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
-  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK_FALSE(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
 }
 
@@ -260,7 +260,7 @@ TEST_CASE("hash join in BUILD_PROBE mode still publishes from a whole build",
 
   CHECK(fixture.stats.publication_attempts.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK_FALSE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
@@ -277,7 +277,7 @@ TEST_CASE("a wired join whose build is not whole reports the skip exactly once",
   CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 1);
 
   CHECK(fixture.stats.publication_attempts.load() == 0);
-  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a sibling delivery",
@@ -296,7 +296,7 @@ TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a s
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
   CHECK(fixture.stats.publications_failed.load() == 0);
-  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK(fixture.channel->snapshot().empty());
 
   fixture.push_build_batch();
 
@@ -305,7 +305,7 @@ TEST_CASE("a claimed but not GPU-resident whole build reopens the window for a s
   CHECK(fixture.stats.publications_finished.load() == 1);
   CHECK(fixture.stats.publications_failed.load() == 0);
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
-  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK_FALSE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("a join whose replica restriction removed every GPU never claims",
@@ -324,7 +324,7 @@ TEST_CASE("a join whose replica restriction removed every GPU never claims",
 
   CHECK(fixture.stats.publication_attempts.load() == 0);
   CHECK(fixture.stats.publications_skipped_build_not_whole.load() == 0);
-  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("device memory exhaustion during a claimed publication fails open",
@@ -355,7 +355,7 @@ TEST_CASE("device memory exhaustion during a claimed publication fails open",
   CHECK(fixture.stats.publications_failed.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
   CHECK(fixture.stats.membership_filters_built.load() == 0);
-  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK(fixture.channel->snapshot().empty());
   CHECK(fixture.channel->snapshot().terminal());
 
   // FAILED is terminal: with the ballast freed, a second whole-build delivery must not reattempt.
@@ -390,13 +390,13 @@ TEST_CASE("a whole build resident on a non-plan GPU reopens the window for a sib
   CHECK(fixture.stats.publications_skipped_source_not_resident.load() == 1);
   CHECK(fixture.stats.publications_finished.load() == 0);
   CHECK(fixture.stats.publications_failed.load() == 0);
-  CHECK(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK(fixture.channel->snapshot().empty());
 
   fixture.push_build_batch();
 
   CHECK(fixture.stats.publication_attempts.load() == 2);
   CHECK(fixture.stats.publications_finished.load() == 1);
-  CHECK_FALSE(fixture.channel->filters_for_column(kProbeColumnIndex).empty());
+  CHECK_FALSE(fixture.channel->snapshot().empty());
 }
 
 TEST_CASE("closing during an unusable whole delivery cannot reopen the producer",
