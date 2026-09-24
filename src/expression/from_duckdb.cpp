@@ -176,6 +176,18 @@ std::unique_ptr<node> translate_cast(duckdb::BoundCastExpression const& expr)
     return nullptr;
   }
 
+  // DuckDB widens mixed signed/UBIGINT operands to HUGEINT. Its full value domain
+  // does not fit the INT64 carrier currently used for HUGEINT on the GPU: casting
+  // UINT64_MAX would turn it into -1 and can create false join matches. Reject at
+  // translation, before join-key preparation or expression evaluation can narrow it.
+  // This is a type-domain check, not a sample/range assumption. Narrow unsigned
+  // integers fit INT64, and direct UBIGINT operations keep their UINT64 carrier.
+  if (target_type.id() == duckdb::LogicalTypeId::HUGEINT &&
+      (source_type.id() == duckdb::LogicalTypeId::UBIGINT ||
+       source_type.id() == duckdb::LogicalTypeId::UHUGEINT)) {
+    return nullptr;
+  }
+
   auto child = from_duckdb(*expr.child);
   if (!child) { return nullptr; }
   return std::make_unique<node>(cast{

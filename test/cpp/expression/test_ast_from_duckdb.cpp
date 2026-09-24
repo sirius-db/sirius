@@ -469,6 +469,48 @@ TEST_CASE("ast_from_duckdb - BOUND_CAST between temporal and numeric returns nul
   }
 }
 
+TEST_CASE("ast_from_duckdb - unsigned widening cannot use the signed HUGEINT carrier",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  for (auto source : {LogicalTypeId::UBIGINT, LogicalTypeId::UHUGEINT}) {
+    for (bool try_cast : {false, true}) {
+      auto expr = BoundCastExpression::AddDefaultCastToType(
+        make_bound_ref(0, source), LogicalType::HUGEINT, try_cast);
+      REQUIRE(sirius::ast::from_duckdb(*expr) == nullptr);
+    }
+  }
+
+  // The nested cast must reject its parent comparison too, including a join predicate.
+  auto left  = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UBIGINT),
+                                                        LogicalType::HUGEINT);
+  auto right = BoundCastExpression::AddDefaultCastToType(make_bound_ref(1, LogicalTypeId::BIGINT),
+                                                         LogicalType::HUGEINT);
+  BoundComparisonExpression predicate(
+    ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
+  REQUIRE(sirius::ast::from_duckdb(predicate) == nullptr);
+}
+
+TEST_CASE("ast_from_duckdb - exact unsigned carriers and safe widenings remain supported",
+          "[ast_from_duckdb][unsigned_narrowing]")
+{
+  auto direct = make_bound_ref(0, LogicalTypeId::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*direct) != nullptr);
+  for (auto source : {LogicalTypeId::TINYINT,
+                      LogicalTypeId::SMALLINT,
+                      LogicalTypeId::INTEGER,
+                      LogicalTypeId::BIGINT,
+                      LogicalTypeId::UTINYINT,
+                      LogicalTypeId::USMALLINT,
+                      LogicalTypeId::UINTEGER}) {
+    auto expr =
+      BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, source), LogicalType::HUGEINT);
+    REQUIRE(sirius::ast::from_duckdb(*expr) != nullptr);
+  }
+  auto widen = BoundCastExpression::AddDefaultCastToType(make_bound_ref(0, LogicalTypeId::UINTEGER),
+                                                         LogicalType::UBIGINT);
+  REQUIRE(sirius::ast::from_duckdb(*widen) != nullptr);
+}
+
 // ============================================================================
 // BOUND_FUNCTION
 // ============================================================================
