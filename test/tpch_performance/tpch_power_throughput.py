@@ -83,7 +83,7 @@ from performance_test import (
     get_git_info,
     log,
 )
-from queries import QUERIES
+from queries import queries_for_scale_factor
 from tpch_pin_columns import QUERY_COLUMNS, union_columns_by_table
 from tpch_query_streams import load_stream
 from tpch_stream_permutations import default_streams, stream_order
@@ -429,7 +429,7 @@ def stream_queries(stream, args):
     """
     if args.vary_predicates:
         return load_stream(args.query_dir, stream, args.sf)
-    return [(q, [QUERIES[f"q{q}"]]) for q in stream_order(stream)]
+    return [(q, [args.query_texts[f"q{q}"]]) for q in stream_order(stream)]
 
 
 # Ordered record of nsys capture ranges opened by this run (--nsys-per-query).
@@ -1604,6 +1604,10 @@ def main():
         return
 
     sf_label = f"{args.sf:g}"
+    try:
+        args.query_texts = queries_for_scale_factor(args.sf)
+    except ValueError as exc:
+        raise SystemExit(f"--sf: {exc}") from exc
 
     if args.input is None:
         args.input = os.path.join(REPO_ROOT, f"test_datasets/tpch_sf{sf_label}.duckdb")

@@ -120,7 +120,7 @@ All commands run from the **project root** directory.
 
 ### TPC-H benchmark with performance_test.py (primary runner)
 
-`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. With `--data-source parquet` (default) it registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine; with `--data-source duckdb` it opens a `.duckdb` file directly (read-only) and queries its native tables (GPU-native `seq_scan`). Either way it runs each query for N iterations and produces a structured per-query benchmark directory, and pinning works for both sources.
+`performance_test.py` is the canonical TPC-H runner shared by the `benchmark` and `profile-analyzer` skills. Pass `--scale-factor` explicitly so Q11's `FRACTION` parameter is rendered as `0.0001 / SF`; omitting it temporarily defaults to SF1 with a warning for compatibility. With `--data-source parquet` (default) it registers TPC-H tables as parquet views over a single in-memory DuckDB connection per engine; with `--data-source duckdb` it opens a `.duckdb` file directly (read-only) and queries its native tables (GPU-native `seq_scan`). Either way it runs each query for N iterations and produces a structured per-query benchmark directory, and pinning works for both sources.
 
 ```bash
 export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
@@ -128,40 +128,48 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 # Both engines, 2 iterations, hot-cache (grouped) mode
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
+    --scale-factor 100 \
     --engine both --iterations 2
 
 # Sirius vs DuckDB result validation, queries 1/3/6 only
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # Per-query GPU-tier pinning
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf100 \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # DuckDB native source from disk (both engines, validate). --input is a .duckdb FILE.
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf1.duckdb --data-source duckdb \
+    --scale-factor 1 \
     --engine both --iterations 1 --validation --queries 1,3,6
 
 # DuckDB native source, pinned into the GPU cache
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_sf100.duckdb --data-source duckdb \
+    --scale-factor 100 \
     --engine gpu --iterations 3 --pin gpu
 
 # Cold-start measurement (drops OS cache between runs; requires passwordless sudo)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf10 \
+    --scale-factor 10 \
     --engine gpu --iterations 2 --mode isolated
 
 # nsys-profile mode (one .nsys-rep + .sqlite per query under <bench>/sirius/q<N>/)
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
 ```
 
 Key flags:
+- `--scale-factor SF` — dataset scale used to render Q11's `0.0001 / SF` threshold. Pass it explicitly; omission defaults to SF1 with a warning only for rollout compatibility.
 - `--data-source parquet|duckdb` — input source/format (default `parquet`). `parquet`: `--input` is a directory of TPC-H parquet files (scanned via `read_parquet` → `GPU_PARQUET_SCAN`). `duckdb`: `--input` is a single `.duckdb` file whose native tables are scanned via the GPU-native `seq_scan` → `GPU_DUCKDB_NATIVE_SCAN`. Works in all modes (incl. `nsys-profile`), and `--pin` works for both. (This is the harness's own 2-value flag — see the disambiguation note below, distinct from the legacy shell `--data-source`.)
 - `--engine gpu|cpu|both` — which engine to benchmark.
 - `--iterations N` — per-query iteration count.
@@ -256,7 +264,8 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 ./test/tpch_performance/run_tpch_parquet.sh --parquet-dir /data/tpch sirius 100 1 3 6
 ```
 <bench>/                              # tpch_<ts>_<mode>_<engine>_iter<N>[_nsys] or --name override
-  metadata.json                       # commit, branch, date, mode, iterations, engine, data_source, queries, pin, nsys_profile
+  metadata.json                       # commit, branch, scale_factor, mode, engine, query list, pin/profile settings
+  queries/q<N>.sql                    # effective SQL after scale-aware rendering
   csv/runtimes.csv                    # engine,query,iteration,runtime_s
   log_dir/sirius_<YYYY-MM-DD>.log     # combined Sirius spdlog (non-profile mode)
   <engine>/q<N>/result.txt            # fetched rows, one repr(row) per line (last iter wins)
@@ -549,6 +558,7 @@ export SIRIUS_CONFIG_FILE=$(pwd)/test/cpp/integration/integration.yaml
 
 pixi run python test/tpch_performance/performance_test.py \
     --input ~/sirius/test_datasets/tpch_parquet_sf1 \
+    --scale-factor 1 \
     --engine gpu --iterations 2 --mode nsys-profile --queries 1,3,6
 ```
 

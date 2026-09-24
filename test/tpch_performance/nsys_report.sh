@@ -195,6 +195,7 @@ else
         pixi run python "$PROJECT_DIR/test/tpch_performance/performance_test.py"
         --mode nsys-profile
         --input "$INPUT"
+        --scale-factor "$SF"
         --data-source "$DATA_SOURCE"
         --engine gpu
         --iterations "$ITERATIONS"

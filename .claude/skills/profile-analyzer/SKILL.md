@@ -44,11 +44,11 @@ export SIRIUS_CONFIG_FILE=<path_to_config>
 
 # Sirius-only timing
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine gpu --iterations <N> [--queries 1,3,6-10]
+    --input <parquet_dir> --scale-factor <SF> --engine gpu --iterations <N> [--queries 1,3,6-10]
 
 # DuckDB vs Sirius timing + result validation in one shot
 pixi run python test/tpch_performance/performance_test.py \
-    --input <parquet_dir> --engine both --iterations <N> --validation
+    --input <parquet_dir> --scale-factor <SF> --engine both --iterations <N> --validation
 ```
 
 The non-profiled run produces a long-format `<bench>/csv/runtimes.csv` (`engine,query,iteration,runtime_s`) and per-query `result.txt`. `--validation` additionally byte-compares the saved Sirius vs DuckDB results (with a small `abs_tol` on floats).
@@ -91,7 +91,7 @@ reports/<label>_<YYYYMMDD_HHMMSS>/
     sirius/q<N>/{nsys.nsys-rep, nsys.sqlite, nsys.sql, timings.csv, log_dir/}
 ```
 
-**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
+**Output from non-profiled run** (`performance_test.py` benchmark layout): a timestamped `<benchmark_dir>/` with `metadata.json` (including `scale_factor`), effective `queries/q<N>.sql`, `csv/runtimes.csv` (`engine,query,iteration,runtime_s`), per-query `<engine>/q<N>/result.txt`, and per-query `sirius/q<N>/sirius.log`. See `test/tpch_performance/CLAUDE.md` for the full layout.
 
 ### Workflow B: Generate Report from Existing Profiles
 

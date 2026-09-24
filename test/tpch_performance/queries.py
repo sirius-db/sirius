@@ -14,6 +14,8 @@
 
 """TPC-H query definitions (base SQL without gpu_processing wrapper)."""
 
+from decimal import Decimal, InvalidOperation
+
 QUERIES = {
     "q1": """select
     l_returnflag,
@@ -649,3 +651,50 @@ group by
 order by
   cntrycode""",
 }
+
+
+_Q11_BASE_FRACTION = Decimal("0.0001")
+_Q11_SF1_LITERAL = "0.0001000000"
+
+
+def normalize_scale_factor(scale_factor):
+    """Return a validated Decimal scale factor.
+
+    Sirius also benchmarks non-standard factors such as 50 and 500, so the
+    renderer accepts any finite positive value rather than restricting callers
+    to the fixed scale factors used for official TPC-H results.
+    """
+    try:
+        sf = Decimal(str(scale_factor))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(
+            f"scale factor must be a finite positive number: {scale_factor!r}"
+        ) from exc
+    if not sf.is_finite() or sf <= 0:
+        raise ValueError(
+            f"scale factor must be a finite positive number: {scale_factor!r}"
+        )
+    return sf
+
+
+def scale_factor_metadata_value(scale_factor):
+    """Return a JSON-number representation without turning integral SFs into floats."""
+    sf = normalize_scale_factor(scale_factor)
+    return int(sf) if sf == sf.to_integral_value() else float(sf)
+
+
+def q11_fraction(scale_factor):
+    """Render Q11's TPC-H FRACTION parameter using qgen's ten-decimal format."""
+    sf = normalize_scale_factor(scale_factor)
+    return f"{_Q11_BASE_FRACTION / sf:.10f}"
+
+
+def queries_for_scale_factor(scale_factor):
+    """Return the fixed query set with Q11 rendered for ``scale_factor``."""
+    rendered = QUERIES.copy()
+    if rendered["q11"].count(_Q11_SF1_LITERAL) != 1:
+        raise RuntimeError("Q11's SF1 fraction literal is missing or ambiguous")
+    rendered["q11"] = rendered["q11"].replace(
+        _Q11_SF1_LITERAL, q11_fraction(scale_factor)
+    )
+    return rendered
