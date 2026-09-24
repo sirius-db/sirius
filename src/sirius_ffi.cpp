@@ -74,11 +74,23 @@ void install_log_sink_from_env()
   auto const* log_dir_env = std::getenv("SIRIUS_LOG_DIR");
   auto const* level_env   = std::getenv("SIRIUS_LOG_LEVEL");
   if (!backend_env && !log_dir_env && !level_env) { return; }
-  if (backend_env) { duckdb::Config::LOG_BACKEND = backend_env; }
-  if (log_dir_env) { duckdb::Config::LOG_DIR = log_dir_env; }
-  if (level_env) { duckdb::Config::LOG_LEVEL = level_env; }
-  // Best-effort (null db): an unknown backend is ignored rather than failing bring-up.
-  duckdb::install_configured_log_sink(nullptr);
+  auto previous_backend = duckdb::Config::LOG_BACKEND;
+  auto previous_log_dir = duckdb::Config::LOG_DIR;
+  auto previous_level   = duckdb::Config::LOG_LEVEL;
+  try {
+    if (backend_env) { duckdb::Config::LOG_BACKEND = backend_env; }
+    if (log_dir_env) { duckdb::Config::LOG_DIR = log_dir_env; }
+    if (level_env) { duckdb::Config::LOG_LEVEL = level_env; }
+    // With no database, an unknown backend leaves the current sink in place.
+    duckdb::install_configured_log_sink(nullptr);
+  } catch (...) {
+    // Sink construction can throw (for example, if LOG_DIR cannot be created).
+    // It happens before set_sink(), so the previous sink is still active.
+    duckdb::Config::LOG_BACKEND.swap(previous_backend);
+    duckdb::Config::LOG_DIR.swap(previous_log_dir);
+    duckdb::Config::LOG_LEVEL.swap(previous_level);
+    throw;
+  }
 }
 
 double elapsed_ms(std::chrono::steady_clock::time_point since)
@@ -148,8 +160,8 @@ struct Context::Impl {
     // Relation API, which re-binds the whole subtree at every level, so a read of one file is
     // bound once per operator above it; with the cache off each bind re-parses the footer and
     // re-derives the column statistics (~0.5 s per bind for a 25 GB, 5k-row-group TPC-H SF100
-    // lineitem: Q21 spent 10 s lowering against 4.6 s executing). The option must be set at
-    // the database level: the consumer's binder does not see session-level SET variables.
+    // lineitem: Q21 spent 10 s lowering against 4.6 s executing). Set the option at the
+    // database level so every connection on this private DuckDB instance inherits it.
     // This DuckDB instance is private to the engine, and the cache validates file mtimes.
     duckdb::DBConfig::GetConfig(*db->instance)
       .SetOptionByName("parquet_metadata_cache", duckdb::Value::BOOLEAN(true));

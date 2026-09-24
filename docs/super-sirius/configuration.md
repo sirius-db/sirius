@@ -574,6 +574,17 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
 
+The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
+If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
+the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
+the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
+backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
+does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
+logging. If the selected sink cannot be constructed, such as when the log directory is not
+writable, context construction throws and restores the previous `Config::LOG_*` values while
+leaving the previous sink active.
+
 ### Expression Evaluation
 
 **File:** `src/expression_evaluator/expression_evaluator_strategy.hpp`
