@@ -357,7 +357,7 @@ step trace_through(sirius_physical_operator const& node,
       auto const key = std::find(shape->group_idx->begin(), shape->group_idx->end(), in);
       if (key == shape->group_idx->end()) {
         // Not a key: read if an aggregate consumes it, and either way the
-        // aggregate's output carries no such column, so the ride ends here.
+        // ride ends here; a FIRST's carried column is treated as read.
         // A read that only COUNTS says so — the values are not needed, which is
         // what count-on-deferred trades on.
         if (counted_only) { return step::counts(); }

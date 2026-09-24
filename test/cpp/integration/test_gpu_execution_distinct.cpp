@@ -369,7 +369,8 @@ TEST_CASE_METHOD(DistinctFixture,
       "s");
   }
 
-  // A second correlated predicate keeps the delim join, so the DISTINCT reads a DELIM_GET.
+  // A second correlated predicate keeps the delim join, so the DISTINCT reads a join against the
+  // DELIM_GET.
   SECTION("delim join")
   {
     compare_gpu_vs_cpu(
