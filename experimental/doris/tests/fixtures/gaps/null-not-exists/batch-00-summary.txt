@@ -1,0 +1,7 @@
+query_id=f8a65a9cf2624c71-a2049d24c6f4f168
+batch_seq=0
+fragments=4
+[0] fragment_id=4 sink=RESULT_SINK instances=1 nodes=[SORT_NODE > EXCHANGE_NODE]
+[1] fragment_id=3 sink=DATA_STREAM_SINK instances=1 nodes=[HASH_JOIN_NODE > EXCHANGE_NODE > EXCHANGE_NODE]
+[2] fragment_id=2 sink=DATA_STREAM_SINK instances=1 nodes=[FILE_SCAN_NODE]
+[3] fragment_id=0 sink=DATA_STREAM_SINK instances=1 nodes=[FILE_SCAN_NODE]

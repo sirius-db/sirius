@@ -1,0 +1,35 @@
+# q01: 3 fragments (root first):
+#   fragment_id=2 sink=RESULT_SINK nodes=[SORT_NODE > EXCHANGE_NODE]
+#   fragment_id=1 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > EXCHANGE_NODE]
+#   fragment_id=0 sink=DATA_STREAM_SINK nodes=[AGGREGATION_NODE > FILE_SCAN_NODE]
+# Reviewed by hand against tests/fixtures/tpch/q01/query.sql; regenerate with
+# `UPDATE_SNAPSHOTS=1 cargo test --test corpus -p sirius-doris-be --no-default-features`.
+stitched: SORT_NODE > AGGREGATION_NODE > FILE_SCAN_NODE
+=== Version 0.85.0
+  producer: sirius-doris-plan-translator
+=== Extensions
+URNs:
+  @  1: extension:io.substrait:functions_comparison
+  @  2: extension:io.substrait:functions_arithmetic
+  @  3: extension:io.substrait:functions_aggregate_generic
+Functions:
+  #  1 @  1: lte
+  #  2 @  2: subtract
+  #  3 @  2: multiply
+  #  4 @  2: add
+  #  5 @  3: sum
+  #  6 @  3: avg
+  #  7 @  3: count
+
+=== Plan
+Root[l_returnflag, l_linestatus, sum_qty, sum_base_price, sum_disc_price, sum_charge, avg_qty, avg_price, avg_disc, count_order]
+  Project[$0, $1, $2, $3, $4, $5, $6, $7, $8, $9]
+    Sort[($0, &AscNullsFirst), ($1, &AscNullsFirst) => $0, $1, $2, $3, $4, $5, $6, $7, $8, $9]
+      Project[$0, $1, ($2)::!decimal?<38, 2>, ($3)::!decimal?<38, 2>, ($4)::!decimal?<38, 4>, ($5)::!decimal?<38, 6>, ($6)::!decimal?<38, 4>, ($7)::!decimal?<38, 4>, ($8)::!decimal?<38, 4>, ($9)::!i64]
+        Aggregate[$0, $1 => $0, $1, sum($2):decimal?<38, 2>, sum($3):decimal?<38, 2>, sum($5):decimal?<38, 4>, sum($6):decimal?<38, 6>, avg($2):decimal?<38, 4>, avg($3):decimal?<38, 4>, avg($4):decimal?<38, 4>, count():i64]
+          Project[$0, $1, $2, $3, $4, $8, (multiply($8, add(1.00:decimal<16, 2>, ($5)::!decimal?<16, 2>):decimal?<16, 2>):decimal?<38, 6>)::!decimal?<38, 6>]
+            Project[$0, $1, $2, $3, $4, $5, $6, $7, (multiply($3, $7):decimal?<31, 4>)::!decimal?<31, 4>]
+              Project[$0, $1, $2, $3, $4, $5, $6, (subtract(1.00:decimal<16, 2>, $6):decimal?<16, 2>)::!decimal?<16, 2>]
+                Project[$4, $5, $0, $1, $2, $3, (($2)::!decimal?<16, 2>)::!decimal?<16, 2>]
+                  Filter[lte($6, '1998-09-02':date):boolean? => $0, $1, $2, $3, $4, $5, $6]
+                    Read["local_files:/tmp/tpch-sf1/lineitem/part.0.parquet" => l_quantity:decimal?<15, 2>, l_extendedprice:decimal?<15, 2>, l_discount:decimal?<15, 2>, l_tax:decimal?<15, 2>, l_returnflag:string?, l_linestatus:string?, l_shipdate:date?]
