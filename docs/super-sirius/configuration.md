@@ -108,6 +108,7 @@ sirius:
     dynamic_filter_inlist_max_l2_fraction: 0.125  # hash-IN-list fraction of known probe-GPU L2 (0 = Bloom for non-small keys; 1.0 = full L2)
     dynamic_filter_keep_threshold: 0.9  # disable a scan's filtering when a split keeps > this fraction
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
+    enable_runtime_size_estimation: false  # project total port input from upstream ratios
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -433,6 +434,7 @@ individually.
 | `enable_pinned_zone_map_pruning` | true | Capture per-chunk min/max statistics while pinning and use them to skip cached chunks that cannot match a scan filter. |
 | `admission_bytes_per_gpu` | 0 (off) | Target projected scan-output bytes per GPU. At admission the engine estimates a query's total scan output and takes the smallest GPU subset that keeps each GPU under this figure, bounded by `topology.gpus_per_query`. `0` disables the estimate, leaving the allocation to `topology.gpus_per_query` alone. |
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
+| `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 
@@ -571,6 +573,17 @@ Registered in `src/sirius_extension.cpp`. These can be changed at runtime:
 
 These can also be set at load via the `SIRIUS_LOG_BACKEND`, `SIRIUS_LOG_DIR`, and
 `SIRIUS_LOG_LEVEL` environment variables.
+
+The embedded FFI engine reads these variables when it constructs a `sirius::ffi::Context`.
+If none is set, it leaves the current log sink unchanged. If only `SIRIUS_LOG_LEVEL` is set,
+the default `spdlog` backend writes to `./log/sirius.log`; if only `SIRIUS_LOG_DIR` is set,
+the default `spdlog` backend writes there. An unknown backend leaves the current sink in
+place. With `spdlog`, an unknown level falls back to `info` and emits a warning. The `duckdb`
+backend needs a DuckDB database when the sink is installed, so selecting it in the FFI path
+does not create a sink; this path has no SQL or settings entry point to enable or read DuckDB
+logging. If the selected sink cannot be constructed, such as when the log directory is not
+writable, context construction throws and restores the previous `Config::LOG_*` values while
+leaving the previous sink active.
 
 ### Expression Evaluation
 
@@ -724,6 +737,19 @@ still an experimental optimization, not a normal session choice.
 Five further `SIRIUS_EXP_LATE_MAT_*` knobs tune the deferral floors and the count-on-deferred
 path; see [Late Materialization](late-materialization.md#turning-it-on-experimental) for the full
 gate table, the mechanism, and results.
+
+### Runtime Data Size Estimation
+
+Runtime estimation projects the total bytes that will reach an input port from measured upstream
+ratios. Its current consumer is the grouped-aggregation `PARTITION`, which can overlap with its
+producer after an estimate is available. The disabled path retains the original `FULL` barrier.
+
+The partition logs its sizing basis (`projected`, `upstream-complete`, or `measured`) and final
+error. See [Data Size Estimation](data-size-estimation.md) for the design.
+
+```sql
+SET enable_runtime_size_estimation = true;   -- off by default
+```
 
 ### Transparent Execution
 

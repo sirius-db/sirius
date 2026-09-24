@@ -90,13 +90,4 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
 std::shared_ptr<iceberg_gpu_ingestible> make_ingestible(
   std::unique_ptr<iceberg_ingestible_table_info> info);
 
-/**
- * @brief Row provenance of the batch a @c parquet_split_info decodes to.
- *
- * The decoded table is the concatenation, in split order, of each slice's selected row groups.
- * Each (slice, row group) pair becomes one @ref batch_row_run whose file offset is the prefix
- * sum of that file's preceding row-group row counts. Exposed for testing.
- */
-std::vector<batch_row_run> build_batch_layout(parquet_split_info const& split);
-
 }  // namespace sirius::op::scan

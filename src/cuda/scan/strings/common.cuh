@@ -25,14 +25,19 @@
 #pragma once
 
 #include "cuda/scan/detail/warp.cuh"
+#include "cuda/scan/gpu_decode_strings.cuh"
 
 #include <rmm/detail/error.hpp>
 
+#include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace sirius::cuda::scan {
@@ -45,6 +50,8 @@ constexpr uint32_t FSST_SIZE             = 256;
 constexpr uint32_t FSST_NUM_SYMBOLS      = 255;
 constexpr uint8_t FSST_ESC               = 255;
 constexpr uint32_t FSST_SYMTAB_MAX_BYTES = 8192;  // opaque serialized blob
+/// FSST import reads this prefix before symbol data: version (8B), flag (1B), histogram (8B).
+constexpr uint32_t FSST_SYMTAB_HEADER_BYTES = 8 + 1 + 8;
 
 /// Trimmed `duckdb_fsst_decoder_t`: just the `len` + `symbol` arrays the device
 /// decode path populates and reads (drops `version` + `zeroTerminated`).
@@ -99,6 +106,9 @@ constexpr uint32_t MIN_ROWS_PER_CHUNK =
        ///< per chunk -> 8 rows per warp at this minimum.
 constexpr uint32_t MAX_BITPACKING_WIDTH = 32;
 
+//! Kernels form bit positions and row indices in 32-bit signed arithmetic.
+constexpr uint64_t KERNEL_INDEX_LIMIT = std::numeric_limits<int32_t>::max();
+
 /// Above this, take the exact-total sync rather than trust the host upper
 /// bound — a pathological max_string_length could otherwise force a GB-class
 /// over-allocation.
@@ -144,6 +154,101 @@ struct prepared_dict_fsst {
 //!
 //! Mirror of DuckDB's AlignValue<idx_t> for 64-bit idx_t.
 constexpr uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
+
+//! Mirror of BitpackingPrimitives::GetRequiredSize: DuckDB reserves whole groups of 32 values
+//! for each bitpacked region. The host validators size every bitpacked region with it, so a
+//! header whose next region starts before DuckDB would have placed it is refused before decode.
+constexpr uint64_t bitpacked_region_bytes(uint64_t count, uint64_t width)
+{
+  return ((count + 31u) / 32u) * 32u * width / 8u;
+}
+
+//! Pinned scratch storage retained until destruction; capacity grows on demand.
+class pinned_host_pool {
+  void* ptr_  = nullptr;
+  size_t cap_ = 0;
+
+ public:
+  void* get(size_t bytes)
+  {
+    if (bytes > cap_) {
+      if (ptr_) cudaFreeHost(ptr_);
+      ptr_ = nullptr;
+      cap_ = 0;
+      if (bytes > 0) {
+        RMM_CUDA_TRY(cudaMallocHost(&ptr_, bytes));
+        cap_ = bytes;
+      }
+    }
+    return ptr_;
+  }
+  ~pinned_host_pool()
+  {
+    if (ptr_) cudaFreeHost(ptr_);
+  }
+};
+
+//! Read non-empty segment headers with one stream sync. Zero-row slots remain untouched.
+//! Reject truncated headers before issuing any copy. The result borrows pool storage.
+template <typename Header>
+Header const* fetch_segment_headers(gpu_string_codec_run const& run,
+                                    pinned_host_pool& pool,
+                                    char const* codec_name,
+                                    ::cuda::stream_ref stream)
+{
+  auto const num_segs = run.segments.size();
+  for (size_t i = 0; i < num_segs; ++i) {
+    auto const& seg = run.segments[i];
+    if (seg.row_count == 0) continue;
+    if (seg.bytes_size < sizeof(Header)) {
+      throw std::runtime_error(std::string(codec_name) + " segment " + std::to_string(i) +
+                               " (rows " + std::to_string(seg.row_offset) + "+" +
+                               std::to_string(seg.row_count) + "): bytes_size " +
+                               std::to_string(seg.bytes_size) + " is shorter than the header");
+    }
+  }
+  auto* headers = static_cast<Header*>(pool.get(sizeof(Header) * num_segs));
+  for (size_t i = 0; i < num_segs; ++i) {
+    auto const& seg = run.segments[i];
+    if (seg.row_count == 0) continue;
+    RMM_CUDA_TRY(cudaMemcpyAsync(
+      &headers[i], seg.d_bytes, sizeof(Header), cudaMemcpyDeviceToHost, stream.get()));
+  }
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.get()));
+  return headers;
+}
+
+[[noreturn]] inline void throw_malformed_segment(char const* codec_name,
+                                                 size_t seg_idx,
+                                                 gpu_string_segment_desc const& seg,
+                                                 std::string const& what)
+{
+  throw std::runtime_error(std::string(codec_name) + " segment " + std::to_string(seg_idx) +
+                           " (rows " + std::to_string(seg.row_offset) + "+" +
+                           std::to_string(seg.row_count) + "): " + what);
+}
+
+//! Refuse a bitpacking width the kernels cannot unpack; @p name is the header field.
+template <class Fail>
+void check_bitpacking_width(char const* name, uint32_t width, Fail&& fail)
+{
+  if (width > MAX_BITPACKING_WIDTH) {
+    fail(std::string(name) + " " + std::to_string(width) + " > " +
+         std::to_string(MAX_BITPACKING_WIDTH));
+  }
+}
+
+//! Refuse @p count values of @p width bits when a row or bit index would not fit the kernels'
+//! 32-bit signed index arithmetic. Call after check_bitpacking_width so count * width cannot
+//! overflow.
+template <class Fail>
+void check_kernel_index_range(uint64_t count, uint64_t width, Fail&& fail)
+{
+  if (count > KERNEL_INDEX_LIMIT || count * width > KERNEL_INDEX_LIMIT) {
+    fail("row or bit index for rows " + std::to_string(count) +
+         " does not fit the kernels' 32-bit index arithmetic");
+  }
+}
 
 //! @brief Target CTA count for chunking segments: two full device waves at
 //! STRINGS_BLOCK_DIM threads. Cached per device.

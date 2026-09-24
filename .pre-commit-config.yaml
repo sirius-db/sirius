@@ -99,5 +99,5 @@ repos:
         name: check for orphaned test files
         entry: python3 scripts/check_orphan_tests.py
         language: system
-        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|test/cpp/orphan_test_allowlist\.txt)$
+        files: ^(test/cpp/.*\.cpp|CMakeLists\.txt|cmake/sirius-.*\.cmake|test/cpp/orphan_test_allowlist\.txt)$
         pass_filenames: false

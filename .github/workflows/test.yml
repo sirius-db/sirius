@@ -16,13 +16,13 @@ name: Test
 on:
   push:
     branches:
-      - dev
+      - main
   pull_request:
   merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `dev` and merge queue commits
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }} # cancel existing runs on PRs but run on all `main` and merge queue commits
 
 jobs:
   build:
@@ -46,7 +46,7 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop CUDA variants marked merge/main-only; on merge_group/main, match nothing.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
@@ -78,6 +78,8 @@ jobs:
           echo "SCCACHE_S3_KEY_PREFIX=sirius" >> $GITHUB_ENV
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - name: Build
         env:
@@ -119,7 +121,7 @@ jobs:
             runner: ubuntu-22.04
             run-on-pr: false
         exclude:
-          # On PRs, drop CUDA variants marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop CUDA variants marked merge/main-only; on merge_group/main, match nothing.
           - cuda:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false

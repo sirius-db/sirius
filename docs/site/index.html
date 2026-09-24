@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sirius API documentation</title>
+  <style>
+    :root { color-scheme: light dark; --background: #f5f8fc; --surface: #fff; --text: #172b43; --muted: #50647b; --accent: #2563a6; --border: #d6e1ee; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--background); color: var(--text); font: 1rem/1.6 system-ui, sans-serif; }
+    main { max-width: 56rem; margin: 0 auto; padding: 4rem 1.5rem; }
+    .logo { display: block; width: 240px; max-width: 100%; height: auto; margin-bottom: 2.5rem; }
+    h1 { font-size: clamp(2rem, 5vw, 3rem); line-height: 1.2; margin-bottom: 1rem; }
+    p { color: var(--muted); }
+    nav { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin: 2rem 0; }
+    .reference { display: block; padding: 1.5rem; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); text-decoration: none; }
+    .reference:hover { border-color: var(--accent); }
+    .reference strong { display: block; color: var(--accent); font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .reference span { color: var(--muted); }
+    a { color: var(--accent); }
+    a:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+    footer { margin-top: 3rem; }
+    @media (prefers-color-scheme: dark) {
+      :root { --background: #111923; --surface: #192635; --text: #e5edf7; --muted: #b0c1d4; --accent: #8cbfff; --border: #34485f; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="cpp/sirius_dark_full.svg">
+      <img class="logo" src="cpp/sirius_light_full.svg" alt="Sirius" width="610" height="194">
+    </picture>
+    <h1>API documentation</h1>
+    <p>Embed Sirius, the GPU-native analytics engine, in your application.</p>
+    <nav aria-label="API references">
+      <a class="reference" href="cpp/index.html">
+        <strong>C++ reference &rarr;</strong>
+        <span>Public headers for embedding the engine and executing query plans.</span>
+      </a>
+      <a class="reference" href="rust/index.html">
+        <strong>Rust reference &rarr;</strong>
+        <span>The sirius crate: safe Rust bindings for the engine.</span>
+      </a>
+    </nav>
+    <p>These references follow the <code>main</code> branch. The APIs are under active development.</p>
+    <footer>
+      <a href="https://github.com/sirius-db/sirius">Source on GitHub</a>
+      &middot;
+      <a href="https://github.com/sirius-db/sirius/blob/main/docs/DEVELOPMENT.md">Development guide</a>
+    </footer>
+  </main>
+</body>
+</html>

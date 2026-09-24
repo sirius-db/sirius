@@ -2,6 +2,9 @@
 channels = ["rapidsai", "conda-forge" ]
 name = "sirius"
 platforms = [
+  "linux-64",
+  "linux-aarch64",
+  "osx-arm64",
   { name = "linux-64-cuda13", platform = "linux-64", cuda = "13" },
   { name = "linux-aarch64-cuda13", platform = "linux-aarch64", cuda = "13" },
   { name = "linux-64-cuda12", platform = "linux-64", cuda = "12" },
@@ -23,7 +26,7 @@ cuda-nvml-dev = "*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
-sccache = "=0.15.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
+sccache = "=0.18.0" # Version must match sccache version installed by mozilla-actions/sccache-action in GH workflows
 unzip = "*"
 clang = "21.*"
 wget = "*"
@@ -81,7 +84,7 @@ args = [{ arg = "output_dir", default = "telemetry_data" }]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
 
 [feature.cuda13.dependencies]
-cuda-version = "13.2.*"
+cuda-version = "13.3.*"
 libcudf = "==26.08.01"
 libcuvs = "==26.08.01"
 
@@ -128,7 +131,7 @@ scikit-build-core = "*"
 setuptools-scm = "*"
 
 [feature.duckdb-python.tasks]
-build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb\" pip install --no-build-isolation ./duckdb-python"
+build-duckdb-python = "CMAKE_ARGS=\"-DDUCKDB_SOURCE_PATH=$PIXI_PROJECT_ROOT/duckdb -DOVERRIDE_GIT_DESCRIBE=v1.5.5\" pip install --no-build-isolation ./duckdb-python"
 
 [feature.nightly-runner]
 platforms = ["linux-64-cuda13", "linux-aarch64-cuda13"]
@@ -147,3 +150,40 @@ duckdb-python = ["duckdb-python"]
 vcpkg = ["vcpkg", "cuda13"]
 vcpkg-cuda12 = ["vcpkg", "cuda12"]
 nightly-runner = { features = ["nightly-runner"], no-default-feature = true }
+docs = { features = ["docs"], no-default-feature = true }
+
+[feature.docs]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[feature.docs.dependencies]
+coreutils = "9.*"
+curl = "8.*"
+cxx-compiler = "*"
+doxygen = "1.13.*"
+rust = "1.*"
+
+[feature.docs.tasks.docs-rust]
+description = "Build the Sirius Rust API reference without libsirius."
+cmd = "cargo clean --doc --manifest-path rust/Cargo.toml --target-dir build/docs/rust-target && cargo doc --locked --manifest-path rust/Cargo.toml -p sirius --lib --no-deps --target-dir build/docs/rust-target"
+env = { DOCS_RS = "1", RUSTDOCFLAGS = "-D warnings" }
+
+[feature.docs.tasks.docs-theme]
+description = "Download and verify Doxygen Awesome v2.5.0."
+cmd = '''
+mkdir -p build/docs/theme &&
+curl --fail --location --silent --show-error --retry 3 --max-time 120 https://codeload.github.com/jothepro/doxygen-awesome-css/tar.gz/46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da --output build/docs/theme.tar.gz &&
+echo '65abe1d85bc2adf9d1a1b6ef90ae5e63f72425024196f89ec27b7bdc52d94267  build/docs/theme.tar.gz' | sha256sum --check &&
+tar -xzf build/docs/theme.tar.gz --strip-components=1 -C build/docs/theme doxygen-awesome-css-46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da/doxygen-awesome.css doxygen-awesome-css-46483f1e5a70ffb9ecd3b82d0a1cd1b24edf13da/LICENSE
+'''
+inputs = ["pixi.toml"]
+outputs = ["build/docs/theme/doxygen-awesome.css", "build/docs/theme/LICENSE"]
+
+[feature.docs.tasks.docs-cpp]
+description = "Build the Sirius public C++ API reference in build/docs/html."
+cmd = "rm -rf build/docs/html && doxygen docs/api/Doxyfile"
+depends-on = ["docs-theme"]
+
+[feature.docs.tasks.docs]
+description = "Build the combined C++ and Rust documentation site in build/docs/site."
+cmd = "rm -rf build/docs/site && mkdir -p build/docs/site && cp -R build/docs/html build/docs/site/cpp && cp -R build/docs/rust-target/doc build/docs/site/rust && cp docs/site/index.html build/docs/site/index.html && cp docs/site/rust/index.html build/docs/site/rust/index.html"
+depends-on = ["docs-cpp", "docs-rust"]

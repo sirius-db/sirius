@@ -185,6 +185,9 @@ struct operator_params {
   /// the scan-level gate active.
   double dynamic_filter_keep_threshold = 0.9;
 
+  /// Let grouped-aggregation partitions size from projected input.
+  bool enable_runtime_size_estimation = false;
+
   /// Zone-map pruning of pinned-table chunks at cache-serve time: skip cached chunks whose pin-time
   /// min/max statistics prove the scan's pushed-down filter matches no rows. Gates BOTH the
   /// pin-time statistics capture and the serve-side survivor plan: a table pinned while the flag is

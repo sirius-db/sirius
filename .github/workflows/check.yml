@@ -16,7 +16,7 @@ name: Check
 on:
   push:
     branches:
-      - dev
+      - main
   pull_request:
   merge_group:
 
@@ -110,7 +110,7 @@ jobs:
             cudf-channel: nightly
             run-on-pr: false
         exclude:
-          # On PRs, drop rows marked merge/dev-only; on merge_group/dev, match nothing.
+          # On PRs, drop rows marked merge/main-only; on merge_group/main, match nothing.
           - build:
               run-on-pr: ${{ case(github.event_name == 'pull_request', false, 'no-match') }}
       fail-fast: false
@@ -170,6 +170,8 @@ jobs:
           fi
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
 
       - run: |
           set -o pipefail
@@ -193,8 +195,18 @@ jobs:
           && matrix.build.cudf-channel == 'stable'
         run: |
           pixi run -e duckdb-python build-duckdb-python
-          pixi run -e duckdb-python python -c \
-            "import duckdb; assert duckdb.sql('SELECT 42').fetchone() == (42,)"
+          pixi run -e duckdb-python python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import duckdb
+
+          presets = json.loads(Path("cmake/CMakePresets.json").read_text())
+          base = next(preset for preset in presets["configurePresets"] if preset["name"] == "base")
+          expected = base["cacheVariables"]["OVERRIDE_GIT_DESCRIBE"]
+          actual = duckdb.sql("SELECT version()").fetchone()[0]
+          assert actual == expected, f"Python DuckDB {actual} does not match Sirius DuckDB {expected}"
+          PY
 
       # Rust bindings (sirius-sys + sirius) — fmt/clippy + build/link the test.
       # Run on a single representative entry. `cargo test --no-run` compiles the

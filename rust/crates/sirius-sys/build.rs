@@ -22,6 +22,12 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
+    // Rustdoc needs the Rust declarations, not the native bridge or library.
+    if std::env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest
         .join("../../..")

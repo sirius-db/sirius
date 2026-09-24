@@ -18,6 +18,7 @@
 
 // sirius
 #include <helper/logical_type.hpp>
+#include <memory/size_arithmetic.hpp>
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/scan/row_group_metadata.hpp>  // row_group_slice + hybrid_scan_reader
 #include <op/scan/scan_plan.hpp>
@@ -42,6 +43,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -72,6 +74,7 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   duckdb::vector<std::string> names;
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
   duckdb::vector<duckdb::HivePartitioningIndex> partition_indices;
+  std::vector<bound_virtual_column> virtual_columns;
   /// Sirius-side dynamic join filters published by a build-side hash join. Null when none are
   /// wired. The ingestible uses AST-capable filters for row-group pruning; the downstream
   /// dynamic-filter operator applies membership filters post-decode.
@@ -96,6 +99,8 @@ class parquet_ingestible_table_info : public ingestible_table_info {
   {
     return resolved_file_paths.empty() ? "<unknown>" : resolved_file_paths.front();
   }
+
+  [[nodiscard]] bool has_requested_user_virtual_columns() const;
 };
 
 /// Canonical identity form for a parquet file path so pinned-cache matching
@@ -110,6 +115,16 @@ class parquet_ingestible_table_info : public ingestible_table_info {
 
 /// In-place @ref canonical_scan_file_path over a resolved-file-path vector.
 void canonicalize_scan_file_paths(std::vector<std::string>& paths);
+
+struct filename_column_size_estimate {
+  std::size_t output_bytes;
+  std::size_t working_bytes;
+};
+
+/// Size the repeated filename column and cuDF's temporary pointer/length pairs.
+/// Uses the active cuDF large-string settings and saturates on overflow.
+[[nodiscard]] filename_column_size_estimate estimate_filename_column_size(std::size_t rows,
+                                                                          std::size_t path_bytes);
 
 //===----------------------------------------------------------------------===//
 // parquet_split_info
@@ -154,7 +169,7 @@ class parquet_split_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& s : rg_slices) {
-      total += s.estimated_output_bytes;
+      total = memory::saturating_add(total, s.estimated_output_bytes);
     }
     return total;
   }
@@ -162,10 +177,17 @@ class parquet_split_info : public scan_info {
   [[nodiscard]] std::size_t estimated_working_set_bytes() const noexcept override
   {
     std::size_t total = 0;
+    std::size_t runs  = 0;
     for (auto const& s : rg_slices) {
-      total += s.estimated_decode_working_bytes;
+      total = memory::saturating_add(total, s.estimated_decode_working_bytes);
+      runs  = memory::saturating_add(runs, s.row_group_indices.size());
     }
-    return total;
+    // The provenance-preserving virtual path decodes one table per selected row group. When
+    // several pieces are present they all remain alive while concatenate allocates an equally
+    // sized result, so reserve both sides of that peak.
+    return plan && plan->has_user_virtual_columns() && runs > 1
+             ? memory::saturating_mul(total, std::size_t{2})
+             : total;
   }
 
   /// One fadvise_entry per row-group slice: the slice's datasource paired with
@@ -213,6 +235,8 @@ class parquet_file_scan_info : public scan_info {
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
   /// File path (also the datasource cache key).
   std::string file_path;
+  /// Stable position in DuckDB's bound file list.
+  std::size_t file_index = 0;
   /// Pre-built datasource for this file, reused by @c materialize_table. May be
   /// null for local paths no sirius backend claims.
   std::shared_ptr<io::sirius_datasource> datasource;
@@ -239,7 +263,7 @@ class parquet_file_scan_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& rg : row_groups) {
-      total += rg.output_bytes;
+      total = memory::saturating_add(total, rg.output_bytes);
     }
     return total;
   }
@@ -248,7 +272,7 @@ class parquet_file_scan_info : public scan_info {
   {
     std::size_t total = 0;
     for (auto const& rg : row_groups) {
-      total += rg.decode_working_bytes;
+      total = memory::saturating_add(total, rg.decode_working_bytes);
     }
     return total;
   }
@@ -344,7 +368,20 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+                                                  std::size_t file_index,
                                                   std::shared_ptr<io::ioctx> const& io_ctx);
+
+  /// Add the carrier and user-requested virtual columns to a decoded parquet batch.
+  [[nodiscard]] std::unique_ptr<cudf::table> append_virtual_columns(
+    std::unique_ptr<cudf::table> decoded,
+    cudf::io::parquet_reader_options const& reader_options,
+    std::string const& file_path,
+    std::size_t file_index,
+    std::int64_t file_row_offset,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
+  [[nodiscard]] bool can_project_during_filter() const noexcept;
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 
@@ -359,6 +396,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // Coalesced DuckDB filter expression. Empty when no filters survived the
   // partition-column drop pass.
   std::shared_ptr<duckdb::Expression> _duckdb_filter_expression;
+  std::unordered_map<duckdb::column_t, sirius::logical_type> _virtual_types;
+  bool _has_virtual_filter = false;
 
   // This scan's pushed-down filter digested once at bind — what filter_analysis()
   // advertises. Empty when the scan has no pushed-down filter.
