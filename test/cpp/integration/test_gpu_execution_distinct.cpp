@@ -530,6 +530,12 @@ TEST_CASE_METHOD(DistinctFloatFixture,
   {
     compare_gpu_vs_cpu_on_keys(*this, "SELECT DISTINCT d, f FROM dist_fp", {0, 1});
   }
+
+  // Exact, not canonicalized: the sections above prove nothing if the scan drops the sign bit.
+  SECTION("the GPU scan keeps a negative zero")
+  {
+    compare_gpu_vs_cpu("SELECT d, f FROM dist_fp WHERE d = 0");
+  }
 }
 
 TEST_CASE_METHOD(DistinctFloatFixture,
